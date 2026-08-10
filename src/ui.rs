@@ -5053,7 +5053,7 @@ fn minimap_input(
     if buttons.just_pressed(MouseButton::Left) && inside && ui.teleport_place.is_some() {
         if let (Some(arm), Some(c)) = (ui.teleport_place, cursor) {
             let uv = Vec2::new(c.x - rect.min.x, c.y - rect.min.y);
-            let ground = clamp_to_map(minimap_to_world(uv));
+            let ground = clamp_to_map(minimap_to_world(uv, hud.minimap_px));
             let mut best: Option<(Entity, f32)> = None;
             for (e, b, team, tf) in &halls {
                 if *team != Team::Human || !is_hall(b.kind) {
