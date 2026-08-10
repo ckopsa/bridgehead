@@ -3888,6 +3888,327 @@ pub struct RememberedBuilding {
     pub last_seen: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Intel — a sighting as durable, queryable knowledge
+// ---------------------------------------------------------------------------
+//
+// The memory model above stops at structures, and `CellVis::Explored` gives
+// the reason: an army is not furniture, and a remembered army is a lie that
+// gets people killed. That is still true of `units`, which reports what a team
+// can see THIS INSTANT and is left exactly as it was.
+//
+// What it was never an argument for is throwing the observation away. A player
+// who watches six footmen cross the centre ford does not forget it a quarter
+// of a second later. They remember a stale fact *as* a stale fact and discount
+// it accordingly — and the discount is the whole skill. The lie was never the
+// memory; it was reporting a memory in the same shape as a sighting, so that
+// nothing downstream could tell them apart.
+//
+// So intel is a SEPARATE section with a timestamp welded to every entry.
+// Nothing in it can be mistaken for something standing on the board right now,
+// because there is no field-compatible way to read it as one: `units[]` has no
+// `t_seen` and every sighting has nothing else.
+//
+// FOG-HONEST BY CONSTRUCTION, and in the same way everything else here is: the
+// ledger is written by `update_fog`, in the same pass, off the same cells that
+// decide what the snapshot and the screen show. The only line that inserts a
+// sighting is guarded by the identical `vis_at(..).sees()` the building ghosts
+// are guarded by. A unit that has never stood in a visible cell cannot appear
+// in this ledger, and there is no second code path that could put it there.
+
+/// How long an unrefreshed unit sighting survives before it is dropped.
+///
+/// Buildings are remembered forever because they do not move; a unit's
+/// position decays into fiction at walking pace. Ninety seconds is about the
+/// time it takes an army to cross this map twice, so a sighting that old has
+/// no remaining power to say where anything *is* — only that it existed and
+/// once passed through. Past the horizon it is a rumour, and the ledger drops
+/// it rather than let a commander plan against it.
+///
+/// This is the one place unit intel and building ghosts genuinely differ, and
+/// the difference is exactly the thing that moves.
+pub const SIGHTING_TTL_S: f32 = 90.0;
+
+/// How close two concurrent sightings must be to read as one body of troops.
+pub const GROUP_RADIUS: f32 = 18.0;
+
+/// ...and how close in observation time. See `FogGrid::army_groups`.
+const GROUP_WINDOW_S: f32 = 10.0;
+
+/// Below this much observed movement between two consecutive fog ticks, a unit
+/// is standing still and HAS no heading. Well above float jitter, well below
+/// what the slowest unit in the game covers in one `FOG_INTERVAL`.
+const HEADING_MIN_MOVE: f32 = 0.2;
+
+/// Two observations further apart than this in game time are not a track.
+/// Re-sighting a raider a minute later on the other side of the map says
+/// nothing about which way it is walking now, and the straight line between
+/// the two observations is a line nobody watched it travel.
+const HEADING_GAP_S: f32 = 1.0;
+
+/// A coarse eight-point heading, as an observer reads it off a moving body of
+/// troops. Eight and not sixty-four because "they are heading northeast" is
+/// the whole of what somebody watching from across a valley can honestly
+/// claim, and a finer number would be precision the observation does not have.
+///
+/// `N` is `+Z`, which is the minimap's up (`ui::world_to_minimap`), so the word
+/// in the snapshot and the arrow on the screen point the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Heading8 {
+    N,
+    NE,
+    E,
+    SE,
+    S,
+    SW,
+    W,
+    NW,
+}
+
+impl Heading8 {
+    /// The heading implied by observed movement, or `None` if the body did not
+    /// visibly move. `None` is a real answer here, not a failure: a unit
+    /// standing still has no heading, and inventing one from float noise would
+    /// be the smallest possible lie told the most often.
+    pub fn of(delta: Vec3) -> Option<Heading8> {
+        if Vec2::new(delta.x, delta.z).length() < HEADING_MIN_MOVE {
+            return None;
+        }
+        // atan2(x, z): zero is +Z (north), increasing toward +X (east).
+        let deg = delta.x.atan2(delta.z).to_degrees();
+        Some(match ((deg / 45.0).round() as i32).rem_euclid(8) {
+            0 => Heading8::N,
+            1 => Heading8::NE,
+            2 => Heading8::E,
+            3 => Heading8::SE,
+            4 => Heading8::S,
+            5 => Heading8::SW,
+            6 => Heading8::W,
+            _ => Heading8::NW,
+        })
+    }
+
+    /// The wire word. Short because it rides on every sighting in the
+    /// snapshot and reads next to a coordinate pair.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Heading8::N => "N",
+            Heading8::NE => "NE",
+            Heading8::E => "E",
+            Heading8::SE => "SE",
+            Heading8::S => "S",
+            Heading8::SW => "SW",
+            Heading8::W => "W",
+            Heading8::NW => "NW",
+        }
+    }
+}
+
+/// An enemy unit as this team last observed it.
+///
+/// Every field is something a human at the keyboard could have read off the
+/// screen while that unit stood in their vision, and **nothing else**:
+///
+/// | field | how a human knows it |
+/// |---|---|
+/// | `kind` | the model is on screen |
+/// | `pos` | it is standing there |
+/// | `hp_frac` | health bars are children of their owner, so an enemy that renders renders its bar (`ui::apply_fog_visibility`) |
+/// | `heading` | they watched it move, across two consecutive fog ticks |
+/// | `t_seen` | the clock |
+///
+/// Deliberately **absent**: level, xp, mana, inventory, squad, orders,
+/// abilities. ui.rs's pickers select own-team entities only — both the
+/// rubber-band and the plain click `continue` on `*team != Team::Human` — so
+/// no enemy is ever loaded into the panel that prints `Lv 4`. A commander
+/// given a level here would hold an information right no human has a gesture
+/// to exercise, which is the exact asymmetry docs/FOG.md exists to close.
+#[derive(Clone, Copy, Debug)]
+pub struct Sighting {
+    /// The real entity's `to_bits()` — the same identity `RememberedBuilding`
+    /// uses, so a renderer can match a marker against the live unit and
+    /// suppress one when the other is on screen.
+    pub id: u64,
+    /// The observed unit's team. Always the ledger owner's enemy: the only
+    /// insert is guarded on `*t != team`.
+    pub team: Team,
+    pub kind: UnitKind,
+    pub pos: Vec3,
+    /// Health fraction when last observed, `0..=1`.
+    pub hp_frac: f32,
+    /// Which way it was walking when last observed. `None` when it was
+    /// standing still, and `None` on a first glimpse — a single glance carries
+    /// no heading, because a heading is a difference between two of them.
+    pub heading: Option<Heading8>,
+    /// Game time of the observation. The field that makes this a memory rather
+    /// than a report.
+    pub t_seen: f32,
+}
+
+impl Sighting {
+    /// Game-seconds since the observation.
+    pub fn age(&self, now: f32) -> f32 {
+        (now - self.t_seen).max(0.0)
+    }
+}
+
+/// What one team believes about one enemy hero class.
+///
+/// Three states, and there is no fourth, because there is no fourth thing an
+/// observer can honestly be in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeroStatus {
+    /// Never laid eyes on it. **Not** "they have no hero": those are the same
+    /// empty observation, and conflating them is precisely the mistake the
+    /// `fog` block exists to prevent for terrain — "I have no information" and
+    /// "there is nothing there" must not be the same answer.
+    Unknown,
+    /// Seen alive, and nothing observed since has said otherwise. The honest
+    /// reading is *alive as far as you know*: it may have died two minutes ago
+    /// somewhere nobody was looking, and this will go on saying `Alive`. That
+    /// is not a bug in the belief, it is the belief.
+    Alive,
+    /// We **watched it die** — it stood in our vision on the previous fog tick
+    /// and is not in the world on this one. Witnessed, not inferred from an
+    /// absence.
+    SeenDying,
+}
+
+impl HeroStatus {
+    /// The wire word, and the same word the HUD line uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeroStatus::Unknown => "unknown",
+            HeroStatus::Alive => "alive",
+            HeroStatus::SeenDying => "seen-dying",
+        }
+    }
+}
+
+/// One team's belief about one enemy hero class.
+///
+/// Keyed by *class* rather than by entity, because a class is what survives a
+/// death: heroes revive through `HeroRecords`, and the question a commander
+/// asks is "is their Champion on the field", not "is entity 4294968150 alive".
+/// A revive is observed the ordinary way — see the hero again and `status`
+/// goes back to `Alive`, so the belief is revocable rather than sticky.
+#[derive(Clone, Copy, Debug)]
+pub struct HeroIntel {
+    pub kind: UnitKind,
+    pub status: HeroStatus,
+    /// Where it was when last observed. `None` iff `status` is `Unknown`.
+    pub pos: Option<Vec3>,
+    /// Game time of that observation. `None` iff `status` is `Unknown`.
+    pub t_seen: Option<f32>,
+    /// Health fraction when last observed — the bar the watcher could see.
+    /// `0.0` alongside `SeenDying`, which is what they watched happen.
+    pub hp_frac: Option<f32>,
+}
+
+/// The hero classes, in one canonical order.
+///
+/// The ledger keeps one entry per class in this order — a fixed `Vec` rather
+/// than a map — so hero intel iterates deterministically without `UnitKind`
+/// having to grow an `Ord` that nothing else in the codebase wants.
+pub const HERO_CLASSES: [UnitKind; 2] = [UnitKind::Hero, UnitKind::Priestess];
+
+fn blank_hero_intel() -> Vec<HeroIntel> {
+    HERO_CLASSES
+        .iter()
+        .map(|kind| HeroIntel {
+            kind: *kind,
+            status: HeroStatus::Unknown,
+            pos: None,
+            t_seen: None,
+            hp_frac: None,
+        })
+        .collect()
+}
+
+/// Write one class's entry. A no-op for a non-hero kind, which cannot happen —
+/// every caller is already behind `is_hero_kind`.
+fn set_hero_intel(
+    heroes: &mut [HeroIntel],
+    kind: UnitKind,
+    status: HeroStatus,
+    pos: Vec3,
+    t: f32,
+    hp_frac: f32,
+) {
+    if let Some(h) = heroes.iter_mut().find(|h| h.kind == kind) {
+        h.status = status;
+        h.pos = Some(pos);
+        h.t_seen = Some(t);
+        h.hp_frac = Some(hp_frac);
+    }
+}
+
+/// Concurrent sightings read as one body of troops.
+///
+/// The aggregate view exists because the ledger's grain is wrong for the
+/// question actually being asked. Nobody wants eleven rows; they want "there
+/// is an army of eleven at the ford". Clustering is done where it is *read*
+/// rather than stored, so the ledger keeps one truth and the summary is always
+/// derived from the current one.
+#[derive(Clone, Debug)]
+pub struct ArmyGroup {
+    pub size: usize,
+    /// `(kind, count)`, most numerous first, ties broken by the kind's name so
+    /// the summary string is byte-identical on every run.
+    pub composition: Vec<(UnitKind, usize)>,
+    pub centroid: Vec3,
+    /// The **freshest** observation in the group — "the group was seen at
+    /// least this recently". Individual members may be up to `GROUP_WINDOW_S`
+    /// older, which is what makes them one concurrent picture at all.
+    pub t_seen: f32,
+}
+
+impl ArmyGroup {
+    /// `"5 Footman, 3 Archer"` — the composition as the event feed, the
+    /// snapshot and the HUD all say it. One producer, so the three cannot
+    /// drift into three different descriptions of one army.
+    pub fn summary(&self) -> String {
+        self.composition
+            .iter()
+            .map(|(kind, n)| format!("{n} {}", kind_name(*kind)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// How near a named chokepoint a spot must be to be called by its name.
+const PLACE_CHOKE_RADIUS: f32 = 30.0;
+/// ...and how near a base to be called "our"/"their" ground.
+const PLACE_BASE_RADIUS: f32 = 50.0;
+
+/// Name a spot the way a player would say it out loud.
+///
+/// The nearest named chokepoint wins, then whose base it is near, then the
+/// bare coordinate. All three are **public geography** — chokepoint names and
+/// positions ship in every snapshot's `map` block and both bases are known to
+/// everyone from the first frame — so naming a place reveals nothing about who
+/// is standing in it. What the event says about the army is fog-gated; where
+/// the ground is was never secret.
+pub fn place_name(pos: Vec3, me: Team) -> String {
+    let mut best: Option<(f32, &'static str)> = None;
+    for choke in crate::terrain::active_map().chokepoints() {
+        let d = Vec2::new(pos.x - choke.pos.x, pos.z - choke.pos.z).length();
+        if d <= PLACE_CHOKE_RADIUS && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, choke.name));
+        }
+    }
+    if let Some((_, name)) = best {
+        return format!("near the {name}");
+    }
+    for (team, label) in [(me, "our base"), (me.enemy(), "their base")] {
+        let home = team.base_pos();
+        if Vec2::new(pos.x - home.x, pos.z - home.z).length() <= PLACE_BASE_RADIUS {
+            return format!("near {label}");
+        }
+    }
+    format!("at ({:.0}, {:.0})", pos.x, pos.z)
+}
+
 /// One team's knowledge of the map: what it can see now, what it has ever
 /// seen, and what it remembers standing there.
 pub struct FogGrid {
@@ -3900,6 +4221,17 @@ pub struct FogGrid {
     /// `min_by`. Under a `HashMap` two equidistant ghosts would pick a
     /// different target in every process.
     ghosts: std::collections::BTreeMap<u64, RememberedBuilding>,
+    /// Enemy **units** this team has seen, keyed by entity id. `BTreeMap` for
+    /// the same reason `ghosts` is one, and with a second reason on top: this
+    /// is the input to `army_groups`, whose cluster order and float centroids
+    /// would both differ per process under std's hash order.
+    sightings: std::collections::BTreeMap<u64, Sighting>,
+    /// One entry per hero class, in `HERO_CLASSES` order. Never empty.
+    heroes: Vec<HeroIntel>,
+    /// Game time of the previous recompute. A unit counts as *watched dying*
+    /// only if it was visible at that instant and is gone at this one — see
+    /// `update_fog`, which is the only writer.
+    last_update: f32,
     explored: usize,
     visible: usize,
 }
@@ -3909,6 +4241,9 @@ impl FogGrid {
         FogGrid {
             cells: vec![CellVis::Unexplored; GRID_DIM * GRID_DIM],
             ghosts: std::collections::BTreeMap::new(),
+            sightings: std::collections::BTreeMap::new(),
+            heroes: blank_hero_intel(),
+            last_update: 0.0,
             explored: 0,
             visible: 0,
         }
@@ -3922,6 +4257,14 @@ impl FogGrid {
         FogGrid {
             cells: vec![CellVis::Visible; n],
             ghosts: std::collections::BTreeMap::new(),
+            // Empty, and stays empty: `update_fog` returns before it writes
+            // anything under `WC3_FOG=0`, exactly as it already does for
+            // `ghosts`. Under the omniscient baseline live sight supersedes
+            // memory entirely — every enemy is in `units[]` every tick — so an
+            // intel section would be a second, staler copy of the same board.
+            sightings: std::collections::BTreeMap::new(),
+            heroes: blank_hero_intel(),
+            last_update: 0.0,
             explored: n,
             visible: n,
         }
@@ -3973,6 +4316,127 @@ impl FogGrid {
     /// reject orders against things a seat should not know exist.
     pub fn knows_entity(&self, id: u64, pos: Vec3) -> bool {
         self.sees(pos) || self.ghosts.contains_key(&id)
+    }
+
+    /// Enemy units this team remembers seeing, in id order.
+    ///
+    /// Unlike `ghosts()` there is **no visible-now filter**, and the asymmetry
+    /// is deliberate. A ghost stands in for a building that is still there, so
+    /// showing one beside the live article would draw the same base twice. A
+    /// sighting is a record of an *instant* — "here at T" — and the live unit
+    /// that refreshed it is somewhere else by definition of having moved.
+    /// Renderers that want to suppress the marker under a live unit have the
+    /// `id` to do it with; see `ui::sync_intel_markers`, which does exactly
+    /// that for the one tick where they coincide.
+    pub fn sightings(&self) -> impl Iterator<Item = &Sighting> + '_ {
+        self.sightings.values()
+    }
+
+    /// This team's belief about each enemy hero class, in `HERO_CLASSES`
+    /// order. Always `HERO_CLASSES.len()` entries — a class never observed
+    /// reports `HeroStatus::Unknown` rather than going missing, because a
+    /// missing row and a row saying "no idea" are different claims and only
+    /// one of them is true.
+    pub fn hero_intel(&self) -> &[HeroIntel] {
+        &self.heroes
+    }
+
+    /// This team's belief about one enemy hero class.
+    pub fn hero_intel_of(&self, kind: UnitKind) -> Option<&HeroIntel> {
+        self.heroes.iter().find(|h| h.kind == kind)
+    }
+
+    /// Cluster concurrent sightings into bodies of troops.
+    ///
+    /// Single-link agglomeration: two sightings join the same group when they
+    /// are within `GROUP_RADIUS` of each other **and** were observed within
+    /// `GROUP_WINDOW_S` of each other. Both halves are load-bearing. Without
+    /// the distance test the whole map is one army. Without the **time** test
+    /// a footman glimpsed at the ford eighty seconds ago merges with an archer
+    /// standing there now, and the ledger reports a two-unit force that
+    /// existed at no instant — an aggregate that is a lie assembled out of
+    /// two honest facts, which is the failure mode this whole section is
+    /// arranged to avoid.
+    ///
+    /// **Workers are excluded.** A mining crew is not an army, and
+    /// `enemy_army_seen` firing on one would be the same false alarm
+    /// `base_under_attack` refuses to raise for a skirmish in midfield. They
+    /// stay in the ledger — seeing five workers on a hillside is exactly how
+    /// you find an expansion — they just do not constitute a force.
+    ///
+    /// Deliberately not clever: O(n²) over a ledger bounded by how many enemy
+    /// units a team has recently seen, recomputed where it is read rather than
+    /// cached anywhere it could go stale.
+    pub fn army_groups(&self) -> Vec<ArmyGroup> {
+        // `sightings` is a BTreeMap, so this vector is in id order and every
+        // tie broken below resolves the same way on every run.
+        let seen: Vec<&Sighting> = self
+            .sightings
+            .values()
+            .filter(|s| s.kind != UnitKind::Worker)
+            .collect();
+        let n = seen.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        fn root(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        let mut parent: Vec<usize> = (0..n).collect();
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let d = seen[a].pos - seen[b].pos;
+                let close = Vec2::new(d.x, d.z).length() <= GROUP_RADIUS;
+                let concurrent = (seen[a].t_seen - seen[b].t_seen).abs() <= GROUP_WINDOW_S;
+                if close && concurrent {
+                    let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+                    if ra != rb {
+                        parent[ra] = rb;
+                    }
+                }
+            }
+        }
+
+        let mut buckets: std::collections::BTreeMap<usize, Vec<&Sighting>> =
+            std::collections::BTreeMap::new();
+        for i in 0..n {
+            let r = root(&mut parent, i);
+            buckets.entry(r).or_default().push(seen[i]);
+        }
+
+        buckets
+            .into_values()
+            .map(|members| {
+                // Count by NAME so the ordering key and the printed word are
+                // the same string — a composition that sorts by one and prints
+                // the other is a summary that can reorder without changing.
+                let mut counts: std::collections::BTreeMap<&'static str, (UnitKind, usize)> =
+                    std::collections::BTreeMap::new();
+                let (mut sx, mut sz) = (0.0f32, 0.0f32);
+                let mut t_seen = f32::MIN;
+                for s in &members {
+                    counts.entry(kind_name(s.kind)).or_insert((s.kind, 0)).1 += 1;
+                    sx += s.pos.x;
+                    sz += s.pos.z;
+                    t_seen = t_seen.max(s.t_seen);
+                }
+                let mut composition: Vec<(UnitKind, usize)> = counts.into_values().collect();
+                composition
+                    .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| kind_name(a.0).cmp(kind_name(b.0))));
+                let k = members.len() as f32;
+                ArmyGroup {
+                    size: members.len(),
+                    composition,
+                    centroid: Vec3::new(ev_r1(sx / k), 0.0, ev_r1(sz / k)),
+                    t_seen,
+                }
+            })
+            .collect()
     }
 
     pub fn explored_frac(&self) -> f32 {
@@ -4080,6 +4544,23 @@ impl FogGrids {
         grid.ghosts.insert(record.id, record);
     }
 
+    /// Test-only: plant a unit sighting in `team`'s ledger, exactly as
+    /// `update_fog` does when the unit is in sight. Same `#[cfg(test)]`
+    /// reasoning as `test_remember` — nothing outside a test may seed a team's
+    /// knowledge, and the compiler rather than a comment should be what says
+    /// so.
+    #[cfg(test)]
+    pub fn test_sight(&mut self, team: Team, record: Sighting) {
+        self.get_mut(team).sightings.insert(record.id, record);
+    }
+
+    /// Test-only: set one team's belief about one enemy hero class directly,
+    /// so a trigger test can assert on the predicate without staging a death.
+    #[cfg(test)]
+    pub fn test_hero_intel(&mut self, team: Team, kind: UnitKind, status: HeroStatus, pos: Vec3) {
+        set_hero_intel(&mut self.get_mut(team).heroes, kind, status, pos, 0.0, 0.0);
+    }
+
     pub fn get(&self, team: Team) -> &FogGrid {
         match team {
             Team::Human => &self.human,
@@ -4127,7 +4608,13 @@ fn fog_stamp(cells: &mut [CellVis], pos: Vec3, radius: f32) {
 fn update_fog(
     time: Res<Time>,
     mut fog: ResMut<FogGrids>,
-    units: Query<(&Unit, &Team, &Transform)>,
+    // `Health` is OPTIONAL, and deliberately so. It is read only to stamp a
+    // sighting's `hp_frac`; requiring it would make a unit's ability to SEE
+    // conditional on it having a health bar, which is a coupling nothing in
+    // the fog rule wants and which would fail silently — the unit would simply
+    // stop lighting cells, and the map would go dark for no stated reason.
+    // Vision comes from the stat table and the transform, full stop.
+    units: Query<(Entity, &Unit, &Team, &Transform, Option<&Health>)>,
     buildings: Query<(Entity, &Building, &Team, &Transform, &Health, Has<UnderConstruction>)>,
 ) {
     if !fog.enabled {
@@ -4151,7 +4638,7 @@ fn update_fog(
                 *c = CellVis::Explored;
             }
         }
-        for (unit, t, tf) in &units {
+        for (_, unit, t, tf, _) in &units {
             if *t == team {
                 fog_stamp(&mut grid.cells, tf.translation, unit_stats(unit.kind).vision);
             }
@@ -4170,7 +4657,14 @@ fn update_fog(
         // --- building memory ------------------------------------------------
         // Split the borrow so the retain below can read cells while writing
         // ghosts.
-        let FogGrid { cells, ghosts, .. } = grid;
+        let FogGrid {
+            cells,
+            ghosts,
+            sightings,
+            heroes,
+            last_update,
+            ..
+        } = grid;
         let vis_at = |p: Vec3| match NavGrid::world_to_cell(p) {
             Some((cx, cz)) => cells[NavGrid::idx(cx, cz)],
             None => CellVis::Visible,
@@ -4203,6 +4697,101 @@ fn update_fog(
         // keep believing the barracks is still standing, which is precisely
         // the mistake fog of war is supposed to let you make.
         ghosts.retain(|id, g| live.contains(id) || !vis_at(g.pos).sees());
+
+        // --- unit sightings (intel) -----------------------------------------
+        // Written from the identical cells the ghosts above are written from.
+        // Two rules of knowability would be two rules, and this is the same
+        // one.
+        let mut live_units: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (e, unit, t, tf, health) in &units {
+            if *t == team {
+                continue;
+            }
+            let id = e.to_bits();
+            live_units.insert(id);
+            let pos = tf.translation;
+            if !vis_at(pos).sees() {
+                continue;
+            }
+            // A heading is a TRACK, not a glance: it needs a previous
+            // observation close enough in time that we actually watched the
+            // ground get covered. Re-acquiring the same raider a minute later
+            // yields `None`, which is the honest answer.
+            let heading = sightings.get(&id).and_then(|prev| {
+                if now - prev.t_seen <= HEADING_GAP_S {
+                    Heading8::of(pos - prev.pos)
+                } else {
+                    None
+                }
+            });
+            // No bar to read means nothing to report; full is the honest
+            // default for a unit that has no health to be missing.
+            let frac = health.map_or(1.0, |h| {
+                if h.max > 0.0 {
+                    (h.current / h.max).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            });
+            sightings.insert(
+                id,
+                Sighting {
+                    id,
+                    team: *t,
+                    kind: unit.kind,
+                    pos,
+                    hp_frac: frac,
+                    heading,
+                    t_seen: now,
+                },
+            );
+            if is_hero_kind(unit.kind) {
+                // Seeing it alive OVERWRITES a `SeenDying` belief, which is
+                // how a revive is learned: heroes come back through
+                // `HeroRecords`, so the belief has to be revocable by the
+                // ordinary act of looking rather than latched forever.
+                set_hero_intel(heroes, unit.kind, HeroStatus::Alive, pos, now, frac);
+            }
+        }
+
+        // A unit is "seen dying" only if it stood in our vision at the
+        // PREVIOUS recompute and is absent from the world at this one.
+        //
+        // The weaker test the building ghosts use — "gone, and we can see the
+        // spot where it was" — is *wrong* for something that moves. A hero
+        // that walked out of our sight and died half a map away would be
+        // reported as watched-dying by a scout still staring at the empty
+        // grass it left behind, which is intelligence nobody observed.
+        // Requiring that it was visible one tick ago closes that: a quarter of
+        // a second is not enough to leave our vision AND die somewhere we
+        // cannot see. Entities are despawned centrally by `apply_death` and by
+        // nothing else, so "absent from the world" means dead and not
+        // bookkeeping.
+        let witnessed: Vec<Sighting> = sightings
+            .values()
+            .filter(|s| s.t_seen >= *last_update && !live_units.contains(&s.id))
+            .copied()
+            .collect();
+        for dead in &witnessed {
+            if is_hero_kind(dead.kind) {
+                set_hero_intel(heroes, dead.kind, HeroStatus::SeenDying, dead.pos, now, 0.0);
+            }
+            sightings.remove(&dead.id);
+        }
+
+        // The rumour horizon, and the ONLY other way a sighting leaves.
+        //
+        // Note what is deliberately absent: there is no "we looked at the spot
+        // and it was empty" removal. That rule is right for a building, whose
+        // record claims the thing is standing there; a sighting claims only
+        // that a unit was there AT `t_seen`, and walking onto the spot
+        // confirms nothing the timestamp had not already said. Watching an
+        // army march off is not amnesia — the marker stays where you last saw
+        // it, wearing the heading you watched it leave on, which is precisely
+        // the fact worth keeping.
+        sightings.retain(|_, s| s.age(now) <= SIGHTING_TTL_S);
+
+        *last_update = now;
     }
 }
 
@@ -4538,6 +5127,399 @@ mod fog_tests {
         assert!(building_stats(BuildingKind::Keep).vision > building_stats(BuildingKind::TownHall).vision);
     }
 
+    // -- intel: the sightings ledger --------------------------------------
+    //
+    // The subject of every test below is KNOWABILITY, so each one pins the fog
+    // mode rather than inheriting `WC3_FOG` — same discipline as the ghost
+    // tests above, and for a sharper reason: a ledger tested under an
+    // omniscient grid would pass while proving nothing.
+
+    /// A scouting app: one Human unit whose position the test drives, and the
+    /// real `update_fog` on a hand-driven clock.
+    fn intel_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        let mut grids = FogGrids::default();
+        grids.enabled = true;
+        grids.human = FogGrid::dark();
+        grids.claude = FogGrid::dark();
+        app.insert_resource(grids);
+        app.add_systems(Update, update_fog);
+        app
+    }
+
+    fn tick(app: &mut App, secs: f32) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(secs));
+        app.update();
+    }
+
+    fn human_grid(app: &App) -> &FogGrid {
+        app.world().resource::<FogGrids>().get(Team::Human)
+    }
+
+    fn spawn_scout(app: &mut App, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(at),
+                Health::new(100.0),
+            ))
+            .id()
+    }
+
+    fn spawn_enemy(app: &mut App, kind: UnitKind, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind },
+                Team::Claude,
+                Transform::from_translation(at),
+                Health::new(100.0),
+            ))
+            .id()
+    }
+
+    /// **The headline honesty property.** An enemy that has never stood in a
+    /// visible cell is absent from the ledger, and no amount of time passing
+    /// puts it there. If this ever fails, `intel` has become the omniscient
+    /// snapshot docs/FOG.md was written to delete.
+    #[test]
+    fn a_unit_never_seen_never_enters_the_ledger() {
+        let mut app = intel_app();
+        spawn_scout(&mut app, Vec3::new(-90.0, 0.0, -90.0));
+        spawn_enemy(&mut app, UnitKind::Footman, Vec3::new(80.0, 0.0, 80.0));
+
+        for _ in 0..8 {
+            tick(&mut app, 0.3);
+        }
+        let grid = human_grid(&app);
+        assert_eq!(
+            grid.sightings().count(),
+            0,
+            "an army nobody looked at is an army nobody knows about"
+        );
+        assert!(grid.army_groups().is_empty());
+        // And the enemy's OWN ledger is equally empty of our scout's kind —
+        // the rule is symmetric, which is the whole point of one producer.
+        let claude = app.world().resource::<FogGrids>().get(Team::Claude);
+        assert_eq!(claude.sightings().count(), 0);
+    }
+
+    /// Seen, then left: the record persists at the place and time it was
+    /// observed, which is the entire difference between this and `units[]`.
+    #[test]
+    fn a_unit_seen_then_left_is_remembered_where_it_was() {
+        let mut app = intel_app();
+        let spot = Vec3::new(6.0, 0.0, 0.0);
+        let scout = spawn_scout(&mut app, Vec3::ZERO);
+        let enemy = spawn_enemy(&mut app, UnitKind::Raider, spot);
+        tick(&mut app, 0.3);
+        assert_eq!(human_grid(&app).sightings().count(), 1, "eyes on it");
+
+        // The scout leaves; the enemy stays put and is now unobserved.
+        app.world_mut()
+            .entity_mut(scout)
+            .insert(Transform::from_translation(Vec3::new(-90.0, 0.0, -90.0)));
+        tick(&mut app, 0.3);
+        let grid = human_grid(&app);
+        let seen: Vec<&Sighting> = grid.sightings().collect();
+        assert_eq!(seen.len(), 1, "memory outlives sight");
+        assert_eq!(seen[0].id, enemy.to_bits());
+        assert_eq!(seen[0].pos, spot, "recorded where it was, not where it is");
+        assert!(!grid.sees(spot), "and we can no longer see that ground");
+    }
+
+    /// The rumour horizon. A sighting older than `SIGHTING_TTL_S` is dropped
+    /// rather than reported, because a ninety-second-old unit position is not
+    /// a stale fact, it is a wrong one.
+    #[test]
+    fn a_sighting_expires_at_the_staleness_horizon() {
+        let mut app = intel_app();
+        let spot = Vec3::new(6.0, 0.0, 0.0);
+        let scout = spawn_scout(&mut app, Vec3::ZERO);
+        spawn_enemy(&mut app, UnitKind::Footman, spot);
+        tick(&mut app, 0.3);
+        assert_eq!(human_grid(&app).sightings().count(), 1);
+
+        app.world_mut()
+            .entity_mut(scout)
+            .insert(Transform::from_translation(Vec3::new(-90.0, 0.0, -90.0)));
+
+        // Just inside the horizon: still believed.
+        tick(&mut app, SIGHTING_TTL_S - 1.0);
+        assert_eq!(
+            human_grid(&app).sightings().count(),
+            1,
+            "a stale sighting is still a sighting, right up to the horizon"
+        );
+        // Past it: dropped, silently. We did not witness anything; we simply
+        // stopped being entitled to the claim.
+        tick(&mut app, 2.0);
+        assert_eq!(
+            human_grid(&app).sightings().count(),
+            0,
+            "past the horizon it is a rumour, and the ledger does not keep rumours"
+        );
+    }
+
+    /// Watched dying: the record goes immediately, because we saw it happen.
+    #[test]
+    fn a_unit_that_dies_while_watched_is_removed_at_once() {
+        let mut app = intel_app();
+        let spot = Vec3::new(6.0, 0.0, 0.0);
+        spawn_scout(&mut app, Vec3::ZERO);
+        let enemy = spawn_enemy(&mut app, UnitKind::Footman, spot);
+        tick(&mut app, 0.3);
+        assert_eq!(human_grid(&app).sightings().count(), 1);
+
+        // `apply_death` despawns centrally; from fog's point of view the unit
+        // is simply no longer in the world while we are looking at its cell.
+        app.world_mut().entity_mut(enemy).despawn();
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).sightings().count(),
+            0,
+            "we watched it die; there is nothing left to remember"
+        );
+    }
+
+    /// The honesty case that the building rule would have got wrong.
+    ///
+    /// A unit walks out of our vision and dies somewhere we cannot see. The
+    /// ghost rule — "gone, and we can see the spot it was" — would call that
+    /// witnessed, because our scout is still staring at the grass it left.
+    /// It was not witnessed, and the sighting must survive as the stale fact
+    /// it is.
+    #[test]
+    fn a_unit_that_leaves_our_sight_and_dies_elsewhere_is_not_seen_dying() {
+        let mut app = intel_app();
+        let watched = Vec3::new(6.0, 0.0, 0.0);
+        let away = Vec3::new(80.0, 0.0, 80.0);
+        spawn_scout(&mut app, Vec3::ZERO);
+        let enemy = spawn_enemy(&mut app, UnitKind::Hero, watched);
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap().status,
+            HeroStatus::Alive
+        );
+
+        // It walks far away — out of our vision, while we go on watching the
+        // ground it stood on.
+        app.world_mut()
+            .entity_mut(enemy)
+            .insert(Transform::from_translation(away));
+        tick(&mut app, 0.3);
+        tick(&mut app, 0.3);
+        assert!(human_grid(&app).sees(watched), "we ARE still watching that spot");
+
+        // And now it dies, unobserved.
+        app.world_mut().entity_mut(enemy).despawn();
+        tick(&mut app, 0.3);
+        let grid = human_grid(&app);
+        assert_eq!(
+            grid.hero_intel_of(UnitKind::Hero).unwrap().status,
+            HeroStatus::Alive,
+            "a death nobody watched must not be reported as watched"
+        );
+        assert_eq!(
+            grid.sightings().count(),
+            1,
+            "and the last honest observation survives as the stale fact it is"
+        );
+    }
+
+    /// The full hero belief cycle: unknown -> alive -> seen-dying -> alive
+    /// again on a revive. The last leg is what keeps the belief a belief.
+    #[test]
+    fn hero_intel_moves_unknown_to_alive_to_seen_dying_and_back() {
+        let mut app = intel_app();
+        let spot = Vec3::new(6.0, 0.0, 0.0);
+        spawn_scout(&mut app, Vec3::ZERO);
+
+        // Unknown: never met. Note the entry EXISTS and says so, rather than
+        // being absent — "no idea" is a claim.
+        tick(&mut app, 0.3);
+        let intel = *human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap();
+        assert_eq!(intel.status, HeroStatus::Unknown);
+        assert!(intel.pos.is_none() && intel.t_seen.is_none());
+        assert_eq!(
+            human_grid(&app).hero_intel().len(),
+            HERO_CLASSES.len(),
+            "every class is listed, met or not"
+        );
+
+        // Alive.
+        let hero = spawn_enemy(&mut app, UnitKind::Hero, spot);
+        tick(&mut app, 0.3);
+        let intel = *human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap();
+        assert_eq!(intel.status, HeroStatus::Alive);
+        assert_eq!(intel.pos, Some(spot));
+        assert!(intel.hp_frac.is_some(), "a watcher can read the health bar");
+
+        // Seen dying, while we are looking at it.
+        app.world_mut().entity_mut(hero).despawn();
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap().status,
+            HeroStatus::SeenDying
+        );
+        // The OTHER class is untouched — beliefs are per class, not per team.
+        assert_eq!(
+            human_grid(&app)
+                .hero_intel_of(UnitKind::Priestess)
+                .unwrap()
+                .status,
+            HeroStatus::Unknown
+        );
+
+        // Revived and seen again: the belief is revocable by the ordinary act
+        // of looking. Heroes come back through `HeroRecords`, so a latched
+        // "dead forever" would be the interface lying on the enemy's behalf.
+        spawn_enemy(&mut app, UnitKind::Hero, spot);
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap().status,
+            HeroStatus::Alive,
+            "seeing it alive again corrects the belief"
+        );
+    }
+
+    /// A heading is a difference between two observations, so the first glance
+    /// has none and a stationary unit has none.
+    #[test]
+    fn heading_needs_two_observations_and_actual_movement() {
+        let mut app = intel_app();
+        spawn_scout(&mut app, Vec3::ZERO);
+        let enemy = spawn_enemy(&mut app, UnitKind::Raider, Vec3::new(4.0, 0.0, 0.0));
+
+        tick(&mut app, 0.3);
+        assert!(
+            human_grid(&app).sightings().next().unwrap().heading.is_none(),
+            "a single glance carries no heading"
+        );
+
+        // Standing still through a second observation: still none.
+        tick(&mut app, 0.3);
+        assert!(
+            human_grid(&app).sightings().next().unwrap().heading.is_none(),
+            "a unit that has not moved is not going anywhere"
+        );
+
+        // Now it walks north (+Z is north, matching the minimap's up).
+        app.world_mut()
+            .entity_mut(enemy)
+            .insert(Transform::from_translation(Vec3::new(4.0, 0.0, 6.0)));
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).sightings().next().unwrap().heading,
+            Some(Heading8::N)
+        );
+    }
+
+    #[test]
+    fn the_eight_headings_point_where_they_say() {
+        for (delta, want) in [
+            (Vec3::new(0.0, 0.0, 5.0), Heading8::N),
+            (Vec3::new(5.0, 0.0, 5.0), Heading8::NE),
+            (Vec3::new(5.0, 0.0, 0.0), Heading8::E),
+            (Vec3::new(5.0, 0.0, -5.0), Heading8::SE),
+            (Vec3::new(0.0, 0.0, -5.0), Heading8::S),
+            (Vec3::new(-5.0, 0.0, -5.0), Heading8::SW),
+            (Vec3::new(-5.0, 0.0, 0.0), Heading8::W),
+            (Vec3::new(-5.0, 0.0, 5.0), Heading8::NW),
+        ] {
+            assert_eq!(Heading8::of(delta), Some(want), "delta {delta:?}");
+        }
+        // Altitude is not a direction: fog is XZ only, so a flyer climbing
+        // straight up is standing still as far as any observer is concerned.
+        assert_eq!(Heading8::of(Vec3::new(0.0, 99.0, 0.0)), None);
+    }
+
+    /// Clustering needs BOTH tests. Two units close in space but far apart in
+    /// observation time are not one force, and reporting them as one would be
+    /// an aggregate assembled out of two honest facts into a lie.
+    #[test]
+    fn army_groups_cluster_by_distance_and_by_concurrency() {
+        let mut grids = FogGrids::test_dark();
+        let sighting = |id: u64, kind: UnitKind, x: f32, t: f32| Sighting {
+            id,
+            team: Team::Claude,
+            kind,
+            pos: Vec3::new(x, 0.0, 0.0),
+            hp_frac: 1.0,
+            heading: None,
+            t_seen: t,
+        };
+        // Three together at the same instant...
+        grids.test_sight(Team::Human, sighting(1, UnitKind::Footman, 0.0, 100.0));
+        grids.test_sight(Team::Human, sighting(2, UnitKind::Footman, 5.0, 100.0));
+        grids.test_sight(Team::Human, sighting(3, UnitKind::Archer, 9.0, 100.0));
+        // ...one far away at the same instant...
+        grids.test_sight(Team::Human, sighting(4, UnitKind::Footman, 90.0, 100.0));
+        // ...and one standing where the first three are, but seen a minute
+        // earlier. Close in space, not concurrent.
+        grids.test_sight(Team::Human, sighting(5, UnitKind::Knight, 4.0, 40.0));
+
+        let groups = grids.get(Team::Human).army_groups();
+        assert_eq!(groups.len(), 3, "two forces and one straggler in time");
+        let big = groups.iter().find(|g| g.size == 3).expect("the body of three");
+        assert_eq!(big.summary(), "2 Footman, 1 Archer", "most numerous first");
+        assert_eq!(big.t_seen, 100.0);
+        assert!(
+            groups.iter().any(|g| g.size == 1 && g.composition[0].0 == UnitKind::Knight),
+            "the stale knight is its own group, not a fourth member of theirs"
+        );
+    }
+
+    /// Workers are in the ledger and out of the armies. Finding five workers
+    /// on a hillside is how you find an expansion; it is not a force, and a
+    /// rule that fired on one would be an alarm nobody can act on.
+    #[test]
+    fn workers_are_remembered_but_are_not_an_army() {
+        let mut grids = FogGrids::test_dark();
+        for id in 0..5u64 {
+            grids.test_sight(
+                Team::Human,
+                Sighting {
+                    id,
+                    team: Team::Claude,
+                    kind: UnitKind::Worker,
+                    pos: Vec3::new(id as f32, 0.0, 0.0),
+                    hp_frac: 1.0,
+                    heading: None,
+                    t_seen: 10.0,
+                },
+            );
+        }
+        let grid = grids.get(Team::Human);
+        assert_eq!(grid.sightings().count(), 5, "you did see them");
+        assert!(grid.army_groups().is_empty(), "a mining crew is not an army");
+    }
+
+    /// The omniscient baseline keeps its old shape: live sight supersedes
+    /// memory entirely, so the ledger stays empty exactly as `ghosts` does.
+    #[test]
+    fn the_disabled_fog_baseline_keeps_an_empty_ledger() {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        let mut grids = FogGrids::default();
+        grids.enabled = false;
+        grids.human = FogGrid::revealed();
+        grids.claude = FogGrid::revealed();
+        app.insert_resource(grids);
+        app.add_systems(Update, update_fog);
+        spawn_scout(&mut app, Vec3::ZERO);
+        spawn_enemy(&mut app, UnitKind::Footman, Vec3::new(6.0, 0.0, 0.0));
+        tick(&mut app, 0.3);
+
+        let grid = human_grid(&app);
+        assert_eq!(grid.sightings().count(), 0);
+        assert_eq!(grid.ghosts().count(), 0);
+        assert!(grid.sees(Vec3::new(6.0, 0.0, 0.0)), "and everything is visible");
+    }
+
     #[test]
     fn nearest_unexplored_prefers_close_and_skips_blocked() {
         let grid = lit(Vec3::ZERO, 10.0);
@@ -4765,6 +5747,55 @@ pub enum TriggerWhen {
         #[serde(default = "one_u32")]
         count: u32,
     },
+    /// Our intel ledger holds a body of at least `size` enemy units that was
+    /// observed as one concurrent force (`FogGrid::army_groups`).
+    ///
+    /// Unlike `enemy_sighted` this reads MEMORY, and that is the whole point:
+    /// an army does not stop existing because your scout died, and a rule that
+    /// only fires while eyes are on the enemy is a rule that disarms itself at
+    /// exactly the moment the enemy wants it to. Workers do not count toward
+    /// the size — a mining crew is not a force.
+    ///
+    /// `within_s` bounds how stale the observation may be. Absent, any
+    /// surviving sighting counts, which means up to `SIGHTING_TTL_S` old; set
+    /// it when the rule wants a *current* army rather than a known one.
+    ///
+    /// Deliberately carries no region: regions are a sibling's vocabulary, and
+    /// a predicate that grew its own notion of "where" would be the second
+    /// implementation this project keeps refusing to write.
+    EnemyArmySeen {
+        /// Defaults to 1.
+        #[serde(default = "one_u32")]
+        size: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within_s: Option<f32>,
+    },
+    /// An enemy hero class is **currently believed dead** — we watched one die
+    /// and have not seen it alive since (`HeroStatus::SeenDying`). `class`
+    /// names a hero kind (`Hero`, `Priestess`); absent means any of them.
+    ///
+    /// This is a **level** predicate, like every other arm here, and the
+    /// wording above is exact: it is not "a hero died this tick" but "as far
+    /// as we know, their hero is down". That distinction decides how it
+    /// behaves.
+    ///
+    /// * A **once** trigger — the normal case, and the one the recipes use —
+    ///   fires on the first sweep where the belief holds, then disarms. That
+    ///   is the edge behaviour a commander wants from "when their hero falls,
+    ///   strike", and they get it without the engine having to keep an
+    ///   edge-detection latch nobody can inspect.
+    /// * A **repeating** trigger re-fires every cooldown for as long as the
+    ///   belief stands. That is a coherent thing to want — "keep pressing
+    ///   while they have no hero" — and it is why the level form was kept
+    ///   rather than special-cased into an edge.
+    ///
+    /// The belief is revocable: see the hero alive again after a revive and
+    /// the status returns to `Alive`, so a re-armed once-trigger will fire
+    /// again on the next death actually witnessed.
+    EnemyHeroDown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
+    },
     /// At least one neutral bounty cache is on the map AND visible to us. Also
     /// fog-honest — the snapshot's `bounties` array is filtered the same way,
     /// so the trigger sees exactly the caches its owner is shown.
@@ -4827,6 +5858,17 @@ impl TriggerWhen {
                     format!("{count} or more {what} are sighted")
                 }
             }
+            TriggerWhen::EnemyArmySeen { size, within_s } => {
+                let fresh = match within_s {
+                    Some(w) => format!(" seen in the last {w:.0}s"),
+                    None => String::new(),
+                };
+                format!("we know of {size} or more enemy troops together{fresh}")
+            }
+            TriggerWhen::EnemyHeroDown { class } => match class {
+                Some(class) => format!("their {class} is believed dead"),
+                None => "an enemy hero is believed dead".to_string(),
+            },
             TriggerWhen::BountySpawned => "a bounty cache is sighted".to_string(),
             TriggerWhen::MineDry => "a mine at our base runs dry".to_string(),
             TriggerWhen::TierReached { tier } => format!("we reach tier {tier}"),
@@ -7315,6 +8357,23 @@ const HERO_LOW_FRAC: f32 = 0.35;
 pub const BUILDING_HURT_FRAC: f32 = 0.5;
 /// A tick that loses this many units of one kind is reported as one line.
 const LOSS_AGGREGATE: usize = 3;
+/// Smallest body of enemy troops worth an event line. Below this it is a
+/// patrol, and the feed's job is attention rather than transcription.
+const ARMY_EVENT_MIN: usize = 4;
+/// How recently a group must have been observed to be "spotted" rather than
+/// merely remembered. Generous in GAME seconds because the feed's cadence is
+/// REAL seconds: at `WC3_SPEED=16` a whole diff interval is sixteen game
+/// seconds, and a window narrower than that would silently stop announcing
+/// armies at speed — the exact class of bug the two clocks invite.
+const ARMY_EVENT_FRESH_S: f32 = 20.0;
+/// Same ground, same news: an army near a place already reported stays quiet
+/// this long. Rate-limiting re-sightings is not politeness, it is the
+/// difference between a feed and a stream.
+const ARMY_REANNOUNCE_S: f32 = 60.0;
+/// How near counts as the same place for that suppression. Wider than
+/// `GROUP_RADIUS` so an army that shuffles across its own frontage does not
+/// re-announce itself as a second army.
+const ARMY_SAME_PLACE: f32 = GROUP_RADIUS * 1.5;
 /// Sudden growth in the base-threat count that re-raises the event.
 const THREAT_SPIKE: usize = 3;
 /// Slack on a vanished bounty's deadline before we call its disappearance
@@ -7487,6 +8546,19 @@ struct EventMemo {
     /// bounty entity id -> (position, gold, expiry deadline). Bounties are the
     /// one thing in this memo that isn't own-team: treasure is neutral.
     bounties: std::collections::BTreeMap<u64, ([f32; 2], u32, f32)>,
+    /// `(centroid, game time)` of each enemy army already announced.
+    ///
+    /// Keyed by PLACE rather than by group identity, and that is the whole
+    /// trick. A group has no stable id — it is re-clustered from scratch every
+    /// time anyone asks, and one casualty or one straggler renumbers it — so
+    /// suppressing repeats by identity would suppress nothing. What a reader
+    /// actually means by "I already know about that army" is "I already know
+    /// about an army *there*", and ground holds still.
+    ///
+    /// A `Vec` and not a map: it is pruned to the last `ARMY_REANNOUNCE_S` and
+    /// bounded by how many distinct places an army can be at once, and it must
+    /// iterate in insertion order for the event lines to be reproducible.
+    announced_armies: Vec<([f32; 2], f32)>,
 }
 
 /// One decimal place — event text stays terse and diffs cleanly.
@@ -7963,6 +9035,49 @@ fn diff_team(
             // stop believing in it — silently, because we did not witness it.
             cur_bounties.remove(&id);
         }
+    }
+
+    // --- enemy armies spotted --------------------------------------------
+    // The aggregate view, pushed rather than polled. Both renderers get the
+    // same line for the same reason the rest of the feed exists: a commander
+    // that has to notice an army by diffing two intel sections is paying the
+    // polling latency trigger.rs was written to delete, and a human who has to
+    // spot one by watching the minimap is paying it too.
+    //
+    // Fog-honest for free — `army_groups()` clusters THIS team's ledger, which
+    // cannot contain a unit this team never saw.
+    memo.announced_armies
+        .retain(|(_, t)| now - *t <= ARMY_REANNOUNCE_S);
+    for group in fog.army_groups() {
+        if group.size < ARMY_EVENT_MIN {
+            continue;
+        }
+        // Remembered is not spotted. Without this gate a ninety-second-old
+        // rumour would be announced as news the moment the suppression window
+        // on its patch of ground expired, and the feed would report armies
+        // that were reported an hour ago.
+        if now - group.t_seen > ARMY_EVENT_FRESH_S {
+            continue;
+        }
+        let here = [group.centroid.x, group.centroid.z];
+        if memo
+            .announced_armies
+            .iter()
+            .any(|(p, _)| (p[0] - here[0]).hypot(p[1] - here[1]) <= ARMY_SAME_PLACE)
+        {
+            continue;
+        }
+        memo.announced_armies.push((here, now));
+        out.push((
+            format!(
+                "enemy army spotted: ~{} ({}) {}",
+                group.size,
+                group.summary(),
+                place_name(group.centroid, me)
+            ),
+            EventSeverity::Warning,
+            Some(group.centroid),
+        ));
     }
 
     // --- remember --------------------------------------------------------
@@ -9786,6 +10901,96 @@ mod tests {
         // And the id is filed for the diff, so the claimer is not ALSO shown
         // the anonymous `bounty gone` line for its own cache a second later.
         assert_eq!(feed.claims, vec![(7, Team::Claude)]);
+    }
+
+    /// A newly sighted army announces itself, in the aggregate shape a human
+    /// would use out loud — and then stops, because a feed that repeated it
+    /// every second would be a stream.
+    #[test]
+    fn a_newly_sighted_enemy_army_is_announced_once_per_place() {
+        let mut memo = EventMemo::default();
+        // Skip the seeding tick: this test is about the army block, not about
+        // the diff's first-frame behaviour.
+        memo.seeded = true;
+        let mut grids = FogGrids::test_dark();
+        for i in 0..5u64 {
+            grids.test_sight(
+                Team::Human,
+                Sighting {
+                    id: i,
+                    team: Team::Claude,
+                    kind: if i < 3 {
+                        UnitKind::Footman
+                    } else {
+                        UnitKind::Archer
+                    },
+                    pos: Vec3::new(i as f32, 0.0, 0.0),
+                    hp_frac: 1.0,
+                    heading: None,
+                    t_seen: 100.0,
+                },
+            );
+        }
+        let orders = SquadOrders::default();
+        let mut run = |now: f32, memo: &mut EventMemo| {
+            diff_team(
+                Team::Human,
+                now,
+                memo,
+                &[],
+                &[],
+                &[],
+                &orders,
+                grids.get(Team::Human),
+                &[],
+            )
+        };
+
+        let out = run(100.0, &mut memo);
+        assert_eq!(out.len(), 1, "one line for one army");
+        assert!(
+            out[0].0.starts_with("enemy army spotted: ~5 (3 Footman, 2 Archer)"),
+            "unexpected wording: {}",
+            out[0].0
+        );
+        assert_eq!(out[0].1, EventSeverity::Warning);
+        assert!(out[0].2.is_some(), "and somewhere for the camera to look");
+
+        // Same army, same ground, one second later: silence.
+        assert!(
+            run(101.0, &mut memo).is_empty(),
+            "re-sightings are rate-limited — this is news, not telemetry"
+        );
+
+        // Long enough later that the suppression lapses, but the sighting is
+        // now far too stale to be called a spotting. Still silence, and for
+        // the OTHER reason: remembered is not spotted.
+        assert!(
+            run(100.0 + ARMY_REANNOUNCE_S + 1.0, &mut memo).is_empty(),
+            "a ninety-second-old rumour must never be re-announced as news"
+        );
+    }
+
+    /// The feed obeys the same ledger the snapshot does: no sightings, no
+    /// army line, however many enemies are actually standing there.
+    #[test]
+    fn an_unseen_army_raises_no_event() {
+        let mut memo = EventMemo::default();
+        memo.seeded = true;
+        let grids = FogGrids::test_dark();
+        let orders = SquadOrders::default();
+        let out = diff_team(
+            Team::Human,
+            100.0,
+            &mut memo,
+            &[],
+            &[],
+            &[],
+            &orders,
+            grids.get(Team::Human),
+            &[],
+        );
+        assert!(out.is_empty());
     }
 
     /// The Sanctum's whole content wiring, asked of the derived tables rather
