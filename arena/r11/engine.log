@@ -1,0 +1,133 @@
+[2m2026-08-10T18:56:11.374431Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m fog of war: ON (WC3_FOG=0 to disable)
+[2m2026-08-10T18:56:11.374460Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m WC3_SPEED: game speed set to 16x
+[2m2026-08-10T18:56:11.374558Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m WC3_AI_BOTH: AI vs AI — the AI is playing Blue too
+[2m2026-08-10T18:56:11.384251Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": A canyon river runs corner to corner between the bases. It is impassable: every army, worker and expansion must use one of three fords, and the two flank fords are the neutral gold mines. Ground held at a ford is ground the enemy cannot walk around.
+[2m2026-08-10T18:56:11.384272Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": northwest ford at (-60,60), 30 wide
+[2m2026-08-10T18:56:11.384280Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": center ford at (0,0), 16 wide
+[2m2026-08-10T18:56:11.384283Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": southeast ford at (60,-60), 30 wide
+[2m2026-08-10T18:56:11.384313Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": 502 nav cells are impassable terrain
+[2m2026-08-10T18:56:11.480713Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] town halls: 0 -> 1 | gold left in reachable mines: 5000
+[2m2026-08-10T18:56:11.480764Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Claude] town halls: 0 -> 1 | gold left in reachable mines: 5000
+[2m2026-08-10T18:56:12.355545Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  15.2s] Human: gold 210 lumber 80 supply 6/10 | 6 units, 3 buildings | 6 Worker
+[2m2026-08-10T18:56:12.355566Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  15.2s] Claude: gold 220 lumber 80 supply 6/10 | 6 units, 3 buildings | 6 Worker
+[2m2026-08-10T18:56:13.296401Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  30.2s] Human: gold 240 lumber 100 supply 8/16 | 8 units, 3 buildings | 8 Worker
+[2m2026-08-10T18:56:13.296428Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  30.2s] Claude: gold 250 lumber 110 supply 8/16 | 8 units, 3 buildings | 8 Worker
+[2m2026-08-10T18:56:14.247795Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  45.4s] Human: gold 240 lumber 130 supply 9/16 | 10 units, 3 buildings | 10 Worker
+[2m2026-08-10T18:56:14.247823Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  45.4s] Claude: gold 260 lumber 150 supply 9/16 | 10 units, 3 buildings | 10 Worker
+[2m2026-08-10T18:56:15.184266Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  60.4s] Human: gold 325 lumber 70 supply 12/16 | 12 units, 4 buildings | 12 Worker
+[2m2026-08-10T18:56:15.184394Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  60.4s] Claude: gold 325 lumber 110 supply 12/16 | 12 units, 4 buildings | 12 Worker
+[2m2026-08-10T18:56:16.123124Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  75.4s] Human: gold 485 lumber 70 supply 12/16 | 12 units, 5 buildings | 12 Worker
+[2m2026-08-10T18:56:16.123152Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  75.4s] Claude: gold 485 lumber 130 supply 12/16 | 12 units, 5 buildings | 12 Worker
+[2m2026-08-10T18:56:17.072532Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  90.5s] Human: gold 425 lumber 110 supply 14/16 | 13 units, 6 buildings | 12 Worker, 1 Footman
+[2m2026-08-10T18:56:17.072642Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  90.5s] Claude: gold 445 lumber 190 supply 14/16 | 13 units, 6 buildings | 12 Worker, 1 Footman
+[2m2026-08-10T18:56:18.002304Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 105.5s] Human: gold 175 lumber 50 supply 16/22 | 14 units, 7 buildings | 12 Worker, 2 Footman
+[2m2026-08-10T18:56:18.002409Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 105.5s] Claude: gold 205 lumber 120 supply 16/22 | 14 units, 7 buildings | 12 Worker, 2 Footman
+[2m2026-08-10T18:56:18.856145Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Human: ultimate auto-cast doctrine installed — Warcry at 4+ targets
+[2m2026-08-10T18:56:18.892189Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Claude: ultimate auto-cast doctrine installed — Warcry at 4+ targets
+[2m2026-08-10T18:56:18.979748Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 120.9s] Human: gold 175 lumber 70 supply 21/28 | 15 units, 8 buildings | 12 Worker, 2 Footman, 1 Hero
+[2m2026-08-10T18:56:18.979854Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 120.9s] Claude: gold 155 lumber 10 supply 21/28 | 15 units, 8 buildings | 12 Worker, 2 Footman, 1 Hero
+[2m2026-08-10T18:56:19.926307Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 136.3s] Human: gold 160 lumber 110 supply 27/34 | 19 units, 8 buildings | 12 Worker, 3 Footman, 2 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:19.926491Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 136.3s] Claude: gold 95 lumber 10 supply 28/34 | 18 units, 9 buildings | 12 Worker, 2 Footman, 1 Archer, 1 Hero, 1 Catapult, 1 Spearman
+[2m2026-08-10T18:56:21.076313Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 226g at (-23,15)
+[2m2026-08-10T18:56:21.076974Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 152.8s] Human: gold 290 lumber 160 supply 29/34 | 19 units, 8 buildings | 12 Worker, 3 Footman, 2 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:21.077224Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 152.8s] Claude: gold 85 lumber 30 supply 30/40 | 19 units, 9 buildings | 12 Worker, 2 Footman, 2 Archer, 1 Hero, 1 Catapult, 1 Spearman
+[2m2026-08-10T18:56:21.645492Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] teching up: TownHall -> Keep at (-70,-70) for 320g 160l (army 7)
+[2m2026-08-10T18:56:21.653395Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] TownHall -> Keep upgrade started at (-70,-70) — 320g 160l, 40s (training paused)
+[2m2026-08-10T18:56:22.262648Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 170.2s] Human: gold 30 lumber 30 supply 29/34 | 18 units, 8 buildings | 12 Worker, 2 Footman, 2 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:22.266358Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 170.2s] Claude: gold 145 lumber 50 supply 33/40 | 18 units, 9 buildings | 12 Worker, 1 Footman, 2 Archer, 1 Hero, 1 Raider, 1 Spearman
+[2m2026-08-10T18:56:23.462090Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 187.9s] Human: gold 130 lumber 70 supply 23/34 | 16 units, 8 buildings | 12 Worker, 2 Footman, 1 Archer, 1 Hero
+[2m2026-08-10T18:56:23.462200Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 187.9s] Claude: gold 110 lumber 90 supply 22/40 | 15 units, 9 buildings | 12 Worker, 1 Footman, 1 Hero, 1 Raider
+[2m2026-08-10T18:56:23.468719Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] enemy CAVALRY sighted — shifting the mix toward Spearmen
+[2m2026-08-10T18:56:24.020390Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] Keep upgrade complete at (-70,-70) — tier 2, 1700 HP
+[2m2026-08-10T18:56:24.032559Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] hall tier: 1 -> 2
+[2m2026-08-10T18:56:24.406573Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 203.0s] Human: gold 15 lumber 110 supply 21/34 | 15 units, 8 buildings | 12 Worker, 1 Footman, 1 Archer, 1 Hero
+[2m2026-08-10T18:56:24.406911Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 203.0s] Claude: gold 80 lumber 90 supply 18/40 | 15 units, 9 buildings | 12 Worker, 2 Footman, 1 Archer
+[2m2026-08-10T18:56:25.343971Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 218.0s] Human: gold 110 lumber 150 supply 21/34 | 15 units, 8 buildings | 12 Worker, 1 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:25.344411Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 218.0s] Claude: gold 15 lumber 160 supply 18/40 | 15 units, 9 buildings | 12 Worker, 1 Footman, 1 Archer, 1 Spearman
+[2m2026-08-10T18:56:25.859162Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Claude: ultimate auto-cast doctrine installed — Warcry at 4+ targets
+[2m2026-08-10T18:56:26.284530Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 233.1s] Human: gold 35 lumber 110 supply 25/34 | 17 units, 8 buildings | 12 Worker, 1 Footman, 2 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:26.284976Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 233.1s] Claude: gold 345 lumber 220 supply 25/40 | 17 units, 9 buildings | 12 Worker, 2 Footman, 1 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:26.413440Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Claude] expanding: TownHall at (-50,60) for the mine at (-60,60) holding 5000 gold — held mines are down to 1700
+[2m2026-08-10T18:56:26.894374Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 271g at (-29,-1)
+[2m2026-08-10T18:56:27.226006Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 248.1s] Human: gold 115 lumber 150 supply 23/34 | 17 units, 9 buildings | 12 Worker, 2 Footman, 2 Archer, 1 Catapult
+[2m2026-08-10T18:56:27.226448Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 248.1s] Claude: gold 405 lumber 270 supply 21/40 | 15 units, 9 buildings | 12 Worker, 1 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:27.414952Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] enemy CAVALRY contact has lapsed — mix back to standard
+[2m2026-08-10T18:56:28.249924Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 263.7s] Human: gold 35 lumber 230 supply 25/40 | 18 units, 9 buildings | 12 Worker, 2 Footman, 3 Archer, 1 Catapult
+[2m2026-08-10T18:56:28.250014Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 263.7s] Claude: gold 140 lumber 65 supply 25/40 | 17 units, 10 buildings | 12 Worker, 2 Footman, 1 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:28.776890Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Human: ultimate auto-cast doctrine installed — Warcry at 4+ targets
+[2m2026-08-10T18:56:29.248860Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 280.0s] Human: gold 235 lumber 270 supply 26/40 | 17 units, 9 buildings | 12 Worker, 1 Footman, 2 Archer, 1 Hero, 1 Catapult
+[2m2026-08-10T18:56:29.249291Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 280.0s] Claude: gold 130 lumber 95 supply 27/40 | 18 units, 9 buildings | 12 Worker, 3 Footman, 1 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:29.782515Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Claude] town halls: 1 -> 2 | gold left in reachable mines: 5760
+[2m2026-08-10T18:56:30.212153Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 295.4s] Human: gold 210 lumber 210 supply 26/40 | 17 units, 10 buildings | 12 Worker, 1 Footman, 2 Archer, 1 Hero, 1 Catapult
+[2m2026-08-10T18:56:30.212257Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 295.4s] Claude: gold 410 lumber 135 supply 27/50 | 18 units, 9 buildings | 12 Worker, 3 Footman, 1 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:31.120065Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 310.4s] Human: gold 265 lumber 280 supply 19/40 | 15 units, 10 buildings | 12 Worker, 2 Footman, 1 Catapult
+[2m2026-08-10T18:56:31.120472Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 310.4s] Claude: gold 195 lumber 115 supply 23/50 | 16 units, 9 buildings | 12 Worker, 1 Footman, 1 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:32.084389Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 325.8s] Human: gold 205 lumber 330 supply 17/40 | 14 units, 10 buildings | 12 Worker, 1 Footman, 1 Catapult
+[2m2026-08-10T18:56:32.084644Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 325.8s] Claude: gold 275 lumber 125 supply 25/50 | 17 units, 9 buildings | 12 Worker, 2 Footman, 1 Archer, 1 Hero, 1 Spearman
+[2m2026-08-10T18:56:32.114993Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Human: ultimate auto-cast doctrine installed — Warcry at 4+ targets
+[2m2026-08-10T18:56:32.531310Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 316g at (25,-1)
+[2m2026-08-10T18:56:32.845837Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] expanding: TownHall at (-60,50) for the mine at (-60,60) holding 4470 gold — held mines are down to 530
+[2m2026-08-10T18:56:33.036791Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 341.0s] Human: gold 415 lumber 390 supply 22/40 | 15 units, 10 buildings | 12 Worker, 1 Footman, 1 Hero, 1 Catapult
+[2m2026-08-10T18:56:33.037020Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 341.0s] Claude: gold 380 lumber 35 supply 29/50 | 19 units, 10 buildings | 12 Worker, 2 Footman, 2 Archer, 1 Hero, 2 Spearman
+[2m2026-08-10T18:56:33.997234Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 356.4s] Human: gold 100 lumber 200 supply 22/40 | 15 units, 11 buildings | 12 Worker, 1 Footman, 1 Hero, 1 Catapult
+[2m2026-08-10T18:56:34.001318Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 356.4s] Claude: gold 455 lumber 85 supply 35/50 | 22 units, 10 buildings | 12 Worker, 4 Footman, 3 Archer, 1 Hero, 2 Spearman
+[2m2026-08-10T18:56:34.432654Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty claimed: Claude +316g at (25,-1)
+[2m2026-08-10T18:56:34.989668Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 372.0s] Human: gold 65 lumber 205 supply 26/40 | 17 units, 11 buildings | 12 Worker, 2 Footman, 1 Hero, 1 Catapult, 1 Sorcerer
+[2m2026-08-10T18:56:34.990068Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 372.0s] Claude: gold 951 lumber 105 supply 39/50 | 24 units, 11 buildings | 12 Worker, 6 Footman, 3 Archer, 1 Hero, 2 Spearman
+[2m2026-08-10T18:56:35.908161Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 387.1s] Human: gold 125 lumber 255 supply 16/34 | 14 units, 9 buildings | 12 Worker, 1 Spearman, 1 Sorcerer
+[2m2026-08-10T18:56:35.908272Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 387.1s] Claude: gold 1019 lumber 155 supply 41/56 | 25 units, 11 buildings | 12 Worker, 7 Footman, 3 Archer, 1 Hero, 2 Spearman
+[2m2026-08-10T18:56:36.111596Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Claude] teching up: TownHall -> Keep at (70,70) for 320g 160l (army 13)
+[2m2026-08-10T18:56:36.115303Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Claude] TownHall -> Keep upgrade started at (70,70) — 320g 160l, 40s (training paused)
+[2m2026-08-10T18:56:36.352670Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] town halls: 1 -> 2 | gold left in reachable mines: 3110
+[2m2026-08-10T18:56:36.850962Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 402.1s] Human: gold 185 lumber 325 supply 12/38 | 12 units, 8 buildings | 12 Worker
+[2m2026-08-10T18:56:36.851058Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 402.1s] Claude: gold 599 lumber 35 supply 43/56 | 27 units, 11 buildings | 12 Worker, 9 Footman, 3 Archer, 1 Hero, 2 Spearman
+[2m2026-08-10T18:56:37.788042Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 417.1s] Human: gold 145 lumber 310 supply 10/26 | 10 units, 6 buildings | 10 Worker
+[2m2026-08-10T18:56:37.788132Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 417.1s] Claude: gold 501 lumber 55 supply 49/56 | 29 units, 12 buildings | 12 Worker, 10 Footman, 3 Archer, 1 Hero, 3 Spearman
+[2m2026-08-10T18:56:37.915088Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Human: ultimate auto-cast doctrine installed — Warcry at 4+ targets
+[2m2026-08-10T18:56:38.161916Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 361g at (7,-27)
+[2m2026-08-10T18:56:38.583874Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Claude] Keep upgrade complete at (70,70) — tier 2, 1700 HP
+[2m2026-08-10T18:56:38.594104Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Claude] hall tier: 1 -> 2
+[2m2026-08-10T18:56:38.727914Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 432.2s] Human: gold 175 lumber 180 supply 10/26 | 10 units, 4 buildings | 10 Worker
+[2m2026-08-10T18:56:38.728008Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 432.2s] Claude: gold 282 lumber 85 supply 44/62 | 28 units, 12 buildings | 12 Worker, 10 Footman, 3 Archer, 3 Spearman
+[2m2026-08-10T18:56:39.176857Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Claude: ultimate auto-cast doctrine installed — Warcry at 4+ targets
+[2m2026-08-10T18:56:39.665136Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 447.2s] Human: gold 75 lumber 150 supply 11/20 | 11 units, 3 buildings | 11 Worker
+[2m2026-08-10T18:56:39.665243Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 447.2s] Claude: gold 6 lumber 25 supply 54/62 | 31 units, 12 buildings | 12 Worker, 11 Footman, 3 Archer, 1 Hero, 1 Raider, 3 Spearman
+[2m2026-08-10T18:56:40.051473Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] enemy CAVALRY sighted — shifting the mix toward Spearmen
+[2m2026-08-10T18:56:40.180710Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Human: ultimate auto-cast doctrine installed — Warcry at 4+ targets
+[2m2026-08-10T18:56:40.615696Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 462.4s] Human: gold 55 lumber 130 supply 8/20 | 4 units, 4 buildings | 3 Worker, 1 Hero
+[2m2026-08-10T18:56:40.616074Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 462.4s] Claude: gold 15 lumber 55 supply 53/62 | 29 units, 12 buildings | 9 Worker, 12 Footman, 3 Archer, 1 Hero, 1 Raider, 3 Spearman
+[2m2026-08-10T18:56:40.794359Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m Claude: ultimate auto-cast doctrine installed — Sanctuary at 3+ targets
+[2m2026-08-10T18:56:41.553650Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 477.4s] Human: gold 55 lumber 130 supply 5/26 | 1 units, 4 buildings | 1 Hero
+[2m2026-08-10T18:56:41.554031Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 477.4s] Claude: gold 15 lumber 115 supply 52/62 | 28 units, 12 buildings | 10 Worker, 10 Footman, 3 Archer, 1 Hero, 1 Priestess, 3 Spearman
+[2m2026-08-10T18:56:42.499299Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 492.5s] Human: gold 55 lumber 130 supply 5/26 | 1 units, 4 buildings | 1 Hero
+[2m2026-08-10T18:56:42.499521Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 492.5s] Claude: gold 50 lumber 155 supply 48/62 | 26 units, 12 buildings | 10 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:43.443755Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 507.6s] Human: gold 55 lumber 130 supply 0/26 | 0 units, 4 buildings | 
+[2m2026-08-10T18:56:43.443857Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 507.6s] Claude: gold 64 lumber 215 supply 48/62 | 26 units, 12 buildings | 10 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:43.793246Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 406g at (-37,-23)
+[2m2026-08-10T18:56:44.350147Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] enemy CAVALRY contact has lapsed — mix back to standard
+[2m2026-08-10T18:56:44.387713Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 522.6s] Human: gold 55 lumber 130 supply 0/26 | 0 units, 4 buildings | 
+[2m2026-08-10T18:56:44.387805Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 522.6s] Claude: gold 10 lumber 255 supply 48/62 | 26 units, 12 buildings | 10 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:44.523302Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty claimed: Claude +406g at (-37,-23)
+[2m2026-08-10T18:56:45.364781Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 538.3s] Human: gold 55 lumber 130 supply 0/26 | 0 units, 4 buildings | 
+[2m2026-08-10T18:56:45.364871Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 538.3s] Claude: gold 144 lumber 155 supply 50/62 | 28 units, 12 buildings | 12 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:46.324876Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 553.7s] Human: gold 55 lumber 130 supply 0/20 | 0 units, 2 buildings | 
+[2m2026-08-10T18:56:46.324967Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 553.7s] Claude: gold 144 lumber 215 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:46.707330Z[0m [32m INFO[0m [2mwc3clone::ai[0m[2m:[0m [ai Human] town halls: 2 -> 1 | gold left in reachable mines: 0
+[2m2026-08-10T18:56:47.291463Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 569.0s] Human: gold 55 lumber 130 supply 0/10 | 0 units, 1 buildings | 
+[2m2026-08-10T18:56:47.291701Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 569.0s] Claude: gold 186 lumber 265 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:48.230844Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 584.2s] Human: gold 55 lumber 130 supply 0/10 | 0 units, 1 buildings | 
+[2m2026-08-10T18:56:48.231219Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 584.2s] Claude: gold 207 lumber 345 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:49.191940Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 599.6s] Human: gold 55 lumber 130 supply 0/10 | 0 units, 1 buildings | 
+[2m2026-08-10T18:56:49.192184Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 599.6s] Claude: gold 228 lumber 405 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:49.432914Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 451g at (1,-33)
+[2m2026-08-10T18:56:50.131679Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 614.6s] Human: gold 55 lumber 130 supply 0/10 | 0 units, 1 buildings | 
+[2m2026-08-10T18:56:50.131761Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 614.6s] Claude: gold 270 lumber 485 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:51.071733Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 629.7s] Human: gold 55 lumber 130 supply 0/10 | 0 units, 1 buildings | 
+[2m2026-08-10T18:56:51.071813Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 629.7s] Claude: gold 277 lumber 555 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:52.072014Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 644.7s] Human: gold 55 lumber 130 supply 0/10 | 0 units, 1 buildings | 
+[2m2026-08-10T18:56:52.072116Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 644.7s] Claude: gold 312 lumber 615 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:53.951557Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 660.5s] Human: gold 55 lumber 130 supply 0/10 | 0 units, 1 buildings | 
+[2m2026-08-10T18:56:53.951655Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 660.5s] Claude: gold 326 lumber 635 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:55.442561Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 676.9s] Human: gold 55 lumber 130 supply 0/0 | 0 units, 0 buildings | 
+[2m2026-08-10T18:56:55.442809Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 676.9s] Claude: gold 333 lumber 665 supply 51/62 | 29 units, 13 buildings | 13 Worker, 9 Footman, 3 Archer, 1 Hero, 1 Priestess, 2 Spearman
+[2m2026-08-10T18:56:55.488231Z[0m [32m INFO[0m [2mwc3clone[0m[2m:[0m headless: game over — Claude wins (razed) at t=672.9s — exiting

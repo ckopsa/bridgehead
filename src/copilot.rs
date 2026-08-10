@@ -197,6 +197,9 @@ impl Plugin for CopilotPlugin {
         app.insert_resource(Copilot::from_env())
             .add_event::<CopilotWire>()
             .add_event::<ProposalVerdict>()
+            // Declared once, so anything later tagged only `.in_set(CopilotSet)`
+            // inherits the frame order rather than floating outside it.
+            .configure_sets(Update, CopilotSet.in_set(crate::shared::SimSet::CoCommand))
             .add_systems(
                 Update,
                 // `auto_approve` sits between the two for the same reason
@@ -207,7 +210,6 @@ impl Plugin for CopilotPlugin {
                 (ingest_wire, auto_approve, resolve_proposals)
                     .chain()
                     .in_set(CopilotSet)
-                    .in_set(crate::shared::SimSet::CoCommand)
                     .after(crate::bridge::BridgePoll)
                     .before(IntentApply)
                     .run_if(copilot_seated),

@@ -139,16 +139,15 @@ impl Plugin for IntentPlugin {
             .init_resource::<IntentJournal>()
             .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
+            // `IntentApply` lives INSIDE `SimSet::Intent`, declared once here
+            // rather than restated per system: anything later tagged only
+            // `.in_set(IntentApply)` then inherits the frame order instead of
+            // silently floating outside it.
+            .configure_sets(Update, IntentApply.in_set(SimSet::Intent))
             // `.after(FogSet)`: an intent is judged against the visibility its
             // issuer has right now, the same grid the snapshot and the HUD are
             // about to show them.
-            .add_systems(
-                Update,
-                apply_intents
-                    .in_set(IntentApply)
-                    .in_set(SimSet::Intent)
-                    .after(FogSet),
-            );
+            .add_systems(Update, apply_intents.in_set(IntentApply).after(FogSet));
     }
 }
 
@@ -1022,7 +1021,7 @@ fn compile_intent(
                 )),
             }
         }
-        Intent::Cast { hero, ability } => {
+        Intent::Cast { hero, ability, x, z, target } => {
             let Some(entity) = intent_entity(hero) else {
                 errors.push(format!("{tag}: caster {hero} not found/not yours"));
                 return;
@@ -1126,6 +1125,111 @@ fn compile_intent(
                     Some(reference.clone())
                 }
             };
+
+            // --- geometry ------------------------------------------------
+            //
+            // WHICH DEF is being aimed. An explicit selector names it outright;
+            // with no selector, a caster with a single ability still has only
+            // one answer (every shipping targeted caster — the Sorcerer — is
+            // that case, and so is every ability building). A caster with
+            // several abilities and no selector is genuinely ambiguous here,
+            // because "first UNLOCKED" is combat.rs's question and needs a
+            // hero level this query does not carry; those fall through
+            // un-checked and combat.rs fizzles them if the aim is bad.
+            let aimed_def = ability_slot_of(&selector, list)
+                .or(if list.len() == 1 { Some(0) } else { None })
+                .map(|i| list[i]);
+
+            // Where the caster stands. Buildings answer through `targets`,
+            // which carries a `Transform` for anything with a `Team` — a
+            // building caster needed no position before this bead, because a
+            // hall is a command node and its link is provably zero.
+            let origin = caster_pos.or_else(|| targets.get(entity).ok().map(|(_, _, _, tf)| tf.translation));
+
+            let requested = match (x, z, target) {
+                (Some(x), Some(z), None) => Some(CastTarget::Point(Vec3::new(x, 0.0, z))),
+                (None, None, Some(id)) => {
+                    let Some(victim) = intent_entity(id) else {
+                        errors.push(format!("{tag}: cast target {id} not found"));
+                        return;
+                    };
+                    Some(CastTarget::Unit(victim))
+                }
+                (None, None, None) => None,
+                // Half a point, or a point AND a unit: two aims are not an
+                // aim. Said plainly rather than by picking one.
+                _ => {
+                    errors.push(format!(
+                        "{tag}: cast wants either x AND z, or target, or neither — not a mixture"
+                    ));
+                    return;
+                }
+            };
+
+            // A payload is only meaningful if the ability takes one, and only
+            // legal if it is inside the ability's reach. Both are refused
+            // rather than clamped or walked into: see the note on
+            // `AbilityTarget` — a caster that closes the distance by itself is
+            // a caster back in the front line, which is the exact failure
+            // targeted casting exists to end.
+            if let (Some(def), Some(want)) = (aimed_def, requested) {
+                let Some(range) = def.target.range() else {
+                    errors.push(format!(
+                        "{tag}: {} is cast on the caster and takes no target — send just \
+                         the caster and the ability",
+                        def.name
+                    ));
+                    return;
+                };
+                let aim_pos = match want {
+                    CastTarget::Point(p) => Some(p),
+                    CastTarget::Unit(victim) => {
+                        if !def.target.wants_unit() {
+                            errors.push(format!(
+                                "{tag}: {} is cast at a POINT — send x and z, not target",
+                                def.name
+                            ));
+                            return;
+                        }
+                        match targets.get(victim) {
+                            Ok((_, unit, _, tf)) => {
+                                if unit.is_none() {
+                                    // Named by the id the commander sent, not
+                                    // by an `Entity` debug string they have
+                                    // never seen and cannot look up.
+                                    errors.push(format!(
+                                        "{tag}: {} is cast on a unit; {} is a building",
+                                        def.name,
+                                        intent_id(victim)
+                                    ));
+                                    return;
+                                }
+                                Some(tf.translation)
+                            }
+                            Err(_) => {
+                                errors.push(format!("{tag}: cast target not found"));
+                                return;
+                            }
+                        }
+                    }
+                };
+                if let (Some(from), Some(to)) = (origin, aim_pos) {
+                    let reach = Vec2::new(from.x - to.x, from.z - to.z).length();
+                    if reach > range {
+                        // Both numbers, because "out of range" without them
+                        // sends the reader to the catalog to find one of them
+                        // and to the snapshot to compute the other.
+                        errors.push(format!(
+                            "{tag}: {} reaches {range:.0} and that point is {reach:.1} away \
+                             — move the caster closer or aim nearer (the caster is not \
+                             walked into range: casting from behind your line is the point)",
+                            def.name
+                        ));
+                        return;
+                    }
+                }
+            }
+
             // A DIRECT ORDER, and priced like one (docs/TEMPO.md §7). For a
             // hero this computes zero — a hero is a command node, so hero
             // micro is exactly as fast as it always was — and for a Sorcerer
@@ -1133,11 +1237,21 @@ fn compile_intent(
             // far costs. The player who would rather not pay it has the
             // `autocast` verb, which is instant, and that is the whole design.
             match caster_pos {
-                Some(pos) => {
-                    issuer.issue_cast(commands, &mut events.casts, me, pos, entity, selector)
-                }
+                Some(pos) => issuer.issue_cast(
+                    commands,
+                    &mut events.casts,
+                    me,
+                    pos,
+                    entity,
+                    selector,
+                    requested,
+                ),
                 None => {
-                    events.casts.write(CastAbility { caster: entity, ability: selector });
+                    events.casts.write(CastAbility {
+                        caster: entity,
+                        ability: selector,
+                        target: requested,
+                    });
                 }
             }
         }
@@ -1728,6 +1842,11 @@ fn ability_slot(sel: &AbilitySelector, list: &[AbilityDef]) -> Option<usize> {
         AbilitySelector::Index(i) => (*i < list.len()).then_some(*i),
         AbilitySelector::Id(id) => ability_index_by_id(list, id),
     }
+}
+
+/// The slot an OPTIONAL selector names, if it names one at all.
+fn ability_slot_of(sel: &Option<AbilitySelector>, list: &[AbilityDef]) -> Option<usize> {
+    ability_slot(sel.as_ref()?, list)
 }
 
 /// Resolve one id to a living unit of the seat's own team.
@@ -2648,6 +2767,11 @@ mod tests {
             r#"{"type":"cast","caster":1}"#,
             r#"{"type":"cast","hero":1,"ability":2}"#,
             r#"{"type":"cast","hero":1,"ability":"Slam"}"#,
+            // v3 geometry: a ground point, and a named unit. Both OPTIONAL —
+            // the four forms above are still legal and still mean what they
+            // always meant, which is the whole back-compat claim.
+            r#"{"type":"cast","caster":1,"ability":"Slow","x":12.0,"z":-4.0}"#,
+            r#"{"type":"cast","caster":1,"ability":"Slow","target":9}"#,
             r#"{"type":"buy","shop":1,"item":"HealingPotion"}"#,
             r#"{"type":"use_item","slot":0}"#,
             r#"{"type":"autopilot","on":true}"#,
@@ -2713,6 +2837,9 @@ mod tests {
                 source: IntentSource::Bridge,
                 tag: "cmd 0".to_string(),
                 intent: Intent::Cast {
+                    x: None,
+                    z: None,
+                    target: None,
                     hero: caster.to_bits(),
                     ability: Some(AbilitySelector::Id("CallToArms".to_string())),
                 },
@@ -2738,7 +2865,10 @@ mod tests {
                 team: Team::Human,
                 source: IntentSource::Bridge,
                 tag: "cmd 0".to_string(),
-                intent: Intent::Cast { hero: caster, ability: None },
+                intent: Intent::Cast {
+                    x: None,
+                    z: None,
+                    target: None, hero: caster, ability: None },
             });
             app.update();
             app.world()
@@ -2930,6 +3060,197 @@ mod tests {
         // Omitted stays omitted, so a v1 log line is still a v1 log line.
         let v = serde_json::to_value(&bare).unwrap();
         assert!(v.get("ability").is_none());
+        // ...and geometry it never carried is absent too, so an old log line
+        // round-trips byte for byte.
+        assert!(v.get("x").is_none() && v.get("z").is_none() && v.get("target").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // v3: targeted-cast geometry on the wire
+    // -----------------------------------------------------------------------
+
+    /// A Sorcerer of the seat's own team, standing where you put it.
+    fn spawn_sorcerer(app: &mut App, team: Team, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Sorcerer },
+                team,
+                Transform::from_translation(at),
+                Health::new(unit_stats(UnitKind::Sorcerer).hp),
+                Order::Idle,
+            ))
+            .id()
+    }
+
+    /// A command off the wire, tagged the way a bridge batch tags one — so a
+    /// refusal below lands in the same `errors` array a commander reads.
+    fn from_the_wire(team: Team, json: &str) -> SubmitIntent {
+        SubmitIntent {
+            team,
+            source: IntentSource::Bridge,
+            tag: "cmd 1".to_string(),
+            intent: serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}")),
+        }
+    }
+
+    fn casts_of(app: &mut App) -> Vec<CastAbility> {
+        app.world_mut()
+            .resource_mut::<Events<CastAbility>>()
+            .drain()
+            .collect()
+    }
+
+    /// **The wire carries the aim.** A commander's coordinates survive the
+    /// compiler and arrive on the event combat.rs reads — the point of the
+    /// whole verb.
+    #[test]
+    fn a_point_cast_carries_its_coordinates_to_the_executor() {
+        let mut app = compiler_app();
+        let sorcerer = spawn_sorcerer(&mut app, Team::Human, Vec3::ZERO);
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"cast","caster":{},"ability":"Slow","x":6.0,"z":0.0}}"#,
+                sorcerer.to_bits()
+            ),
+        ));
+        app.update();
+
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "{:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+        let fired = casts_of(&mut app);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].caster, sorcerer);
+        match fired[0].target {
+            Some(CastTarget::Point(p)) => {
+                assert_eq!((p.x, p.z), (6.0, 0.0));
+            }
+            other => panic!("expected the commander's point, got {other:?}"),
+        }
+    }
+
+    /// **Out of range is refused, with both numbers.** The decision (see
+    /// `AbilityTarget`) is instant rejection rather than walking the caster
+    /// into range: a Sorcerer that closes the distance by itself is a Sorcerer
+    /// back in the front rank, which is the failure targeted casting exists to
+    /// end. So the compiler has to *teach* instead — and the same string
+    /// reaches the bridge's `errors` array and the human's alert stack,
+    /// because both seats read one channel.
+    #[test]
+    fn a_cast_beyond_its_range_is_refused_with_both_numbers() {
+        let mut app = compiler_app();
+        let sorcerer = spawn_sorcerer(&mut app, Team::Human, Vec3::ZERO);
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"cast","caster":{},"ability":"Slow","x":40.0,"z":0.0}}"#,
+                sorcerer.to_bits()
+            ),
+        ));
+        app.update();
+
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).to_vec();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let msg = &errors[0];
+        assert!(msg.contains("Slow"), "names the ability: {msg}");
+        assert!(msg.contains('9'), "names the ability's reach: {msg}");
+        assert!(msg.contains("40"), "names the distance asked for: {msg}");
+        // And nothing was cast: a refusal is a refusal, not a partial one.
+        assert!(casts_of(&mut app).is_empty());
+        // The caster was not re-tasked towards the point either.
+        assert!(matches!(
+            app.world().entity(sorcerer).get::<Order>(),
+            Some(Order::Idle)
+        ));
+    }
+
+    /// A point handed to an ability that has nowhere to put it is a mistake
+    /// worth naming, not a payload to silently drop.
+    #[test]
+    fn a_caster_centred_ability_refuses_a_target_it_cannot_use() {
+        let mut app = compiler_app();
+        let tf = Transform::from_translation(Vec3::ZERO);
+        let champion = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Hero::from_record(None),
+                Health::new(unit_stats(UnitKind::Hero).hp),
+                Order::Idle,
+                tf,
+            ))
+            .id();
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"cast","caster":{},"ability":"Slam","x":3.0,"z":0.0}}"#,
+                champion.to_bits()
+            ),
+        ));
+        app.update();
+
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).to_vec();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("takes no target"), "{}", errors[0]);
+    }
+
+    /// **Back-compat at the compiler.** The four v2 spellings still compile to
+    /// a cast with no aim, which is exactly what they used to compile to — and
+    /// what the engine now reads as "aim it for me".
+    #[test]
+    fn the_old_cast_forms_still_compile_to_an_unaimed_cast() {
+        for form in [
+            r#"{"type":"cast","hero":ID}"#,
+            r#"{"type":"cast","caster":ID}"#,
+            r#"{"type":"cast","hero":ID,"ability":0}"#,
+            r#"{"type":"cast","hero":ID,"ability":"Slow"}"#,
+        ] {
+            let mut app = compiler_app();
+            let sorcerer = spawn_sorcerer(&mut app, Team::Human, Vec3::ZERO);
+            let json = form.replace("ID", &sorcerer.to_bits().to_string());
+            app.world_mut().send_event(from_the_wire(Team::Human, &json));
+            app.update();
+
+            assert!(
+                app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+                "{json} was refused: {:?}",
+                app.world().resource::<IntentErrors>().get(Team::Human)
+            );
+            let fired = casts_of(&mut app);
+            assert_eq!(fired.len(), 1, "{json} produced no cast");
+            assert!(
+                fired[0].target.is_none(),
+                "{json} must carry no aim — the engine picks"
+            );
+        }
+    }
+
+    /// Half a point is not a point, and a point plus a unit is two aims. Both
+    /// are named rather than half-obeyed.
+    #[test]
+    fn a_malformed_aim_is_refused_rather_than_guessed() {
+        for bad in [
+            r#"{"type":"cast","caster":ID,"ability":"Slow","x":3.0}"#,
+            r#"{"type":"cast","caster":ID,"ability":"Slow","z":3.0}"#,
+            r#"{"type":"cast","caster":ID,"ability":"Slow","x":1.0,"z":2.0,"target":7}"#,
+        ] {
+            let mut app = compiler_app();
+            let sorcerer = spawn_sorcerer(&mut app, Team::Human, Vec3::ZERO);
+            let json = bad.replace("ID", &sorcerer.to_bits().to_string());
+            app.world_mut().send_event(from_the_wire(Team::Human, &json));
+            app.update();
+
+            let errors = app.world().resource::<IntentErrors>().get(Team::Human).to_vec();
+            assert_eq!(errors.len(), 1, "{json} should be refused, got {errors:?}");
+            assert!(casts_of(&mut app).is_empty());
+        }
     }
 
     #[test]
@@ -3185,6 +3506,9 @@ mod tests {
         // hotkey IS a slot; a commander may say the same thing by name. Both
         // spellings are the same verb on the same caster.
         let gesture = Intent::Cast {
+            x: None,
+            z: None,
+            target: None,
             hero: 5,
             ability: Some(AbilitySelector::Index(1)),
         };

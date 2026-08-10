@@ -231,6 +231,9 @@ pub struct BridgePoll;
 impl Plugin for BridgePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Bridge>()
+            // Declared once, so anything later tagged only `.in_set(BridgePoll)`
+            // inherits the frame order rather than floating outside it.
+            .configure_sets(Update, BridgePoll.in_set(SimSet::Input))
             .add_systems(Startup, bridge_startup)
             .add_systems(
                 Update,
@@ -243,10 +246,7 @@ impl Plugin for BridgePlugin {
                 // the previous frame's. (`IntentApply` is itself `.after(FogSet)`,
                 // so the compiler judges visibility against the same grid.)
                 (
-                    poll_commands
-                        .in_set(BridgePoll)
-                        .in_set(SimSet::Input)
-                        .before(IntentApply),
+                    poll_commands.in_set(BridgePoll).before(IntentApply),
                     // `SimSet::Feed`, the frame's reporting phase: the
                     // snapshot describes the finished frame, so it now lands
                     // after movement, combat and the economy rather than

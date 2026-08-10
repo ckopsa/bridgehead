@@ -110,7 +110,7 @@ the schema.
 ### Abilities & items
 | Verb | Shape |
 |---|---|
-| `cast` | `{hero:id, ability?}` (alias `caster`) — any own CASTER: hero, Sorcerer, or ability building |
+| `cast` | `{hero:id, ability?, x?, z?, target?}` (alias `caster`) — any own CASTER: hero, Sorcerer, or ability building |
 | `buy` | `{shop:id, item:"HealingPotion", hero?:id}` — `hero` optional, see below |
 | `use_item` | `{slot:0, hero?:id}` |
 
@@ -142,6 +142,54 @@ slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
 |---|---|
 | `autopilot` | `{on:true}` — hand this faction to the scripted AI |
 | `surrender` | `{}` |
+
+### Where a cast lands (v3)
+
+`catalog.abilities[].target` is the geometry, and it is data like everything
+else:
+
+| `target` | Payload | Meaning |
+|---|---|---|
+| `"caster"` | none | Centred on the caster. Every ability but Slow. |
+| `"point"` | `x`, `z` | A ground point within `target_range` of the caster. |
+| `"unit"` | `target:id` | A unit within `target_range`; the effect follows it. |
+
+`target_range` is caster→centre; the effect's own `radius` blooms from there,
+so a spell's total reach is `target_range + radius`.
+
+**Omitting the payload is legal and meaningful.** For a `"caster"` ability it is
+the only thing to send, which is why every v2 `cast` command still parses and
+still means what it meant. For a targeted one it means *"aim it for me"*, and
+the engine answers with `shared::best_cast_focus`: among the bodies the effect
+would actually affect, the reachable centre that catches the most of them, ties
+to the nearest. A body past `target_range` still proposes a centre — the point
+furthest towards it the caster can reach — so the auto-pick is exactly as
+long-armed as a player's click, and a cast that would catch nobody does not
+happen and spends no cooldown.
+
+That one rule serves three callers deliberately: a commander's bare `cast`, a
+player's hotkey before the click, and **`autocast`** — which names no target,
+so a Sorcerer on standing orders aims itself.
+
+**Out of range is refused, not walked into.** The alternative — an `Order`
+variant that walks the caster forward and then casts, matching `attack`
+semantics — was considered and rejected on the merits rather than on cost:
+targeted casting exists *because* the arena found Sorcerers dying in the front
+rank, and a caster that closes the distance by itself is a caster back in the
+front rank. It would also have had to win a continuous argument with doctrine's
+squad re-tasking, which re-issues orders every second. So the compiler measures
+the same distance the executor will and refuses with both numbers
+(`Slow reaches 9 and that point is 40.0 away — …`). The executor re-checks on
+arrival and *fizzles* silently if the caster has moved since, which is the same
+honest-fizzle rule a link-delayed cast whose mana ran out already obeyed.
+
+**Not yet: the NL compiler.** `tools/intent_compile.py` has no clause for
+aiming — *"slow their cavalry"* does not yet compile to a `cast` with an `x`/`z`.
+The hook is small and deliberate: the geometry is on the wire and in the
+catalog, so a vocabulary bead adds a clause that reads `abilities[].target`,
+resolves a noun phrase to a position from the snapshot, and emits the same
+object this page documents. Until then a commander aims by writing the JSON, or
+omits the aim entirely and lets the engine pick.
 
 ### The ability selector
 

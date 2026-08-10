@@ -160,6 +160,14 @@ impl PendingOrder {
 pub struct PendingCast {
     /// Which ability, in the one selector type the whole game names slots with.
     pub ability: Option<AbilitySelector>,
+    /// WHERE it was aimed when it was spoken, carried unchanged. A targeted
+    /// cast is a decision about a place, and the place is part of the sentence
+    /// — re-aiming it on arrival would be the engine quietly correcting an
+    /// order the player got wrong, which is the opposite of what latency is
+    /// for. A cast aimed at a clump that has since walked away arrives and
+    /// hits the empty ground it was pointed at, and an aim that has drifted
+    /// out of range by then fizzles in combat.rs like any other late cast.
+    pub target: Option<CastTarget>,
     pub ready_at: f32,
     pub issued_at: f32,
 }
@@ -454,6 +462,11 @@ impl OrderIssuer<'_> {
     ///
     /// The event writer is passed in rather than held, so the zero-delay path
     /// is the exact `casts.write(...)` it replaced.
+    // Eight parameters because a cast is now "who, where they stand, which
+    // ability, and where they aimed it". Bundling the last two into a struct
+    // would name the pair something this module has no opinion about — it
+    // forwards them verbatim to `CastAbility`, which already names them.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_cast(
         &mut self,
         commands: &mut Commands,
@@ -462,15 +475,17 @@ impl OrderIssuer<'_> {
         pos: Vec3,
         entity: Entity,
         ability: Option<AbilitySelector>,
+        target: Option<CastTarget>,
     ) {
         let delay = self.delay(team, pos);
         if delay <= 0.0 {
-            casts.write(CastAbility { caster: entity, ability });
+            casts.write(CastAbility { caster: entity, ability, target });
             return;
         }
         self.max_delay = self.max_delay.max(delay);
         let pending = PendingCast {
             ability,
+            target,
             ready_at: self.now + delay,
             issued_at: self.now,
         };
@@ -480,8 +495,13 @@ impl OrderIssuer<'_> {
             };
             // Asking twice for the ability already on its way is one request,
             // for the same reason repeating an order is — see `issue`.
+            //
+            // The AIM is part of "the same request": re-clicking the identical
+            // point is a repeat and must not reset the clock, but pointing the
+            // same spell somewhere else is changing your mind at range, which
+            // is precisely what this module charges for.
             if let Some(existing) = entity.get::<PendingCast>() {
-                if existing.ability == pending.ability {
+                if existing.ability == pending.ability && existing.target == pending.target {
                     return;
                 }
             }
@@ -534,6 +554,13 @@ impl Plugin for CommandPlugin {
         }
         app.insert_resource(latency)
             .init_resource::<CommandNodes>()
+            // Declared once, so anything later tagged only
+            // `.in_set(CommandNodeRefresh)` inherits the frame order rather
+            // than floating outside it.
+            .configure_sets(
+                Update,
+                CommandNodeRefresh.in_set(crate::shared::SimSet::Input),
+            )
             .add_systems(
                 Update,
                 (
@@ -694,6 +721,7 @@ fn dispatch_pending_casts(
         casts.write(CastAbility {
             caster: entity,
             ability: cast.ability.clone(),
+            target: cast.target,
         });
         commands.entity(entity).try_remove::<PendingCast>();
     }
@@ -1328,6 +1356,7 @@ mod tests {
                 max_delay: 0.0,
             };
             let pending = PendingCast {
+                target: None,
                 ability: None,
                 ready_at: issuer.now + issuer.delay(Team::Human, far),
                 issued_at: issuer.now,
@@ -1352,5 +1381,48 @@ mod tests {
             app.world().entity(sorcerer).get::<PendingCast>().is_none(),
             "the cast never arrived"
         );
+    }
+
+    /// **A delayed cast arrives still pointing where it was aimed.** The aim
+    /// is part of the sentence, so the link carries it unchanged rather than
+    /// re-deciding it on arrival — a spell thrown at a clump that has since
+    /// moved hits the ground the player pointed at, which is what makes
+    /// reaching past your chain of command cost something.
+    #[test]
+    fn a_delayed_cast_carries_its_aim() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .insert_resource(tuned())
+            .insert_resource(cache(Vec::new()))
+            .add_event::<CastAbility>()
+            .add_systems(Update, dispatch_pending_casts);
+
+        let far = at(60.0, 60.0);
+        let sorcerer = app
+            .world_mut()
+            .spawn((Team::Human, Transform::from_translation(far)))
+            .id();
+
+        let aim = Vec3::new(66.0, 0.0, 60.0);
+        app.world_mut().entity_mut(sorcerer).insert(PendingCast {
+            ability: Some(AbilitySelector::Id("Slow".into())),
+            target: Some(CastTarget::Point(aim)),
+            ready_at: 0.5,
+            issued_at: 0.0,
+        });
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.0));
+        app.update();
+
+        let fired: Vec<CastAbility> = app
+            .world_mut()
+            .resource_mut::<Events<CastAbility>>()
+            .drain()
+            .collect();
+        assert_eq!(fired.len(), 1, "the delayed cast never dispatched");
+        assert_eq!(fired[0].target, Some(CastTarget::Point(aim)));
+        assert_eq!(fired[0].ability, Some(AbilitySelector::Id("Slow".into())));
     }
 }

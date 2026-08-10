@@ -942,14 +942,132 @@ fn tower_fire(
 // Abilities: one generic executor, driven by the `AbilityDef` tables
 // ---------------------------------------------------------------------------
 
-/// One `CastAbility` resolved down to "who, where, which ability, how strong".
-struct ResolvedCast {
-    def: AbilityDef,
+/// Everything a cast can land on: live units and buildings with a team, a
+/// place, and the two things a cast writes to. Named because the aimer and the
+/// applier are now two functions sharing it.
+type AffectedQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Team,
+        &'static GlobalTransform,
+        &'static mut Health,
+        Option<&'static Unit>,
+        Option<&'static mut StatusEffects>,
+    ),
+    Or<(With<Unit>, With<Building>)>,
+>;
+
+/// **Where this cast lands**, or `None` if it lands nowhere and should not
+/// happen at all.
+///
+/// Three questions in one, in the order they can fail:
+///
+///   1. `AbilityTarget::Caster` — the answer is the caster, and any payload
+///      the event happened to carry is ignored. Every v2 ability takes this
+///      path and cannot fail it, which is what "back-compatible" means here.
+///   2. an EXPLICIT point or unit — honoured if it is within the ability's
+///      range (and, for a unit, if that unit is still alive). Out of range at
+///      this moment is a fizzle rather than an error: the commander was
+///      already told at compile time (intent.rs measures the same distance and
+///      refuses with a number), so reaching here means the caster MOVED while
+///      the order was in transit, and a link-delayed cast that lands late is
+///      supposed to miss.
+///   3. NO payload — the auto-pick. `best_cast_focus` over exactly the bodies
+///      this cast would affect, so the answer is "the biggest clump I can
+///      reach" for a debuff and "the worst-off knot of my own" for a heal.
+///      Nothing in range ⇒ `None` ⇒ no cast, no cooldown.
+fn cast_center(
+    def: &AbilityDef,
+    caster_pos: Vec3,
     team: Team,
-    center: Vec3,
-    /// `def.power` after hero level scaling (Militia and ApplyStatus ignore the
-    /// scaling — theirs is a duration and a magnitude, not a damage number).
-    power: f32,
+    requested: Option<CastTarget>,
+    affected: &AffectedQuery,
+) -> Option<Vec3> {
+    let Some(range) = def.target.range() else {
+        return Some(caster_pos);
+    };
+    match requested {
+        Some(CastTarget::Point(p)) => {
+            (xz_dist(caster_pos, p) <= range).then_some(Vec3::new(p.x, caster_pos.y, p.z))
+        }
+        Some(CastTarget::Unit(entity)) => {
+            let (_, _, gt, health, _, _) = affected.get(entity).ok()?;
+            if health.current <= 0.0 {
+                return None;
+            }
+            let pos = gt.translation();
+            (xz_dist(caster_pos, pos) <= range).then_some(pos)
+        }
+        None => {
+            // Candidates are the bodies the effect would actually touch. A
+            // heal additionally wants someone who is DOWN some health: aiming
+            // is about where the wound is, and a heal centred on the healthiest
+            // half of a healthy army is a heal aimed at nothing. (Whether it is
+            // worth casting at all stays doctrine's `min_targets` question.)
+            let wounded_only = def.effect.heals();
+            let candidates: Vec<Vec3> = affected
+                .iter()
+                .filter(|(_, other_team, gt, health, unit, _)| {
+                    effect_hits(def, team, **other_team, *unit, health)
+                        && (!wounded_only || health.current < health.max)
+                        // A `Unit`-targeted ability must be aimed at a unit,
+                        // never at a building that merely happens to be hit —
+                        // and at one the caster can actually reach, since the
+                        // aim has to BE that unit rather than a point short of
+                        // it (see `best_cast_focus`).
+                        && (!def.target.wants_unit()
+                            || (unit.is_some()
+                                && xz_dist(caster_pos, gt.translation()) <= range))
+                })
+                .map(|(_, _, gt, _, _, _)| gt.translation())
+                .collect();
+            let (_, focus, _) = best_cast_focus(caster_pos, range, def.radius, &candidates)?;
+            Some(focus)
+        }
+    }
+}
+
+/// **Would this cast affect that entity?** — the team/kind half of the filter,
+/// split out of the effect loop so the AUTO-PICK can ask the same question
+/// before choosing where to aim. An aimer that used a different predicate from
+/// the applier would confidently centre a heal on the enemy.
+///
+/// The distance test is deliberately NOT here: the applier measures from the
+/// centre, the aimer measures candidacy from the caster, and folding both into
+/// one function would have needed two distances and a flag.
+fn effect_hits(
+    def: &AbilityDef,
+    team: Team,
+    other_team: Team,
+    unit: Option<&Unit>,
+    health: &Health,
+) -> bool {
+    if health.current <= 0.0 {
+        return false;
+    }
+    // Ground AoE stops at the ground: the Champion's Slam passes harmlessly
+    // under a flyer, while the Priestess's Heal reaches up to one. Both are
+    // `hits_air` in the ability table, not code here.
+    if !def.hits_air && is_air(unit) {
+        return false;
+    }
+    match def.effect {
+        // Damage is the one effect that counts BUILDINGS as victims.
+        AbilityEffect::Damage => other_team != team,
+        AbilityEffect::Heal => other_team == team && unit.is_some(),
+        AbilityEffect::Militia => {
+            other_team == team && unit.map(|u| u.kind) == Some(UnitKind::Worker)
+        }
+        AbilityEffect::ApplyStatus { targets, .. } => match targets {
+            AbilityTargets::Enemies => other_team != team && unit.is_some(),
+            AbilityTargets::Allies => other_team == team && unit.is_some(),
+            AbilityTargets::OwnWorkers => {
+                other_team == team && unit.map(|u| u.kind) == Some(UnitKind::Worker)
+            }
+        },
+    }
 }
 
 /// Execute `CastAbility` for BOTH caster families, v2 style:
@@ -964,6 +1082,14 @@ struct ResolvedCast {
 /// team's tech tier — so a locked ability cannot be cast by the UI, the AI, the
 /// auto-caster or a bridge commander, and none of them need their own copy of
 /// the rule.
+///
+/// **v3 split it into four phases, and the order is the design.** Resolving
+/// the ability is read-only; then [`cast_center`] decides WHERE (which can
+/// fail — out of range, target dead, nothing worth aiming at); only then is
+/// mana spent and the cooldown started; then the effect is applied. Paying
+/// last is what makes a mis-aimed or unaimable cast *free* rather than a
+/// 9-second punishment for a mis-click, and it is only possible because
+/// aiming needs no mutable access to anything.
 ///
 /// The `Option<&mut Hero>` here is the module's only mutable hero access;
 /// `engagement` reads heroes in a different system, so the two can never
@@ -999,95 +1125,92 @@ fn cast_abilities(
         (&Building, &Team, &Transform, Option<&mut AbilityCooldowns>),
         Without<UnderConstruction>,
     >,
-    mut affected: Query<
-        (
-            Entity,
-            &Team,
-            &GlobalTransform,
-            &mut Health,
-            Option<&Unit>,
-            Option<&mut StatusEffects>,
-        ),
-        Or<(With<Unit>, With<Building>)>,
-    >,
+    mut affected: AffectedQuery,
 ) {
     let now = time.elapsed_secs();
 
     for ev in events.read() {
-        // --- resolve the caster, then the ability --------------------------
-        let resolved = if let Ok((unit, mut hero, team, tf, cooldowns)) =
-            unit_casters.get_mut(ev.caster)
-        {
-            // A non-hero caster is level 0 and mana-less; the ability list and
-            // the cooldown store work identically either way.
-            let list = abilities_of_unit(unit.kind);
-            let level = hero.as_ref().map_or(0, |h| h.level);
-            let ctx = UnlockCtx::new(level, tiers.get(*team));
-            let Some(index) = resolve_ability(list, ev.ability.as_ref(), ctx) else {
+        // --- 1. WHO and WHICH, without spending anything -------------------
+        //
+        // Read-only on purpose. Aiming (step 2) can fail, and a cast that
+        // never happened must not have cost a cooldown — so nothing is paid
+        // until step 3, once the cast is known to be going somewhere.
+        let (def, index, team, caster_pos, is_unit_caster, level) =
+            if let Ok((unit, hero, team, tf, cooldowns)) = unit_casters.get(ev.caster) {
+                // A non-hero caster is level 0 and mana-less; the ability list
+                // and the cooldown store work identically either way.
+                let list = abilities_of_unit(unit.kind);
+                let level = hero.map_or(0, |h| h.level);
+                let ctx = UnlockCtx::new(level, tiers.get(*team));
+                let Some(index) = resolve_ability(list, ev.ability.as_ref(), ctx) else {
+                    continue;
+                };
+                let def = list[index];
+                if !ability_ready(&def, hero, cooldowns, index) {
+                    continue;
+                }
+                (def, index, *team, tf.translation, true, level)
+            } else if let Ok((building, team, tf, cooldowns)) = building_casters.get(ev.caster) {
+                let list = abilities_of_building(building.kind);
+                let ctx = UnlockCtx::building(tiers.get(*team));
+                let Some(index) = resolve_ability(list, ev.ability.as_ref(), ctx) else {
+                    continue;
+                };
+                let def = list[index];
+                if !ability_ready(&def, None, cooldowns, index) {
+                    continue;
+                }
+                (def, index, *team, tf.translation, false, 0)
+            } else {
                 continue;
             };
-            let def = list[index];
-            if !ability_ready(&def, hero.as_deref(), cooldowns.as_deref(), index) {
+
+        // --- 2. WHERE ------------------------------------------------------
+        //
+        // The one place the new geometry lives. `None` means this cast has
+        // nowhere to go — out of range, target dead, or nothing worth aiming
+        // at — and a cast with nowhere to go simply does not happen. That is
+        // the same honest fizzle a cast whose mana ran out in transit gets,
+        // and it is why step 3 comes after this one rather than before.
+        let Some(center) = cast_center(&def, caster_pos, team, ev.target, &affected) else {
+            continue;
+        };
+
+        // --- 3. PAY --------------------------------------------------------
+        let power = if is_unit_caster {
+            let Ok((_, mut hero, _, _, cooldowns)) = unit_casters.get_mut(ev.caster) else {
                 continue;
-            }
+            };
             if let Some(hero) = hero.as_mut() {
                 hero.mana = (hero.mana - def.mana_cost).max(0.0);
             }
             start_cooldown(&mut commands, ev.caster, cooldowns, index, def.cooldown);
-            ResolvedCast {
-                def,
-                team: *team,
-                center: tf.translation,
-                // Only a hero's power scales with a level it actually has.
-                power: def.power * hero.map_or(1.0, |h| Hero::damage_mult(h.level)),
-            }
-        } else if let Ok((building, team, tf, cooldowns)) = building_casters.get_mut(ev.caster) {
-            let list = abilities_of_building(building.kind);
-            let ctx = UnlockCtx::building(tiers.get(*team));
-            let Some(index) = resolve_ability(list, ev.ability.as_ref(), ctx) else {
+            // Only a hero's power scales with a level it actually has.
+            def.power * if level > 0 { Hero::damage_mult(level) } else { 1.0 }
+        } else {
+            let Ok((_, _, _, cooldowns)) = building_casters.get_mut(ev.caster) else {
                 continue;
             };
-            let def = list[index];
-            if !ability_ready(&def, None, cooldowns.as_deref(), index) {
-                continue;
-            }
             start_cooldown(&mut commands, ev.caster, cooldowns, index, def.cooldown);
-            ResolvedCast { def, team: *team, center: tf.translation, power: def.power }
-        } else {
-            continue;
+            def.power
         };
 
-        let ResolvedCast { def, team, center, power } = resolved;
-
-        // --- apply the effect ----------------------------------------------
+        // --- 4. apply the effect -------------------------------------------
         for (entity, other_team, gt, mut health, unit, mut status) in &mut affected {
-            if health.current <= 0.0 || xz_dist(center, gt.translation()) > def.radius {
-                continue;
-            }
-            // Ground AoE stops at the ground: the Champion's Slam passes
-            // harmlessly under a flyer, while the Priestess's Heal reaches up
-            // to one. Both are `hits_air` in the ability table, not code here.
-            if !def.hits_air && is_air(unit) {
+            if xz_dist(center, gt.translation()) > def.radius
+                || !effect_hits(&def, team, *other_team, unit, &health)
+            {
                 continue;
             }
             match def.effect {
                 AbilityEffect::Damage => {
-                    if other_team == &team {
-                        continue;
-                    }
                     // Health is only ever subtracted in `apply_damage`.
                     damage.write(DamageEvent { victim: entity, attacker: ev.caster, amount: power });
                 }
                 AbilityEffect::Heal => {
-                    if other_team != &team || unit.is_none() {
-                        continue;
-                    }
                     health.current = (health.current + power).min(health.max);
                 }
                 AbilityEffect::Militia => {
-                    if other_team != &team || unit.map(|u| u.kind) != Some(UnitKind::Worker) {
-                        continue;
-                    }
                     // `power` is a duration here, so it is never level-scaled.
                     commands
                         .entity(entity)
@@ -1096,18 +1219,8 @@ fn cast_abilities(
                 // The whole point of (A) meeting (B): a status ability is a
                 // table row. `power` is the magnitude, `duration` the seconds,
                 // `targets` says who — and shared.rs expires it.
-                AbilityEffect::ApplyStatus { status: kind, targets, also } => {
+                AbilityEffect::ApplyStatus { status: kind, also, .. } => {
                     // (`status` is the target's component, rebound mutable.)
-                    let matches = match targets {
-                        AbilityTargets::Enemies => other_team != &team && unit.is_some(),
-                        AbilityTargets::Allies => other_team == &team && unit.is_some(),
-                        AbilityTargets::OwnWorkers => {
-                            other_team == &team && unit.map(|u| u.kind) == Some(UnitKind::Worker)
-                        }
-                    };
-                    if !matches {
-                        continue;
-                    }
                     // One cast, one or two statuses. `also` shares this cast's
                     // duration and targets and brings only its own magnitude —
                     // Sanctuary's heal-over-time and its armour arrive
@@ -2425,5 +2538,221 @@ mod tests {
         let out = engage(UnitKind::Spearman, 3, UnitKind::Raider, 1);
         assert_eq!(out.b_alive(), 0);
         assert_eq!(out.a_alive(), 3, "cavalry should not even take one with it");
+    }
+
+    // -----------------------------------------------------------------------
+    // v3: targeted-cast geometry, through the real executor
+    // -----------------------------------------------------------------------
+
+    /// The executor and nothing else: one `CastAbility` in, one board state
+    /// out. No AI, no doctrine, no latency — so every assertion below is about
+    /// `cast_abilities`' own arithmetic.
+    fn cast_world() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<TechTiers>()
+            .init_resource::<TeamResearch>()
+            .init_resource::<HeroRecords>()
+            .add_event::<CastAbility>()
+            .add_event::<XpDrop>()
+            .add_event::<DamageEvent>()
+            .insert_resource(CombatAssets::test_stub())
+            .add_systems(Update, (cast_abilities, apply_damage).chain());
+        app
+    }
+
+    fn spawn_at(app: &mut App, kind: UnitKind, team: Team, at: Vec3) -> Entity {
+        let tf = Transform::from_translation(at);
+        app.world_mut()
+            .spawn((
+                Unit { kind },
+                team,
+                Health::new(unit_stats(kind).hp),
+                Order::Idle,
+                tf,
+                GlobalTransform::from(tf),
+            ))
+            .id()
+    }
+
+    fn is_slowed(app: &App, entity: Entity) -> bool {
+        app.world()
+            .entity(entity)
+            .get::<StatusEffects>()
+            .is_some_and(|s| s.magnitude(StatusKind::Slow) > 0.0)
+    }
+
+    /// Did this caster spend anything? The cooldown store is the receipt: it
+    /// is inserted on the first successful cast and never on a fizzle.
+    fn spent(app: &App, caster: Entity) -> bool {
+        app.world().entity(caster).get::<AbilityCooldowns>().is_some()
+    }
+
+    /// **The headline.** A point cast lands where it is AIMED, and the bodies
+    /// standing next to the caster are not touched. Under v2 geometry this
+    /// test is impossible to write: every body within 8 of the Sorcerer was
+    /// hit and nothing beyond it ever was.
+    #[test]
+    fn a_point_cast_lands_where_it_is_aimed_not_on_the_caster() {
+        let mut app = cast_world();
+        let sorcerer = spawn_at(&mut app, UnitKind::Sorcerer, Team::Human, Vec3::ZERO);
+        // Right on top of the caster — the v2 bubble's favourite victim.
+        let neighbour = spawn_at(&mut app, UnitKind::Raider, Team::Claude, Vec3::new(1.0, 0.0, 0.0));
+        // Out at the aim point, further away than the old radius-8 bubble
+        // could ever have reached.
+        let aim = Vec3::new(9.0, 0.0, 0.0);
+        let victim = spawn_at(&mut app, UnitKind::Raider, Team::Claude, aim);
+        let bystander = spawn_at(&mut app, UnitKind::Raider, Team::Claude, Vec3::new(11.0, 0.0, 0.0));
+
+        app.world_mut()
+            .send_event(CastAbility::index(sorcerer, 0).at(CastTarget::Point(aim)));
+        app.update();
+
+        assert!(is_slowed(&app, victim), "the body at the aim point is slowed");
+        assert!(
+            is_slowed(&app, bystander),
+            "and so is one 2 away from it — 4.5 of radius still bloomed"
+        );
+        assert!(
+            !is_slowed(&app, neighbour),
+            "the enemy standing ON the Sorcerer is NOT slowed: the spell went \
+             where it was pointed, which is the entire feature"
+        );
+        assert!(spent(&app, sorcerer), "a cast that landed pays its cooldown");
+    }
+
+    /// **Out of range is a fizzle, not a stagger-forward — and it is free.**
+    /// The caster does not walk in (that would put it back in the front line,
+    /// which is what this bead exists to end) and it does not burn the
+    /// cooldown on a spell that never happened.
+    #[test]
+    fn a_cast_beyond_its_range_fizzles_and_costs_nothing() {
+        let mut app = cast_world();
+        let sorcerer = spawn_at(&mut app, UnitKind::Sorcerer, Team::Human, Vec3::ZERO);
+        let far = Vec3::new(20.0, 0.0, 0.0);
+        let victim = spawn_at(&mut app, UnitKind::Raider, Team::Claude, far);
+
+        app.world_mut()
+            .send_event(CastAbility::index(sorcerer, 0).at(CastTarget::Point(far)));
+        app.update();
+
+        assert!(!is_slowed(&app, victim), "20 away is past Slow's 9 of reach");
+        assert!(
+            !spent(&app, sorcerer),
+            "a cast that never happened must not have cost a cooldown — \
+             otherwise a mis-click disarms the Sorcerer for 9s"
+        );
+        // The caster has not been re-ordered anywhere either.
+        assert!(matches!(
+            app.world().entity(sorcerer).get::<Order>(),
+            Some(Order::Idle)
+        ));
+
+        // Exactly at the limit is IN range: the boundary is inclusive, so a
+        // commander who reads `target_range: 9` off the catalog and sends a
+        // point 9 away is obeyed rather than lectured.
+        let edge = Vec3::new(9.0, 0.0, 0.0);
+        let close = spawn_at(&mut app, UnitKind::Raider, Team::Claude, edge);
+        app.world_mut()
+            .send_event(CastAbility::index(sorcerer, 0).at(CastTarget::Point(edge)));
+        app.update();
+        assert!(is_slowed(&app, close), "range is inclusive at exactly 9");
+    }
+
+    /// **The auto-pick, through the executor.** A cast with no aim is not a
+    /// cast at nothing: it is "slow them", and the engine answers with the
+    /// biggest clump the caster can reach. This is the path a bridge
+    /// commander's `{"type":"cast","ability":"Slow"}` takes, and the path
+    /// auto-cast takes, so they cannot disagree.
+    #[test]
+    fn an_unaimed_point_cast_aims_itself_at_the_clump() {
+        let mut app = cast_world();
+        let sorcerer = spawn_at(&mut app, UnitKind::Sorcerer, Team::Human, Vec3::ZERO);
+        // A lone scout close by, and the real problem further out.
+        let scout = spawn_at(&mut app, UnitKind::Raider, Team::Claude, Vec3::new(3.0, 0.0, 0.0));
+        let clump: Vec<Entity> = [
+            Vec3::new(0.0, 0.0, 8.0),
+            Vec3::new(1.5, 0.0, 8.0),
+            Vec3::new(0.0, 0.0, 9.0),
+        ]
+        .into_iter()
+        .map(|p| spawn_at(&mut app, UnitKind::Raider, Team::Claude, p))
+        .collect();
+
+        app.world_mut().send_event(CastAbility::index(sorcerer, 0));
+        app.update();
+
+        for victim in &clump {
+            assert!(is_slowed(&app, *victim), "the clump is what the spell was for");
+        }
+        assert!(
+            !is_slowed(&app, scout),
+            "the near scout is not the biggest clump, so it is not the aim"
+        );
+    }
+
+    /// **Nothing to aim at is not a cast.** No enemies in reach ⇒ no spell, no
+    /// cooldown — so a Sorcerer left on auto-cast in an empty field is ready
+    /// the instant something arrives.
+    #[test]
+    fn a_targeted_cast_with_nothing_in_reach_does_not_happen() {
+        let mut app = cast_world();
+        let sorcerer = spawn_at(&mut app, UnitKind::Sorcerer, Team::Human, Vec3::ZERO);
+        spawn_at(&mut app, UnitKind::Raider, Team::Claude, Vec3::new(40.0, 0.0, 0.0));
+        // An ALLY in reach is not a target for a debuff.
+        spawn_at(&mut app, UnitKind::Footman, Team::Human, Vec3::new(2.0, 0.0, 0.0));
+
+        app.world_mut().send_event(CastAbility::index(sorcerer, 0));
+        app.update();
+
+        assert!(!spent(&app, sorcerer));
+    }
+
+    /// **Back-compat, at the executor.** Every v2 ability is caster-centred,
+    /// and a caster-centred ability is unmoved by geometry it never asked for:
+    /// the bare event still works, and a stray target payload cannot drag a
+    /// Slam off the Champion.
+    #[test]
+    fn a_caster_centred_ability_still_lands_on_its_caster() {
+        let mut app = cast_world();
+        let tf = Transform::from_translation(Vec3::ZERO);
+        let champion = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Hero::from_record(None),
+                Health::new(unit_stats(UnitKind::Hero).hp),
+                Order::Idle,
+                tf,
+                GlobalTransform::from(tf),
+            ))
+            .id();
+        let near = spawn_at(&mut app, UnitKind::Footman, Team::Claude, Vec3::new(3.0, 0.0, 0.0));
+        let away = spawn_at(&mut app, UnitKind::Footman, Team::Claude, Vec3::new(30.0, 0.0, 0.0));
+        let full = unit_stats(UnitKind::Footman).hp;
+
+        // The bare v1/v2 event: no selector, no target.
+        app.world_mut().send_event(CastAbility::new(champion));
+        app.update();
+        let hurt = |app: &App, e: Entity| app.world().entity(e).get::<Health>().unwrap().current < full;
+        assert!(hurt(&app, near), "Slam still damages what stands by the Champion");
+        assert!(!hurt(&app, away));
+
+        // And a target payload handed to a caster-centred ability is ignored
+        // rather than obeyed — the Slam cannot be thrown.
+        let hp_away = app.world().entity(away).get::<Health>().unwrap().current;
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(30.0));
+        app.world_mut().send_event(
+            CastAbility::new(champion).at(CastTarget::Point(Vec3::new(30.0, 0.0, 0.0))),
+        );
+        app.update();
+        assert_eq!(
+            app.world().entity(away).get::<Health>().unwrap().current,
+            hp_away,
+            "Slam is centred on the Champion whatever the event carries"
+        );
     }
 }

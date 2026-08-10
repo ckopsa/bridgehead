@@ -438,12 +438,13 @@ fn auto_cast_abilities(
             if !ability_ready(def, hero, cooldowns, index) {
                 continue;
             }
-            let count = others
+            // Everything this ability could affect, ANYWHERE — the distance
+            // test comes after, because for a targeted ability the distance
+            // that matters is not measured from the caster.
+            let reachable: Vec<Vec3> = others
                 .iter()
-                .filter(|(other_team, other_tf, health, other_unit)| {
-                    if health.current <= 0.0
-                        || xz_dist(tf.translation, other_tf.translation) > def.radius
-                    {
+                .filter(|(other_team, _, health, other_unit)| {
+                    if health.current <= 0.0 {
                         return false;
                     }
                     // Only count what the ability can actually affect. Three
@@ -479,7 +480,34 @@ fn auto_cast_abilities(
                         },
                     }
                 })
-                .count() as u32;
+                .map(|(_, other_tf, _, _)| other_tf.translation)
+                .collect();
+
+            // **How many bodies this cast would actually catch** — and for a
+            // targeted ability that is a question about the best AIM, not
+            // about the caster's surroundings. `best_cast_focus` is the same
+            // function combat.rs uses to aim the resulting `CastAbility`, so
+            // the trigger count and the cast agree by construction: doctrine
+            // cannot promise four victims and then deliver a spell centred
+            // somewhere that catches one.
+            //
+            // This is what lets a Sorcerer on auto-cast stand BEHIND its line.
+            // Under the old caster-centred count it had to be within `radius`
+            // of the enemy for the rule to fire at all, so "auto-cast Slow"
+            // and "walk into the front rank" were the same instruction.
+            let count = match def.target.range() {
+                Some(range) => {
+                    match best_cast_focus(tf.translation, range, def.radius, &reachable) {
+                        Some((_, _, caught)) => caught,
+                        // Nothing reachable: no aim, no cast.
+                        None => continue,
+                    }
+                }
+                None => reachable
+                    .iter()
+                    .filter(|pos| xz_dist(tf.translation, **pos) <= def.radius)
+                    .count() as u32,
+            };
             // A trigger of 0 still needs someone to affect — never cast at air.
             if count < min_targets.max(1) {
                 continue;
@@ -1542,5 +1570,175 @@ mod tests {
             matches!(order_of(&app, member), Order::AttackMove(_)),
             "the engine's standing order did not dispatch in the same frame"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v3: auto-cast under targeted geometry
+    // -----------------------------------------------------------------------
+
+    /// The auto-caster on its own, with no timer gate, so one `update` is one
+    /// decision.
+    fn autocast_world() -> App {
+        let mut app = world();
+        app.init_resource::<TechTiers>()
+            .add_event::<CastAbility>()
+            .add_systems(Update, auto_cast_abilities);
+        app
+    }
+
+    fn spawn_sorcerer(app: &mut App, team: Team, at: Vec3) -> Entity {
+        let mut policy = AutoCastPolicy::default();
+        let (slot, min_targets) = default_autocast(UnitKind::Sorcerer).unwrap();
+        policy.set(slot, min_targets);
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Sorcerer },
+                team,
+                Transform::from_translation(at),
+                Health::new(unit_stats(UnitKind::Sorcerer).hp),
+                Order::Idle,
+                policy,
+            ))
+            .id()
+    }
+
+    /// Every cast the auto-caster asked for this frame.
+    fn casts_fired(app: &mut App) -> Vec<CastAbility> {
+        app.world_mut()
+            .resource_mut::<Events<CastAbility>>()
+            .drain()
+            .collect()
+    }
+
+    /// **The arena finding, answered.** The fog/arena report was that
+    /// Sorcerers die because auto-cast Slow required them to be within the
+    /// spell's radius of the enemy — i.e. in the front rank. This is that
+    /// exact board: the Sorcerer stands BEHIND its own line, the enemy is
+    /// beyond the old bubble entirely, and the auto-caster fires anyway.
+    #[test]
+    fn a_sorcerer_behind_its_own_line_auto_casts_without_walking_in() {
+        let mut app = autocast_world();
+
+        // The Sorcerer at the back; its own footmen screening at z = 6; the
+        // enemy charge arriving at z = 11-13.
+        let sorcerer = spawn_sorcerer(&mut app, Team::Human, Vec3::ZERO);
+        for x in [-2.0, 0.0, 2.0] {
+            spawn_footman(&mut app, Team::Human, Vec3::new(x, 0.0, 6.0));
+        }
+        let enemies: Vec<Vec3> = vec![
+            Vec3::new(-1.0, 0.0, 11.0),
+            Vec3::new(1.0, 0.0, 11.5),
+            Vec3::new(0.0, 0.0, 13.0),
+        ];
+        for at in &enemies {
+            app.world_mut().spawn((
+                Unit { kind: UnitKind::Raider },
+                Team::Claude,
+                Transform::from_translation(*at),
+                Health::new(unit_stats(UnitKind::Raider).hp),
+                Order::Idle,
+            ));
+        }
+
+        // The nearest enemy is further away than the WHOLE of the old
+        // caster-centred bubble, so on master this board produces no cast at
+        // all and the Sorcerer stands there doing nothing until it is charged.
+        const OLD_RADIUS: f32 = 8.0;
+        let nearest = enemies
+            .iter()
+            .map(|e| xz_dist(Vec3::ZERO, *e))
+            .fold(f32::MAX, f32::min);
+        assert!(
+            nearest > OLD_RADIUS,
+            "the scenario must put the enemy out of the old bubble (nearest {nearest:.1})"
+        );
+
+        app.update();
+
+        let fired = casts_fired(&mut app);
+        assert_eq!(fired.len(), 1, "the Sorcerer should have cast exactly once");
+        assert_eq!(fired[0].caster, sorcerer);
+        assert!(
+            fired[0].target.is_none(),
+            "auto-cast names no target: it hands the aim to the engine, which is \
+             what makes the standing policy and a bare bridge `cast` identical"
+        );
+        // ...and it did all of that from behind its own screen: no order, no
+        // step forward, still at the back.
+        assert!(matches!(order_of(&app, sorcerer), Order::Idle));
+    }
+
+    /// The other half of the same rule: reach is not infinite. An enemy past
+    /// `range + radius` produces no cast, so the Sorcerer does not burn its
+    /// cooldown at a rumour on the far side of the map.
+    #[test]
+    fn auto_cast_still_needs_something_within_reach() {
+        let mut app = autocast_world();
+        spawn_sorcerer(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Raider },
+            Team::Claude,
+            Transform::from_translation(Vec3::new(0.0, 0.0, 30.0)),
+            Health::new(unit_stats(UnitKind::Raider).hp),
+            Order::Idle,
+        ));
+
+        app.update();
+        assert!(casts_fired(&mut app).is_empty());
+    }
+
+    /// A caster-centred ability's trigger is unchanged: the Champion still
+    /// counts the bodies around ITSELF, because that is still where its Slam
+    /// goes. Geometry became data without redefining the abilities that never
+    /// used it.
+    #[test]
+    fn a_caster_centred_autocast_still_counts_its_own_bubble() {
+        let mut app = autocast_world();
+        let mut policy = AutoCastPolicy::default();
+        policy.set(0, 2);
+        let champion = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Hero::from_record(None),
+                Transform::from_translation(Vec3::ZERO),
+                Health::new(unit_stats(UnitKind::Hero).hp),
+                Order::Idle,
+                policy,
+            ))
+            .id();
+
+        let slam = abilities_of_unit(UnitKind::Hero)[0];
+        // Two enemies just OUTSIDE the Slam's radius: no cast.
+        for x in [0.0, 1.0] {
+            app.world_mut().spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Claude,
+                Transform::from_translation(Vec3::new(x, 0.0, slam.radius + 2.0)),
+                Health::new(100.0),
+                Order::Idle,
+            ));
+        }
+        app.update();
+        assert!(
+            casts_fired(&mut app).is_empty(),
+            "a caster-centred ability must not have gained reach it never had"
+        );
+
+        // Two inside: cast.
+        for x in [0.0, 1.0] {
+            app.world_mut().spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Claude,
+                Transform::from_translation(Vec3::new(x, 0.0, 2.0)),
+                Health::new(100.0),
+                Order::Idle,
+            ));
+        }
+        app.update();
+        let fired = casts_fired(&mut app);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].caster, champion);
     }
 }

@@ -384,7 +384,7 @@ const RESEARCH_SPARE_GOLD: u32 = 120;
 const RESEARCH_MIN_ARMY: usize = KEEP_MIN_ARMY;
 /// Slam is worth casting once this many enemies stand in (or just outside) it.
 const SLAM_MIN_TARGETS: usize = 3;
-/// Slack added to `HERO_ABILITY_RADIUS` when counting slam targets.
+/// Slack added to `hero_ability_radius()` when counting slam targets.
 const SLAM_RADIUS_SLACK: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
@@ -1987,7 +1987,7 @@ fn think(
     // --- military ------------------------------------------------------------
     // Slam whenever a worthwhile clump is standing on the Champion. Same event
     // the player's R hotkey sends; combat.rs validates mana and cooldown.
-    let slam_radius = HERO_ABILITY_RADIUS + SLAM_RADIUS_SLACK;
+    let slam_radius = hero_ability_radius() + SLAM_RADIUS_SLACK;
     for hero in &own_heroes {
         if !hero.ready {
             continue;
@@ -2006,7 +2006,11 @@ fn think(
             // same frame it always did — but routing it here means the day the
             // script learns to hand-fire a Sorcerer, the third seat pays for
             // that reach automatically instead of quietly not paying.
-            issuer.issue_cast(commands, &mut events.casts, me, hero.pos, hero.entity, None);
+            // `None` aim: the Slam is caster-centred, so there is nothing to
+            // point it at. The day the script hand-fires a targeted ability it
+            // can pass a `CastTarget` here, or pass `None` and let the engine's
+            // auto-pick aim it — the same rule the auto-caster uses.
+            issuer.issue_cast(commands, &mut events.casts, me, hero.pos, hero.entity, None, None);
         }
     }
 

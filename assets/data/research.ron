@@ -1,0 +1,48 @@
+// ---------------------------------------------------------------------------
+// research.ron — the two team-wide ladders and the price list they share.
+//
+//   * `ladders` — one record per `ResearchKind` variant, every variant exactly
+//                 once. `id` is the wire id (the `upgrade` field of a
+//                 `research` intent, and the catalog id); `label` is what a
+//                 HUD button and a log line call it.
+//   * `steps`   — the price list, one record per rung. It must cover exactly
+//                 levels 1..=RESEARCH_MAX_LEVEL (a const in src/shared.rs,
+//                 because `research_bonus` is a formula rather than a table)
+//                 and the loader refuses to start otherwise.
+//
+// Both ladders share ONE price list on purpose: a game where armor is cheaper
+// than attack is a game where everybody buys armor first, and the interesting
+// decision (do I want to kill faster or die slower?) disappears into
+// arithmetic.
+//
+// The escalation is deliberately steeper in lumber than in gold (2x, 2x)
+// because gold is the resource a winning economy floods with; a team that
+// wants all three rungs has to have kept workers on trees, not just on the
+// mine it is out-expanding you at.
+// ---------------------------------------------------------------------------
+(
+    // Which building kind runs research. One field so a second forge (or
+    // moving the ladders to another building) is a data change.
+    building: Blacksmith,
+
+    ladders: [
+        (
+            kind: Attack,
+            id: "attack",
+            label: "Weapon Smithing",
+            description: "+1 damage per level on every attack made by one of your UNITS. Flat and applied last, so it is never multiplied by a Catapult's siege bonus or a hero's level. Does not arm Towers — research equips the army.",
+        ),
+        (
+            kind: Armor,
+            id: "armor",
+            label: "Armor Plating",
+            description: "-1 damage per level from every hit taken by one of your UNITS, floored at 1 damage per hit. Does not protect buildings — a Keep upgrade is what thickens masonry.",
+        ),
+    ],
+
+    steps: [
+        (level: 1, cost_gold: 100, cost_lumber: 50,  research_time: 40.0),
+        (level: 2, cost_gold: 175, cost_lumber: 100, research_time: 55.0),
+        (level: 3, cost_gold: 250, cost_lumber: 150, research_time: 70.0),
+    ],
+)
