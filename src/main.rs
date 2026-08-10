@@ -8,6 +8,7 @@ mod command;
 mod copilot;
 mod doctrine;
 mod economy;
+mod hotkeys;
 mod intent;
 mod shared;
 mod terrain;
