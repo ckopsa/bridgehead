@@ -2124,3 +2124,132 @@ mod tests {
         assert_eq!(fired[0].caster, champion);
     }
 }
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    // The R10 shape, restated so this module needs nothing from `mod tests`.
+    const T_TOWER: Vec3 = Vec3::new(40.0, 0.0, 0.0);
+    const T_COVERED: Vec3 = Vec3::new(70.0, 0.0, 0.0);
+    const T_OPEN: Vec3 = Vec3::new(0.0, 0.0, 70.0);
+
+    /// A measurement first and an assertion second. Run with `--nocapture` to
+    /// read the numbers; it also fails if either headline result drifts back.
+    ///
+    /// R10's death was not six Footmen picking six different destinations — with
+    /// one cache they all picked the same one. It was six Footmen *arriving*
+    /// separately, because a strung-out squad was ordered onto the treasure and
+    /// then trickled into the tower's range in whatever order they got there.
+    /// So the quantity that matters is: **when the squad is not gathered, is it
+    /// ordered under the guns anyway?**
+    #[test]
+    fn probe_r10_forage_entry() {
+        let radius = building_stats(BuildingKind::Tower)
+            .attack
+            .expect("a Tower shoots")
+            .range
+            + DEFENSE_MARGIN;
+        let defenses = vec![(T_TOWER, radius)];
+        // Strictly inside. A point ON the ring is where `clear_of_defenses`
+        // deliberately puts a staging squad, and counting the ring as covered
+        // would score the fix as the bug.
+        let covered = |p: Vec3| xz_dist(p, T_TOWER) < radius - 0.05;
+
+        let mut seed: u64 = 0x5EED_1234;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32) / (0xFF_FFFF as f32)
+        };
+
+        // (a) One cache, behind the guns. Ungathered squads only.
+        let (mut n, mut old_in, mut new_in) = (0usize, 0usize, 0usize);
+        // (b) Two caches, one with a clean approach. All squads.
+        let (mut m, mut old_bad, mut new_bad) = (0usize, 0usize, 0usize);
+
+        // The squad approaches from outside the guns. A formation already
+        // standing inside the covered disc is not a decision anyone gets to
+        // make — it is already being shot at — so it is not sampled.
+        for step in 0..40 {
+            let centre = Vec3::new(step as f32 * 0.45 - 4.0, 0.0, 0.0);
+            for _ in 0..12 {
+                let spread = 2.0 + rnd() * 22.0;
+                let squad: Vec<Vec3> = (0..6)
+                    .map(|_| {
+                        centre
+                            + Vec3::new(
+                                (rnd() - 0.5) * 2.0 * spread,
+                                0.0,
+                                (rnd() - 0.5) * 2.0 * spread,
+                            )
+                    })
+                    .collect();
+                let (real_centroid, real_spread) = formation(&squad, centre);
+                if xz_dist(real_centroid, T_TOWER) <= radius {
+                    continue;
+                }
+
+                // What master did: no opinion about defense whatsoever.
+                let old = |caches: &[Vec3]| -> Vec3 {
+                    let (c, _) = formation(&squad, centre);
+                    let obj = nearest_point(caches, c).unwrap();
+                    cohesion_point(&squad, obj).unwrap_or(obj)
+                };
+                let new = |caches: &[Vec3]| -> Vec3 {
+                    match plan_forage(&squad, caches, &defenses, centre) {
+                        ForagePlan::Together(p) => p,
+                        ForagePlan::Scatter(ts) => nearest_point(&ts, centre).unwrap(),
+                    }
+                };
+
+                // (a) An UNGATHERED squad must not be pointed under the guns.
+                if real_spread > DEFENDED_SPREAD {
+                    n += 1;
+                    if covered(old(&[T_COVERED])) {
+                        old_in += 1;
+                    }
+                    if covered(new(&[T_COVERED])) {
+                        new_in += 1;
+                    }
+                }
+
+                // (b) With a clean cache available, taking the covered one is
+                //     simply the wrong call.
+                m += 1;
+                let pick_bad = |t: Vec3| xz_dist(t, T_OPEN) > xz_dist(t, T_COVERED);
+                if pick_bad(old(&[T_COVERED, T_OPEN])) {
+                    old_bad += 1;
+                }
+                if pick_bad(new(&[T_COVERED, T_OPEN])) {
+                    new_bad += 1;
+                }
+            }
+        }
+
+        let pct = |a: usize, b: usize| 100.0 * a as f32 / b.max(1) as f32;
+        println!("\n=== R10 forage probe — one remembered Tower, covered disc {radius:.0} units ===");
+        println!("(a) UNGATHERED squads ordered onto covered ground  (n = {n})");
+        println!("      master {old_in:4}/{n}  ({:5.1}%)", pct(old_in, n));
+        println!("      now    {new_in:4}/{n}  ({:5.1}%)", pct(new_in, n));
+        println!("(b) squads that chose the covered cache with a clean one available  (n = {m})");
+        println!("      master {old_bad:4}/{m}  ({:5.1}%)", pct(old_bad, m));
+        println!("      now    {new_bad:4}/{m}  ({:5.1}%)", pct(new_bad, m));
+        println!();
+
+        // The measurement is the point, but it is worth nothing if it can
+        // silently drift back, so the two headline numbers are also the bar.
+        assert_eq!(
+            new_in, 0,
+            "a strung-out squad was ordered onto covered ground {new_in} times"
+        );
+        assert!(
+            pct(new_bad, m) < 25.0,
+            "the divert rule only fires {:.1}% of the time",
+            100.0 - pct(new_bad, m)
+        );
+        // …and the bar has to be one master actually fails, or it proves nothing.
+        assert!(old_in > 0 && pct(old_bad, m) > 50.0);
+    }
+}

@@ -3217,6 +3217,14 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
             flex_direction: FlexDirection::Column,
             margin: UiRect::all(Val::Px(PAD)),
             row_gap: Val::Px(4.0),
+            // This panel is the console's only *elastic* zone, so it is the
+            // only one whose contents can be forced past their box: squeeze the
+            // width and the idle hint wraps from two lines to nine, which at
+            // 560px runs out of the bottom of the window. `hud_layout` cannot
+            // help — the overflow is text reflow, not geometry — so the panel
+            // owns its own edge. Nothing is lost that was ever visible: the
+            // clip only bites once the line has already fallen off the screen.
+            overflow: Overflow::clip(),
             ..default()
         })
         .with_children(|c| {
