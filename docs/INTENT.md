@@ -126,28 +126,50 @@ doctrine a player set before handing it over.
 **Cost: none measurable.** A think tick that used to write components now
 writes events for one system to drain a few sets later. Interleaved A/B on the
 release binaries, same map, same seed, 1800 frames, at a population both
-binaries reach identically (13 units / 5 buildings a side): **784ms before,
-780ms after** — the two are the same number. One sim's worth of extra event
-traffic is free, which is what you would hope from a handful of small `Vec`s a
-second going into a system that was already running. (Take the *minimum* of
-several interleaved runs if you repeat this: a contended machine reports
-whatever else it is doing, and early samples here disagreed by 2.5x in both
-directions before the box went quiet.)
+binaries reach identically (13 units / 5 buildings a side): **1712ms before,
+1667ms after** — the same number, and the same verdict the pre-merge pair gave
+(784ms / 780ms). One sim's worth of extra event traffic is free, which is what
+you would hope from a handful of small `Vec`s a second going into a system that
+was already running.
 
-**What the sims say.** Eleven headless AI-vs-AI matches across both maps, with
-`WC3_COMMAND_LATENCY` on and off, all decisive; `WC3_SEED` determinism verified
-on both maps (65 and 45 identical fingerprints across paired runs), which is
-the check that the script submits in a deterministic order. Nine of eleven land
-in the documented 5–12min band, and `open`/42 lands at 628.7s against master's
-625.0s — the geometry really is preserved.
+Two measurement notes, because both cost an hour here. Take the **minimum of
+several interleaved runs**: a contended machine reports whatever else it is
+doing, and samples on a box at load 18 disagreed by 2.5x in both directions.
+And measure **wall time, not CPU time** — user+sys says this branch costs 8–16%
+more, which is real and is not a slowdown: making `ai_think`'s building query
+read-only (it no longer pushes training queues) lets Bevy run more systems
+concurrently, and more parallelism buys lower wall time with *higher*
+CPU-seconds. The metric that answers "is the sim slower" is the clock.
 
-The two that do not are `crossings` with latency **on**, which settles at
-280.5s (4.7min) regardless of seed. Master on that same configuration is
-*worse*: two of three seeds ran to the 900s cap without a verdict. The cause is
-the only geometry change the compiler forces — build sites snap to the nav
-lattice, so bases are laid out a cell differently, and an RTS amplifies that.
-It is a shift worth knowing about before the next balance pass, not a
-privilege: the script fights exactly the way it did.
+**What the sims say.** Headless AI-vs-AI matches across both maps, with
+`WC3_COMMAND_LATENCY` on and off, **all decisive**; `WC3_SEED` determinism
+verified on both maps (50 and 55 identical fingerprints across paired runs),
+which is the check that the script submits in a deterministic order. Five of
+six land in the documented 5–12min band, and on `open` the branch tracks the
+baseline closely — 478.0s against 461.1s, 475.0s against 449.1s.
+
+`crossings` is where it diverges, and `crossings` with latency **on** settles
+at 280.5s: under the band, and seed-insensitive.
+
+**The cause is worth being precise about, because it is the one behavioural
+consequence this refactor could not avoid.** `Intent::Build` snaps a site to
+the nav lattice before it checks the ground; the old direct path did not, so
+the scripted AI used to place buildings on coordinates no player could have
+chosen. It builds where a player builds now. Each footprint moves by at most
+half a cell — but a moved footprint occupies *different nav cells*, so the next
+site query gets a different answer, and by the time the build order reaches the
+ford emplacements the divergence is not small any more: on `crossings`/5 the
+defending Tower goes up at (-48,68) here against (-53,54) on master, both of
+them "8 back from the crossing" and 14 units apart. On a map whose whole
+strategy is who holds the fords, that is a different match.
+
+So it is a *placement* change cascading into a balance change, not a change in
+how the script fights — its orders are the ones it always gave. And it is
+forced: exempting the script from the snap would hand it back the privilege of
+building where nobody else can, which is the exact thing this bead removes.
+Flagging it for the next balance pass is the right disposal, and the specific
+thing to look at is the emplacement ring in `ai.rs::pick_spot`, which was tuned
+against unsnapped candidates.
 
 **Rejection.** The compiler can now say no to the script, which the old direct
 path could not. Nothing latches: a think tick states what it wants against the
@@ -598,16 +620,16 @@ leaves no file behind.
 Until **wc3clone-jem** an AI-vs-AI headless sim wrote nothing at all, because
 `ai.rs` was not a player. It is one now, so a scripted sim produces a full
 transcript. Measured across six AI-vs-AI matches on both maps, latency on and
-off: **4.7 to 10.6 intents per second across both factions**, i.e. 2.3–5.3 per
+off: **3.7 to 10.4 intents per second across both factions**, i.e. 1.9–5.2 per
 team per second against a think tick that runs at 1Hz. A ten-minute match
-leaves a 3,000–5,000 line replay. Verb mix of one of them (`open`, seed 42,
-628.7s, 3,678 intents):
+leaves a 2,000–5,000 line replay. Verb mix of one of them (`open`, seed 42,
+478.0s, 1,862 intents):
 
 ```
-attackmove 3254   train 127   harvest 123   move 73   build 52   cast 20
+attackmove 1549   harvest 101   train 89   move 65   build 38   cast 8   autocast 7
 ```
 
-`attackmove` is ~90% of it, and that is a real property of the script rather
+`attackmove` is ~85% of it, and that is a real property of the script rather
 than an artifact: it states one order per unit for the army's current job
 (see below), and the `defend` branch restates the whole army every tick for as
 long as an enemy is standing in the base. The branches that *could* have been
@@ -622,7 +644,8 @@ Volume is also the *reason* for one design decision worth knowing about.
 `move`/`attackmove` are the only verbs whose result depends on how many units
 one sentence names — `ground_order` spreads a group over `formation_offset`.
 Batching the military branches would have cut the log by ~6.6x (3,678 lines to
-555), and it also made the scripted baseline about **40% more lethal**: a
+555, measured on the pre-merge pair — the ratio is the point, not the
+absolutes), and it also made the scripted baseline about **40% more lethal**: a
 spread line engages with more of itself at once, and `crossings` fell from
 ~7.6min to ~4.75min. That is a genuine improvement to how the script fights and
 a genuine change to every balance number keyed to the baseline, so it did not
