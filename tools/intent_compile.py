@@ -97,9 +97,19 @@ KIND_WORDS = {
     "gryphon": ["GryphonRider"],
     "air": ["GryphonRider"],
     "flyers": ["GryphonRider"],
+    # "the hero" means every hero-CLASS unit, which is now more than one:
+    # hero slots climb the hall ladder, so a Keep team fields a Champion AND a
+    # Priestess. Group verbs want both; the verbs that need exactly one refuse
+    # rather than pick (see `resolve_one_unit`).
     "hero": ["Hero", "Priestess"],
+    "heroes": ["Hero", "Priestess"],
     "champion": ["Hero"],
     "priestess": ["Priestess"],
+    # The Sorcerer is a CASTER but not a hero: no hero slot, no revival, no
+    # levels. Keeping it out of "the hero" is the whole reason the word matters.
+    "sorcerer": ["Sorcerer"],
+    "sorcerers": ["Sorcerer"],
+    "casters": ["Hero", "Priestess", "Sorcerer"],
     "workers": ["Worker"],
     "worker": ["Worker"],
     "peons": ["Worker"],
@@ -129,14 +139,18 @@ CLASS_WORDS = {
 }
 
 # --- production ------------------------------------------------------------
-# Which building trains what. The catalog is authoritative (`catalog.json`);
-# this is the shortcut that lets "train 3 footmen" pick a building by itself.
-TRAINS = {
+# Which building trains what. `catalog.json` is authoritative and the tool
+# reads it whenever the seat has one (see `Snapshot.trains`); this table is the
+# offline fallback, and it is a fallback precisely because it goes stale — it
+# claimed the Raider trained at the Workshop for exactly as long as that was
+# true, and nothing here noticed when it moved to the Barracks.
+FALLBACK_TRAINS = {
     "TownHall": ["Worker", "Hero", "Priestess"],
     "Keep": ["Worker", "Hero", "Priestess"],
     "Castle": ["Worker", "Hero", "Priestess"],
-    "Barracks": ["Footman", "Archer", "Spearman", "Knight"],
-    "Workshop": ["Catapult", "Raider", "GryphonRider"],
+    "Barracks": ["Footman", "Archer", "Raider", "Spearman", "Knight"],
+    "Workshop": ["Catapult", "GryphonRider"],
+    "Sanctum": ["Sorcerer"],
 }
 UNIT_WORDS = {
     "worker": "Worker", "workers": "Worker", "peon": "Worker", "peons": "Worker",
@@ -149,13 +163,21 @@ UNIT_WORDS = {
     "gryphon": "GryphonRider", "gryphons": "GryphonRider",
     "gryphon rider": "GryphonRider", "gryphon riders": "GryphonRider",
     "hero": "Hero", "champion": "Hero", "priestess": "Priestess",
+    "sorcerer": "Sorcerer", "sorcerers": "Sorcerer",
 }
+
+# The kinds that occupy a hero slot (shared.rs::is_hero_kind). The Sorcerer is
+# deliberately absent: it casts, but it is not a hero.
+HERO_KINDS = ("Hero", "Priestess")
+# What a commander calls each hero class when disambiguating "the hero".
+HERO_CLASS_WORD = {"Hero": "the champion", "Priestess": "the priestess"}
 BUILDING_WORDS = {
     "farm": "Farm", "farms": "Farm",
     "barracks": "Barracks",
     "tower": "Tower", "towers": "Tower",
     "wall": "Wall", "walls": "Wall",
     "shop": "Shop",
+    "sanctum": "Sanctum", "arcane sanctum": "Sanctum",
     "blacksmith": "Blacksmith", "forge": "Blacksmith",
     "workshop": "Workshop",
     "town hall": "TownHall", "townhall": "TownHall", "hall": "TownHall",
@@ -182,7 +204,8 @@ class Snapshot:
     fails to resolve, which is the same answer the game would give.
     """
 
-    def __init__(self, data):
+    def __init__(self, data, catalog=None):
+        self.catalog = catalog or {}
         self.data = data or {}
         self.my_team = self.data.get("my_team", "Claude")
         self.units = self.data.get("units", [])
@@ -194,11 +217,59 @@ class Snapshot:
         self.chokes = self.map.get("chokes", []) or []
 
     @classmethod
-    def load(cls, path):
-        if path is None:
-            return cls({})
-        with open(path) as f:
-            return cls(json.load(f))
+    def load(cls, path, catalog=None):
+        """Load a snapshot, and the seat's `catalog.json` beside it if present.
+
+        The catalog is the game's own declaration of what exists — since
+        bead/polish it carries each unit's `trained_at` and `class`
+        transitively, i.e. it IS the tech tree. Reading it means new content is
+        discoverable by this tool the same way it is discoverable by a
+        commander: by reading, not by patching a table in here.
+        """
+        data = {}
+        if path is not None:
+            with open(path) as f:
+                data = json.load(f)
+            if catalog is None:
+                beside = os.path.join(os.path.dirname(path) or ".", "catalog.json")
+                catalog = beside if os.path.exists(beside) else None
+        cat = None
+        if catalog:
+            try:
+                with open(catalog) as f:
+                    cat = json.load(f)
+            except Exception:
+                cat = None
+        return cls(data, cat)
+
+    @property
+    def trains(self):
+        """`{building kind: [unit ids]}` — from the catalog when we have one."""
+        units = self.catalog.get("units") or []
+        if not units:
+            return FALLBACK_TRAINS
+        table = {}
+        for entry in units:
+            trainer = entry.get("trained_at")
+            if trainer:
+                table.setdefault(trainer, []).append(entry["id"])
+        # The hall ladder trains one roster; the catalog names only the lowest
+        # rung, so an upgraded hall would otherwise train nothing.
+        for rung in ("Keep", "Castle"):
+            table.setdefault(rung, list(table.get("TownHall", [])))
+        return table
+
+    @property
+    def target_classes(self):
+        """Valid `priority` classes, from the catalog's `class` field."""
+        found = {e.get("class") for e in (self.catalog.get("units") or [])}
+        found.discard(None)
+        return found or set(CLASS_WORDS.values())
+
+    def heroes(self):
+        """Living hero-CLASS units of ours. More than one, now that hero slots
+        climb the hall ladder."""
+        return [u for u in self.own_units() if u.get("kind") in HERO_KINDS]
 
     @property
     def enemy_team(self):
@@ -447,6 +518,42 @@ def resolve_units(text, snap, default="army"):
     return [u["id"] for u in mine if u.get("kind") in kinds]
 
 
+def resolve_one_unit(text, snap, role, result, clause, default="hero"):
+    """Exactly one unit, or a refusal that says how to say it unambiguously.
+
+    Hero slots climb the hall ladder, so a Keep team fields a Champion AND a
+    Priestess and "the hero" stops naming one thing. The verbs that take a
+    LIST (retreat, focus, leash, autocast, squad) are unaffected — both heroes
+    is a fine answer to "autocast at 3". The verbs that take exactly ONE unit
+    are not, and this is where they land.
+
+    Picking the first, or the nearest, would be this tool guessing at the one
+    place a guess is unrecoverable: an escort posture aimed at the wrong hero
+    sends the army to the wrong side of the map, and it does it silently. So
+    it refuses, and names the two words that resolve it. Refusing here is the
+    same rule as an unresolvable place — say what you meant.
+    """
+    ids = resolve_units(text, snap, default=default)
+    if ids is None:
+        result.fail(clause, f"cannot resolve units {text!r}")
+        return None
+    if not ids:
+        result.fail(clause, f"no unit matches {text or default!r}")
+        return None
+    if len(ids) == 1:
+        return ids[0]
+    named = {u["id"]: u for u in snap.own_units()}
+    classes = [named[i]["kind"] for i in ids if i in named]
+    if all(c in HERO_KINDS for c in classes) and len(set(classes)) == len(classes):
+        options = " or ".join(sorted(HERO_CLASS_WORD[c] for c in classes))
+        result.fail(clause, f"{text or default!r} is ambiguous — you have "
+                            f"{len(ids)} heroes; say {options}")
+    else:
+        result.fail(clause, f"{text or default!r} names {len(ids)} units and "
+                            f"{role} takes exactly one")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Compilation context
 # ---------------------------------------------------------------------------
@@ -623,11 +730,10 @@ def _forage(m, ctx, clause):
 @rule("escort", r"^(?:escort|bodyguard|protect|babysit)\s+(?P<who_target>.+?)" + WITH + r"$")
 def _escort(m, ctx, clause):
     snap = ctx.snap
-    target_ids = resolve_units(m.group("who_target"), snap, default="hero")
-    if not target_ids:
-        ctx.result.fail(clause, f"no unit matches {m.group('who_target')!r}")
+    target = resolve_one_unit(m.group("who_target"), snap, "escort",
+                              ctx.result, clause)
+    if target is None:
         return []
-    target = target_ids[0]
     escorts = resolve_units(m.group("who"), snap)
     if escorts is None:
         ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
@@ -708,11 +814,15 @@ def _retreat(m, ctx, clause):
 def _focus(m, ctx, clause):
     snap = ctx.snap
     parts = re.split(r"\s*(?:>|then|before)\s*", m.group("classes").strip(), flags=re.I)
+    known = snap.target_classes
     classes = []
     for part in parts:
         for token in _words(part):
-            if token in CLASS_WORDS and CLASS_WORDS[token] not in classes:
-                classes.append(CLASS_WORDS[token])
+            name = CLASS_WORDS.get(token)
+            # The catalog names every class that exists; a word this tool knows
+            # but the loaded build does not is not a class here.
+            if name and name in known and name not in classes:
+                classes.append(name)
     if not classes:
         ctx.result.fail(clause, f"no valid target class in {m.group('classes')!r}")
         return []
@@ -758,7 +868,8 @@ def _autocast(m, ctx, clause):
     return [{"type": "autocast", "units": ids, "min_enemies": n}]
 
 
-@rule("buy", r"^(?:buy|purchase)\s+(?:a\s+|an\s+|the\s+)?(?P<item>.+?)$")
+@rule("buy", r"^(?:buy|purchase)\s+(?:a\s+|an\s+|the\s+)?(?P<item>.+?)"
+             r"(?:\s+for\s+(?P<who>.+?))?$")
 def _buy(m, ctx, clause):
     snap = ctx.snap
     shops = [b for b in snap.finished("Shop") if b.get("sells")]
@@ -779,8 +890,38 @@ def _buy(m, ctx, clause):
     if match.get("locked"):
         ctx.result.fail(clause, f"{match['id']} is locked (needs tier {match.get('tier')})")
         return []
-    ctx.result.ok(clause, f"buy {match['id']} at shop {shop['id']}")
-    return [{"type": "buy", "shop": shop["id"], "item": match["id"]}]
+    # `buy` gained an optional `hero`, because a team can field two of them and
+    # only one inventory can take the item. With one hero the field stays
+    # absent — the historical shape, and the game infers the only candidate.
+    # With two, "buy a potion" is a question, not an order.
+    buyer = None
+    if m.group("who") or len(snap.heroes()) > 1:
+        buyer = resolve_one_unit(m.group("who"), snap, "buy", ctx.result, clause)
+        if buyer is None:
+            return []
+    intent = {"type": "buy", "shop": shop["id"], "item": match["id"]}
+    if buyer is not None:
+        intent["hero"] = buyer
+    ctx.result.ok(clause, f"buy {match['id']} at shop {shop['id']}"
+                          + (f" for hero {buyer}" if buyer else ""))
+    return [intent]
+
+
+@rule("use-item", r"^use\s+(?:the\s+)?(?:item\s+)?(?:in\s+)?"
+                  r"(?:slot\s+)?(?P<slot>[012])(?:\s+for\s+(?P<who>.+?))?$")
+def _use_item(m, ctx, clause):
+    snap = ctx.snap
+    holder = None
+    if m.group("who") or len(snap.heroes()) > 1:
+        holder = resolve_one_unit(m.group("who"), snap, "use_item", ctx.result, clause)
+        if holder is None:
+            return []
+    intent = {"type": "use_item", "slot": int(m.group("slot"))}
+    if holder is not None:
+        intent["hero"] = holder
+    ctx.result.ok(clause, f"use item in slot {m.group('slot')}"
+                          + (f" (hero {holder})" if holder else ""))
+    return [intent]
 
 
 @rule("tier-up", r"^(?:tier\s*up|upgrade\s+(?:the\s+)?(?:hall|town\s*hall|keep)|"
@@ -857,8 +998,9 @@ def _train(m, ctx, clause):
     kind = UNIT_WORDS.get(name) or UNIT_WORDS.get(name + "s")
     if kind is None:
         return None  # not a unit: let the `build` rule have this clause
+    trains = snap.trains
     producers = [b for b in snap.own_buildings()
-                 if b.get("done") and kind in TRAINS.get(b.get("kind"), [])]
+                 if b.get("done") and kind in trains.get(b.get("kind"), [])]
     if not producers:
         ctx.result.fail(clause, f"no finished building of yours trains {kind}")
         return []
@@ -1108,12 +1250,17 @@ WHAT THE PATTERN LAYER UNDERSTANDS
     train [n] <unit>                           -> train, spread across producers
     tier up                                    -> upgrade your top hall
     research attack|armor                      -> research at a Blacksmith
-    buy <item>                                 -> buy at your Shop
+    buy <item> [for the champion|priestess]    -> buy at your Shop
+    use slot <0|1> [for the champion]          -> consume an inventory item
     scout <place> [with <units>]               -> attack-move your cheapest eyes
     surrender / autopilot [off]
 
   UNITS:  the army (default) | cavalry | siege | footmen | archers | spearmen
-          knights | gryphons | the hero | workers | squad <n> | everything
+          knights | gryphons | sorcerers | workers | squad <n> | everything
+          the hero  -- every hero-CLASS unit. Hero slots climb the hall ladder,
+          so a Keep team has TWO; verbs taking a list get both, and the verbs
+          taking exactly one (escort, buy, use) refuse and ask for
+          "the champion" or "the priestess" rather than guess.
   PLACES: mid | our base | their base | <choke name, e.g. "the west ford">
           the west/east/north/south | the north mine | the contested mine
           the nearest bounty | our expansion | explicit "(-40, 20)"

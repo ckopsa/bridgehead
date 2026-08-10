@@ -963,8 +963,15 @@ struct ResolvedCast {
 /// auto-caster or a bridge commander, and none of them need their own copy of
 /// the rule.
 ///
-/// The `&mut Hero` here is the module's only mutable hero access; `engagement`
-/// reads heroes in a different system, so the two can never alias.
+/// The `Option<&mut Hero>` here is the module's only mutable hero access;
+/// `engagement` reads heroes in a different system, so the two can never
+/// alias. It is OPTIONAL because a caster need not be a hero: the Sorcerer
+/// carries an ability list and an `AbilityCooldowns` slot and no `Hero` at
+/// all, paying a cooldown where a hero pays mana. Everything below that used
+/// to read `hero.` now reads `None` for such a caster — no mana is spent, no
+/// level scaling is applied, and `UnlockCtx` sees level 0 (so an
+/// `AbilityUnlock::HeroLevel` row is unreachable for a non-hero, which is
+/// exactly what that predicate already promised).
 #[allow(clippy::type_complexity)]
 fn cast_abilities(
     mut commands: Commands,
@@ -977,7 +984,13 @@ fn cast_abilities(
     // share the `AbilityCooldowns` component, so the two caster queries need an
     // explicit disjointness proof to both take it mutably (B0001).
     mut unit_casters: Query<
-        (&Unit, &mut Hero, &Team, &Transform, Option<&mut AbilityCooldowns>),
+        (
+            &Unit,
+            Option<&mut Hero>,
+            &Team,
+            &Transform,
+            Option<&mut AbilityCooldowns>,
+        ),
         Without<Building>,
     >,
     mut building_casters: Query<
@@ -1003,22 +1016,28 @@ fn cast_abilities(
         let resolved = if let Ok((unit, mut hero, team, tf, cooldowns)) =
             unit_casters.get_mut(ev.caster)
         {
+            // A non-hero caster is level 0 and mana-less; the ability list and
+            // the cooldown store work identically either way.
             let list = abilities_of_unit(unit.kind);
-            let ctx = UnlockCtx::new(hero.level, tiers.get(*team));
+            let level = hero.as_ref().map_or(0, |h| h.level);
+            let ctx = UnlockCtx::new(level, tiers.get(*team));
             let Some(index) = resolve_ability(list, ev.ability.as_ref(), ctx) else {
                 continue;
             };
             let def = list[index];
-            if !ability_ready(&def, Some(&hero), cooldowns.as_deref(), index) {
+            if !ability_ready(&def, hero.as_deref(), cooldowns.as_deref(), index) {
                 continue;
             }
-            hero.mana = (hero.mana - def.mana_cost).max(0.0);
+            if let Some(hero) = hero.as_mut() {
+                hero.mana = (hero.mana - def.mana_cost).max(0.0);
+            }
             start_cooldown(&mut commands, ev.caster, cooldowns, index, def.cooldown);
             ResolvedCast {
                 def,
                 team: *team,
                 center: tf.translation,
-                power: def.power * Hero::damage_mult(hero.level),
+                // Only a hero's power scales with a level it actually has.
+                power: def.power * hero.map_or(1.0, |h| Hero::damage_mult(h.level)),
             }
         } else if let Ok((building, team, tf, cooldowns)) = building_casters.get_mut(ev.caster) {
             let list = abilities_of_building(building.kind);

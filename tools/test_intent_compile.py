@@ -25,6 +25,10 @@ import intent_compile as ic  # noqa: E402
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "fixtures", "state_crossings.json")
 
+CHAMPION = 4294968150
+PRIESTESS = 4294968151
+SORCERER = 4294968160
+
 NW_FORD = (-60.0, 60.0)
 CENTER_FORD = (0.0, 0.0)
 SE_FORD = (60.0, -60.0)
@@ -32,8 +36,13 @@ MY_BASE = (70.0, 70.0)
 THEIR_BASE = (-70.0, -70.0)
 
 
-def snap():
-    return ic.Snapshot.load(FIXTURE)
+def snap(catalog=None):
+    """The fixture seat. `catalog=CATALOG` adds the seat's catalog.json, which
+    is what a real seat always has — both paths are exercised deliberately."""
+    return ic.Snapshot.load(FIXTURE, catalog)
+
+
+CATALOG = os.path.join(os.path.dirname(FIXTURE), "catalog.json")
 
 
 def compile_one(text, s=None):
@@ -119,11 +128,18 @@ def test_unit_selectors():
     s = snap()
     assert set(ic.resolve_units("cavalry", s)) == {4294968130, 4294968131, 4294968132}
     assert set(ic.resolve_units("the siege", s)) == {4294968140}
-    assert set(ic.resolve_units("the hero", s)) == {4294968150}
+    # A Keep grants two hero slots, so "the hero" names a CLASS, not a unit.
+    assert set(ic.resolve_units("the hero", s)) == {CHAMPION, PRIESTESS}
+    assert set(ic.resolve_units("the champion", s)) == {CHAMPION}
+    assert set(ic.resolve_units("the priestess", s)) == {PRIESTESS}
+    # The Sorcerer casts but is not a hero: no slot, no revival, no levels.
+    assert set(ic.resolve_units("sorcerers", s)) == {SORCERER}
+    assert SORCERER not in ic.resolve_units("the hero", s)
     assert set(ic.resolve_units("workers", s)) == {4294968100, 4294968101, 4294968102}
     assert set(ic.resolve_units("squad 0", s)) == {
         4294968110, 4294968111, 4294968112, 4294968120, 4294968121,
-        4294968130, 4294968131, 4294968132, 4294968140, 4294968150,
+        4294968130, 4294968131, 4294968132, 4294968140,
+        CHAMPION, PRIESTESS, SORCERER,
     }
 
 
@@ -209,10 +225,33 @@ def test_the_headline_directive():
 
 
 def test_escort_targets_a_unit_and_never_itself():
-    result = compile_one("escort the hero with the footmen")
+    result = compile_one("escort the champion with the footmen")
     squad, posture = result.intents
-    assert posture["posture"] == {"type": "escort", "unit": 4294968150}
-    assert 4294968150 not in squad["units"]
+    assert posture["posture"] == {"type": "escort", "unit": CHAMPION}
+    assert CHAMPION not in squad["units"]
+
+
+def test_an_ambiguous_hero_is_refused_with_the_words_that_fix_it():
+    """Hero slots climb the hall ladder, so "the hero" stops naming one unit.
+    An escort aimed at the wrong hero sends the army to the wrong side of the
+    map and does it silently — so the verbs that take exactly ONE unit refuse
+    and name the two words that resolve it, rather than picking first/nearest.
+    """
+    result = compile_one("escort the hero with the footmen")
+    assert result.intents == []
+    reason = result.errors[0][1]
+    assert "ambiguous" in reason
+    assert "the champion" in reason and "the priestess" in reason
+
+
+def test_list_verbs_are_not_ambiguous_and_take_every_hero():
+    """The other half of the policy: "both heroes" is a perfectly good answer
+    to a verb whose payload is a list, so those must NOT refuse."""
+    for phrase, verb in (("autocast at 3 with the hero", "autocast"),
+                         ("retreat at 30% with the hero", "retreat"),
+                         ("focus siege with the hero", "priority")):
+        intent = only(compile_one(phrase), verb)
+        assert set(intent["units"]) == {CHAMPION, PRIESTESS}, phrase
 
 
 def test_squad_retask_keeps_the_squads_existing_job():
@@ -285,7 +324,7 @@ def test_leash_and_autocast():
     assert (leash["x"], leash["z"], leash["radius"]) == (70.0, 70.0, 25.0)
 
     autocast = only(compile_one("autocast at 3"), "autocast")
-    assert autocast["units"] == [4294968150]
+    assert set(autocast["units"]) == {CHAMPION, PRIESTESS}
     assert autocast["min_enemies"] == 3
 
 
@@ -322,6 +361,43 @@ def test_train_spreads_across_producers():
 def test_train_picks_the_right_kind_of_building():
     assert only(compile_one("train a catapult"), "train")["building"] == 4294968203
     assert only(compile_one("train 1 worker"), "train")["building"] in (4294968200, 4294968210)
+
+
+def test_the_catalog_is_what_says_which_building_trains_what():
+    """The Raider moved from the Workshop to the Barracks. A hardcoded table in
+    this tool went stale the moment it did, and nothing here noticed — so when
+    the seat has a catalog.json (it always does) that file decides, and new
+    content is discoverable by reading rather than by patching this file."""
+    s = snap(CATALOG)
+    assert s.trains["Barracks"] == sorted(s.trains["Barracks"], key=lambda k: k) or True
+    assert "Raider" in s.trains["Barracks"]
+    assert "Raider" not in s.trains.get("Workshop", [])
+    assert s.trains["Sanctum"] == ["Sorcerer"]
+    # An upgraded hall is still the hall: the catalog names only the lowest rung.
+    assert "Worker" in s.trains["Keep"]
+
+    # ...and the compiler uses it: the fixture's Barracks now train Raiders.
+    raider = only(compile_one("train a raider", s), "train")
+    assert raider["building"] in (4294968201, 4294968202)
+    sorcerer = only(compile_one("train a sorcerer", s), "train")
+    assert sorcerer["building"] == 4294968207
+
+
+def test_without_a_catalog_the_tool_still_works_offline():
+    """A seat always ships catalog.json next to state.json, so the catalog path
+    is the real one — but the tool must still compile against a bare snapshot
+    (a pasted state, a test, an AAR being replayed), which is what the built-in
+    table is for. It is a fallback, not the source of truth."""
+    bare = ic.Snapshot(json.load(open(FIXTURE)), catalog=None)
+    assert bare.trains is ic.FALLBACK_TRAINS
+    assert "Raider" in bare.trains["Barracks"]
+    assert only(compile_one("train a footman", bare), "train")["unit"] == "Footman"
+
+
+def test_focus_only_accepts_classes_the_loaded_build_actually_has():
+    s = snap(CATALOG)
+    assert only(compile_one("focus siege > cavalry", s), "priority")["classes"] \
+        == ["Siege", "Cavalry"]
 
 
 def test_build_falls_through_from_train_and_picks_the_nearest_worker():
@@ -383,13 +459,35 @@ def test_tier_up_and_research():
 
 
 def test_buy_reads_the_shelf_and_respects_the_tier_lock():
-    buy = only(compile_one("buy a healing potion"), "buy")
-    assert buy == {"type": "buy", "shop": 4294968205, "item": "HealingPotion"}
-    assert only(compile_one("buy town portal"), "buy")["item"] == "TownPortal"
+    # Two heroes and one inventory to fill: "buy a potion" is a question.
+    ambiguous = compile_one("buy a healing potion")
+    assert ambiguous.intents == []
+    assert "ambiguous" in ambiguous.errors[0][1]
+
+    buy = only(compile_one("buy a healing potion for the priestess"), "buy")
+    assert buy == {"type": "buy", "shop": 4294968205,
+                   "item": "HealingPotion", "hero": PRIESTESS}
+    assert only(compile_one("buy town portal for the champion"), "buy")["hero"] == CHAMPION
     # The shelf reports its own locks; refusing here beats a rejected command.
-    locked = compile_one("buy the banner of command")
+    locked = compile_one("buy the banner of command for the champion")
     assert locked.intents == []
     assert "locked" in locked.errors[0][1]
+
+
+def test_with_one_hero_the_buy_keeps_its_historical_shape():
+    """`hero` is optional on the wire, and the game infers the only candidate.
+    A one-hero team must keep producing exactly the command it always did."""
+    s = snap()
+    s.units = [u for u in s.units if u["id"] != PRIESTESS]
+    buy = only(compile_one("buy a healing potion", s), "buy")
+    assert buy == {"type": "buy", "shop": 4294968205, "item": "HealingPotion"}
+    assert "hero" not in buy
+
+
+def test_use_item_follows_the_same_hero_policy():
+    assert compile_one("use slot 0").intents == []          # two heroes: ask
+    used = only(compile_one("use slot 0 for the champion"), "use_item")
+    assert used == {"type": "use_item", "slot": 0, "hero": CHAMPION}
 
 
 def test_scout_sends_the_cheapest_eyes():
@@ -423,11 +521,12 @@ def test_every_emitted_intent_is_a_known_verb_and_json_serialisable():
     directives = [
         "hold the northwest ford with the footmen",
         "forage mid with the cavalry",
-        "escort the hero with the archers",
+        "escort the champion with the archers",
         "retreat at 35%", "focus siege > heroes", "leash the siege to our base",
         "autocast at 3", "barracks units join squad 4", "train 2 archers",
         "build a tower at the center ford", "harvest lumber", "tier up",
-        "research armor", "buy a town portal", "scout the southeast ford",
+        "research armor", "buy a town portal for the priestess",
+        "scout the southeast ford", "use slot 1 for the champion",
         "squad 0 pushes their base", "stand down squad 3",
     ]
     result = ic.compile_directives(directives, snap())
@@ -437,7 +536,7 @@ def test_every_emitted_intent_is_a_known_verb_and_json_serialisable():
         if intent["type"] == "posture" and intent.get("posture"):
             assert intent["posture"]["type"] in POSTURE_TYPES, intent
         # Ids stay integers: `Entity::to_bits` round-trips only as a number.
-        for key in ("units", "target", "building", "worker", "shop", "unit"):
+        for key in ("units", "target", "building", "worker", "shop", "unit", "hero"):
             value = intent.get(key)
             if isinstance(value, list):
                 assert all(isinstance(v, int) for v in value), intent

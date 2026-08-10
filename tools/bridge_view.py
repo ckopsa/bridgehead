@@ -101,22 +101,37 @@ def main():
     else:
         print("ARMY 0")
 
-    hero = next((u for u in mine_units if u["kind"] == "Hero"), None)
-    if hero and hero.get("hero"):
-        h = hero["hero"]
+    # Hero slots scale with the hall tier (1/2/3) and classes must be distinct,
+    # so this is a list now rather than "the" hero.
+    living = [u for u in mine_units if u.get("hero")]
+    for u in living:
+        h = u["hero"]
         print(
-            f"HERO id={hero['id']} Lv{h['level']} hp={hero['hp']:.0f}/{hero['max_hp']:.0f} "
+            f"HERO {u['kind']} id={u['id']} Lv{h['level']} "
+            f"hp={u['hp']:.0f}/{u['max_hp']:.0f} "
             f"mana={h['mana']:.0f}/{h['max_mana']:.0f} cd={h['cd']:.0f} "
-            f"@{tuple(hero['pos'])} order={hero['order']}"
+            f"@{tuple(u['pos'])} order={u['order']}"
         )
-    else:
-        hr = me.get("hero_record")
-        hc = me["hero_cost"]
-        print(
-            "HERO none"
-            + (f" (record Lv{hr['level']})" if hr else "")
-            + f" cost={hc['gold']}g/{hc['lumber']}l {hc['time']:.0f}s"
+    slots = me.get("hero_slots", 1)
+    used = me.get("hero_slots_used", len(living))
+    dead = [r for r in me.get("hero_records", []) if not r["alive"]]
+    costs = {c["kind"]: c for c in me.get("hero_costs", [])}
+    held = {u["kind"] for u in living}
+    buyable = [
+        "{}={}g/{}l{}".format(
+            k, costs[k]["gold"], costs[k]["lumber"], "(revive)" if costs[k]["revive"] else ""
         )
+        for k in costs
+        if k not in held
+    ]
+    line = "HERO SLOTS {}/{}".format(used, slots)
+    if dead:
+        line += " dead=[{}]".format(
+            ",".join("{} Lv{}".format(r["kind"], r["level"]) for r in dead)
+        )
+    if used < slots and buyable:
+        line += " can train: " + " ".join(buyable)
+    print(line)
 
     # --- my buildings ---
     for b in mine_b:

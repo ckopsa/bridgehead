@@ -28,23 +28,36 @@ Unit orders (ids from state):
 - `{"type":"return","units":[worker_ids]}`  `{"type":"stop","units":[ids]}`  `{"type":"follow","units":[ids],"target":own_id}`
 Production:
 - `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free; you pay on placement)
-- `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"}` (queue cap 7)
+- `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"|...}` (queue cap 7;
+  full roster in `catalog.json`). A `train` of a hero is rejected with a reason when your slots
+  are full or you already hold that class.
 - `{"type":"cancel","building":id,"index":n}`  `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}`
 - `{"type":"cast","hero":id}` — cast the caster's first available ability (heroes: their class
   ability; a TownHall id works too: CallToArms turns nearby workers into fighters for 40s,
   90s cooldown). Add `"ability":<index>` or `"ability":"Slam"` to pick a specific one — casters
   can have several, each with its own cooldown and unlock condition. Every caster's slots are
   listed in the snapshot as `units[].abilities` / `buildings[].abilities`
-  (`index`, `cd`, `unlocked`, `ready`, `requires`), and described in catalog `abilities`.
-- `{"type":"buy","shop":id,"item":"HealingPotion"|"TownPortal"}` — your living hero buys the item
-  (2 inventory slots; see catalog `items`). `{"type":"use_item","slot":0}` consumes it.
-  TownPortal teleports your hero + nearby own units to your nearest TownHall — the expansion-saver.
+  (`index`, `cd`, `unlocked`, `ready`, `requires`), and described in catalog `abilities`
+  (where `unlock_hero_level` / `unlock_tier` give the gate as a number). Names are matched
+  loosely — case, spaces, dashes and underscores are all noise, so `"Call to Arms"`,
+  `"calltoarms"` and `"call_to_arms"` are one ability. The same holds for unit, building,
+  item and research names, and for `priority` classes.
+- `{"type":"buy","shop":id,"item":"HealingPotion"|...,"hero":id}` — a hero buys the item
+  (2 inventory slots; see catalog `items`). `{"type":"use_item","slot":0,"hero":id}` consumes it.
+  **`hero` is optional but you want it once you field two.** Omitted, both verbs default to your
+  living hero with the LOWEST id — fine with one hero, a coin flip with a Champion and a
+  Priestess. Name the hero and the item lands in that hero's bag; name one that is not a living
+  hero of yours and the command is REJECTED rather than redirected, so a typo can never hand
+  your potion to the wrong character.
+  TownPortal teleports that hero + nearby own units to your nearest TownHall — the expansion-saver.
 Doctrine (standing orders, executed continuously — USE THESE, they fight for you between your turns):
 - `{"type":"priority","units":[ids],"classes":[...]}` — focus-fire order ([] clears). Valid classes:
-  Hero (both hero types), Archer, Footman, Worker, Building, Siege (catapults), Cavalry (raiders).
+  Hero (both hero types), Archer (also Sorcerers — the fragile ranged back rank), Footman,
+  Worker, Building, Siege (catapults), Cavalry (raiders and knights).
 - `{"type":"retreat","units":[ids],"below":0.35,"x":..,"z":..}` — auto fall-back when hurt
 - `{"type":"leash","units":[ids],"x":..,"z":..,"radius":20}` — never chase/fight beyond anchor (radius 0 clears)
-- `{"type":"autocast","units":[hero_id],"min_enemies":3}` — hero slams automatically. Add
+- `{"type":"autocast","units":[caster_ids],"min_enemies":3}` — any CASTER fires on its own
+  (heroes and Sorcerers alike; Sorcerers are born with Slow on autocast at 1 enemy). Add
   `"ability":<index|"Name">` to govern a specific ability; each one keeps its own trigger, and
   `min_enemies:0` clears just that rule.
 - `{"type":"squad","units":[ids],"id":1}` then `{"type":"posture","id":1,"posture":{"type":"defend","x":..,"z":..,"radius":18}}`
@@ -85,6 +98,28 @@ ids, and because places have names: `mid`, `our base`, `their base`, `the
 northwest ford` (any choke in `map.chokes`, by name), `the contested mine`,
 `the nearest bounty`, `the west`. Units too: `the cavalry`, `the siege`, `the
 hero`, `squad 2`, and the default — the whole army, never your workers.
+
+Unit and building vocabulary is read from your seat's `catalog.json` when it is
+there (it always is), so new content is speakable the day it ships — the tool
+learns that the Raider trains at the Barracks, or that a Sanctum trains
+Sorcerers, by reading the same file you do.
+
+**Two heroes, one word.** Hero slots climb the hall ladder, so at a Keep you
+field a Champion *and* a Priestess. `the hero` names the class, i.e. both:
+`autocast at 3`, `retreat at 35% with the hero` and `focus siege` all apply to
+both, which is what you want. The three verbs that take exactly **one** unit —
+`escort`, `buy`, `use` — refuse instead of guessing, and tell you the words
+that fix it:
+
+```
+  FAILED   'escort the hero with the footmen' -> 'the hero' is ambiguous — you
+           have 2 heroes; say the champion or the priestess
+```
+
+Say `the champion` or `the priestess`. `buy a potion for the priestess` fills
+in `buy`'s optional `hero` field for you; with only one hero alive it is
+omitted, exactly as before. The Sorcerer is a caster but **not** a hero, so
+`the hero` never sweeps it up — use `sorcerers`.
 
 - `--explain` prints the full vocabulary. **Read it once**; it is the list of
   idioms that compile deterministically.
@@ -129,11 +164,18 @@ the same `why` string it stamped, so a unit's answer and the sentence that
 caused it are one grep apart.
 
 ## What you can build/train: read `<SEAT>/catalog.json`
-The FULL content catalog — every unit, building, and ability: costs, stats,
-train/build times, what produces what, and `requires` (tech prerequisites).
+The FULL content catalog — every unit, building, ability, research and item:
+costs, stats, train/build times, what produces what, and what gates it.
 Read it ONCE at match start; it is the authoritative content reference.
+
+**The catalog IS the tech tree — no prose needed.** `requires` on everything
+lists what must be STANDING (trainer included, transitively) and `tier` says how
+far up the hall ladder that puts you; `upgrades_to`/`upgraded_from` walk
+TownHall→Keep→Castle with every price on it. T2 arrives ~min 3-5, T3 ~min 6-9.
+
 The live snapshot's `unlocked` map tells you which entries' requirements you
-currently satisfy (e.g. Towers need a Barracks first).
+currently satisfy — but it checks tech gates only, not whether you own the
+trainer, so cross-check against `requires`.
 
 ## The rules of the world (not in the catalog)
 - **FOG OF WAR — read this before you read `units`.** Your snapshot shows only what your
@@ -175,12 +217,29 @@ currently satisfy (e.g. Towers need a Barracks first).
   the map itself forces a decision. Ceding the middle
   cedes an economy. After the mines die, bounties are the only income on the map.
 - Supply-block = production stalls: build Farms BEFORE you hit the cap.
-- Your Hero levels from ANY nearby enemy deaths, +HP/+damage per level. THE key unit — keep it
-  alive (retreat policy!), keep it near fights (XP), revive it fast when it dies (keeps its level).
-- **Choose your hero class at first training** (see catalog: units with abilities). Your team's
-  class locks in — revival always restores the class you chose. Choose for your gameplan.
+- Your heroes level from ANY nearby enemy deaths, +HP/+damage per level. THE key units — keep
+  them alive (retreat policy!), near fights (XP), and revive fast when one dies (keeps its
+  level, per class). Two heroes at Keep means two retreat policies and two autocast rules.
+- **HERO SLOTS SCALE WITH YOUR HALL TIER: TownHall 1, Keep 2, Castle 3.** A second hero is
+  one of the two concrete things teching to a Keep buys you (the other is the Arcane Sanctum).
+  Heroes must be of **distinct classes** — Champion *and* Priestess is legal, two Champions
+  never is. Read `me.hero_slots` / `me.hero_slots_used` in the snapshot before you train:
+  used counts living heroes **plus any hero already sitting in a queue**. `me.hero_records`
+  lists every class you have ever fielded (with `alive`), and `me.hero_costs` prices each
+  class — full freight for a class you have never played, the cheap revival price for one you
+  have, per class and never discounted by the other. Only two classes ship today, so a
+  Castle's third slot currently has nothing to put in it.
 - Counter triangle: fortifications stop armies, siege outranges fortifications, fast cavalry
-  dives siege. Check catalog `vs_*` multipliers.
+  dives siege. It is all data: catalog `units[].class` says what a unit IS, and
+  `vs_building_mult` / `vs_siege_mult` / `vs_cavalry_mult` say what it eats. The
+  multipliers are keyed off the CLASS, so a Spearman's anti-cavalry bonus lands on the
+  Knight and the Raider alike. `damage` with `attack_cooldown` gives you dps.
+- **Crowd control (tier 2).** An **Arcane Sanctum** (requires a Keep) trains **Sorcerers**:
+  fragile, barely fight, and auto-cast **Slow** — -40% move AND attack speed on every enemy
+  within 8 of the caster, 5s, 9s cooldown, no mana. It is the answer to a Raider or Knight
+  charge (a slowed Raider is slower than a Footman) and the way you cover a retreat. Slow
+  **refreshes rather than stacks**, so 2-3 Sorcerers buy frontage, not depth — a wall of them
+  is wasted supply. Keep them behind the line; anything that reaches one kills it.
 - Ranged units/towers outrange melee; footmen tank; workers fight terribly.
 - Towers shoot at enemy units in range on their own; Walls just block pathing and soak hits.
   Defense is a real strategy — and SIEGE is its counter: check the catalog for what outranges towers.

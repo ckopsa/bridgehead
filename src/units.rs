@@ -136,6 +136,9 @@ struct UnitAssets {
     priestess_hood: Handle<Mesh>,
     priestess_staff: Handle<Mesh>,
     priestess_tip: Handle<Mesh>,
+    sorcerer_body: Handle<Mesh>,
+    sorcerer_hood: Handle<Mesh>,
+    sorcerer_orb: Handle<Mesh>,
     knight_mount: Handle<Mesh>,
     knight_leg: Handle<Mesh>,
     knight_rider: Handle<Mesh>,
@@ -156,6 +159,10 @@ struct UnitAssets {
     robe_mat: Handle<StandardMaterial>,
     /// Emissive staff tip.
     glow_mat: Handle<StandardMaterial>,
+    /// The Sorcerer's floating orb: violet, and deliberately the same hue as
+    /// `StatusKind::Slow`'s ground ring — the unit and the debuff it puts on
+    /// the field read as one thing at a glance.
+    arcane_mat: Handle<StandardMaterial>,
 }
 
 impl UnitAssets {
@@ -186,6 +193,14 @@ fn setup_unit_assets(
         base_color: Color::srgb(0.85, 0.95, 1.0),
         emissive: LinearRgba::new(1.6, 2.2, 3.0, 1.0),
         unlit: false,
+        ..default()
+    });
+
+    // Violet arcane light, matched to `StatusKind::Slow.tint()` so the caster
+    // and its debuff ring are visibly the same magic.
+    let arcane_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.55, 0.45, 1.0),
+        emissive: LinearRgba::new(0.9, 0.6, 2.4, 1.0),
         ..default()
     });
 
@@ -238,6 +253,14 @@ fn setup_unit_assets(
         priestess_hood: meshes.add(Sphere::new(0.26)),
         priestess_staff: meshes.add(Cuboid::new(0.07, 1.30, 0.07)),
         priestess_tip: meshes.add(Sphere::new(0.11)),
+        // Sorcerer: the slightest silhouette on the field — a narrow robe
+        // under a pointed hood, with an untethered orb floating at shoulder
+        // height instead of a weapon. Nothing it carries is a weapon, which is
+        // the read: this thing does not fight, it does something to you.
+        // Total 1.44 = the kind's height.
+        sorcerer_body: meshes.add(Capsule3d::new(0.23, 0.92)),
+        sorcerer_hood: meshes.add(Cone::new(0.27, 0.44)),
+        sorcerer_orb: meshes.add(Sphere::new(0.14)),
         // Knight: the Raider's silhouette rebuilt in steel and scaled up — a
         // heavier barded mount, thicker legs, an armoured rider, and a lance
         // couched forward past the horse's head. The read from the RTS camera
@@ -265,6 +288,7 @@ fn setup_unit_assets(
         gold_mat,
         robe_mat: solid(Color::srgb(0.88, 0.86, 0.95)),
         glow_mat,
+        arcane_mat,
     });
 }
 
@@ -283,6 +307,8 @@ fn unit_height(kind: UnitKind) -> f32 {
         // Taller than a Footman and much narrower — before the spear is even
         // drawn, the silhouette says "reach, not shoulders".
         UnitKind::Spearman => 1.56,
+        // Shortest adult on the field: a scholar, not a soldier.
+        UnitKind::Sorcerer => 1.44,
         // Taller and heavier than the Raider's 1.50 — armoured horse, armoured
         // man. The extra 0.2 is the whole visual claim of a tier-3 unit.
         UnitKind::Knight => 1.70,
@@ -365,6 +391,7 @@ fn spawn_units(
             UnitKind::Raider => assets.raider_rider.clone(),
             UnitKind::Priestess => assets.priestess_body.clone(),
             UnitKind::Spearman => assets.spearman_body.clone(),
+            UnitKind::Sorcerer => assets.sorcerer_body.clone(),
             // Both mounted kinds put the RIDER at the root for the same reason
             // the Raider does: the root wears the team colour and faces where
             // the unit faces, and the beast underneath is a child.
@@ -380,7 +407,10 @@ fn spawn_units(
 
         // Hero classes resume their team's progression; a fresh one starts at
         // level 1. Either way they arrive at full (class- and level-scaled) HP.
-        let hero = is_hero_kind(ev.kind).then(|| Hero::from_record(records.get(ev.team)));
+        // Per CLASS: a team that fields a Champion and a Priestess keeps two
+        // independent progressions, and each revival restores its own.
+        let hero =
+            is_hero_kind(ev.kind).then(|| Hero::from_record(records.get(ev.team, ev.kind)));
         let health = match hero {
             Some(hero) => {
                 let max = Hero::max_hp_for(ev.kind, hero.level);
@@ -473,6 +503,7 @@ fn spawn_units(
                 UnitKind::Raider => "Raider",
                 UnitKind::Priestess => "Priestess",
                 UnitKind::Spearman => "Spearman",
+                UnitKind::Sorcerer => "Sorcerer",
                 UnitKind::Knight => "Knight",
                 UnitKind::GryphonRider => "Gryphon Rider",
             }),
@@ -482,6 +513,10 @@ fn spawn_units(
         if let Some(hero) = hero {
             entity.insert((hero, Inventory::default()));
         }
+
+        // Set when a `DoctrineTemplate` had an explicit opinion about
+        // auto-cast, so the per-kind default below does not overrule it.
+        let mut stamped_autocast = false;
 
         // Standing doctrine from the producing building, applied verbatim.
         // Deliberately touches nothing but doctrine components — the rally
@@ -496,13 +531,27 @@ fn spawn_units(
             if let Some(priority) = &template.priority {
                 entity.insert(TargetPriority(priority.clone()));
             }
-            // Only heroes have an ability to auto-cast.
-            if is_hero_kind(ev.kind) {
+            // Anything with an ability can auto-cast it — heroes were merely
+            // the only casters that existed when this was written, and the
+            // Sorcerer's whole value is a spell it fires on its own.
+            if !abilities_of_unit(ev.kind).is_empty() {
                 if let Some(min_enemies) = template.autocast {
                     // Templates speak the v1 language (one number); it lands on
                     // the trained unit's first ability slot.
                     entity.insert(AutoCastPolicy::first(min_enemies));
+                    stamped_autocast = true;
                 }
+            }
+        }
+
+        // Kinds whose ability is meant to be on by default (the Sorcerer's
+        // Slow) are born with it. A template that said something about
+        // auto-cast wins — that is a standing order the player actually gave.
+        if !stamped_autocast {
+            if let Some((slot, min_enemies)) = default_autocast(ev.kind) {
+                let mut policy = AutoCastPolicy::default();
+                policy.set(slot, min_enemies);
+                entity.insert(policy);
             }
         }
 
@@ -628,6 +677,25 @@ fn spawn_units(
                         Mesh3d(assets.spearman_head.clone()),
                         MeshMaterial3d(assets.metal_mat.clone()),
                         Transform::from_xyz(0.30, 1.52, -0.04),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Sorcerer => {
+                    // Pointed hood over the head — the one shape on the field
+                    // that comes to a point.
+                    parent.spawn((
+                        Mesh3d(assets.sorcerer_hood.clone()),
+                        MeshMaterial3d(assets.dark_mat.clone()),
+                        Transform::from_xyz(0.0, head_y + 0.20, 0.0),
+                        UnitAccent,
+                    ));
+                    // The orb: unattached, hanging off the right shoulder.
+                    // No haft, no string, no blade — this unit carries no
+                    // weapon at all, and that is the silhouette's whole job.
+                    parent.spawn((
+                        Mesh3d(assets.sorcerer_orb.clone()),
+                        MeshMaterial3d(assets.arcane_mat.clone()),
+                        Transform::from_xyz(0.38, 0.30, -0.12),
                         UnitAccent,
                     ));
                 }

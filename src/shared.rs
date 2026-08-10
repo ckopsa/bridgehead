@@ -132,19 +132,24 @@ pub enum UnitKind {
     Worker,
     Footman,
     Archer,
-    /// The Champion — one per team, levels up, casts an AoE slam. Entities of
-    /// this kind always carry a `Hero` component (units.rs guarantees it).
+    /// The Champion, levels up, casts an AoE slam. Entities of this kind
+    /// always carry a `Hero` component (units.rs guarantees it). Occupies one
+    /// of the team's tier-scaled hero slots — see `hero_slots`.
     Hero,
     /// Siege engine: outranges towers, wrecks buildings, helpless up close.
     Catapult,
     /// Fast cavalry: dives siege engines and raids workers; dies to massed fire.
     Raider,
     /// The second hero class: ranged, heals allies instead of slamming enemies.
-    /// Carries a `Hero` component like the Champion; one hero per team total.
+    /// Carries a `Hero` component like the Champion, and occupies a hero slot
+    /// of its own — at a Keep a team may field both (`hero_slots`).
     Priestess,
     /// Anti-cavalry line infantry: cheap, slow, and feeble against everything
     /// except a horse, which it deletes. The tier-1 answer to Raiders.
     Spearman,
+    /// The game's first non-hero caster: a fragile tier-2 support unit whose
+    /// whole job is the `Slow` debuff. Trained at the Arcane Sanctum.
+    Sorcerer,
     /// Castle-gated heavy shock cavalry: the tier-3 line-breaker. Raw stats and
     /// speed with no type bonus at all — and `TargetClass::Cavalry`, so the
     /// 90-gold Spearman is still the answer.
@@ -155,8 +160,8 @@ pub enum UnitKind {
     GryphonRider,
 }
 
-/// Hero-class unit kinds (carry the `Hero` component, count against the
-/// one-hero-per-team rule, revive through `HeroRecords`).
+/// Hero-class unit kinds (carry the `Hero` component, occupy one of the team's
+/// tier-scaled hero SLOTS, revive through `HeroRecords`).
 pub fn is_hero_kind(kind: UnitKind) -> bool {
     matches!(kind, UnitKind::Hero | UnitKind::Priestess)
 }
@@ -185,9 +190,12 @@ pub enum BuildingKind {
     Keep,
     /// Tier 3 of the town hall ladder, upgraded from a Keep.
     Castle,
+    /// Tier-2 magic college: trains Sorcerers. Requires a Keep, which is the
+    /// first thing in the game a hall upgrade actually *buys* you.
+    Sanctum,
 }
 
-pub const ALL_UNIT_KINDS: [UnitKind; 10] = [
+pub const ALL_UNIT_KINDS: [UnitKind; 11] = [
     UnitKind::Worker,
     UnitKind::Footman,
     UnitKind::Archer,
@@ -196,10 +204,11 @@ pub const ALL_UNIT_KINDS: [UnitKind; 10] = [
     UnitKind::Raider,
     UnitKind::Priestess,
     UnitKind::Spearman,
+    UnitKind::Sorcerer,
     UnitKind::Knight,
     UnitKind::GryphonRider,
 ];
-pub const ALL_BUILDING_KINDS: [BuildingKind; 10] = [
+pub const ALL_BUILDING_KINDS: [BuildingKind; 11] = [
     BuildingKind::TownHall,
     BuildingKind::Barracks,
     BuildingKind::Farm,
@@ -210,6 +219,7 @@ pub const ALL_BUILDING_KINDS: [BuildingKind; 10] = [
     BuildingKind::Blacksmith,
     BuildingKind::Keep,
     BuildingKind::Castle,
+    BuildingKind::Sanctum,
 ];
 
 pub struct UnitStats {
@@ -393,6 +403,26 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             // counter a wall you walk into rather than a patrol that hunts you.
             vision: 18.0,
         },
+        // The first crowd control in the game, and deliberately the worst
+        // fighter that has ever been worth 110 gold: 55 hp (less than an
+        // Archer), 8 damage on a 2.0s cast, and a 6.0 walk that cannot
+        // disengage from anything. Everything it is worth is `Slow` — the
+        // Sanctum's tier-2 price buys an EFFECT, not a body, which is the
+        // whole point of a caster. Missiles, so it shoots air like the Archer.
+        // Two Sorcerers are not twice the debuff (Slow refreshes rather than
+        // stacks — see `StackPolicy`), so a team wants a few, never a wall of
+        // them; what more Sorcerers buy is coverage of a wider frontage.
+        UnitKind::Sorcerer => UnitStats {
+            cost_gold: 110, cost_lumber: 45, supply: 2, hp: 55.0, damage: 8.0,
+            range: 11.0, attack_cooldown: 2.0, speed: 6.0, train_time: 15.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
+            // Sees like an Archer. A caster whose ability is a 8-unit bubble
+            // around itself must see the charge coming from further out than
+            // it can throw the spell, or its auto-cast fires at the moment it
+            // is already being ridden down.
+            vision: 18.0,
+        },
         // Tier 3, Castle-gated, Barracks-trained: the line-breaker. Its whole
         // design is that it has NO type multiplier — no anti-siege bonus (that
         // stays the Raider's job), no anti-anything. What 270 gold buys is raw
@@ -549,6 +579,20 @@ pub fn building_stats(kind: BuildingKind) -> BuildingStats {
             cost_gold: 480, cost_lumber: 240, hp: 2200.0, build_time: 50.0,
             supply_provided: 10, size: 8.0, attack: None, vision: 34.0,
         },
+        // Arcane Sanctum: the first building in the game gated on a Keep, so
+        // it is also the first concrete reason to climb the hall ladder at
+        // all. Lumber-heavy (a college is timber and parchment, and lumber is
+        // the resource an army does not compete for), and thin-walled — 480 hp
+        // on a 5.0 footprint is the softest production building on the field,
+        // because a tech building that also tanks is a tech building nobody
+        // has to raid.
+        BuildingKind::Sanctum => BuildingStats {
+            cost_gold: 150, cost_lumber: 130, hp: 480.0, build_time: 30.0,
+            supply_provided: 0, size: 5.0, attack: None,
+            // Level with the Barracks: the Sanctum is the caster's drill yard,
+            // not a watchtower.
+            vision: 18.0,
+        },
     }
 }
 
@@ -702,10 +746,15 @@ pub struct StartResearch {
 pub fn building_requires(kind: BuildingKind) -> &'static [BuildingKind] {
     match kind {
         BuildingKind::Tower | BuildingKind::Workshop => &[BuildingKind::Barracks],
-        // Tier 2. Research is the reward for teching, not an opening build:
-        // gating it behind the Keep means the 100g/50l first level is a choice
-        // made *after* the 320g/160l hall upgrade, so nobody buys +1 attack
-        // instead of their second barracks in the first four minutes.
+        // Both tier-2 gates, expressed as the RUNG rather than as a
+        // `TechTier`: `requirements_met` compares tiers through
+        // `building_satisfies`, so a Castle satisfies them for free and losing
+        // the Keep closes them again.
+        BuildingKind::Sanctum => &[BuildingKind::Keep],
+        // Research is the reward for teching, not an opening build: gating it
+        // behind the Keep means the 100g/50l first level is a choice made
+        // *after* the 320g/160l hall upgrade, so nobody buys +1 attack instead
+        // of their second barracks in the first four minutes.
         BuildingKind::Blacksmith => &[BuildingKind::Keep],
         _ => &[],
     }
@@ -725,6 +774,68 @@ pub fn unit_requires(kind: UnitKind) -> &'static [BuildingKind] {
         UnitKind::Knight | UnitKind::GryphonRider => &[BuildingKind::Castle],
         _ => &[],
     }
+}
+
+/// Everything that must be STANDING before a team can train `kind`: the
+/// building that trains it, whatever gates that building, and whatever gates
+/// the unit itself — transitively, to the bottom.
+///
+/// `unit_requires` above is deliberately partial. It lists requirements
+/// *beyond* owning the trainer, which is the right shape for
+/// `requirements_met` (the trainer is checked separately, by the order being
+/// given at it) and the wrong shape for a CATALOG. Exported raw it says
+/// `Footman: requires []` — which reads as "buildable from nothing" — and
+/// `Catapult: requires []`, hiding a real Barracks→Workshop chain behind a
+/// join the JSON never advertises. The caveat that made those entries true
+/// lived in a Rust doc comment, and serde does not export doc comments.
+///
+/// So this is the shape the catalog ships: complete, and needing no prose.
+/// Order is a usable build order — trainer first, then its gates.
+pub fn unit_tech_chain(kind: UnitKind) -> Vec<BuildingKind> {
+    fn add(chain: &mut Vec<BuildingKind>, b: BuildingKind) {
+        if !chain.contains(&b) {
+            chain.push(b);
+        }
+    }
+    let mut chain: Vec<BuildingKind> = Vec::new();
+    // The LOWEST rung that trains it is the one to name: `building_satisfies`
+    // makes a requirement of "TownHall" mean "TownHall or better", so naming
+    // the base rung covers the Keep and Castle that also train Workers
+    // without listing three alternatives a reader would have to know are ORs.
+    if let Some(trainer) = ALL_BUILDING_KINDS
+        .iter()
+        .copied()
+        .find(|b| trainable(*b).contains(&kind))
+    {
+        add(&mut chain, trainer);
+    }
+    for req in unit_requires(kind) {
+        add(&mut chain, *req);
+    }
+    // Breadth-first over what those in turn need, so the list stays in build
+    // order and a cycle (there are none, but the data is editable) terminates.
+    let mut i = 0;
+    while i < chain.len() {
+        for req in building_requires(chain[i]) {
+            add(&mut chain, *req);
+        }
+        i += 1;
+    }
+    chain
+}
+
+/// The team tech tier a unit needs — the highest rung anything in its chain
+/// sits on. Non-hall buildings are all tier 1, so this reduces to "how far up
+/// the hall ladder must I be", which is exactly what `tech_tier_for` measures.
+///
+/// Honest rather than flattering: a Catapult is tier 1, because a Workshop
+/// needs only a Barracks and no hall upgrade at all.
+pub fn unit_tier(kind: UnitKind) -> u32 {
+    unit_tech_chain(kind)
+        .iter()
+        .map(|b| building_tier(*b))
+        .max()
+        .unwrap_or(1)
 }
 
 /// Does `team` satisfy `reqs` right now? Pass an iterator over the team's
@@ -1119,6 +1230,7 @@ pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
         | BuildingKind::Wall
         | BuildingKind::Shop
         | BuildingKind::Blacksmith => &[],
+        BuildingKind::Sanctum => &[UnitKind::Sorcerer],
     }
 }
 
@@ -1141,6 +1253,7 @@ pub fn kind_name(kind: UnitKind) -> &'static str {
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
         UnitKind::Spearman => "Spearman",
+        UnitKind::Sorcerer => "Sorcerer",
         UnitKind::Knight => "Knight",
         UnitKind::GryphonRider => "GryphonRider",
     }
@@ -1158,6 +1271,7 @@ pub fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Blacksmith => "Blacksmith",
         BuildingKind::Keep => "Keep",
         BuildingKind::Castle => "Castle",
+        BuildingKind::Sanctum => "Sanctum",
     }
 }
 
@@ -1166,27 +1280,31 @@ pub fn unit_description(kind: UnitKind) -> &'static str {
         UnitKind::Worker => "Harvests gold/lumber, constructs buildings. Fights poorly.",
         UnitKind::Footman => "Cheap melee line unit. Tanks for archers.",
         UnitKind::Archer => "Long-range attacker. Fragile; keep behind footmen.",
-        UnitKind::Hero => "The Champion: levels from nearby enemy deaths, AoE Slam ability, revivable at reduced cost with level preserved. One per team.",
+        UnitKind::Hero => "The Champion: melee hero, levels from nearby enemy deaths, AoE Slam ability, revivable at reduced cost with level preserved. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class.",
         UnitKind::Catapult => "Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it.",
         UnitKind::Raider => "Fast cavalry: 2x damage vs Catapults, excels at worker raids and map control. Melts under massed fire.",
-        UnitKind::Priestess => "Support hero: ranged attack, Heal ability (AoE ally healing). One hero per team; revival preserves level and class.",
+        UnitKind::Priestess => "Support hero: ranged attack, Heal ability (AoE ally healing). Occupies one hero slot — a Keep lets her stand alongside a Champion; revival preserves her own level.",
         UnitKind::Spearman => "Cheap anti-cavalry line: 5x damage vs Raiders and Knights, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
         UnitKind::Knight => "Requires a Castle. Heavy shock cavalry: 350 hp at speed 9.5, no type bonus, just the best raw stats on the field. Breaks Footman and Archer lines at equal gold. Counter it with Spearmen — the Knight is cavalry, so it takes 5x from a spear, and 270g of Knight loses to 270g of Spearmen. Melee: cannot touch air.",
         UnitKind::GryphonRider => "Requires a Castle; trained at the Workshop. Flying: ignores walls, forests and chokepoints entirely, and attacks both ground and air. Melee units and Catapults CANNOT hit it at all — only Archers, the Priestess and Towers can. Counter it with massed Archers: 270g of Archers beats one Gryphon. Sees 26, the widest eye in the game.",
+        UnitKind::Sorcerer => "Tier-2 caster (Arcane Sanctum, requires a Keep): auto-casts Slow, a -40% move and attack speed debuff on every enemy within 8 for 5s. Blunts cavalry charges and covers retreats. Barely fights; keep it behind the line.",
     }
 }
 
 pub fn building_description(kind: BuildingKind) -> &'static str {
     match kind {
         BuildingKind::TownHall => {
-            "Tier 1 hall. Resource drop-off. Trains Workers and the Hero. Upgrades to a Keep."
+            "Tier 1 hall. Resource drop-off. Trains Workers and heroes (1 hero slot). \
+             Upgrades to a Keep."
         }
         BuildingKind::Keep => {
             "Tier 2 hall: everything the TownHall was, with a deeper HP pool. \
-             Satisfies tier-1 requirements and unlocks tier-2 content. Upgrades to a Castle."
+             Opens a SECOND hero slot (distinct classes only) and unlocks tier-2 content \
+             such as the Arcane Sanctum. Satisfies tier-1 requirements. Upgrades to a Castle."
         }
         BuildingKind::Castle => {
-            "Tier 3 hall: the top of the ladder. Satisfies every hall requirement below it."
+            "Tier 3 hall: the top of the ladder. A third hero slot (unusable until a third \
+             hero class ships). Satisfies every hall requirement below it."
         }
         BuildingKind::Barracks => "Trains Footmen, Archers and Spearmen (Raiders once a Workshop stands, Knights once a Castle does).",
         BuildingKind::Farm => "+6 supply. Build ahead of the cap or production stalls.",
@@ -1194,6 +1312,7 @@ pub fn building_description(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Cheap blocking segment. No function except HP in the way.",
         BuildingKind::Workshop => "Siege works: trains Catapults, and Gryphon Riders once a Castle stands. Both answers to a tower turtle — one knocks the door down, the other flies over it.",
         BuildingKind::Shop => "Item vendor: heroes buy consumables here (see catalog items).",
+        BuildingKind::Sanctum => "Arcane Sanctum: trains Sorcerers. Requires a Keep — the first thing a hall upgrade unlocks.",
         BuildingKind::Blacksmith => {
             "Tier 2 forge (requires a Keep). Researches the two team-wide ladders in \
              catalog.research: Attack (+1/+2/+3 flat damage on every UNIT attack) and \
@@ -1214,9 +1333,26 @@ pub struct CatalogUnit {
     pub hp: f32,
     pub damage: f32,
     pub range: f32,
+    /// Seconds between attacks. Exported because every balance claim in the
+    /// descriptions is stated in dps, and `damage` alone cannot produce one.
+    pub attack_cooldown: f32,
     pub speed: f32,
     pub train_time: f32,
+    /// Which `TargetClass` this kind IS — the class a `priority` command
+    /// names, and the class the `vs_*` multipliers below are keyed against.
+    /// Load-bearing for the counter triangle: a Knight and a Raider are both
+    /// `Cavalry`, so a Spearman's `vs_cavalry_mult` lands on both, and no
+    /// amount of reading the two unit entries side by side would reveal that
+    /// without this field.
+    pub class: Option<&'static str>,
+    /// Damage multipliers, all three of them. Only `vs_building_mult` used to
+    /// be here, which made tools/COMMANDER_BRIEF.md's "check catalog `vs_*`
+    /// multipliers" an instruction that could not be followed: the anti-siege
+    /// and anti-cavalry legs of the counter triangle existed in `combat.rs`
+    /// and in English inside `description`, and nowhere a machine could read.
     pub vs_building_mult: f32,
+    pub vs_siege_mult: f32,
+    pub vs_cavalry_mult: f32,
     /// Airborne: ignores terrain and buildings when moving, and can only be
     /// attacked by things whose `can_hit_air` is true.
     pub flying: bool,
@@ -1224,8 +1360,16 @@ pub struct CatalogUnit {
     pub can_hit_ground: bool,
     /// Sight radius — how far this kind lifts fog of war for its team.
     pub vision: f32,
+    /// The lowest rung that trains this kind. Higher rungs of the same ladder
+    /// train it too — `tier`/`upgraded_from` on the building say so.
     pub trained_at: &'static str,
+    /// **Everything that must be standing to train this**, transitively,
+    /// including `trained_at` itself and anything that gates it. In build
+    /// order. See `unit_tech_chain`: this used to list only the extras beyond
+    /// the trainer, so a Footman claimed to require nothing at all.
     pub requires: Vec<&'static str>,
+    /// Team tech tier this unit needs — the highest `tier` in `requires`.
+    pub tier: u32,
     pub description: &'static str,
 }
 
@@ -1270,6 +1414,16 @@ pub struct CatalogBuilding {
     pub built_by: &'static str,
     pub requires: Vec<&'static str>,
     pub trains: Vec<&'static str>,
+    /// Research ladders this building can start (`research[].id`). The inverse
+    /// of `research[].researched_at`, which was the only direction exported —
+    /// so "what is a Blacksmith FOR" needed the reader to scan a different
+    /// array on the off chance.
+    pub researches: Vec<&'static str>,
+    /// Items this building sells (`items[].id`), in shelf order. The inverse
+    /// of `items[].sold_at`, and the catalog half of the live snapshot's
+    /// `buildings[].sells` — which carries the same ids with this team's tier
+    /// already applied.
+    pub sells: Vec<&'static str>,
     /// Rung on this building's upgrade ladder: 1 for everything that is not
     /// upgraded from something else. A requirement naming a tier is satisfied
     /// by that tier OR ANY HIGHER one on the same ladder, so "requires Keep"
@@ -1307,7 +1461,18 @@ pub struct CatalogAbility {
     pub duration: f32,
     pub hits_air: bool,
     /// Human-readable unlock condition: "always", "hero level N", "tier TN".
+    /// Kept verbatim — the snapshot's `requires` uses the same text and the
+    /// HUD prints it — but it is prose, so the two fields below carry the same
+    /// predicate as numbers. Both null means "always".
     pub unlock: String,
+    /// Hero level the caster must reach, when that is the gate. Nothing else
+    /// in the catalog says how a hero levels, but this at least names the
+    /// quantity rather than burying `5` inside a sentence.
+    pub unlock_hero_level: Option<u32>,
+    /// Team tech tier required, when that is the gate — the same 1/2/3 scale
+    /// as `buildings[].tier` and `items[].tier`, so the three gating systems
+    /// are finally comparable without parsing "tier T2" out of a string.
+    pub unlock_tier: Option<u32>,
     pub description: &'static str,
 }
 
@@ -1411,15 +1576,21 @@ pub fn game_catalog() -> Catalog {
                     hp: s.hp,
                     damage: s.damage,
                     range: s.range,
+                    attack_cooldown: s.attack_cooldown,
                     speed: s.speed,
                     train_time: s.train_time,
+                    class: TargetClass::of(Some(k), false).map(|c| c.name()),
                     vs_building_mult: s.vs_building_mult,
+                    vs_siege_mult: s.vs_siege_mult,
+                    vs_cavalry_mult: s.vs_cavalry_mult,
                     flying: s.flying,
                     can_hit_air: s.can_hit_air,
                     can_hit_ground: s.can_hit_ground,
                     vision: s.vision,
                     trained_at: trainer_of(k),
-                    requires: unit_requires(k).iter().map(|b| building_name(*b)).collect(),
+                    // The FULL chain, not just the extras beyond the trainer.
+                    requires: unit_tech_chain(k).iter().map(|b| building_name(*b)).collect(),
+                    tier: unit_tier(k),
                     description: unit_description(k),
                 }
             })
@@ -1446,6 +1617,12 @@ pub fn game_catalog() -> Catalog {
                     built_by: if building_placeable(k) { "Worker" } else { "Upgrade" },
                     requires: building_requires(k).iter().map(|b| building_name(*b)).collect(),
                     trains: trainable(k).iter().map(|u| kind_name(*u)).collect(),
+                    researches: building_researches(k).iter().map(|r| r.id()).collect(),
+                    sells: if k == BuildingKind::Shop {
+                        ALL_ITEMS.iter().map(|i| item_def(*i).name).collect()
+                    } else {
+                        Vec::new()
+                    },
                     tier: building_tier(k),
                     placeable: building_placeable(k),
                     upgrades_to: upgrade_cost(k).map(|(gold, lumber, time)| CatalogUpgrade {
@@ -1476,6 +1653,14 @@ pub fn game_catalog() -> Catalog {
                 duration: a.duration,
                 hits_air: a.hits_air,
                 unlock: unlock_label(a.unlock),
+                unlock_hero_level: match a.unlock {
+                    AbilityUnlock::HeroLevel(n) => Some(n),
+                    _ => None,
+                },
+                unlock_tier: match a.unlock {
+                    AbilityUnlock::TeamTier(t) => Some(t.level()),
+                    _ => None,
+                },
                 description: a.description,
             };
             let mut out = Vec::new();
@@ -2388,10 +2573,65 @@ const PROBE_CHILL: AbilityDef = AbilityDef {
     description: "Dev probe: slows enemies around the Champion by 40% for 6s. Requires tier 2.",
 };
 
+/// The Sorcerer's Slow: the game's first shipping crowd control, and a pure
+/// table row — no new effect variant, no new system, no new component.
+///
+/// Tuning notes, because every number here is a balance decision:
+///
+///   * **magnitude 0.4** — a Raider drops from 10.5 to 6.3 speed (slower than
+///     a Footman) and its 1.1s swing becomes 1.83s. That is what "cripples a
+///     charge" has to mean: the dive still happens, it just arrives late and
+///     hits at two thirds rate. `StackPolicy::Refresh` (shared.rs's rule for
+///     every debuff) means a second Sorcerer refreshes rather than compounds,
+///     so massed casters can never approach the 0.75 cap and stun the field.
+///   * **duration 5s** against a **9s cooldown** — a 55% uptime on one
+///     Sorcerer. Long enough to decide a collision, short enough that a
+///     retreat covered by Slow is a real cost in tempo rather than a free out.
+///   * **radius 8.0, centred on the caster** — a small AoE rather than a
+///     single target, because the ability framework's only geometry is "around
+///     the caster" (see the framework-gap note in the bead report). 8.0 is one
+///     unit past the Priestess's Heal and comfortably inside the Sorcerer's
+///     own 11 attack range, so a caster standing behind its line still catches
+///     everything crashing into the front rank without being in the front rank.
+///   * **no mana** — the Sorcerer is not a hero and carries no `Hero`
+///     component, so its only gate is `AbilityCooldowns`, exactly like the
+///     TownHall's Call to Arms. `ability_ready` already treats a mana-less
+///     caster as affordable, so this needed no new rule.
+///   * **hits_air: true** — this is a hex, not a shockwave. A spell that
+///     travels to its victim has no reason to stop at head height, and it
+///     makes the Sorcerer a partial answer to air harass on a map where the
+///     only other answers are Archers and Towers.
+///   * **unlock: Always** — the tech gate is the Sanctum (which requires a
+///     Keep), so gating the spell on `TeamTier` as well would be the same
+///     rule written twice, and would silently disarm every Sorcerer alive the
+///     moment a team's Keep fell.
+const SLOW: AbilityDef = AbilityDef {
+    name: "Slow",
+    effect: AbilityEffect::ApplyStatus {
+        status: StatusKind::Slow,
+        targets: AbilityTargets::Enemies,
+        // Slow is one debuff and nothing else. The `also` slot exists for the
+        // Priestess ultimate, which genuinely is two effects on one button;
+        // stapling a second status onto crowd control would make the game's
+        // cheapest debuff its most complicated one.
+        also: None,
+    },
+    mana_cost: 0.0,
+    cooldown: 9.0,
+    radius: 8.0,
+    power: 0.4,
+    duration: 5.0,
+    hits_air: true,
+    unlock: AbilityUnlock::Always,
+    description: "Slows every enemy within 8 of the Sorcerer by 40% (move AND attack speed) \
+                  for 5s. Refreshes rather than stacks; no mana, 9s cooldown.",
+};
+
 const NO_ABILITIES: [AbilityDef; 0] = [];
 const HERO_ABILITIES: [AbilityDef; 2] = [SLAM, WARCRY];
 const HERO_ABILITIES_PROBE: [AbilityDef; 3] = [SLAM, WARCRY, PROBE_CHILL];
 const PRIESTESS_ABILITIES: [AbilityDef; 2] = [HEAL, SANCTUARY];
+const SORCERER_ABILITIES: [AbilityDef; 1] = [SLOW];
 const TOWNHALL_ABILITIES: [AbilityDef; 1] = [CALL_TO_ARMS];
 
 /// `WC3_STATUS_PROBE=1`: dev instrumentation for the status + ability-v2
@@ -2413,7 +2653,33 @@ pub fn abilities_of_unit(kind: UnitKind) -> &'static [AbilityDef] {
             }
         }
         UnitKind::Priestess => &PRIESTESS_ABILITIES,
+        UnitKind::Sorcerer => &SORCERER_ABILITIES,
         _ => &NO_ABILITIES,
+    }
+}
+
+/// Auto-cast doctrine a freshly trained unit is BORN with, when its kind has
+/// one. units.rs applies it at spawn.
+///
+/// This exists because a caster whose entire value is one debuff is worthless
+/// as a statue, and "the player must remember to turn the Sorcerer on" is
+/// exactly the kind of mechanical bookkeeping THESIS.md says the engine should
+/// be doing for whichever side set it. Heroes deliberately have NO default:
+/// their mana is a resource a player budgets, and a hero that spends it the
+/// instant one enemy wanders past is a hero with none left for the fight.
+/// The Sorcerer pays only a cooldown, so there is nothing to hoard.
+///
+/// It is a `(slot, min_targets)` pair — the same shape `AutoCastPolicy::set`
+/// takes — rather than a field on `AbilityDef`, so a kind can default one of
+/// its abilities on and leave the rest silent, and so adding a row here never
+/// disturbs the ability tables above.
+pub fn default_autocast(kind: UnitKind) -> Option<(usize, u32)> {
+    match kind {
+        // One enemy in the bubble is enough: the cooldown is the only cost,
+        // and a Slow landed on a single Raider diving your workers is exactly
+        // the moment the unit was built for.
+        UnitKind::Sorcerer => Some((0, 1)),
+        _ => None,
     }
 }
 
@@ -2469,9 +2735,34 @@ pub fn first_unlocked_ability(list: &[AbilityDef], ctx: UnlockCtx) -> Option<usi
     list.iter().position(|def| ability_unlocked(def, ctx))
 }
 
-/// Slot of the ability with this id (case-insensitive), unlocked or not.
+/// Loose form of a name on the wire: case, spaces, dashes and underscores are
+/// all noise, so `"town_hall"`, `"Town Hall"` and `"townhall"` are one name.
+///
+/// **This is the one name matcher.** Every player-facing name — unit kinds,
+/// building kinds, research ladders, items, abilities, target classes — is
+/// compared through here, so a commander who spells a name the way the catalog
+/// prints it is never told it does not exist. It lives in shared.rs rather
+/// than intent.rs because the catalog it folds names *of* lives here, and
+/// because `ability_index_by_id` below is the shared.rs consumer that used to
+/// have its own, stricter rule.
+pub fn normalize_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Slot of the ability with this id, unlocked or not.
+///
+/// Matched through `normalize_name`, exactly like every other name on the
+/// wire. This used to be `eq_ignore_ascii_case`, which made `"CallToArms"` and
+/// `"calltoarms"` work while `"Call to Arms"` — the spelling a person actually
+/// types — did not. The old forms are a strict subset of what normalising
+/// accepts, so nothing that parsed before stopped parsing.
 pub fn ability_index_by_id(list: &[AbilityDef], id: &str) -> Option<usize> {
-    list.iter().position(|def| def.name.eq_ignore_ascii_case(id))
+    let wanted = normalize_name(id);
+    list.iter()
+        .position(|def| normalize_name(def.name) == wanted)
 }
 
 /// Enemies inside Warcry's radius (and allies to buff) before the scripted
@@ -2745,43 +3036,134 @@ pub fn xp_for_kill(unit: Option<UnitKind>, building: Option<BuildingKind>) -> f3
     }
 }
 
-/// A team's hero progression, kept up to date while the hero lives and
-/// preserved when it dies so revival restores the level.
+/// ONE hero's progression, kept up to date while it lives and preserved when
+/// it dies so revival restores the level.
 #[derive(Clone, Copy, Debug)]
 pub struct HeroRecord {
     pub level: u32,
     pub xp: f32,
-    /// Which hero class this team plays. Locked in by the first hero trained;
-    /// revival restores the same class.
+    /// Which hero class this record belongs to — the key of the record, since
+    /// a team holds at most one per class (`HeroRecords`).
     pub kind: UnitKind,
 }
 
+/// Every hero record a team has ever opened, **one per class**.
+///
+/// v1 was `Option<HeroRecord>` per team, because a team was allowed exactly
+/// one hero for the whole match. Hero slots now scale with the hall ladder
+/// (`hero_slots`), so a team can field a Champion *and* a Priestess at tier 2
+/// — and each of them needs its own preserved level, XP and revival price. A
+/// list keyed by class is therefore the shape, and "the class lock" changed
+/// meaning with it: it no longer stops a SECOND hero, it stops a DUPLICATE
+/// class (see `hero_slots`).
 #[derive(Resource, Default)]
 pub struct HeroRecords {
-    pub human: Option<HeroRecord>,
-    pub claude: Option<HeroRecord>,
+    pub human: Vec<HeroRecord>,
+    pub claude: Vec<HeroRecord>,
 }
 
 impl HeroRecords {
-    pub fn get(&self, team: Team) -> Option<HeroRecord> {
+    pub fn list(&self, team: Team) -> &[HeroRecord] {
         match team {
-            Team::Human => self.human,
-            Team::Claude => self.claude,
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
         }
     }
-    pub fn set(&mut self, team: Team, record: HeroRecord) {
+    fn list_mut(&mut self, team: Team) -> &mut Vec<HeroRecord> {
         match team {
-            Team::Human => self.human = Some(record),
-            Team::Claude => self.claude = Some(record),
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+    /// This team's record for one hero CLASS, if it has ever fielded one.
+    pub fn get(&self, team: Team, kind: UnitKind) -> Option<HeroRecord> {
+        self.list(team).iter().copied().find(|r| r.kind == kind)
+    }
+    /// Insert or update the record for `record.kind`. Upsert by class, so
+    /// `hero_progression` writing every frame stays idempotent.
+    pub fn set(&mut self, team: Team, record: HeroRecord) {
+        let list = self.list_mut(team);
+        match list.iter_mut().find(|r| r.kind == record.kind) {
+            Some(existing) => *existing = record,
+            None => list.push(record),
         }
     }
 }
 
-/// Gold/lumber/time to put a Hero in a training queue right now: full price
-/// for the first hero, revival price once a record exists.
-pub fn hero_train_cost(records: &HeroRecords, team: Team) -> (u32, u32, f32) {
-    let base = unit_stats(UnitKind::Hero);
-    match records.get(team) {
+/// How many heroes a team at this tech tier may field at once: **1 at
+/// TownHall, 2 at Keep, 3 at Castle**. One rung, one hero — the tier number
+/// *is* the answer, so there is no second table to keep in step with the
+/// ladder, and a fourth rung would need no edit here.
+///
+/// Two rules travel with the count, and both are enforced at economy.rs's
+/// pay-point (with a matching pre-check in intent.rs so a seat gets an error
+/// string instead of a silent drop):
+///
+///   1. **Distinct classes only.** A team may hold a Champion and a Priestess,
+///      never two Champions. Duplicate heroes would make the hero a *unit*
+///      rather than a *character* — the whole reason revival preserves a level
+///      is that the thing coming back is the same person — and it would turn
+///      the tier-2 reward into "buy a second copy of your best unit", which is
+///      a power spike rather than a widened decision.
+///   2. **Slots are a ceiling that can fall.** The count is read from the
+///      team's LIVE tier, exactly like every other tier-gated thing: lose the
+///      Keep and you may not train a second hero, though the second hero you
+///      already have is not confiscated. Nothing is ever retroactive.
+///
+/// Consequence worth stating plainly: only TWO hero classes exist today, so
+/// tier 3's third slot is **currently unreachable** — a Castle team can field
+/// Champion + Priestess and nothing more. That is deliberate future-proofing
+/// rather than an oversight; the number comes from the ladder, and the third
+/// slot fills itself the day a third class ships. Asserted by
+/// `hero_slots_climb_the_hall_ladder_one_per_rung`.
+pub fn hero_slots(tier: TechTier) -> u32 {
+    tier.level()
+}
+
+/// Why a hero may (not) be queued right now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeroSlotVerdict {
+    Ok,
+    /// The team already holds this class — alive on the map, or in flight in
+    /// somebody's training queue.
+    DuplicateClass,
+    /// Every slot the team's tier grants is spoken for.
+    NoSlot { used: u32, slots: u32 },
+}
+
+/// **THE hero-slot rule**, in one function, so the four places that ask cannot
+/// disagree: economy.rs at the pay-point (authoritative), intent.rs as the
+/// pre-check that turns a refusal into an error string, ui.rs to grey the
+/// button, and ai.rs to decide what to queue.
+///
+/// `held` is every hero class this team is holding — **living heroes plus
+/// every hero already sitting in any of its training queues**. The queued half
+/// is the whole reason this takes a list rather than a count of bodies: two
+/// halls each queuing a Priestess, or one hall queuing three Champions, are
+/// all in flight and none of them is alive yet, and a rule that counted only
+/// the map would let every one of them through.
+pub fn hero_slot_check(held: &[UnitKind], kind: UnitKind, tier: TechTier) -> HeroSlotVerdict {
+    if held.contains(&kind) {
+        return HeroSlotVerdict::DuplicateClass;
+    }
+    let slots = hero_slots(tier);
+    let used = held.len() as u32;
+    if used >= slots {
+        return HeroSlotVerdict::NoSlot { used, slots };
+    }
+    HeroSlotVerdict::Ok
+}
+
+/// Gold/lumber/time to put a hero of `kind` in a training queue right now:
+/// full price for a class this team has never fielded, revival price once a
+/// record for THAT CLASS exists.
+///
+/// Per class, not per team: with two heroes allowed, a team that has a level-6
+/// Champion in the field must still pay full price for its first Priestess,
+/// and reviving the Champion must not be discounted by the Priestess existing.
+pub fn hero_train_cost(records: &HeroRecords, team: Team, kind: UnitKind) -> (u32, u32, f32) {
+    let base = unit_stats(kind);
+    match records.get(team, kind) {
         Some(_) => (HERO_REVIVE_COST_GOLD, 0, HERO_REVIVE_TIME),
         None => (base.cost_gold, base.cost_lumber, base.train_time),
     }
@@ -2857,7 +3239,13 @@ impl TargetClass {
         match (unit, building) {
             // Both hero classes are "Hero" for targeting purposes.
             (Some(UnitKind::Hero) | Some(UnitKind::Priestess), _) => Some(TargetClass::Hero),
-            (Some(UnitKind::Archer), _) => Some(TargetClass::Archer),
+            // The Sorcerer answers to "Archer": the class is the fragile
+            // ranged BACK RANK, and a doctrine that says "kill their archers"
+            // means "get behind the line and kill the soft things", which is
+            // exactly the order you want pointed at a caster. Naming a
+            // separate Caster class would let a priority list that already
+            // says Archer silently miss the most valuable target on the field.
+            (Some(UnitKind::Archer) | Some(UnitKind::Sorcerer), _) => Some(TargetClass::Archer),
             // The Spearman answers to "Footman" for targeting purposes: the
             // class is the melee line, and a doctrine that says "focus the
             // front rank" means the front rank, whatever it is holding.
@@ -3369,6 +3757,33 @@ impl FogGrids {
     /// skip painting an overlay that would be entirely transparent.
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Test-only: a fully dark, fog-enabled pair, so a test in another module
+    /// can pin the mode instead of inheriting whatever `WC3_FOG` happens to
+    /// say. Deliberately `#[cfg(test)]` rather than a widened public API —
+    /// nothing outside a test may seed a team's knowledge, and the compiler
+    /// should be the thing enforcing that rather than a comment.
+    #[cfg(test)]
+    pub fn test_dark() -> Self {
+        FogGrids {
+            enabled: true,
+            human: FogGrid::dark(),
+            claude: FogGrid::dark(),
+            ..Default::default()
+        }
+    }
+
+    /// Test-only: plant a memory in `team`'s grid, exactly as `update_fog`
+    /// does when the structure is in sight, without a scout having to walk
+    /// there and back.
+    #[cfg(test)]
+    pub fn test_remember(&mut self, team: Team, record: RememberedBuilding) {
+        let grid = match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        };
+        grid.ghosts.insert(record.id, record);
     }
 
     pub fn get(&self, team: Team) -> &FogGrid {
@@ -4040,15 +4455,28 @@ pub enum Intent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ability: Option<AbilitySelector>,
     },
-    /// Buy a consumable at one of our own finished Shops. The buyer is implied:
-    /// a team has at most one living hero, and only heroes carry an inventory.
+    /// Buy a consumable at one of our own finished Shops.
+    ///
+    /// `hero` names WHICH of your heroes is buying. It used to be implied,
+    /// because a team had at most one — but hero slots scale with the hall
+    /// ladder now (`hero_slots`), so a Keep team fielding a Champion AND a
+    /// Priestess had a coin-flip about which inventory a potion landed in.
+    /// Omit it and the tie-break is documented and stable: **the living hero
+    /// with the lowest entity id**, which is the same hero every existing
+    /// one-hero call site already got. Back-compatible by construction.
     Buy {
         shop: IntentId,
         item: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hero: Option<IntentId>,
     },
+    /// Consume the item in one of a hero's inventory slots. `hero` picks which
+    /// hero's bag, with the same default as `Buy`.
     #[serde(rename = "use_item")]
     UseItem {
         slot: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hero: Option<IntentId>,
     },
 
     // --- doctrine: standing policy, executed by the engine at machine speed ---
@@ -4277,8 +4705,14 @@ impl Intent {
             Intent::Cast { hero, ability } => {
                 format!("{hero} casts {}", ability_name(ability))
             }
-            Intent::Buy { shop, item } => format!("buy {item} at shop {shop}"),
-            Intent::UseItem { slot } => format!("hero uses item in slot {slot}"),
+            Intent::Buy { shop, item, hero } => match hero {
+                Some(hero) => format!("hero {hero} buys {item} at shop {shop}"),
+                None => format!("buy {item} at shop {shop}"),
+            },
+            Intent::UseItem { slot, hero } => match hero {
+                Some(hero) => format!("hero {hero} uses item in slot {slot}"),
+                None => format!("hero uses item in slot {slot}"),
+            },
             Intent::Priority { units, classes } => {
                 if classes.is_empty() {
                     format!("{} clear focus-fire priority", group(units))
@@ -4384,8 +4818,14 @@ impl Intent {
     }
 }
 
-/// Who spelled the intent. The compiler treats every source identically — this
-/// is recorded for the replay log, not consulted for authority.
+/// Who spelled the intent. The compiler treats every source identically when
+/// deciding whether it is *legal* — this is never consulted for authority.
+///
+/// It is consulted for one thing: which renderer gets told when an intent is
+/// refused. A bridge seat reads its errors out of the next snapshot; a human
+/// has no snapshot, so a `Ui` rejection is also raised on that team's
+/// `GameEvents` feed for the alert stack. Same verdict, same string, delivered
+/// down the channel the seat is actually reading.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum IntentSource {
@@ -5079,6 +5519,8 @@ fn status_probe(
     mut subject: Local<Option<Entity>>,
     mut casts: EventWriter<CastAbility>,
     mut next_cast: Local<f32>,
+    mut next_sorcerer_report: Local<f32>,
+    mut sorcerer_slow_seen: Local<bool>,
     mut seen_tier: Local<Option<TechTier>>,
     units: Query<(Entity, &Unit, &Team, Option<&StatusEffects>)>,
     heroes: Query<(Entity, &Unit, &Team, &Hero)>,
@@ -5125,6 +5567,51 @@ fn status_probe(
                 }
             }
         }
+    }
+
+    // Sorcerer watch: the SHIPPING half of the same chain, and the one the
+    // dev probe cannot fake. Nothing here casts anything — it only reports who
+    // is standing under an ability-sourced Slow, which is a thing that can
+    // only be true if a Sorcerer auto-cast at a real enemy in a real fight.
+    // Filtered on `StatusSource::Ability` precisely so the probe's own
+    // `Debug`-sourced Slow on a worker cannot be mistaken for the evidence.
+    // Sampled EVERY tick rather than on the report cadence: a Slow lasts 5
+    // seconds, so a 15-second sampler would routinely look between two of them
+    // and report a working caster as an idle one.
+    let sorcerers = units
+        .iter()
+        .filter(|(_, u, _, _)| u.kind == UnitKind::Sorcerer)
+        .count();
+    let slowed: Vec<&'static str> = units
+        .iter()
+        .filter(|(_, _, _, status)| {
+            status.is_some_and(|s| {
+                s.iter()
+                    .any(|e| e.kind == StatusKind::Slow && e.source == StatusSource::Ability)
+            })
+        })
+        .map(|(_, u, _, _)| kind_name(u.kind))
+        .collect();
+    // Gated on a Sorcerer being ALIVE, because the Champion's probe-only
+    // `ProbeChill` also writes an ability-sourced Slow and would otherwise
+    // claim this latch — the evidence has to be about the shipping unit.
+    if sorcerers > 0 && !slowed.is_empty() && !*sorcerer_slow_seen {
+        *sorcerer_slow_seen = true;
+        info!(
+            "[{now:>6.1}s] STATUS PROBE: FIRST Sorcerer Slow has landed in combat — \
+             {sorcerers} Sorcerer(s) alive, victims [{}]",
+            slowed.join(" ")
+        );
+    }
+    if sorcerers > 0 && now >= *next_sorcerer_report {
+        *next_sorcerer_report = now + 15.0;
+        info!(
+            "[{now:>6.1}s] STATUS PROBE: {sorcerers} Sorcerer(s) alive, {} unit(s) under an \
+             ability Slow right now [{}] (ever landed: {})",
+            slowed.len(),
+            slowed.join(" "),
+            *sorcerer_slow_seen,
+        );
     }
 
     // The direct-application probe: one unit, one Slow, three log lines.
@@ -6793,6 +7280,583 @@ mod tests {
         }
         assert_eq!(walked, vec!["TownHall", "Keep", "Castle"]);
         assert_eq!(paid, (320 + 480, 160 + 240));
+    }
+
+    /// The other half of "the catalog IS the tech tree": not just the hall
+    /// ladder, but **every gated kind's full requirement chain**, reconstructed
+    /// from `Catalog` and nothing else — no `unit_requires`, no `trainable`,
+    /// no prose.
+    ///
+    /// The gap this pins shut: `units[].requires` used to carry only the
+    /// requirements *beyond* owning the trainer, a caveat that lived in a Rust
+    /// doc comment. Exported that way the catalog stated `Footman: requires
+    /// []` — buildable from nothing — and `Catapult: requires []`, silently
+    /// hiding a Barracks→Workshop chain. An agent could not tell a tier-1 unit
+    /// from a tier-3 one without a join it was never told to make.
+    #[test]
+    fn the_catalog_alone_reconstructs_every_requirement_chain() {
+        let catalog = game_catalog();
+        let building = |id: &str| {
+            catalog
+                .buildings
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the catalog"))
+        };
+        let unit = |id: &str| {
+            catalog
+                .units
+                .iter()
+                .find(|u| u.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the catalog"))
+        };
+
+        // --- reconstruct, using catalog fields only -----------------------
+        // Everything a build order must contain to reach `id`: each named
+        // building, whatever IT requires, and — for an upgrade-only rung —
+        // every rung below it, walked down via `upgraded_from`.
+        let full_chain = |seeds: &[&str]| -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            let mut queue: Vec<String> = seeds.iter().map(|s| s.to_string()).collect();
+            while let Some(id) = queue.pop() {
+                if out.contains(&id) {
+                    continue;
+                }
+                let b = building(&id);
+                out.push(id);
+                queue.extend(b.requires.iter().map(|r| r.to_string()));
+                queue.extend(b.upgraded_from.map(|r| r.to_string()));
+            }
+            out.sort();
+            out
+        };
+        let chain_of = |id: &str| {
+            let u = unit(id);
+            let seeds: Vec<&str> = u.requires.to_vec();
+            full_chain(&seeds)
+        };
+        let expect = |got: Vec<String>, want: &[&str]| {
+            let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want);
+        };
+
+        // --- every gated kind, bottom to top ------------------------------
+        // A basic unit names its trainer. This is the entry that used to be
+        // an empty list.
+        expect(chain_of("Footman"), &["Barracks"]);
+        expect(chain_of("Worker"), &["TownHall"]);
+        // The Raider's Workshop gate drags in the Workshop's own Barracks
+        // gate — the two-step chain that was entirely invisible before.
+        expect(chain_of("Raider"), &["Barracks", "Workshop"]);
+        expect(chain_of("Catapult"), &["Barracks", "Workshop"]);
+        // The tier-3 pair: a Castle, which means a Keep, which means a hall.
+        expect(chain_of("Knight"), &["Barracks", "TownHall", "Keep", "Castle"]);
+        expect(
+            chain_of("GryphonRider"),
+            &["Barracks", "Workshop", "TownHall", "Keep", "Castle"],
+        );
+
+        // --- and the chains agree with the tiers --------------------------
+        // `tier` is not an independent claim a reader has to trust: it is the
+        // highest rung in the chain, and the catalog proves it against itself.
+        for u in &catalog.units {
+            let chain = chain_of(u.id);
+            let reconstructed = chain
+                .iter()
+                .map(|id| building(id).tier)
+                .max()
+                .expect("every unit has a trainer");
+            assert_eq!(
+                u.tier, reconstructed,
+                "{}: tier {} disagrees with its own requirement chain {chain:?}",
+                u.id, u.tier
+            );
+            // The chain must bottom out somewhere a worker can actually
+            // start: at least one placeable, ungated tier-1 building.
+            assert!(
+                chain
+                    .iter()
+                    .any(|id| { let b = building(id); b.placeable && b.tier == 1 && b.requires.is_empty() }),
+                "{}: nothing in {chain:?} can be built from an empty base",
+                u.id
+            );
+            // `trained_at` is in the chain, so the two fields cannot drift.
+            assert!(
+                u.requires.contains(&u.trained_at),
+                "{}: trained_at {} is missing from requires",
+                u.id,
+                u.trained_at
+            );
+        }
+        // Nothing is buildable above the top of the hall ladder.
+        assert_eq!(catalog.units.iter().map(|u| u.tier).max(), Some(3));
+        // The Catapult is honestly tier 1: a Workshop needs no hall upgrade.
+        assert_eq!(unit("Catapult").tier, 1);
+        assert_eq!(unit("Knight").tier, 3);
+
+        // --- the counter triangle, as data rather than as English ----------
+        // `class` plus the three multipliers is the whole triangle. Without
+        // `class` even an exported `vs_cavalry_mult` would be unusable: no
+        // field would say that a Knight is what it hits.
+        let cavalry: Vec<&str> = catalog
+            .units
+            .iter()
+            .filter(|u| u.class == Some("Cavalry"))
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(cavalry, vec!["Raider", "Knight"]);
+        let anti_cavalry: Vec<&str> = catalog
+            .units
+            .iter()
+            .filter(|u| u.vs_cavalry_mult > 1.0)
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(anti_cavalry, vec!["Spearman"]);
+        let anti_siege: Vec<&str> = catalog
+            .units
+            .iter()
+            .filter(|u| u.vs_siege_mult > 1.0)
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(anti_siege, vec!["Raider"]);
+        assert_eq!(unit("Catapult").class, Some("Siege"));
+        // Siege is the answer to fortification, and it says so numerically.
+        assert!(unit("Catapult").vs_building_mult > 1.0);
+        // dps is computable, which is what every description quotes.
+        assert!(catalog.units.iter().all(|u| u.attack_cooldown > 0.0));
+
+        // --- the reverse indices agree with the forward ones ---------------
+        for r in &catalog.research {
+            assert!(
+                building(r.researched_at).researches.contains(&r.id),
+                "{} is researched at {} but that building does not list it",
+                r.id,
+                r.researched_at
+            );
+        }
+        for i in &catalog.items {
+            assert!(
+                building(i.sold_at).sells.contains(&i.id),
+                "{} is sold at {} but that building does not list it",
+                i.id,
+                i.sold_at
+            );
+        }
+        // Ability gates are numbers, not sentences to parse.
+        let ult = catalog
+            .abilities
+            .iter()
+            .find(|a| a.id == "Warcry")
+            .expect("the Champion's ultimate");
+        assert_eq!(ult.unlock_hero_level, Some(5));
+        assert_eq!(ult.unlock_tier, None);
+        assert_eq!(ult.unlock, "hero level 5");
+        for a in &catalog.abilities {
+            assert_eq!(
+                a.unlock == "always",
+                a.unlock_hero_level.is_none() && a.unlock_tier.is_none(),
+                "{}: the prose and the numbers disagree about the gate",
+                a.id
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The Sorcerer's Slow: the first shipping crowd control, and the proof
+    // that a status ability is a table row rather than a system.
+    // -----------------------------------------------------------------------
+
+    /// The one ability slot the Sorcerer has.
+    fn slow_def() -> AbilityDef {
+        let list = abilities_of_unit(UnitKind::Sorcerer);
+        assert_eq!(list.len(), 1, "the Sorcerer ships exactly one ability");
+        list[0]
+    }
+
+    /// The whole bead, end to end and without a World: take the Sorcerer's
+    /// ability straight out of the table, build the status instance combat.rs
+    /// would build from it, and read the result through `effective_stats` —
+    /// the one function units.rs and combat.rs actually run on. If this holds,
+    /// a Slow landing on a Raider really does what the card claims.
+    #[test]
+    fn sorcerer_slow_cripples_a_charge_through_effective_stats() {
+        let def = slow_def();
+        assert_eq!(def.name, "Slow");
+        assert_eq!(
+            def.effect,
+            AbilityEffect::ApplyStatus {
+                status: StatusKind::Slow,
+                targets: AbilityTargets::Enemies,
+                also: None,
+            },
+            "Slow must reach the status framework through ApplyStatus, not a new variant",
+        );
+
+        // Exactly what `cast_abilities` constructs for an ApplyStatus effect.
+        let mut effects = StatusEffects::new();
+        effects.apply(StatusEffect::new(
+            StatusKind::Slow,
+            def.power,
+            0.0,
+            def.duration,
+            StatusSource::Ability,
+        ));
+
+        // The victim the ability was designed against.
+        let charger = UnitKind::Raider;
+        let base = effective_unit_stats(charger, None);
+        let slowed = effective_unit_stats(charger, Some(&effects));
+
+        // Legs: -40%, and now slower than the Footman it was diving past.
+        assert!((slowed.speed - base.speed * 0.6).abs() < 1e-4);
+        assert!(
+            slowed.speed < unit_stats(UnitKind::Footman).speed,
+            "a slowed Raider ({}) must be slower than a Footman ({})",
+            slowed.speed,
+            unit_stats(UnitKind::Footman).speed,
+        );
+
+        // Weapon: attack speed is the RECIPROCAL of cooldown, so -40% attack
+        // speed is a cooldown DIVIDED by 0.6, not multiplied by it. This is
+        // the arithmetic `effective_stats` exists to own.
+        assert!((slowed.attack_cooldown - base.attack_cooldown / 0.6).abs() < 1e-4);
+        assert!(slowed.attack_cooldown > base.attack_cooldown);
+
+        // Nothing else moved: Slow is a tempo debuff, not a damage one.
+        assert_eq!(slowed.damage_mult, 1.0);
+        assert_eq!(slowed.damage_taken_mult, 1.0);
+
+        // And it ends. `tick_status_effects` calls exactly this.
+        let mut expired = effects.clone();
+        assert!(expired.expire(def.duration + 0.01));
+        assert!(expired.is_empty());
+        let recovered = effective_unit_stats(charger, Some(&expired));
+        assert!((recovered.speed - base.speed).abs() < 1e-4);
+    }
+
+    /// Massing Sorcerers must widen the debuff, never deepen it. `Slow` is a
+    /// debuff and debuffs REFRESH — three casters on one victim is still -40%,
+    /// which is what keeps crowd control from becoming a stun.
+    #[test]
+    fn massed_sorcerers_refresh_a_slow_rather_than_stacking_it() {
+        let def = slow_def();
+        let mut effects = StatusEffects::new();
+        for i in 0..3 {
+            effects.apply(StatusEffect::new(
+                StatusKind::Slow,
+                def.power,
+                i as f32,
+                def.duration,
+                StatusSource::Ability,
+            ));
+        }
+        assert_eq!(effects.iter().count(), 1);
+        assert!((effects.magnitude(StatusKind::Slow) - def.power).abs() < 1e-4);
+    }
+
+    /// The Sorcerer is the first caster in the game that is not a hero: no
+    /// `Hero` component, no mana, gated on its cooldown slot alone. The
+    /// readiness rule has to answer that without special-casing it.
+    #[test]
+    fn the_sorcerer_is_a_mana_less_caster_gated_only_by_cooldown() {
+        let def = slow_def();
+        assert_eq!(def.mana_cost, 0.0, "a non-hero caster cannot pay mana");
+        assert_eq!(def.unlock, AbilityUnlock::Always);
+
+        // No hero, no cooldown store yet -> ready.
+        assert!(ability_ready(&def, None, None, 0));
+
+        let mut cds = AbilityCooldowns::default();
+        cds.start(0, def.cooldown);
+        assert!(!ability_ready(&def, None, Some(&cds), 0));
+        cds.tick(def.cooldown + 0.01);
+        assert!(ability_ready(&def, None, Some(&cds), 0));
+
+        // And it is on by default — a caster whose only value is a spell it
+        // never casts is a statue.
+        assert_eq!(default_autocast(UnitKind::Sorcerer), Some((0, 1)));
+        assert_eq!(default_autocast(UnitKind::Hero), None);
+    }
+
+    /// The Sanctum's whole content wiring, asked of the derived tables rather
+    /// than of the enum: it is placeable, it is a production building (so it
+    /// counts for the win condition), it wants a Keep, and a Castle satisfies
+    /// that for free.
+    #[test]
+    fn the_sanctum_is_a_tier_two_building_that_trains_the_sorcerer() {
+        assert_eq!(trainable(BuildingKind::Sanctum), &[UnitKind::Sorcerer]);
+        assert!(building_placeable(BuildingKind::Sanctum));
+        assert_eq!(building_tier(BuildingKind::Sanctum), 1, "not on a ladder");
+
+        let reqs = building_requires(BuildingKind::Sanctum);
+        assert_eq!(reqs, &[BuildingKind::Keep]);
+        assert!(!requirements_met(reqs, [BuildingKind::TownHall].into_iter()));
+        assert!(requirements_met(reqs, [BuildingKind::Keep].into_iter()));
+        assert!(
+            requirements_met(reqs, [BuildingKind::Castle].into_iter()),
+            "teching past the gate must never close it",
+        );
+
+        // The Sorcerer needs no requirement of its own: the Sanctum IS the
+        // gate, and stating it twice would let the two drift.
+        assert!(unit_requires(UnitKind::Sorcerer).is_empty());
+
+        // The catalog picks both up with no bespoke entry.
+        let cat = game_catalog();
+        let unit = cat
+            .units
+            .iter()
+            .find(|u| u.id == "Sorcerer")
+            .expect("Sorcerer in catalog");
+        assert_eq!(unit.trained_at, "Sanctum");
+        assert!(unit.vision > 0.0, "every kind needs a vision radius");
+        let building = cat
+            .buildings
+            .iter()
+            .find(|b| b.id == "Sanctum")
+            .expect("Sanctum in catalog");
+        assert_eq!(building.trains, vec!["Sorcerer"]);
+        assert_eq!(building.requires, vec!["Keep"]);
+        assert!(building.vision > 0.0);
+        assert!(
+            cat.abilities
+                .iter()
+                .any(|a| a.caster == "Sorcerer" && a.id == "Slow" && a.status == Some("Slow")),
+            "the catalog must describe Slow so both seats can read it",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hero slots
+    // -----------------------------------------------------------------------
+
+    /// One rung, one hero. Derived from the ladder, so a fourth rung needs no
+    /// edit here — and tier 3's third slot is deliberately unreachable today,
+    /// because only two hero classes exist.
+    #[test]
+    fn hero_slots_climb_the_hall_ladder_one_per_rung() {
+        assert_eq!(hero_slots(TechTier::T1), 1);
+        assert_eq!(hero_slots(TechTier::T2), 2);
+        assert_eq!(hero_slots(TechTier::T3), 3);
+
+        for kind in ALL_BUILDING_KINDS.into_iter().filter(|k| is_hall(*k)) {
+            let tier = tech_tier_for([kind].into_iter());
+            assert_eq!(
+                hero_slots(tier),
+                building_tier(kind),
+                "{} must open exactly its rung's worth of hero slots",
+                building_name(kind),
+            );
+        }
+
+        let classes = ALL_UNIT_KINDS
+            .into_iter()
+            .filter(|k| is_hero_kind(*k))
+            .count();
+        assert_eq!(
+            classes, 2,
+            "if a third hero class ships, tier 3's third slot becomes reachable — \
+             update docs and the AI's HERO_PICK_ORDER",
+        );
+    }
+
+    /// The slot rule itself, including the case that made it worth extracting:
+    /// a hero already sitting in a QUEUE spends a slot exactly like one
+    /// standing on the map, so two halls cannot each pay for one.
+    #[test]
+    fn hero_slots_count_living_and_queued_heroes_and_forbid_duplicate_classes() {
+        use HeroSlotVerdict::*;
+        let champion = UnitKind::Hero;
+        let priestess = UnitKind::Priestess;
+
+        // Tier 1: one slot, and it is the first hero of either class.
+        assert_eq!(hero_slot_check(&[], champion, TechTier::T1), Ok);
+        assert_eq!(hero_slot_check(&[], priestess, TechTier::T1), Ok);
+        assert_eq!(
+            hero_slot_check(&[champion], priestess, TechTier::T1),
+            NoSlot { used: 1, slots: 1 },
+            "a TownHall team may not have a second hero of ANY class",
+        );
+
+        // Tier 2: the second class fits, a duplicate never does.
+        assert_eq!(hero_slot_check(&[champion], priestess, TechTier::T2), Ok);
+        assert_eq!(
+            hero_slot_check(&[champion], champion, TechTier::T2),
+            DuplicateClass,
+            "distinct classes only — a Keep buys a different hero, not a copy",
+        );
+        assert_eq!(
+            hero_slot_check(&[champion, priestess], champion, TechTier::T2),
+            DuplicateClass,
+            "the class check outranks the slot check, so the error is the true one",
+        );
+
+        // THE QUEUE EDGE CASE: `held` is living heroes PLUS everything in
+        // flight. A Champion alive and a Priestess merely queued fills a
+        // tier-2 team's slate — a further request is refused even though only
+        // one hero is standing on the map.
+        let held_with_queued = [champion, priestess];
+        assert_eq!(
+            hero_slot_check(&held_with_queued, priestess, TechTier::T2),
+            DuplicateClass,
+        );
+        assert_eq!(
+            hero_slot_check(&held_with_queued, champion, TechTier::T3),
+            DuplicateClass,
+            "even at tier 3 with a free slot, the class is the wall",
+        );
+
+        // Two of the SAME hero queued in two different halls: the second one
+        // to reach a pay-point sees the first in `held` and is refused.
+        assert_eq!(
+            hero_slot_check(&[champion], champion, TechTier::T3),
+            DuplicateClass,
+        );
+
+        // Losing the Keep closes the slot for FUTURE heroes without
+        // confiscating the ones standing: the check refuses, it never kills.
+        assert_eq!(
+            hero_slot_check(&[champion, priestess], UnitKind::Hero, TechTier::T1),
+            DuplicateClass,
+        );
+        assert_eq!(
+            hero_slot_check(&[champion], priestess, TechTier::T1),
+            NoSlot { used: 1, slots: 1 },
+        );
+    }
+
+    /// Where hero SLOTS meet hero ULTIMATES: with two heroes on the field the
+    /// unlock predicate has to read the level of the hero it is asked about,
+    /// and revival has to hand back that hero's own progression.
+    ///
+    /// The failure this pins is specific and was reachable: while records were
+    /// one-per-team, a Champion's level answered for the Priestess too, so a
+    /// level-6 Champion would have unlocked Sanctuary on a level-1 Priestess
+    /// the moment she was trained. Records are per class, so each hero's
+    /// ultimate opens on its own XP — and survives its own death.
+    #[test]
+    fn each_hero_class_unlocks_its_own_ultimate_from_its_own_record() {
+        let team = Team::Human;
+        let mut records = HeroRecords::default();
+
+        // A veteran Champion and a brand-new Priestess.
+        records.set(team, HeroRecord { level: 6, xp: 40.0, kind: UnitKind::Hero });
+        records.set(team, HeroRecord { level: 1, xp: 0.0, kind: UnitKind::Priestess });
+
+        let ultimate = |kind: UnitKind| {
+            let list = abilities_of_unit(kind);
+            *list
+                .iter()
+                .find(|d| matches!(d.unlock, AbilityUnlock::HeroLevel(_)))
+                .expect("both hero classes ship a level-gated ultimate")
+        };
+        let champion_ult = ultimate(UnitKind::Hero);
+        let priestess_ult = ultimate(UnitKind::Priestess);
+        assert_eq!(champion_ult.name, "Warcry");
+        assert_eq!(priestess_ult.name, "Sanctuary");
+
+        // Each hero is rebuilt from ITS OWN record, exactly as units.rs does.
+        let champion = Hero::from_record(records.get(team, UnitKind::Hero));
+        let priestess = Hero::from_record(records.get(team, UnitKind::Priestess));
+        assert_eq!(champion.level, 6);
+        assert_eq!(priestess.level, 1);
+
+        // T3 in hand, so nothing here is a tier gate in disguise.
+        let ctx = |h: &Hero| UnlockCtx::new(h.level, TechTier::T3);
+        assert!(
+            ability_unlocked(&champion_ult, ctx(&champion)),
+            "a level-6 Champion has earned Warcry",
+        );
+        assert!(
+            !ability_unlocked(&priestess_ult, ctx(&priestess)),
+            "a level-1 Priestess must NOT inherit the Champion's level",
+        );
+
+        // She levels to 5 and it opens — then she dies, and revival restores
+        // her own record, so the ultimate is still hers.
+        records.set(team, HeroRecord { level: 5, xp: 10.0, kind: UnitKind::Priestess });
+        let revived = Hero::from_record(records.get(team, UnitKind::Priestess));
+        assert_eq!(revived.level, 5);
+        assert!(
+            ability_unlocked(&priestess_ult, ctx(&revived)),
+            "Sanctuary must survive a revival, because the level does",
+        );
+        // ...and the Champion's own record is untouched by any of it.
+        assert_eq!(records.get(team, UnitKind::Hero).map(|r| r.level), Some(6));
+
+        // Both ultimates coexist: two classes, two slots, one team, one match.
+        assert_eq!(hero_slots(TechTier::T2), 2);
+        assert_eq!(
+            hero_slot_check(&[UnitKind::Hero], UnitKind::Priestess, TechTier::T2),
+            HeroSlotVerdict::Ok,
+            "a Keep team may field both ultimates at once",
+        );
+    }
+
+    /// Records are per CLASS now, and so is the price: a team fielding a
+    /// level-6 Champion still pays full freight for its first Priestess, and
+    /// reviving the Champion is not discounted by the Priestess existing.
+    #[test]
+    fn hero_records_and_prices_are_per_class() {
+        let mut records = HeroRecords::default();
+        let team = Team::Human;
+
+        let (g, l, t) = hero_train_cost(&records, team, UnitKind::Hero);
+        let base = unit_stats(UnitKind::Hero);
+        assert_eq!(
+            (g, l, t),
+            (base.cost_gold, base.cost_lumber, base.train_time)
+        );
+
+        records.set(
+            team,
+            HeroRecord {
+                level: 6,
+                xp: 12.0,
+                kind: UnitKind::Hero,
+            },
+        );
+        assert_eq!(
+            hero_train_cost(&records, team, UnitKind::Hero),
+            (HERO_REVIVE_COST_GOLD, 0, HERO_REVIVE_TIME),
+        );
+        let priestess = unit_stats(UnitKind::Priestess);
+        assert_eq!(
+            hero_train_cost(&records, team, UnitKind::Priestess),
+            (
+                priestess.cost_gold,
+                priestess.cost_lumber,
+                priestess.train_time
+            ),
+            "a Champion's record must not discount a first Priestess",
+        );
+
+        // Both classes coexist, upsert keeps one record each, and the other
+        // team is untouched.
+        records.set(
+            team,
+            HeroRecord {
+                level: 2,
+                xp: 5.0,
+                kind: UnitKind::Priestess,
+            },
+        );
+        records.set(
+            team,
+            HeroRecord {
+                level: 7,
+                xp: 0.0,
+                kind: UnitKind::Hero,
+            },
+        );
+        assert_eq!(records.list(team).len(), 2);
+        assert_eq!(records.get(team, UnitKind::Hero).map(|r| r.level), Some(7));
+        assert_eq!(
+            records.get(team, UnitKind::Priestess).map(|r| r.level),
+            Some(2)
+        );
+        assert!(records.list(Team::Claude).is_empty());
     }
 
     // -----------------------------------------------------------------------
