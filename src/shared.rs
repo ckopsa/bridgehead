@@ -236,6 +236,16 @@ pub struct UnitStats {
     /// current kind can; the flag exists so a pure interceptor is data, not a
     /// code change.
     pub can_hit_ground: bool,
+
+    // --- perception -------------------------------------------------------
+    /// How far this kind SEES, in world units. The only input to fog of war,
+    /// and deliberately independent of `range`: what a unit can shoot and what
+    /// it can find are different questions, and the gap between them is where
+    /// scouting lives. Catapults see less than they shoot (siege needs
+    /// spotters); Raiders see far more than they can hit (cavalry is the
+    /// scout). Exported in the catalog, so a commander can plan around it the
+    /// same way the player reads it off the minimap.
+    pub vision: f32,
 }
 
 /// How high above the ground plane flying units are drawn and held. Chosen to
@@ -284,12 +294,14 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             range: 1.8, attack_cooldown: 1.5, speed: 8.0, train_time: 8.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 12.0,
         },
         UnitKind::Footman => UnitStats {
             cost_gold: 135, cost_lumber: 0, supply: 2, hp: 140.0, damage: 12.0,
             range: 2.0, attack_cooldown: 1.2, speed: 7.0, train_time: 12.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 16.0,
         },
         // The line's anti-air: a footman screen is helpless overhead, archers
         // behind it are not.
@@ -298,6 +310,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             range: 14.0, attack_cooldown: 1.5, speed: 7.0, train_time: 12.0, projectile: true,
             vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: true, can_hit_ground: true,
+            vision: 18.0,
         },
         // Base (level 1) stats; damage/HP grow per level — see `Hero`.
         // The Champion swings a greatsword: no reach into the air, and its
@@ -308,6 +321,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             range: 2.4, attack_cooldown: 1.1, speed: 7.5, train_time: 25.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 20.0,
         },
         // Outranges towers (20 vs 16) and pulverizes structures, but 15 damage
         // vs units, 110 hp, and 4.5 speed means anything that reaches it wins.
@@ -318,6 +332,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             range: 20.0, attack_cooldown: 3.0, speed: 4.5, train_time: 22.0, projectile: true,
             vs_building_mult: 6.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 14.0,
         },
         // Speed is the weapon: dives catapults (2x) and worker lines, melts
         // under focused fire. Gold-heavy so it competes with footmen for budget.
@@ -326,6 +341,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             range: 2.2, attack_cooldown: 1.1, speed: 10.5, train_time: 16.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 2.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 24.0,
         },
         // Ranged support hero: heals instead of slams. Base (level 1) stats.
         // Her bolts track upward, so the support hero is also the hero answer
@@ -335,6 +351,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             range: 10.0, attack_cooldown: 1.4, speed: 7.5, train_time: 25.0, projectile: true,
             vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: true, can_hit_ground: true,
+            vision: 18.0,
         },
         // The counter-triangle's missing third leg. Before this, a team that
         // met Raiders had nothing at tier 1 to answer them: Footmen are too
@@ -353,6 +370,12 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             range: 2.6, attack_cooldown: 1.7, speed: 5.5, train_time: 10.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 5.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
+            // A picket that cannot see the riders coming is not a picket, so
+            // the anti-cavalry line watches a little further than a footman.
+            // Still well short of the Raider's 24: cavalry keeps the initiative
+            // and gets to choose the engagement, which is what makes the
+            // counter a wall you walk into rather than a patrol that hunts you.
+            vision: 18.0,
         },
     }
 }
@@ -380,21 +403,28 @@ pub struct BuildingStats {
     pub size: f32,
     /// Some for buildings that fight back (towers). combat.rs executes.
     pub attack: Option<BuildingAttack>,
+    /// How far this structure SEES. Buildings are a team's permanent eyes, so
+    /// this is what makes a forward outpost worth its gold and a Tower more
+    /// than a gun: a Tower sees 20 against a 16 attack range, so it is never
+    /// shooting at something the team cannot also see. Vision applies while
+    /// under construction too — a builder standing on a foundation is looking
+    /// around.
+    pub vision: f32,
 }
 
 pub fn building_stats(kind: BuildingKind) -> BuildingStats {
     match kind {
         BuildingKind::TownHall => BuildingStats {
             cost_gold: 385, cost_lumber: 205, hp: 1200.0, build_time: 40.0,
-            supply_provided: 10, size: 8.0, attack: None,
+            supply_provided: 10, size: 8.0, attack: None, vision: 26.0,
         },
         BuildingKind::Barracks => BuildingStats {
             cost_gold: 160, cost_lumber: 60, hp: 700.0, build_time: 25.0,
-            supply_provided: 0, size: 6.0, attack: None,
+            supply_provided: 0, size: 6.0, attack: None, vision: 18.0,
         },
         BuildingKind::Farm => BuildingStats {
             cost_gold: 80, cost_lumber: 20, hp: 350.0, build_time: 12.0,
-            supply_provided: 6, size: 4.0, attack: None,
+            supply_provided: 6, size: 4.0, attack: None, vision: 12.0,
         },
         BuildingKind::Tower => BuildingStats {
             cost_gold: 110, cost_lumber: 80, hp: 550.0, build_time: 25.0,
@@ -402,18 +432,19 @@ pub fn building_stats(kind: BuildingKind) -> BuildingStats {
             attack: Some(BuildingAttack {
                 damage: 16.0, range: 16.0, cooldown: 1.3, can_hit_air: true,
             }),
+            vision: 20.0,
         },
         BuildingKind::Wall => BuildingStats {
             cost_gold: 25, cost_lumber: 10, hp: 300.0, build_time: 8.0,
-            supply_provided: 0, size: 2.0, attack: None,
+            supply_provided: 0, size: 2.0, attack: None, vision: 8.0,
         },
         BuildingKind::Workshop => BuildingStats {
             cost_gold: 140, cost_lumber: 100, hp: 550.0, build_time: 22.0,
-            supply_provided: 0, size: 5.0, attack: None,
+            supply_provided: 0, size: 5.0, attack: None, vision: 16.0,
         },
         BuildingKind::Shop => BuildingStats {
             cost_gold: 75, cost_lumber: 60, hp: 400.0, build_time: 15.0,
-            supply_provided: 0, size: 4.0, attack: None,
+            supply_provided: 0, size: 4.0, attack: None, vision: 14.0,
         },
         // Tier 2/3 halls. `cost_*` and `build_time` are the price and duration
         // of the UPGRADE STEP that produces them, not of a placement — these
@@ -422,13 +453,21 @@ pub fn building_stats(kind: BuildingKind) -> BuildingStats {
         // Footprint stays 8.0 all the way up: an upgrade must never need room
         // the original hall did not already occupy, or a tightly packed base
         // could not tier up at all. HP is the visible reward for the money.
+        //
+        // Vision climbs with the rung for the same reason HP does. A hall is
+        // its team's permanent eye over its own base (see TownHall's 26), and
+        // the thing you are buying with an upgrade is a taller fortification —
+        // so each rung watches a little further over its own ground. It is a
+        // real if modest reward: at Castle the hall alone covers the whole
+        // approach a Tower would, without the Tower. Strictly increasing, like
+        // every other number on this ladder.
         BuildingKind::Keep => BuildingStats {
             cost_gold: 320, cost_lumber: 160, hp: 1700.0, build_time: 40.0,
-            supply_provided: 10, size: 8.0, attack: None,
+            supply_provided: 10, size: 8.0, attack: None, vision: 30.0,
         },
         BuildingKind::Castle => BuildingStats {
             cost_gold: 480, cost_lumber: 240, hp: 2200.0, build_time: 50.0,
-            supply_provided: 10, size: 8.0, attack: None,
+            supply_provided: 10, size: 8.0, attack: None, vision: 34.0,
         },
     }
 }
@@ -796,6 +835,8 @@ pub struct CatalogUnit {
     pub flying: bool,
     pub can_hit_air: bool,
     pub can_hit_ground: bool,
+    /// Sight radius — how far this kind lifts fog of war for its team.
+    pub vision: f32,
     pub trained_at: &'static str,
     pub requires: Vec<&'static str>,
     pub description: &'static str,
@@ -837,6 +878,8 @@ pub struct CatalogBuilding {
     pub supply_provided: u32,
     pub size: f32,
     pub attack: Option<CatalogAttack>,
+    /// Sight radius — how far this structure lifts fog of war for its team.
+    pub vision: f32,
     pub built_by: &'static str,
     pub requires: Vec<&'static str>,
     pub trains: Vec<&'static str>,
@@ -944,6 +987,7 @@ pub fn game_catalog() -> Catalog {
                     flying: s.flying,
                     can_hit_air: s.can_hit_air,
                     can_hit_ground: s.can_hit_ground,
+                    vision: s.vision,
                     trained_at: trainer_of(k),
                     requires: unit_requires(k).iter().map(|b| building_name(*b)).collect(),
                     description: unit_description(k),
@@ -968,6 +1012,7 @@ pub fn game_catalog() -> Catalog {
                         cooldown: a.cooldown,
                         can_hit_air: a.can_hit_air,
                     }),
+                    vision: s.vision,
                     built_by: if building_placeable(k) { "Worker" } else { "Upgrade" },
                     requires: building_requires(k).iter().map(|b| building_name(*b)).collect(),
                     trains: trainable(k).iter().map(|u| kind_name(*u)).collect(),
@@ -2343,6 +2388,720 @@ impl NavGrid {
 }
 
 // ---------------------------------------------------------------------------
+// Fog of war — one rule of knowability, computed once, rendered twice
+// ---------------------------------------------------------------------------
+//
+// This is the last of the three asymmetries in THESIS.md. Until now the
+// snapshot handed a commander the whole board while the player at the keyboard
+// got one screenful, and the scripted AI read enemy positions straight out of
+// the ECS. Three different notions of "what is knowable" for one game.
+//
+// So knowability is defined exactly once, here, in the same file that owns the
+// event feed and for the same reason: a rule with two implementations is two
+// rules, and two rules is an information advantage for whoever has the better
+// one. `update_fog` walks the world at ~4 Hz and writes one `FogGrid` per
+// team. Everything downstream only ever *reads* it:
+//
+//   * bridge.rs filters each seat's snapshot through that seat's grid,
+//   * ui.rs draws the identical grid as a terrain overlay and minimap fog and
+//     hides the same entities the snapshot omits,
+//   * ai.rs and doctrine.rs take their decision inputs through it,
+//
+// which is what makes "snapshot content == renderable content" a property of
+// the code rather than a promise in a comment.
+//
+// WHAT IS *NOT* FOG-GATED, and why. Fog models a commander's ATTENTION, not a
+// unit's senses. A tower that shoots what walks past it, a footman that swings
+// at whatever closes on him, a leashed squad that holds its anchor — those are
+// the units' own eyes, they run in combat.rs, and gating them would produce
+// soldiers who stand still while being stabbed because headquarters had not
+// noticed yet. The line is: *where a unit is sent* obeys fog; *what a unit does
+// when something arrives in front of it* does not. See docs/FOG.md.
+//
+// Map GEOGRAPHY is public and always was: terrain layout, chokepoints, and
+// gold mine positions ship in every snapshot and paint on every minimap. Fog
+// hides what the enemy is DOING, not where the map's furniture is.
+
+/// `WC3_FOG=0` restores the pre-v2 omniscient baseline: every cell permanently
+/// `Visible`, no memory, nothing filtered anywhere. It exists so old AARs and
+/// balance tooling have something to compare against — not as a gameplay
+/// option. Default is on.
+pub const FOG_ENV: &str = "WC3_FOG";
+
+/// Game-seconds between recomputes (~4 Hz). Deliberately GAME time and not
+/// real time, unlike the event feed's cadence: the feed keeps a *watcher*
+/// current and a watcher's attention runs at one second per second, but fog is
+/// a gameplay input that the scripted AI and the doctrine layer both read, so
+/// a `WC3_SPEED=16` run has to resolve the same number of fog updates per
+/// game-second as a 1x run or the two are not the same match.
+const FOG_INTERVAL: f32 = 0.25;
+
+/// Ordering handle for the fog recompute. Consumers (`bridge.rs`, `ui.rs`,
+/// `ai.rs`, `doctrine.rs`) declare `.after(FogSet)` so that every reader in a
+/// frame sees the same grid, and never the previous tick's on the frame the
+/// grid flips.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FogSet;
+
+/// Classic two-level fog. `Explored` is the interesting one: it is the state
+/// that lets a player remember terrain and structures without being told what
+/// is standing on them right now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CellVis {
+    /// Never seen by this team. Terrain unknown, everything on it unknown.
+    #[default]
+    Unexplored,
+    /// Seen before, not seen now. Terrain and remembered enemy BUILDINGS
+    /// persist at their last observed state; units do not (an army is not
+    /// furniture, and a remembered army is a lie that gets people killed).
+    Explored,
+    /// In sight of a living unit or building of this team, right now.
+    Visible,
+}
+
+impl CellVis {
+    /// Currently in sight — the test for "may this team act on it".
+    pub fn sees(self) -> bool {
+        matches!(self, CellVis::Visible)
+    }
+    /// Visible now or seen at some point — the test for "may this team
+    /// remember it".
+    pub fn known(self) -> bool {
+        !matches!(self, CellVis::Unexplored)
+    }
+}
+
+/// An enemy structure as this team last observed it. Buildings are remembered
+/// because they do not move: reporting one where it was is honest, and it is
+/// exactly what a human remembers after scouting. HP is the observed HP, so a
+/// ghost can be stale — a razed barracks keeps its ghost until somebody looks
+/// at the spot again, which is the correct amount of wrong.
+#[derive(Clone, Copy, Debug)]
+pub struct RememberedBuilding {
+    /// The real entity's `to_bits()`, so a renderer can match a ghost against
+    /// the live entity and a commander can keep referring to it by id.
+    pub id: u64,
+    pub team: Team,
+    pub kind: BuildingKind,
+    pub pos: Vec3,
+    pub hp: f32,
+    pub max_hp: f32,
+    /// Was it finished when last observed?
+    pub done: bool,
+    /// Game time of the observation.
+    pub last_seen: f32,
+}
+
+/// One team's knowledge of the map: what it can see now, what it has ever
+/// seen, and what it remembers standing there.
+pub struct FogGrid {
+    /// `GRID_DIM * GRID_DIM`, indexed exactly like `NavGrid` — fog reuses the
+    /// nav grid's cell geometry rather than inventing a second one, so "the
+    /// cell a unit stands in" means one thing in this codebase.
+    cells: Vec<CellVis>,
+    ghosts: std::collections::HashMap<u64, RememberedBuilding>,
+    explored: usize,
+    visible: usize,
+}
+
+impl FogGrid {
+    fn dark() -> Self {
+        FogGrid {
+            cells: vec![CellVis::Unexplored; GRID_DIM * GRID_DIM],
+            ghosts: std::collections::HashMap::new(),
+            explored: 0,
+            visible: 0,
+        }
+    }
+
+    /// The `WC3_FOG=0` grid: permanently and entirely lit. Every reader works
+    /// unchanged against it, which is why the escape hatch needs no `if` at
+    /// any call site.
+    fn revealed() -> Self {
+        let n = GRID_DIM * GRID_DIM;
+        FogGrid {
+            cells: vec![CellVis::Visible; n],
+            ghosts: std::collections::HashMap::new(),
+            explored: n,
+            visible: n,
+        }
+    }
+
+    pub fn cell(&self, cx: usize, cz: usize) -> CellVis {
+        self.cells[NavGrid::idx(cx, cz)]
+    }
+
+    /// Visibility of a world position. Off-grid resolves to `Visible`: a grid
+    /// miss must never be the reason something is hidden, because a silently
+    /// invisible unit is far worse than a briefly over-shared one.
+    pub fn at(&self, pos: Vec3) -> CellVis {
+        match NavGrid::world_to_cell(pos) {
+            Some((cx, cz)) => self.cell(cx, cz),
+            None => CellVis::Visible,
+        }
+    }
+
+    /// The one question every consumer asks: can this team see that spot now?
+    pub fn sees(&self, pos: Vec3) -> bool {
+        self.at(pos).sees()
+    }
+
+    /// Has this team ever seen that spot?
+    pub fn known(&self, pos: Vec3) -> bool {
+        self.at(pos).known()
+    }
+
+    /// Raw cells, for renderers that paint the whole grid in one pass.
+    pub fn cells(&self) -> &[CellVis] {
+        &self.cells
+    }
+
+    /// Enemy structures this team remembers but cannot currently see.
+    ///
+    /// The filter is load-bearing. The backing map holds a record for every
+    /// enemy structure ever observed, refreshed while it is in sight — that is
+    /// what makes the memory current the moment sight is lost. But a consumer
+    /// iterating it would then emit a ghost for a building it is also
+    /// reporting live, and every renderer would show the enemy base twice.
+    /// "Ghost" means *memory standing in for sight*, so sight wins here.
+    pub fn ghosts(&self) -> impl Iterator<Item = &RememberedBuilding> + '_ {
+        self.ghosts.values().filter(|g| !self.at(g.pos).sees())
+    }
+
+    /// May this team act on that entity at all — because it can see it, or
+    /// because it remembers a structure there? The gate bridge.rs uses to
+    /// reject orders against things a seat should not know exist.
+    pub fn knows_entity(&self, id: u64, pos: Vec3) -> bool {
+        self.sees(pos) || self.ghosts.contains_key(&id)
+    }
+
+    pub fn explored_frac(&self) -> f32 {
+        self.explored as f32 / (GRID_DIM * GRID_DIM) as f32
+    }
+
+    pub fn visible_frac(&self) -> f32 {
+        self.visible as f32 / (GRID_DIM * GRID_DIM) as f32
+    }
+
+    fn recount(&mut self) {
+        self.explored = self.cells.iter().filter(|c| c.known()).count();
+        self.visible = self.cells.iter().filter(|c| c.sees()).count();
+    }
+}
+
+/// Per-team fog, plus the cadence. One producer, several renderers.
+#[derive(Resource)]
+pub struct FogGrids {
+    human: FogGrid,
+    claude: FogGrid,
+    enabled: bool,
+    timer: Timer,
+    /// Light the opening position on frame one instead of a quarter-second in,
+    /// so nothing ever reads an all-dark grid for a team that has a town hall
+    /// standing in the middle of its own vision.
+    force: bool,
+}
+
+impl Default for FogGrids {
+    fn default() -> Self {
+        // Read at resource-init rather than in a Startup system so that no
+        // system can ever observe the wrong mode, not even for one frame.
+        let enabled = std::env::var(FOG_ENV)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+        let grid = || if enabled { FogGrid::dark() } else { FogGrid::revealed() };
+        FogGrids {
+            human: grid(),
+            claude: grid(),
+            enabled,
+            timer: Timer::from_seconds(FOG_INTERVAL, TimerMode::Repeating),
+            force: true,
+        }
+    }
+}
+
+impl FogGrids {
+    /// False under `WC3_FOG=0`. Readers do not need this to be *correct* — the
+    /// revealed grid makes every query answer "yes" — but renderers use it to
+    /// skip painting an overlay that would be entirely transparent.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn get(&self, team: Team) -> &FogGrid {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+
+    fn get_mut(&mut self, team: Team) -> &mut FogGrid {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+}
+
+/// Light every cell whose centre is within `radius` of `pos`. Vision is
+/// radial and terrain does NOT block it: the game has no elevation model, the
+/// `crossings` canyon is a nav barrier rather than a cliff, and a
+/// line-of-sight pass would cost more than the whole rest of the fog system
+/// for a fidelity nobody can act on. Both teams get the same simple rule.
+fn fog_stamp(cells: &mut [CellVis], pos: Vec3, radius: f32) {
+    let reach = (radius / CELL).ceil() as i32;
+    let cx0 = ((pos.x + MAP_HALF) / CELL).floor() as i32;
+    let cz0 = ((pos.z + MAP_HALF) / CELL).floor() as i32;
+    let r2 = radius * radius;
+    for dz in -reach..=reach {
+        for dx in -reach..=reach {
+            let (cx, cz) = (cx0 + dx, cz0 + dz);
+            if cx < 0 || cz < 0 || cx >= GRID_DIM as i32 || cz >= GRID_DIM as i32 {
+                continue;
+            }
+            let (cx, cz) = (cx as usize, cz as usize);
+            let w = NavGrid::cell_to_world(cx, cz);
+            if (w.x - pos.x).powi(2) + (w.z - pos.z).powi(2) <= r2 {
+                cells[NavGrid::idx(cx, cz)] = CellVis::Visible;
+            }
+        }
+    }
+}
+
+/// Recompute both teams' grids and refresh their building memory.
+///
+/// Runs after `apply_death` so a unit that died this frame has already stopped
+/// seeing, and before every consumer (see `FogSet`).
+fn update_fog(
+    time: Res<Time>,
+    mut fog: ResMut<FogGrids>,
+    units: Query<(&Unit, &Team, &Transform)>,
+    buildings: Query<(Entity, &Building, &Team, &Transform, &Health, Has<UnderConstruction>)>,
+) {
+    if !fog.enabled {
+        return;
+    }
+    let due = fog.timer.tick(time.delta()).just_finished();
+    if !due && !fog.force {
+        return;
+    }
+    fog.force = false;
+    let now = ev_r1(time.elapsed_secs());
+
+    for team in [Team::Human, Team::Claude] {
+        let grid = fog.get_mut(team);
+
+        // Everything lit last tick decays to remembered; live eyes re-light it
+        // below. A team that loses its last scout loses sight of the midfield
+        // in the same quarter-second the scout dies.
+        for c in grid.cells.iter_mut() {
+            if *c == CellVis::Visible {
+                *c = CellVis::Explored;
+            }
+        }
+        for (unit, t, tf) in &units {
+            if *t == team {
+                fog_stamp(&mut grid.cells, tf.translation, unit_stats(unit.kind).vision);
+            }
+        }
+        for (_, building, t, tf, _, _) in &buildings {
+            if *t == team {
+                fog_stamp(
+                    &mut grid.cells,
+                    tf.translation,
+                    building_stats(building.kind).vision,
+                );
+            }
+        }
+        grid.recount();
+
+        // --- building memory ------------------------------------------------
+        // Split the borrow so the retain below can read cells while writing
+        // ghosts.
+        let FogGrid { cells, ghosts, .. } = grid;
+        let vis_at = |p: Vec3| match NavGrid::world_to_cell(p) {
+            Some((cx, cz)) => cells[NavGrid::idx(cx, cz)],
+            None => CellVis::Visible,
+        };
+        let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (e, building, t, tf, health, under) in &buildings {
+            if *t == team {
+                continue;
+            }
+            let id = e.to_bits();
+            live.insert(id);
+            if vis_at(tf.translation).sees() {
+                ghosts.insert(
+                    id,
+                    RememberedBuilding {
+                        id,
+                        team: *t,
+                        kind: building.kind,
+                        pos: tf.translation,
+                        hp: ev_r1(health.current),
+                        max_hp: ev_r1(health.max),
+                        done: !under,
+                        last_seen: now,
+                    },
+                );
+            }
+        }
+        // Forget a ghost only when we can actually see that the thing is gone.
+        // Walk back onto the rubble and the memory clears; stay away and you
+        // keep believing the barracks is still standing, which is precisely
+        // the mistake fog of war is supposed to let you make.
+        ghosts.retain(|id, g| live.contains(id) || !vis_at(g.pos).sees());
+    }
+}
+
+/// Announce the mode once, so a log or an AAR says which rules it was played
+/// under without anyone having to guess from the environment.
+fn log_fog_mode(fog: Res<FogGrids>) {
+    if fog.enabled {
+        info!("fog of war: ON (WC3_FOG=0 to disable)");
+    } else {
+        info!("fog of war: OFF ({FOG_ENV}=0) — omniscient baseline");
+    }
+}
+
+/// Nearest walkable cell this team has never seen. The scripted AI's scouting
+/// primitive: with no enemy structure known, "go look over there" is the only
+/// move that can ever end the game, and it has to be reachable to be worth
+/// walking to.
+pub fn nearest_unexplored(grid: &FogGrid, from: Vec3, nav: &NavGrid) -> Option<Vec3> {
+    let mut best: Option<(f32, Vec3)> = None;
+    for cz in 0..GRID_DIM {
+        for cx in 0..GRID_DIM {
+            if grid.cell(cx, cz) != CellVis::Unexplored || nav.is_blocked(cx, cz) {
+                continue;
+            }
+            let w = NavGrid::cell_to_world(cx, cz);
+            let d = (w.x - from.x).hypot(w.z - from.z);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, w));
+            }
+        }
+    }
+    best.map(|(_, w)| w)
+}
+
+#[cfg(test)]
+mod fog_tests {
+    use super::*;
+
+    /// A grid with one lit disc, built without running the Bevy schedule.
+    fn lit(pos: Vec3, radius: f32) -> FogGrid {
+        let mut grid = FogGrid::dark();
+        fog_stamp(&mut grid.cells, pos, radius);
+        grid.recount();
+        grid
+    }
+
+    #[test]
+    fn vision_is_a_disc_around_the_seer_and_nothing_else() {
+        let grid = lit(Vec3::ZERO, 10.0);
+        assert!(grid.sees(Vec3::ZERO));
+        assert!(grid.sees(Vec3::new(8.0, 0.0, 0.0)));
+        // Well outside the radius: never seen, so not even remembered terrain.
+        assert_eq!(grid.at(Vec3::new(40.0, 0.0, 40.0)), CellVis::Unexplored);
+        assert!(!grid.known(Vec3::new(40.0, 0.0, 40.0)));
+    }
+
+    /// The two-level model: leaving an area demotes it to remembered terrain,
+    /// it does NOT return to unexplored.
+    #[test]
+    fn leaving_an_area_remembers_the_terrain() {
+        let mut grid = lit(Vec3::ZERO, 10.0);
+        for c in grid.cells.iter_mut() {
+            if *c == CellVis::Visible {
+                *c = CellVis::Explored;
+            }
+        }
+        grid.recount();
+        assert!(!grid.sees(Vec3::ZERO));
+        assert!(grid.known(Vec3::ZERO));
+        assert_eq!(grid.at(Vec3::ZERO), CellVis::Explored);
+    }
+
+    /// Altitude must not change what a unit sees: every fog query is XZ, so a
+    /// flyer overhead lights the same cells it would standing on them.
+    #[test]
+    fn vision_ignores_altitude() {
+        let grid = lit(Vec3::new(0.0, FLYER_ALTITUDE, 0.0), 10.0);
+        assert!(grid.sees(Vec3::new(4.0, 0.0, 4.0)));
+    }
+
+    /// `WC3_FOG=0` must make every question answer "yes" so that no consumer
+    /// needs a special case for it.
+    #[test]
+    fn the_revealed_grid_hides_nothing() {
+        let grid = FogGrid::revealed();
+        assert!(grid.sees(Vec3::new(-99.0, 0.0, 99.0)));
+        assert!(grid.known(Vec3::new(0.0, 0.0, 0.0)));
+        assert_eq!(grid.explored_frac(), 1.0);
+    }
+
+    /// Off-grid positions must never be the reason something is hidden.
+    #[test]
+    fn out_of_bounds_resolves_to_visible() {
+        let grid = FogGrid::dark();
+        assert!(grid.sees(Vec3::new(1000.0, 0.0, 1000.0)));
+    }
+
+    /// A ghost is memory STANDING IN FOR sight. While the spot is visible the
+    /// live entity is reported instead, so `ghosts()` must stay silent — this
+    /// is what stops every renderer drawing a scouted base twice.
+    #[test]
+    fn ghosts_yield_only_what_is_currently_unseen() {
+        let mut grid = lit(Vec3::ZERO, 10.0);
+        let remembered = |pos: Vec3, id: u64| RememberedBuilding {
+            id,
+            team: Team::Claude,
+            kind: BuildingKind::Barracks,
+            pos,
+            hp: 700.0,
+            max_hp: 700.0,
+            done: true,
+            last_seen: 12.0,
+        };
+        // One inside the lit disc, one far outside it.
+        let seen = Vec3::new(2.0, 0.0, 2.0);
+        let unseen = Vec3::new(60.0, 0.0, 60.0);
+        grid.ghosts.insert(1, remembered(seen, 1));
+        grid.ghosts.insert(2, remembered(unseen, 2));
+
+        let ids: Vec<u64> = grid.ghosts().map(|g| g.id).collect();
+        assert_eq!(ids, vec![2]);
+
+        // Both remain addressable: you may act on what you can see AND on what
+        // you remember. That is the union the bridge validates orders against.
+        assert!(grid.knows_entity(1, seen));
+        assert!(grid.knows_entity(2, unseen));
+        // Something never seen and not remembered is neither.
+        assert!(!grid.knows_entity(3, unseen));
+    }
+
+    /// The full memory lifecycle through the real system and a real schedule:
+    /// see it, leave it, come back to find it gone. The pure-data tests above
+    /// cannot catch a mistake in `update_fog` itself — a demotion pass that
+    /// forgets to run, a ghost recorded for the wrong team, or a `retain` that
+    /// clears memory the moment sight is lost, which would make the whole
+    /// feature a no-op that still passes every other assertion here.
+    #[test]
+    fn a_building_seen_then_left_is_remembered_then_forgotten() {
+        use std::time::Duration;
+
+        let barracks_at = Vec3::new(6.0, 0.0, 0.0);
+        let far_corner = Vec3::new(-90.0, 0.0, -90.0);
+
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        let mut grids = FogGrids::default();
+        // Pin the mode: the ambient WC3_FOG must not decide a test's outcome.
+        grids.enabled = true;
+        grids.human = FogGrid::dark();
+        grids.claude = FogGrid::dark();
+        app.insert_resource(grids);
+        app.add_systems(Update, update_fog);
+
+        let scout = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+        let barracks = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Claude,
+                Transform::from_translation(barracks_at),
+                Health::new(700.0),
+            ))
+            .id();
+
+        // --- in sight -----------------------------------------------------
+        app.update();
+        {
+            let human = app.world().resource::<FogGrids>().get(Team::Human);
+            assert!(human.sees(barracks_at));
+            assert_eq!(human.ghosts().count(), 0, "what is visible is not a ghost");
+            // The owner is not haunted by its own buildings.
+            let claude = app.world().resource::<FogGrids>().get(Team::Claude);
+            assert_eq!(claude.ghosts().count(), 0);
+        }
+
+        // --- scout walks away: sight lost, memory kept ---------------------
+        app.world_mut()
+            .entity_mut(scout)
+            .insert(Transform::from_translation(far_corner));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(300));
+        app.update();
+        {
+            let human = app.world().resource::<FogGrids>().get(Team::Human);
+            assert!(!human.sees(barracks_at), "sight should have lapsed");
+            assert!(human.known(barracks_at), "terrain stays explored");
+            let ghosts: Vec<&RememberedBuilding> = human.ghosts().collect();
+            assert_eq!(ghosts.len(), 1);
+            assert_eq!(ghosts[0].kind, BuildingKind::Barracks);
+            assert_eq!(ghosts[0].team, Team::Claude);
+            assert_eq!(ghosts[0].pos, barracks_at);
+        }
+
+        // --- razed while unseen: the stale belief SURVIVES ------------------
+        app.world_mut().entity_mut(barracks).despawn();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(300));
+        app.update();
+        assert_eq!(
+            app.world().resource::<FogGrids>().get(Team::Human).ghosts().count(),
+            1,
+            "a building destroyed behind our back must still be believed in"
+        );
+
+        // --- walk back onto the rubble: the belief clears -------------------
+        app.world_mut()
+            .entity_mut(scout)
+            .insert(Transform::from_translation(barracks_at));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(300));
+        app.update();
+        assert_eq!(
+            app.world().resource::<FogGrids>().get(Team::Human).ghosts().count(),
+            0,
+            "seeing the empty spot is the only thing that corrects the memory"
+        );
+    }
+
+    /// The upgrade ladder meets the memory model. `Building.kind` mutates in
+    /// place when a hall tiers up, so a scouted TownHall can become a Keep with
+    /// nobody watching. The memory must keep working and must stay HONESTLY
+    /// stale — reporting the TownHall the scout actually saw, not the Keep it
+    /// has no way to know about. The footprint is 8.0 at every rung, so a ghost
+    /// drawn from the remembered kind is still the right size on screen.
+    #[test]
+    fn a_hall_that_tiers_up_behind_the_fog_keeps_its_stale_ghost() {
+        use std::time::Duration;
+
+        let hall_at = Vec3::new(6.0, 0.0, 0.0);
+        let far_corner = Vec3::new(-90.0, 0.0, -90.0);
+
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        let mut grids = FogGrids::default();
+        grids.enabled = true;
+        grids.human = FogGrid::dark();
+        grids.claude = FogGrid::dark();
+        app.insert_resource(grids);
+        app.add_systems(Update, update_fog);
+
+        let scout = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+        let hall = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::TownHall },
+                Team::Claude,
+                Transform::from_translation(hall_at),
+                Health::new(1200.0),
+            ))
+            .id();
+
+        app.update();
+        // Walk away, so the hall is remembered as a TownHall.
+        app.world_mut()
+            .entity_mut(scout)
+            .insert(Transform::from_translation(far_corner));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(300));
+        app.update();
+        {
+            let ghosts: Vec<RememberedBuilding> = app
+                .world()
+                .resource::<FogGrids>()
+                .get(Team::Human)
+                .ghosts()
+                .copied()
+                .collect();
+            assert_eq!(ghosts.len(), 1);
+            assert_eq!(ghosts[0].kind, BuildingKind::TownHall);
+        }
+
+        // economy.rs finishes the upgrade in place, unobserved.
+        app.world_mut().entity_mut(hall).insert(Building { kind: BuildingKind::Keep });
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(300));
+        app.update();
+        {
+            let ghosts: Vec<RememberedBuilding> = app
+                .world()
+                .resource::<FogGrids>()
+                .get(Team::Human)
+                .ghosts()
+                .copied()
+                .collect();
+            assert_eq!(ghosts.len(), 1, "the ghost must survive a tier-up");
+            assert_eq!(
+                ghosts[0].kind,
+                BuildingKind::TownHall,
+                "memory reports what was seen, not what it has become"
+            );
+            // Every rung shares a footprint, so the drawn ghost is still right.
+            assert_eq!(
+                building_stats(ghosts[0].kind).size,
+                building_stats(BuildingKind::Keep).size
+            );
+        }
+
+        // Scout back: the memory is replaced by the truth, at the new rung.
+        app.world_mut()
+            .entity_mut(scout)
+            .insert(Transform::from_translation(hall_at));
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(300));
+        app.update();
+        {
+            let human = app.world().resource::<FogGrids>().get(Team::Human);
+            assert_eq!(human.ghosts().count(), 0, "sight outranks memory");
+            assert!(human.sees(hall_at));
+        }
+        // And the upgraded hall now sees further for ITS owner than a TownHall
+        // did — the tier-up reward, applied from the live kind every tick
+        // rather than cached at spawn.
+        assert!(building_stats(BuildingKind::Keep).vision > building_stats(BuildingKind::TownHall).vision);
+    }
+
+    #[test]
+    fn nearest_unexplored_prefers_close_and_skips_blocked() {
+        let grid = lit(Vec3::ZERO, 10.0);
+        let nav = NavGrid::default();
+        let target = nearest_unexplored(&grid, Vec3::ZERO, &nav).expect("map is not fully lit");
+        // Just outside the lit disc, not on the far rim of the map.
+        let d = (target.x * target.x + target.z * target.z).sqrt();
+        assert!(d > 9.0 && d < 16.0, "picked {target:?} at distance {d}");
+
+        // A fully explored map has nowhere left to scout, and the caller has
+        // to cope with that rather than being handed a bogus destination.
+        assert!(nearest_unexplored(&FogGrid::revealed(), Vec3::ZERO, &nav).is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Economy resource
 // ---------------------------------------------------------------------------
 
@@ -2585,6 +3344,7 @@ impl Plugin for CorePlugin {
             .init_resource::<SquadOrders>()
             .init_resource::<TechTiers>()
             .init_resource::<GameEvents>()
+            .init_resource::<FogGrids>()
             .add_event::<SpawnUnitEvent>()
             .add_event::<SpawnBuildingEvent>()
             .add_event::<CameraFocus>()
@@ -2596,11 +3356,15 @@ impl Plugin for CorePlugin {
             .add_event::<UseItem>()
             .add_event::<TeleportRequest>()
             .add_event::<UpgradeBuilding>()
-            .add_systems(Startup, (initial_spawns, apply_env_speed))
+            .add_systems(Startup, (initial_spawns, apply_env_speed, log_fog_mode))
             .add_systems(
                 Update,
                 (
                     apply_death,
+                    // The one producer of knowability. After `apply_death` so
+                    // the dead have stopped seeing; ahead of every consumer in
+                    // every other module via `FogSet`.
+                    update_fog.in_set(FogSet).after(apply_death),
                     award_xp,
                     hero_progression,
                     regen_health,
@@ -2615,7 +3379,9 @@ impl Plugin for CorePlugin {
                     // After `apply_death`, so a unit that died this frame is
                     // already gone from the picture the diff walks — the feed
                     // reports losses on the tick they happen, not the next one.
-                    produce_game_events.after(apply_death),
+                    // After `FogSet` because the feed is now vision-filtered:
+                    // a team is told about hostiles and treasure it can see.
+                    produce_game_events.after(apply_death).after(FogSet),
                 ),
             );
     }
@@ -3111,8 +3877,25 @@ fn check_game_over(
 // "Own" means the team the feed belongs to, so the two feeds are mirror images
 // built from one world, and neither carries knowledge the other's owner could
 // not have had. A team's feed reports *its* losses, *its* hero, threats to
-// *its* base. Bounty caches are the one shared entry: treasure glowing on open
-// ground is public information.
+// *its* base.
+//
+// Two categories are about things that are not ours, and both are now filtered
+// through this team's `FogGrid` (see the fog section above):
+//
+//   * "hostiles near base" counts enemies within THREAT_RADIUS of home — 45
+//     world units, which is FARTHER than any vision radius in the stat table.
+//     It was tempting to assume anything near your own base is inside your own
+//     vision by definition; it is not, and unfiltered this event was a
+//     free early-warning radar ringing the whole approach to your base.
+//     Now it reports the hostiles you can actually see.
+//   * bounty caches. Treasure glowing on open ground is public information
+//     only to somebody who is looking at that ground. A cache is announced
+//     when it enters your vision and "gone" only when you are watching the
+//     spot it vanished from — never as news of an empty patch of map you
+//     have no eyes on.
+//
+// Everything else in the vocabulary is own-team knowledge by construction and
+// needs no gate: your losses, your buildings, your hero, your squads.
 
 /// Enemy combat units this close to home count toward the base-threat event.
 const THREAT_RADIUS: f32 = 45.0;
@@ -3338,6 +4121,7 @@ fn produce_game_events(
     real: Res<Time<Real>>,
     mut feed: ResMut<GameEvents>,
     squad_orders: Res<SquadOrders>,
+    fog: Res<FogGrids>,
     unit_q: Query<(
         Entity,
         &Unit,
@@ -3405,6 +4189,7 @@ fn produce_game_events(
             &buildings,
             &bounties,
             &squad_orders,
+            fog.get(team),
         );
         for (message, severity, pos) in produced {
             let seq = feed.next_seq;
@@ -3437,6 +4222,7 @@ fn diff_team(
     buildings: &[EvBuilding],
     bounties: &[EvBounty],
     squad_orders: &SquadOrders,
+    fog: &FogGrid,
 ) -> Vec<(String, EventSeverity, Option<Vec3>)> {
     use std::collections::HashMap;
 
@@ -3465,9 +4251,12 @@ fn diff_team(
                 squad_points.entry(id).or_default().push(u.pos);
             }
         } else if u.kind != UnitKind::Worker {
-            // Workers wander; only combat units count as a threat.
+            // Workers wander; only combat units count as a threat — and only
+            // ones we can see. THREAT_RADIUS (45) is wider than any vision
+            // radius, so without the fog test this event would report an
+            // approach nothing of ours has laid eyes on.
             let d = (u.pos[0] - home.x).hypot(u.pos[1] - home.z);
-            if d <= THREAT_RADIUS {
+            if d <= THREAT_RADIUS && fog.sees(ev_ground(u.pos)) {
                 hostiles.push(u.pos);
             }
         }
@@ -3482,8 +4271,10 @@ fn diff_team(
 
     let threat = hostiles.len();
 
-    let cur_bounties: HashMap<u64, ([f32; 2], u32, f32)> = bounties
+    // What this team can actually see of the treasure on the map right now.
+    let seen_bounties: HashMap<u64, ([f32; 2], u32, f32)> = bounties
         .iter()
+        .filter(|b| fog.sees(ev_ground(b.pos)))
         .map(|b| (b.id, (b.pos, b.gold, b.expires_at)))
         .collect();
 
@@ -3505,7 +4296,7 @@ fn diff_team(
         memo.threat = threat;
         memo.squad_members = members.clone();
         memo.squad_peak = members;
-        memo.bounties = cur_bounties;
+        memo.bounties = seen_bounties;
         return Vec::new();
     }
 
@@ -3647,30 +4438,51 @@ fn diff_team(
     // the spot knows the gold was its own; one without knows it lost the race.
     // Caches that simply time out say nothing: the glow on the ground and the
     // snapshot's `expires_in` already counted them down.
-    for b in bounties {
-        if !memo.bounties.contains_key(&b.id) {
+    //
+    // Under fog the memo is this team's BELIEF about the treasure on the map,
+    // not the map's truth, so the three transitions have to be kept apart:
+    // a cache entering our vision is news, a cache leaving our vision is not
+    // (we go on believing it is there), and a cache we are looking straight at
+    // that is no longer there is news again.
+    let live_ids: std::collections::HashSet<u64> = bounties.iter().map(|b| b.id).collect();
+    let mut cur_bounties = memo.bounties.clone();
+
+    for (id, entry) in &seen_bounties {
+        if !memo.bounties.contains_key(id) {
+            let (pos, gold, _) = entry;
             out.push((
-                format!("bounty spawned: {}g @({:.1},{:.1})", b.gold, b.pos[0], b.pos[1]),
-                EventSeverity::Info,
-                Some(ev_ground(b.pos)),
-            ));
-        }
-    }
-    let mut gone: Vec<(&u64, &([f32; 2], u32, f32))> = memo
-        .bounties
-        .iter()
-        .filter(|(id, _)| !cur_bounties.contains_key(*id))
-        .collect();
-    gone.sort_unstable_by_key(|(id, _)| **id);
-    for (_, (pos, _, expires_at)) in gone {
-        // Tolerance absorbs the rounded clock; anything still short of its
-        // deadline was taken, not timed out.
-        if now + BOUNTY_EXPIRY_EPS < *expires_at {
-            out.push((
-                format!("bounty gone @({:.1},{:.1})", pos[0], pos[1]),
+                format!("bounty spawned: {gold}g @({:.1},{:.1})", pos[0], pos[1]),
                 EventSeverity::Info,
                 Some(ev_ground(*pos)),
             ));
+        }
+        cur_bounties.insert(*id, *entry);
+    }
+
+    let mut gone: Vec<(u64, ([f32; 2], u32, f32))> = memo
+        .bounties
+        .iter()
+        .filter(|(id, _)| !live_ids.contains(*id))
+        .map(|(id, entry)| (*id, *entry))
+        .collect();
+    gone.sort_unstable_by_key(|(id, _)| *id);
+    for (id, (pos, _, expires_at)) in gone {
+        if fog.sees(ev_ground(pos)) {
+            // We are watching the spot and it is empty. Tolerance absorbs the
+            // rounded clock; anything still short of its deadline was taken,
+            // not timed out.
+            if now + BOUNTY_EXPIRY_EPS < expires_at {
+                out.push((
+                    format!("bounty gone @({:.1},{:.1})", pos[0], pos[1]),
+                    EventSeverity::Info,
+                    Some(ev_ground(pos)),
+                ));
+            }
+            cur_bounties.remove(&id);
+        } else if now >= expires_at {
+            // Out of sight and past its deadline: it cannot still be there, so
+            // stop believing in it — silently, because we did not witness it.
+            cur_bounties.remove(&id);
         }
     }
 
@@ -4083,6 +4895,15 @@ mod tests {
             );
             // Supply must not drop, or upgrading could strand an army.
             assert!(to.supply_provided >= from.supply_provided);
+            // Neither may sight: a tier-up must never narrow what the hall
+            // watches, or teching up would blind you in your own base and the
+            // fog would punish the reward.
+            assert!(
+                to.vision >= from.vision,
+                "{} must not see less than {}",
+                building_name(next),
+                building_name(kind)
+            );
             // Cumulative worth strictly grows, so `asset_score` can never
             // punish a team for teching up.
             let (gold_before, lumber_before) = building_value(kind);

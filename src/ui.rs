@@ -24,6 +24,9 @@
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
+use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::render_asset::RenderAssetUsages;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::{PrimaryWindow, SystemCursorIcon};
 use bevy::winit::cursor::CursorIcon;
 use std::collections::{HashMap, VecDeque};
@@ -120,11 +123,19 @@ impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiState>()
             .init_resource::<Notifications>()
-            .add_systems(Startup, (setup_ui, setup_hover).chain())
+            // `setup_fog` after `setup_ui`: it parents the minimap's fog layer
+            // to the `MinimapRoot` that `setup_ui` spawns.
+            .add_systems(Startup, (setup_ui, setup_hover, setup_fog).chain())
             .add_systems(
                 Update,
                 (
                     minimap_static_markers,
+                    // Fog first, so everything downstream in this chain — the
+                    // pickers, the minimap, the hover ring — reads the same
+                    // visibility the player is looking at.
+                    apply_fog_visibility,
+                    update_fog_overlay,
+                    sync_building_ghosts,
                     surrender_hotkey,
                     command_input,
                     panel_clicks,
@@ -145,7 +156,8 @@ impl Plugin for UiPlugin {
                     update_notifications,
                     update_hud,
                 )
-                    .chain(),
+                    .chain()
+                    .after(FogSet),
             );
     }
 }
@@ -1226,12 +1238,22 @@ fn hp_color(frac: f32) -> Color {
     }
 }
 
+/// Can the player see that spot right now? The one question every picker and
+/// every marker in this file asks before letting the interface acknowledge an
+/// enemy. Always the Human grid — this file only ever renders for the human,
+/// even when a script is driving that faction.
+fn fog_sees(fog: &FogGrids, pos: Vec3) -> bool {
+    fog.get(Team::Human).sees(pos)
+}
+
+/// Shift a colour toward white. A NEGATIVE amount darkens instead, which is
+/// how remembered enemy structures are drawn — hence the clamp at both ends.
 fn lighten(c: Color, amount: f32) -> Color {
     let s = c.to_srgba();
     Color::srgb(
-        (s.red + amount).min(1.0),
-        (s.green + amount).min(1.0),
-        (s.blue + amount).min(1.0),
+        (s.red + amount).clamp(0.0, 1.0),
+        (s.green + amount).clamp(0.0, 1.0),
+        (s.blue + amount).clamp(0.0, 1.0),
     )
 }
 
@@ -1568,6 +1590,9 @@ fn spawn_minimap(console: &mut ChildSpawnerCommands) {
                 },
                 BackgroundColor(Color::NONE),
                 BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+                // Above the fog layer — where the camera is looking is never
+                // hidden from the player.
+                ZIndex(3),
                 MinimapViewport,
             ));
         });
@@ -2733,6 +2758,7 @@ fn right_mouse(
         Has<UnderConstruction>,
     )>,
     nodes: Query<(Entity, &Transform, &ResourceNode)>,
+    fog: Res<FogGrids>,
 ) {
     if !buttons.just_pressed(MouseButton::Right) || game_over.0.is_some() {
         return;
@@ -2786,6 +2812,13 @@ fn right_mouse(
         }
         match team {
             Team::Claude => {
+                // An enemy the fog is hiding is not clickable. The bridge
+                // rejects `attack` orders against unseen ids for the same
+                // reason: a target you cannot be shown must not be a target
+                // you can name, or the filtering is decoration.
+                if !fog_sees(&fog, tf.translation) {
+                    continue;
+                }
                 if enemy.is_none_or(|(_, bd)| d < bd) {
                     enemy = Some((e, d));
                 }
@@ -2808,6 +2841,9 @@ fn right_mouse(
         }
         match team {
             Team::Claude => {
+                if !fog_sees(&fog, tf.translation) {
+                    continue;
+                }
                 if !hit_enemy_unit && enemy.is_none_or(|(_, bd)| d < bd) {
                     enemy = Some((e, d));
                 }
@@ -3116,10 +3152,14 @@ fn minimap_static_markers(
     let Ok(root) = root.single() else {
         return;
     };
+    // Gold mines draw ABOVE the fog layer, trees below it. Mine positions are
+    // map geography — they ship unfiltered in every bridge snapshot, so hiding
+    // them from the player would be the asymmetry running backwards. Tree
+    // clusters are scenery and can sit in the dark like the rest of it.
     for (tf, node) in &nodes {
-        let (size, color) = match node.kind {
-            ResourceKind::Gold => (5.0, Color::srgb(1.0, 0.82, 0.25)),
-            ResourceKind::Lumber => (2.0, Color::srgb(0.16, 0.42, 0.18)),
+        let (size, color, z) = match node.kind {
+            ResourceKind::Gold => (5.0, Color::srgb(1.0, 0.82, 0.25), 2),
+            ResourceKind::Lumber => (2.0, Color::srgb(0.16, 0.42, 0.18), 0),
         };
         let p = world_to_minimap(tf.translation);
         commands.spawn((
@@ -3132,6 +3172,7 @@ fn minimap_static_markers(
                 ..default()
             },
             BackgroundColor(color),
+            ZIndex(z),
             MinimapStatic,
             ChildOf(root),
         ));
@@ -3152,6 +3193,9 @@ fn minimap_static_markers(
                 ..default()
             },
             BackgroundColor(rock),
+            // Above the fog: the map's layout is public information, and the
+            // snapshot's `map.chokes` says so to the other player.
+            ZIndex(2),
             MinimapStatic,
             ChildOf(root),
         ));
@@ -3162,20 +3206,346 @@ fn minimap_static_markers(
 /// Bounty caches: a bright-gold dot that pulses so it stands out from the
 /// static gold-mine dots it shares a colour family with. Same pooled pattern as
 /// `update_minimap` (mutate in place, never despawn) on its own small pool.
+// ---------------------------------------------------------------------------
+// Fog of war — the player's renderer of `shared::FogGrids`
+// ---------------------------------------------------------------------------
+//
+// Nothing here decides anything. shared.rs computes one grid per team at ~4 Hz
+// and bridge.rs filters a commander's snapshot through it; these systems draw
+// the identical grid for the player at the keyboard. That is the whole point:
+// if this file made its own judgement about what the human may see, the game
+// would have two definitions of knowability again, and the one the machine got
+// would quietly be the better one.
+//
+// Three renderings of the same array:
+//
+//   * a translucent black quad over the whole ground plane, textured with the
+//     grid itself — one 100x100 image, one entity, linearly filtered so the
+//     boundary is soft rather than a staircase of nav cells;
+//   * the SAME image on the minimap as an `ImageNode` (flipped, because the
+//     minimap puts +Z up while the texture puts +Z at the bottom), so the two
+//     views can never disagree;
+//   * translucent boxes standing in for enemy structures the player has
+//     scouted and can no longer see.
+//
+// And one system that is not drawing at all but hiding: `apply_fog_visibility`
+// takes enemy units and buildings out of the 3D scene entirely. Health bars are
+// children of their owner, so they inherit the hidden state for free.
+
+/// Opaque enough to read as "nothing known", not so opaque that the map's
+/// shape stops being legible under it.
+const FOG_UNEXPLORED_ALPHA: f32 = 0.88;
+/// Terrain remembered, contents not. Deliberately a long way from both
+/// neighbours so the three states are told apart at a glance.
+const FOG_EXPLORED_ALPHA: f32 = 0.44;
+/// Above the ground plane and its cosmetic patches (0.02-0.046) and above the
+/// selection/hover rings (0.08/0.1), below the placement ghost's box. Low
+/// enough that it reads as lying ON the ground rather than hanging over it.
+const FOG_PLANE_Y: f32 = 0.16;
+
+/// The single ground-plane fog quad.
+#[derive(Component)]
+struct FogPlane;
+
+/// The minimap's fog image node.
+#[derive(Component)]
+struct MinimapFog;
+
+/// A pooled stand-in for an enemy structure the player remembers but cannot
+/// currently see.
+#[derive(Component)]
+struct BuildingGhost;
+
+#[derive(Resource)]
+struct FogAssets {
+    /// Shared by the world quad's material and the minimap node — the literal
+    /// "computed once, rendered twice".
+    image: Handle<Image>,
+    ghost_mesh: Handle<Mesh>,
+    ghost_mat: Handle<StandardMaterial>,
+}
+
+/// Build the fog texture, the quad that wears it, and the minimap node that
+/// wears the same one. Runs after `setup_ui` because it needs `MinimapRoot`.
+fn setup_fog(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    minimap: Query<Entity, With<MinimapRoot>>,
+) {
+    // One texel per nav cell: fog reuses the nav grid's geometry all the way
+    // out to the screen.
+    let image = images.add(Image::new_fill(
+        Extent3d {
+            width: GRID_DIM as u32,
+            height: GRID_DIM as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        // Start fully dark: the first `update_fog_overlay` lights the opening
+        // position, and an unpainted first frame should hide the map rather
+        // than reveal it.
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    ));
+
+    // A hand-built quad rather than `Plane3d`, so the UV mapping is pinned to
+    // the grid's own convention (u along +X, v along +Z) instead of whatever
+    // the mesh builder happens to emit.
+    let mut quad = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    quad.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![
+            [-MAP_HALF, 0.0, -MAP_HALF],
+            [MAP_HALF, 0.0, -MAP_HALF],
+            [MAP_HALF, 0.0, MAP_HALF],
+            [-MAP_HALF, 0.0, MAP_HALF],
+        ],
+    );
+    quad.insert_attribute(
+        Mesh::ATTRIBUTE_UV_0,
+        vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    );
+    quad.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4]);
+    quad.insert_indices(Indices::U32(vec![0, 2, 1, 0, 3, 2]));
+
+    let fog_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(image.clone()),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        // The quad is viewed from above, but leaving culling off costs nothing
+        // and removes winding as a failure mode.
+        cull_mode: None,
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(meshes.add(quad)),
+        MeshMaterial3d(fog_mat),
+        Transform::from_xyz(0.0, FOG_PLANE_Y, 0.0),
+        FogPlane,
+    ));
+
+    let ghost_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    // Washed-out and translucent: a memory should never be mistaken for a
+    // sighting.
+    let ghost_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.62, 0.38, 0.36, 0.40),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+
+    if let Ok(root) = minimap.single() {
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Px(MINIMAP_PX),
+                height: Val::Px(MINIMAP_PX),
+                ..default()
+            },
+            ImageNode {
+                image: image.clone(),
+                // The minimap draws +Z upward; the texture stores +Z downward.
+                flip_y: true,
+                ..default()
+            },
+            // Above the pooled dots (which are spawned later and would
+            // otherwise win), below the camera viewport outline.
+            ZIndex(1),
+            MinimapFog,
+            ChildOf(root),
+        ));
+    }
+
+    commands.insert_resource(FogAssets {
+        image,
+        ghost_mesh,
+        ghost_mat,
+    });
+}
+
+/// Repaint the fog texture from the human's grid. Cheap enough to do every
+/// frame (40 KB) and doing so keeps the overlay in lockstep with the 4 Hz
+/// recompute without a second clock to get out of sync.
+fn update_fog_overlay(
+    fog: Res<FogGrids>,
+    assets: Res<FogAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut plane: Query<&mut Visibility, With<FogPlane>>,
+    mut minimap_fog: Query<&mut Node, With<MinimapFog>>,
+) {
+    // `WC3_FOG=0`: take the overlay off the screen entirely rather than
+    // painting a fully transparent one every frame.
+    if !fog.enabled() {
+        for mut vis in &mut plane {
+            if *vis != Visibility::Hidden {
+                *vis = Visibility::Hidden;
+            }
+        }
+        for mut node in &mut minimap_fog {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+        }
+        return;
+    }
+
+    let Some(image) = images.get_mut(&assets.image) else {
+        return;
+    };
+    let Some(data) = image.data.as_mut() else {
+        return;
+    };
+    for (i, cell) in fog.get(Team::Human).cells().iter().enumerate() {
+        let alpha = match cell {
+            CellVis::Unexplored => FOG_UNEXPLORED_ALPHA,
+            CellVis::Explored => FOG_EXPLORED_ALPHA,
+            CellVis::Visible => 0.0,
+        };
+        // Texel layout is `NavGrid::idx` order, which is exactly the grid's
+        // own iteration order — no transposition anywhere in the pipeline.
+        data[i * 4 + 3] = (alpha * 255.0) as u8;
+    }
+}
+
+/// Take enemy units and buildings the player cannot see out of the 3D scene.
+///
+/// The same rule bridge.rs applies to a seat's snapshot, applied to the
+/// player's eyes: an enemy is drawn only while visible, and a scouted
+/// structure is replaced by a ghost (below) rather than left standing — which
+/// matters, because leaving the real building rendered would keep reporting
+/// its health and its destruction to somebody with nothing watching it.
+fn apply_fog_visibility(
+    fog: Res<FogGrids>,
+    mut units: Query<(&Team, &Transform, &mut Visibility), (With<Unit>, Without<Building>)>,
+    mut buildings: Query<(&Team, &Transform, &mut Visibility), (With<Building>, Without<Unit>)>,
+    mut trees: Query<
+        (&ResourceNode, &Transform, &mut Visibility),
+        (Without<Unit>, Without<Building>),
+    >,
+) {
+    if !fog.enabled() {
+        return;
+    }
+    let grid = fog.get(Team::Human);
+
+    // Tree clusters are hidden until their ground has been EXPLORED (not
+    // seen — terrain is remembered), for a reason that is as much correctness
+    // as polish: the fog overlay is a flat quad lying on the ground plane, so
+    // anything tall enough pokes through it and a forest in never-visited
+    // terrain would stand there fully lit above a black floor. Gold mines are
+    // exempt: mine positions are public geography, they ship unfiltered in
+    // every bridge snapshot, and the minimap draws them above the fog for the
+    // same reason.
+    for (node, tf, mut vis) in &mut trees {
+        if node.kind == ResourceKind::Gold {
+            if *vis != Visibility::Inherited {
+                *vis = Visibility::Inherited;
+            }
+            continue;
+        }
+        let want = if grid.known(tf.translation) {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+    let apply = |team: &Team, tf: &Transform, vis: &mut Visibility| {
+        let want = if *team == Team::Human || grid.sees(tf.translation) {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    };
+    for (team, tf, mut vis) in &mut units {
+        apply(team, tf, &mut vis);
+    }
+    for (team, tf, mut vis) in &mut buildings {
+        apply(team, tf, &mut vis);
+    }
+}
+
+/// Pooled translucent boxes where the player remembers enemy structures.
+/// Position, footprint and existence come from the shared grid's memory, so
+/// what the player sees standing in the fog is precisely what a bridge
+/// commander receives as a `last_seen` building record.
+fn sync_building_ghosts(
+    mut commands: Commands,
+    fog: Res<FogGrids>,
+    assets: Res<FogAssets>,
+    mut ghosts: Query<(&mut Transform, &mut Visibility), With<BuildingGhost>>,
+) {
+    let wanted: Vec<(Vec3, f32)> = if fog.enabled() {
+        fog.get(Team::Human)
+            .ghosts()
+            .map(|g| (g.pos, building_stats(g.kind).size))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut used = 0usize;
+    for (mut tf, mut vis) in &mut ghosts {
+        match wanted.get(used) {
+            Some((pos, size)) => {
+                let height = size * 0.6;
+                tf.translation = Vec3::new(pos.x, height * 0.5, pos.z);
+                tf.scale = Vec3::new(*size, height, *size);
+                if *vis != Visibility::Inherited {
+                    *vis = Visibility::Inherited;
+                }
+            }
+            None => {
+                if *vis != Visibility::Hidden {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+        used += 1;
+    }
+    // Grow the pool; never shrink it (same discipline as the minimap dots).
+    for _ in used..wanted.len() {
+        commands.spawn((
+            Mesh3d(assets.ghost_mesh.clone()),
+            MeshMaterial3d(assets.ghost_mat.clone()),
+            Transform::from_xyz(0.0, -50.0, 0.0),
+            Visibility::Hidden,
+            BuildingGhost,
+        ));
+    }
+}
+
 fn update_minimap_bounties(
     mut commands: Commands,
     time: Res<Time>,
     root: Query<Entity, With<MinimapRoot>>,
     bounties: Query<&Transform, With<Bounty>>,
+    fog: Res<FogGrids>,
     mut markers: Query<&mut Node, With<MinimapBounty>>,
 ) {
     let Ok(root) = root.single() else {
         return;
     };
+    let grid = fog.get(Team::Human);
     // 5px to 6px and back, ~2.5 rad/s — a slow, unmistakable throb.
     let size = 5.5 + 0.5 * (time.elapsed_secs() * 2.5).sin();
+    // Only caches the player can see, matching the `bounties` array a bridge
+    // commander gets. Treasure is neutral, but noticing it is not free.
     let wanted: Vec<Vec2> = bounties
         .iter()
+        .filter(|tf| grid.sees(tf.translation))
         .map(|tf| world_to_minimap(tf.translation))
         .collect();
 
@@ -3216,6 +3586,7 @@ fn update_minimap(
     camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     units: Query<(&Transform, &Team, Has<Hero>), (With<Unit>, Without<Building>)>,
     buildings: Query<(&Transform, &Team), (With<Building>, Without<Unit>)>,
+    fog: Res<FogGrids>,
     mut markers: Query<
         (&mut Node, &mut BackgroundColor),
         (With<MinimapMarker>, Without<MinimapViewport>),
@@ -3225,10 +3596,19 @@ fn update_minimap(
     let Ok(root) = root.single() else {
         return;
     };
+    let grid = fog.get(Team::Human);
+    // The minimap is the most tempting place in the game to cheat, because a
+    // dot costs nothing to draw and reveals everything. Same rule as the 3D
+    // scene and the same rule as a bridge snapshot: ours always, theirs only
+    // while seen.
+    let known = |team: &Team, p: Vec3| *team == Team::Human || grid.sees(p);
 
     // Desired dots: units first, then buildings (drawn later == on top).
     let mut wanted: Vec<(Vec2, f32, Color)> = Vec::new();
     for (tf, team, is_hero) in &units {
+        if !known(team, tf.translation) {
+            continue;
+        }
         // Heroes read as bigger, brighter dots.
         let (size, color) = if is_hero {
             (5.0, lighten(team.color(), 0.35))
@@ -3238,10 +3618,23 @@ fn update_minimap(
         wanted.push((world_to_minimap(tf.translation), size, color));
     }
     for (tf, team) in &buildings {
+        if !known(team, tf.translation) {
+            continue;
+        }
         wanted.push((
             world_to_minimap(tf.translation),
             6.0,
             lighten(team.color(), 0.12),
+        ));
+    }
+    // Scouted enemy structures, dimmed. They also sit under the `Explored`
+    // shading of the fog layer, so a remembered base reads as distinctly
+    // fainter than one being looked at.
+    for ghost in grid.ghosts() {
+        wanted.push((
+            world_to_minimap(ghost.pos),
+            6.0,
+            lighten(ghost.team.color(), -0.35),
         ));
     }
 
@@ -3980,6 +4373,7 @@ fn hover_feedback(
     buildings: Query<(&Transform, &Team, &Building), Without<HoverRing>>,
     nodes: Query<(&Transform, &ResourceNode)>,
     selected: Query<&Unit, With<Selected>>,
+    fog: Res<FogGrids>,
     mut ring: Query<
         (
             &mut Transform,
@@ -4017,6 +4411,13 @@ fn hover_feedback(
                     let ray = cursor_ray(cam, cam_tf, cursor);
                     let mut best_unit: Option<(f32, Vec3, Team)> = None;
                     for (tf, team) in &units {
+                        // A hover ring over an invisible enemy would be a
+                        // perfect enemy detector — sweep the cursor across the
+                        // fog and watch the crosshair light up. Same gate as
+                        // the click that follows it.
+                        if *team != Team::Human && !fog_sees(&fog, tf.translation) {
+                            continue;
+                        }
                         let d = dist_xz(
                             tf.translation,
                             pick_point_for(ray, ground, tf.translation.y),
@@ -4038,6 +4439,9 @@ fn hover_feedback(
                     } else {
                         let mut best_bld: Option<(f32, Vec3, Team, f32)> = None;
                         for (tf, team, building) in &buildings {
+                            if *team != Team::Human && !fog_sees(&fog, tf.translation) {
+                                continue;
+                            }
                             let r = building_stats(building.kind).size * 0.5;
                             let d = dist_xz(tf.translation, ground);
                             if d <= r && best_bld.is_none_or(|(bd, _, _, _)| d < bd) {

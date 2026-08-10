@@ -39,9 +39,29 @@
 //! buildings' `TrainingQueue`, sets `RallyPoint`, and sends `CastAbility`.
 //! It never spawns anything, never writes `Health`, never touches enemy
 //! entities, and only *reads* its own `Economies` entry (economy.rs pays).
-//! Enemy units and buildings are reported in the snapshot (full vision parity
-//! with the scripted AI) but enemy gold/lumber never is — and a seat only ever
-//! sees its *own* squads and policies, never the opponent's command structure.
+//! Enemy gold/lumber is never reported, and a seat only ever sees its *own*
+//! squads and policies, never the opponent's command structure.
+//!
+//! FOG OF WAR. Every seat's snapshot is filtered through that seat's team's
+//! `shared::FogGrid` — the same grid ui.rs paints for the player at the
+//! keyboard. The bridge does not decide what is knowable; it renders a
+//! decision made once in shared.rs. Concretely:
+//!
+//!   * enemy `units` appear only while currently visible. They are not
+//!     remembered: an army that walks out of sight is simply gone from the
+//!     snapshot, because a remembered army is a lie a commander would act on.
+//!   * enemy `buildings` appear as themselves while visible, and afterwards as
+//!     REMEMBERED GHOSTS carrying a `last_seen` game-time stamp and the hp/
+//!     queue state observed at that moment. A ghost can be stale — a razed
+//!     barracks keeps its ghost until somebody looks at the spot again. Own
+//!     buildings never carry `last_seen`, so the field's presence is exactly
+//!     the "this is memory, not observation" flag.
+//!   * `bounties` only while visible (see below).
+//!   * `mines`, `trees_near`, `map` are unfiltered map GEOGRAPHY (see below).
+//!
+//! `WC3_FOG=0` restores the old omniscient snapshot with no other change.
+//! The top-level `fog` object reports which mode is in force plus this seat's
+//! explored/visible fraction of the map.
 //!
 //! Everything in a snapshot is relative to the seat that receives it: `me` is
 //! the seat's economy, `my_team` names it, `trees_near` are the trees nearest
@@ -96,9 +116,22 @@
 //! inventory. The snapshot answers back with `units[].items`,
 //! `units[].militia` and `buildings[].ability_cd`.
 //!
+//! MAP GEOGRAPHY IS PUBLIC, and always was: the `map` block (layout, summary,
+//! chokepoints), `mines` (position and remaining gold) and `trees_near` ship
+//! unfiltered to both seats, exactly as ui.rs paints mines and the terrain
+//! barrier on the minimap from the first frame. Fog hides what the opponent is
+//! DOING, not where the map's furniture sits. Mine `remaining` is the one
+//! deliberate concession: it is the shared clock the whole economy is timed
+//! against (expansion windows, "mines run dry"), both `plan_expansion` and a
+//! commander budget against it, and scouting reveals it anyway — hiding it
+//! would buy a little intel and cost the design principle it serves.
+//!
 //! Bounty caches (bounty.rs) ride along as a top-level `bounties` array —
-//! `pos`, `gold` and `expires_in` — identical for both seats, because treasure
-//! glowing on the ground is public information. The event feed reports them
+//! `pos`, `gold` and `expires_in` — but only while the seat's team can SEE
+//! them. A cache is treasure on open ground, not geography, and open ground
+//! nobody is looking at tells you nothing. This is a real gameplay change:
+//! a Forage squad now hunts only what its team has eyes on. The event feed
+//! reports them
 //! *unattributed*: `"bounty spawned: 300g @(x,z)"` when one appears, and
 //! `"bounty gone @(x,z)"` when one disappears before its deadline, which means
 //! somebody claimed it. The bridge deliberately does not say who: a claim
@@ -175,8 +208,12 @@ impl Plugin for BridgePlugin {
                 Update,
                 // Poll first, snapshot second: a batch applied this frame is
                 // visible in the snapshot written the same frame.
+                // After `FogSet`: both the snapshot a seat reads and the orders
+                // it may issue are filtered through this frame's fog, never
+                // the previous frame's.
                 (poll_commands, write_snapshot)
                     .chain()
+                    .after(FogSet)
                     .run_if(bridge_enabled),
             );
     }
@@ -368,6 +405,9 @@ struct StateOut {
     /// where its impassable terrain can be crossed. The human sees the canyon
     /// on screen and on the minimap; this is the same fact in JSON.
     map: MapOut,
+    /// What this seat can currently know. Read it before concluding anything
+    /// from an empty `units` list.
+    fog: FogOut,
     /// `catalog.json` entry id -> may this seat build/train it right now?
     /// Every unit and building in the catalog appears, whether or not it has
     /// requirements, so a commander can gate its build order on one lookup.
@@ -377,8 +417,8 @@ struct StateOut {
     squads: Vec<SquadOut>,
     mines: Vec<MineOut>,
     trees_near: Vec<TreeOut>,
-    /// Live bounty caches, identical for both seats — treasure on the ground is
-    /// public information.
+    /// Bounty caches this seat can currently SEE. Treasure on the ground is
+    /// public information to whoever is looking at that ground.
     bounties: Vec<BountyOut>,
     /// `[[game_time, message], ...]`, oldest first — see `diff_events`.
     events: Vec<(f32, String)>,
@@ -588,13 +628,25 @@ struct BuildingOut {
     #[serde(skip_serializing_if = "is_false")]
     template: bool,
     /// Rung on this building's upgrade ladder — 1 for everything not on one.
-    /// Public information: both players can see a Keep is a Keep.
+    /// Not secret: a Keep looks like a Keep to anyone LOOKING at it. Under fog
+    /// that qualifier does the work — an unseen building is not in this array
+    /// at all, and a remembered one reports the tier it wore when last
+    /// observed, which is exactly what a scout brings home.
     tier: u32,
     /// Present only while this building is converting to its next tier. The
     /// `upgrade` command starts one; while it runs the building trains nothing
-    /// (the queue is frozen, not cancelled).
+    /// (the queue is frozen, not cancelled). Never set on a remembered ghost:
+    /// a conversion is a live thing, and a stale progress bar would be
+    /// invented intelligence rather than preserved intelligence.
     #[serde(skip_serializing_if = "Option::is_none")]
     upgrading: Option<UpgradeOut>,
+    /// Present ONLY on remembered enemy structures: the game time at which
+    /// this seat last actually saw it. Everything else in the record is the
+    /// state observed at that moment and may since have changed — including
+    /// the building having upgraded to a higher tier, or been destroyed.
+    /// Absent means "observed right now".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen: Option<f32>,
 }
 
 /// An in-place upgrade in progress, as it appears in a snapshot.
@@ -610,8 +662,10 @@ fn is_false(flag: &bool) -> bool {
     !*flag
 }
 
-/// A live bounty cache. Neutral information: both seats get the identical
-/// list, exactly as both players see the same glow on the ground.
+/// A live bounty cache. Neutral but not free: the treasure belongs to nobody,
+/// and seeing the glow on the ground still costs you eyes on that ground. A
+/// cache is listed only while this seat's team can see it, exactly as the
+/// player at the keyboard sees a glow only outside the fog.
 #[derive(Serialize)]
 struct BountyOut {
     pos: [f32; 2],
@@ -628,6 +682,17 @@ struct BountySnap {
     pos: [f32; 2],
     gold: u32,
     expires_at: f32,
+}
+
+/// How much of the map this seat has ever seen / can see right now, plus the
+/// mode in force. Not a gameplay input — a legibility one, so a commander (and
+/// an after-action report) can tell "I have no information" apart from "there
+/// is nothing there", which are the same empty `units` array otherwise.
+#[derive(Serialize)]
+struct FogOut {
+    enabled: bool,
+    explored: f32,
+    visible: f32,
 }
 
 #[derive(Serialize)]
@@ -710,6 +775,7 @@ fn write_snapshot(
     squad_orders: Res<SquadOrders>,
     tiers: Res<TechTiers>,
     feed: Res<GameEvents>,
+    fog: Res<FogGrids>,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
     nodes: SnapshotNodes,
@@ -723,6 +789,8 @@ fn write_snapshot(
             continue;
         }
         seat.force_snapshot = false;
+        // The seat's own team's fog — the whole point of a per-seat snapshot.
+        let seat_fog = fog.get(seat.team);
         write_seat_snapshot(
             seat,
             now,
@@ -732,6 +800,7 @@ fn write_snapshot(
             &squad_orders,
             &tiers,
             &feed,
+            (fog.enabled(), seat_fog),
             &units,
             &buildings,
             &nodes,
@@ -752,16 +821,22 @@ fn write_seat_snapshot(
     squad_orders: &SquadOrders,
     tiers: &TechTiers,
     feed: &GameEvents,
+    fog: (bool, &FogGrid),
     units: &SnapshotUnits,
     buildings: &SnapshotBuildings,
     nodes: &SnapshotNodes,
     bounties: &SnapshotBounties,
 ) {
     let me = seat.team;
+    let (fog_enabled, fog) = fog;
 
-    // Full vision of both armies; doctrine only for our own units.
+    // Our own army, plus whatever of theirs we can see RIGHT NOW. Enemy units
+    // are never remembered: a stale unit position is not information, it is a
+    // decoy, and a commander acting on one has been lied to by its own
+    // interface. Doctrine only for our own units, as before.
     let mut units_out: Vec<UnitOut> = units
         .iter()
+        .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(|(e, unit, team, tf, health, order, move_to, carrying, hero, doctrine, kit)| {
             let (squad, prio, retreat, leash, autocast) = doctrine;
             let (inventory, militia, cooldowns) = kit;
@@ -818,8 +893,12 @@ fn write_seat_snapshot(
         .collect();
     units_out.sort_by_key(|u| u.id);
 
+    // Ours, plus enemy structures we can see now. Ones we have seen before and
+    // cannot see now are appended below as remembered ghosts, so the array is
+    // "everything this seat has grounds to believe is standing".
     let mut buildings_out: Vec<BuildingOut> = buildings
         .iter()
+        .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(
             |(e, building, team, tf, health, under, queue, template, cooldown, upgrading)| BuildingOut {
             id: e.to_bits(),
@@ -853,9 +932,41 @@ fn write_seat_snapshot(
                 to: building_name(u.to),
                 remaining: r1(u.remaining),
             }),
+            // Observed this instant.
+            last_seen: None,
             },
         )
         .collect();
+
+    // Memory. Everything this seat scouted and can no longer see, reported at
+    // the state it was in when last observed and stamped with when that was.
+    // `queue`/`progress`/`ability_cd` are deliberately empty rather than
+    // stale: a production queue is a live thing, and remembering one would be
+    // inventing intelligence rather than preserving it. The building's
+    // existence, kind, place and health are what a scout actually brings home.
+    for ghost in fog.ghosts() {
+        buildings_out.push(BuildingOut {
+            id: ghost.id,
+            team: team_name(ghost.team),
+            kind: building_name(ghost.kind),
+            pos: [r1(ghost.pos.x), r1(ghost.pos.z)],
+            hp: ghost.hp,
+            max_hp: ghost.max_hp,
+            done: ghost.done,
+            queue: Vec::new(),
+            progress: 0.0,
+            ability_cd: None,
+            abilities: Vec::new(),
+            template: false,
+            // The tier it wore when last observed. A hall that has since been
+            // upgraded behind our back still reports the old rung — the memory
+            // is stale in exactly the way the scouting report was.
+            tier: building_tier(ghost.kind),
+            // Never on a ghost: see the field's doc.
+            upgrading: None,
+            last_seen: Some(ghost.last_seen),
+        });
+    }
     buildings_out.sort_by_key(|b| b.id);
 
     // Tech state, for this seat only: what its completed buildings unlock.
@@ -918,9 +1029,11 @@ fn write_seat_snapshot(
         })
         .collect();
 
-    // Bounty caches, sorted by id so both seats serialize the same order.
+    // Bounty caches this seat can see, sorted by id so a seat serializes the
+    // same order every tick. The two seats' lists now legitimately differ.
     let mut bounty_snaps: Vec<BountySnap> = bounties
         .iter()
+        .filter(|(_, _, tf)| fog.sees(tf.translation))
         .map(|(e, bounty, tf)| BountySnap {
             id: e.to_bits(),
             pos: [r1(tf.translation.x), r1(tf.translation.z)],
@@ -993,6 +1106,11 @@ fn write_seat_snapshot(
                     width: r1(c.width),
                 })
                 .collect(),
+        },
+        fog: FogOut {
+            enabled: fog_enabled,
+            explored: r1(fog.explored_frac()),
+            visible: r1(fog.visible_frac()),
         },
         unlocked,
         units: units_out,
@@ -1347,6 +1465,8 @@ type CmdBuildings<'w, 's> = Query<
 /// The events a command batch can emit. Bundled for the same reason ui.rs
 /// bundles its own: `poll_commands` is at Bevy's 16-parameter ceiling, and the
 /// next command that needs a writer should not have to reshape the system.
+/// (Fog spent one of those slots on `FogGrids`, which is what put this system
+/// against the ceiling in the first place.)
 #[derive(SystemParam)]
 struct CmdEvents<'w> {
     casts: EventWriter<'w, CastAbility>,
@@ -1355,7 +1475,9 @@ struct CmdEvents<'w> {
     upgrades: EventWriter<'w, UpgradeBuilding>,
 }
 
-/// Anything that can be attacked: a live unit or building with a team.
+/// Anything that can be attacked: a live unit or building with a team. The
+/// `Transform` is carried so an attack order can be checked against the seat's
+/// fog — an id a seat could never have learned is not a legal target.
 type CmdTargets<'w, 's> = Query<
     'w,
     's,
@@ -1363,6 +1485,7 @@ type CmdTargets<'w, 's> = Query<
         &'static Team,
         Option<&'static Unit>,
         Option<&'static Building>,
+        &'static Transform,
     ),
 >;
 
@@ -1378,6 +1501,7 @@ fn poll_commands(
     records: Res<HeroRecords>,
     nav: Res<NavGrid>,
     mut squad_orders: ResMut<SquadOrders>,
+    fog: Res<FogGrids>,
     mut commands: Commands,
     mut events: CmdEvents,
     units: CmdUnits,
@@ -1437,6 +1561,7 @@ fn poll_commands(
                 &economies,
                 &records,
                 &nav,
+                fog.get(seat.team),
                 &mut squad_orders,
                 &mut commands,
                 &mut events,
@@ -1467,6 +1592,7 @@ fn apply_batch(
     economies: &Economies,
     records: &HeroRecords,
     nav: &NavGrid,
+    fog: &FogGrid,
     squad_orders: &mut SquadOrders,
     commands: &mut Commands,
     events: &mut CmdEvents,
@@ -1514,7 +1640,7 @@ fn apply_batch(
                     continue;
                 };
                 match targets.get(target_entity) {
-                    Ok((team, unit, building)) => {
+                    Ok((team, unit, building, tf)) => {
                         // Only the seat's enemy is a legal attack target.
                         if *team != me.enemy() {
                             errors.push(format!("cmd {i}: target {target} is your own"));
@@ -1522,6 +1648,15 @@ fn apply_batch(
                         }
                         if unit.is_none() && building.is_none() {
                             errors.push(format!("cmd {i}: target {target} is not attackable"));
+                            continue;
+                        }
+                        // Fog cuts both ways: a snapshot that will not show you
+                        // an enemy must not accept orders against it either,
+                        // or the filtering is decoration. Visible now, or a
+                        // structure we remember, is the whole legal set — the
+                        // same set the player can click on.
+                        if !fog.knows_entity(target, tf.translation) {
+                            errors.push(format!("cmd {i}: target {target} is not visible"));
                             continue;
                         }
                     }
