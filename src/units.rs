@@ -579,14 +579,21 @@ fn handle_teleports(
     mut commands: Commands,
     mut events: EventReader<TeleportRequest>,
     nav: Res<NavGrid>,
-    mut units: Query<(Entity, &Unit, &Team, &Health, &mut Transform)>,
+    mut units: Query<(
+        Entity,
+        &Unit,
+        &Team,
+        &Health,
+        &mut Transform,
+        &mut GlobalTransform,
+    )>,
 ) {
     /// How far from the destination a passenger may be placed.
     const SPREAD: f32 = 3.0;
 
     for ev in events.read() {
         // The caster may have died between the request and now.
-        let Ok((_, _, center_team, center_health, center_tf)) = units.get(ev.center) else {
+        let Ok((_, _, center_team, center_health, center_tf, _)) = units.get(ev.center) else {
             continue;
         };
         if center_health.current <= 0.0 {
@@ -602,13 +609,13 @@ fn handle_teleports(
         // Snapshot the passenger list first (the query is borrowed mutably below).
         let riders: Vec<(Entity, Vec3)> = units
             .iter()
-            .filter(|(entity, _, unit_team, health, tf)| {
+            .filter(|(entity, _, unit_team, health, tf, _)| {
                 (**unit_team == team && health.current > 0.0
                     && Vec2::new(tf.translation.x - origin.x, tf.translation.z - origin.z).length()
                         <= ev.radius)
                     || *entity == ev.center
             })
-            .map(|(entity, _, _, _, tf)| {
+            .map(|(entity, _, _, _, tf, _)| {
                 let rel = Vec3::new(tf.translation.x - origin.x, 0.0, tf.translation.z - origin.z);
                 let len = rel.length();
                 let offset = if len > SPREAD { rel * (SPREAD / len) } else { rel };
@@ -633,8 +640,17 @@ fn handle_teleports(
                     }
                 }
             }
-            if let Ok((_, unit, _, _, mut tf)) = units.get_mut(entity) {
+            if let Ok((_, unit, _, _, mut tf, mut gt)) = units.get_mut(entity) {
                 tf.translation = Vec3::new(spot.x, unit_y(unit.kind), spot.z);
+                // Same hole as a fresh spawn, in reverse: Bevy only propagates
+                // Transform -> GlobalTransform in PostUpdate, so for the rest
+                // of THIS frame combat.rs (which reads positions through
+                // GlobalTransform) would still see the passenger standing
+                // where it used to be — a hero town-portalling out of a fight
+                // could be struck once at the position it had already left.
+                // A unit is a root entity, so its GlobalTransform simply IS
+                // its Transform; write it here and the hole never opens.
+                *gt = GlobalTransform::from(*tf);
             }
             // Whatever they were walking toward is on the other side of the map.
             commands
