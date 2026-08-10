@@ -3158,6 +3158,125 @@ mod tests {
         );
     }
 
+    /// The other end of the same path: the script actually BUILDING a flyer.
+    ///
+    /// Four conditions have to be true on one think tick — a Castle standing, a
+    /// Workshop with room in its queue, the siege counter on its beat, and the
+    /// bank fat after the reserve — and no scripted match has ever had all four
+    /// at once, which is why nobody had seen this branch either. A headless run
+    /// with `WC3_AI_GRYPHON_BANK=0` still needs the match to LAST long enough to
+    /// reach tier 3, and the scripted matchup resolves at tier 2 (verified: both
+    /// maps end 6-7 minutes with the loser collapsing before its Castle). So the
+    /// board is built here instead of waited for.
+    #[test]
+    fn a_castle_and_a_fat_bank_put_a_gryphon_in_the_workshop() {
+        let mut app = ai_app();
+        let home = Team::Claude.base_pos();
+        spawn_building(&mut app, BuildingKind::Castle, Team::Claude, home);
+        spawn_building(
+            &mut app,
+            BuildingKind::Barracks,
+            Team::Claude,
+            home + Vec3::new(-12.0, 0.0, 0.0),
+        );
+        let workshop = spawn_building(
+            &mut app,
+            BuildingKind::Workshop,
+            Team::Claude,
+            home + Vec3::new(0.0, 0.0, -12.0),
+        );
+        for i in 0..5 {
+            spawn_unit(
+                &mut app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        {
+            // A long game's worth of line units behind us, so siege is due.
+            let mut state = app.world_mut().resource_mut::<AiState>();
+            state.claude.army_counter = 20;
+            state.claude.siege_counter = 0;
+        }
+        // Comfortably past `GRYPHON_BANK_GOLD` even after the reserve.
+        app.world_mut()
+            .resource_mut::<Economies>()
+            .get_mut(Team::Claude)
+            .gold = 3000;
+
+        think_once(&mut app);
+
+        assert_eq!(
+            queued(&mut app, workshop),
+            vec![UnitKind::GryphonRider],
+            "Castle + Workshop + a fat bank is the whole air gate"
+        );
+    }
+
+    /// ...and the gate is a gate. The same board with a thin treasury degrades
+    /// to a Catapult rather than parking an unpayable Gryphon at the front of
+    /// the queue — which is what the `affordable` fallback in the Workshop arm
+    /// is for, and what makes the air branch surplus spending rather than a
+    /// commitment.
+    #[test]
+    fn a_thin_bank_degrades_the_gryphon_back_to_a_catapult() {
+        let mut app = ai_app();
+        let home = Team::Claude.base_pos();
+        spawn_building(&mut app, BuildingKind::Castle, Team::Claude, home);
+        spawn_building(
+            &mut app,
+            BuildingKind::Barracks,
+            Team::Claude,
+            home + Vec3::new(-12.0, 0.0, 0.0),
+        );
+        let workshop = spawn_building(
+            &mut app,
+            BuildingKind::Workshop,
+            Team::Claude,
+            home + Vec3::new(0.0, 0.0, -12.0),
+        );
+        for i in 0..5 {
+            spawn_unit(
+                &mut app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        // A hero already on the field. Without one the script ring-fences 400g
+        // for the hero it wants, then buys it — and the Workshop is priced
+        // against what is left, which would make this test about the hero
+        // reserve rather than about the air gate.
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Hero },
+            Team::Claude,
+            Transform::from_translation(home),
+            Order::Idle,
+            Health::new(600.0),
+            Hero { level: 1, xp: 0.0, mana: 80.0 },
+        ));
+        {
+            let mut state = app.world_mut().resource_mut::<AiState>();
+            state.claude.army_counter = 20;
+            state.claude.siege_counter = 0;
+        }
+        // One gold under the gate. The script's reserves (a hero slot, a
+        // research rung) come off the top before either unit is priced, so this
+        // is a treasury that can pay for siege and cannot pay for air — which
+        // is exactly the state the fallback exists for.
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let claude = economies.get_mut(Team::Claude);
+            claude.gold = GRYPHON_BANK_GOLD - 1;
+            claude.lumber = 900;
+        }
+
+        think_once(&mut app);
+
+        assert_eq!(queued(&mut app, workshop), vec![UnitKind::Catapult]);
+    }
+
     /// The probe knobs, which exist so a headless sim can reach the air branch
     /// at all. Unset, they must read their constants exactly — a knob that
     /// changes the default is a balance change wearing a debugging hat.
