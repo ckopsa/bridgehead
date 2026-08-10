@@ -220,7 +220,8 @@ impl Plugin for CombatPlugin {
                     use_items,
                     apply_damage,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(SimSet::Combat),
             )
             .add_systems(
                 Update,
@@ -229,9 +230,10 @@ impl Plugin for CombatPlugin {
                     update_health_bars,
                     update_status_rings,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(SimSet::Cosmetic),
             )
-            .add_systems(Update, update_shockwaves);
+            .add_systems(Update, update_shockwaves.in_set(SimSet::Cosmetic));
     }
 }
 

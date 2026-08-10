@@ -139,6 +139,11 @@ impl Plugin for IntentPlugin {
             .init_resource::<IntentJournal>()
             .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
+            // `IntentApply` lives INSIDE `SimSet::Intent`, declared once here
+            // rather than restated per system: anything later tagged only
+            // `.in_set(IntentApply)` then inherits the frame order instead of
+            // silently floating outside it.
+            .configure_sets(Update, IntentApply.in_set(SimSet::Intent))
             // `.after(FogSet)`: an intent is judged against the visibility its
             // issuer has right now, the same grid the snapshot and the HUD are
             // about to show them.

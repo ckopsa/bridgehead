@@ -12,9 +12,13 @@
 //! economy.rs banks the gold (untaxed — see shared.rs). ui.rs draws the
 //! minimap dot and bridge.rs reports the caches to external commanders.
 //!
-//! Placement uses runtime randomness (`rand::thread_rng`) rather than the
-//! map's fixed seed: bounty spots are meant to be unpredictable from one match
-//! to the next, and nothing else in the sim depends on them being reproducible.
+//! Placement is random, but no longer *unaccountably* random. It used to draw
+//! from `rand::thread_rng()` — OS entropy, reproducible by nothing — on the
+//! reasoning that nothing else in the sim depended on cache positions. That
+//! turned out to be false: a cache is 100-600g of untaxed income and doctrine
+//! steers whole squads at one, so the draw decides matches. It now comes from
+//! the shared `SimRng`, which is seeded randomly by default (so a match is
+//! still unpredictable) and from `WC3_SEED` when you want to replay one.
 
 use bevy::prelude::*;
 use rand::Rng;
@@ -51,7 +55,12 @@ impl Plugin for BountyPlugin {
             .add_systems(Startup, setup_bounty_assets)
             .add_systems(
                 Update,
-                (spawn_bounty, claim_bounties, expire_bounties, pulse_orbs).chain(),
+                (
+                    (spawn_bounty, claim_bounties, expire_bounties)
+                        .chain()
+                        .in_set(SimSet::Bounty),
+                    pulse_orbs.in_set(SimSet::Cosmetic),
+                ),
             );
     }
 }
@@ -125,6 +134,7 @@ fn spawn_bounty(
     nav: Res<NavGrid>,
     assets: Option<Res<BountyAssets>>,
     mut schedule: ResMut<BountySchedule>,
+    mut sim_rng: ResMut<SimRng>,
     game_over: Res<GameOver>,
 ) {
     let now = time.elapsed_secs();
@@ -137,7 +147,7 @@ fn spawn_bounty(
         return; // Startup hasn't run yet; try again next interval.
     };
 
-    let Some(pos) = free_ring_spot(&nav) else {
+    let Some(pos) = free_ring_spot(&nav, &mut sim_rng) else {
         debug!("bounty: no free spot on the ring this cycle — skipping");
         return;
     };
@@ -170,8 +180,14 @@ fn spawn_bounty(
 
 /// A random unblocked cell on the contested ring, or `None` if every attempt
 /// landed on trees, mines or a building footprint.
-fn free_ring_spot(nav: &NavGrid) -> Option<Vec3> {
-    let mut rng = rand::thread_rng();
+///
+/// Takes the match stream by `&mut` rather than opening its own: the number of
+/// draws varies (a blocked attempt costs two and retries), and that variation
+/// is part of the sequence every later draw inherits. One stream, advanced in
+/// sim order, is the whole idea — a private RNG here would be a second thing to
+/// seed and reason about.
+fn free_ring_spot(nav: &NavGrid, sim_rng: &mut SimRng) -> Option<Vec3> {
+    let rng = sim_rng.rng();
     for _ in 0..PLACEMENT_TRIES {
         let angle = rng.gen_range(0.0..std::f32::consts::TAU);
         let radius = rng.gen_range(BOUNTY_RING_MIN..BOUNTY_RING_MAX);
