@@ -776,6 +776,140 @@ pub fn unit_requires(kind: UnitKind) -> &'static [BuildingKind] {
     }
 }
 
+/// The LOWEST rung that trains `kind`, which is the one worth naming:
+/// `building_satisfies` makes a requirement of "TownHall" mean "TownHall or
+/// better", so the base rung covers the Keep and Castle that train Workers too.
+///
+/// `None` only if nothing trains it — impossible today, but the table is data.
+/// Folded out of three copies of the same `find` (`unit_tech_chain`,
+/// `game_catalog`'s `trainer_of`, and the error strings below), because "where
+/// does this come from" is now asked in enough places that three answers is
+/// three chances to disagree.
+pub fn unit_trainer(kind: UnitKind) -> Option<BuildingKind> {
+    ALL_BUILDING_KINDS
+        .iter()
+        .copied()
+        .find(|b| trainable(*b).contains(&kind))
+}
+
+/// The subset of `reqs` this team does not meet. Tier-aware exactly like
+/// `requirements_met`, so a Castle is never reported as a missing Keep.
+pub fn missing_requirements(reqs: &[BuildingKind], completed: &[BuildingKind]) -> Vec<BuildingKind> {
+    reqs.iter()
+        .copied()
+        .filter(|r| !completed.iter().any(|owned| building_satisfies(*owned, *r)))
+        .collect()
+}
+
+/// `"a Workshop"` / `"a Workshop and a Castle"`.
+fn a_list(kinds: &[BuildingKind]) -> String {
+    let names: Vec<String> = kinds
+        .iter()
+        .map(|k| format!("a {}", building_name(*k)))
+        .collect();
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, head)) => format!("{} and {last}", head.join(", ")),
+    }
+}
+
+fn stands(n: usize) -> &'static str {
+    if n == 1 { "stands" } else { "stand" }
+}
+
+/// What the team holds toward a requirement it does not meet, parenthesised.
+///
+/// The hall ladder is the case worth spelling out: `you have none` is a lie to
+/// a commander staring at a TownHall while being told they need a Castle, and
+/// `upgrade it` is the entire instruction they were missing.
+fn holdings_clause(missing: &[BuildingKind], completed: &[BuildingKind]) -> String {
+    let lower = missing.iter().find_map(|r| {
+        completed
+            .iter()
+            .filter(|owned| upgrade_root(**owned) == upgrade_root(*r))
+            .max_by_key(|owned| building_tier(**owned))
+            .map(|owned| building_name(*owned))
+    });
+    match lower {
+        Some(have) => format!("yours is a {have} — upgrade it"),
+        None => "you have none".to_string(),
+    }
+}
+
+/// Why a `train` order at the RIGHT building bounced: the unit's own tech gate.
+/// `None` when the team already meets it.
+///
+/// Round-9 AAR (`wc3clone-pbd`) — this used to render through the generic
+/// `requirement_error` as `Raider requires Workshop`, which is true and
+/// useless. The commander read it *at the Barracks*, concluded the Barracks
+/// was the wrong building, walked the next order over to the Workshop, and got
+/// `Workshop cannot train Raider`. Between them the two strings never said the
+/// one thing that unsticks you: **keep training it here, once a Workshop
+/// stands**. So the string names the trainer even though the reader is already
+/// standing at it — the redundancy is the fix.
+pub fn train_gate_error(kind: UnitKind, completed: &[BuildingKind]) -> Option<String> {
+    let missing = missing_requirements(unit_requires(kind), completed);
+    if missing.is_empty() {
+        return None;
+    }
+    let trainer = unit_trainer(kind).map(building_name).unwrap_or("-");
+    Some(format!(
+        "{} trains at the {trainer} once {} {} ({})",
+        kind_name(kind),
+        a_list(&missing),
+        stands(missing.len()),
+        holdings_clause(&missing, completed),
+    ))
+}
+
+/// Why a `train` order at the WRONG building bounced — and where to send it.
+///
+/// The other half of the round-9 pair. `Workshop cannot train Raider` is
+/// technically true and maximally confusing: it is the reply to the correction
+/// the *previous* error talked the commander into making. Naming the real
+/// trainer, its gate, and the unit's gate turns a dead end into a build order.
+///
+/// The Sorcerer is the case that shaped the last clause. Its `unit_requires`
+/// is empty — the gate is on the Arcane Sanctum (which needs a Keep), not on
+/// the unit — so a commander with no Sanctum has no building to name and can
+/// only ever reach this string. It therefore has to carry the *trainer's* gate
+/// too, or the one unit whose gate is invisible in `unit_requires` stays
+/// invisible here.
+pub fn wrong_trainer_error(
+    at: BuildingKind,
+    kind: UnitKind,
+    completed: &[BuildingKind],
+) -> String {
+    let unit = kind_name(kind);
+    let head = format!("{} cannot train {unit}", building_name(at));
+    let Some(trainer) = unit_trainer(kind) else {
+        return format!("{head} — nothing trains it");
+    };
+    let trainer_name = building_name(trainer);
+    let mut out = format!("{head} — {unit} trains at the {trainer_name}");
+    let unit_missing = missing_requirements(unit_requires(kind), completed);
+    if !unit_missing.is_empty() {
+        out.push_str(&format!(
+            " once {} {}",
+            a_list(&unit_missing),
+            stands(unit_missing.len())
+        ));
+    }
+    if !completed.iter().any(|owned| building_satisfies(*owned, trainer)) {
+        let trainer_missing = missing_requirements(building_requires(trainer), completed);
+        if trainer_missing.is_empty() {
+            out.push_str(&format!(" (you have no {trainer_name})"));
+        } else {
+            out.push_str(&format!(
+                " (you have no {trainer_name}; it needs {})",
+                a_list(&trainer_missing)
+            ));
+        }
+    }
+    out
+}
+
 /// Everything that must be STANDING before a team can train `kind`: the
 /// building that trains it, whatever gates that building, and whatever gates
 /// the unit itself — transitively, to the bottom.
@@ -798,15 +932,8 @@ pub fn unit_tech_chain(kind: UnitKind) -> Vec<BuildingKind> {
         }
     }
     let mut chain: Vec<BuildingKind> = Vec::new();
-    // The LOWEST rung that trains it is the one to name: `building_satisfies`
-    // makes a requirement of "TownHall" mean "TownHall or better", so naming
-    // the base rung covers the Keep and Castle that also train Workers
-    // without listing three alternatives a reader would have to know are ORs.
-    if let Some(trainer) = ALL_BUILDING_KINDS
-        .iter()
-        .copied()
-        .find(|b| trainable(*b).contains(&kind))
-    {
+    // The LOWEST rung that trains it is the one to name — see `unit_trainer`.
+    if let Some(trainer) = unit_trainer(kind) {
         add(&mut chain, trainer);
     }
     for req in unit_requires(kind) {
@@ -1394,6 +1521,29 @@ pub struct CatalogUpgrade {
     pub upgrade_time: f32,
 }
 
+/// One entry of `buildings[].trains_gated`: a unit on this building's roster,
+/// with the tech gate that applies **at this building**.
+///
+/// Round-9 AAR (`wc3clone-pbd`): `buildings[].trains` is a bare list of ids, so
+/// the Barracks advertised `["Footman","Archer","Spearman","Raider","Knight",
+/// "Champion","Priestess"]` with nothing anywhere to say that two of those
+/// wait on a Workshop and a Castle. `units[].requires` had the answer, but it
+/// is on the other side of the catalog and a commander reading a *roster* has
+/// no reason to suspect a join is needed. So the gate now sits where the
+/// roster is read. It cost a commander their scout timing to learn otherwise.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogTrains {
+    /// `units[].id`.
+    pub unit: &'static str,
+    /// Buildings that must ALSO stand before this trainer accepts the order —
+    /// `unit_requires`, i.e. the gate BEYOND owning the trainer itself. Empty
+    /// for an ungated unit. Whatever gates the trainer is `requires` on this
+    /// same building entry, so the two fields together are the whole chain.
+    pub requires: Vec<&'static str>,
+    /// Team tech tier the unit needs — the same 1/2/3 scale as `units[].tier`.
+    pub tier: u32,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct CatalogBuilding {
     pub id: &'static str,
@@ -1413,7 +1563,15 @@ pub struct CatalogBuilding {
     pub vision: f32,
     pub built_by: &'static str,
     pub requires: Vec<&'static str>,
+    /// The roster as bare ids. Kept verbatim and in the same order — it is the
+    /// historical shape and tools read it (`verify_research_bridge.py` asserts
+    /// the Blacksmith's is empty) — but read `trains_gated` instead: this list
+    /// cannot tell you that half of it is locked.
     pub trains: Vec<&'static str>,
+    /// The same roster with each unit's gate attached. Parallel to `trains`,
+    /// element for element, so the two can never disagree about who trains
+    /// what — only about how much they say.
+    pub trains_gated: Vec<CatalogTrains>,
     /// Research ladders this building can start (`research[].id`). The inverse
     /// of `research[].researched_at`, which was the only direction exported —
     /// so "what is a Blacksmith FOR" needed the reader to scan a different
@@ -1556,13 +1714,7 @@ pub struct Catalog {
 
 /// Assemble the full content catalog from the stat/requirement tables.
 pub fn game_catalog() -> Catalog {
-    let trainer_of = |kind: UnitKind| {
-        ALL_BUILDING_KINDS
-            .iter()
-            .find(|b| trainable(**b).contains(&kind))
-            .map(|b| building_name(*b))
-            .unwrap_or("-")
-    };
+    let trainer_of = |kind: UnitKind| unit_trainer(kind).map(building_name).unwrap_or("-");
     Catalog {
         units: ALL_UNIT_KINDS
             .iter()
@@ -1617,6 +1769,17 @@ pub fn game_catalog() -> Catalog {
                     built_by: if building_placeable(k) { "Worker" } else { "Upgrade" },
                     requires: building_requires(k).iter().map(|b| building_name(*b)).collect(),
                     trains: trainable(k).iter().map(|u| kind_name(*u)).collect(),
+                    trains_gated: trainable(k)
+                        .iter()
+                        .map(|u| CatalogTrains {
+                            unit: kind_name(*u),
+                            requires: unit_requires(*u)
+                                .iter()
+                                .map(|b| building_name(*b))
+                                .collect(),
+                            tier: unit_tier(*u),
+                        })
+                        .collect(),
                     researches: building_researches(k).iter().map(|r| r.id()).collect(),
                     sells: if k == BuildingKind::Shop {
                         ALL_ITEMS.iter().map(|i| item_def(*i).name).collect()
@@ -1817,6 +1980,11 @@ pub struct BountyClaim {
     pub team: Team,
     pub gold: u32,
     pub pos: Vec3,
+    /// The cache entity's `to_bits()` — the same key the event feed's own
+    /// bounty memo is indexed by, so the claiming team's feed can suppress the
+    /// unattributed `bounty gone` line it would otherwise ALSO be shown for a
+    /// cache it just took itself.
+    pub id: u64,
 }
 
 /// Generous on purpose: walking PAST treasure should grab it. Playtest showed
@@ -5273,8 +5441,46 @@ pub struct SpawnBuildingEvent {
 // Game over
 // ---------------------------------------------------------------------------
 
+/// How a match ended. Round-9 AAR (`wc3clone-azo`): the winner could not tell
+/// which win they had got. The engine recognises exactly two endings and has
+/// always known which one it took — it just never said.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GameOverReason {
+    /// The loser has no production buildings left — see `check_game_over`.
+    Razed,
+    /// The loser conceded.
+    Surrender,
+}
+
+impl GameOverReason {
+    /// Wire text. Snapshot, HUD and headless log all print this one string.
+    pub fn name(self) -> &'static str {
+        match self {
+            GameOverReason::Razed => "razed",
+            GameOverReason::Surrender => "surrender",
+        }
+    }
+}
+
+/// The verdict, once there is one. Named fields rather than the old
+/// `GameOver(Option<Team>)` tuple so the reason cannot be added at one call
+/// site and forgotten at the other: `decide` is the only way to set either,
+/// and it takes both.
 #[derive(Resource, Default)]
-pub struct GameOver(pub Option<Team>); // Some(winner) once decided
+pub struct GameOver {
+    /// `Some(winner)` once decided.
+    pub winner: Option<Team>,
+    /// Always `Some` exactly when `winner` is.
+    pub reason: Option<GameOverReason>,
+}
+
+impl GameOver {
+    /// Record the verdict. Both halves, in one statement, or neither.
+    pub fn decide(&mut self, winner: Team, reason: GameOverReason) {
+        self.winner = Some(winner);
+        self.reason = Some(reason);
+    }
+}
 
 /// Which teams the scripted AI drives. Claude is always AI; the Human side
 /// can be AI too (AI-vs-AI spectating): `WC3_AI_BOTH=1` at launch or F9 at
@@ -5416,6 +5622,10 @@ impl Plugin for CorePlugin {
                     // reports losses on the tick they happen, not the next one.
                     // After `FogSet` because the feed is now vision-filtered:
                     // a team is told about hostiles and treasure it can see.
+                    // Before the diff, so a claim's id is registered in the
+                    // same tick the diff would otherwise report the cache
+                    // vanishing anonymously to the team that took it.
+                    announce_bounty_claims.before(produce_game_events),
                     produce_game_events.after(apply_death).after(FogSet),
                 ),
             );
@@ -5922,13 +6132,13 @@ fn check_game_over(
     mut surrenders: EventReader<Surrender>,
     buildings: Query<(&Building, &Team)>,
 ) {
-    if game_over.0.is_some() {
+    if game_over.winner.is_some() {
         surrenders.clear();
         return;
     }
     if let Some(surrender) = surrenders.read().next() {
         info!("{:?} surrenders — {:?} wins", surrender.team, surrender.team.enemy());
-        game_over.0 = Some(surrender.team.enemy());
+        game_over.decide(surrender.team.enemy(), GameOverReason::Surrender);
         return;
     }
     if time.elapsed_secs() < 10.0 {
@@ -5939,7 +6149,7 @@ fn check_game_over(
             .iter()
             .any(|(b, t)| *t == team && !trainable(b.kind).is_empty());
         if !has_production {
-            game_over.0 = Some(team.enemy());
+            game_over.decide(team.enemy(), GameOverReason::Razed);
         }
     }
 }
@@ -6055,6 +6265,14 @@ pub struct GameEvents {
     /// seeded from the opening position.
     force: bool,
     next_seq: u64,
+    /// Caches claimed since the last diff, as `(cache id, claiming team)`.
+    /// Written by `announce_bounty_claims`, read and cleared by the diff.
+    ///
+    /// It accumulates rather than being cleared per frame because the two run
+    /// on different clocks: claims are swept every few game-seconds by
+    /// bounty.rs, the diff every real second. An id has to survive the gap or
+    /// the claimer gets the anonymous `bounty gone` line for its own cache.
+    claims: Vec<(u64, Team)>,
 }
 
 impl Default for GameEvents {
@@ -6065,6 +6283,7 @@ impl Default for GameEvents {
             timer: Timer::from_seconds(EVENT_INTERVAL, TimerMode::Repeating),
             force: true,
             next_seq: 1,
+            claims: Vec::new(),
         }
     }
 }
@@ -6207,6 +6426,41 @@ struct EvBounty {
 /// Walk the world once per real second and append what changed to each team's
 /// ring buffer. Registered by `CorePlugin`, so the feed exists in every run
 /// mode — headless, windowed, bridged — and every renderer can rely on it.
+/// Tell the claiming team it claimed. Round-9 AAR (`wc3clone-azo`): the feed's
+/// only word on a cache was the unattributed `bounty gone`, which is what a
+/// watcher *observes* — and the team standing on the cache observed exactly
+/// that too, then had to diff its own gold against harvest income arriving in
+/// the same second to work out whether it had won the race or lost it.
+///
+/// A claim is a discrete act with no lasting trace, so it goes through
+/// `GameEvents::push` rather than the once-a-second diff: there is nothing in
+/// two consecutive pictures of the world that says who took the gold. That is
+/// also why the diff could never have answered this — the fix is not a better
+/// diff, it is the one fact only the claim event carries.
+///
+/// Pushed to `claim.team` and to nobody else. **The asymmetry is deliberate
+/// and is the fog rule, not an oversight** — see docs/FOG.md: the enemy still
+/// gets only `bounty gone`, and only if they were looking at the spot. Who
+/// took a cache is not visible in any snapshot, so telling them would hand out
+/// intel the map does not contain.
+fn announce_bounty_claims(
+    time: Res<Time>,
+    mut claims: EventReader<BountyClaim>,
+    mut feed: ResMut<GameEvents>,
+) {
+    let now = time.elapsed_secs();
+    for claim in claims.read() {
+        feed.claims.push((claim.id, claim.team));
+        feed.push(
+            claim.team,
+            now,
+            format!("we claimed the cache (+{}g)", claim.gold),
+            EventSeverity::Info,
+            Some(claim.pos),
+        );
+    }
+}
+
 fn produce_game_events(
     time: Res<Time>,
     real: Res<Time<Real>>,
@@ -6271,7 +6525,17 @@ fn produce_game_events(
         .collect();
     bounties.sort_unstable_by_key(|b| b.id);
 
+    // Cloned out before the per-team loop takes a mutable borrow of the memo.
+    // Two entries at the very most; a Vec is the honest size here.
+    let claims = feed.claims.clone();
+    feed.claims.clear();
+
     for team in [Team::Human, Team::Claude] {
+        let mine: Vec<u64> = claims
+            .iter()
+            .filter(|(_, t)| *t == team)
+            .map(|(id, _)| *id)
+            .collect();
         let produced = diff_team(
             team,
             now,
@@ -6281,6 +6545,7 @@ fn produce_game_events(
             &bounties,
             &squad_orders,
             fog.get(team),
+            &mine,
         );
         for (message, severity, pos) in produced {
             let seq = feed.next_seq;
@@ -6314,6 +6579,10 @@ fn diff_team(
     bounties: &[EvBounty],
     squad_orders: &SquadOrders,
     fog: &FogGrid,
+    // Caches THIS team claimed since the last tick. `announce_bounty_claims`
+    // has already told it so by name; the anonymous `bounty gone` line below
+    // would only be the same news told worse.
+    my_claims: &[u64],
 ) -> Vec<(String, EventSeverity, Option<Vec3>)> {
     use std::collections::HashMap;
 
@@ -6562,7 +6831,9 @@ fn diff_team(
             // We are watching the spot and it is empty. Tolerance absorbs the
             // rounded clock; anything still short of its deadline was taken,
             // not timed out.
-            if now + BOUNTY_EXPIRY_EPS < expires_at {
+            // ...unless it was OURS, in which case we have already been told
+            // so, with the gold attached.
+            if now + BOUNTY_EXPIRY_EPS < expires_at && !my_claims.contains(&id) {
                 out.push((
                     format!("bounty gone @({:.1},{:.1})", pos[0], pos[1]),
                     EventSeverity::Info,
@@ -7722,6 +7993,241 @@ mod tests {
         // never casts is a statue.
         assert_eq!(default_autocast(UnitKind::Sorcerer), Some((0, 1)));
         assert_eq!(default_autocast(UnitKind::Hero), None);
+    }
+
+    /// **The roster names its own gates** — `wc3clone-pbd`, round-9 AAR.
+    ///
+    /// `buildings[].trains` listed the Raider under the Barracks with nothing
+    /// on that entry to say it waits on a Workshop. The answer did exist, in
+    /// `units[].requires`, on the far side of the catalog behind a join
+    /// nothing advertised — and a commander reading a *roster* has no reason
+    /// to suspect a join is needed. It cost them their scout timing.
+    ///
+    /// So the gate is now legible without leaving the building entry, and the
+    /// two roster fields are pinned together so they cannot drift.
+    #[test]
+    fn the_roster_shows_the_gate_where_the_roster_is_read() {
+        let catalog = game_catalog();
+        let building = |id: &str| {
+            catalog
+                .buildings
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the catalog"))
+        };
+        let entry = |b: &str, u: &str| {
+            building(b)
+                .trains_gated
+                .iter()
+                .find(|t| t.unit == u)
+                .unwrap_or_else(|| panic!("{b} does not train {u}"))
+        };
+
+        // One roster, two readings — element for element, in the same order.
+        for b in &catalog.buildings {
+            let ids: Vec<&str> = b.trains_gated.iter().map(|t| t.unit).collect();
+            assert_eq!(b.trains, ids, "{}: trains and trains_gated disagree", b.id);
+        }
+
+        // The three units gated AT their trainer. This is the fact round 9 had
+        // to learn from a rejection.
+        assert_eq!(entry("Barracks", "Raider").requires, vec!["Workshop"]);
+        assert_eq!(entry("Barracks", "Knight").requires, vec!["Castle"]);
+        assert_eq!(entry("Workshop", "GryphonRider").requires, vec!["Castle"]);
+        // An ungated unit says so with an empty list rather than with silence.
+        assert!(entry("Barracks", "Footman").requires.is_empty());
+        // The Sorcerer's gate is on its TRAINER, not on itself — so its entry
+        // is legitimately empty, and the Sanctum's own `requires` carries the
+        // Keep. The building entry is complete either way, which is the
+        // property that matters: one entry, whole answer.
+        assert!(entry("Sanctum", "Sorcerer").requires.is_empty());
+        assert_eq!(building("Sanctum").requires, vec!["Keep"]);
+
+        // Tier travels with it, so "is this branch open to me yet" is one
+        // lookup against `me.tier` instead of a walk up the chain.
+        assert_eq!(entry("Barracks", "Raider").tier, 1);
+        assert_eq!(entry("Barracks", "Knight").tier, 3);
+        assert_eq!(entry("Sanctum", "Sorcerer").tier, 2);
+
+        // The catalog cannot claim a gate the engine does not enforce.
+        for b in &catalog.buildings {
+            for t in &b.trains_gated {
+                let kind = ALL_UNIT_KINDS
+                    .into_iter()
+                    .find(|k| kind_name(*k) == t.unit)
+                    .expect("roster names a real unit");
+                let want: Vec<&str> = unit_requires(kind).iter().map(|r| building_name(*r)).collect();
+                assert_eq!(t.requires, want, "{}: {} gate is not the engine's", b.id, t.unit);
+            }
+        }
+    }
+
+    /// **A refused train order says where the unit actually trains** —
+    /// `wc3clone-pbd`, the other half of the round-9 pair.
+    ///
+    /// The two strings a commander hit were individually true and collectively
+    /// a dead end. `Raider requires Workshop`, read *at the Barracks*, reads as
+    /// "wrong building" — so they moved the order to the Workshop and got
+    /// `Workshop cannot train Raider`. Neither ever said: keep training it
+    /// here, once a Workshop stands.
+    #[test]
+    fn a_refused_train_order_says_where_the_unit_actually_trains() {
+        let opening = [BuildingKind::TownHall, BuildingKind::Barracks];
+        let with_workshop = [
+            BuildingKind::TownHall,
+            BuildingKind::Barracks,
+            BuildingKind::Workshop,
+        ];
+
+        // The Raider at the Barracks — the right building, so the string has
+        // to name it anyway. The redundancy IS the fix.
+        assert_eq!(
+            train_gate_error(UnitKind::Raider, &opening).unwrap(),
+            "Raider trains at the Barracks once a Workshop stands (you have none)"
+        );
+        // ...and at the Workshop, which is where the old error sent them.
+        assert!(train_gate_error(UnitKind::Raider, &with_workshop).is_none());
+        assert_eq!(
+            wrong_trainer_error(BuildingKind::Workshop, UnitKind::Raider, &with_workshop),
+            "Workshop cannot train Raider — Raider trains at the Barracks"
+        );
+
+        // The hall ladder: "you have none" is a lie to somebody looking
+        // straight at their TownHall, so the clause names what they hold and
+        // what to do to it.
+        assert_eq!(
+            train_gate_error(UnitKind::Knight, &opening).unwrap(),
+            "Knight trains at the Barracks once a Castle stands \
+             (yours is a TownHall — upgrade it)"
+        );
+        assert_eq!(
+            train_gate_error(UnitKind::GryphonRider, &with_workshop).unwrap(),
+            "GryphonRider trains at the Workshop once a Castle stands \
+             (yours is a TownHall — upgrade it)"
+        );
+
+        // The Sorcerer. Its `unit_requires` is empty, so `train_gate_error`
+        // has nothing to say and the wrong-building string is the ONLY one it
+        // can ever produce — which is why that string has to carry the
+        // Sanctum's own Keep requirement too.
+        assert!(train_gate_error(UnitKind::Sorcerer, &opening).is_none());
+        assert_eq!(
+            wrong_trainer_error(BuildingKind::Barracks, UnitKind::Sorcerer, &opening),
+            "Barracks cannot train Sorcerer — Sorcerer trains at the Sanctum \
+             (you have no Sanctum; it needs a Keep)"
+        );
+        // Keep up, Sanctum not yet: the only instruction left is the building.
+        let keep = [BuildingKind::Keep, BuildingKind::Barracks];
+        assert_eq!(
+            wrong_trainer_error(BuildingKind::Barracks, UnitKind::Sorcerer, &keep),
+            "Barracks cannot train Sorcerer — Sorcerer trains at the Sanctum \
+             (you have no Sanctum)"
+        );
+        // A Castle satisfies the Keep, so the gate clause must not reappear.
+        let castle = [BuildingKind::Castle, BuildingKind::Barracks];
+        assert_eq!(
+            wrong_trainer_error(BuildingKind::Barracks, UnitKind::Sorcerer, &castle),
+            "Barracks cannot train Sorcerer — Sorcerer trains at the Sanctum \
+             (you have no Sanctum)"
+        );
+
+        // The general property, rather than the three cases: every gate error
+        // names the building that will accept the order once the gate is met.
+        // This is what the round-9 pair failed AS A PAIR.
+        for kind in ALL_UNIT_KINDS {
+            let Some(msg) = train_gate_error(kind, &opening) else {
+                continue;
+            };
+            let trainer = building_name(unit_trainer(kind).expect("a gated unit has a trainer"));
+            assert!(msg.contains(trainer), "{kind:?}: '{msg}' never names {trainer}");
+        }
+    }
+
+    /// **The verdict says which win it was** — `wc3clone-azo`, round-9 AAR:
+    /// the winner could not tell a razed base from a concession.
+    #[test]
+    fn the_verdict_says_which_win_it_was() {
+        let verdict = |setup: &dyn Fn(&mut App)| -> (Option<Team>, Option<GameOverReason>) {
+            let mut app = App::new();
+            app.init_resource::<Time>()
+                .init_resource::<GameOver>()
+                .add_event::<Surrender>()
+                .add_systems(Update, check_game_over);
+            setup(&mut app);
+            app.update();
+            let over = app.world().resource::<GameOver>();
+            (over.winner, over.reason)
+        };
+
+        // Razed: Claude has no production building left. The 10s grace has to
+        // be cleared first, or the opening frame decides the match.
+        let (winner, reason) = verdict(&|app: &mut App| {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs(20));
+            app.world_mut()
+                .spawn((Building { kind: BuildingKind::Barracks }, Team::Human));
+        });
+        assert_eq!(winner, Some(Team::Human));
+        assert_eq!(reason, Some(GameOverReason::Razed));
+
+        // Surrender: decided before the grace period even matters, and the
+        // conceding team is the one that loses.
+        let (winner, reason) = verdict(&|app: &mut App| {
+            app.world_mut().send_event(Surrender { team: Team::Human });
+        });
+        assert_eq!(winner, Some(Team::Claude));
+        assert_eq!(reason, Some(GameOverReason::Surrender));
+
+        // The two halves are set together or not at all — a winner with no
+        // reason is the bug this shape exists to make unrepresentable.
+        assert_eq!(GameOver::default().winner, None);
+        assert_eq!(GameOver::default().reason, None);
+        assert_eq!(GameOverReason::Razed.name(), "razed");
+        assert_eq!(GameOverReason::Surrender.name(), "surrender");
+    }
+
+    /// **The team that took the cache is told it took the cache** —
+    /// `wc3clone-azo`. The feed's only word used to be the unattributed
+    /// `bounty gone`, so the team standing on the cache saw exactly what a
+    /// distant watcher saw and had to diff its own gold against harvest income
+    /// arriving in the same second to find out whether it had won the race.
+    ///
+    /// The asymmetry that remains is the fog rule, not an oversight: who took
+    /// a cache appears in no snapshot, so the enemy gets nothing from here.
+    /// Documented in docs/FOG.md.
+    #[test]
+    fn the_claiming_team_is_told_it_claimed_and_the_enemy_is_not() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<GameEvents>()
+            .add_event::<BountyClaim>()
+            .add_systems(Update, announce_bounty_claims);
+        app.world_mut().send_event(BountyClaim {
+            team: Team::Claude,
+            gold: 270,
+            pos: Vec3::new(4.0, 0.0, -8.0),
+            id: 7,
+        });
+        app.update();
+
+        let feed = app.world().resource::<GameEvents>();
+        let mine: Vec<&str> = feed
+            .feed(Team::Claude)
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(mine, vec!["we claimed the cache (+270g)"]);
+        assert!(
+            feed.feed(Team::Human).is_empty(),
+            "a claim is not visible in any snapshot — telling the enemy would \
+             hand out intel the map does not contain"
+        );
+        // The cache is where it can be pointed at, so the HUD can focus it.
+        assert_eq!(feed.feed(Team::Claude)[0].pos, Some(Vec3::new(4.0, 0.0, -8.0)));
+        // And the id is filed for the diff, so the claimer is not ALSO shown
+        // the anonymous `bounty gone` line for its own cache a second later.
+        assert_eq!(feed.claims, vec![(7, Team::Claude)]);
     }
 
     /// The Sanctum's whole content wiring, asked of the derived tables rather

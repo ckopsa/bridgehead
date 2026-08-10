@@ -128,7 +128,7 @@ fn spawn_bounty(
     game_over: Res<GameOver>,
 ) {
     let now = time.elapsed_secs();
-    if now < schedule.next_at || game_over.0.is_some() {
+    if now < schedule.next_at || game_over.winner.is_some() {
         return;
     }
     // Whether or not a spot was found, the clock moves on.
@@ -243,6 +243,7 @@ fn claim_bounties(
             team,
             gold: bounty.gold,
             pos,
+            id: entity.to_bits(),
         });
         commands.entity(entity).despawn();
     }

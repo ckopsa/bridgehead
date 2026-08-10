@@ -131,10 +131,16 @@ fn check_decided(
     mut decided_at: Local<Option<f32>>,
     mut exit: EventWriter<AppExit>,
 ) {
-    if let Some(winner) = game_over.0 {
+    if let Some(winner) = game_over.winner {
         let decided = *decided_at.get_or_insert(time.elapsed_secs());
         if time.elapsed_secs() > decided + 5.0 {
-            info!("headless: game over — {winner:?} wins — exiting");
+            // The reason, not just the winner: a sim log that cannot tell a
+            // razed base from a concession is a log somebody misreads later.
+            let reason = game_over
+                .reason
+                .map(shared::GameOverReason::name)
+                .unwrap_or("unknown");
+            info!("headless: game over — {winner:?} wins ({reason}) — exiting");
             exit.write(AppExit::Success);
         }
     }

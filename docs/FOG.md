@@ -207,6 +207,36 @@ did leak:
   that walks out of sight stays believed-in, and one that expires unseen is dropped
   silently rather than reported as news you did not witness.
 
+### A claimed cache is asymmetric on purpose
+
+*`wc3clone-azo`, from a round-9 AAR.* The two bounty lines above are what a **watcher**
+observes, and for a long time they were all anyone got — including the team standing on
+the cache. That team saw `bounty gone @(x,z)`, exactly what a distant observer saw, and
+then had to diff its own gold against harvest income arriving in the same second to work
+out whether it had won the race or lost it. The one fact that settles it is the only fact
+the diff structurally cannot produce: **who took it.** Nothing about two consecutive
+pictures of the world says so, because bounty.rs despawns the cache on claim.
+
+So the claim announces itself, out of band of the diff, through `GameEvents::push`:
+
+| seat | what it is told |
+|---|---|
+| the team that claimed | `we claimed the cache (+270g)` — attributed, with the gold |
+| the other team | `bounty gone @(x,z)` — and **only** if it was watching the spot |
+
+**The asymmetry is the fog rule, not an exemption from it.** Who claimed a cache appears
+in no snapshot and on no minimap: there is no observation an opponent could make that
+would reveal it, so telling them would hand out intelligence the map does not contain.
+What an opponent *can* observe is that treasure they were looking at is no longer there,
+and that is precisely what they are told. An opponent who was not looking is told nothing
+and goes on believing the cache is there, per the memo rule above.
+
+The claiming team does **not** also get the anonymous `bounty gone` line for its own
+cache — it has already been told, with more information. The claim's cache id rides on
+`BountyClaim` for exactly this suppression, so the two producers cannot double-report.
+This is the "one producer, two renderers" rule holding: still one event feed, still
+pushed to the acting team only, still nobody writing to `team.enemy()`.
+
 **Attack orders are gated both ways.** A `state.json` that will not show you an enemy must
 not accept an `attack` command against it either, or the filtering is decoration. The
 gate is `knows_entity` — visible now **or** a remembered structure — and `intent.rs`
@@ -251,6 +281,7 @@ be.
 | `fog` | **new** object: `{enabled, explored, visible}`. Read it before concluding anything from an empty `units` array — "I have no information" and "there is nothing there" are otherwise the same empty list |
 | `mines[]`, `trees_near`, `map` | **unchanged** — public geography |
 | `me`, `squads`, `unlocked`, `events` | **unchanged** — own-team by construction |
+| `events[]` bounty claims | `we claimed the cache (+Ng)` reaches the **claiming team only** — see "A claimed cache is asymmetric on purpose" |
 | commands | `attack` against a target that is neither visible nor remembered is rejected |
 
 `catalog.json` gains `vision` on every unit and building.

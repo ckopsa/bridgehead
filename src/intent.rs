@@ -682,8 +682,8 @@ fn compile_intent(
             let pos = snap_footprint(clamp_to_map(Vec3::new(x, 0.0, z)), stats.size);
             if !nav.rect_is_free(pos, stats.size) {
                 errors.push(format!(
-                    "{tag}: site ({:.1}, {:.1}) is blocked for {kind}",
-                    pos.x, pos.z
+                    "{tag}: {}",
+                    blocked_site_error(nav, pos, building_kind)
                 ));
                 return;
             }
@@ -762,10 +762,12 @@ fn compile_intent(
             // Read the tech state before taking the mutable borrow of the
             // producing building below.
             let completed = completed_kinds(buildings, me);
-            if let Some(err) =
-                requirement_error(tag, kind_name(kind), unit_requires(kind), &completed)
-            {
-                errors.push(err);
+            // NOT the generic `requirement_error`: a training gate is refused
+            // at the very building that will train the unit once the gate is
+            // met, and `X requires Y` read there sends the commander looking
+            // for a different building. See `shared::train_gate_error`.
+            if let Some(err) = train_gate_error(kind, &completed) {
+                errors.push(format!("{tag}: {err}"));
                 return;
             }
             // Hero slots. economy.rs is the authoritative gate (it enforces
@@ -829,8 +831,8 @@ fn compile_intent(
             }
             if !trainable(b.kind).contains(&kind) {
                 errors.push(format!(
-                    "{tag}: {} cannot train {unit}",
-                    building_name(b.kind)
+                    "{tag}: {}",
+                    wrong_trainer_error(b.kind, kind, &completed)
                 ));
                 return;
             }
@@ -1024,45 +1026,79 @@ fn compile_intent(
             // have one) or one of our finished buildings with an ability.
             // combat.rs owns the unlock/mana/cooldown verdict either way,
             // exactly as it does for the R and C hotkeys.
+            //
+            // WHAT THE ID NAMES, resolved once into owned facts. Two reasons
+            // it is shaped this way rather than as a chain of fallthroughs:
+            // the borrow ends here, so each failure below can re-ask nothing;
+            // and there are FOUR distinct ways to fail, which the old single
+            // fallthrough flattened into one sentence.
+            //
+            // `wc3clone-d4y`, round-10 AAR: a commander cast Call to Arms at
+            // their expansion TownHall and read
+            // `caster N is not a hero or an own ability building`. Every word
+            // of that points at the tech tree, so they checked the catalog,
+            // found TownHall listed as a Call to Arms caster, and filed a bug
+            // against the roster. The roster was right and the compiler was
+            // right — *every* hall is a caster and a second one resolves
+            // exactly like the first (`a_second_hall_casts_call_to_arms_like_
+            // the_first` pins that). What the id named was something the
+            // buildings query could not find at all: a dead entity, or one
+            // never in it. The engine knew which; the string refused to say.
+            let unit_hit = units
+                .get(entity)
+                .ok()
+                .map(|(_, u, team, tf, _)| (u.kind, *team, tf.translation));
+            let building_hit = buildings
+                .get(entity)
+                .ok()
+                .map(|(b, team, under, _, _)| (b.kind, *team, under.is_some()));
+
             // Where the caster is standing, when it is a unit. `None` means a
             // building caster, which needs no position: `abilities_of_building`
             // is `is_hall`-only and a hall IS a command node, so its link is
             // provably zero (`every_building_caster_is_a_command_node`).
             let mut caster_pos: Option<Vec3> = None;
-            let unit_list = match units.get(entity) {
-                Ok((_, u, team, tf, _)) if *team == me => {
-                    caster_pos = Some(tf.translation);
-                    abilities_of_unit(u.kind)
-                }
-                _ => &[][..],
-            };
-            let list = if !unit_list.is_empty() {
-                unit_list
-            } else {
-                match buildings.get(entity) {
-                    Ok((b, team, under, _, _)) if *team == me => {
-                        if under.is_some() {
-                            errors.push(format!(
-                                "{tag}: building {hero} is under construction"
-                            ));
-                            return;
-                        }
-                        let list = abilities_of_building(b.kind);
-                        if list.is_empty() {
-                            errors.push(format!(
-                                "{tag}: {} has no ability",
-                                building_name(b.kind)
-                            ));
-                            return;
-                        }
-                        list
-                    }
-                    _ => {
-                        errors.push(format!(
-                            "{tag}: caster {hero} is not a hero or an own ability building"
-                        ));
+            let list = match (unit_hit, building_hit) {
+                (Some((kind, team, pos)), _) if team == me => {
+                    let list = abilities_of_unit(kind);
+                    if list.is_empty() {
+                        // Previously fell through to the building lookup and
+                        // came back as "not a hero or an own ability
+                        // building" — true of a Footman, and no help at all.
+                        errors.push(format!("{tag}: {} has no ability", kind_name(kind)));
                         return;
                     }
+                    caster_pos = Some(pos);
+                    list
+                }
+                (_, Some((kind, team, under))) if team == me => {
+                    if under {
+                        errors.push(format!("{tag}: building {hero} is under construction"));
+                        return;
+                    }
+                    let list = abilities_of_building(kind);
+                    if list.is_empty() {
+                        errors.push(format!("{tag}: {} has no ability", building_name(kind)));
+                        return;
+                    }
+                    list
+                }
+                // It exists and it is the enemy's. Say so: "not yours" is a
+                // fact about ownership, and sending the reader to the tech
+                // tree for it costs a minute of the wrong investigation.
+                (Some(_), _) | (_, Some(_)) => {
+                    errors.push(format!("{tag}: caster {hero} is not yours"));
+                    return;
+                }
+                // Nothing has that id. The overwhelmingly likely cause is a
+                // snapshot that has aged out from under the batch, which is
+                // the one explanation the reader can act on.
+                (None, None) => {
+                    errors.push(format!(
+                        "{tag}: caster {hero} not found — no unit or building has that id \
+                         (it may have died since the snapshot you read)"
+                    ));
+                    return;
                 }
             };
             // A named slot is checked for EXISTENCE here so a typo is an
@@ -1856,6 +1892,76 @@ pub fn snap_footprint(p: Vec3, size: f32) -> Vec3 {
     )
 }
 
+/// How far a blocked-placement rejection looks for somewhere that *would*
+/// work. Round-9 AAR (`wc3clone-vjy`): both commanders spent 20s+ guessing
+/// after `site (56.0, -56.0) is blocked for TownHall`, because the string named
+/// no rule and no alternative. 15 world units is a little under two TownHall
+/// footprints — far enough to clear a gold mine's 6x6 block plus your own
+/// half-footprint, near enough that the answer is still the base you meant.
+pub const PLACEMENT_HINT_RADIUS: f32 = 15.0;
+
+/// The nearest site within `radius` of `around` where a `size`-edge footprint
+/// would actually fit, or `None` if the whole neighbourhood is taken.
+///
+/// Candidates are generated on the nav lattice and put through the *same*
+/// `snap_footprint` + `rect_is_free` pair the rejection above just applied, so
+/// a hint is legal by construction rather than by two functions agreeing —
+/// which is the property `a_blocked_placement_hint_is_itself_legal` asserts by
+/// feeding the hint straight back to the validator.
+///
+/// Ties break on (distance, x, z) so two seats reading the same board are
+/// given the same advice. There is no fog consideration on purpose: the nav
+/// grid is map furniture (terrain, trees, mines) plus buildings, and
+/// docs/FOG.md already holds that map geography is public. A hint can point at
+/// a cell an enemy building has since taken, and the commander then gets the
+/// ordinary rejection there — the same thing that happens to the human's ghost.
+pub fn nearest_free_site(nav: &NavGrid, around: Vec3, size: f32, radius: f32) -> Option<Vec3> {
+    let steps = (radius / CELL).ceil() as i32;
+    let mut best: Option<(f32, Vec3)> = None;
+    for dz in -steps..=steps {
+        for dx in -steps..=steps {
+            let candidate = snap_footprint(
+                clamp_to_map(Vec3::new(
+                    around.x + dx as f32 * CELL,
+                    0.0,
+                    around.z + dz as f32 * CELL,
+                )),
+                size,
+            );
+            let d = (candidate.x - around.x).hypot(candidate.z - around.z);
+            if d > radius || !nav.rect_is_free(candidate, size) {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((bd, bp)) => (d, candidate.x, candidate.z) < (bd, bp.x, bp.z),
+            };
+            if better {
+                best = Some((d, candidate));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// The whole blocked-site rejection, hint included. One function because the
+/// bridge's `errors` array and the human's alert stack must read identically —
+/// docs/INTENT.md's "the text after the channel tag is byte-identical".
+pub fn blocked_site_error(nav: &NavGrid, pos: Vec3, kind: BuildingKind) -> String {
+    let size = building_stats(kind).size;
+    let hint = match nearest_free_site(nav, pos, size, PLACEMENT_HINT_RADIUS) {
+        Some(p) => format!("nearest legal: ({:.1}, {:.1})", p.x, p.z),
+        None => format!("no legal site within {PLACEMENT_HINT_RADIUS:.0}"),
+    };
+    format!(
+        "site ({:.1}, {:.1}) is blocked for {} — needs {size:.0}x{size:.0} clear \
+         (mines block 6x6, trees 2x2, buildings their own footprint); {hint}",
+        pos.x,
+        pos.z,
+        building_name(kind),
+    )
+}
+
 /// `None` when `reqs` are satisfied, otherwise the error line to report, e.g.
 /// `"cmd 3: Tower requires Barracks"`.
 fn requirement_error(
@@ -2570,6 +2676,230 @@ mod tests {
                 "{case} re-serialized under a different tag"
             );
         }
+    }
+
+    /// **Every hall is a caster, not just the first one** — `wc3clone-d4y`,
+    /// round-10 AAR. `cast CallToArms` at an expansion TownHall came back
+    /// `caster N is not a hero or an own ability building`, twice, while the
+    /// identical command worked at the team's Keep.
+    #[test]
+    fn a_second_hall_casts_call_to_arms_like_the_first() {
+        let mut app = compiler_app();
+        let hall = |app: &mut App, kind: BuildingKind, at: Vec3| {
+            app.world_mut()
+                .spawn((
+                    Building { kind },
+                    Team::Human,
+                    Transform::from_translation(at),
+                ))
+                .id()
+        };
+        let keep = hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+        let expansion = hall(&mut app, BuildingKind::TownHall, Vec3::new(20.0, 0.0, 20.0));
+
+        for (label, caster) in [("keep", keep), ("expansion", expansion)] {
+            app.world_mut()
+                .resource_mut::<IntentErrors>()
+                .get_mut(Team::Human)
+                .clear();
+            app.world_mut().send_event(SubmitIntent {
+                team: Team::Human,
+                source: IntentSource::Bridge,
+                tag: "cmd 0".to_string(),
+                intent: Intent::Cast {
+                    hero: caster.to_bits(),
+                    ability: Some(AbilitySelector::Id("CallToArms".to_string())),
+                },
+            });
+            app.update();
+            assert!(
+                app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+                "{label} hall refused the cast: {:?}",
+                app.world().resource::<IntentErrors>().get(Team::Human)
+            );
+        }
+
+        // So the roster and the compiler were both right, and the string was
+        // the liar: ONE sentence stood for four different failures, and the
+        // one it sounded like was the only one that was never happening.
+        // Each now says which.
+        let cast_error = |app: &mut App, caster: u64| -> String {
+            app.world_mut()
+                .resource_mut::<IntentErrors>()
+                .get_mut(Team::Human)
+                .clear();
+            app.world_mut().send_event(SubmitIntent {
+                team: Team::Human,
+                source: IntentSource::Bridge,
+                tag: "cmd 0".to_string(),
+                intent: Intent::Cast { hero: caster, ability: None },
+            });
+            app.update();
+            app.world()
+                .resource::<IntentErrors>()
+                .get(Team::Human)
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        // 1. A dead or never-existent id — the round-10 case. The old string
+        //    sent the reader to the catalog; this one names the real suspect.
+        app.world_mut().entity_mut(expansion).despawn();
+        let msg = cast_error(&mut app, expansion.to_bits());
+        assert!(msg.contains("not found"), "stale id: {msg}");
+        assert!(msg.contains("may have died"), "stale id gives no cause: {msg}");
+        assert!(
+            !msg.contains("ability building"),
+            "a dead hall must not be reported as a tech-tree problem: {msg}"
+        );
+
+        // 2. Someone else's hall. Ownership, not tech.
+        let theirs = hall(&mut app, BuildingKind::TownHall, Vec3::new(70.0, 0.0, 70.0));
+        app.world_mut().entity_mut(theirs).insert(Team::Claude);
+        assert_eq!(
+            cast_error(&mut app, theirs.to_bits()),
+            format!("cmd 0: caster {} is not yours", theirs.to_bits())
+        );
+
+        // 3. Our own building, standing, that genuinely has no ability. This
+        //    one was always right and stays untouched.
+        let farm = hall(&mut app, BuildingKind::Farm, Vec3::new(-60.0, 0.0, -60.0));
+        assert_eq!(cast_error(&mut app, farm.to_bits()), "cmd 0: Farm has no ability");
+
+        // 4. Our own UNIT with no abilities. This used to fall through to the
+        //    building lookup and come back as "not a hero or an own ability
+        //    building" — technically true of a Footman, and useless.
+        let footman = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+        assert_eq!(
+            cast_error(&mut app, footman.to_bits()),
+            "cmd 0: Footman has no ability"
+        );
+
+        // 5. And an own hall still going up is refused for the reason it is
+        //    actually refused for, in the same words every other verb uses.
+        let raising = hall(&mut app, BuildingKind::TownHall, Vec3::new(-20.0, 0.0, -20.0));
+        app.world_mut()
+            .entity_mut(raising)
+            .insert(UnderConstruction { remaining: 12.0 });
+        let msg = cast_error(&mut app, raising.to_bits());
+        assert!(msg.contains("is under construction"), "{msg}");
+    }
+
+    /// **A blocked site names one that works, and the name is good** —
+    /// `wc3clone-vjy`, round-9 AAR.
+    ///
+    /// `site (56.0, -56.0) is blocked for TownHall` named no rule and no
+    /// alternative, and both commanders spent 20s+ guessing at 2-unit
+    /// increments. The obvious failure mode of a fix is a hint that is itself
+    /// illegal, so this does not eyeball the string: it takes the coordinates
+    /// out of the rejection and feeds them back through the identical
+    /// compiler, and demands the second order be accepted.
+    #[test]
+    fn a_blocked_placement_hint_is_itself_legal() {
+        let mut app = compiler_app();
+        // A gold mine's footprint, exactly as terrain.rs lays it down (6x6),
+        // sitting where the commander wants their expansion hall. A TownHall
+        // is 8x8, so its centre has to clear the mine's by 7 on an axis —
+        // there is no separate "keep away from mines" rule, just two
+        // footprints that cannot overlap, and that is the whole reason the
+        // site the eye picks is the site that fails.
+        let mine = Vec3::new(56.0, 0.0, -56.0);
+        app.world_mut()
+            .resource_mut::<NavGrid>()
+            .set_blocked_rect(mine, 6.0, true);
+        let eco = app.world_mut().resource_mut::<Economies>().get_mut(Team::Human).gold;
+        assert!(eco > 0, "the default economy is what pays for the retry");
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let e = economies.get_mut(Team::Human);
+            e.gold = 2000;
+            e.lumber = 2000;
+        }
+        let worker = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Worker },
+                Team::Human,
+                Transform::from_translation(Vec3::new(50.0, 0.0, -50.0)),
+            ))
+            .id();
+
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: Intent::Build {
+                worker: worker.to_bits(),
+                kind: "TownHall".to_string(),
+                x: mine.x,
+                z: mine.z,
+            },
+        });
+        app.update();
+
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).to_vec();
+        assert_eq!(errors.len(), 1, "expected exactly one rejection: {errors:?}");
+        let msg = &errors[0];
+        // The rule, so a commander can predict the next one instead of probing.
+        assert!(msg.contains("8x8 clear"), "no clearance rule in '{msg}'");
+        assert!(msg.contains("mines block 6x6"), "no mine rule in '{msg}'");
+
+        // The alternative, parsed the way a commander would read it.
+        let hint = msg
+            .split("nearest legal: (")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no hint in '{msg}'"));
+        let hint = hint.split(')').next().unwrap();
+        let (hx, hz) = hint.split_once(", ").expect("hint is an x, z pair");
+        let (hx, hz) = (hx.parse::<f32>().unwrap(), hz.parse::<f32>().unwrap());
+
+        // Within the promised radius of the site actually asked for — which is
+        // the SNAPPED site the error printed, not the raw request.
+        let asked = snap_footprint(clamp_to_map(mine), building_stats(BuildingKind::TownHall).size);
+        let d = (hx - asked.x).hypot(hz - asked.z);
+        assert!(d <= PLACEMENT_HINT_RADIUS, "hint is {d} away, past the promise");
+
+        // ...and legal, asserted by the validator rather than by inspection.
+        app.world_mut()
+            .resource_mut::<IntentErrors>()
+            .get_mut(Team::Human)
+            .clear();
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: Intent::Build {
+                worker: worker.to_bits(),
+                kind: "TownHall".to_string(),
+                x: hx,
+                z: hz,
+            },
+        });
+        app.update();
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "the hint was refused: {:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+
+        // The other half of the promise: when there really is nowhere, say so
+        // rather than pointing at something far away.
+        {
+            let mut nav = app.world_mut().resource_mut::<NavGrid>();
+            nav.set_blocked_rect(mine, PLACEMENT_HINT_RADIUS * 2.0 + 20.0, true);
+        }
+        let nav = app.world().resource::<NavGrid>();
+        assert!(nearest_free_site(nav, mine, 8.0, PLACEMENT_HINT_RADIUS).is_none());
+        assert!(blocked_site_error(nav, mine, BuildingKind::TownHall)
+            .contains("no legal site within 15"));
     }
 
     /// The ability selector is untagged on the wire: a bare number is a slot

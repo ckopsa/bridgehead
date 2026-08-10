@@ -812,7 +812,7 @@ fn ai_think(
     // it reaches the same mechanism through the same helper the compiler uses.
     link: CommandLink,
 ) {
-    if game_over.0.is_some() {
+    if game_over.winner.is_some() {
         return;
     }
     if !state.timer.tick(time.delta()).just_finished() {
