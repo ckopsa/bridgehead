@@ -28,7 +28,7 @@ for whoever happens to have the better one.
 | Consumer | What it does with the grid |
 |---|---|
 | `bridge.rs` | filters each seat's `state.json` through that seat's team's grid |
-| `ui.rs` | paints the same grid as a terrain overlay + minimap fog, and hides the same entities the snapshot omits |
+| `ui.rs` | paints the same grid as a terrain overlay + minimap fog, **tints the scenery standing on it**, and hides the same entities the snapshot omits |
 | `ai.rs` | takes every enemy fact through it before planning |
 | `doctrine.rs` | Forage targeting and Defend threat response go through it |
 | `shared.rs` (event feed) | filters the two event categories that are not own-team knowledge |
@@ -327,20 +327,64 @@ that line is ever removed.
 
 Consequences of it being a flat quad rather than a shader:
 
-- **Tall scenery would poke through it.** A forest in never-visited terrain would stand
-  fully lit above a black floor. Tree clusters are therefore hidden outright until their
-  ground is *explored* (not *visible* — terrain is remembered). Gold mines are exempt as
-  public geography. Small ground doodads (rocks) still poke through; they carry no
-  information and are left alone.
 - **Enemy entities are hidden, not dimmed.** `Visibility::Hidden` on the root removes the
   whole entity, health bars included, since bars are children of their owner. This is the
   correct behaviour anyway — a dimmed enemy is still an enemy you can see.
 - The overlay is removed from the screen entirely under `WC3_FOG=0` rather than painted
   transparent every frame.
 
-A proper fog *shader* (sampling the same texture in the terrain material, or a
-post-process) would remove the tall-scenery caveat and is the obvious next step if fog
-rendering is ever revisited. It would not change the rule — only who draws it.
+### Scenery obeys the fog — the third renderer
+
+![Before and after: doodads under the fog](fog-scenery-before-after.png)
+
+*The same camera, the same map seed, the same 800×600 window. **Left:** the flat quad
+darkens the ground and nothing else, so four rocks standing in fogged terrain are lit as if
+it were noon. **Right:** the same four rocks wear their cell's shade. Measured peak
+luminance across those four doodads: **171.8 → 103.6**, and their contrast against the
+fogged ground beside them falls from 3.16× to 1.91× — dimmed with the earth they stand on
+rather than glowing out of it.*
+
+The quad lies at `y = 0.16`, so it can darken nothing taller than 0.16, which is nothing.
+A rock is half a unit across and a pine's canopy is four units up: both stood in full
+daylight over black or half-black earth. The floor said *unexplored* and the forest on it
+said *I am being watched right now*, and the eye believes the forest.
+
+That used to be papered over — trees were hidden outright until their ground was
+explored, and rocks were written off as carrying no information — but "carries no
+information" was the wrong test. A field of lit pebbles floating on unexplored black is
+the single most obvious way this fog looked broken, whatever it told you.
+
+So there is now a **third renderer of the one rule**, and it is materials rather than
+WGSL:
+
+| renderer | what it does with the state |
+|---|---|
+| the ground quad | lays `1 - shade` of black over the ground |
+| the minimap | the same texture, as an `ImageNode` |
+| **scenery tint** | multiplies a doodad's own base colour by `shade` |
+
+`shared::fog_shade` is the single rule all three read — **100% / 56% / 12%**, which is the
+same 0.0 / 0.44 / 0.88 of black the overlay always used, so the legibility those numbers
+were tuned for is preserved by construction rather than re-tuned.
+`the_scenery_tint_and_the_ground_overlay_are_one_darkness` fails if they ever stop summing
+to 1.
+
+Each doodad carries a `FogTinted` — its own look, pre-built once per state — and
+`ui::apply_fog_tint` decides which of the three it wears, off `GlobalTransform` so a
+canopy is shaded by the cell its trunk stands in. Three materials rather than one repainted
+material is deliberate: it is the *design-out* of the bind-group staleness bug above.
+Nothing is repainted, so nothing can go stale; swapping which handle an entity wears is
+the whole update.
+
+Trees are **still** hidden outright while `Unexplored`, and the reason has changed. It used
+to be a rendering workaround. It is now an information rule: where a forest stands is
+lumber and it is cover, so a team that has never been there does not get to see its
+silhouette, however dark. Gold mines and the map's barrier stay exempt as public
+geography — the minimap draws them above the fog for the same reason.
+
+What a real shader would still buy is a *soft* boundary on tall geometry and per-pixel
+rather than per-cell shading. Neither changes the rule; both are polish on top of a
+limitation that is now closed.
 
 ## Cadence and ordering
 

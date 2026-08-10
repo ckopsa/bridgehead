@@ -78,6 +78,16 @@ const COHESION_SPREAD: f32 = 14.0;
 /// blob creeping toward the objective instead of standing still.
 const COHESION_STEP: f32 = 8.0;
 
+/// How far past a known emplacement's attack range a squad treats the ground
+/// as covered. A squad that stops exactly on the range ring is already being
+/// shot at by the time it works out that it is: the margin is the approach.
+const DEFENSE_MARGIN: f32 = 6.0;
+/// Cohesion demanded before a Forage squad walks onto ground it knows is
+/// covered by static defense. Tighter than `COHESION_SPREAD` deliberately —
+/// the general rule only has to stop a squad arriving in packets, this one has
+/// to stop it arriving in ones.
+const DEFENDED_SPREAD: f32 = 7.0;
+
 // ---------------------------------------------------------------------------
 // Module-private components
 // ---------------------------------------------------------------------------
@@ -182,6 +192,176 @@ fn cohesion_point(positions: &[Vec3], target: Vec3) -> Option<Vec3> {
     }
     let dir = Vec3::new(target.x - centroid.x, 0.0, target.z - centroid.z).normalize_or_zero();
     Some(Vec3::new(centroid.x, 0.0, centroid.z) + dir * COHESION_STEP)
+}
+
+/// Centre of mass on the ground plane, and the distance of the widest member
+/// from it. `(from, 0.0)` for an empty formation.
+fn formation(positions: &[Vec3], fallback: Vec3) -> (Vec3, f32) {
+    if positions.is_empty() {
+        return (fallback, 0.0);
+    }
+    let centroid = positions.iter().copied().sum::<Vec3>() / positions.len() as f32;
+    let centroid = Vec3::new(centroid.x, 0.0, centroid.z);
+    let spread = positions
+        .iter()
+        .map(|p| xz_dist(*p, centroid))
+        .fold(0.0_f32, f32::max);
+    (centroid, spread)
+}
+
+/// Distance from `p` to the segment `a`-`b`, on the ground plane.
+fn point_segment_dist(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let ab = Vec2::new(b.x - a.x, b.z - a.z);
+    let ap = Vec2::new(p.x - a.x, p.z - a.z);
+    let len_sq = ab.length_squared();
+    if len_sq <= f32::EPSILON {
+        return ap.length();
+    }
+    let t = (ap.dot(ab) / len_sq).clamp(0.0, 1.0);
+    (ap - ab * t).length()
+}
+
+/// Static defense `team` has reason to believe is standing there, as
+/// `(position, covered radius)` discs.
+///
+/// It takes BOTH halves of "known" — what the team can see right now and what
+/// it remembers — and the second half is the point. `FogGrid::ghosts()` drops
+/// a record the instant the team can see the spot again ("sight wins", per
+/// docs/FOG.md), so a memory-only list would evaporate exactly as the squad
+/// got close enough for it to matter: the tower would guard the approach and
+/// then stop guarding the doorstep, which is a worse behaviour than having no
+/// opinion at all. A tower nobody has ever looked at is in neither half, and
+/// that is the fog rule holding — doctrine reads the grid, it does not peek
+/// around it.
+fn known_defenses(
+    fog: &FogGrid,
+    team: Team,
+    live: &Query<(&Team, &Transform, &Building), Without<UnderConstruction>>,
+) -> Vec<(Vec3, f32)> {
+    let covered = |kind: BuildingKind| {
+        building_stats(kind)
+            .attack
+            .map(|a| a.range + DEFENSE_MARGIN)
+    };
+    let mut out: Vec<(Vec3, f32)> = Vec::new();
+    // Remembered: a scout saw it, nobody is watching it now. `done` matters —
+    // a foundation the scout caught mid-build was not shooting at anything.
+    for ghost in fog.ghosts() {
+        if ghost.team == team || !ghost.done {
+            continue;
+        }
+        if let Some(r) = covered(ghost.kind) {
+            out.push((ghost.pos, r));
+        }
+    }
+    // Seen: in sight this instant, so it is not in `ghosts()` and would
+    // otherwise be missing from the list at the worst possible moment.
+    for (btm, tf, building) in live {
+        if *btm == team || !fog.sees(tf.translation) {
+            continue;
+        }
+        if let Some(r) = covered(building.kind) {
+            out.push((tf.translation, r));
+        }
+    }
+    out
+}
+
+/// Does the straight run from `from` to `to` pass through covered ground?
+///
+/// Deliberately the whole *approach* rather than just the destination: R10's
+/// tower was not standing on the treasure, it was standing on the way to it,
+/// and a rule that only asked about the cache would have marched the squad
+/// past the guns to reach an "uncovered" prize.
+fn approach_is_covered(from: Vec3, to: Vec3, defenses: &[(Vec3, f32)]) -> bool {
+    defenses
+        .iter()
+        .any(|(centre, radius)| point_segment_dist(*centre, from, to) <= *radius)
+}
+
+/// Slide `p` out of any covered disc it landed in, straight away from the
+/// emplacement. A staging point is where a squad *waits*, and waiting under
+/// the guns is precisely the death this rule exists to prevent.
+fn clear_of_defenses(p: Vec3, defenses: &[(Vec3, f32)]) -> Vec3 {
+    let mut out = Vec3::new(p.x, 0.0, p.z);
+    for (centre, radius) in defenses {
+        let d = xz_dist(out, *centre);
+        if d < *radius {
+            let away = Vec3::new(out.x - centre.x, 0.0, out.z - centre.z);
+            let dir = if away.length_squared() > f32::EPSILON {
+                away.normalize()
+            } else {
+                Vec3::X
+            };
+            out = Vec3::new(centre.x, 0.0, centre.z) + dir * *radius;
+        }
+    }
+    out
+}
+
+/// What a Forage squad does this tick, once known static defense has had its
+/// say. Two shapes, and the difference between them is the bead:
+#[derive(Clone, Debug, PartialEq)]
+enum ForagePlan {
+    /// Free hunting. Every member walks to the cache nearest to ITSELF, so a
+    /// spread-out squad splits across the map instead of queueing behind one
+    /// pile. The original, and still the common case.
+    Scatter(Vec<Vec3>),
+    /// One point for the whole squad — a regroup, a staging point short of the
+    /// guns, or a single cache being taken as a body.
+    Together(Vec3),
+}
+
+/// Pick the Forage objective, respecting emplacements the team knows about.
+///
+/// **R10 (Red):** six Footmen went into a tower on a forage path one at a
+/// time and died one at a time, because `Scatter` gives every member its own
+/// nearest cache and nothing in the posture had any opinion about a building
+/// the squad could not currently see. Two rules fix it, in order:
+///
+/// 1. **Divert.** Treasure whose approach nothing known is shooting at is
+///    strictly better treasure. If any cache qualifies, hunt only those and
+///    the tower never enters the story.
+/// 2. **Gather, then go in as one.** When every cache left is behind the guns,
+///    the squad stops scattering: it takes the nearest one as a single body,
+///    and it must be gathered to `DEFENDED_SPREAD` first — staging on the near
+///    side of the covered ground, never inside it.
+///
+/// What it deliberately does not do is refuse to go. A forager that will not
+/// walk past a tower it once saw is a forager that never leaves home, and the
+/// posture's whole job is to be out on the map.
+fn plan_forage(
+    positions: &[Vec3],
+    bounties: &[Vec3],
+    defenses: &[(Vec3, f32)],
+    muster: Vec3,
+) -> ForagePlan {
+    let (centroid, spread) = formation(positions, muster);
+
+    // 1. Divert: prefer caches with a clean run to them.
+    let open: Vec<Vec3> = bounties
+        .iter()
+        .copied()
+        .filter(|p| !approach_is_covered(centroid, *p, defenses))
+        .collect();
+    if !open.is_empty() {
+        let objective = nearest_point(&open, centroid).unwrap_or(muster);
+        return match cohesion_point(positions, objective) {
+            Some(p) => ForagePlan::Together(p),
+            None => ForagePlan::Scatter(open),
+        };
+    }
+
+    // 2. Everything left is covered. One objective for everybody, and nobody
+    //    crosses the line until the squad is actually a squad.
+    let objective = nearest_point(bounties, centroid).unwrap_or(muster);
+    if spread > DEFENDED_SPREAD {
+        let dir =
+            Vec3::new(objective.x - centroid.x, 0.0, objective.z - centroid.z).normalize_or_zero();
+        let stage = centroid + dir * COHESION_STEP;
+        return ForagePlan::Together(clear_of_defenses(stage, defenses));
+    }
+    ForagePlan::Together(objective)
 }
 
 /// Closest of `points` to `from` on the ground plane. `None` = empty slice.
@@ -677,6 +857,12 @@ fn run_squad_postures(
     // Read-only, so it may freely overlap `members` (defenders can themselves
     // be somebody else's threat).
     hostiles: Query<(&Team, &Transform, &Health), With<Unit>>,
+    // Emplacements standing right now. Read-only, so it may overlap freely;
+    // `Without<UnderConstruction>` is the same filter combat.rs's
+    // `tower_acquire` uses, because a foundation shoots at nothing. What the
+    // team is allowed to KNOW about these is decided by the fog grid in
+    // `known_defenses`, not by this query.
+    emplacements: Query<(&Team, &Transform, &Building), Without<UnderConstruction>>,
     healths: Query<&Health>,
     // Live treasure. bounty.rs despawns a cache the instant it is claimed or
     // expires, so "still in this query" is the whole liveness test.
@@ -781,11 +967,22 @@ fn run_squad_postures(
             .collect();
         let regroup = match posture {
             SquadPosture::Push { pos } => cohesion_point(&squad_positions, pos),
+            _ => None,
+        };
+
+        // Forage gets its own planner, because cohesion is only half of what a
+        // treasure hunt owes the squad: the other half is *which* treasure, and
+        // that question now has an answer about static defense in it. See
+        // `plan_forage` for the R10 story.
+        let forage_plan = match posture {
             SquadPosture::Forage { muster } if !bounty_points.is_empty() => {
-                let centroid = squad_positions.iter().copied().sum::<Vec3>()
-                    / (squad_positions.len().max(1)) as f32;
-                let objective = nearest_point(&bounty_points, centroid).unwrap_or(muster);
-                cohesion_point(&squad_positions, objective)
+                let defenses = known_defenses(team_fog, team, &emplacements);
+                Some(plan_forage(
+                    &squad_positions,
+                    &bounty_points,
+                    &defenses,
+                    muster,
+                ))
             }
             _ => None,
         };
@@ -855,18 +1052,24 @@ fn run_squad_postures(
                     }
                     (Order::Follow(unit), None)
                 }
-                // Treasure hunt: each member walks to the cache nearest to
+                // Treasure hunt. `plan_forage` has already decided whether this
+                // is a free scatter (each member walks to the cache nearest to
                 // ITSELF, so a spread-out squad splits across the map instead
-                // of queueing behind one pile. AttackMove, not Move, because a
-                // forager that meets an enemy on the way should fight it — the
-                // contested middle is exactly where bounties spawn.
+                // of queueing behind one pile) or one point for everybody.
+                // AttackMove, not Move, because a forager that meets an enemy
+                // on the way should fight it — the contested middle is exactly
+                // where bounties spawn.
                 //
                 // The see-nothing case became Defend above, so `muster` here is
                 // only a defensive fallback.
                 SquadPosture::Forage { muster } => {
-                    let target = regroup.unwrap_or_else(|| {
-                        nearest_point(&bounty_points, tf.translation).unwrap_or(muster)
-                    });
+                    let target = match &forage_plan {
+                        Some(ForagePlan::Together(point)) => *point,
+                        Some(ForagePlan::Scatter(targets)) => {
+                            nearest_point(targets, tf.translation).unwrap_or(muster)
+                        }
+                        None => muster,
+                    };
                     (Order::AttackMove(target), Some(target))
                 }
             };
@@ -1062,6 +1265,185 @@ mod tests {
 
         assert!(matches!(order_of(&app, unit), Order::AttackMove(_)));
         assert_eq!(why_of(&app, unit), "posture:forage sq2");
+    }
+
+    // -----------------------------------------------------------------
+    // Forage vs known static defense (R10: six Footmen, one tower, one
+    // at a time)
+    // -----------------------------------------------------------------
+
+    /// Where the guns are and how wide their covered disc is, in the geometry
+    /// both tests below share. The tower sits between the squad's muster and
+    /// the far cache; the near cache is off to one side with a clean run.
+    const T_TOWER: Vec3 = Vec3::new(40.0, 0.0, 0.0);
+    const T_COVERED: Vec3 = Vec3::new(70.0, 0.0, 0.0);
+    const T_OPEN: Vec3 = Vec3::new(0.0, 0.0, 70.0);
+
+    fn tower_radius() -> f32 {
+        building_stats(BuildingKind::Tower)
+            .attack
+            .expect("a Tower shoots")
+            .range
+            + DEFENSE_MARGIN
+    }
+
+    /// A dark grid with just the cache cells lit. Everything else stays unseen,
+    /// which is what keeps the planted tower a *ghost*: `FogGrid::ghosts()`
+    /// drops any record whose cell is currently visible.
+    fn forage_fog(app: &mut App, caches: &[Vec3]) {
+        let mut fog = FogGrids::test_dark();
+        for c in caches {
+            let (cx, cz) = NavGrid::world_to_cell(*c).expect("cache is on the map");
+            fog.test_set_cell(Team::Human, cx, cz, CellVis::Visible);
+        }
+        app.insert_resource(fog);
+    }
+
+    fn remember_tower(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<FogGrids>()
+            .test_remember(
+                Team::Human,
+                RememberedBuilding {
+                    id: 7,
+                    team: Team::Claude,
+                    kind: BuildingKind::Tower,
+                    pos: T_TOWER,
+                    hp: 550.0,
+                    max_hp: 550.0,
+                    done: true,
+                    last_seen: 0.0,
+                },
+            );
+    }
+
+    fn spawn_cache(app: &mut App, at: Vec3) {
+        app.world_mut()
+            .spawn((Bounty { gold: 270, expires_at: 999.0 }, Transform::from_translation(at)));
+    }
+
+    /// Three bodies strung out by 10 units: cohesive by the general rule
+    /// (`COHESION_SPREAD` is 14) and NOT cohesive by the stricter rule that
+    /// applies under known guns (`DEFENDED_SPREAD` is 7). Any test using this
+    /// formation is therefore testing the new gate specifically.
+    fn spawn_strung_out_squad(app: &mut App) -> Vec<Entity> {
+        let squad: Vec<Entity> = [
+            Vec3::new(0.0, 0.0, -10.0),
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+        ]
+        .into_iter()
+        .map(|p| spawn_footman(app, Team::Human, p))
+        .collect();
+        for e in &squad {
+            app.world_mut().entity_mut(*e).insert(SquadId(2));
+        }
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 2), SquadPosture::Forage { muster: Vec3::ZERO });
+        squad
+    }
+
+    fn move_target(app: &App, e: Entity) -> Vec3 {
+        match order_of(app, e) {
+            Order::AttackMove(p) | Order::Move(p) => p,
+            other => panic!("expected a move order, got {other:?}"),
+        }
+    }
+
+    /// Rule 1, the cheap one: treasure with a clean run to it is strictly
+    /// better treasure. With a tower remembered on the path to the far cache,
+    /// a Forage squad hunts the other one and the tower never enters the story.
+    #[test]
+    fn a_forage_squad_diverts_to_the_cache_no_remembered_tower_is_covering() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+        forage_fog(&mut app, &[T_COVERED, T_OPEN]);
+        remember_tower(&mut app);
+        spawn_cache(&mut app, T_COVERED);
+        spawn_cache(&mut app, T_OPEN);
+        let squad = spawn_strung_out_squad(&mut app);
+
+        app.update();
+
+        for e in &squad {
+            let target = move_target(&app, *e);
+            assert!(
+                xz_dist(target, T_OPEN) < 0.1,
+                "a forager walked toward {target:?} with an uncovered cache at \
+                 {T_OPEN:?} available"
+            );
+        }
+    }
+
+    /// Rule 2, the one R10 needed: when the only treasure left is behind the
+    /// guns, the squad stops trickling. Every member is sent to ONE point, that
+    /// point is short of the covered ground, and it stays there until the squad
+    /// has actually gathered.
+    ///
+    /// The control half is the whole test: with nothing remembered, the same
+    /// three bodies walk straight at the cache — which is exactly the
+    /// single-file entry that killed six Footmen.
+    #[test]
+    fn a_forage_squad_gathers_short_of_a_remembered_tower_instead_of_trickling_in() {
+        // Control: no memory of the tower, so no opinion about it.
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+        forage_fog(&mut app, &[T_COVERED]);
+        spawn_cache(&mut app, T_COVERED);
+        let squad = spawn_strung_out_squad(&mut app);
+        app.update();
+        for e in &squad {
+            assert!(
+                xz_dist(move_target(&app, *e), T_COVERED) < 0.1,
+                "control: without the memory a forager should march at the cache"
+            );
+        }
+
+        // Same map, same squad, one scouted tower on the path.
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+        forage_fog(&mut app, &[T_COVERED]);
+        remember_tower(&mut app);
+        spawn_cache(&mut app, T_COVERED);
+        let squad = spawn_strung_out_squad(&mut app);
+        app.update();
+
+        let targets: Vec<Vec3> = squad.iter().map(|e| move_target(&app, *e)).collect();
+        // ONE point for everybody — the end of single file.
+        for t in &targets {
+            assert!(
+                xz_dist(*t, targets[0]) < 0.1,
+                "the squad was sent to {targets:?}: still entering piecemeal"
+            );
+        }
+        let stage = targets[0];
+        assert!(
+            xz_dist(stage, T_COVERED) > 0.1,
+            "the squad walked onto the cache without gathering first"
+        );
+        assert!(
+            xz_dist(stage, T_TOWER) >= tower_radius() - 0.01,
+            "the squad staged at {stage:?}, inside the tower's covered ground"
+        );
+    }
+
+    /// The rule must not turn Forage into a posture that never leaves home:
+    /// once the squad IS gathered, it goes in — as a body, to the cache.
+    #[test]
+    fn a_gathered_forage_squad_still_takes_the_defended_cache() {
+        let defenses = vec![(T_TOWER, tower_radius())];
+        let tight = [
+            Vec3::new(0.0, 0.0, -2.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+        ];
+        assert_eq!(
+            plan_forage(&tight, &[T_COVERED], &defenses, Vec3::ZERO),
+            ForagePlan::Together(T_COVERED),
+            "a gathered squad must commit to the cache, not sit outside forever"
+        );
     }
 
     /// The policy rung. A unit running for home is not obeying an order anyone
@@ -1747,5 +2129,134 @@ mod tests {
         let fired = casts_fired(&mut app);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].caster, champion);
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    // The R10 shape, restated so this module needs nothing from `mod tests`.
+    const T_TOWER: Vec3 = Vec3::new(40.0, 0.0, 0.0);
+    const T_COVERED: Vec3 = Vec3::new(70.0, 0.0, 0.0);
+    const T_OPEN: Vec3 = Vec3::new(0.0, 0.0, 70.0);
+
+    /// A measurement first and an assertion second. Run with `--nocapture` to
+    /// read the numbers; it also fails if either headline result drifts back.
+    ///
+    /// R10's death was not six Footmen picking six different destinations — with
+    /// one cache they all picked the same one. It was six Footmen *arriving*
+    /// separately, because a strung-out squad was ordered onto the treasure and
+    /// then trickled into the tower's range in whatever order they got there.
+    /// So the quantity that matters is: **when the squad is not gathered, is it
+    /// ordered under the guns anyway?**
+    #[test]
+    fn probe_r10_forage_entry() {
+        let radius = building_stats(BuildingKind::Tower)
+            .attack
+            .expect("a Tower shoots")
+            .range
+            + DEFENSE_MARGIN;
+        let defenses = vec![(T_TOWER, radius)];
+        // Strictly inside. A point ON the ring is where `clear_of_defenses`
+        // deliberately puts a staging squad, and counting the ring as covered
+        // would score the fix as the bug.
+        let covered = |p: Vec3| xz_dist(p, T_TOWER) < radius - 0.05;
+
+        let mut seed: u64 = 0x5EED_1234;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32) / (0xFF_FFFF as f32)
+        };
+
+        // (a) One cache, behind the guns. Ungathered squads only.
+        let (mut n, mut old_in, mut new_in) = (0usize, 0usize, 0usize);
+        // (b) Two caches, one with a clean approach. All squads.
+        let (mut m, mut old_bad, mut new_bad) = (0usize, 0usize, 0usize);
+
+        // The squad approaches from outside the guns. A formation already
+        // standing inside the covered disc is not a decision anyone gets to
+        // make — it is already being shot at — so it is not sampled.
+        for step in 0..40 {
+            let centre = Vec3::new(step as f32 * 0.45 - 4.0, 0.0, 0.0);
+            for _ in 0..12 {
+                let spread = 2.0 + rnd() * 22.0;
+                let squad: Vec<Vec3> = (0..6)
+                    .map(|_| {
+                        centre
+                            + Vec3::new(
+                                (rnd() - 0.5) * 2.0 * spread,
+                                0.0,
+                                (rnd() - 0.5) * 2.0 * spread,
+                            )
+                    })
+                    .collect();
+                let (real_centroid, real_spread) = formation(&squad, centre);
+                if xz_dist(real_centroid, T_TOWER) <= radius {
+                    continue;
+                }
+
+                // What master did: no opinion about defense whatsoever.
+                let old = |caches: &[Vec3]| -> Vec3 {
+                    let (c, _) = formation(&squad, centre);
+                    let obj = nearest_point(caches, c).unwrap();
+                    cohesion_point(&squad, obj).unwrap_or(obj)
+                };
+                let new = |caches: &[Vec3]| -> Vec3 {
+                    match plan_forage(&squad, caches, &defenses, centre) {
+                        ForagePlan::Together(p) => p,
+                        ForagePlan::Scatter(ts) => nearest_point(&ts, centre).unwrap(),
+                    }
+                };
+
+                // (a) An UNGATHERED squad must not be pointed under the guns.
+                if real_spread > DEFENDED_SPREAD {
+                    n += 1;
+                    if covered(old(&[T_COVERED])) {
+                        old_in += 1;
+                    }
+                    if covered(new(&[T_COVERED])) {
+                        new_in += 1;
+                    }
+                }
+
+                // (b) With a clean cache available, taking the covered one is
+                //     simply the wrong call.
+                m += 1;
+                let pick_bad = |t: Vec3| xz_dist(t, T_OPEN) > xz_dist(t, T_COVERED);
+                if pick_bad(old(&[T_COVERED, T_OPEN])) {
+                    old_bad += 1;
+                }
+                if pick_bad(new(&[T_COVERED, T_OPEN])) {
+                    new_bad += 1;
+                }
+            }
+        }
+
+        let pct = |a: usize, b: usize| 100.0 * a as f32 / b.max(1) as f32;
+        println!("\n=== R10 forage probe — one remembered Tower, covered disc {radius:.0} units ===");
+        println!("(a) UNGATHERED squads ordered onto covered ground  (n = {n})");
+        println!("      master {old_in:4}/{n}  ({:5.1}%)", pct(old_in, n));
+        println!("      now    {new_in:4}/{n}  ({:5.1}%)", pct(new_in, n));
+        println!("(b) squads that chose the covered cache with a clean one available  (n = {m})");
+        println!("      master {old_bad:4}/{m}  ({:5.1}%)", pct(old_bad, m));
+        println!("      now    {new_bad:4}/{m}  ({:5.1}%)", pct(new_bad, m));
+        println!();
+
+        // The measurement is the point, but it is worth nothing if it can
+        // silently drift back, so the two headline numbers are also the bar.
+        assert_eq!(
+            new_in, 0,
+            "a strung-out squad was ordered onto covered ground {new_in} times"
+        );
+        assert!(
+            pct(new_bad, m) < 25.0,
+            "the divert rule only fires {:.1}% of the time",
+            100.0 - pct(new_bad, m)
+        );
+        // …and the bar has to be one master actually fails, or it proves nothing.
+        assert!(old_in > 0 && pct(old_bad, m) > 50.0);
     }
 }
