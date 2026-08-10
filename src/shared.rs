@@ -140,6 +140,9 @@ pub enum UnitKind {
     /// The second hero class: ranged, heals allies instead of slamming enemies.
     /// Carries a `Hero` component like the Champion; one hero per team total.
     Priestess,
+    /// Anti-cavalry line infantry: cheap, slow, and feeble against everything
+    /// except a horse, which it deletes. The tier-1 answer to Raiders.
+    Spearman,
 }
 
 /// Hero-class unit kinds (carry the `Hero` component, count against the
@@ -163,7 +166,7 @@ pub enum BuildingKind {
     Shop,
 }
 
-pub const ALL_UNIT_KINDS: [UnitKind; 7] = [
+pub const ALL_UNIT_KINDS: [UnitKind; 8] = [
     UnitKind::Worker,
     UnitKind::Footman,
     UnitKind::Archer,
@@ -171,6 +174,7 @@ pub const ALL_UNIT_KINDS: [UnitKind; 7] = [
     UnitKind::Catapult,
     UnitKind::Raider,
     UnitKind::Priestess,
+    UnitKind::Spearman,
 ];
 pub const ALL_BUILDING_KINDS: [BuildingKind; 7] = [
     BuildingKind::TownHall,
@@ -203,6 +207,11 @@ pub struct UnitStats {
     pub vs_building_mult: f32,
     /// Damage multiplier against Catapults (cavalry's anti-siege role).
     pub vs_siege_mult: f32,
+    /// Damage multiplier against `TargetClass::Cavalry` (the Spearman's
+    /// anti-cavalry role). Large on purpose: a spear line is the only thing a
+    /// 90g tier-1 unit can do to a 170g Raider, and without it nothing a team
+    /// can build before a Workshop answers cavalry at all.
+    pub vs_cavalry_mult: f32,
 
     // --- movement plane & attack envelope ---------------------------------
     /// Airborne: ignores the `NavGrid` entirely (straight-line paths over
@@ -263,13 +272,13 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Worker => UnitStats {
             cost_gold: 75, cost_lumber: 0, supply: 1, hp: 60.0, damage: 5.0,
             range: 1.8, attack_cooldown: 1.5, speed: 8.0, train_time: 8.0, projectile: false,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         UnitKind::Footman => UnitStats {
             cost_gold: 135, cost_lumber: 0, supply: 2, hp: 140.0, damage: 12.0,
             range: 2.0, attack_cooldown: 1.2, speed: 7.0, train_time: 12.0, projectile: false,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // The line's anti-air: a footman screen is helpless overhead, archers
@@ -277,7 +286,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Archer => UnitStats {
             cost_gold: 90, cost_lumber: 30, supply: 2, hp: 70.0, damage: 14.0,
             range: 14.0, attack_cooldown: 1.5, speed: 7.0, train_time: 12.0, projectile: true,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: true, can_hit_ground: true,
         },
         // Base (level 1) stats; damage/HP grow per level — see `Hero`.
@@ -287,7 +296,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Hero => UnitStats {
             cost_gold: 400, cost_lumber: 100, supply: 5, hp: 320.0, damage: 24.0,
             range: 2.4, attack_cooldown: 1.1, speed: 7.5, train_time: 25.0, projectile: false,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Outranges towers (20 vs 16) and pulverizes structures, but 15 damage
@@ -297,7 +306,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Catapult => UnitStats {
             cost_gold: 180, cost_lumber: 120, supply: 3, hp: 110.0, damage: 15.0,
             range: 20.0, attack_cooldown: 3.0, speed: 4.5, train_time: 22.0, projectile: true,
-            vs_building_mult: 6.0, vs_siege_mult: 1.0,
+            vs_building_mult: 6.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Speed is the weapon: dives catapults (2x) and worker lines, melts
@@ -305,7 +314,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Raider => UnitStats {
             cost_gold: 170, cost_lumber: 30, supply: 3, hp: 130.0, damage: 16.0,
             range: 2.2, attack_cooldown: 1.1, speed: 10.5, train_time: 16.0, projectile: false,
-            vs_building_mult: 1.0, vs_siege_mult: 2.0,
+            vs_building_mult: 1.0, vs_siege_mult: 2.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Ranged support hero: heals instead of slams. Base (level 1) stats.
@@ -314,8 +323,26 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Priestess => UnitStats {
             cost_gold: 400, cost_lumber: 100, supply: 5, hp: 240.0, damage: 14.0,
             range: 10.0, attack_cooldown: 1.4, speed: 7.5, train_time: 25.0, projectile: true,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: true, can_hit_ground: true,
+        },
+        // The counter-triangle's missing third leg. Before this, a team that
+        // met Raiders had nothing at tier 1 to answer them: Footmen are too
+        // slow to catch cavalry and too expensive to trade with it, Archers
+        // die to it. So the Spearman is deliberately BAD at everything else —
+        // 6 damage on a 1.7s thrust is the worst dps in the game, and a
+        // Footman beats one in a straight duel without dropping below half —
+        // and it buys that weakness back at 5x against a horse. What it is
+        // always worth is meat: 160 hp for 90 gold is the cheapest hit points
+        // on the field, so a spear line in front of archers is a real
+        // formation even in a match where the enemy never builds cavalry.
+        // Slow (5.5) so it can screen but never chase; the counter is a wall
+        // you walk cavalry into, not a hunter.
+        UnitKind::Spearman => UnitStats {
+            cost_gold: 90, cost_lumber: 0, supply: 2, hp: 160.0, damage: 6.0,
+            range: 2.6, attack_cooldown: 1.7, speed: 5.5, train_time: 10.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 5.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
         },
     }
 }
@@ -415,7 +442,15 @@ pub fn requirements_met(
 pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
     match kind {
         BuildingKind::TownHall => &[UnitKind::Worker, UnitKind::Hero, UnitKind::Priestess],
-        BuildingKind::Barracks => &[UnitKind::Footman, UnitKind::Archer, UnitKind::Raider],
+        // Spearman is appended rather than slotted next to the Footman on
+        // purpose: production hotkeys are positional, and moving Archer off W
+        // to make room would retrain every existing pair of hands.
+        BuildingKind::Barracks => &[
+            UnitKind::Footman,
+            UnitKind::Archer,
+            UnitKind::Raider,
+            UnitKind::Spearman,
+        ],
         BuildingKind::Workshop => &[UnitKind::Catapult],
         BuildingKind::Farm | BuildingKind::Tower | BuildingKind::Wall | BuildingKind::Shop => &[],
     }
@@ -439,6 +474,7 @@ pub fn kind_name(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Catapult",
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
+        UnitKind::Spearman => "Spearman",
     }
 }
 
@@ -463,13 +499,14 @@ pub fn unit_description(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it.",
         UnitKind::Raider => "Fast cavalry: 2x damage vs Catapults, excels at worker raids and map control. Melts under massed fire.",
         UnitKind::Priestess => "Support hero: ranged attack, Heal ability (AoE ally healing). One hero per team; revival preserves level and class.",
+        UnitKind::Spearman => "Cheap anti-cavalry line: 5x damage vs Raiders, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
     }
 }
 
 pub fn building_description(kind: BuildingKind) -> &'static str {
     match kind {
         BuildingKind::TownHall => "Resource drop-off. Trains Workers and the Hero.",
-        BuildingKind::Barracks => "Trains Footmen and Archers.",
+        BuildingKind::Barracks => "Trains Footmen, Archers and Spearmen (and Raiders, once a Workshop stands).",
         BuildingKind::Farm => "+6 supply. Build ahead of the cap or production stalls.",
         BuildingKind::Tower => "Static defense: shoots arrows at enemies in range.",
         BuildingKind::Wall => "Cheap blocking segment. No function except HP in the way.",
@@ -1149,7 +1186,10 @@ impl TargetClass {
             // Both hero classes are "Hero" for targeting purposes.
             (Some(UnitKind::Hero) | Some(UnitKind::Priestess), _) => Some(TargetClass::Hero),
             (Some(UnitKind::Archer), _) => Some(TargetClass::Archer),
-            (Some(UnitKind::Footman), _) => Some(TargetClass::Footman),
+            // The Spearman answers to "Footman" for targeting purposes: the
+            // class is the melee line, and a doctrine that says "focus the
+            // front rank" means the front rank, whatever it is holding.
+            (Some(UnitKind::Footman) | Some(UnitKind::Spearman), _) => Some(TargetClass::Footman),
             (Some(UnitKind::Worker), _) => Some(TargetClass::Worker),
             (Some(UnitKind::Catapult), _) => Some(TargetClass::Siege),
             (Some(UnitKind::Raider), _) => Some(TargetClass::Cavalry),
@@ -1845,9 +1885,24 @@ fn debug_log(
         let e = economies.get(team);
         let u = units.iter().filter(|(_, t)| **t == team).count();
         let b = buildings.iter().filter(|(_, t)| **t == team).count();
+        // Per-kind breakdown, driven by ALL_UNIT_KINDS so new content shows up
+        // here the day it is added. A bare unit count cannot answer the one
+        // question every balance run asks — "did anyone actually build the
+        // thing, and did it live?" — and an army is its composition.
+        let army = ALL_UNIT_KINDS
+            .iter()
+            .filter_map(|kind| {
+                let n = units
+                    .iter()
+                    .filter(|(unit, t)| **t == team && unit.kind == *kind)
+                    .count();
+                (n > 0).then(|| format!("{n} {}", kind_name(*kind)))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         info!(
-            "[{:>6.1}s] {:?}: gold {} lumber {} supply {}/{} | {} units, {} buildings",
-            time.elapsed_secs(), team, e.gold, e.lumber, e.supply_used, e.supply_cap, u, b
+            "[{:>6.1}s] {:?}: gold {} lumber {} supply {}/{} | {} units, {} buildings | {}",
+            time.elapsed_secs(), team, e.gold, e.lumber, e.supply_used, e.supply_cap, u, b, army
         );
     }
 }

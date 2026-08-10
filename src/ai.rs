@@ -42,6 +42,14 @@ const ARCHER_EVERY_NTH: u32 = 3;
 /// Every Nth army unit is a Raider instead — cavalry to chase siege and
 /// workers. Checked before the Archer slot, so the 15th unit is a Raider.
 const RAIDER_EVERY_NTH: u32 = 5;
+/// Every Nth army unit is a Spearman — checked last, so it only takes slots
+/// the Raider and Archer rules left alone (~1 in 6 of actual Barracks output).
+/// A flat fraction rather than a reaction to scouted cavalry: the script has
+/// no memory of what it has seen, and a standing hedge in front of the archers
+/// is worth its 90 gold as cheap hit points even in a match where the enemy
+/// never mounts up. Reacting properly is a commander's job, and a commander
+/// gets the same unit through the same catalog.
+const SPEARMAN_EVERY_NTH: u32 = 4;
 
 /// Siege. A Workshop is a luxury: only once a Barracks stands and the treasury
 /// is comfortably ahead of army production does the AI branch into siege.
@@ -800,6 +808,8 @@ fn think(
                     UnitKind::Raider
                 } else if next % ARCHER_EVERY_NTH == 0 {
                     UnitKind::Archer
+                } else if next % SPEARMAN_EVERY_NTH == 0 {
+                    UnitKind::Spearman
                 } else {
                     UnitKind::Footman
                 };

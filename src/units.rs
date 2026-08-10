@@ -129,6 +129,9 @@ struct UnitAssets {
     raider_mount: Handle<Mesh>,
     raider_leg: Handle<Mesh>,
     raider_rider: Handle<Mesh>,
+    spearman_body: Handle<Mesh>,
+    spearman_shaft: Handle<Mesh>,
+    spearman_head: Handle<Mesh>,
     priestess_body: Handle<Mesh>,
     priestess_hood: Handle<Mesh>,
     priestess_staff: Handle<Mesh>,
@@ -213,6 +216,14 @@ fn setup_unit_assets(
         // their centre at -0.58 without punching through it.
         raider_leg: meshes.add(Cylinder::new(0.09, 0.34)),
         raider_rider: meshes.add(Capsule3d::new(0.19, 0.30)),
+        // Spearman: the tallest infantry silhouette and the thinnest — a
+        // narrow capsule under a spear that stands a full body-length above
+        // the head. At RTS camera distance the vertical line is the whole
+        // read: if you can see spears over the front rank, that rank is a
+        // wall, and you do not ride into it.
+        spearman_body: meshes.add(Capsule3d::new(0.25, 1.06)),
+        spearman_shaft: meshes.add(Cylinder::new(0.045, 1.75)),
+        spearman_head: meshes.add(Cone::new(0.10, 0.26)),
         // Priestess: slim robe, oversized hood, tall staff with a lit tip.
         // Total 1.60 = the kind's height, so she stands on the ground plane.
         priestess_body: meshes.add(Capsule3d::new(0.27, 1.06)),
@@ -244,6 +255,9 @@ fn unit_height(kind: UnitKind) -> f32 {
         // Mounted: long and low, rider's head about where a footman's is.
         UnitKind::Raider => 1.50,
         UnitKind::Priestess => 1.60,
+        // Taller than a Footman and much narrower — before the spear is even
+        // drawn, the silhouette says "reach, not shoulders".
+        UnitKind::Spearman => 1.56,
     }
 }
 
@@ -315,6 +329,7 @@ fn spawn_units(
             // faces where the unit faces); the dark mount is a child below it.
             UnitKind::Raider => assets.raider_rider.clone(),
             UnitKind::Priestess => assets.priestess_body.clone(),
+            UnitKind::Spearman => assets.spearman_body.clone(),
         };
         // Everyone wears their team's colour; the catapult is a wooden machine
         // that merely carries a painted panel (spawned as a child below).
@@ -400,6 +415,7 @@ fn spawn_units(
                 UnitKind::Catapult => "Catapult",
                 UnitKind::Raider => "Raider",
                 UnitKind::Priestess => "Priestess",
+                UnitKind::Spearman => "Spearman",
             }),
         ));
 
@@ -535,6 +551,24 @@ fn spawn_units(
                             UnitAccent,
                         ));
                     }
+                }
+                UnitKind::Spearman => {
+                    // The spear itself: a thin shaft held upright at the right
+                    // shoulder, deliberately overlong so a block of them reads
+                    // as a hedge from the RTS camera.
+                    parent.spawn((
+                        Mesh3d(assets.spearman_shaft.clone()),
+                        MeshMaterial3d(assets.wood_mat.clone()),
+                        Transform::from_xyz(0.30, 0.52, -0.04),
+                        UnitAccent,
+                    ));
+                    // Leaf-blade point on top of the shaft.
+                    parent.spawn((
+                        Mesh3d(assets.spearman_head.clone()),
+                        MeshMaterial3d(assets.metal_mat.clone()),
+                        Transform::from_xyz(0.30, 1.52, -0.04),
+                        UnitAccent,
+                    ));
                 }
                 UnitKind::Priestess => {
                     // Hood: a pale sphere pulled over the head.
