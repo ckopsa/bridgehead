@@ -4411,6 +4411,7 @@ mod tests {
                 team: Team::Human,
                 source: IntentSource::Bridge,
                 tag: "cmd 0".to_string(),
+                trigger: None,
                 intent: Intent::UseItem {
                     slot: 0,
                     hero: Some(hero.to_bits()),
@@ -4494,6 +4495,7 @@ mod tests {
             team: Team::Human,
             source: IntentSource::Bridge,
             tag: "cmd 0".to_string(),
+            trigger: None,
             intent: Intent::UseItem {
                 slot: 0,
                 hero: Some(hero.to_bits()),
