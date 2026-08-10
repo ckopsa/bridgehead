@@ -1,0 +1,63 @@
+// ---------------------------------------------------------------------------
+// items.ron — the Shop shelf.
+//
+// One record per `ItemId` variant, every variant exactly once. The SHELF ORDER
+// a player and a commander see is `ALL_ITEMS` in src/shared.rs, not the order
+// of this file.
+//
+// `tier` is the team tech tier required to BUY the item. The shelf is tiered
+// for the same reason the ability list is: a Shop built in the first two
+// minutes must not sell the late-game map-control scroll. `item_unlocked` is
+// the one place the comparison happens.
+//
+// The magnitudes an item's EFFECT applies (POTION_HEAL, BOOTS_HASTE,
+// BANNER_ARMOR, …) are scalar constants in src/shared.rs, not table rows —
+// see the data-file contract in DESIGN.md for where that line is drawn.
+// ---------------------------------------------------------------------------
+[
+    (
+        id: HealingPotion,
+        def: (
+            name: "HealingPotion",
+            cost_gold: 100,
+            tier: T1,
+            description: "Instantly restores 150 HP to the hero.",
+        ),
+    ),
+    (
+        id: TownPortal,
+        def: (
+            name: "TownPortal",
+            cost_gold: 150,
+            tier: T1,
+            description: "Teleports the hero and nearby own units to the nearest own TownHall.",
+        ),
+    ),
+    (
+        id: BootsOfSpeed,
+        def: (
+            name: "BootsOfSpeed",
+            cost_gold: 50,
+            tier: T1,
+            description: "Hastes the hero: +40% move speed for 15s.",
+        ),
+    ),
+    (
+        id: BannerOfCommand,
+        def: (
+            name: "BannerOfCommand",
+            cost_gold: 125,
+            tier: T2,
+            description: "Plants a banner: own units within 8 take 30% less damage for 10s.",
+        ),
+    ),
+    (
+        id: ScrollOfMassTeleport,
+        def: (
+            name: "ScrollOfMassTeleport",
+            cost_gold: 250,
+            tier: T3,
+            description: "Recalls the hero and EVERY own non-worker unit on the map to the hall nearest the hero.",
+        ),
+    ),
+]
