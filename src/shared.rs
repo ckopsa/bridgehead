@@ -6147,7 +6147,12 @@ fn check_game_over(
         return;
     }
     if let Some(surrender) = surrenders.read().next() {
-        info!("{:?} surrenders — {:?} wins", surrender.team, surrender.team.enemy());
+        info!(
+            "{:?} surrenders at t={:.0}s — {:?} wins",
+            surrender.team,
+            time.elapsed_secs(),
+            surrender.team.enemy()
+        );
         game_over.decide(surrender.team.enemy(), GameOverReason::Surrender);
         return;
     }

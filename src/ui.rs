@@ -34,9 +34,11 @@ use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::window::{PrimaryWindow, SystemCursorIcon};
 use bevy::winit::cursor::CursorIcon;
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 
 use crate::command::{CommandLink, PendingOrder};
 use crate::copilot::{Copilot, CopilotSet, ProposalVerdict, VetoReason, PROPOSAL_TTL};
@@ -313,6 +315,7 @@ impl Plugin for UiPlugin {
                         update_fog_overlay,
                         sync_building_ghosts,
                         surrender_hotkey,
+                        screenshot_hotkey,
                         command_input,
                         panel_clicks,
                         // Before `minimap_input`: both write `CameraFocus` and
@@ -7177,6 +7180,85 @@ fn surrender_hotkey(
 }
 
 // ---------------------------------------------------------------------------
+// F10: the game takes its own picture
+// ---------------------------------------------------------------------------
+//
+// Three agents in a row tried to photograph this game with an external capture
+// tool and filed a stale pixmap as evidence: under XWayland the X11 window
+// contents are not what is on the screen, so the screenshot showed a frame
+// from minutes earlier — or nothing at all — and nobody could tell, because a
+// stale frame of an RTS looks exactly like a fresh one.
+//
+// The fix is not a better capture tool. The only process that reliably knows
+// what this frame looks like is the one that drew it, so the engine takes its
+// own pictures: F10 asks the renderer for the primary window's contents at the
+// end of this frame and writes a PNG to `shots/` (or `$WC3_SHOT_DIR`).
+//
+// Registered by `UiPlugin`, which main.rs adds only when there is a window —
+// so a headless run has no key to press and no renderer to ask, and simply
+// never does this. That is the graceful no-op: not a branch, an absence.
+
+/// Take a picture of the game.
+const SCREENSHOT_KEY: KeyCode = KeyCode::F10;
+/// Overrides the output directory — the arena runner points it at the round's
+/// own evidence directory so shots file themselves with the match.
+const SHOT_DIR_ENV: &str = "WC3_SHOT_DIR";
+const DEFAULT_SHOT_DIR: &str = "shots";
+
+/// Where screenshots go, given the raw environment value. Split from
+/// `shot_dir` so the policy — including "an empty variable is not an answer" —
+/// is testable without mutating the process environment.
+fn shot_dir_from(raw: Option<&str>) -> PathBuf {
+    match raw.map(str::trim) {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(DEFAULT_SHOT_DIR),
+    }
+}
+
+/// Where this session's screenshots go.
+pub fn shot_dir() -> PathBuf {
+    shot_dir_from(std::env::var(SHOT_DIR_ENV).ok().as_deref())
+}
+
+/// The file name of the `nth` shot of a run, taken at game time `game_secs`.
+///
+/// Both clocks are in the name deliberately. The wall-clock `stamp` keeps two
+/// runs that share one directory from overwriting each other; the game time is
+/// the only number an after-action report can use, because "the push at t=324"
+/// is a thing you can look up and `screenshot_3.png` is not.
+fn shot_name(stamp: u64, game_secs: f32, nth: u32) -> String {
+    format!("wc3-{stamp}-t{:04}-{nth:02}.png", game_secs.max(0.0) as u32)
+}
+
+fn screenshot_hotkey(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut taken: Local<u32>,
+    mut commands: Commands,
+) {
+    if !keys.just_pressed(SCREENSHOT_KEY) {
+        return;
+    }
+    let dir = shot_dir();
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        warn!("screenshot: cannot create {} — {err}", dir.display());
+        return;
+    }
+    *taken += 1;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let path = dir.join(shot_name(stamp, time.elapsed_secs(), *taken));
+    // Logged on the keypress rather than on success: `save_to_disk` reports its
+    // own failures, and a line that only appears when the write worked cannot
+    // tell you whether the key registered at all.
+    info!("screenshot: {}", path.display());
+    commands
+        .spawn(Screenshot::primary_window())
+        .observe(save_to_disk(path));
+}
+
+// ---------------------------------------------------------------------------
 // Alert stack: the human's half of the shared event feed
 // ---------------------------------------------------------------------------
 //
@@ -8941,5 +9023,36 @@ mod tests {
             (FOG_UNEXPLORED_ALPHA * 255.0) as u8,
             "unvisited ground stays dark"
         );
+    }
+
+    // -- F10 screenshots ---------------------------------------------------
+    //
+    // The capture itself needs a GPU and a window, so what is testable here is
+    // the part that bit people: where the file goes and what it is called.
+
+    #[test]
+    fn a_shot_is_named_for_the_moment_it_shows() {
+        // Zero-padded game seconds so a directory listing sorts into match
+        // order, and the counter breaks ties inside one second.
+        assert_eq!(shot_name(1754870400, 324.6, 1), "wc3-1754870400-t0324-01.png");
+        assert_eq!(shot_name(1754870400, 324.9, 2), "wc3-1754870400-t0324-02.png");
+        // Two runs sharing one directory cannot collide: the wall clock differs.
+        assert_ne!(
+            shot_name(1754870400, 12.0, 1),
+            shot_name(1754870999, 12.0, 1),
+            "the wall-clock stamp is what keeps two runs apart"
+        );
+        // A match can outlive four digits; the name must not wrap or truncate.
+        assert_eq!(shot_name(7, 12345.0, 3), "wc3-7-t12345-03.png");
+    }
+
+    #[test]
+    fn an_unset_or_blank_shot_dir_falls_back() {
+        assert_eq!(shot_dir_from(Some("arena/r11/shots")), PathBuf::from("arena/r11/shots"));
+        assert_eq!(shot_dir_from(None), PathBuf::from(DEFAULT_SHOT_DIR));
+        // `WC3_SHOT_DIR= cargo run` sets the variable to nothing at all. Taking
+        // that literally would write PNGs into the process's own directory.
+        assert_eq!(shot_dir_from(Some("")), PathBuf::from(DEFAULT_SHOT_DIR));
+        assert_eq!(shot_dir_from(Some("   ")), PathBuf::from(DEFAULT_SHOT_DIR));
     }
 }

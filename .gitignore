@@ -7,3 +7,9 @@ bridge/
 .beads-credential-key
 .beads/proxieddb/
 .claude/worktrees/
+shots/
+tools/__pycache__/
+# The arena runner's pre-match skeleton. It is a working artifact that the
+# ledger line supersedes the moment the round is appended; keeping both under
+# git only invites the two to drift apart.
+arena/*/round.json

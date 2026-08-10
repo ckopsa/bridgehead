@@ -140,7 +140,10 @@ fn check_decided(
                 .reason
                 .map(shared::GameOverReason::name)
                 .unwrap_or("unknown");
-            info!("headless: game over — {winner:?} wins ({reason}) — exiting");
+            // The game clock, not the wall clock: an automated run's only
+            // record of how long the match was is this line, and every
+            // after-action report in the series is written in game seconds.
+            info!("headless: game over — {winner:?} wins ({reason}) at t={decided:.1}s — exiting");
             exit.write(AppExit::Success);
         }
     }
