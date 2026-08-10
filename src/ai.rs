@@ -229,6 +229,51 @@ const GRYPHON_EVERY_NTH: u32 = 3;
 /// last thing the script buys, never the thing it saves for.
 const GRYPHON_BANK_GOLD: u32 = 700;
 
+/// ---- Making the air branch observable ------------------------------------
+///
+/// The two constants above are so conservative that across every sim run of
+/// the era, NO scripted match ever produced a Gryphon: it needs a Castle, a
+/// Workshop, 700 gold spare after the reserve, and the siege counter on its
+/// every-third beat, all true on the same think tick. That is the correct
+/// default — the reasoning above is not a bug — but it meant the air branch
+/// and everything downstream of it (the enemy's archer shift, the reactive
+/// Tower) had never once run in a real match. Content nobody has seen is
+/// indistinguishable from content that does not work.
+///
+/// So the two gates are env-tunable, and ONLY the two gates: unset, they read
+/// their constants and the script's behaviour is byte-identical to before.
+/// `WC3_AI_GRYPHON_BANK=0 WC3_AI_GRYPHON_NTH=1 WC3_HEADLESS=1 cargo run` puts
+/// flyers in the air as soon as a Castle and Workshop stand, which is how the
+/// path gets exercised in a real sim rather than only in a unit test.
+///
+/// These are probe knobs, not balance knobs. A run with them set is not a
+/// baseline run and its timings mean nothing.
+const GRYPHON_BANK_ENV: &str = "WC3_AI_GRYPHON_BANK";
+const GRYPHON_NTH_ENV: &str = "WC3_AI_GRYPHON_NTH";
+
+/// Read a `u32` override once per process. Anything unparseable is ignored
+/// rather than fatal — a typo in a probe knob must not change a match.
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+/// `GRYPHON_BANK_GOLD`, or the `WC3_AI_GRYPHON_BANK` override.
+fn gryphon_bank_gold() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| env_u32(GRYPHON_BANK_ENV, GRYPHON_BANK_GOLD))
+}
+
+/// `GRYPHON_EVERY_NTH`, or the `WC3_AI_GRYPHON_NTH` override, floored at 1 —
+/// the value is a modulus, and a zero here would panic the think tick rather
+/// than mis-plan it.
+fn gryphon_every_nth() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| env_u32(GRYPHON_NTH_ENV, GRYPHON_EVERY_NTH).max(1))
+}
+
 /// Building placement: rings of candidate offsets around the base.
 const BUILD_PADDING: f32 = 2.0;
 const BUILD_RING_RADII: [f32; 4] = [12.0, 16.0, 20.0, 25.0];
@@ -555,6 +600,19 @@ fn ai_apply_env(mut ai_controlled: ResMut<AiControlled>) {
     if enabled {
         ai_controlled.human = true;
         info!("{AI_BOTH_ENV}: AI vs AI — the AI is playing Blue too");
+    }
+    // Announce the probe knobs, and only when they are actually doing
+    // something: a run whose trace does not say it was tuned is a run somebody
+    // will later read as a baseline.
+    if gryphon_bank_gold() != GRYPHON_BANK_GOLD || gryphon_every_nth() != GRYPHON_EVERY_NTH {
+        info!(
+            "{GRYPHON_BANK_ENV}/{GRYPHON_NTH_ENV}: air branch tuned to bank {}g, every {} \
+             Workshop item (defaults {}g / {}) — NOT a baseline run",
+            gryphon_bank_gold(),
+            gryphon_every_nth(),
+            GRYPHON_BANK_GOLD,
+            GRYPHON_EVERY_NTH,
+        );
     }
 }
 
@@ -1839,8 +1897,8 @@ fn think(
                 // cannot pay for silently degrades back to one rather than
                 // parking an unaffordable item at the front of the queue.
                 let want_air = current_tier >= 3
-                    && gold.saturating_sub(reserve_gold) >= GRYPHON_BANK_GOLD
-                    && brain.siege_counter % GRYPHON_EVERY_NTH == 0;
+                    && gold.saturating_sub(reserve_gold) >= gryphon_bank_gold()
+                    && brain.siege_counter % gryphon_every_nth() == 0;
                 let kind = if want_air {
                     UnitKind::GryphonRider
                 } else {
@@ -2787,6 +2845,257 @@ mod tests {
             pick_army_kind(KNIGHT_EVERY_NTH, true, false, 3, 4),
             UnitKind::Knight
         );
+    }
+
+    // -- The air reaction, end to end (wc3clone-il4) ------------------------
+    //
+    // Everything above this line tests the air reaction as arithmetic:
+    // `tick_alert` counts, `reactive_cadences` returns a different number,
+    // `tower_quota` returns a bigger one. None of it proves the script ever
+    // REACHES those functions, and the sim runs of the era proved it never
+    // had: no scripted match built a Gryphon (Castle + Workshop + 700g spare +
+    // the every-third beat, all on one tick), so no scripted match ever showed
+    // an enemy flyer to anybody, so the archer shift and the reactive Tower
+    // were dead code that passed its unit tests.
+    //
+    // What follows is the missing half: one real `ai_think` tick, on a real
+    // World, with a real enemy Gryphon in the fog, asserting the two things the
+    // script is supposed to DO about it. The knobs added for the sim
+    // (`WC3_AI_GRYPHON_BANK` / `_NTH`) let a headless run reach the same place
+    // the slow way; this reaches it in a millisecond and on every CI run.
+
+    /// A world with the scripted commander in it and nothing else: no fog to
+    /// walk through, no economy ticking, no units.rs to execute the orders.
+    /// One `app.update()` past the think timer is exactly one thought.
+    fn ai_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<AiState>()
+            .init_resource::<GameOver>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<NavGrid>()
+            .init_resource::<TeamResearch>()
+            .add_event::<CastAbility>()
+            .add_event::<UpgradeBuilding>()
+            .add_event::<StartResearch>()
+            .add_event::<BuyItem>()
+            .add_event::<UseItem>()
+            .add_systems(Update, ai_think);
+        // Claude only, so the assertions below can name one brain.
+        app.insert_resource(AiControlled { human: false, claude: true });
+        // Lit, not dark: the subject is what the script does about a flyer it
+        // can see, not whether it can see it. `test_dark` would make this test
+        // pass for the wrong reason (no sighting, no reaction, no assertion).
+        app.insert_resource(FogGrids::test_revealed());
+        // Rich enough that no branch below is refused for money, and supplied
+        // enough that the Farm branch (which sits above the Tower) stays quiet.
+        let mut economies = Economies::default();
+        let claude = economies.get_mut(Team::Claude);
+        claude.gold = 900;
+        claude.lumber = 500;
+        claude.supply_used = 10;
+        claude.supply_cap = 60;
+        app.insert_resource(economies);
+        app
+    }
+
+    fn spawn_building(app: &mut App, kind: BuildingKind, team: Team, pos: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Building { kind },
+                team,
+                Transform::from_translation(pos),
+                TrainingQueue::default(),
+                Health::new(building_stats(kind).hp),
+            ))
+            .id()
+    }
+
+    fn spawn_unit(app: &mut App, kind: UnitKind, team: Team, pos: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind },
+                team,
+                Transform::from_translation(pos),
+                Order::Idle,
+                Health::new(unit_stats(kind).hp),
+            ))
+            .id()
+    }
+
+    /// A Claude base that has finished its opening: a hall, a Barracks, and a
+    /// worker line. No Tower yet, and the army counter parked one short of a
+    /// beat that only the AIR cadence divides.
+    fn claude_base(app: &mut App) -> Entity {
+        let home = Team::Claude.base_pos();
+        spawn_building(app, BuildingKind::TownHall, Team::Claude, home);
+        let barracks = spawn_building(
+            app,
+            BuildingKind::Barracks,
+            Team::Claude,
+            home + Vec3::new(-12.0, 0.0, 0.0),
+        );
+        for i in 0..5 {
+            spawn_unit(
+                app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        // next = 4: divisible by ARCHER_EVERY_NTH_AIR (2) but not by
+        // ARCHER_EVERY_NTH (3), so the very next Barracks item is an Archer if
+        // and only if air has been seen. Absent the alert the same beat falls
+        // through to the Spearman rule, which is what the control asserts.
+        app.world_mut().resource_mut::<AiState>().claude.army_counter = 3;
+        barracks
+    }
+
+    /// One think tick.
+    fn think_once(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(THINK_INTERVAL * 1.5));
+        app.update();
+    }
+
+    fn queued(app: &mut App, building: Entity) -> Vec<UnitKind> {
+        app.world()
+            .entity(building)
+            .get::<TrainingQueue>()
+            .map(|q| q.queue.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Is anybody building a Tower — i.e. did the reactive emplacement branch
+    /// actually reach a worker?
+    fn tower_ordered(app: &mut App) -> bool {
+        app.world_mut()
+            .query::<&Order>()
+            .iter(app.world())
+            .any(|o| matches!(o, Order::Build { kind: BuildingKind::Tower, .. }))
+    }
+
+    /// THE test this bead exists for. An enemy Gryphon in sight, one thought,
+    /// and both halves of the documented reaction have to be visible in the
+    /// world: the mix tightens toward Archers, and a Tower goes up.
+    #[test]
+    fn a_seen_gryphon_tightens_the_archer_cadence_and_buys_a_tower() {
+        let mut app = ai_app();
+        let barracks = claude_base(&mut app);
+        // The flyer, in Claude's face and in Claude's vision.
+        spawn_unit(
+            &mut app,
+            UnitKind::GryphonRider,
+            Team::Human,
+            Team::Claude.base_pos() + Vec3::new(-20.0, 0.0, -20.0),
+        );
+
+        think_once(&mut app);
+
+        // The sighting registered, as a decaying counter and not as a memory
+        // of where the thing was.
+        let alert = app.world().resource::<AiState>().claude.air_alert;
+        assert_eq!(alert, ALERT_TICKS, "the sighting must refill the alert");
+
+        // Reaction one: the Barracks queued the anti-air unit. This is the
+        // assertion the arithmetic tests could not make — it is the real
+        // `think` walking the real cadence into a real queue.
+        assert_eq!(
+            queued(&mut app, barracks),
+            vec![UnitKind::Archer],
+            "air contact must put an Archer in the Barracks, not a Footman"
+        );
+
+        // Reaction two: the emplacement. A flyer cannot be blocked or
+        // out-walked, so the script buys the thing that is already standing.
+        assert!(
+            tower_ordered(&mut app),
+            "a seen Gryphon must buy a reactive Tower"
+        );
+    }
+
+    /// The control, and the reason the test above means anything: the SAME
+    /// board with a ground unit instead of a flyer produces neither reaction.
+    /// Without this, a script that always built Archers and always built
+    /// Towers would pass.
+    #[test]
+    fn a_seen_footman_buys_neither_the_archer_nor_the_tower() {
+        let mut app = ai_app();
+        let barracks = claude_base(&mut app);
+        spawn_unit(
+            &mut app,
+            UnitKind::Footman,
+            Team::Human,
+            Team::Claude.base_pos() + Vec3::new(-20.0, 0.0, -20.0),
+        );
+
+        think_once(&mut app);
+
+        assert_eq!(app.world().resource::<AiState>().claude.air_alert, 0);
+        // The same beat (next = 4) that air contact turns into an Archer falls
+        // through to the Spearman rule when the sky is empty. What matters is
+        // that it is NOT the anti-air pick.
+        let standing = queued(&mut app, barracks);
+        assert_eq!(standing, vec![UnitKind::Spearman]);
+        assert!(
+            !standing.contains(&UnitKind::Archer),
+            "no flyer seen, so nothing should have shifted toward anti-air"
+        );
+        assert!(
+            !tower_ordered(&mut app),
+            "the reactive Tower is reactive — no flyer, no emplacement"
+        );
+    }
+
+    /// The alert is a fading memory, not a latch: once the Gryphon is gone the
+    /// mix goes back to standard. A permanent reaction would be an AI that
+    /// counters whatever it saw once, forever.
+    #[test]
+    fn the_air_reaction_lapses_when_the_sky_clears() {
+        let mut app = ai_app();
+        let barracks = claude_base(&mut app);
+        let gryphon = spawn_unit(
+            &mut app,
+            UnitKind::GryphonRider,
+            Team::Human,
+            Team::Claude.base_pos() + Vec3::new(-20.0, 0.0, -20.0),
+        );
+        think_once(&mut app);
+        assert_eq!(queued(&mut app, barracks), vec![UnitKind::Archer]);
+
+        // It leaves. Nothing else about the board changes.
+        app.world_mut().entity_mut(gryphon).despawn();
+        app.world_mut().resource_mut::<AiState>().claude.army_counter = 3;
+        app.world_mut()
+            .entity_mut(barracks)
+            .get_mut::<TrainingQueue>()
+            .unwrap()
+            .queue
+            .clear();
+        for _ in 0..ALERT_TICKS {
+            think_once(&mut app);
+        }
+        assert_eq!(
+            app.world().resource::<AiState>().claude.air_alert,
+            0,
+            "the alert must drain, or the reaction is permanent"
+        );
+    }
+
+    /// The probe knobs, which exist so a headless sim can reach the air branch
+    /// at all. Unset, they must read their constants exactly — a knob that
+    /// changes the default is a balance change wearing a debugging hat.
+    #[test]
+    fn the_gryphon_probe_knobs_default_to_the_shipped_constants() {
+        // These are process-wide `OnceLock`s read from the environment, and the
+        // test suite does not set them, so this is the shipped behaviour.
+        assert_eq!(gryphon_bank_gold(), GRYPHON_BANK_GOLD);
+        assert_eq!(gryphon_every_nth(), GRYPHON_EVERY_NTH);
+        // Parsing is total: rubbish and empty strings fall back rather than
+        // panicking mid-match, and the modulus can never reach zero.
+        assert_eq!(env_u32("WC3_AI_NO_SUCH_VAR_HOPEFULLY", 42), 42);
+        assert_eq!(env_u32(GRYPHON_NTH_ENV, GRYPHON_EVERY_NTH).max(1).max(1), GRYPHON_EVERY_NTH);
     }
 
     // -- Ford fortification (wc3clone-j0d) ---------------------------------

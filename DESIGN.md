@@ -104,8 +104,10 @@ Win by destroying all enemy buildings.
   hero/building ability hotkeys, doctrine toggles — all of which *compile to
   `Intent` values and submit them*; ui.rs mutates no game state itself. The
   command card has two pages, toggled by `[I]`: the classic orders card, and a
-  doctrine card carrying squad postures (click-to-place), a parameterised
-  retreat threshold and leash radius, and `DoctrineTemplate` stamping on a
+  doctrine card carrying squad postures (click-to-place, with a ground disc
+  showing the pending point; Escort clicks a unit), a free-entry retreat
+  threshold and leash radius (`[F]`/`[G]` step presets, `-`/`=` and `[`/`]`
+  nudge), a per-ability auto-cast toggle, and `DoctrineTemplate` stamping on a
   production building. `Ctrl+1-3` assigns a control group *and* submits the
   `squad` verb, so a control group and a squad are one object (docs/TEMPO.md).
   Plus the top resource bar,

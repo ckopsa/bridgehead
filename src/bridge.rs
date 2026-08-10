@@ -120,6 +120,12 @@
 //! right now?" for every catalog entry, computed from the seat's own completed
 //! buildings. The same check gates the `build` and `train` commands, so a
 //! commander that respects `unlocked` never has an order bounced by economy.rs.
+//! For a unit that means BOTH halves of "right now" — the tech gates met and a
+//! finished building of ours that trains it standing somewhere. The map used to
+//! report only the first half, so a team with no Barracks read `Footman: true`;
+//! the honest answer, and the one that stops a `train` bouncing, is no. Planning
+//! ahead is still the catalog's job: `units[].requires` lists the whole chain,
+//! trainer included, and does not care what you own yet.
 //!
 //! Abilities and items are described by the catalog (`abilities`, `items`) and
 //! driven by three commands: `cast` takes any caster — a hero of either class
@@ -1409,6 +1415,19 @@ fn write_seat_snapshot(
 /// Every catalog entry -> can this team build/train it with what it has
 /// standing right now. Derived from the shared kind tables, so new content is
 /// reported without touching this file.
+///
+/// "Right now" is the whole contract, and for a UNIT it takes two facts, not
+/// one. `unit_requires` is deliberately partial — it lists the gates BEYOND
+/// owning the trainer, because the trainer is normally checked by the order
+/// being given AT it. A map built from that half alone answered `Footman: true`
+/// for a team with no Barracks: every tech gate satisfied (there are none),
+/// and nowhere on the map to train one. That is not a caveat, it is a wrong
+/// answer to the only question this map is asked, and it cost a commander a
+/// bounced `train` to discover.
+///
+/// So a unit is unlocked when its tech gates are met AND this team has a
+/// finished building standing that trains it. Buildings are unchanged: nothing
+/// produces a building except a worker, which every team always has.
 fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
     let mut out = BTreeMap::new();
     for kind in ALL_BUILDING_KINDS {
@@ -1424,9 +1443,10 @@ fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
         );
     }
     for kind in ALL_UNIT_KINDS {
+        let has_trainer = completed.iter().any(|b| trainable(*b).contains(&kind));
         out.insert(
             kind_name(kind),
-            requirements_met(unit_requires(kind), completed.iter().copied()),
+            has_trainer && requirements_met(unit_requires(kind), completed.iter().copied()),
         );
     }
     out
@@ -1636,5 +1656,75 @@ mod tests {
             unit_requires(UnitKind::Spearman).is_empty(),
             "the tier-1 answer to cavalry must not itself be tech-gated"
         );
+    }
+
+    /// The bug this replaced: a team holding nothing but its town hall was told
+    /// `Footman: true`, because the Footman has no tech gate and the map never
+    /// asked where one would be trained.
+    #[test]
+    fn unlocked_needs_the_trainer_standing_not_just_the_tech() {
+        let opening = unlocked_map(&[BuildingKind::TownHall]);
+        assert_eq!(
+            opening["Footman"], false,
+            "no Barracks means no Footman, whatever the tech table says"
+        );
+        assert_eq!(opening["Archer"], false);
+        assert_eq!(opening["Spearman"], false);
+        // The hall trains these three itself, so they are honestly available.
+        assert_eq!(opening["Worker"], true);
+        assert_eq!(opening["Hero"], true);
+        assert_eq!(opening["Priestess"], true);
+        // Buildings are unaffected: a worker is the trainer, and every team
+        // has one.
+        assert_eq!(opening["Barracks"], true);
+        assert_eq!(opening["Tower"], false, "Tower is still gated on Barracks");
+
+        let with_barracks = unlocked_map(&[BuildingKind::TownHall, BuildingKind::Barracks]);
+        assert_eq!(with_barracks["Footman"], true);
+        assert_eq!(with_barracks["Tower"], true);
+    }
+
+    /// Both halves are required, in both directions: owning the trainer is not
+    /// enough when the unit carries its own gate, and satisfying the gate is
+    /// not enough without the trainer.
+    #[test]
+    fn a_unit_gate_and_its_trainer_are_both_load_bearing() {
+        // Castle satisfies the Knight's gate; without a Barracks he has no
+        // stable.
+        let castle_only = unlocked_map(&[BuildingKind::Castle]);
+        assert_eq!(castle_only["Knight"], false);
+        assert_eq!(
+            castle_only["GryphonRider"], false,
+            "the Gryphon needs the Workshop as well as the Castle"
+        );
+
+        // Barracks without the Castle: the gate bites instead.
+        let barracks_only = unlocked_map(&[BuildingKind::TownHall, BuildingKind::Barracks]);
+        assert_eq!(barracks_only["Knight"], false);
+
+        let both = unlocked_map(&[BuildingKind::Castle, BuildingKind::Barracks]);
+        assert_eq!(both["Knight"], true);
+
+        // And the Gryphon's full chain, which is what the AI's air path needs
+        // standing before it can ever pick one: Castle + Workshop.
+        let air = unlocked_map(&[
+            BuildingKind::Castle,
+            BuildingKind::Barracks,
+            BuildingKind::Workshop,
+        ]);
+        assert_eq!(air["GryphonRider"], true);
+        assert_eq!(air["Catapult"], true);
+    }
+
+    /// A Keep is a TownHall that grew: intersecting with trainers must go
+    /// through `trainable`, which knows the whole hall ladder, and not through
+    /// `kind == TownHall`.
+    #[test]
+    fn an_upgraded_hall_still_trains_its_roster() {
+        for hall in [BuildingKind::Keep, BuildingKind::Castle] {
+            let map = unlocked_map(&[hall]);
+            assert_eq!(map["Worker"], true, "{hall:?} must still train workers");
+            assert_eq!(map["Priestess"], true);
+        }
     }
 }
