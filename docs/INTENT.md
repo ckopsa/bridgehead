@@ -778,7 +778,23 @@ stops proposing around a plan you never actually issued.
   who can stop proposing around it.
 - **Ordinary seats' wire format is byte-shape identical.** `copilot`,
   `proposals` and `partner_log` are `Option` and skipped when absent; `red` and
-  `blue` snapshots keep exactly the keys they had.
+  `blue` snapshots keep exactly the keys they had (16, verified live).
+
+### It inherited Chain of Command for free
+
+docs/TEMPO.md §3's order latency (`command.rs`) and co-command were built on
+separate branches and met at a merge. Nothing had to be done to make them agree:
+an approved proposal is submitted through the ordinary compiler, so under
+`WC3_COMMAND_LATENCY` a co-commander's orders travel exactly as the human's do,
+priced by the same `OrderIssuer` against the same command nodes. There is no
+"approved orders arrive instantly" shortcut, because there is no second path
+that *could* have one.
+
+That is the same dividend the ghost right-click paid Chain of Command a bead
+earlier — a new way of speaking cannot accidentally arrive at a privileged
+speed — and it is the strongest argument this document has for the choke point.
+Two features that never saw each other's code compose correctly because they
+both go through the one place an order becomes real.
 
 ### Follow-ups co-command leaves open
 
