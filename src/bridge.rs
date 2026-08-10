@@ -574,6 +574,37 @@ fn abilities_out(
         .collect()
 }
 
+/// One rung of a Shop's shelf, as the commander sees it. `locked` is the same
+/// verdict economy.rs will reach, so the snapshot can never advertise a
+/// purchase the buy handler would refuse.
+#[derive(Serialize)]
+struct ShopItemOut {
+    /// Accepted verbatim as the `item` field of a `buy`.
+    id: &'static str,
+    cost_gold: u32,
+    /// Team tech tier this rung needs: 1, 2 or 3.
+    tier: u32,
+    /// Our tier is below `tier` — climb the hall ladder first.
+    locked: bool,
+}
+
+/// The shelf a Shop shows a team at `tier`. Walks `ALL_ITEMS`, so a content
+/// bead that adds an item adds it to the bridge by adding the table row.
+fn shop_shelf(tier: TechTier) -> Vec<ShopItemOut> {
+    ALL_ITEMS
+        .iter()
+        .map(|&id| {
+            let def = item_def(id);
+            ShopItemOut {
+                id: def.name,
+                cost_gold: def.cost_gold,
+                tier: def.tier.level(),
+                locked: !item_unlocked(id, tier),
+            }
+        })
+        .collect()
+}
+
 /// Mirror of the doctrine components, in the same shape the `priority` /
 /// `retreat` / `leash` / `autocast` commands take them.
 #[derive(Serialize)]
@@ -629,6 +660,11 @@ struct BuildingOut {
     /// Own ability buildings only: every slot, with unlock and cooldown state.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     abilities: Vec<AbilityOut>,
+    /// Own completed SHOPS only: the shelf, with this team's tier already
+    /// applied. The catalog says what each item costs and does; this says
+    /// which rungs of it a `buy` would actually be allowed to take right now.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    sells: Vec<ShopItemOut>,
     /// Own production buildings only, and only when a `template` command has
     /// installed a `DoctrineTemplate`: a flag, not the contents — the
     /// commander that set the template already knows what is in it.
@@ -937,6 +973,13 @@ fn write_seat_snapshot(
             } else {
                 Vec::new()
             },
+            // The shelf, tier applied. Only our own finished Shops: what an
+            // ENEMY Shop would sell us is not a fact about the battlefield.
+            sells: if *team == me && building.kind == BuildingKind::Shop && under.is_none() {
+                shop_shelf(tiers.get(me))
+            } else {
+                Vec::new()
+            },
             // Never for the opponent: a template is command structure.
             template: *team == me && template.is_some(),
             tier: building_tier(building.kind),
@@ -969,6 +1012,8 @@ fn write_seat_snapshot(
             progress: 0.0,
             ability_cd: None,
             abilities: Vec::new(),
+            // A remembered enemy Shop sells us nothing.
+            sells: Vec::new(),
             template: false,
             // The tier it wore when last observed. A hall that has since been
             // upgraded behind our back still reports the old rung — the memory
