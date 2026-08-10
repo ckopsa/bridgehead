@@ -207,6 +207,7 @@ impl Plugin for CopilotPlugin {
                 (ingest_wire, auto_approve, resolve_proposals)
                     .chain()
                     .in_set(CopilotSet)
+                    .in_set(crate::shared::SimSet::CoCommand)
                     .after(crate::bridge::BridgePoll)
                     .before(IntentApply)
                     .run_if(copilot_seated),

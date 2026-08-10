@@ -143,6 +143,107 @@ Win by destroying all enemy buildings.
 - **Selection**: `Selected` marker is written only by ui.rs.
 - Teams: every unit/building/projectile-owner entity has a `Team` component.
 
+## Determinism — the canonical frame order
+
+Same seed + same intent stream + same tick = same match. This is the
+foundation WeGo turns and replays are built on, and it rests on three things.
+
+### 1. One explicit set order
+
+`shared::SimSet` names every phase of a simulation frame and `CorePlugin`
+chains them pairwise straight out of `shared::SIM_ORDER`, so the constant below
+*is* the schedule — it cannot drift from this document without failing
+`the_frame_order_names_every_phase_exactly_once`.
+
+```
+Deaths → Fog → Input → CoCommand → AiThink → Think → Intent
+       → Movement → Combat → Bounty → Economy → Upkeep → Feed → Cosmetic
+```
+
+| Set | Who lives there |
+| --- | --- |
+| `Deaths` | `apply_death` |
+| `Fog` | `update_fog` (wraps the older `FogSet` handle) |
+| `Input` | ui.rs gesture chain, `bridge::poll_commands`, command.rs dispatchers, hotkeys, `status_probe` |
+| `CoCommand` | copilot.rs `CopilotSet` |
+| `AiThink` | `ai::ai_think`, `seed_machine_autocast` |
+| `Think` | doctrine.rs — postures, retreat, leash, auto-cast |
+| `Intent` | `intent::apply_intents` (wraps `IntentApply`) |
+| `Movement` | units.rs — spawn, path, steer, separate |
+| `Combat` | combat.rs — acquire, engage, projectiles, abilities, damage |
+| `Bounty` | bounty.rs — spawn, claim, expire |
+| `Economy` | economy.rs — bank, build, research, harvest, train, buy |
+| `Upkeep` | xp, regen, cooldowns, status, supply, tech, win check |
+| `Feed` | `produce_game_events`, `write_snapshot`, fingerprint, logging, headless exit |
+| `Cosmetic` | health bars, rings, shockwaves, orb pulses, camera — outside the contract |
+
+Before this, the schedule had exactly two ordering handles — `FogSet` and
+`IntentApply` — and everything else was left to Bevy's multi-threaded
+executor, which resolves conflicting systems against whatever is running on
+another thread. Movement, combat and separation all take `&mut Transform`, so
+two runs of the same binary could step the same units in different orders.
+
+Three edges were already in the code and are **re-encoded**, not invented:
+`Deaths → Fog` (`update_fog.after(apply_death)` — the dead stop seeing),
+`Fog → Intent` (an order is judged against the visibility its issuer has now),
+and `Input`/`CoCommand → Intent` (the bridge poll and the co-command layer both
+declared `.before(IntentApply)`).
+
+The rest was genuinely ambiguous and was **chosen** here:
+
+- **`Deaths`/`Fog` lead the frame.** Forced: fog must follow death and intent
+  must follow fog. The consequence is that damage dealt in `Combat` becomes a
+  despawn at the top of the *next* frame — a one-tick lag the old schedule
+  already had about half the time, now had consistently.
+- **`Think` before `Intent`.** command.rs already states the rule: "a fresh
+  direct order issued in the same frame still wins." Standing orders execute
+  first so an explicit order can overrule them, never the reverse. The cost is
+  that a posture set *through* the compiler takes effect one tick later.
+- **`AiThink` before `Think`**, because the scripted commander writes the
+  `SquadOrders` doctrine then executes.
+- **`Movement` before `Combat`**, so a unit shoots from where it now stands.
+- **`Bounty` before `Economy`**, so treasure claimed this frame banks this
+  frame.
+- **`Upkeep`/`Feed` last**, so recounts, the win check and the snapshot all
+  describe the frame that just finished.
+
+Parallelism *within* a set is fine where systems don't conflict; where they do
+(`regen_health` vs `tick_status_effects`, `bank_bounties` vs `harvest_loop`)
+they are explicitly `.chain()`ed rather than left to the executor.
+
+### 2. One seeded RNG
+
+`shared::SimRng` is the only source of gameplay randomness in a running match.
+`WC3_SEED=<u64>` sets it; the default is a fresh random seed **logged at
+startup**, so a normal match stays unpredictable and any match can be replayed
+from its own log. Terrain was already deterministic (`terrain.rs` seeds
+`StdRng` from the fixed `MAP_SEED`); bounty placement was not, and now is.
+
+Iteration order counts as randomness too. `SquadOrders`, the fog `ghosts` map
+and the whole `GameEvents` memo are `BTreeMap`s, because std's `HashMap`
+reseeds its hasher **per process** — a hash map on any of those paths means
+squads execute, ghosts are targeted and event lines are emitted in a different
+order in every run.
+
+### 3. One fixed tick
+
+`WC3_FIXED_DT=0.05` (headless only) installs Bevy's
+`TimeUpdateStrategy::ManualDuration`, so each frame advances the clock by a
+constant instead of by however long the frame took. Without it every
+accumulator in the sim — attack cooldowns, construction, projectile flight,
+every `on_timer` gate — integrates a wall-clock delta and no two runs agree.
+It drives `Time<Real>` too, so bridge.rs's poll/snapshot cadence stops being a
+property of the host. `WC3_SPEED` is ignored while it is set.
+
+### Proving it
+
+`WC3_FINGERPRINT=<seconds>` logs a hash of the entire world (raw IEEE bits of
+every unit's and building's position and health, entity ids, both economies) at
+fixed game-time intervals. `tools/determinism_check.sh` runs two headless
+AI-vs-AI matches with one seed and diffs those lines; it exits 0 only if every
+sample matches. **All three envs are opt-in — with none of them set, behaviour
+is exactly what it was.**
+
 ## Bevy 0.16 API notes (avoid stale idioms)
 
 - Spawning visible meshes: `commands.spawn((Mesh3d(meshes.add(Cuboid::new(1.0,1.0,1.0))), MeshMaterial3d(materials.add(StandardMaterial { base_color: Color::srgb(0.2,0.4,0.9), ..default() })), Transform::from_translation(pos)))` — no `PbrBundle` (bundles are gone).

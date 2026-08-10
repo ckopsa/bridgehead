@@ -142,7 +142,13 @@ impl Plugin for IntentPlugin {
             // `.after(FogSet)`: an intent is judged against the visibility its
             // issuer has right now, the same grid the snapshot and the HUD are
             // about to show them.
-            .add_systems(Update, apply_intents.in_set(IntentApply).after(FogSet));
+            .add_systems(
+                Update,
+                apply_intents
+                    .in_set(IntentApply)
+                    .in_set(SimSet::Intent)
+                    .after(FogSet),
+            );
     }
 }
 

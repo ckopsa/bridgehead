@@ -42,7 +42,9 @@ fn main() {
         // provided by InputPlugin; empty ones keep them satisfied and inert.
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<ButtonInput<MouseButton>>()
-        .add_systems(Update, headless_exit);
+        // Reads the finished frame and decides whether there is another one;
+        // that is reporting, not simulation.
+        .add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));
     } else {
         app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -52,6 +54,35 @@ fn main() {
             ..default()
         }))
         .add_plugins(ui::UiPlugin);
+    }
+
+    // WC3_FIXED_DT=0.05: every frame advances the clock by exactly 50ms rather
+    // than by however long the frame took. Together with WC3_SEED this is what
+    // makes a run reproducible — without it the sim integrates a wall-clock
+    // delta, and no two runs (let alone two machines) agree on it.
+    //
+    // Headless only. A windowed run is paced by the display and its frames are
+    // wall-clock events by definition; a fixed step there would only decouple
+    // the game from the screen drawing it.
+    //
+    // After the plugin groups, for two reasons: the log line needs `LogPlugin`
+    // to exist, and `TimePlugin` has by now run its own
+    // `init_resource::<TimeUpdateStrategy>()` — `insert_resource` overwrites
+    // that default, which is exactly the intended direction.
+    match (shared::fixed_time_strategy(), headless) {
+        (Some(strategy), true) => {
+            info!(
+                "{}: fixed tick — the clock advances a constant step per frame \
+                 (WC3_SPEED is ignored)",
+                shared::FIXED_DT_ENV
+            );
+            app.insert_resource(strategy);
+        }
+        (Some(_), false) => warn!(
+            "{} ignored: the fixed tick is a headless-only mode",
+            shared::FIXED_DT_ENV
+        ),
+        (None, _) => {}
     }
 
     app.add_plugins((
@@ -76,6 +107,54 @@ fn main() {
         bounty::BountyPlugin,
     ))
     .run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one test that can only live here: every other module tests its own
+    /// systems in a hand-built app, so nothing else ever sees the real
+    /// composition. `SimSet` spans eleven plugins, and a set ordering is only
+    /// checked for cycles when the schedule is first built — a contradiction
+    /// (say, a system filed in `Input` that also declares `.after(CopilotSet)`)
+    /// compiles fine and panics the first time anyone runs the game. This
+    /// assembles the headless app exactly as `main` does and steps it, so that
+    /// panic happens in CI instead of in a match.
+    #[test]
+    fn the_whole_game_schedules_without_a_cycle() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::transform::TransformPlugin,
+            bevy::asset::AssetPlugin::default(),
+        ))
+        .init_asset::<Mesh>()
+        .init_asset::<StandardMaterial>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .init_resource::<ButtonInput<MouseButton>>()
+        .add_plugins((
+            shared::CorePlugin,
+            intent::IntentPlugin,
+            command::CommandPlugin,
+            terrain::TerrainPlugin { headless: true },
+            units::UnitsPlugin,
+            combat::CombatPlugin,
+            economy::EconomyPlugin,
+            ai::AiPlugin,
+            bridge::BridgePlugin,
+            copilot::CopilotPlugin,
+            doctrine::DoctrinePlugin,
+            bounty::BountyPlugin,
+        ))
+        .add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));
+
+        // Two frames, not one: the first builds and validates the schedule,
+        // the second proves the world it left behind is one the same schedule
+        // can step again.
+        app.update();
+        app.update();
+    }
 }
 
 /// Headless runs terminate themselves: shortly after a decisive game over, or

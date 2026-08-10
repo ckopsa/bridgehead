@@ -539,20 +539,25 @@ impl Plugin for CommandPlugin {
                 (
                     // Built from this frame's positions, before anyone asks it
                     // a question.
-                    refresh_command_nodes
-                        .in_set(CommandNodeRefresh)
-                        .before(crate::intent::IntentApply),
+                    refresh_command_nodes.in_set(CommandNodeRefresh),
                     // Before the compiler too: an order that comes due this
                     // frame lands first, so a fresh direct order issued in the
-                    // same frame still wins.
-                    dispatch_pending.before(crate::intent::IntentApply),
-                    dispatch_pending_casts.before(crate::intent::IntentApply),
+                    // same frame still wins. `SimSet::Input` is upstream of
+                    // `SimSet::Intent`, so the `.before(IntentApply)` these
+                    // three used to carry is now structural — but the two
+                    // dispatchers still need ordering against each other and
+                    // against the refresh, which `.chain()` states.
+                    dispatch_pending,
+                    dispatch_pending_casts,
                 )
+                    .chain()
+                    .in_set(crate::shared::SimSet::Input)
                     .run_if(latency_enabled),
             )
             .add_systems(
                 Update,
                 report_link_load
+                    .in_set(crate::shared::SimSet::Feed)
                     .run_if(latency_enabled)
                     .run_if(on_timer(Duration::from_secs(30))),
             );

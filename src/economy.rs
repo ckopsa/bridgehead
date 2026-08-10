@@ -49,6 +49,13 @@ impl Plugin for EconomyPlugin {
         app.add_systems(Startup, setup_economy_assets).add_systems(
             Update,
             (
+                // Banking a bounty has nothing to do with the harvest loop
+                // that follows, but it does touch the same `Economies`, so it
+                // can no longer float: two systems that both write a team's
+                // gold must have a stated order or the total depends on the
+                // executor. It goes FIRST so treasure claimed this frame is
+                // spendable this frame — bounty.rs sits immediately upstream.
+                bank_bounties,
                 spawn_buildings,
                 construction_progress,
                 start_upgrades,
@@ -61,11 +68,9 @@ impl Plugin for EconomyPlugin {
                 training_queues,
                 buy_items,
             )
-                .chain(),
-        )
-        // Banking a bounty has nothing to do with the harvest loop above; it
-        // runs on its own so an ordering change there can never drop gold.
-        .add_systems(Update, bank_bounties);
+                .chain()
+                .in_set(SimSet::Economy),
+        );
     }
 }
 

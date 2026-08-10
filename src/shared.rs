@@ -95,7 +95,10 @@ pub fn asset_score(
 // Teams
 // ---------------------------------------------------------------------------
 
-#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// `Ord` is not decoration: it is what lets `SquadOrders` be a `BTreeMap` and
+/// therefore what makes doctrine execute squads in the same order every run
+/// (DESIGN.md § Determinism).
+#[derive(Component, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Team {
     Human,
     Claude,
@@ -3565,8 +3568,14 @@ impl SquadPosture {
 pub const DEFAULT_SQUAD: u8 = 0;
 
 /// Posture per (team, squad id). Bridge/AI writes; doctrine.rs executes.
+///
+/// A `BTreeMap`, not a `HashMap`, and that is a determinism decision rather
+/// than a performance one: `run_squad_postures` snapshots this map and walks
+/// it, and std's `HashMap` reseeds its hasher every process, so a hash map
+/// here means the squads execute in a different order in every run of the
+/// same binary. Sorted keys make the walk reproducible.
 #[derive(Resource, Default)]
-pub struct SquadOrders(pub std::collections::HashMap<(Team, u8), SquadPosture>);
+pub struct SquadOrders(pub std::collections::BTreeMap<(Team, u8), SquadPosture>);
 
 // ---------------------------------------------------------------------------
 // Orders (high-level intents) & movement (low-level)
@@ -3798,7 +3807,11 @@ pub struct FogGrid {
     /// nav grid's cell geometry rather than inventing a second one, so "the
     /// cell a unit stands in" means one thing in this codebase.
     cells: Vec<CellVis>,
-    ghosts: std::collections::HashMap<u64, RememberedBuilding>,
+    /// `BTreeMap` for determinism: `ghosts()` feeds ai.rs's wave targeting,
+    /// which picks the nearest remembered structure with a first-minimum
+    /// `min_by`. Under a `HashMap` two equidistant ghosts would pick a
+    /// different target in every process.
+    ghosts: std::collections::BTreeMap<u64, RememberedBuilding>,
     explored: usize,
     visible: usize,
 }
@@ -3807,7 +3820,7 @@ impl FogGrid {
     fn dark() -> Self {
         FogGrid {
             cells: vec![CellVis::Unexplored; GRID_DIM * GRID_DIM],
-            ghosts: std::collections::HashMap::new(),
+            ghosts: std::collections::BTreeMap::new(),
             explored: 0,
             visible: 0,
         }
@@ -3820,7 +3833,7 @@ impl FogGrid {
         let n = GRID_DIM * GRID_DIM;
         FogGrid {
             cells: vec![CellVis::Visible; n],
-            ghosts: std::collections::HashMap::new(),
+            ghosts: std::collections::BTreeMap::new(),
             explored: n,
             visible: n,
         }
@@ -5577,6 +5590,166 @@ pub fn ray_at_height(ray: Ray3d, y: f32) -> Option<Vec3> {
 }
 
 // ---------------------------------------------------------------------------
+// The sim frame: one explicit, total order
+// ---------------------------------------------------------------------------
+
+/// The canonical order of a simulation frame. Every gameplay system in the
+/// project lands in exactly one of these, and `CorePlugin` chains them, so
+/// "what runs before what" is one list in one file instead of a scatter of
+/// `.after()` clauses that only constrained a fraction of the schedule.
+///
+/// Before this existed the schedule had exactly two ordering handles —
+/// `FogSet` and `IntentApply` — and everything else (movement vs combat vs
+/// economy vs bounty) was left to Bevy's multi-threaded executor, which
+/// resolves conflicts against whatever happens to be running on another
+/// thread. Two runs of the same binary could therefore step units, resolve
+/// damage and spend gold in different orders. That is the bug this enum
+/// closes; see DESIGN.md § Determinism.
+///
+/// Three edges were already in the code and are merely re-encoded here:
+///   * `Deaths` → `Fog` (`update_fog.after(apply_death)`: the dead stop seeing)
+///   * `Fog` → `Intent` (`IntentApply.after(FogSet)`: an order is judged
+///     against the visibility its issuer has right now)
+///   * `Input`/`CoCommand` → `Intent` (bridge poll, co-command negotiation and
+///     the latency dispatcher all declared `.before(IntentApply)`)
+///
+/// The rest was ambiguous and is CHOSEN here. The choices, and why:
+///   * `Deaths`/`Fog` lead the frame. They are forced there: fog must follow
+///     death and intent must follow fog, so both sit upstream of everything
+///     the commander does. The consequence is that damage dealt in `Combat`
+///     becomes a despawn at the top of the NEXT frame — a one-tick lag that
+///     the old schedule already had roughly half the time, now had always.
+///   * `Think` (doctrine) before `Intent`, matching command.rs's existing rule
+///     that "a fresh direct order issued in the same frame still wins":
+///     standing orders execute first so an explicit order can overwrite them
+///     in the same frame, never the other way round.
+///   * `AiThink` before `Think`, because the scripted commander writes the
+///     `SquadOrders` that doctrine then executes — same frame, not next.
+///   * `Movement` before `Combat` so a unit shoots from where it now stands.
+///   * `Bounty` before `Economy` so a cache claimed this frame is banked this
+///     frame rather than next.
+///   * `Upkeep`/`Feed` last, so the recounts, the win check and the event feed
+///     all describe the frame that just finished.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum SimSet {
+    /// `apply_death` — reap anything at zero HP and free its nav footprint.
+    Deaths,
+    /// `update_fog` — the one producer of knowability. Wraps `FogSet`.
+    Fog,
+    /// Everything that reads the outside world: hotkeys, the bridge poll, the
+    /// chain-of-command dispatcher, the whole ui.rs gesture chain.
+    Input,
+    /// Co-command negotiation, between reading a partner's wire and compiling.
+    CoCommand,
+    /// The scripted commander's macro decisions.
+    AiThink,
+    /// Standing orders: postures, retreats, leashes, auto-cast.
+    Think,
+    /// `apply_intents` — the one path from a stated intent to game state.
+    Intent,
+    /// Spawning, pathing, steering, separation.
+    Movement,
+    /// Target acquisition, projectiles, abilities, damage application.
+    Combat,
+    /// Treasure caches: spawn, claim, expiry.
+    Bounty,
+    /// Construction, research, harvesting, training, purchases.
+    Economy,
+    /// Per-tick bookkeeping: xp, regen, cooldowns, supply, tech, win check.
+    Upkeep,
+    /// Everything that only *describes* the frame: event feed, snapshot,
+    /// logging. Nothing here may change game state.
+    Feed,
+    /// Purely visual: health bars, status rings, shockwaves, orb pulses.
+    /// Excluded from the determinism contract on purpose — it cannot affect
+    /// the sim, so it is free to run wherever the executor likes.
+    Cosmetic,
+}
+
+/// The canonical frame order, as data, so tests and DESIGN.md can't drift from
+/// the schedule.
+pub const SIM_ORDER: [SimSet; 14] = [
+    SimSet::Deaths,
+    SimSet::Fog,
+    SimSet::Input,
+    SimSet::CoCommand,
+    SimSet::AiThink,
+    SimSet::Think,
+    SimSet::Intent,
+    SimSet::Movement,
+    SimSet::Combat,
+    SimSet::Bounty,
+    SimSet::Economy,
+    SimSet::Upkeep,
+    SimSet::Feed,
+    SimSet::Cosmetic,
+];
+
+// ---------------------------------------------------------------------------
+// Seeded randomness
+// ---------------------------------------------------------------------------
+
+/// Environment override for the match seed.
+pub const SEED_ENV: &str = "WC3_SEED";
+
+/// The one source of gameplay randomness in the running sim.
+///
+/// Terrain has always been deterministic (`terrain.rs` seeds `StdRng` from the
+/// fixed `MAP_SEED`), but bounty placement used `rand::thread_rng()` — OS
+/// entropy, reproducible by nothing. Any system that wants a random number now
+/// draws from here, in sim order, so the whole draw sequence is a function of
+/// the seed alone.
+///
+/// Default is a fresh random seed, logged at startup, so a normal match is
+/// still unpredictable; set `WC3_SEED` to replay one.
+#[derive(Resource)]
+pub struct SimRng {
+    /// The seed this match was started with. Logged at startup, which is the
+    /// point: a run that turns out to be worth reproducing can be reproduced
+    /// from its own log, without having decided in advance to record it.
+    pub seed: u64,
+    rng: rand::rngs::StdRng,
+}
+
+impl SimRng {
+    pub fn from_env() -> Self {
+        let seed = std::env::var(SEED_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or_else(rand::random::<u64>);
+        SimRng::from_seed(seed)
+    }
+
+    pub fn from_seed(seed: u64) -> Self {
+        use rand::SeedableRng;
+        SimRng {
+            seed,
+            rng: rand::rngs::StdRng::seed_from_u64(seed),
+        }
+    }
+
+    /// Draw from the match stream. Callers take the whole `Rng` rather than a
+    /// single value so a system that needs several numbers advances the stream
+    /// once, in one place.
+    pub fn rng(&mut self) -> &mut impl rand::Rng {
+        &mut self.rng
+    }
+}
+
+impl Default for SimRng {
+    fn default() -> Self {
+        SimRng::from_env()
+    }
+}
+
+fn log_seed(rng: Res<SimRng>) {
+    info!(
+        "{SEED_ENV}: match seed {} (set {SEED_ENV}={} to replay this match)",
+        rng.seed, rng.seed
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Core plugin: initial spawns, death, supply recount, win condition
 // ---------------------------------------------------------------------------
 
@@ -5584,6 +5757,14 @@ pub struct CorePlugin;
 
 impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
+        // The frame order, installed pairwise straight out of `SIM_ORDER`
+        // rather than retyped as a `.chain()` tuple — the constant IS the
+        // schedule, so the list in DESIGN.md and the list Bevy enforces can
+        // never drift apart.
+        for pair in SIM_ORDER.windows(2) {
+            app.configure_sets(Update, pair[0].before(pair[1]));
+        }
+
         app.init_resource::<NavGrid>()
             .init_resource::<Economies>()
             .init_resource::<GameOver>()
@@ -5607,15 +5788,42 @@ impl Plugin for CorePlugin {
             .add_event::<TeleportRequest>()
             .add_event::<UpgradeBuilding>()
             .add_event::<StartResearch>()
-            .add_systems(Startup, (initial_spawns, apply_env_speed, log_fog_mode))
+            .init_resource::<SimRng>()
+            // `FogSet` predates `SimSet` and stays: it is the handle four
+            // modules already declare `.after()`. It now lives *inside*
+            // `SimSet::Fog`, so both spellings mean the same edge.
+            .configure_sets(Update, FogSet.in_set(SimSet::Fog))
+            .add_systems(
+                Startup,
+                (initial_spawns, apply_env_speed, log_fog_mode, log_seed),
+            )
             .add_systems(
                 Update,
                 (
-                    apply_death,
+                    apply_death.in_set(SimSet::Deaths),
                     // The one producer of knowability. After `apply_death` so
                     // the dead have stopped seeing; ahead of every consumer in
-                    // every other module via `FogSet`.
+                    // every other module via `FogSet`. Both edges are now also
+                    // implied by `SimSet::Deaths` -> `SimSet::Fog`; the
+                    // explicit `.after` stays because it is the statement of
+                    // intent the set order was derived from.
                     update_fog.in_set(FogSet).after(apply_death),
+                    // Reads the keyboard, so: input.
+                    speed_hotkeys.in_set(SimSet::Input),
+                    // Dev-only synthetic commander. In `Input` because it
+                    // emits `CastAbility`, which `SimSet::Combat` consumes
+                    // later in the same frame.
+                    status_probe.in_set(SimSet::Input),
+                ),
+            )
+            .add_systems(
+                Update,
+                // Chained, not merely co-located: `regen_health`,
+                // `tick_status_effects` and `tick_militia_and_cooldowns` all
+                // take `&mut Health`/`&mut StatusEffects`, so leaving them
+                // unordered inside one set would move the race rather than
+                // remove it. The order is the old declaration order.
+                (
                     award_xp,
                     hero_progression,
                     regen_health,
@@ -5624,9 +5832,14 @@ impl Plugin for CorePlugin {
                     recount_supply,
                     recount_tech_tiers,
                     check_game_over,
+                )
+                    .chain()
+                    .in_set(SimSet::Upkeep),
+            )
+            .add_systems(
+                Update,
+                (
                     debug_log,
-                    status_probe,
-                    speed_hotkeys,
                     // After `apply_death`, so a unit that died this frame is
                     // already gone from the picture the diff walks — the feed
                     // reports losses on the tick they happen, not the next one.
@@ -5635,9 +5848,12 @@ impl Plugin for CorePlugin {
                     // Before the diff, so a claim's id is registered in the
                     // same tick the diff would otherwise report the cache
                     // vanishing anonymously to the team that took it.
-                    announce_bounty_claims.before(produce_game_events),
-                    produce_game_events.after(apply_death).after(FogSet),
-                ),
+                    announce_bounty_claims,
+                    produce_game_events,
+                    fingerprint_log,
+                )
+                    .chain()
+                    .in_set(SimSet::Feed),
             );
     }
 }
@@ -6043,6 +6259,156 @@ fn status_probe(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Determinism fingerprint
+// ---------------------------------------------------------------------------
+
+/// `WC3_FINGERPRINT=<game seconds>`: log a hash of the whole simulation state
+/// at fixed game-time intervals. Off by default and pure output — it never
+/// touches game state, which is why it sits in `SimSet::Feed`.
+///
+/// The point is falsifiability. "Deterministic" is a claim about every float
+/// in the world, so the check hashes every float in the world: raw IEEE bits
+/// of each unit's, building's and cache's position and health, plus the entity
+/// id that owns them and both economies. Two runs that agree on this line at
+/// every interval agree on the match; the first interval where they differ is
+/// the first sample after they diverged.
+pub const FINGERPRINT_ENV: &str = "WC3_FINGERPRINT";
+
+fn fingerprint_interval() -> Option<f32> {
+    std::env::var(FINGERPRINT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|s| *s > 0.0)
+}
+
+/// FNV-1a, hand-rolled on purpose: `DefaultHasher` is `RandomState`-seeded and
+/// would produce a different number every process, which is the exact failure
+/// this function exists to detect.
+fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Neutral entities — treasure caches — belong to no team, so they get their
+/// own tag rather than being squeezed into `Team`.
+const FP_NEUTRAL: u8 = 2;
+
+fn fp_team(team: Team) -> u8 {
+    match team {
+        Team::Human => 0,
+        Team::Claude => 1,
+    }
+}
+
+/// One entity's contribution, as a canonical byte string.
+///
+/// `aux` is the second float worth watching, and what it means depends on the
+/// entity: a cache's expiry deadline, and nothing (0.0) for a unit or
+/// building, whose max HP is a constant of their kind and would add no
+/// information.
+fn fingerprint_record(id: u64, team: u8, name: &str, pos: Vec3, hp: f32, aux: f32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(44 + name.len());
+    v.extend_from_slice(&id.to_le_bytes());
+    v.push(team);
+    v.extend_from_slice(name.as_bytes());
+    v.extend_from_slice(&pos.x.to_bits().to_le_bytes());
+    v.extend_from_slice(&pos.y.to_bits().to_le_bytes());
+    v.extend_from_slice(&pos.z.to_bits().to_le_bytes());
+    v.extend_from_slice(&hp.to_bits().to_le_bytes());
+    v.extend_from_slice(&aux.to_bits().to_le_bytes());
+    v
+}
+
+#[allow(clippy::type_complexity)]
+fn fingerprint_log(
+    time: Res<Time>,
+    mut due_at: Local<f32>,
+    economies: Res<Economies>,
+    units: Query<(Entity, &Unit, &Team, &Health, &Transform)>,
+    buildings: Query<(Entity, &Building, &Team, &Health, &Transform)>,
+    // Caches are in here because they are the ONE thing `WC3_SEED` actually
+    // steers. A fingerprint that skipped them could not tell two seeds apart
+    // until an army happened to walk onto one, which is a check that passes
+    // for the wrong reason.
+    bounties: Query<(Entity, &Bounty, &Transform)>,
+) {
+    let Some(step) = fingerprint_interval() else {
+        return;
+    };
+    let now = time.elapsed_secs();
+    if now < *due_at {
+        return;
+    }
+    *due_at = now + step;
+
+    // Sorted, so the hash describes the WORLD and not the order Bevy happened
+    // to hand us its archetypes. An archetype-order change is still visible —
+    // it moves entity ids, which are inside the records.
+    let mut records: Vec<Vec<u8>> = Vec::new();
+    for (e, unit, team, hp, tf) in &units {
+        records.push(fingerprint_record(
+            e.to_bits(),
+            fp_team(*team),
+            kind_name(unit.kind),
+            tf.translation,
+            hp.current,
+            0.0,
+        ));
+    }
+    for (e, b, team, hp, tf) in &buildings {
+        records.push(fingerprint_record(
+            e.to_bits(),
+            fp_team(*team),
+            building_name(b.kind),
+            tf.translation,
+            hp.current,
+            0.0,
+        ));
+    }
+    for (e, bounty, tf) in &bounties {
+        records.push(fingerprint_record(
+            e.to_bits(),
+            FP_NEUTRAL,
+            "Bounty",
+            tf.translation,
+            bounty.gold as f32,
+            bounty.expires_at,
+        ));
+    }
+    records.sort_unstable();
+
+    let mut h = FNV_OFFSET;
+    for r in &records {
+        h = fnv1a(r, h);
+    }
+    for team in [Team::Human, Team::Claude] {
+        let e = economies.get(team);
+        h = fnv1a(&e.gold.to_le_bytes(), h);
+        h = fnv1a(&e.lumber.to_le_bytes(), h);
+        h = fnv1a(&e.supply_used.to_le_bytes(), h);
+        h = fnv1a(&e.supply_cap.to_le_bytes(), h);
+    }
+
+    let (hu, cl) = (economies.get(Team::Human), economies.get(Team::Claude));
+    info!(
+        "FINGERPRINT t={:.2} n={} human={}g/{}l/{}s claude={}g/{}l/{}s hash={h:016x}",
+        now,
+        records.len(),
+        hu.gold,
+        hu.lumber,
+        hu.supply_used,
+        cl.gold,
+        cl.lumber,
+        cl.supply_used,
+    );
+}
+
 /// Supply is recomputed from the world every frame so no module has to
 /// track increments/decrements on death.
 fn recount_supply(
@@ -6084,14 +6450,65 @@ fn speed_hotkeys(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>
 }
 
 /// `WC3_SPEED=4 cargo run` — accelerated headless-ish testing.
+///
+/// Ignored under `WC3_FIXED_DT`: there the step size IS the tick, and
+/// multiplying the two would silently turn a 0.05s tick into a 0.4s one, which
+/// is not "the same match faster" but a different, coarser match.
 fn apply_env_speed(mut time: ResMut<Time<Virtual>>) {
     if let Ok(raw) = std::env::var("WC3_SPEED") {
         if let Ok(speed) = raw.parse::<f32>() {
+            if let Some(dt) = fixed_step_from_env() {
+                info!("WC3_SPEED={raw} ignored: {FIXED_DT_ENV}={dt} sets the tick");
+                return;
+            }
             let speed = speed.clamp(0.1, 16.0);
             time.set_relative_speed(speed);
             info!("WC3_SPEED: game speed set to {speed}x");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-tick clock
+// ---------------------------------------------------------------------------
+
+/// `WC3_FIXED_DT=0.05`: advance the clock by exactly this many seconds per
+/// frame instead of by however long the frame took.
+pub const FIXED_DT_ENV: &str = "WC3_FIXED_DT";
+
+/// The smallest step worth allowing, and the largest. A tick below a
+/// millisecond makes a match take forever to simulate; a tick above a quarter
+/// second is coarser than the fog recompute and the projectile hit test, both
+/// of which would start skipping.
+const FIXED_DT_MIN: f64 = 0.001;
+const FIXED_DT_MAX: f64 = 0.25;
+
+/// The configured tick, in seconds, if `WC3_FIXED_DT` names a sane one.
+pub fn fixed_step_from_env() -> Option<f64> {
+    std::env::var(FIXED_DT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|d| (FIXED_DT_MIN..=FIXED_DT_MAX).contains(d))
+}
+
+/// Bevy's own hook for a hand-driven clock, configured from the environment.
+///
+/// This is what makes a headless replay independent of the machine it runs on.
+/// Normally `TimePlugin` derives the frame delta from the wall clock, so every
+/// accumulator in the sim — attack cooldowns, construction progress,
+/// projectile flight, the `on_timer` gates — integrates a number that depends
+/// on how fast the CPU happened to be that second. `ManualDuration` replaces
+/// that with a constant, and two runs of the same seed then see the same
+/// numbers in the same frames.
+///
+/// It drives `Time<Real>` as well as `Time<Virtual>`, which matters more than
+/// it looks: bridge.rs paces its snapshot writes and command polls off the
+/// real clock, so on the wall clock the frame an external order lands on would
+/// be a property of the host rather than of the match.
+pub fn fixed_time_strategy() -> Option<bevy::time::TimeUpdateStrategy> {
+    fixed_step_from_env().map(|dt| {
+        bevy::time::TimeUpdateStrategy::ManualDuration(std::time::Duration::from_secs_f64(dt))
+    })
 }
 
 /// Periodic state snapshot in the console — sim health check without a screen.
@@ -6363,9 +6780,13 @@ struct EventMemo {
     /// noteworthy.
     seeded: bool,
     /// own unit id -> (kind, last known position)
-    units: std::collections::HashMap<u64, (UnitKind, [f32; 2])>,
+    ///
+    /// Every map in this memo is a `BTreeMap`. The diff walks them to build
+    /// event text and to average positions into a centroid; hash order would
+    /// make both the line order AND the float sum differ between runs.
+    units: std::collections::BTreeMap<u64, (UnitKind, [f32; 2])>,
     /// own building id -> (kind, position, hp, max_hp)
-    buildings: std::collections::HashMap<u64, (BuildingKind, [f32; 2], f32, f32)>,
+    buildings: std::collections::BTreeMap<u64, (BuildingKind, [f32; 2], f32, f32)>,
     hero_alive: bool,
     hero_level: u32,
     /// Last place the hero was seen, so "hero died" still has somewhere to
@@ -6374,16 +6795,16 @@ struct EventMemo {
     /// Latched so "hero low" fires once per crossing rather than every tick.
     hero_low: bool,
     threat: usize,
-    squad_members: std::collections::HashMap<u8, usize>,
+    squad_members: std::collections::BTreeMap<u8, usize>,
     /// Largest membership seen since each squad was last empty. A squad that
     /// bleeds out one member per tick is still a squad that got wiped, so the
     /// report keys off this rather than the previous tick's count.
-    squad_peak: std::collections::HashMap<u8, usize>,
+    squad_peak: std::collections::BTreeMap<u8, usize>,
     /// Last known centre of mass per squad — where to look when one is wiped.
-    squad_pos: std::collections::HashMap<u8, [f32; 2]>,
+    squad_pos: std::collections::BTreeMap<u8, [f32; 2]>,
     /// bounty entity id -> (position, gold, expiry deadline). Bounties are the
     /// one thing in this memo that isn't own-team: treasure is neutral.
-    bounties: std::collections::HashMap<u64, ([f32; 2], u32, f32)>,
+    bounties: std::collections::BTreeMap<u64, ([f32; 2], u32, f32)>,
 }
 
 /// One decimal place — event text stays terse and diffs cleanly.
@@ -6594,19 +7015,23 @@ fn diff_team(
     // would only be the same news told worse.
     my_claims: &[u64],
 ) -> Vec<(String, EventSeverity, Option<Vec3>)> {
-    use std::collections::HashMap;
+    // `BTreeMap`, not `HashMap`, for every scratch map below: each one is
+    // walked to produce ordered output (event lines) or to sum floats
+    // (centroids), so all of them must iterate in key order rather than in
+    // std's per-process hash order.
+    use std::collections::BTreeMap;
 
     let home = me.base_pos();
 
     // --- gather the current picture -------------------------------------
-    let mut cur_units: HashMap<u64, (UnitKind, [f32; 2])> = HashMap::new();
+    let mut cur_units: BTreeMap<u64, (UnitKind, [f32; 2])> = BTreeMap::new();
     let mut hero_alive = false;
     let mut hero_level = memo.hero_level;
     let mut hero_frac = 1.0f32;
     let mut hero_pos = memo.hero_pos;
     let mut hostiles: Vec<[f32; 2]> = Vec::new();
-    let mut members: HashMap<u8, usize> = HashMap::new();
-    let mut squad_points: HashMap<u8, Vec<[f32; 2]>> = HashMap::new();
+    let mut members: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut squad_points: BTreeMap<u8, Vec<[f32; 2]>> = BTreeMap::new();
     for u in units {
         if u.team == me {
             cur_units.insert(u.id, (u.kind, u.pos));
@@ -6632,7 +7057,7 @@ fn diff_team(
         }
     }
 
-    let mut cur_buildings: HashMap<u64, (BuildingKind, [f32; 2], f32, f32)> = HashMap::new();
+    let mut cur_buildings: BTreeMap<u64, (BuildingKind, [f32; 2], f32, f32)> = BTreeMap::new();
     for b in buildings {
         if b.team == me {
             cur_buildings.insert(b.id, (b.kind, b.pos, b.hp, b.max_hp));
@@ -6642,7 +7067,7 @@ fn diff_team(
     let threat = hostiles.len();
 
     // What this team can actually see of the treasure on the map right now.
-    let seen_bounties: HashMap<u64, ([f32; 2], u32, f32)> = bounties
+    let seen_bounties: BTreeMap<u64, ([f32; 2], u32, f32)> = bounties
         .iter()
         .filter(|b| fog.sees(ev_ground(b.pos)))
         .map(|b| (b.id, (b.pos, b.gold, b.expires_at)))
@@ -6675,7 +7100,7 @@ fn diff_team(
     // --- unit losses ----------------------------------------------------
     // Grouped by kind so a wiped squad reads as one line, not eight. Keyed and
     // ordered by the *name*, which is what goes out on the wire.
-    let mut lost: HashMap<&'static str, Vec<[f32; 2]>> = HashMap::new();
+    let mut lost: BTreeMap<&'static str, Vec<[f32; 2]>> = BTreeMap::new();
     for (id, (kind, pos)) in &memo.units {
         if cur_units.contains_key(id) || is_hero_kind(*kind) {
             continue; // the hero gets its own, better, event below
@@ -6880,6 +7305,144 @@ fn diff_team(
 // are pinned here rather than left to a sim to notice. Every one is written
 // against the derived helpers, not against `Keep`/`Castle` literals where it
 // can be avoided — a second ladder should inherit the guarantees.
+
+#[cfg(test)]
+mod determinism_tests {
+    use super::*;
+
+    /// The claim `WC3_SEED` makes: a seed IS the match's randomness. If two
+    /// generators built from one seed ever disagree, replay is a fiction and
+    /// every downstream guarantee in DESIGN.md § Determinism goes with it.
+    #[test]
+    fn a_seed_replays_the_same_number_stream() {
+        use rand::Rng;
+        let draw = |seed: u64| {
+            let mut sim = SimRng::from_seed(seed);
+            let rng = sim.rng();
+            (0..64)
+                .map(|_| rng.gen_range(0.0f32..1.0))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(draw(42), draw(42), "one seed, two different streams");
+        assert_ne!(
+            draw(42),
+            draw(43),
+            "two seeds produced the same stream — the seed is being ignored"
+        );
+    }
+
+    /// `SIM_ORDER` is not documentation, it is what `CorePlugin` feeds to
+    /// `configure_sets` pairwise. A duplicate would silently install a
+    /// contradictory edge and a missing phase would leave its systems floating
+    /// free again, which is the exact bug the enum was added to close.
+    #[test]
+    fn the_frame_order_names_every_phase_exactly_once() {
+        let mut seen: Vec<SimSet> = SIM_ORDER.to_vec();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            SIM_ORDER.len(),
+            "a phase appears twice in SIM_ORDER"
+        );
+        // The edges that were load-bearing before `SimSet` existed, and that
+        // the set order had to preserve rather than invent.
+        let at = |s: SimSet| SIM_ORDER.iter().position(|x| *x == s).unwrap();
+        assert!(at(SimSet::Deaths) < at(SimSet::Fog), "the dead still see");
+        assert!(
+            at(SimSet::Fog) < at(SimSet::Intent),
+            "an order would be judged against last frame's visibility"
+        );
+        assert!(
+            at(SimSet::Input) < at(SimSet::Intent),
+            "input would compile a frame late"
+        );
+        assert!(
+            at(SimSet::CoCommand) < at(SimSet::Intent),
+            "an approved proposal would compile a frame late"
+        );
+        // And the choices this bead made, asserted so a later reshuffle has to
+        // argue with a test rather than quietly change what a match is.
+        assert!(
+            at(SimSet::AiThink) < at(SimSet::Think),
+            "doctrine would execute postures the commander has not written yet"
+        );
+        assert!(
+            at(SimSet::Think) < at(SimSet::Intent),
+            "a standing order would overrule a direct one issued the same frame"
+        );
+        assert!(
+            at(SimSet::Movement) < at(SimSet::Combat),
+            "units would shoot from where they used to stand"
+        );
+        assert!(
+            at(SimSet::Bounty) < at(SimSet::Economy),
+            "treasure claimed this frame would bank next frame"
+        );
+        assert!(
+            at(SimSet::Economy) < at(SimSet::Feed),
+            "the snapshot would report a stale bank balance"
+        );
+    }
+
+    /// The fingerprint has to be a function of the WORLD. Bevy hands entities
+    /// back in archetype order, which is stable within a run but is not what
+    /// we are measuring, so the records are sorted before hashing — otherwise
+    /// a harmless archetype reshuffle would read as a divergence and the check
+    /// would cry wolf until nobody trusted it.
+    #[test]
+    fn the_fingerprint_describes_the_world_not_the_visit_order() {
+        let a = fingerprint_record(1, 0, "Spearman", Vec3::new(1.0, 0.0, 2.0), 40.0, 0.0);
+        let b = fingerprint_record(2, 1, "Raider", Vec3::new(-3.0, 0.0, 4.0), 55.0, 0.0);
+
+        let hash = |mut recs: Vec<Vec<u8>>| {
+            recs.sort_unstable();
+            recs.iter().fold(FNV_OFFSET, |h, r| fnv1a(r, h))
+        };
+        assert_eq!(
+            hash(vec![a.clone(), b.clone()]),
+            hash(vec![b.clone(), a.clone()]),
+            "visiting the same two entities in the other order changed the hash"
+        );
+
+        // ...and it must still be sensitive to the thing it is watching. One
+        // unit one hit point lighter is a different match.
+        let a_hurt = fingerprint_record(1, 0, "Spearman", Vec3::new(1.0, 0.0, 2.0), 39.0, 0.0);
+        assert_ne!(
+            hash(vec![a.clone(), b.clone()]),
+            hash(vec![a_hurt, b.clone()]),
+            "a health change left the fingerprint unmoved"
+        );
+
+        // The neutral slot has to be live too: a treasure cache two world
+        // units to the left is the difference between two seeds, and it was
+        // invisible to this hash until caches were added to it.
+        let cache = |x: f32| {
+            fingerprint_record(
+                9,
+                FP_NEUTRAL,
+                "Bounty",
+                Vec3::new(x, 0.0, 0.0),
+                300.0,
+                225.0,
+            )
+        };
+        assert_ne!(
+            hash(vec![a.clone(), b.clone(), cache(10.0)]),
+            hash(vec![a, b, cache(12.0)]),
+            "a cache moving left the fingerprint unmoved"
+        );
+    }
+
+    /// A hand-rolled FNV-1a rather than `DefaultHasher`, because
+    /// `DefaultHasher` is `RandomState`-seeded and reseeds every process — it
+    /// would report every pair of runs as divergent. This pins the constant so
+    /// the fingerprints in one run's log can be compared against another's.
+    #[test]
+    fn the_hash_is_the_same_number_in_every_process() {
+        assert_eq!(fnv1a(b"wc3clone", FNV_OFFSET), 0x581d_75bc_381f_f889);
+    }
+}
 
 #[cfg(test)]
 mod tests {

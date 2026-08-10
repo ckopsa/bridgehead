@@ -289,7 +289,7 @@ impl Plugin for TerrainPlugin {
                     ..default()
                 })
                 .add_systems(Startup, (setup_lighting, setup_camera))
-                .add_systems(Update, camera_control);
+                .add_systems(Update, camera_control.in_set(SimSet::Cosmetic));
         }
     }
 }

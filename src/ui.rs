@@ -354,7 +354,11 @@ impl Plugin for UiPlugin {
                     // Every gesture system here submits intents; the compiler
                     // runs after all of them, so a click is compiled in the
                     // frame it happened rather than the next one.
+                    // That is exactly `SimSet::Input`'s slot — after the fog
+                    // recompute, before `SimSet::Intent` — so the set name now
+                    // carries what these two clauses used to.
                     .chain()
+                    .in_set(SimSet::Input)
                     .before(IntentApply)
                     .after(FogSet),
             )
@@ -369,8 +373,12 @@ impl Plugin for UiPlugin {
             .add_systems(
                 Update,
                 (
-                    proposal_input.before(CopilotSet),
-                    update_proposals.after(CopilotSet),
+                    proposal_input.in_set(SimSet::Input).before(CopilotSet),
+                    // `SimSet::Cosmetic`, not `Input`: this one must run after
+                    // `CopilotSet`, and `CopilotSet` is downstream of `Input`,
+                    // so filing it with its sibling would be a cycle. It draws
+                    // and nothing else, which is what `Cosmetic` is for.
+                    update_proposals.in_set(SimSet::Cosmetic).after(CopilotSet),
                 ),
             );
     }

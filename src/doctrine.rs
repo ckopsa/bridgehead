@@ -120,6 +120,12 @@ impl Plugin for DoctrinePlugin {
                 // threat response), so the whole chain sits after the one
                 // producer of it.
                 .chain()
+                // `SimSet::Think` runs after the scripted commander has
+                // written its postures and BEFORE the intent compiler, which
+                // is the same rule command.rs states for its latency
+                // dispatcher: standing orders execute first so an explicit
+                // order issued in the same frame can still overrule them.
+                .in_set(SimSet::Think)
                 .after(FogSet),
         );
     }

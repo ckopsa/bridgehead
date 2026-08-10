@@ -70,7 +70,14 @@ impl Plugin for UnitsPlugin {
                     separate_units,
                     cleanup_orphan_paths,
                 )
-                    .chain(),
+                    .chain()
+                    // `steer_units` and `separate_units` both hold
+                    // `&mut Transform`, and so does combat.rs's `engagement`.
+                    // Before `SimSet` nothing ordered this chain against
+                    // combat's, so which one moved a unit first was decided by
+                    // whichever thread got there. Now movement finishes before
+                    // combat begins: a unit shoots from where it now stands.
+                    .in_set(SimSet::Movement),
             );
     }
 }

@@ -404,9 +404,18 @@ impl Plugin for AiPlugin {
             .add_systems(Startup, ai_apply_env)
             // `ai_think` after `FogSet`: the scripted commander plans from
             // this frame's visibility, exactly like the bridge seats.
+            .add_systems(Update, ai_toggle_hotkey.in_set(SimSet::Input))
             .add_systems(
                 Update,
-                (ai_toggle_hotkey, seed_machine_autocast, ai_think.after(FogSet)),
+                // Chained and boxed into `SimSet::AiThink`, which sits between
+                // the fog recompute and doctrine: the scripted commander plans
+                // from this frame's visibility and writes the `SquadOrders`
+                // that doctrine executes later in the SAME frame, rather than
+                // racing it and landing next frame half the time.
+                (seed_machine_autocast, ai_think)
+                    .chain()
+                    .in_set(SimSet::AiThink)
+                    .after(FogSet),
             );
     }
 }
