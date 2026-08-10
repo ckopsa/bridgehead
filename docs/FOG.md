@@ -79,6 +79,7 @@ can find are different questions, and the gap between them is where scouting liv
 | Spearman | 18 | 2.6 | a picket must see the riders coming — but still short of the Raider's 24, so cavalry keeps the initiative |
 | Catapult | 14 | 20 | **sees less than it shoots** — siege needs spotters |
 | Raider | 24 | 2.2 | **the scout**: sees far, can barely hit anything |
+| Sorcerer | 18 | 11 | a caster whose spell is an 8-unit bubble around itself must see the charge coming from further out than it can throw it |
 | Hero (Champion) | 20 | 2.4 | leaders see |
 | Priestess | 18 | 10 | |
 
@@ -89,6 +90,7 @@ can find are different questions, and the gap between them is where scouting liv
 | TownHall | 26 | a base is a team's permanent eyes |
 | Tower | 20 | exceeds its 16 attack range — never shoots at what the team cannot see |
 | Barracks | 18 | |
+| Arcane Sanctum | 18 | level with the Barracks — the caster's drill yard, not a watchtower |
 | Workshop | 16 | |
 | Shop | 14 | |
 | Farm | 12 | |

@@ -53,7 +53,7 @@ const MAX_QUEUE: usize = 7;
 const GUARD_RADIUS: f32 = 18.0;
 /// HP fraction at which the [V Fallback] toggle breaks a unit off.
 const FALLBACK_FRAC: f32 = 0.35;
-/// Enemies inside the slam radius before [T Auto-Slam] fires.
+/// Enemies inside a caster's ability radius before [T Auto-Cast] fires.
 const AUTOCAST_MIN_ENEMIES: u32 = 3;
 
 const TOP_BAR_H: f32 = 34.0;
@@ -474,6 +474,8 @@ impl UnitDoctrine {
         retreat: Option<&RetreatPolicy>,
         prio: Option<&TargetPriority>,
         autocast: Option<&AutoCastPolicy>,
+        // `hero`: does this unit have anything to auto-cast? Any caster, not
+        // just a hero — the Sorcerer's whole doctrine is its auto-cast toggle.
         hero: bool,
     ) -> Self {
         UnitDoctrine {
@@ -492,6 +494,9 @@ impl UnitDoctrine {
 #[derive(Clone, Copy, Default)]
 struct DoctrineState {
     units: usize,
+    /// Selected units that HAVE an ability — heroes and Sorcerers alike. Named
+    /// for the only thing it decides: whether the [T Auto-Cast] toggle is on
+    /// the card at all.
     heroes: usize,
     leashed: usize,
     leash_radius: f32,
@@ -574,7 +579,7 @@ impl DoctrineState {
             parts.push(format!("prio:{}", self.prio.tag()));
         }
         if self.autocast > 0 {
-            parts.push(format!("autoslam{}", tally(self.autocast, self.heroes)));
+            parts.push(format!("autocast{}", tally(self.autocast, self.heroes)));
         }
         if parts.is_empty() {
             String::new()
@@ -693,15 +698,66 @@ struct HeroCmds {
     items: [Option<ItemId>; 2],
 }
 
-/// The town hall's hero button(s). A team plays exactly one hero class: the
-/// first one trained locks it in (`HeroRecord.kind`), and from then on the card
-/// offers only that class, as a cheaper "Revive".
-#[derive(Clone, Copy)]
+/// The hall's hero button(s). Hero slots scale with the hall ladder
+/// (`shared::hero_slots`: 1 at TownHall, 2 at Keep, 3 at Castle) and classes
+/// must be distinct, so the card no longer offers "the" hero — it offers one
+/// button per class and decides each independently:
+///
+///   * class already standing or already queued -> **hidden** (there is
+///     nothing to buy);
+///   * class dead but recorded -> shown as a cheaper **"Revive"**;
+///   * class never fielded -> shown at full price;
+///   * ...and any of those is **greyed** when every slot is spoken for, so a
+///     tier-1 player can SEE the Priestess they would get by teching up rather
+///     than discovering her existence in the catalog.
+#[derive(Clone, Default)]
 struct HeroTrain {
-    gold: u32,
-    lumber: u32,
-    /// `Some(kind)` once a record exists — only that class may be revived.
-    recorded: Option<UnitKind>,
+    /// Hero classes alive on the field or sitting in a queue.
+    held: Vec<UnitKind>,
+    /// The team's live tier — what `hero_slot_check` reads the ceiling from.
+    tier: TechTier,
+    /// The same numbers, kept for the greyed button's "slots 1/2" caption.
+    slots: u32,
+    used: u32,
+    /// Per class: `(kind, gold, lumber, is_revival)`.
+    costs: Vec<(UnitKind, u32, u32, bool)>,
+}
+
+impl HeroTrain {
+    /// `(gold, lumber, label, enabled)` for one hero class, or `None` when the
+    /// button should not appear at all.
+    fn offer(&self, kind: UnitKind) -> Option<(u32, u32, &'static str, bool)> {
+        let verdict = hero_slot_check(&self.held, kind, self.tier);
+        if verdict == HeroSlotVerdict::DuplicateClass {
+            return None;
+        }
+        let (_, gold, lumber, revival) = *self.costs.iter().find(|(k, ..)| *k == kind)?;
+        let label = if revival { "Revive" } else { unit_name(kind) };
+        Some((gold, lumber, label, verdict == HeroSlotVerdict::Ok))
+    }
+}
+
+/// Build the hero card state for one team from the world.
+fn hero_train_state(
+    records: &HeroRecords,
+    tier: TechTier,
+    held: Vec<UnitKind>,
+) -> HeroTrain {
+    HeroTrain {
+        tier,
+        slots: hero_slots(tier),
+        used: held.len() as u32,
+        costs: ALL_UNIT_KINDS
+            .iter()
+            .copied()
+            .filter(|k| is_hero_kind(*k))
+            .map(|k| {
+                let (gold, lumber, _) = hero_train_cost(records, Team::Human, k);
+                (k, gold, lumber, records.get(Team::Human, k).is_some())
+            })
+            .collect(),
+        held,
+    }
 }
 
 /// Why a Shop's buy buttons are (not) usable. The Shop sells to the team's
@@ -721,11 +777,12 @@ struct ShopState {
 /// name and tech gating all come from the shared tables via `build_cards`.
 ///
 /// Free letters only: every other command key in this file is
-/// A S R C B F H O L K N Q W E G V P T Z X U, plus the second/third ability
-/// slots Y D (hero) and J M (building), plus Esc / '.' / Ctrl+1-3;
+/// A S R C B F H O I L K N Q W E G V P T Z X U, plus the second/third ability
+/// slots Y D (caster) and J M (building), plus Esc / '.' / Ctrl+1-3;
 /// shared.rs owns F1-F4, ai.rs F9, the surrender hotkey F12, and terrain.rs
-/// the arrow keys. K (workshop) and N (shop) were picked against that whole
-/// list — I is the only remaining unclaimed letter.
+/// the arrow keys. K (workshop), N (shop) and I (arcane sanctum) were picked
+/// against that whole list, and I was the LAST free letter — the next
+/// placeable building needs a modifier or a second build page.
 fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
     match kind {
         BuildingKind::Barracks => Some((0, KeyCode::KeyB, "B")),
@@ -735,6 +792,10 @@ fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
         BuildingKind::Wall => Some((4, KeyCode::KeyL, "L")),
         BuildingKind::Workshop => Some((5, KeyCode::KeyK, "K")),
         BuildingKind::Shop => Some((6, KeyCode::KeyN, "N")),
+        // I — the last unclaimed letter, spent on the tier-2 caster building.
+        // A new placeable kind after this one needs a modifier or a second
+        // build page.
+        BuildingKind::Sanctum => Some((7, KeyCode::KeyI, "I")),
         // Reached by upgrading a hall, never by placing one — no build card,
         // and `build_cards` filters on `building_placeable` besides.
         BuildingKind::Keep | BuildingKind::Castle => None,
@@ -848,7 +909,7 @@ fn ability_slots(
 /// Build commands never yield — a greyed [K Workshop] is how the player learns
 /// what unlocks it, and it is the only route to a building at all. The doctrine
 /// toggles give way first, in the order [P Priority] (a preference),
-/// [V Fallback], [G Guard]; [T Auto-Slam] is kept longest because it is the
+/// [V Fallback], [G Guard]; [T Auto-Cast] is kept longest because it is the
 /// only hero-specific toggle with no other route in. With seven buildable kinds
 /// a worker card spends its whole budget on the classic layout, so a worker
 /// selection loses the toggles outright — and a worker+hero selection loses the
@@ -907,7 +968,12 @@ fn command_entries(
             hotkey,
             &ability_label(&slot.def, slot.cooldown),
         );
-        entry.cost = format!("{:.0}mp", slot.def.mana_cost);
+        // A mana-less caster (the Sorcerer pays only a cooldown) would
+        // otherwise advertise "0mp", which reads as a bug rather than a
+        // design. Its readiness is already in the label's cooldown timer.
+        if slot.def.mana_cost > 0.0 {
+            entry.cost = format!("{:.0}mp", slot.def.mana_cost);
+        }
         entry.enabled = slot.ready;
         out.push(entry);
     }
@@ -933,22 +999,23 @@ fn command_entries(
                     continue;
                 };
                 if is_hero_kind(*unit) {
-                    // Hidden entirely while the team already has (or is
-                    // training) its one hero...
-                    let Some(train) = hero.train else {
+                    // One button per hero class, each decided on its own —
+                    // hidden while that hero is alive or queued, "Revive" once
+                    // it has a record, greyed while every slot is taken.
+                    let Some(train) = hero.train.as_ref() else {
                         continue;
                     };
-                    // ...and once a record exists the team is locked to that
-                    // class: only the recorded one is offered, as a Revive.
-                    let label = match train.recorded {
-                        Some(recorded) if recorded != *unit => continue,
-                        Some(_) => "Revive",
-                        None => unit_name(*unit),
+                    let Some((gold, lumber, label, enabled)) = train.offer(*unit) else {
+                        continue;
                     };
-                    out.push(
+                    let mut entry =
                         CmdEntry::plain(CmdAction::Train(*unit), key, hotkey, label)
-                            .priced(train.gold, train.lumber),
-                    );
+                            .priced(gold, lumber);
+                    if !enabled {
+                        entry.enabled = false;
+                        entry.cost = format!("slots {}/{}", train.used, train.slots);
+                    }
+                    out.push(entry);
                 } else {
                     let s = unit_stats(*unit);
                     out.push(
@@ -1031,7 +1098,7 @@ fn command_entries(
         ];
         if doc.heroes > 0 {
             doctrine.push(
-                CmdEntry::plain(CmdAction::ToggleAutoCast, KeyCode::KeyT, "T", "Auto-Slam")
+                CmdEntry::plain(CmdAction::ToggleAutoCast, KeyCode::KeyT, "T", "Auto-Cast")
                     .active(doc.autocast_active()),
             );
         }
@@ -1081,6 +1148,7 @@ fn unit_name(kind: UnitKind) -> &'static str {
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
         UnitKind::Spearman => "Spearman",
+        UnitKind::Sorcerer => "Sorcerer",
     }
 }
 
@@ -1106,6 +1174,7 @@ fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Shop => "Shop",
         BuildingKind::Keep => "Keep",
         BuildingKind::Castle => "Castle",
+        BuildingKind::Sanctum => "Sanctum",
     }
 }
 
@@ -1979,8 +2048,15 @@ fn command_input(
     >,
     // Read-only: the team's hero (anywhere on the map) is the Shop's customer.
     all_units: Query<(Entity, &Unit, &Team, &Order, &Transform, Option<&Inventory>)>,
-    // Read-only: the fallback rally looks for the nearest own town hall.
-    all_buildings: Query<(&Building, &Team, &Transform, Has<UnderConstruction>)>,
+    // Read-only: the fallback rally looks for the nearest own town hall, and
+    // the hero-slot tally has to see EVERY own queue, not just the selection.
+    all_buildings: Query<(
+        &Building,
+        &Team,
+        &Transform,
+        Has<UnderConstruction>,
+        Option<&TrainingQueue>,
+    )>,
 ) {
     if game_over.0.is_some() {
         return;
@@ -2030,13 +2106,14 @@ fn command_input(
     let has_worker = sel_units
         .iter()
         .any(|(_, u, t, _, _, _, _, _, _, _)| *t == Team::Human && u.kind == UnitKind::Worker);
-    // Every selected own hero (there is only ever one, but iterate anyway).
-    // Keyed off the `Hero` component, so both classes qualify.
-    let own_heroes: Vec<(Entity, UnitKind, Hero, Inventory)> = sel_units
+    // Every selected own CASTER — anything whose kind has an ability list.
+    // Heroes qualify through their tables like everything else, and so does
+    // the Sorcerer, which carries no `Hero` component at all.
+    let own_casters: Vec<(Entity, UnitKind, Option<Hero>, Inventory)> = sel_units
         .iter()
-        .filter(|(_, _, t, _, h, _, _, _, _, _)| **t == Team::Human && h.is_some())
+        .filter(|(_, u, t, ..)| **t == Team::Human && !abilities_of_unit(u.kind).is_empty())
         .map(|(e, u, _, _, h, _, _, _, _, inv)| {
-            (e, u.kind, *h.unwrap(), inv.copied().unwrap_or_default())
+            (e, u.kind, h.copied(), inv.copied().unwrap_or_default())
         })
         .collect();
     // Doctrine of the own-unit selection, in a stable order.
@@ -2044,10 +2121,16 @@ fn command_input(
         sel_units
             .iter()
             .filter(|(_, _, t, _, _, _, _, _, _, _)| **t == Team::Human)
-            .map(|(e, _, _, _, hero, leash, retreat, prio, autocast, _)| {
+            .map(|(e, u, _, _, _, leash, retreat, prio, autocast, _)| {
                 (
                     e.index(),
-                    UnitDoctrine::read(leash, retreat, prio, autocast, hero.is_some()),
+                    UnitDoctrine::read(
+                        leash,
+                        retreat,
+                        prio,
+                        autocast,
+                        !abilities_of_unit(u.kind).is_empty(),
+                    ),
                 )
             })
             .collect(),
@@ -2064,37 +2147,43 @@ fn command_input(
     };
     let single_building = single.map(|(_, kind, done, _)| (kind, done));
 
-    // Hero training is offered only while the team has neither a living
-    // hero (of either class) nor one already queued in this building.
-    let team_has_hero = all_units
+    // Every hero class this team is holding: alive anywhere on the map, or
+    // sitting in ANY of its queues (not just the selected building's — two
+    // halls each queuing a Priestess is exactly the case the slot rule is
+    // for). Same tally the bridge snapshot and economy.rs's pay-point compute.
+    let mut held_heroes: Vec<UnitKind> = all_units
         .iter()
-        .any(|(_, u, t, _, _, _)| *t == Team::Human && is_hero_kind(u.kind));
-    let hero_in_queue = sel_buildings.iter().any(|(_, _, t, q, _, _)| {
-        *t == Team::Human
-            && q.map(|q| q.queue.iter().any(|k| is_hero_kind(*k)))
-                .unwrap_or(false)
-    });
-    // The team's hero wherever it stands — the Shop's only customer.
+        .filter(|(_, u, t, _, _, _)| **t == Team::Human && is_hero_kind(u.kind))
+        .map(|(_, u, _, _, _, _)| u.kind)
+        .collect();
+    for (_, team, _, _, queue) in all_buildings.iter() {
+        if *team != Team::Human {
+            continue;
+        }
+        held_heroes.extend(
+            queue
+                .into_iter()
+                .flat_map(|q| q.queue.iter().copied())
+                .filter(|k| is_hero_kind(*k)),
+        );
+    }
+    // The team's hero wherever it stands — the Shop's only customer. With two
+    // heroes possible, this is the first one found; the Shop has always sold
+    // to "the team's hero" and now picks one.
     let team_hero: Option<(Entity, Inventory)> = all_units
         .iter()
         .find(|(_, u, t, _, _, _)| **t == Team::Human && is_hero_kind(u.kind))
         .map(|(e, _, _, _, _, inv)| (e, inv.copied().unwrap_or_default()));
+    let hero_train = hero_train_state(&records, cast.tiers.get(Team::Human), held_heroes);
     let hero_cmds = HeroCmds {
-        train: (!team_has_hero && !hero_in_queue).then(|| {
-            let (gold, lumber, _) = hero_train_cost(&records, Team::Human);
-            HeroTrain {
-                gold,
-                lumber,
-                recorded: records.get(Team::Human).map(|r| r.kind),
-            }
-        }),
-        abilities: own_heroes
+        train: Some(hero_train.clone()),
+        abilities: own_casters
             .first()
             .map(|(entity, kind, hero, _)| {
                 ability_slots(
                     abilities_of_unit(*kind),
-                    UnlockCtx::new(hero.level, cast.tiers.get(Team::Human)),
-                    Some(hero),
+                    UnlockCtx::new(hero.map_or(0, |h| h.level), cast.tiers.get(Team::Human)),
+                    hero.as_ref(),
                     cast.cooldowns.get(*entity).ok(),
                 )
             })
@@ -2122,14 +2211,14 @@ fn command_input(
                 .flatten()
                 .map(|((gold, lumber, _), to)| (to, gold, lumber))
         }),
-        items: own_heroes.first().map(|(_, _, _, inv)| inv.0).unwrap_or_default(),
+        items: own_casters.first().map(|(_, _, _, inv)| inv.0).unwrap_or_default(),
     };
 
     // Completed own buildings = the tech state every build entry is gated on.
     let completed: Vec<BuildingKind> = all_buildings
         .iter()
-        .filter(|(_, t, _, under)| **t == Team::Human && !under)
-        .map(|(b, _, _, _)| b.kind)
+        .filter(|(_, t, _, under, _)| **t == Team::Human && !under)
+        .map(|(b, _, _, _, _)| b.kind)
         .collect();
 
     let entries = command_entries(
@@ -2196,7 +2285,7 @@ fn command_input(
             // slot, so the UI is index-native; a commander may name the same
             // slot by id. Both spellings are the same intent.
             CmdAction::CastHero(index) => {
-                for (hero, _, _, _) in &own_heroes {
+                for (hero, _, _, _) in &own_casters {
                     say(
                         &mut submissions,
                         Intent::Cast {
@@ -2248,7 +2337,7 @@ fn command_input(
                 }
             }
             CmdAction::UseSlot(slot) => {
-                if own_heroes.first().is_some() {
+                if own_casters.first().is_some() {
                     say(&mut submissions, Intent::UseItem { slot });
                 }
             }
@@ -2305,12 +2394,12 @@ fn command_input(
                     // Nearest own completed town hall, else the start base.
                     let rally = all_buildings
                         .iter()
-                        .filter(|(b, t, _, under)| {
+                        .filter(|(b, t, _, under, _)| {
                             // Any rung of the hall ladder is a place to fall
                             // back to.
                             **t == Team::Human && is_hall(b.kind) && !under
                         })
-                        .map(|(_, _, tf, _)| tf.translation)
+                        .map(|(_, _, tf, _, _)| tf.translation)
                         .min_by(|a, b| {
                             dist_xz(*a, centroid)
                                 .partial_cmp(&dist_xz(*b, centroid))
@@ -2359,7 +2448,7 @@ fn command_input(
             }
             CmdAction::ToggleAutoCast => {
                 // Heroes only — a footman has nothing to auto-cast.
-                if own_heroes.is_empty() {
+                if own_casters.is_empty() {
                     continue;
                 }
                 // The card's one toggle governs the hero's FIRST ability;
@@ -2368,7 +2457,7 @@ fn command_input(
                 // the language says "slot 0", so the card and a bare bridge
                 // `autocast` are the same sentence.
                 let units: Vec<IntentId> =
-                    own_heroes.iter().map(|(e, _, _, _)| intent_id(*e)).collect();
+                    own_casters.iter().map(|(e, _, _, _)| intent_id(*e)).collect();
                 say(
                     &mut submissions,
                     Intent::Autocast {
@@ -2383,15 +2472,11 @@ fn command_input(
                 );
             }
             CmdAction::Train(kind) => {
-                // One hero per team — never let a second one be queued, and
-                // never a class the team's record doesn't name.
-                if is_hero_kind(kind) {
-                    if team_has_hero || hero_in_queue {
-                        continue;
-                    }
-                    if records.get(Team::Human).is_some_and(|r| r.kind != kind) {
-                        continue;
-                    }
+                // Hero slots: the same UX gate the card draws. intent.rs
+                // re-checks and economy.rs enforces at the pay-point; this
+                // only keeps a greyed-out button from filling the error feed.
+                if is_hero_kind(kind) && hero_train.offer(kind).is_none_or(|(.., ok)| !ok) {
+                    continue;
                 }
                 let mut iter = sel_buildings.iter();
                 let (first, second) = (iter.next(), iter.next());
@@ -2410,7 +2495,7 @@ fn command_input(
                 // is NOT allowed is queuing into scaffolding (`uc`, above).
                 let _ = upgrading;
                 let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
-                    let (g, l, _) = hero_train_cost(&records, Team::Human);
+                    let (g, l, _) = hero_train_cost(&records, Team::Human, kind);
                     (g, l)
                 } else {
                     let s = unit_stats(kind);
@@ -3852,11 +3937,17 @@ fn update_hud(
     mut texts: Query<(&Slot, &mut Text, &mut TextColor)>,
     mut nodes: Query<(&El, &mut Node)>,
     mut colors: Query<(&El, &mut BackgroundColor, Option<&Interaction>)>,
-    // Read-only view of every hero on the map (one-hero rule, card labels, and
-    // the Shop's customer + its inventory).
-    heroes: Query<(&Team, Option<&Inventory>), With<Hero>>,
-    // Read-only: which buildings the player has FINISHED (the tech gate).
-    all_buildings: Query<(&Building, &Team, Has<UnderConstruction>)>,
+    // Read-only view of every hero on the map (slot tally, card labels, and
+    // the Shop's customer + its inventory). `Unit` for the class.
+    heroes: Query<(&Team, &Unit, Option<&Inventory>), With<Hero>>,
+    // Read-only: which buildings the player has FINISHED (the tech gate), and
+    // what is in their queues (heroes in flight spend a slot).
+    all_buildings: Query<(
+        &Building,
+        &Team,
+        Has<UnderConstruction>,
+        Option<&TrainingQueue>,
+    )>,
     sel_units: Query<
         (
             Entity,
@@ -4044,7 +4135,7 @@ fn update_hud(
                     }
                     if let Some(front) = queue.queue.front() {
                         let train = if is_hero_kind(*front) {
-                            hero_train_cost(&records, Team::Human).2
+                            hero_train_cost(&records, Team::Human, *front).2
                         } else {
                             unit_stats(*front).train_time
                         }
@@ -4106,10 +4197,16 @@ fn update_hud(
         sel_units
             .iter()
             .filter(|(_, _, _, t, _, _, _, _, _, _, _, _)| **t == Team::Human)
-            .map(|(e, _, _, _, _, hero, leash, retreat, prio, autocast, _, _)| {
+            .map(|(e, u, _, _, _, _, leash, retreat, prio, autocast, _, _)| {
                 (
                     e.index(),
-                    UnitDoctrine::read(leash, retreat, prio, autocast, hero.is_some()),
+                    UnitDoctrine::read(
+                        leash,
+                        retreat,
+                        prio,
+                        autocast,
+                        !abilities_of_unit(u.kind).is_empty(),
+                    ),
                 )
             })
             .collect(),
@@ -4127,37 +4224,43 @@ fn update_hud(
     };
     let single_building = single.map(|(_, kind, done, _)| (kind, done));
 
-    // Hero commands: the ability of a selected hero (whichever class), the
-    // train/revive button on a town hall while the team is hero-less, the
-    // building's own ability, and the Shop's wares.
-    let team_hero = heroes.iter().find(|(t, _)| **t == Team::Human);
-    let team_has_hero = team_hero.is_some();
-    let hero_in_queue = sel_buildings.iter().any(|(_, _, _, t, q, _, _)| {
-        *t == Team::Human
-            && q.map(|q| q.queue.iter().any(|k| is_hero_kind(*k)))
-                .unwrap_or(false)
-    });
-    let selected_hero = sel_units
+    // Hero commands: the ability of a selected caster, one train/revive button
+    // per hero class the team's slots have room for, the building's own
+    // ability, and the Shop's wares.
+    let team_hero = heroes.iter().find(|(t, _, _)| **t == Team::Human);
+    let mut held_heroes: Vec<UnitKind> = heroes
         .iter()
-        .find(|(_, _, _, t, _, h, _, _, _, _, _, _)| **t == Team::Human && h.is_some());
+        .filter(|(t, _, _)| **t == Team::Human)
+        .map(|(_, u, _)| u.kind)
+        .collect();
+    for (_, team, _, queue) in all_buildings.iter() {
+        if *team != Team::Human {
+            continue;
+        }
+        held_heroes.extend(
+            queue
+                .into_iter()
+                .flat_map(|q| q.queue.iter().copied())
+                .filter(|k| is_hero_kind(*k)),
+        );
+    }
+    let selected_caster = sel_units.iter().find(|(_, u, _, t, ..)| {
+        **t == Team::Human && !abilities_of_unit(u.kind).is_empty()
+    });
     let hero_cmds = HeroCmds {
-        train: (!team_has_hero && !hero_in_queue).then(|| {
-            let (gold, lumber, _) = hero_train_cost(&records, Team::Human);
-            HeroTrain {
-                gold,
-                lumber,
-                recorded: records.get(Team::Human).map(|r| r.kind),
-            }
-        }),
-        abilities: selected_hero
-            .and_then(|(e, u, _, _, _, h, _, _, _, _, _, _)| {
-                let hero = h?;
-                Some(ability_slots(
+        train: Some(hero_train_state(
+            &records,
+            tiers.get(Team::Human),
+            held_heroes,
+        )),
+        abilities: selected_caster
+            .map(|(e, u, _, _, _, h, _, _, _, _, _, _)| {
+                ability_slots(
                     abilities_of_unit(u.kind),
-                    UnlockCtx::new(hero.level, tiers.get(Team::Human)),
-                    Some(hero),
+                    UnlockCtx::new(h.map_or(0, |hero| hero.level), tiers.get(Team::Human)),
+                    h,
                     cooldowns.get(e).ok(),
-                ))
+                )
             })
             .unwrap_or_default(),
         building_abilities: single
@@ -4179,21 +4282,21 @@ fn update_hud(
         }),
         shop: single.and_then(|(_, kind, done, _)| {
             (done && kind == BuildingKind::Shop).then(|| ShopState {
-                hero: team_has_hero,
+                hero: team_hero.is_some(),
                 room: team_hero
-                    .and_then(|(_, inv)| inv)
+                    .and_then(|(_, _, inv)| inv)
                     .is_some_and(|inv| inv.0.iter().any(|s| s.is_none())),
             })
         }),
-        items: selected_hero
+        items: selected_caster
             .and_then(|(_, _, _, _, _, _, _, _, _, _, inv, _)| inv.copied())
             .unwrap_or_default()
             .0,
     };
     let completed: Vec<BuildingKind> = all_buildings
         .iter()
-        .filter(|(_, t, under)| **t == Team::Human && !under)
-        .map(|(b, _, _)| b.kind)
+        .filter(|(_, t, under, _)| **t == Team::Human && !under)
+        .map(|(b, _, _, _)| b.kind)
         .collect();
     let entries = command_entries(
         own_units,

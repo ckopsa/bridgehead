@@ -446,6 +446,60 @@ fn setup_economy_assets(
         ],
     );
 
+    // --- Arcane Sanctum: narrow tower + ring + floating capstone -----------
+    // Footprint 5 like the Workshop, but the exact inverse silhouette: the
+    // Workshop is the widest low thing on the field, the Sanctum the narrowest
+    // TALL one (~6.4 to the capstone — above everything but the town hall
+    // spire). A tier-2 building has to be legible from across the map, because
+    // "they have a Sanctum" means "their army now has Slow in it" and that is
+    // information a scout must be able to bring home at a glance.
+    parts.insert(
+        BuildingKind::Sanctum,
+        vec![
+            // Stepped base.
+            Part {
+                mesh: meshes.add(Cuboid::new(4.6, 0.8, 4.6)),
+                tf: Transform::from_xyz(0.0, 0.4, 0.0),
+                mat: 0,
+            },
+            // The tower proper — an octagonal shaft, so it reads as masonry
+            // rather than another crate.
+            Part {
+                mesh: meshes.add(Cylinder::new(1.5, 4.2)),
+                tf: Transform::from_xyz(0.0, 2.9, 0.0),
+                mat: 0,
+            },
+            // Balcony ring two thirds of the way up.
+            Part {
+                mesh: meshes.add(Torus::new(0.22, 1.75)),
+                tf: Transform::from_xyz(0.0, 4.1, 0.0),
+                mat: 2,
+            },
+            // Capstone: a floating cube tipped onto a corner, hovering a hand
+            // above the shaft. Nothing else on the map is detached from the
+            // ground, which is the tell.
+            Part {
+                mesh: meshes.add(Cuboid::new(1.2, 1.2, 1.2)),
+                tf: Transform::from_xyz(0.0, 6.0, 0.0).with_rotation(
+                    Quat::from_rotation_y(std::f32::consts::FRAC_PI_4)
+                        * Quat::from_rotation_x(std::f32::consts::FRAC_PI_4),
+                ),
+                mat: 2,
+            },
+            // Two buttresses, so the shaft does not read as a lone pillar.
+            Part {
+                mesh: meshes.add(Cuboid::new(0.5, 2.6, 0.5)),
+                tf: Transform::from_xyz(1.7, 1.5, 1.7),
+                mat: 1,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(0.5, 2.6, 0.5)),
+                tf: Transform::from_xyz(-1.7, 1.5, -1.7),
+                mat: 1,
+            },
+        ],
+    );
+
     let mut team_mats: HashMap<Team, [Handle<StandardMaterial>; 3]> = HashMap::new();
     let mut wall_mats: HashMap<Team, [Handle<StandardMaterial>; 3]> = HashMap::new();
     for team in [Team::Human, Team::Claude] {
@@ -1386,6 +1440,8 @@ fn training_queues(
     nav: Res<NavGrid>,
     mut economies: ResMut<Economies>,
     records: Res<HeroRecords>,
+    // How many heroes each team may field: `hero_slots` of its live tier.
+    tiers: Res<TechTiers>,
     mut spawn_events: EventWriter<SpawnUnitEvent>,
     mut buildings: Query<
         (
@@ -1406,8 +1462,9 @@ fn training_queues(
         Without<UnderConstruction>,
     >,
     // Read-only, and heroes are units — never buildings — so this can't alias
-    // the mutable building query above.
-    living_heroes: Query<(&Team, &Health), With<Hero>>,
+    // the mutable building query above. `Unit` comes along because the rule is
+    // now per CLASS as well as per count.
+    living_heroes: Query<(&Team, &Unit, &Health), With<Hero>>,
     // Read-only view of the same buildings for the tech tree; reads never
     // conflict with the mutable queue access above.
     completed: Query<(&Building, &Team), Without<UnderConstruction>>,
@@ -1415,22 +1472,33 @@ fn training_queues(
     let dt = time.delta_secs();
     let owned = completed_kinds(&completed);
 
-    // One hero per team, counted across BOTH classes and across every training
-    // building: a team is "committed" while it fields a living hero of either
-    // class, or while some building has already PAID for a hero at its front.
-    // Without the second half, two halls could each pay for a hero in the same
-    // frame (or a Priestess could sneak in behind an in-progress Champion).
-    let mut hero_committed: Vec<Team> = living_heroes
+    // Hero slots, counted across every training building. A CLASS is
+    // "committed" to a team while it fields a living hero of that class, or
+    // while some building has already PAID for one at its queue front. Without
+    // the second half, two halls could each pay for a hero in the same frame.
+    //
+    // This replaces the old one-hero-per-team boolean with a list, because
+    // slots now scale with the hall ladder (`hero_slots`): TownHall 1, Keep 2,
+    // Castle 3. Two rules come out of the same list — the LENGTH is checked
+    // against the slot count, and MEMBERSHIP is the class lock, which no
+    // longer means "no second hero" but "no second hero of the same class".
+    let mut hero_committed: Vec<(Team, UnitKind)> = living_heroes
         .iter()
-        .filter(|(_, hp)| hp.current > 0.0)
-        .map(|(t, _)| *t)
+        .filter(|(_, _, hp)| hp.current > 0.0)
+        .map(|(t, u, _)| (*t, u.kind))
         .collect();
     for (_, _, team, _, queue, paid, _, _) in buildings.iter() {
-        let front_is_hero = queue.queue.front().is_some_and(|&k| is_hero_kind(k));
-        if front_is_hero && paid.is_some_and(|p| p.0) && !hero_committed.contains(team) {
-            hero_committed.push(*team);
+        let Some(&front) = queue.queue.front() else { continue };
+        if is_hero_kind(front) && paid.is_some_and(|p| p.0) {
+            hero_committed.push((*team, front));
         }
     }
+    let held_by = |list: &[(Team, UnitKind)], team: Team| -> Vec<UnitKind> {
+        list.iter()
+            .filter(|(t, _)| *t == team)
+            .map(|(_, k)| *k)
+            .collect()
+    };
 
     for (entity, building, team, tf, mut queue, paid, rally, upgrading) in &mut buildings {
         // Training PAUSES for the duration of an in-place upgrade. Nothing is
@@ -1455,25 +1523,20 @@ fn training_queues(
         // Heroes of either class are priced (and timed) by `hero_train_cost`:
         // full price for the team's first one, revival price afterwards.
         let (cost_gold, cost_lumber, train_time) = if is_hero_kind(front) {
-            hero_train_cost(&records, *team)
+            hero_train_cost(&records, *team, front)
         } else {
             (stats.cost_gold, stats.cost_lumber, stats.train_time)
         };
 
         if is_hero_kind(front) && !paid_front {
-            // Class lock: the first hero a team trains fixes its class for the
-            // rest of the match (the record survives death, so revival always
-            // brings back the same hero). A hero of the other class that
-            // reaches the front is dropped unpaid.
-            if records.get(*team).is_some_and(|rec| rec.kind != front) {
-                queue.queue.pop_front();
-                queue.progress = 0.0;
-                continue;
-            }
-            // One hero per team: a hero reaching the front while the team
-            // already has one (alive or in production) is dropped unpaid, so
-            // the queue keeps moving.
-            if hero_committed.contains(team) {
+            // THE hero-slot rule, asked in the one place it lives. Both
+            // refusals — a duplicate class, and a full slate — drop the item
+            // unpaid so the queue keeps moving, exactly the treatment the old
+            // one-hero rule gave it. The slot count is read from the team's
+            // LIVE tier, so losing the Keep closes the second slot for FUTURE
+            // heroes and never confiscates one already standing.
+            let held = held_by(&hero_committed, *team);
+            if hero_slot_check(&held, front, tiers.get(*team)) != HeroSlotVerdict::Ok {
                 queue.queue.pop_front();
                 queue.progress = 0.0;
                 continue;
@@ -1499,9 +1562,9 @@ fn training_queues(
             paid_front = true;
             queue.progress = 0.0;
             commands.entity(entity).try_insert(PaidFront(true));
-            if is_hero_kind(front) && !hero_committed.contains(team) {
+            if is_hero_kind(front) {
                 // Later buildings in this same pass must see the commitment.
-                hero_committed.push(*team);
+                hero_committed.push((*team, front));
             }
         }
 

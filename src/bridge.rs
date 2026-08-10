@@ -468,21 +468,44 @@ struct MeOut {
     /// 3 Castle. The one number tier-gated content is written against; the
     /// per-building `tier` field says where each hall individually sits.
     tier: u32,
-    hero_record: Option<HeroRecordOut>,
-    hero_cost: CostOut,
+    /// How many heroes you may field at once, and how many of those slots are
+    /// spoken for right now (living heroes + heroes sitting in any of your
+    /// training queues). Slots come from `tier`: **1 at TownHall, 2 at Keep,
+    /// 3 at Castle** — teching up is how you get a second hero. Heroes must be
+    /// of DISTINCT classes, so `hero_records` below tells you which classes
+    /// are already taken; with only two classes shipping today, a Castle's
+    /// third slot has nothing to put in it yet.
+    hero_slots: u32,
+    hero_slots_used: u32,
+    /// One entry per hero CLASS you have ever fielded, whether or not that
+    /// hero is currently alive. `alive` false means it is dead and revivable
+    /// at `cost` (cheaper, and it keeps `level`).
+    hero_records: Vec<HeroRecordOut>,
+    /// What each hero class would cost you to put in a queue RIGHT NOW: full
+    /// price for a class you have never fielded, revival price for one you
+    /// have. Every class is listed, including ones your slots have no room
+    /// for — `hero_slots_used` vs `hero_slots` is the gate, not this.
+    hero_costs: Vec<HeroCostOut>,
 }
 
 #[derive(Serialize)]
 struct HeroRecordOut {
+    kind: &'static str,
     level: u32,
     xp: f32,
+    /// Is this hero standing on the map right now?
+    alive: bool,
 }
 
 #[derive(Serialize)]
-struct CostOut {
+struct HeroCostOut {
+    kind: &'static str,
     gold: u32,
     lumber: u32,
     time: f32,
+    /// True when this is the (cheaper) revival price of a hero you already
+    /// opened a record for.
+    revive: bool,
 }
 
 #[derive(Serialize)]
@@ -1074,7 +1097,23 @@ fn write_seat_snapshot(
         .collect();
 
     let eco = *economies.get(me);
-    let (hero_gold, hero_lumber, hero_time) = hero_train_cost(records, me);
+    // Hero slots: the ladder decides the ceiling, and everything alive or
+    // queued spends one. Counted here rather than inferred from `hero_records`
+    // because a hero already in a training queue has no record yet and still
+    // occupies a slot — the edge case economy.rs enforces at its pay-point.
+    let my_hero_classes: Vec<UnitKind> = units
+        .iter()
+        .filter(|(_, unit, team, ..)| **team == me && is_hero_kind(unit.kind))
+        .map(|(_, unit, ..)| unit.kind)
+        .collect();
+    let queued_hero_classes: Vec<UnitKind> = buildings
+        .iter()
+        .filter(|(_, _, team, ..)| **team == me)
+        .filter_map(|(_, _, _, _, _, _, queue, ..)| queue)
+        .flat_map(|q| q.queue.iter().copied())
+        .filter(|k| is_hero_kind(*k))
+        .collect();
+    let hero_slots_used = (my_hero_classes.len() + queued_hero_classes.len()) as u32;
 
     let map = crate::terrain::active_map();
     let state = StateOut {
@@ -1102,15 +1141,33 @@ fn write_seat_snapshot(
                 .map(|k| building_tier(*k))
                 .max()
                 .unwrap_or(0),
-            hero_record: records.get(me).map(|r| HeroRecordOut {
-                level: r.level,
-                xp: r1(r.xp),
-            }),
-            hero_cost: CostOut {
-                gold: hero_gold,
-                lumber: hero_lumber,
-                time: hero_time,
-            },
+            hero_slots: hero_slots(tiers.get(me)),
+            hero_slots_used,
+            hero_records: records
+                .list(me)
+                .iter()
+                .map(|r| HeroRecordOut {
+                    kind: kind_name(r.kind),
+                    level: r.level,
+                    xp: r1(r.xp),
+                    alive: my_hero_classes.contains(&r.kind),
+                })
+                .collect(),
+            hero_costs: ALL_UNIT_KINDS
+                .iter()
+                .copied()
+                .filter(|k| is_hero_kind(*k))
+                .map(|k| {
+                    let (gold, lumber, time) = hero_train_cost(records, me, k);
+                    HeroCostOut {
+                        kind: kind_name(k),
+                        gold,
+                        lumber,
+                        time,
+                        revive: records.get(me, k).is_some(),
+                    }
+                })
+                .collect(),
         },
         map: MapOut {
             name: map.id(),

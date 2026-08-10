@@ -103,7 +103,7 @@ the schema.
 ### Abilities & items
 | Verb | Shape |
 |---|---|
-| `cast` | `{hero:id, ability?}` (alias `caster`) — hero or own ability building |
+| `cast` | `{hero:id, ability?}` (alias `caster`) — any own CASTER: hero, Sorcerer, or ability building |
 | `buy` | `{shop:id, item:"HealingPotion"}` — buyer implied by team |
 | `use_item` | `{slot:0}` |
 
@@ -113,7 +113,7 @@ the schema.
 | `priority` | `{units:[id], classes:["Hero","Siege"]}` | `classes` empty |
 | `retreat` | `{units:[id], below:0.35, x, z}` | `below` 0/absent |
 | `leash` | `{units:[id], x, z, radius:20}` | `radius` ≤ 0 |
-| `autocast` | `{units:[id], min_enemies:3, ability?}` | `min_enemies` 0/absent |
+| `autocast` | `{units:[id], min_enemies:3, ability?}` — any own caster | `min_enemies` 0/absent |
 | `squad` | `{units:[id], id:1}` | `id` absent |
 | `posture` | `{id:1, posture:{type:"defend"\|"push"\|"escort"\|"forage", …}}` | `posture` absent |
 | `template` | `{building:id, squad, retreat, priority, autocast}` | all pieces absent |
@@ -130,6 +130,13 @@ the schema.
 wire: a bare `2` is a slot index, a bare `"Slam"` is an ability id
 (case-insensitive). Omit it and you get the caster's first unlocked ability —
 so `{"type":"cast","hero":123}` means exactly what it always meant.
+
+**A caster is anything with an ability list**, not a hero. `cast` always asked
+`abilities_of_unit(kind)` rather than "does it carry a `Hero` component", so the
+Sorcerer needed no work there; `autocast` did test for a hero, and now asks the
+same question `cast` does. The consequence is that a unit with no mana and no
+level is a first-class caster on both seats: the human's `[T]` toggle and a
+commander's `autocast` command land on the identical `AutoCastPolicy`.
 
 There is one type for all three jobs: `shared::AbilitySelector` is the intent
 field, the `CastAbility` event payload and the wire form. A slot cannot be

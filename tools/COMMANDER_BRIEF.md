@@ -28,7 +28,9 @@ Unit orders (ids from state):
 - `{"type":"return","units":[worker_ids]}`  `{"type":"stop","units":[ids]}`  `{"type":"follow","units":[ids],"target":own_id}`
 Production:
 - `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free; you pay on placement)
-- `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"}` (queue cap 7)
+- `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"|...}` (queue cap 7;
+  full roster in `catalog.json`). A `train` of a hero is rejected with a reason when your slots
+  are full or you already hold that class.
 - `{"type":"cancel","building":id,"index":n}`  `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}`
 - `{"type":"cast","hero":id}` — cast the caster's first available ability (heroes: their class
   ability; a TownHall id works too: CallToArms turns nearby workers into fighters for 40s,
@@ -44,7 +46,8 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
   Hero (both hero types), Archer, Footman, Worker, Building, Siege (catapults), Cavalry (raiders).
 - `{"type":"retreat","units":[ids],"below":0.35,"x":..,"z":..}` — auto fall-back when hurt
 - `{"type":"leash","units":[ids],"x":..,"z":..,"radius":20}` — never chase/fight beyond anchor (radius 0 clears)
-- `{"type":"autocast","units":[hero_id],"min_enemies":3}` — hero slams automatically. Add
+- `{"type":"autocast","units":[caster_ids],"min_enemies":3}` — any CASTER fires on its own
+  (heroes and Sorcerers alike; Sorcerers are born with Slow on autocast at 1 enemy). Add
   `"ability":<index|"Name">` to govern a specific ability; each one keeps its own trigger, and
   `min_enemies:0` clears just that rule.
 - `{"type":"squad","units":[ids],"id":1}` then `{"type":"posture","id":1,"posture":{"type":"defend","x":..,"z":..,"radius":18}}`
@@ -108,12 +111,26 @@ currently satisfy (e.g. Towers need a Barracks first).
   the map itself forces a decision. Ceding the middle
   cedes an economy. After the mines die, bounties are the only income on the map.
 - Supply-block = production stalls: build Farms BEFORE you hit the cap.
-- Your Hero levels from ANY nearby enemy deaths, +HP/+damage per level. THE key unit — keep it
-  alive (retreat policy!), keep it near fights (XP), revive it fast when it dies (keeps its level).
-- **Choose your hero class at first training** (see catalog: units with abilities). Your team's
-  class locks in — revival always restores the class you chose. Choose for your gameplan.
+- Your heroes level from ANY nearby enemy deaths, +HP/+damage per level. THE key units — keep
+  them alive (retreat policy!), near fights (XP), and revive fast when one dies (keeps its
+  level, per class). Two heroes at Keep means two retreat policies and two autocast rules.
+- **HERO SLOTS SCALE WITH YOUR HALL TIER: TownHall 1, Keep 2, Castle 3.** A second hero is
+  one of the two concrete things teching to a Keep buys you (the other is the Arcane Sanctum).
+  Heroes must be of **distinct classes** — Champion *and* Priestess is legal, two Champions
+  never is. Read `me.hero_slots` / `me.hero_slots_used` in the snapshot before you train:
+  used counts living heroes **plus any hero already sitting in a queue**. `me.hero_records`
+  lists every class you have ever fielded (with `alive`), and `me.hero_costs` prices each
+  class — full freight for a class you have never played, the cheap revival price for one you
+  have, per class and never discounted by the other. Only two classes ship today, so a
+  Castle's third slot currently has nothing to put in it.
 - Counter triangle: fortifications stop armies, siege outranges fortifications, fast cavalry
   dives siege. Check catalog `vs_*` multipliers.
+- **Crowd control (tier 2).** An **Arcane Sanctum** (requires a Keep) trains **Sorcerers**:
+  fragile, barely fight, and auto-cast **Slow** — -40% move AND attack speed on every enemy
+  within 8 of the caster, 5s, 9s cooldown, no mana. It is the answer to a Raider or Knight
+  charge (a slowed Raider is slower than a Footman) and the way you cover a retreat. Slow
+  **refreshes rather than stacks**, so 2-3 Sorcerers buy frontage, not depth — a wall of them
+  is wasted supply. Keep them behind the line; anything that reaches one kills it.
 - Ranged units/towers outrange melee; footmen tank; workers fight terribly.
 - Towers shoot at enemy units in range on their own; Walls just block pathing and soak hits.
   Defense is a real strategy — and SIEGE is its counter: check the catalog for what outranges towers.

@@ -197,6 +197,7 @@ fn apply_intents(
     time: Res<Time>,
     economies: Res<Economies>,
     records: Res<HeroRecords>,
+    tiers: Res<TechTiers>,
     nav: Res<NavGrid>,
     fog: Res<FogGrids>,
     mut squad_orders: ResMut<SquadOrders>,
@@ -223,6 +224,8 @@ fn apply_intents(
             &mut ai_controlled,
             &economies,
             &records,
+            // The issuing team's tech tier: what hero slots it has open.
+            tiers.get(submission.team),
             &nav,
             // The issuer's own fog: what *they* can see decides what they may
             // order, and neither seat gets to borrow the other's eyes.
@@ -261,6 +264,7 @@ fn compile_intent(
     ai_controlled: &mut AiControlled,
     economies: &Economies,
     records: &HeroRecords,
+    tier: TechTier,
     nav: &NavGrid,
     fog: &FogGrid,
     squad_orders: &mut SquadOrders,
@@ -502,6 +506,49 @@ fn compile_intent(
                 errors.push(err);
                 return;
             }
+            // Hero slots. economy.rs is the authoritative gate (it enforces
+            // at the pay-point, where the money and the race conditions are);
+            // this is the same rule stated early so a seat gets an error
+            // string back instead of watching the item vanish unpaid off the
+            // front of its queue three seconds later.
+            //
+            // The count is living heroes PLUS every hero already sitting in
+            // any of this team's queues — the edge case that makes this worth
+            // writing at all: two halls each queuing a Priestess, or one hall
+            // queuing three Champions, are both "in flight" and neither is
+            // alive yet.
+            if is_hero_kind(kind) {
+                let mut held: Vec<UnitKind> = units
+                    .iter()
+                    .filter(|(_, u, t, _, _)| **t == me && is_hero_kind(u.kind))
+                    .map(|(_, u, _, _, _)| u.kind)
+                    .collect();
+                for (_, b_team, _, b_queue, _) in buildings.iter() {
+                    if *b_team != me {
+                        continue;
+                    }
+                    let Some(b_queue) = b_queue else { continue };
+                    held.extend(b_queue.queue.iter().copied().filter(|k| is_hero_kind(*k)));
+                }
+                match hero_slot_check(&held, kind, tier) {
+                    HeroSlotVerdict::Ok => {}
+                    HeroSlotVerdict::DuplicateClass => {
+                        errors.push(format!(
+                            "{tag}: {} already fielded or queued (heroes are one per class)",
+                            kind_name(kind)
+                        ));
+                        return;
+                    }
+                    HeroSlotVerdict::NoSlot { used, slots } => {
+                        errors.push(format!(
+                            "{tag}: hero slots full ({used}/{slots} at tier {}) — \
+                             upgrade a hall for another",
+                            tier.level()
+                        ));
+                        return;
+                    }
+                }
+            }
             let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
@@ -539,7 +586,7 @@ fn compile_intent(
             // full price (or worse, a first hero cheaply) depending on the
             // record. `is_hero_kind` is the same test economy.rs charges by.
             let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
-                let (g, l, _) = hero_train_cost(records, me);
+                let (g, l, _) = hero_train_cost(records, me, kind);
                 (g, l)
             } else {
                 let s = unit_stats(kind);
@@ -857,18 +904,21 @@ fn compile_intent(
         } => {
             let min_enemies = min_enemies.unwrap_or(0);
             for (entity, _) in own_units(&ids, units, me, tag, errors) {
-                // Any hero class can auto-cast; nothing else has an ability.
+                // Any CASTER can auto-cast — heroes were merely the only ones
+                // that existed when this verb was written. The gate is "does
+                // this kind have an ability list", which is the same question
+                // `Intent::Cast` already asks.
                 let Ok((_, unit, _, _, policy)) = units.get(entity) else {
                     continue;
                 };
-                if !is_hero_kind(unit.kind) {
+                let list = abilities_of_unit(unit.kind);
+                if list.is_empty() {
                     errors.push(format!(
-                        "{tag}: unit {} is not a hero",
+                        "{tag}: unit {} has no abilities",
                         entity.to_bits()
                     ));
                     continue;
                 }
-                let list = abilities_of_unit(unit.kind);
                 let slot = match &ability {
                     None => 0,
                     Some(reference) => match ability_slot(reference, list) {
