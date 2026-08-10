@@ -80,13 +80,15 @@ pub fn asset_score(
             s.cost_gold + s.cost_lumber
         })
         .sum();
-    let building_value: u32 = buildings
+    // `building_value`, not `building_stats`, so a Keep counts as the hall
+    // plus everything paid to raise it — upgrading is investment, not spending.
+    let building_worth: u32 = buildings
         .map(|k| {
-            let s = building_stats(k);
-            s.cost_gold + s.cost_lumber
+            let (gold, lumber) = building_value(k);
+            gold + lumber
         })
         .sum();
-    unit_value + building_value + economy.gold + economy.lumber
+    unit_value + building_worth + economy.gold + economy.lumber
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +142,9 @@ pub enum UnitKind {
     /// The second hero class: ranged, heals allies instead of slamming enemies.
     /// Carries a `Hero` component like the Champion; one hero per team total.
     Priestess,
+    /// Anti-cavalry line infantry: cheap, slow, and feeble against everything
+    /// except a horse, which it deletes. The tier-1 answer to Raiders.
+    Spearman,
 }
 
 /// Hero-class unit kinds (carry the `Hero` component, count against the
@@ -161,9 +166,15 @@ pub enum BuildingKind {
     Workshop,
     /// Item vendor: heroes buy consumables here.
     Shop,
+    /// Tier 2 of the town hall ladder. Never placed — a TownHall upgrades into
+    /// one in place (see `building_upgrades_to`). Trains everything the hall
+    /// trained, and is the tech gate future tier-2 content names.
+    Keep,
+    /// Tier 3 of the town hall ladder, upgraded from a Keep.
+    Castle,
 }
 
-pub const ALL_UNIT_KINDS: [UnitKind; 7] = [
+pub const ALL_UNIT_KINDS: [UnitKind; 8] = [
     UnitKind::Worker,
     UnitKind::Footman,
     UnitKind::Archer,
@@ -171,8 +182,9 @@ pub const ALL_UNIT_KINDS: [UnitKind; 7] = [
     UnitKind::Catapult,
     UnitKind::Raider,
     UnitKind::Priestess,
+    UnitKind::Spearman,
 ];
-pub const ALL_BUILDING_KINDS: [BuildingKind; 7] = [
+pub const ALL_BUILDING_KINDS: [BuildingKind; 9] = [
     BuildingKind::TownHall,
     BuildingKind::Barracks,
     BuildingKind::Farm,
@@ -180,6 +192,8 @@ pub const ALL_BUILDING_KINDS: [BuildingKind; 7] = [
     BuildingKind::Wall,
     BuildingKind::Workshop,
     BuildingKind::Shop,
+    BuildingKind::Keep,
+    BuildingKind::Castle,
 ];
 
 pub struct UnitStats {
@@ -203,6 +217,11 @@ pub struct UnitStats {
     pub vs_building_mult: f32,
     /// Damage multiplier against Catapults (cavalry's anti-siege role).
     pub vs_siege_mult: f32,
+    /// Damage multiplier against `TargetClass::Cavalry` (the Spearman's
+    /// anti-cavalry role). Large on purpose: a spear line is the only thing a
+    /// 90g tier-1 unit can do to a 170g Raider, and without it nothing a team
+    /// can build before a Workshop answers cavalry at all.
+    pub vs_cavalry_mult: f32,
 
     // --- movement plane & attack envelope ---------------------------------
     /// Airborne: ignores the `NavGrid` entirely (straight-line paths over
@@ -263,13 +282,13 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Worker => UnitStats {
             cost_gold: 75, cost_lumber: 0, supply: 1, hp: 60.0, damage: 5.0,
             range: 1.8, attack_cooldown: 1.5, speed: 8.0, train_time: 8.0, projectile: false,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         UnitKind::Footman => UnitStats {
             cost_gold: 135, cost_lumber: 0, supply: 2, hp: 140.0, damage: 12.0,
             range: 2.0, attack_cooldown: 1.2, speed: 7.0, train_time: 12.0, projectile: false,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // The line's anti-air: a footman screen is helpless overhead, archers
@@ -277,7 +296,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Archer => UnitStats {
             cost_gold: 90, cost_lumber: 30, supply: 2, hp: 70.0, damage: 14.0,
             range: 14.0, attack_cooldown: 1.5, speed: 7.0, train_time: 12.0, projectile: true,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: true, can_hit_ground: true,
         },
         // Base (level 1) stats; damage/HP grow per level — see `Hero`.
@@ -287,7 +306,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Hero => UnitStats {
             cost_gold: 400, cost_lumber: 100, supply: 5, hp: 320.0, damage: 24.0,
             range: 2.4, attack_cooldown: 1.1, speed: 7.5, train_time: 25.0, projectile: false,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Outranges towers (20 vs 16) and pulverizes structures, but 15 damage
@@ -297,7 +316,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Catapult => UnitStats {
             cost_gold: 180, cost_lumber: 120, supply: 3, hp: 110.0, damage: 15.0,
             range: 20.0, attack_cooldown: 3.0, speed: 4.5, train_time: 22.0, projectile: true,
-            vs_building_mult: 6.0, vs_siege_mult: 1.0,
+            vs_building_mult: 6.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Speed is the weapon: dives catapults (2x) and worker lines, melts
@@ -305,7 +324,7 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Raider => UnitStats {
             cost_gold: 170, cost_lumber: 30, supply: 3, hp: 130.0, damage: 16.0,
             range: 2.2, attack_cooldown: 1.1, speed: 10.5, train_time: 16.0, projectile: false,
-            vs_building_mult: 1.0, vs_siege_mult: 2.0,
+            vs_building_mult: 1.0, vs_siege_mult: 2.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Ranged support hero: heals instead of slams. Base (level 1) stats.
@@ -314,8 +333,26 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
         UnitKind::Priestess => UnitStats {
             cost_gold: 400, cost_lumber: 100, supply: 5, hp: 240.0, damage: 14.0,
             range: 10.0, attack_cooldown: 1.4, speed: 7.5, train_time: 25.0, projectile: true,
-            vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: false, can_hit_air: true, can_hit_ground: true,
+        },
+        // The counter-triangle's missing third leg. Before this, a team that
+        // met Raiders had nothing at tier 1 to answer them: Footmen are too
+        // slow to catch cavalry and too expensive to trade with it, Archers
+        // die to it. So the Spearman is deliberately BAD at everything else —
+        // 6 damage on a 1.7s thrust is the worst dps in the game, and a
+        // Footman beats one in a straight duel without dropping below half —
+        // and it buys that weakness back at 5x against a horse. What it is
+        // always worth is meat: 160 hp for 90 gold is the cheapest hit points
+        // on the field, so a spear line in front of archers is a real
+        // formation even in a match where the enemy never builds cavalry.
+        // Slow (5.5) so it can screen but never chase; the counter is a wall
+        // you walk cavalry into, not a hunter.
+        UnitKind::Spearman => UnitStats {
+            cost_gold: 90, cost_lumber: 0, supply: 2, hp: 160.0, damage: 6.0,
+            range: 2.6, attack_cooldown: 1.7, speed: 5.5, train_time: 10.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 5.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
         },
     }
 }
@@ -378,7 +415,151 @@ pub fn building_stats(kind: BuildingKind) -> BuildingStats {
             cost_gold: 75, cost_lumber: 60, hp: 400.0, build_time: 15.0,
             supply_provided: 0, size: 4.0, attack: None,
         },
+        // Tier 2/3 halls. `cost_*` and `build_time` are the price and duration
+        // of the UPGRADE STEP that produces them, not of a placement — these
+        // kinds are unplaceable (`building_placeable`), so there is no other
+        // reading, and `upgrade_cost` derives straight from this table.
+        // Footprint stays 8.0 all the way up: an upgrade must never need room
+        // the original hall did not already occupy, or a tightly packed base
+        // could not tier up at all. HP is the visible reward for the money.
+        BuildingKind::Keep => BuildingStats {
+            cost_gold: 320, cost_lumber: 160, hp: 1700.0, build_time: 40.0,
+            supply_provided: 10, size: 8.0, attack: None,
+        },
+        BuildingKind::Castle => BuildingStats {
+            cost_gold: 480, cost_lumber: 240, hp: 2200.0, build_time: 50.0,
+            supply_provided: 10, size: 8.0, attack: None,
+        },
     }
+}
+
+// ---------------------------------------------------------------------------
+// The upgrade ladder
+// ---------------------------------------------------------------------------
+//
+// A building can convert IN PLACE into the next kind up its ladder: same
+// entity, same position, same footprint, bigger body, bigger HP pool. Today
+// the only ladder is TownHall -> Keep -> Castle, but nothing below names those
+// kinds directly: the ladder is data (`building_upgrades_to`), the tier is
+// derived from it, and requirement satisfaction is a tier COMPARISON rather
+// than kind equality — so a Castle satisfies "requires Keep" for free, and a
+// second ladder added later works without touching a single consumer.
+
+/// The kind this one upgrades into, and the sole definition of the ladder.
+pub fn building_upgrades_to(kind: BuildingKind) -> Option<BuildingKind> {
+    match kind {
+        BuildingKind::TownHall => Some(BuildingKind::Keep),
+        BuildingKind::Keep => Some(BuildingKind::Castle),
+        _ => None,
+    }
+}
+
+/// The inverse of `building_upgrades_to`.
+pub fn building_upgraded_from(kind: BuildingKind) -> Option<BuildingKind> {
+    ALL_BUILDING_KINDS
+        .into_iter()
+        .find(|k| building_upgrades_to(*k) == Some(kind))
+}
+
+/// Gold, lumber and seconds to convert `kind` into its next tier. `None` for
+/// anything at the top of its ladder (or not on one). The numbers live in
+/// `building_stats` of the RESULT, so there is exactly one cost table.
+pub fn upgrade_cost(kind: BuildingKind) -> Option<(u32, u32, f32)> {
+    building_upgrades_to(kind).map(|to| {
+        let s = building_stats(to);
+        (s.cost_gold, s.cost_lumber, s.build_time)
+    })
+}
+
+/// The tier-1 kind at the bottom of this kind's ladder (itself, for the
+/// overwhelming majority that are not on one).
+pub fn upgrade_root(kind: BuildingKind) -> BuildingKind {
+    let mut current = kind;
+    // The ladder is short and acyclic; the bound is pure paranoia.
+    for _ in 0..ALL_BUILDING_KINDS.len() {
+        match building_upgraded_from(current) {
+            Some(prev) => current = prev,
+            None => break,
+        }
+    }
+    current
+}
+
+/// 1 for a base building, 2 and 3 for the rungs above it. This is the number
+/// tier-gated content is written against ("requires tier 2") and the number
+/// the catalog and every snapshot report.
+pub fn building_tier(kind: BuildingKind) -> u32 {
+    let mut tier = 1;
+    let mut current = kind;
+    for _ in 0..ALL_BUILDING_KINDS.len() {
+        match building_upgraded_from(current) {
+            Some(prev) => {
+                tier += 1;
+                current = prev;
+            }
+            None => break,
+        }
+    }
+    tier
+}
+
+/// Can a worker place this kind directly? False for everything reachable only
+/// by upgrading, which is what keeps a Keep out of the build menu, out of the
+/// `build` bridge command, and out of the AI's build order.
+pub fn building_placeable(kind: BuildingKind) -> bool {
+    building_upgraded_from(kind).is_none()
+}
+
+/// Is a standing `owned` building enough to satisfy a requirement naming
+/// `req`? Same ladder and at least as high answers yes — so "requires Keep" is
+/// met by a Keep OR a Castle, and a team is never punished for teching up.
+pub fn building_satisfies(owned: BuildingKind, req: BuildingKind) -> bool {
+    upgrade_root(owned) == upgrade_root(req) && building_tier(owned) >= building_tier(req)
+}
+
+/// Everything on the town hall ladder. The one question the drop-off logic,
+/// Town Portal, rally fallbacks and the AI's base bookkeeping actually mean
+/// when they used to ask `kind == TownHall`.
+pub fn is_hall(kind: BuildingKind) -> bool {
+    upgrade_root(kind) == BuildingKind::TownHall
+}
+
+/// Total resources sunk into a building including every upgrade below it — a
+/// Keep is a TownHall *plus* its upgrade. Used by `asset_score`, so teching up
+/// can never lower a team's material worth.
+pub fn building_value(kind: BuildingKind) -> (u32, u32) {
+    let mut gold = 0;
+    let mut lumber = 0;
+    let mut current = Some(kind);
+    for _ in 0..ALL_BUILDING_KINDS.len() {
+        let Some(k) = current else { break };
+        let s = building_stats(k);
+        gold += s.cost_gold;
+        lumber += s.cost_lumber;
+        current = building_upgraded_from(k);
+    }
+    (gold, lumber)
+}
+
+/// A building converting in place. economy.rs inserts it (after taking the
+/// money), ticks it down, and swaps `Building.kind` when it hits zero. While
+/// it is present the building keeps its supply and its training QUEUE, but
+/// trains nothing — the workforce is busy on the scaffolding.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Upgrading {
+    /// What it becomes on completion.
+    pub to: BuildingKind,
+    pub remaining: f32,
+    /// The full duration, so a renderer can show a progress fraction.
+    pub total: f32,
+}
+
+/// Ask a building to start upgrading. Written by ui.rs, bridge.rs and ai.rs;
+/// economy.rs validates (ours, finished, has a next tier, not already
+/// upgrading) and pays — the same division of labour as `Order::Build`.
+#[derive(Event, Debug)]
+pub struct UpgradeBuilding {
+    pub building: Entity,
 }
 
 /// Tech requirements: completed buildings a team must own before this
@@ -404,11 +585,16 @@ pub fn unit_requires(kind: UnitKind) -> &'static [BuildingKind] {
 
 /// Does `team` satisfy `reqs` right now? Pass an iterator over the team's
 /// COMPLETED building kinds.
+///
+/// Satisfaction is `building_satisfies`, not equality: a requirement naming a
+/// tier is met by that tier or anything above it on the same ladder. A team
+/// that upgraded its Keep into a Castle keeps everything the Keep unlocked.
 pub fn requirements_met(
     reqs: &[BuildingKind],
     completed: impl Iterator<Item = BuildingKind> + Clone,
 ) -> bool {
-    reqs.iter().all(|r| completed.clone().any(|b| b == *r))
+    reqs.iter()
+        .all(|r| completed.clone().any(|b| building_satisfies(b, *r)))
 }
 
 // ---------------------------------------------------------------------------
@@ -419,9 +605,8 @@ pub fn requirements_met(
 /// last; the tier exists now because ability unlocks (`AbilityUnlock::TeamTier`)
 /// and future upgrades need ONE thing to ask, and a predicate that reads a
 /// stub is a predicate that never has to be rewritten.
-// T2/T3 are unreachable until the TownHall -> Keep -> Castle bead lands; the
-// ladder is declared now so `AbilityUnlock::TeamTier` has something to name.
-#[allow(dead_code)]
+/// A team's position on the tech ladder, as `AbilityUnlock::TeamTier` and any
+/// future tier-gated content name it. Ordered, so "at least T2" is a `>=`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub enum TechTier {
     #[default]
@@ -438,7 +623,8 @@ impl TechTier {
             TechTier::T3 => "T3",
         }
     }
-    /// Numeric rung, for HUD captions and snapshot fields once tiers exist.
+    /// Numeric rung, for HUD captions and snapshot fields. `building_tier`
+    /// answers the same question about a single building.
     #[allow(dead_code)]
     pub fn level(self) -> u32 {
         match self {
@@ -447,18 +633,34 @@ impl TechTier {
             TechTier::T3 => 3,
         }
     }
+    /// The inverse: `building_tier` speaks in numbers, unlock predicates speak
+    /// in tiers. Anything above the ladder's top clamps to T3.
+    pub fn from_level(level: u32) -> TechTier {
+        match level {
+            0 | 1 => TechTier::T1,
+            2 => TechTier::T2,
+            _ => TechTier::T3,
+        }
+    }
 }
 
-/// **INTEGRATION POINT — TownHall → Keep → Castle.**
-///
 /// The single function that decides a team's tier from its COMPLETED
-/// buildings. It returns `T1` unconditionally today. The tiers bead should
-/// replace this body (a completed Keep → `T2`, a completed Castle → `T3`) and
-/// change nothing else: `recount_tech_tiers` already feeds the `TechTiers`
-/// resource from here every frame, and every unlock predicate in the game
-/// reads that resource.
-pub fn tech_tier_for(_completed: impl Iterator<Item = BuildingKind>) -> TechTier {
-    TechTier::T1
+/// buildings: the highest rung it holds on the town-hall ladder. A Keep makes
+/// a team T2, a Castle T3, and losing the Keep drops it back — tier is a
+/// property of what is standing, never a latch.
+///
+/// Derived, not enumerated: `is_hall` + `building_tier` mean a fourth rung, or
+/// a second ladder promoted to count, changes this by changing the ladder data
+/// and nothing here. `recount_tech_tiers` feeds the `TechTiers` resource from
+/// here every frame, and every unlock predicate in the game reads that
+/// resource — so this is the only place tier is decided.
+pub fn tech_tier_for(completed: impl Iterator<Item = BuildingKind>) -> TechTier {
+    let best = completed
+        .filter(|kind| is_hall(*kind))
+        .map(building_tier)
+        .max()
+        .unwrap_or(1);
+    TechTier::from_level(best)
 }
 
 /// Per-team tech tier, recomputed from the world every frame (like supply) so
@@ -487,8 +689,21 @@ impl TechTiers {
 /// What each building can train.
 pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
     match kind {
-        BuildingKind::TownHall => &[UnitKind::Worker, UnitKind::Hero, UnitKind::Priestess],
-        BuildingKind::Barracks => &[UnitKind::Footman, UnitKind::Archer, UnitKind::Raider],
+        // The whole hall ladder trains the same roster: an upgraded hall is
+        // still the hall. This is also what keeps a Keep counting as a
+        // PRODUCTION building for the win condition — see `check_game_over`.
+        BuildingKind::TownHall | BuildingKind::Keep | BuildingKind::Castle => {
+            &[UnitKind::Worker, UnitKind::Hero, UnitKind::Priestess]
+        }
+        // Spearman is appended rather than slotted next to the Footman on
+        // purpose: production hotkeys are positional, and moving Archer off W
+        // to make room would retrain every existing pair of hands.
+        BuildingKind::Barracks => &[
+            UnitKind::Footman,
+            UnitKind::Archer,
+            UnitKind::Raider,
+            UnitKind::Spearman,
+        ],
         BuildingKind::Workshop => &[UnitKind::Catapult],
         BuildingKind::Farm | BuildingKind::Tower | BuildingKind::Wall | BuildingKind::Shop => &[],
     }
@@ -512,6 +727,7 @@ pub fn kind_name(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Catapult",
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
+        UnitKind::Spearman => "Spearman",
     }
 }
 
@@ -524,6 +740,8 @@ pub fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Wall",
         BuildingKind::Workshop => "Workshop",
         BuildingKind::Shop => "Shop",
+        BuildingKind::Keep => "Keep",
+        BuildingKind::Castle => "Castle",
     }
 }
 
@@ -536,13 +754,23 @@ pub fn unit_description(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it.",
         UnitKind::Raider => "Fast cavalry: 2x damage vs Catapults, excels at worker raids and map control. Melts under massed fire.",
         UnitKind::Priestess => "Support hero: ranged attack, Heal ability (AoE ally healing). One hero per team; revival preserves level and class.",
+        UnitKind::Spearman => "Cheap anti-cavalry line: 5x damage vs Raiders, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
     }
 }
 
 pub fn building_description(kind: BuildingKind) -> &'static str {
     match kind {
-        BuildingKind::TownHall => "Resource drop-off. Trains Workers and the Hero.",
-        BuildingKind::Barracks => "Trains Footmen and Archers.",
+        BuildingKind::TownHall => {
+            "Tier 1 hall. Resource drop-off. Trains Workers and the Hero. Upgrades to a Keep."
+        }
+        BuildingKind::Keep => {
+            "Tier 2 hall: everything the TownHall was, with a deeper HP pool. \
+             Satisfies tier-1 requirements and unlocks tier-2 content. Upgrades to a Castle."
+        }
+        BuildingKind::Castle => {
+            "Tier 3 hall: the top of the ladder. Satisfies every hall requirement below it."
+        }
+        BuildingKind::Barracks => "Trains Footmen, Archers and Spearmen (and Raiders, once a Workshop stands).",
         BuildingKind::Farm => "+6 supply. Build ahead of the cap or production stalls.",
         BuildingKind::Tower => "Static defense: shoots arrows at enemies in range.",
         BuildingKind::Wall => "Cheap blocking segment. No function except HP in the way.",
@@ -581,12 +809,30 @@ pub struct CatalogAttack {
     pub can_hit_air: bool,
 }
 
+/// One rung of an upgrade ladder, as it appears on the lower rung's catalog
+/// entry. Everything needed to plan a tier-up is here: what you get, what it
+/// costs, and how long the building is busy becoming it.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogUpgrade {
+    /// Catalog id of the resulting building.
+    pub to: &'static str,
+    pub cost_gold: u32,
+    pub cost_lumber: u32,
+    /// Seconds of in-place conversion. Training pauses for exactly this long.
+    pub upgrade_time: f32,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct CatalogBuilding {
     pub id: &'static str,
+    /// For a placeable building, the price a worker pays to put it down. For an
+    /// upgrade-only building (`placeable: false`) this is the price of the
+    /// upgrade step that produces it — the same numbers as the lower rung's
+    /// `upgrades_to`.
     pub cost_gold: u32,
     pub cost_lumber: u32,
     pub hp: f32,
+    /// Seconds to construct — or, for an upgrade-only kind, to convert into.
     pub build_time: f32,
     pub supply_provided: u32,
     pub size: f32,
@@ -594,6 +840,18 @@ pub struct CatalogBuilding {
     pub built_by: &'static str,
     pub requires: Vec<&'static str>,
     pub trains: Vec<&'static str>,
+    /// Rung on this building's upgrade ladder: 1 for everything that is not
+    /// upgraded from something else. A requirement naming a tier is satisfied
+    /// by that tier OR ANY HIGHER one on the same ladder, so "requires Keep"
+    /// is also met by a Castle.
+    pub tier: u32,
+    /// False for kinds that exist only as the result of an upgrade — they have
+    /// no build button, no `build` command, and no place in a build order.
+    pub placeable: bool,
+    /// The next rung up, or null at the top of the ladder.
+    pub upgrades_to: Option<CatalogUpgrade>,
+    /// Catalog id of the rung below, or null for a base building.
+    pub upgraded_from: Option<&'static str>,
     pub description: &'static str,
 }
 
@@ -710,9 +968,20 @@ pub fn game_catalog() -> Catalog {
                         cooldown: a.cooldown,
                         can_hit_air: a.can_hit_air,
                     }),
-                    built_by: "Worker",
+                    built_by: if building_placeable(k) { "Worker" } else { "Upgrade" },
                     requires: building_requires(k).iter().map(|b| building_name(*b)).collect(),
                     trains: trainable(k).iter().map(|u| kind_name(*u)).collect(),
+                    tier: building_tier(k),
+                    placeable: building_placeable(k),
+                    upgrades_to: upgrade_cost(k).map(|(gold, lumber, time)| CatalogUpgrade {
+                        to: building_name(
+                            building_upgrades_to(k).expect("upgrade_cost implies a next tier"),
+                        ),
+                        cost_gold: gold,
+                        cost_lumber: lumber,
+                        upgrade_time: time,
+                    }),
+                    upgraded_from: building_upgraded_from(k).map(building_name),
                     description: building_description(k),
                 }
             })
@@ -1352,8 +1621,8 @@ impl AbilityEffect {
 }
 
 /// When an ability becomes castable.
-// TeamTier waits on the tiers bead; the predicate exists so it will be a data
-// change, not a code change.
+// `HeroLevel` has no shipping ability behind it yet — the hero ultimates bead
+// is what fills it in; the predicate and its tests exist so that bead is data.
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AbilityUnlock {
@@ -1447,8 +1716,11 @@ const PROBE_CHILL: AbilityDef = AbilityDef {
     power: 0.4,
     duration: 6.0,
     hits_air: false,
-    unlock: AbilityUnlock::HeroLevel(1),
-    description: "Dev probe: slows enemies around the Champion by 40% for 6s.",
+    // Gated on the TEAM TIER on purpose: this is the live test of the join
+    // between the ability framework and the hall ladder. It is locked while a
+    // team has only a TownHall and opens the moment its Keep finishes.
+    unlock: AbilityUnlock::TeamTier(TechTier::T2),
+    description: "Dev probe: slows enemies around the Champion by 40% for 6s. Requires tier 2.",
 };
 
 const NO_ABILITIES: [AbilityDef; 0] = [];
@@ -1482,9 +1754,13 @@ pub fn abilities_of_unit(kind: UnitKind) -> &'static [AbilityDef] {
 
 /// Every ability this building kind can ever cast, in slot order.
 pub fn abilities_of_building(kind: BuildingKind) -> &'static [AbilityDef] {
-    match kind {
-        BuildingKind::TownHall => &TOWNHALL_ABILITIES,
-        _ => &NO_ABILITIES,
+    // The whole hall ladder keeps Call to Arms: an upgrade must never take an
+    // ability away from the player who paid for it. Asked as `is_hall` rather
+    // than by naming the three kinds, so a fourth rung inherits it for free.
+    if is_hall(kind) {
+        &TOWNHALL_ABILITIES
+    } else {
+        &NO_ABILITIES
     }
 }
 
@@ -1811,7 +2087,10 @@ impl TargetClass {
             // Both hero classes are "Hero" for targeting purposes.
             (Some(UnitKind::Hero) | Some(UnitKind::Priestess), _) => Some(TargetClass::Hero),
             (Some(UnitKind::Archer), _) => Some(TargetClass::Archer),
-            (Some(UnitKind::Footman), _) => Some(TargetClass::Footman),
+            // The Spearman answers to "Footman" for targeting purposes: the
+            // class is the melee line, and a doctrine that says "focus the
+            // front rank" means the front rank, whatever it is holding.
+            (Some(UnitKind::Footman) | Some(UnitKind::Spearman), _) => Some(TargetClass::Footman),
             (Some(UnitKind::Worker), _) => Some(TargetClass::Worker),
             (Some(UnitKind::Catapult), _) => Some(TargetClass::Siege),
             (Some(UnitKind::Raider), _) => Some(TargetClass::Cavalry),
@@ -2316,6 +2595,7 @@ impl Plugin for CorePlugin {
             .add_event::<BuyItem>()
             .add_event::<UseItem>()
             .add_event::<TeleportRequest>()
+            .add_event::<UpgradeBuilding>()
             .add_systems(Startup, (initial_spawns, apply_env_speed))
             .add_systems(
                 Update,
@@ -2564,32 +2844,60 @@ fn recount_tech_tiers(
 /// through the public `StatusEffects::apply` path and logs the unit's
 /// effective move speed as the debuff lands, while it holds, and after the
 /// central expiry has cleared it. Combined with the Champion's probe-only
-/// second ability (`ProbeChill`), one headless run demonstrates the whole
-/// chain: ability list → selector → per-ability cooldown → `ApplyStatus` →
-/// `effective_stats` → central expiry.
+/// second ability (`ProbeChill`, gated on tier 2), one headless run
+/// demonstrates the whole chain: hall ladder → `tech_tier_for` → unlock
+/// predicate → ability list → selector → per-ability cooldown → `ApplyStatus`
+/// → `effective_stats` → central expiry.
 fn status_probe(
     time: Res<Time>,
     mut commands: Commands,
+    tiers: Res<TechTiers>,
     mut stage: Local<u32>,
     mut subject: Local<Option<Entity>>,
     mut casts: EventWriter<CastAbility>,
     mut next_cast: Local<f32>,
+    mut seen_tier: Local<Option<TechTier>>,
     units: Query<(Entity, &Unit, &Team, Option<&StatusEffects>)>,
-    heroes: Query<(Entity, &Unit), With<Hero>>,
+    heroes: Query<(Entity, &Unit, &Team, &Hero)>,
 ) {
     if !status_probe_enabled() {
         return;
     }
     let now = time.elapsed_secs();
 
+    // Report every tier change, and what it did to the gated ability. This is
+    // the integration under test: nothing here knows about Keeps, only that
+    // the team's tier moved and an unlock predicate changed its mind.
+    let human_tier = tiers.get(Team::Human);
+    if *seen_tier != Some(human_tier) {
+        *seen_tier = Some(human_tier);
+        let ctx = UnlockCtx::new(1, human_tier);
+        let gated = abilities_of_unit(UnitKind::Hero)
+            .iter()
+            .map(|def| format!("{}={}", def.name, ability_unlocked(def, ctx)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        info!(
+            "[{now:>6.1}s] STATUS PROBE: Human tier -> {} | unlocked {gated}",
+            human_tier.name()
+        );
+    }
+
     // Keep asking the Champion for its SECOND ability by explicit index. The
-    // executor refuses while it is on cooldown or short of mana; every cast
-    // that does land slows whatever is standing around it.
+    // executor refuses while it is locked, on cooldown, or short of mana; every
+    // cast that does land slows whatever is standing around it.
     if now >= *next_cast {
         *next_cast = now + 5.0;
-        for (entity, unit) in &heroes {
-            if unit.kind == UnitKind::Hero && abilities_of_unit(unit.kind).len() > 1 {
-                casts.write(CastAbility::index(entity, 1));
+        for (entity, unit, team, hero) in &heroes {
+            if unit.kind != UnitKind::Hero {
+                continue;
+            }
+            let list = abilities_of_unit(unit.kind);
+            if list.len() > 1 {
+                let ctx = UnlockCtx::new(hero.level, tiers.get(*team));
+                if ability_unlocked(&list[1], ctx) {
+                    casts.write(CastAbility::index(entity, 1));
+                }
             }
         }
     }
@@ -2725,9 +3033,24 @@ fn debug_log(
         let e = economies.get(team);
         let u = units.iter().filter(|(_, t)| **t == team).count();
         let b = buildings.iter().filter(|(_, t)| **t == team).count();
+        // Per-kind breakdown, driven by ALL_UNIT_KINDS so new content shows up
+        // here the day it is added. A bare unit count cannot answer the one
+        // question every balance run asks — "did anyone actually build the
+        // thing, and did it live?" — and an army is its composition.
+        let army = ALL_UNIT_KINDS
+            .iter()
+            .filter_map(|kind| {
+                let n = units
+                    .iter()
+                    .filter(|(unit, t)| **t == team && unit.kind == *kind)
+                    .count();
+                (n > 0).then(|| format!("{n} {}", kind_name(*kind)))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         info!(
-            "[{:>6.1}s] {:?}: gold {} lumber {} supply {}/{} | {} units, {} buildings",
-            time.elapsed_secs(), team, e.gold, e.lumber, e.supply_used, e.supply_cap, u, b
+            "[{:>6.1}s] {:?}: gold {} lumber {} supply {}/{} | {} units, {} buildings | {}",
+            time.elapsed_secs(), team, e.gold, e.lumber, e.supply_used, e.supply_cap, u, b, army
         );
     }
 }
@@ -2880,6 +3203,36 @@ impl GameEvents {
         match team {
             Team::Human => &self.human.events,
             Team::Claude => &self.claude.events,
+        }
+    }
+
+    /// Append one event to a team's OWN feed, out of band of the once-a-second
+    /// diff. The diff can only report what it can see in two consecutive
+    /// snapshots of the world; a discrete act with no lasting trace — an
+    /// upgrade being ordered, say — has to announce itself. Callers must push
+    /// to the acting team only: this is the seam through which an information
+    /// asymmetry could be introduced, and the rule that keeps it shut is that
+    /// nobody ever pushes to `team.enemy()`.
+    pub fn push(
+        &mut self,
+        team: Team,
+        t: f32,
+        message: String,
+        severity: EventSeverity,
+        pos: Option<Vec3>,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let events = &mut self.team_mut(team).events;
+        events.push_back(GameEvent {
+            seq,
+            t: ev_r1(t),
+            message,
+            severity,
+            pos,
+        });
+        while events.len() > MAX_GAME_EVENTS {
+            events.pop_front();
         }
     }
 
@@ -3336,8 +3689,13 @@ fn diff_team(
 }
 
 // ---------------------------------------------------------------------------
-// Tests: the two framework laws
+// Tests: the two frameworks' laws, and the upgrade ladder's invariants
 // ---------------------------------------------------------------------------
+//
+// These are the properties the content beads are about to build on, so they
+// are pinned here rather than left to a sim to notice. Every one is written
+// against the derived helpers, not against `Keep`/`Castle` literals where it
+// can be avoided — a second ladder should inherit the guarantees.
 
 #[cfg(test)]
 mod tests {
@@ -3520,8 +3878,31 @@ mod tests {
             unlocked_abilities(&tiered, UnlockCtx::building(TechTier::T2)),
             vec![0]
         );
-        // The stub the tiers bead replaces.
+    }
+
+    /// The join between the two beads: the hall ladder decides the tier, and
+    /// the tier opens a `TeamTier` ability. A team that upgrades its TownHall
+    /// into a Keep gains the spell without anything else changing.
+    #[test]
+    fn upgrading_the_hall_raises_the_tier_and_unlocks_a_tier_gated_ability() {
+        use BuildingKind::*;
+        // Tier is the highest hall rung STANDING, and nothing else counts.
         assert_eq!(tech_tier_for(std::iter::empty()), TechTier::T1);
+        assert_eq!(tech_tier_for([TownHall, Barracks, Farm].into_iter()), TechTier::T1);
+        assert_eq!(tech_tier_for([Barracks, Workshop, Tower].into_iter()), TechTier::T1);
+        assert_eq!(tech_tier_for([TownHall, Keep].into_iter()), TechTier::T2);
+        assert_eq!(tech_tier_for([Keep, Castle].into_iter()), TechTier::T3);
+        // Losing the Keep drops the team back: tier is a fact, not a latch.
+        assert_eq!(tech_tier_for([TownHall].into_iter()), TechTier::T1);
+
+        let gated = [AbilityDef { unlock: AbilityUnlock::TeamTier(TechTier::T2), ..SLAM }];
+        let before = UnlockCtx::new(1, tech_tier_for([TownHall].into_iter()));
+        let after = UnlockCtx::new(1, tech_tier_for([Keep].into_iter()));
+        assert_eq!(resolve_ability(&gated, None, before), None, "locked at T1");
+        assert_eq!(resolve_ability(&gated, None, after), Some(0), "open once a Keep stands");
+        // A Castle is strictly better, never a regression.
+        let castle = UnlockCtx::new(1, tech_tier_for([Castle].into_iter()));
+        assert_eq!(resolve_ability(&gated, None, castle), Some(0));
     }
 
     #[test]
@@ -3622,5 +4003,122 @@ mod tests {
             .statuses
             .iter()
             .any(|s| s.id == "Haste" && s.stacking == "stack"));
+    }
+
+    // --- the upgrade ladder --------------------------------------------------
+
+    #[test]
+    fn the_hall_ladder_is_three_rungs_and_agrees_with_itself() {
+        assert_eq!(building_upgrades_to(BuildingKind::TownHall), Some(BuildingKind::Keep));
+        assert_eq!(building_upgrades_to(BuildingKind::Keep), Some(BuildingKind::Castle));
+        assert_eq!(building_upgrades_to(BuildingKind::Castle), None);
+        // `upgraded_from` is derived, so this is a real round-trip check.
+        for kind in ALL_BUILDING_KINDS {
+            if let Some(next) = building_upgrades_to(kind) {
+                assert_eq!(building_upgraded_from(next), Some(kind));
+                assert_eq!(building_tier(next), building_tier(kind) + 1);
+                assert_eq!(upgrade_root(next), upgrade_root(kind));
+            }
+        }
+        assert_eq!(building_tier(BuildingKind::TownHall), 1);
+        assert_eq!(building_tier(BuildingKind::Keep), 2);
+        assert_eq!(building_tier(BuildingKind::Castle), 3);
+    }
+
+    #[test]
+    fn requirements_compare_tiers_rather_than_kinds() {
+        // The whole point of the tier rule: a team that teched past the
+        // requirement still satisfies it.
+        let castle = [BuildingKind::Castle];
+        assert!(requirements_met(&[BuildingKind::Keep], castle.iter().copied()));
+        assert!(requirements_met(&[BuildingKind::TownHall], castle.iter().copied()));
+        // ...but teching does not run backwards.
+        let hall = [BuildingKind::TownHall];
+        assert!(!requirements_met(&[BuildingKind::Keep], hall.iter().copied()));
+        // And ladders never bleed into each other.
+        assert!(!building_satisfies(BuildingKind::Castle, BuildingKind::Barracks));
+        assert!(building_satisfies(BuildingKind::Barracks, BuildingKind::Barracks));
+    }
+
+    #[test]
+    fn every_rung_of_the_hall_ladder_is_a_hall_and_a_production_building() {
+        for kind in [BuildingKind::TownHall, BuildingKind::Keep, BuildingKind::Castle] {
+            assert!(is_hall(kind), "{} must count as a hall", building_name(kind));
+            // The win condition is "has any building that can train", so a
+            // team whose only building is a Castle must not be declared dead.
+            assert!(
+                !trainable(kind).is_empty(),
+                "{} must stay a production building",
+                building_name(kind)
+            );
+            // Hero training/revival lives on the hall card.
+            assert!(trainable(kind).contains(&UnitKind::Hero));
+            // Call to Arms must survive the upgrade — and keep its slot, since
+            // an ability's index is its handle for hotkeys, cooldowns and the
+            // bridge selector alike.
+            let abilities = abilities_of_building(kind);
+            assert_eq!(abilities.len(), 1);
+            assert_eq!(abilities[0].name, "CallToArms");
+        }
+    }
+
+    #[test]
+    fn upgrade_only_kinds_are_never_placeable_and_never_shrink_the_building() {
+        for kind in ALL_BUILDING_KINDS {
+            let placeable = building_placeable(kind);
+            assert_eq!(placeable, building_upgraded_from(kind).is_none());
+            let Some(next) = building_upgrades_to(kind) else {
+                continue;
+            };
+            assert!(!building_placeable(next));
+            let (from, to) = (building_stats(kind), building_stats(next));
+            // A tier-up is a reward: more HP, never a smaller HP pool...
+            assert!(to.hp > from.hp, "{} must out-HP {}", building_name(next), building_name(kind));
+            // ...and never a bigger footprint, or a packed base could not tech.
+            assert!(
+                to.size <= from.size,
+                "{} must not need more ground than {}",
+                building_name(next),
+                building_name(kind)
+            );
+            // Supply must not drop, or upgrading could strand an army.
+            assert!(to.supply_provided >= from.supply_provided);
+            // Cumulative worth strictly grows, so `asset_score` can never
+            // punish a team for teching up.
+            let (gold_before, lumber_before) = building_value(kind);
+            let (gold_after, lumber_after) = building_value(next);
+            assert!(gold_after > gold_before && lumber_after > lumber_before);
+        }
+    }
+
+    #[test]
+    fn the_catalog_alone_reconstructs_the_whole_ladder() {
+        // An agent reading catalog.json and nothing else must be able to walk
+        // TownHall -> Keep -> Castle and price every step.
+        let catalog = game_catalog();
+        let find = |id: &str| {
+            catalog
+                .buildings
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the catalog"))
+        };
+        let mut id = "TownHall";
+        let mut walked = vec![id];
+        let mut paid = (0, 0);
+        while let Some(step) = find(id).upgrades_to.as_ref() {
+            paid = (paid.0 + step.cost_gold, paid.1 + step.cost_lumber);
+            assert!(step.upgrade_time > 0.0);
+            let next = find(step.to);
+            assert_eq!(next.upgraded_from, Some(id));
+            assert_eq!(next.tier, find(id).tier + 1);
+            assert!(!next.placeable);
+            // The rung's own cost IS the price of the step that makes it.
+            assert_eq!((next.cost_gold, next.cost_lumber), (step.cost_gold, step.cost_lumber));
+            id = step.to;
+            walked.push(id);
+        }
+        assert_eq!(walked, vec!["TownHall", "Keep", "Castle"]);
+        assert_eq!(paid, (320 + 480, 160 + 240));
     }
 }

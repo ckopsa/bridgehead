@@ -313,6 +313,20 @@ enum Slot {
 // Commands (shared by hotkeys and command-card buttons)
 // ---------------------------------------------------------------------------
 
+/// Every event the command card can emit, in one system param.
+///
+/// `command_input` already reads most of the world to decide what the current
+/// selection can do, and Bevy caps a system at 16 parameters — bundling the
+/// writers keeps room for the next command that needs one instead of spending
+/// the last slot on it.
+#[derive(SystemParam)]
+struct CardActions<'w> {
+    casts: EventWriter<'w, CastAbility>,
+    buys: EventWriter<'w, BuyItem>,
+    item_uses: EventWriter<'w, UseItem>,
+    upgrades: EventWriter<'w, UpgradeBuilding>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CmdAction {
     AttackMove,
@@ -326,6 +340,9 @@ enum CmdAction {
     CastBuilding(usize),
     /// Buy a consumable at the single selected own Shop, for the team's hero.
     Buy(ItemId),
+    /// Convert the single selected own building into its next tier in place.
+    /// Carries the RESULT, so the button can name what you get.
+    Upgrade(BuildingKind),
     /// Consume the selected own hero's inventory slot.
     UseSlot(usize),
     /// Doctrine: toggle `LeashPolicy` on the whole own-unit selection.
@@ -611,7 +628,9 @@ impl CmdEntry {
         if !requirements_met(reqs, completed.iter().copied()) {
             let missing = reqs
                 .iter()
-                .find(|r| !completed.contains(r))
+                // Tier-aware like `requirements_met`, so a card never reads
+                // "needs Keep" to a player who is standing on a Castle.
+                .find(|r| !completed.iter().any(|owned| building_satisfies(*owned, **r)))
                 .copied()
                 .unwrap_or(BuildingKind::TownHall);
             self.locked = true;
@@ -658,6 +677,9 @@ struct HeroCmds {
     building_abilities: Vec<AbilitySlot>,
     /// The single selected own completed Shop's buy state.
     shop: Option<ShopState>,
+    /// The single selected own completed building's available tier-up, when it
+    /// has one and is not already converting: `(result kind, gold, lumber)`.
+    upgrade: Option<(BuildingKind, u32, u32)>,
     /// Inventory of the selected own hero (all None when none is selected).
     items: [Option<ItemId>; 2],
 }
@@ -690,11 +712,11 @@ struct ShopState {
 /// name and tech gating all come from the shared tables via `build_cards`.
 ///
 /// Free letters only: every other command key in this file is
-/// A S R C B F H O L K N Q W E G V P T Z X, plus the second/third ability
-/// slots Y U (hero) and J M (building), plus Esc / '.' / Ctrl+1-3;
+/// A S R C B F H O L K N Q W E G V P T Z X U, plus the second/third ability
+/// slots Y D (hero) and J M (building), plus Esc / '.' / Ctrl+1-3;
 /// shared.rs owns F1-F4, ai.rs F9, the surrender hotkey F12, and terrain.rs
 /// the arrow keys. K (workshop) and N (shop) were picked against that whole
-/// list — D and I are the remaining unclaimed candidates.
+/// list — I is the only remaining unclaimed letter.
 fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
     match kind {
         BuildingKind::Barracks => Some((0, KeyCode::KeyB, "B")),
@@ -704,6 +726,9 @@ fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
         BuildingKind::Wall => Some((4, KeyCode::KeyL, "L")),
         BuildingKind::Workshop => Some((5, KeyCode::KeyK, "K")),
         BuildingKind::Shop => Some((6, KeyCode::KeyN, "N")),
+        // Reached by upgrading a hall, never by placing one — no build card,
+        // and `build_cards` filters on `building_placeable` besides.
+        BuildingKind::Keep | BuildingKind::Castle => None,
     }
 }
 
@@ -712,6 +737,7 @@ fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
 fn build_cards() -> Vec<(u8, BuildingKind, KeyCode, &'static str)> {
     let mut cards: Vec<(u8, BuildingKind, KeyCode, &'static str)> = ALL_BUILDING_KINDS
         .into_iter()
+        .filter(|kind| building_placeable(*kind))
         .filter_map(|kind| {
             build_card_slot(kind).map(|(slot, key, hotkey)| (slot, kind, key, hotkey))
         })
@@ -720,12 +746,14 @@ fn build_cards() -> Vec<(u8, BuildingKind, KeyCode, &'static str)> {
     cards
 }
 
-/// Production hotkeys, by index into `trainable()`: Q, W, E. A Shop trains
-/// nothing, so its buy buttons reuse the same letters without colliding.
-const TRAIN_KEYS: [(KeyCode, &str); 3] = [
+/// Production hotkeys, by index into `trainable()`: Q, W, E, R. A Shop trains
+/// nothing, so its buy buttons reuse the same letters without colliding, and
+/// the hero's [R] lives on a unit selection, never a building one.
+const TRAIN_KEYS: [(KeyCode, &str); 4] = [
     (KeyCode::KeyQ, "Q"),
     (KeyCode::KeyW, "W"),
     (KeyCode::KeyE, "E"),
+    (KeyCode::KeyR, "R"),
 ];
 
 /// Inventory-slot hotkeys, by slot index.
@@ -737,7 +765,11 @@ const ITEM_KEYS: [(KeyCode, &str); 2] = [(KeyCode::KeyZ, "Z"), (KeyCode::KeyX, "
 const HERO_ABILITY_KEYS: [(KeyCode, &str); 3] = [
     (KeyCode::KeyR, "R"),
     (KeyCode::KeyY, "Y"),
-    (KeyCode::KeyU, "U"),
+    // Slot 3 was [U] until the upgrade bead claimed U for the tier-up button.
+    // A building's tier-up and a hero's third spell are never on the same card
+    // (one needs a building selected, the other a hero), but a hotkey the
+    // player has to think about is already broken — so this moved to [D].
+    (KeyCode::KeyD, "D"),
 ];
 
 /// Building ability hotkeys, by ability slot: [C] (Call to Arms today), then
@@ -758,15 +790,16 @@ fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
     }
 }
 
-/// Everything the command card needs to reason about casting: the team's tech
-/// tier (unlock predicates), each caster's per-ability cooldowns, and the
-/// outgoing event. Bundled because `command_input` was already sitting on
-/// Bevy's 16-system-parameter ceiling and ability v2 needed three more.
+/// What the command card READS to decide whether an ability is castable: the
+/// team's tech tier (the `TeamTier` unlock predicate) and each caster's
+/// per-ability cooldowns, looked up by entity so the big selection queries keep
+/// their shape. The matching WRITES live in `CardActions` — two bundles because
+/// `command_input` is near Bevy's 16-parameter ceiling and these five params
+/// would otherwise blow through it.
 #[derive(SystemParam)]
-struct CastParams<'w, 's> {
+struct CastLookup<'w, 's> {
     tiers: Res<'w, TechTiers>,
     cooldowns: Query<'w, 's, &'static AbilityCooldowns>,
-    casts: EventWriter<'w, CastAbility>,
 }
 
 /// Every UNLOCKED ability of a caster, priced and cooled, ready for the card.
@@ -799,7 +832,7 @@ fn ability_slots(
 ///   fighters             A S | G V P                       (5)
 ///   hero                 A S R | Z X (carried items) | G V P T   (<=9)
 ///   town hall            Q(Worker) W/E(hero class) C(CallToArms)
-///   barracks             Q(Footman) W(Archer) E(Raider)    (3)
+///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman)  (4)
 ///   workshop             Q(Catapult)                       (1)
 ///   shop                 Q(Potion) W(Portal)               (2)
 ///
@@ -939,6 +972,21 @@ fn command_entries(
                 out.push(entry);
             }
 
+            // Tier up in place. [U] because it is the last free letter that
+            // says what it does; the card has room here because a hall spends
+            // at most four slots on training and Call to Arms.
+            if let Some((to, gold, lumber)) = hero.upgrade {
+                out.push(
+                    CmdEntry::plain(
+                        CmdAction::Upgrade(to),
+                        KeyCode::KeyU,
+                        "U",
+                        &format!("Upgrade: {}", building_name(to)),
+                    )
+                    .priced(gold, lumber),
+                );
+            }
+
             // A Shop sells to the team's one hero: dark without a hero, with a
             // full inventory, or with an empty purse.
             if let Some(shop) = hero.shop {
@@ -1023,6 +1071,7 @@ fn unit_name(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Catapult",
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
+        UnitKind::Spearman => "Spearman",
     }
 }
 
@@ -1046,6 +1095,8 @@ fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Wall",
         BuildingKind::Workshop => "Workshop",
         BuildingKind::Shop => "Shop",
+        BuildingKind::Keep => "Keep",
+        BuildingKind::Castle => "Castle",
     }
 }
 
@@ -1848,10 +1899,9 @@ fn command_input(
     economies: Res<Economies>,
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
-    mut cast: CastParams,
+    cast: CastLookup,
     mut focus: EventWriter<CameraFocus>,
-    mut buys: EventWriter<BuyItem>,
-    mut item_uses: EventWriter<UseItem>,
+    mut acts: CardActions,
     pressed_buttons: Query<(&Interaction, &El), Changed<Interaction>>,
     selected: Query<Entity, With<Selected>>,
     sel_units: Query<
@@ -1876,6 +1926,10 @@ fn command_input(
             &Team,
             Option<&mut TrainingQueue>,
             Option<&UnderConstruction>,
+            // Per-ability cooldowns are read through `CastLookup` by entity, so
+            // this query stays free of them and no borrow outlives the
+            // `iter_mut` the train command needs.
+            Option<&Upgrading>,
         ),
         With<Selected>,
     >,
@@ -1957,17 +2011,19 @@ fn command_input(
     // The one selected own building: its kind, whether it is finished, its
     // entity (buy/cast target) and its ability cooldown, if it has one.
     let single = match (b_iter.next(), b_iter.next()) {
-        (Some((e, b, t, _, uc)), None) if *t == Team::Human => Some((e, b.kind, uc.is_none())),
+        (Some((e, b, t, _, uc, up)), None) if *t == Team::Human => {
+            Some((e, b.kind, uc.is_none(), up.is_some()))
+        }
         _ => None,
     };
-    let single_building = single.map(|(_, kind, done)| (kind, done));
+    let single_building = single.map(|(_, kind, done, _)| (kind, done));
 
     // Hero training is offered only while the team has neither a living
     // hero (of either class) nor one already queued in this building.
     let team_has_hero = all_units
         .iter()
         .any(|(_, u, t, _, _, _)| *t == Team::Human && is_hero_kind(u.kind));
-    let hero_in_queue = sel_buildings.iter().any(|(_, _, t, q, _)| {
+    let hero_in_queue = sel_buildings.iter().any(|(_, _, t, q, _, _)| {
         *t == Team::Human
             && q.map(|q| q.queue.iter().any(|k| is_hero_kind(*k)))
                 .unwrap_or(false)
@@ -1998,8 +2054,8 @@ fn command_input(
             })
             .unwrap_or_default(),
         building_abilities: single
-            .filter(|(_, _, done)| *done)
-            .map(|(entity, kind, _)| {
+            .filter(|(_, _, done, _)| *done)
+            .map(|(entity, kind, _, _)| {
                 ability_slots(
                     abilities_of_building(kind),
                     UnlockCtx::building(cast.tiers.get(Team::Human)),
@@ -2008,11 +2064,17 @@ fn command_input(
                 )
             })
             .unwrap_or_default(),
-        shop: single.and_then(|(_, kind, done)| {
+        shop: single.and_then(|(_, kind, done, _)| {
             (done && kind == BuildingKind::Shop).then(|| ShopState {
                 hero: team_hero.is_some(),
                 room: team_hero.is_some_and(|(_, inv)| inv.0.iter().any(|s| s.is_none())),
             })
+        }),
+        upgrade: single.and_then(|(_, kind, done, upgrading)| {
+            (done && !upgrading)
+                .then(|| upgrade_cost(kind).zip(building_upgrades_to(kind)))
+                .flatten()
+                .map(|((gold, lumber, _), to)| (to, gold, lumber))
         }),
         items: own_heroes.first().map(|(_, _, _, inv)| inv.0).unwrap_or_default(),
     };
@@ -2089,28 +2151,37 @@ fn command_input(
             // it does for the AI and the bridge.
             CmdAction::CastHero(index) => {
                 for (hero, _, _, _) in &own_heroes {
-                    cast.casts.write(CastAbility::index(*hero, index));
+                    acts.casts.write(CastAbility::index(*hero, index));
                 }
             }
             CmdAction::CastBuilding(index) => {
-                if let Some((entity, kind, true)) = single {
+                if let Some((entity, kind, true, _)) = single {
                     if index < abilities_of_building(kind).len() {
-                        cast.casts.write(CastAbility::index(entity, index));
+                        acts.casts.write(CastAbility::index(entity, index));
                     }
                 }
             }
             CmdAction::Buy(item) => {
                 // economy.rs re-validates ownership, slots and gold; the card
                 // only greys the button so the player knows before clicking.
-                if let (Some((shop, BuildingKind::Shop, true)), Some((hero, _))) =
+                if let (Some((shop, BuildingKind::Shop, true, _)), Some((hero, _))) =
                     (single, team_hero)
                 {
-                    buys.write(BuyItem { shop, hero, item });
+                    acts.buys.write(BuyItem { shop, hero, item });
+                }
+            }
+            CmdAction::Upgrade(to) => {
+                // economy.rs owns the verdict and the money, exactly as it does
+                // for the bridge's `upgrade` command and the AI's tier-up.
+                if let Some((entity, kind, true, false)) = single {
+                    if building_upgrades_to(kind) == Some(to) {
+                        acts.upgrades.write(UpgradeBuilding { building: entity });
+                    }
                 }
             }
             CmdAction::UseSlot(slot) => {
                 if let Some((hero, _, _, _)) = own_heroes.first() {
-                    item_uses.write(UseItem { hero: *hero, slot });
+                    acts.item_uses.write(UseItem { hero: *hero, slot });
                 }
             }
             // --- doctrine toggles: every mutation goes through Commands, so
@@ -2147,7 +2218,9 @@ fn command_input(
                     let rally = all_buildings
                         .iter()
                         .filter(|(b, t, _, under)| {
-                            **t == Team::Human && b.kind == BuildingKind::TownHall && !under
+                            // Any rung of the hall ladder is a place to fall
+                            // back to.
+                            **t == Team::Human && is_hall(b.kind) && !under
                         })
                         .map(|(_, _, tf, _)| tf.translation)
                         .min_by(|a, b| {
@@ -2218,13 +2291,17 @@ fn command_input(
                 if second.is_some() {
                     continue;
                 }
-                let Some((_, building, team, Some(mut queue), uc)) = first else {
+                let Some((_, building, team, Some(mut queue), uc, upgrading)) = first else {
                     continue;
                 };
                 if *team != Team::Human || uc.is_some() || !trainable(building.kind).contains(&kind)
                 {
                     continue;
                 }
+                // Queuing into a hall mid-upgrade is allowed on purpose — the
+                // queue survives the conversion, it just doesn't advance. What
+                // is NOT allowed is queuing into scaffolding (`uc`, above).
+                let _ = upgrading;
                 let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
                     let (g, l, _) = hero_train_cost(&records, Team::Human);
                     (g, l)
@@ -2736,7 +2813,7 @@ fn right_mouse(
                 }
             }
             Team::Human => {
-                if b.kind == BuildingKind::TownHall && !under && own_depot.is_none_or(|bd| d < bd) {
+                if is_hall(b.kind) && !under && own_depot.is_none_or(|bd| d < bd) {
                     own_depot = Some(d);
                 }
             }
@@ -3292,11 +3369,12 @@ fn update_hud(
             &Team,
             Option<&TrainingQueue>,
             Option<&UnderConstruction>,
-            Option<&AbilityCooldowns>,
+            Option<&Upgrading>,
         ),
         With<Selected>,
     >,
-    // Per-ability cooldowns of the selected hero, by entity.
+    // Per-ability cooldowns of the selected caster (hero or building), by
+    // entity — one lookup serves both, so neither selection query carries it.
     cooldowns: Query<&AbilityCooldowns>,
 ) {
     let econ = *economies.get(Team::Human);
@@ -3390,7 +3468,9 @@ fn update_hud(
             }
         }
     } else if total == 1 && building_count == 1 {
-        if let Some((_, building, health, team, queue, under, _)) = sel_buildings.iter().next() {
+        if let Some((_, building, health, team, queue, under, upgrading)) =
+            sel_buildings.iter().next()
+        {
             show_single = true;
             name = building_name(building.kind).to_string();
             portrait_letter = initial(&name);
@@ -3418,7 +3498,34 @@ fn update_hud(
                 } else if stats.supply_provided > 0 {
                     stats_text = format!("Supply +{}", stats.supply_provided);
                 }
-                if let Some(queue) = queue {
+                // A building on an upgrade ladder always says which rung it is
+                // on — the tier is what tech requirements are written against.
+                if building_tier(building.kind) > 1 || building_upgrades_to(building.kind).is_some()
+                {
+                    let tier = format!("Tier {}", building_tier(building.kind));
+                    stats_text = if stats_text.is_empty() {
+                        tier
+                    } else {
+                        format!("{stats_text}    {tier}")
+                    };
+                }
+                if let Some(up) = upgrading {
+                    // The conversion owns the progress bar and the status line
+                    // while it runs: training is frozen, so reporting it would
+                    // show a percentage that never moves.
+                    let total = up.total.max(0.001);
+                    prog = ((total - up.remaining) / total).clamp(0.0, 1.0);
+                    show_prog = true;
+                    extra_text = format!(
+                        "Upgrading to {}: {:.0}%   (training paused, {} queued)",
+                        building_name(up.to),
+                        prog * 100.0,
+                        queue.map(|q| q.queue.len()).unwrap_or(0)
+                    );
+                    for kind in queue.iter().flat_map(|q| q.queue.iter()) {
+                        queue_letters.push(initial(unit_name(*kind)));
+                    }
+                } else if let Some(queue) = queue {
                     for kind in queue.queue.iter() {
                         queue_letters.push(initial(unit_name(*kind)));
                     }
@@ -3501,11 +3608,11 @@ fn update_hud(
             .iter()
             .next()
             .filter(|(_, _, _, t, _, _, _)| **t == Team::Human)
-            .map(|(_, b, _, _, _, uc, cd)| (b.kind, uc.is_none(), cd))
+            .map(|(e, b, _, _, _, uc, up)| (e, b.kind, uc.is_none(), up.is_some()))
     } else {
         None
     };
-    let single_building = single.map(|(kind, done, _)| (kind, done));
+    let single_building = single.map(|(_, kind, done, _)| (kind, done));
 
     // Hero commands: the ability of a selected hero (whichever class), the
     // train/revive button on a town hall while the team is hero-less, the
@@ -3541,17 +3648,23 @@ fn update_hud(
             })
             .unwrap_or_default(),
         building_abilities: single
-            .filter(|(_, done, _)| *done)
-            .map(|(kind, _, cd)| {
+            .filter(|(_, _, done, _)| *done)
+            .map(|(entity, kind, _, _)| {
                 ability_slots(
                     abilities_of_building(kind),
                     UnlockCtx::building(tiers.get(Team::Human)),
                     None,
-                    cd,
+                    cooldowns.get(entity).ok(),
                 )
             })
             .unwrap_or_default(),
-        shop: single.and_then(|(kind, done, _)| {
+        upgrade: single.and_then(|(_, kind, done, upgrading)| {
+            (done && !upgrading)
+                .then(|| upgrade_cost(kind).zip(building_upgrades_to(kind)))
+                .flatten()
+                .map(|((gold, lumber, _), to)| (to, gold, lumber))
+        }),
+        shop: single.and_then(|(_, kind, done, _)| {
             (done && kind == BuildingKind::Shop).then(|| ShopState {
                 hero: team_has_hero,
                 room: team_hero

@@ -44,7 +44,9 @@ Win by destroying all enemy buildings.
     `ApplyStatus`. `CastAbility { caster, ability: Option<AbilitySelector> }`
     picks a slot (`None` = first unlocked); cooldowns live per slot in
     `AbilityCooldowns` and auto-cast rules per slot in `AutoCastPolicy`.
-    `tech_tier_for` is the single stub the TownHall→Keep→Castle bead replaces.
+    `tech_tier_for` derives the team's `TechTier` from the highest hall rung it
+    has standing (`is_hall` + `building_tier`), so a completed Keep opens every
+    `TeamTier(T2)` ability and losing it closes them again.
 - `terrain.rs`: ground, doodads, resource nodes (gold mines at
   `GOLD_MINE_POSITIONS`, tree clusters), lighting, **RTS camera** (spawns the
   `MainCamera`), blocks trees/mines in `NavGrid`, and owns the **map layout**:
@@ -119,6 +121,12 @@ Win by destroying all enemy buildings.
   alive; when following `Order::Attack(target)`/`Harvest(target)`, always
   `if let Ok(..) = query.get(target)` and fall back to Idle if the target is gone.
 - `Query::single()`/`single_mut()` return `Result` in 0.16 — use `let Ok(x) = q.single() else { return; }`.
+- **`GlobalTransform` is only propagated in `PostUpdate`.** Any ROOT entity you
+  spawn *or* teleport during `Update` must seed/update its own
+  `GlobalTransform::from(transform)` in the same statement that writes the
+  `Transform` — otherwise every `GlobalTransform` reader that frame (combat.rs
+  reads positions that way) sees the origin for a fresh spawn, or the stale
+  pre-teleport position for a mover.
 
 ## Verification
 

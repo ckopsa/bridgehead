@@ -69,6 +69,19 @@
 //! snapshot reports only `buildings[].template: true` for own buildings that
 //! carry one — the commander wrote the details, it knows them.
 //!
+//! Tech tiers are the `upgrade` command: `{"type":"upgrade","building":<id>}`
+//! converts one of our own finished buildings into the next rung of its ladder
+//! in place (`catalog.buildings[].upgrades_to` says which, at what price, for
+//! how long). It is validated like `build` and `train` — ours, finished, has a
+//! next tier, not already converting, affordable — and paid in full the moment
+//! it is accepted, because no worker has to walk anywhere first. The building
+//! keeps its id, position, footprint, rally, template and training queue; what
+//! it loses is production TIME, since a converting building trains nothing.
+//! The snapshot answers back with `buildings[].tier`, `buildings[].upgrading`
+//! (`{to, remaining}`) and the seat's headline `me.tier`. Requirements are
+//! compared by tier, not by kind, so a Castle satisfies anything that asks for
+//! a Keep.
+//!
 //! The catalog is static, so tech *availability* rides along with every
 //! snapshot instead: a top-level `unlocked` map answers "may I build/train this
 //! right now?" for every catalog entry, computed from the seat's own completed
@@ -110,6 +123,7 @@
 //! array instead of a panic.
 
 use crate::shared::*;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -403,6 +417,10 @@ struct MeOut {
     supply_cap: u32,
     /// Fraction of each gold delivery you actually receive (upkeep tax).
     upkeep_rate: f32,
+    /// Highest hall tier you have STANDING and finished: 1 TownHall, 2 Keep,
+    /// 3 Castle. The one number tier-gated content is written against; the
+    /// per-building `tier` field says where each hall individually sits.
+    tier: u32,
     hero_record: Option<HeroRecordOut>,
     hero_cost: CostOut,
 }
@@ -569,6 +587,23 @@ struct BuildingOut {
     /// commander that set the template already knows what is in it.
     #[serde(skip_serializing_if = "is_false")]
     template: bool,
+    /// Rung on this building's upgrade ladder — 1 for everything not on one.
+    /// Public information: both players can see a Keep is a Keep.
+    tier: u32,
+    /// Present only while this building is converting to its next tier. The
+    /// `upgrade` command starts one; while it runs the building trains nothing
+    /// (the queue is frozen, not cancelled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upgrading: Option<UpgradeOut>,
+}
+
+/// An in-place upgrade in progress, as it appears in a snapshot.
+#[derive(Serialize)]
+struct UpgradeOut {
+    /// Catalog id of what it is becoming.
+    to: &'static str,
+    /// Seconds left on the conversion.
+    remaining: f32,
 }
 
 fn is_false(flag: &bool) -> bool {
@@ -654,6 +689,7 @@ type SnapshotBuildings<'w, 's> = Query<
         Option<&'static TrainingQueue>,
         Option<&'static DoctrineTemplate>,
         Option<&'static AbilityCooldowns>,
+        Option<&'static Upgrading>,
     ),
 >;
 
@@ -784,7 +820,8 @@ fn write_seat_snapshot(
 
     let mut buildings_out: Vec<BuildingOut> = buildings
         .iter()
-        .map(|(e, building, team, tf, health, under, queue, template, cooldown)| BuildingOut {
+        .map(
+            |(e, building, team, tf, health, under, queue, template, cooldown, upgrading)| BuildingOut {
             id: e.to_bits(),
             team: team_name(*team),
             kind: building_name(building.kind),
@@ -811,14 +848,20 @@ fn write_seat_snapshot(
             },
             // Never for the opponent: a template is command structure.
             template: *team == me && template.is_some(),
-        })
+            tier: building_tier(building.kind),
+            upgrading: upgrading.map(|u| UpgradeOut {
+                to: building_name(u.to),
+                remaining: r1(u.remaining),
+            }),
+            },
+        )
         .collect();
     buildings_out.sort_by_key(|b| b.id);
 
     // Tech state, for this seat only: what its completed buildings unlock.
     let completed: Vec<BuildingKind> = buildings
         .iter()
-        .filter(|(_, _, team, _, _, under, _, _, _)| **team == me && under.is_none())
+        .filter(|(_, _, team, _, _, under, _, _, _, _)| **team == me && under.is_none())
         .map(|(_, building, ..)| building.kind)
         .collect();
     let unlocked = unlocked_map(&completed);
@@ -921,6 +964,12 @@ fn write_seat_snapshot(
             supply_used: eco.supply_used,
             supply_cap: eco.supply_cap,
             upkeep_rate: upkeep_rate(eco.supply_used),
+            tier: completed
+                .iter()
+                .filter(|k| is_hall(**k))
+                .map(|k| building_tier(*k))
+                .max()
+                .unwrap_or(0),
             hero_record: records.get(me).map(|r| HeroRecordOut {
                 level: r.level,
                 xp: r1(r.xp),
@@ -987,9 +1036,15 @@ fn write_seat_snapshot(
 fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
     let mut out = BTreeMap::new();
     for kind in ALL_BUILDING_KINDS {
+        // An upgrade-only kind is never "buildable", however much tech you
+        // have: the honest answer to "may I place this right now" is no, and
+        // the route to one is the catalog's `upgrades_to` plus the `upgrade`
+        // command. Reporting `true` here would send a commander to a `build`
+        // that always bounces.
         out.insert(
             building_name(kind),
-            requirements_met(building_requires(kind), completed.iter().copied()),
+            building_placeable(kind)
+                && requirements_met(building_requires(kind), completed.iter().copied()),
         );
     }
     for kind in ALL_UNIT_KINDS {
@@ -1012,9 +1067,11 @@ fn requirement_error(
     if requirements_met(reqs, completed.iter().copied()) {
         return None;
     }
+    // Tier-aware, exactly like `requirements_met`: a Castle covers a "requires
+    // Keep", so it must not be listed as the thing you are missing.
     let missing: Vec<&str> = reqs
         .iter()
-        .filter(|r| !completed.contains(r))
+        .filter(|r| !completed.iter().any(|owned| building_satisfies(*owned, **r)))
         .map(|r| building_name(*r))
         .collect();
     Some(format!("cmd {index}: {what} requires {}", missing.join(" + ")))
@@ -1094,6 +1151,13 @@ enum Cmd {
     Train {
         building: u64,
         unit: String,
+    },
+    /// Convert one of our own finished buildings into its next tier IN PLACE
+    /// (`catalog.buildings[].upgrades_to`). Paid in full the moment it is
+    /// accepted; the building keeps its position, footprint, rally and
+    /// training queue, but trains nothing until the conversion finishes.
+    Upgrade {
+        building: u64,
     },
     Cancel {
         building: u64,
@@ -1276,8 +1340,20 @@ type CmdBuildings<'w, 's> = Query<
         &'static Team,
         Option<&'static UnderConstruction>,
         Option<&'static mut TrainingQueue>,
+        Option<&'static Upgrading>,
     ),
 >;
+
+/// The events a command batch can emit. Bundled for the same reason ui.rs
+/// bundles its own: `poll_commands` is at Bevy's 16-parameter ceiling, and the
+/// next command that needs a writer should not have to reshape the system.
+#[derive(SystemParam)]
+struct CmdEvents<'w> {
+    casts: EventWriter<'w, CastAbility>,
+    buys: EventWriter<'w, BuyItem>,
+    item_uses: EventWriter<'w, UseItem>,
+    upgrades: EventWriter<'w, UpgradeBuilding>,
+}
 
 /// Anything that can be attacked: a live unit or building with a team.
 type CmdTargets<'w, 's> = Query<
@@ -1303,9 +1379,7 @@ fn poll_commands(
     nav: Res<NavGrid>,
     mut squad_orders: ResMut<SquadOrders>,
     mut commands: Commands,
-    mut casts: EventWriter<CastAbility>,
-    mut buys: EventWriter<BuyItem>,
-    mut item_uses: EventWriter<UseItem>,
+    mut events: CmdEvents,
     units: CmdUnits,
     mut buildings: CmdBuildings,
     targets: CmdTargets,
@@ -1365,9 +1439,7 @@ fn poll_commands(
                 &nav,
                 &mut squad_orders,
                 &mut commands,
-                &mut casts,
-                &mut buys,
-                &mut item_uses,
+                &mut events,
                 &units,
                 &mut buildings,
                 &targets,
@@ -1397,9 +1469,7 @@ fn apply_batch(
     nav: &NavGrid,
     squad_orders: &mut SquadOrders,
     commands: &mut Commands,
-    casts: &mut EventWriter<CastAbility>,
-    buys: &mut EventWriter<BuyItem>,
-    item_uses: &mut EventWriter<UseItem>,
+    events: &mut CmdEvents,
     units: &CmdUnits,
     buildings: &mut CmdBuildings,
     targets: &CmdTargets,
@@ -1577,6 +1647,45 @@ fn apply_batch(
                     pos,
                 });
             }
+            Cmd::Upgrade { building } => {
+                let Some(entity) = entity_of(building) else {
+                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
+                    continue;
+                };
+                let Ok((b, team, under, _, upgrading)) = buildings.get(entity) else {
+                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
+                    continue;
+                };
+                if *team != me {
+                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
+                    continue;
+                }
+                if under.is_some() {
+                    errors.push(format!("cmd {i}: building {building} is under construction"));
+                    continue;
+                }
+                if upgrading.is_some() {
+                    errors.push(format!("cmd {i}: building {building} is already upgrading"));
+                    continue;
+                }
+                let name = building_name(b.kind);
+                let Some((cost_gold, cost_lumber, _)) = upgrade_cost(b.kind) else {
+                    errors.push(format!("cmd {i}: {name} has no upgrade"));
+                    continue;
+                };
+                if !economies.get(me).can_afford(cost_gold, cost_lumber) {
+                    let to = building_name(
+                        building_upgrades_to(b.kind).expect("a cost implies a next tier"),
+                    );
+                    errors.push(format!(
+                        "cmd {i}: cannot afford {to} ({cost_gold}g {cost_lumber}l)"
+                    ));
+                    continue;
+                }
+                // economy.rs takes the money and starts the conversion — the
+                // same single owner of every payment the UI goes through.
+                events.upgrades.write(UpgradeBuilding { building: entity });
+            }
             Cmd::Train { building, unit } => {
                 let Some(kind) = parse_unit_kind(&unit) else {
                     errors.push(format!("cmd {i}: unknown unit kind '{unit}'"));
@@ -1595,7 +1704,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
-                let Ok((b, team, under, queue)) = buildings.get_mut(entity) else {
+                let Ok((b, team, under, queue, _)) = buildings.get_mut(entity) else {
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
@@ -1622,8 +1731,12 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: training queue full ({MAX_QUEUE})"));
                     continue;
                 }
-                // The Champion is priced by `hero_train_cost` (full, then revival).
-                let (cost_gold, cost_lumber) = if kind == UnitKind::Hero {
+                // Hero classes are priced by `hero_train_cost` (full, then
+                // revival) — every hero kind, not just the Champion: pricing
+                // the Priestess off her raw stats let a seat buy a revival at
+                // full price (or worse, a first hero cheaply) depending on the
+                // record. `is_hero_kind` is the same test economy.rs charges by.
+                let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
                     let (g, l, _) = hero_train_cost(records, me);
                     (g, l)
                 } else {
@@ -1644,7 +1757,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
-                let Ok((_, team, _, queue)) = buildings.get_mut(entity) else {
+                let Ok((_, team, _, queue, _)) = buildings.get_mut(entity) else {
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
@@ -1675,7 +1788,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
-                let Ok((b, team, _, _)) = buildings.get(entity) else {
+                let Ok((b, team, _, _, _)) = buildings.get(entity) else {
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
@@ -1734,7 +1847,7 @@ fn apply_batch(
                     unit_list
                 } else {
                     match buildings.get(entity) {
-                        Ok((b, team, under, _)) if *team == me => {
+                        Ok((b, team, under, _, _)) if *team == me => {
                             if under.is_some() {
                                 errors.push(format!(
                                     "cmd {i}: building {hero} is under construction"
@@ -1778,7 +1891,7 @@ fn apply_batch(
                         Some(reference.selector())
                     }
                 };
-                casts.write(CastAbility { caster: entity, ability: selector });
+                events.casts.write(CastAbility { caster: entity, ability: selector });
             }
             Cmd::Buy { shop, item } => {
                 let Some(item) = parse_item(&item) else {
@@ -1789,7 +1902,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {shop} not found/not yours"));
                     continue;
                 };
-                let Ok((b, team, under, _)) = buildings.get(entity) else {
+                let Ok((b, team, under, _, _)) = buildings.get(entity) else {
                     errors.push(format!("cmd {i}: building {shop} not found/not yours"));
                     continue;
                 };
@@ -1815,7 +1928,7 @@ fn apply_batch(
                 };
                 // economy.rs re-validates and pays (gold, free slot, distance-
                 // free just like the UI's Shop card).
-                buys.write(BuyItem {
+                events.buys.write(BuyItem {
                     shop: entity,
                     hero,
                     item,
@@ -1834,7 +1947,7 @@ fn apply_batch(
                     continue;
                 };
                 // combat.rs checks the slot is actually filled.
-                item_uses.write(UseItem { hero, slot });
+                events.item_uses.write(UseItem { hero, slot });
             }
             Cmd::Autopilot { on } => {
                 // Only ever this seat's own faction.
@@ -2048,7 +2161,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
-                let Ok((b, team, under, queue)) = buildings.get(entity) else {
+                let Ok((b, team, under, queue, _)) = buildings.get(entity) else {
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
@@ -2176,7 +2289,7 @@ fn own_units(
 fn completed_kinds(buildings: &CmdBuildings, me: Team) -> Vec<BuildingKind> {
     buildings
         .iter()
-        .filter(|(_, team, under, _)| **team == me && under.is_none())
+        .filter(|(_, team, under, _, _)| **team == me && under.is_none())
         .map(|(building, ..)| building.kind)
         .collect()
 }
@@ -2343,4 +2456,42 @@ fn parse_item(name: &str) -> Option<ItemId> {
     ALL_ITEMS
         .into_iter()
         .find(|id| normalize_name(item_def(*id).name) == wanted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seat-facing surface is a projection of the catalog, not a list
+    /// maintained alongside it: a kind added to `ALL_UNIT_KINDS` and
+    /// `trainable()` becomes orderable over the bridge with no bridge change
+    /// at all. This is the property that lets both kinds of player — the one
+    /// reading a command card and the one reading `state.json` — discover new
+    /// content the same way, so it is worth a test rather than a comment.
+    #[test]
+    fn every_unit_kind_is_orderable_by_name() {
+        for kind in ALL_UNIT_KINDS {
+            assert_eq!(
+                parse_unit_kind(kind_name(kind)),
+                Some(kind),
+                "{} is in the catalog but not orderable",
+                kind_name(kind)
+            );
+        }
+        // Seats type what they like; names are normalized, not matched raw.
+        assert_eq!(parse_unit_kind("spearman"), Some(UnitKind::Spearman));
+        assert_eq!(parse_unit_kind("Spear Man"), Some(UnitKind::Spearman));
+        assert_eq!(parse_unit_kind("pikeman"), None);
+    }
+
+    /// ...and the Barracks really does offer it, so the order has somewhere
+    /// to land.
+    #[test]
+    fn barracks_trains_the_spearman() {
+        assert!(trainable(BuildingKind::Barracks).contains(&UnitKind::Spearman));
+        assert!(
+            unit_requires(UnitKind::Spearman).is_empty(),
+            "the tier-1 answer to cavalry must not itself be tech-gated"
+        );
+    }
 }

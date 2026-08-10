@@ -420,6 +420,30 @@ fn handle_attack_orders(
 
 /// Rank of a candidate's class in a focus-fire list: lower is juicier,
 /// unlisted classes sort after everything named.
+/// The counter-triangle, in one place: how much of an attacker's listed damage
+/// actually lands on this target.
+///
+/// Keyed off `TargetClass` rather than off `UnitKind` equality, so adding a
+/// second siege engine or a second mounted kind is a line in
+/// `TargetClass::of`, not a new branch here. At most one multiplier applies —
+/// a building is never cavalry — so they can never compound.
+fn type_damage_mult(stats: &UnitStats, target_kind: Option<UnitKind>, is_building: bool) -> f32 {
+    // Structures are classified structure-first, as they were before this was
+    // a table: whatever else is true of the thing, if it has a Building
+    // component the siege multiplier is the one that matters.
+    let class = if is_building {
+        Some(TargetClass::Building)
+    } else {
+        TargetClass::of(target_kind, false)
+    };
+    match class {
+        Some(TargetClass::Building) => stats.vs_building_mult,
+        Some(TargetClass::Siege) => stats.vs_siege_mult,
+        Some(TargetClass::Cavalry) => stats.vs_cavalry_mult,
+        _ => 1.0,
+    }
+}
+
 fn priority_rank(class: Option<TargetClass>, priority: &TargetPriority) -> usize {
     match class {
         Some(class) => priority
@@ -692,18 +716,16 @@ fn engagement(
         // effective one, so the debuff shows up in dps without a second rule.
         state.cooldown = effective.attack_cooldown.max(0.1);
 
-        // Heroes hit harder every level; siege engines hit buildings harder
-        // still, and cavalry hits siege engines harder still. The target type
-        // is known here, so projectiles are minted carrying the already-
-        // multiplied damage — a catapult boulder homing on a structure lands
-        // for the full siege amount.
-        let type_mult = if target_building.is_some() {
-            stats.vs_building_mult
-        } else if target_unit.map(|u| u.kind) == Some(UnitKind::Catapult) {
-            stats.vs_siege_mult
-        } else {
-            1.0
-        };
+        // Heroes hit harder every level; the type multipliers stack the
+        // counter-triangle on top of that. The target type is known here, so
+        // projectiles are minted carrying the already-multiplied damage — a
+        // catapult boulder homing on a structure lands for the full siege
+        // amount.
+        let type_mult = type_damage_mult(
+            &stats,
+            target_unit.map(|u| u.kind),
+            target_building.is_some(),
+        );
         // A worker under Call to Arms swings a militia weapon, not a pickaxe.
         let base_damage = if unit.kind == UnitKind::Worker && militia.is_some() {
             MILITIA_DAMAGE
@@ -1151,7 +1173,8 @@ fn use_items(
                 let hall = halls
                     .iter()
                     .filter(|(building, hall_team, _)| {
-                        building.kind == BuildingKind::TownHall && *hall_team == team
+                        // Any rung of the hall ladder is home.
+                        is_hall(building.kind) && *hall_team == team
                     })
                     .map(|(_, _, hall_tf)| hall_tf.translation)
                     .min_by(|a, b| {
@@ -1482,5 +1505,192 @@ fn update_health_bars(
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Balance probe
+// ---------------------------------------------------------------------------
+//
+// A melee engagement in this game is arithmetic: two blocks close, then trade
+// `damage * type_mult` every `attack_cooldown` until one block is gone.
+// Movement decides *when* that starts, not who wins it. So the counter
+// triangle can be checked without a World — this steps the real stat tables
+// through the real multiplier rule and reports who is left standing.
+//
+// The numbers it guards are the ones that make the Spearman a counter rather
+// than a strictly-better Footman: it must beat cavalry it could never catch,
+// and it must lose to the same gold spent on Footmen.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One combatant's mutable state.
+    struct Fighter {
+        hp: f32,
+        cooldown: f32,
+    }
+
+    /// Outcome of a block-vs-block fight: surviving HP on each side.
+    struct Outcome {
+        a_hp: Vec<f32>,
+        b_hp: Vec<f32>,
+    }
+
+    impl Outcome {
+        fn a_alive(&self) -> usize {
+            self.a_hp.iter().filter(|hp| **hp > 0.0).count()
+        }
+        fn b_alive(&self) -> usize {
+            self.b_hp.iter().filter(|hp| **hp > 0.0).count()
+        }
+        /// Winning side's remaining HP as a fraction of what it started with —
+        /// "convincingly" should be a number, not a vibe.
+        fn a_hp_fraction(&self, kind: UnitKind, n: usize) -> f32 {
+            self.a_hp.iter().sum::<f32>() / (unit_stats(kind).hp * n as f32)
+        }
+    }
+
+    /// Step `a_n` units of one kind against `b_n` of another until one side is
+    /// wiped (or two game-minutes pass, meaning neither side can finish).
+    ///
+    /// Both sides resolve simultaneously, so nobody wins on initiative, and
+    /// each attacker round-robins onto a living enemy rather than focus-firing
+    /// — the game has no focus-fire order either, and perfect focus fire would
+    /// hand every fight to whichever side merely brought more bodies.
+    fn engage(a_kind: UnitKind, a_n: usize, b_kind: UnitKind, b_n: usize) -> Outcome {
+        const DT: f32 = 0.02;
+        const TIMEOUT: f32 = 120.0;
+
+        let (a_stats, b_stats) = (unit_stats(a_kind), unit_stats(b_kind));
+        let a_hit = a_stats.damage * type_damage_mult(&a_stats, Some(b_kind), false);
+        let b_hit = b_stats.damage * type_damage_mult(&b_stats, Some(a_kind), false);
+
+        let mut a: Vec<Fighter> = (0..a_n)
+            .map(|_| Fighter { hp: a_stats.hp, cooldown: 0.0 })
+            .collect();
+        let mut b: Vec<Fighter> = (0..b_n)
+            .map(|_| Fighter { hp: b_stats.hp, cooldown: 0.0 })
+            .collect();
+
+        let mut t = 0.0;
+        while t < TIMEOUT {
+            let a_live: Vec<usize> = (0..a.len()).filter(|i| a[*i].hp > 0.0).collect();
+            let b_live: Vec<usize> = (0..b.len()).filter(|i| b[*i].hp > 0.0).collect();
+            if a_live.is_empty() || b_live.is_empty() {
+                break;
+            }
+
+            // Collect both sides' swings before applying either, so a fighter
+            // that dies this tick still lands the blow it had already earned.
+            let mut into_b = vec![0.0f32; b.len()];
+            let mut into_a = vec![0.0f32; a.len()];
+            for (slot, i) in a_live.iter().enumerate() {
+                if a[*i].cooldown <= 0.0 {
+                    a[*i].cooldown = a_stats.attack_cooldown;
+                    into_b[b_live[slot % b_live.len()]] += a_hit;
+                } else {
+                    a[*i].cooldown -= DT;
+                }
+            }
+            for (slot, i) in b_live.iter().enumerate() {
+                if b[*i].cooldown <= 0.0 {
+                    b[*i].cooldown = b_stats.attack_cooldown;
+                    into_a[a_live[slot % a_live.len()]] += b_hit;
+                } else {
+                    b[*i].cooldown -= DT;
+                }
+            }
+            for (f, dmg) in a.iter_mut().zip(into_a) {
+                f.hp -= dmg;
+            }
+            for (f, dmg) in b.iter_mut().zip(into_b) {
+                f.hp -= dmg;
+            }
+            t += DT;
+        }
+
+        Outcome {
+            a_hp: a.iter().map(|f| f.hp.max(0.0)).collect(),
+            b_hp: b.iter().map(|f| f.hp.max(0.0)).collect(),
+        }
+    }
+
+    /// The multiplier table is keyed off `TargetClass`, and exactly one
+    /// multiplier may ever apply to a swing.
+    #[test]
+    fn type_multipliers_follow_target_class() {
+        let spear = unit_stats(UnitKind::Spearman);
+        assert_eq!(
+            type_damage_mult(&spear, Some(UnitKind::Raider), false),
+            5.0,
+            "the Spearman's whole reason to exist"
+        );
+        assert_eq!(type_damage_mult(&spear, Some(UnitKind::Footman), false), 1.0);
+        assert_eq!(type_damage_mult(&spear, Some(UnitKind::Catapult), false), 1.0);
+        assert_eq!(type_damage_mult(&spear, None, true), 1.0);
+
+        // The pre-existing counters must survive the move onto TargetClass.
+        let raider = unit_stats(UnitKind::Raider);
+        assert_eq!(type_damage_mult(&raider, Some(UnitKind::Catapult), false), 2.0);
+        assert_eq!(type_damage_mult(&raider, Some(UnitKind::Footman), false), 1.0);
+        let catapult = unit_stats(UnitKind::Catapult);
+        assert_eq!(type_damage_mult(&catapult, None, true), 6.0);
+    }
+
+    /// A 90g Spearman beats a 170g Raider one-on-one, and not by a hair —
+    /// a counter nobody trusts is not a counter.
+    #[test]
+    fn spearman_beats_raider_one_on_one() {
+        let out = engage(UnitKind::Spearman, 1, UnitKind::Raider, 1);
+        assert_eq!(out.b_alive(), 0, "the Raider should die");
+        assert_eq!(out.a_alive(), 1, "the Spearman should live");
+        let left = out.a_hp_fraction(UnitKind::Spearman, 1);
+        assert!(
+            // Measured: 0.30 of its 160 hp. The margin is the design — wide
+            // enough that a player believes the counter, narrow enough that
+            // walking one Spearman at a Raider is not free.
+            left > 0.25,
+            "Spearman should finish comfortably ahead, had {left:.3} left",
+        );
+    }
+
+    /// ...and is not a general-purpose upgrade: the same gold spent on
+    /// Footmen beats a bigger block of Spearmen, so the cheap unit only pays
+    /// off against the thing it is pointed at.
+    #[test]
+    fn equal_gold_footmen_beat_spearmen() {
+        // 270 gold each way: 2 Footmen (135g) vs 3 Spearmen (90g).
+        assert_eq!(unit_stats(UnitKind::Footman).cost_gold * 2, 270);
+        assert_eq!(unit_stats(UnitKind::Spearman).cost_gold * 3, 270);
+        let out = engage(UnitKind::Footman, 2, UnitKind::Spearman, 3);
+        assert_eq!(out.b_alive(), 0, "the Spearmen should be wiped");
+        // Measured: 1 of the 2 Footmen survives, on 24% of the pair's HP. Not
+        // a rout in either direction — Spearmen are cheap enough that massing
+        // them is a real option, just never a *free* one.
+        assert!(out.a_alive() > 0, "at least one Footman should live");
+    }
+
+    /// The straight duel, for the record: a Footman handles a Spearman easily.
+    #[test]
+    fn footman_beats_spearman_one_on_one() {
+        let out = engage(UnitKind::Footman, 1, UnitKind::Spearman, 1);
+        assert_eq!(out.b_alive(), 0);
+        assert!(
+            out.a_hp_fraction(UnitKind::Footman, 1) > 0.5,
+            "and without dropping below half"
+        );
+    }
+
+    /// The same gold pointed at what it counters: 270g of Spearmen erases the
+    /// cavalry it meets without losing a body.
+    #[test]
+    fn equal_gold_spearmen_beat_raiders() {
+        // 270g buys 1.59 Raiders; 1 Raider vs 3 Spearmen is the closest
+        // whole-unit trade, and it is still a rout.
+        let out = engage(UnitKind::Spearman, 3, UnitKind::Raider, 1);
+        assert_eq!(out.b_alive(), 0);
+        assert_eq!(out.a_alive(), 3, "cavalry should not even take one with it");
     }
 }
