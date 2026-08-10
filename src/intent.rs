@@ -67,6 +67,7 @@
 //! intent was spelled, which is the point: a replay reads identically whether
 //! the match was played with a mouse or with JSON.
 
+use crate::command::{CommandLink, OrderIssuer};
 use crate::shared::*;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -327,6 +328,10 @@ fn apply_intents(
     mut notices: ResMut<UiNotices>,
     mut events: IntentEvents,
     mut world: IntentWorld,
+    // Chain of Command (docs/TEMPO.md §3). Read-only: how far each unit is
+    // from its team's nearest command node, and the curve that turns that into
+    // seconds. Inert with WC3_COMMAND_LATENCY unset.
+    link: CommandLink,
 ) {
     // Owned copies: the compiler needs `&mut` on resources the reader borrows
     // from, and a batch is a handful of values.
@@ -339,6 +344,10 @@ fn apply_intents(
     let mut notice_budget = UI_NOTICE_BURST;
     for submission in batch {
         let mut errors: Vec<String> = Vec::new();
+        // One issuer per sentence, so `max_delay` reports what THIS intent
+        // cost — a group order spread across the map is logged with the worst
+        // link any of its units pays.
+        let mut issuer = link.issuer(now);
         compile_intent(
             submission.intent.clone(),
             submission.team,
@@ -364,8 +373,9 @@ fn apply_intents(
             &mut commands,
             &mut events,
             &mut world,
+            &mut issuer,
         );
-        log.record(now, &submission, &errors);
+        log.record(now, &submission, &errors, issuer.max_delay);
         // The human's copy of the error channel. Source decides which renderer
         // is told, never whether the intent was legal — the verdict above was
         // reached without consulting it.
@@ -416,6 +426,14 @@ fn compile_intent(
     commands: &mut Commands,
     events: &mut IntentEvents,
     world: &mut IntentWorld,
+    // docs/TEMPO.md §3. Every *direct* unit order below goes through this
+    // instead of `commands.entity(e).try_insert(order)`, and that one
+    // substitution is the whole of Chain of Command on the player path. Which
+    // verbs are direct — and why the rest are not — is the table in
+    // command.rs's module docs. Production, doctrine, casts and match-level
+    // verbs keep writing straight through: standing orders are the fast path,
+    // and that asymmetry IS the mechanism.
+    issuer: &mut OrderIssuer,
 ) {
     // Named locally so the arms below read exactly as they did when this was
     // one interface's private applier.
@@ -438,6 +456,7 @@ fn compile_intent(
                 me,
                 Vec3::new(x, 0.0, z),
                 false,
+                issuer,
             );
         }
         Intent::AttackMove { units: ids, x, z } => {
@@ -451,6 +470,7 @@ fn compile_intent(
                 me,
                 Vec3::new(x, 0.0, z),
                 true,
+                issuer,
             );
         }
         Intent::Attack { units: ids, target } => {
@@ -484,10 +504,19 @@ fn compile_intent(
                     return;
                 }
             }
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
-                commands
-                    .entity(entity)
-                    .try_insert((Order::Attack(target_entity), mark.order("attack")));
+            // The link is measured from the unit being ordered, not from its
+            // target: what is slow is reaching your own soldier, not reaching
+            // the enemy. The reason travels with the order and is re-timed to
+            // its arrival — see `command::dispatch_pending`.
+            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
+                issuer.issue(
+                    commands,
+                    me,
+                    pos,
+                    entity,
+                    Order::Attack(target_entity),
+                    mark.order("attack"),
+                );
             }
         }
         Intent::Harvest { units: ids, target } => {
@@ -500,7 +529,7 @@ fn compile_intent(
                     return;
                 }
             };
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
+            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
                 // Only workers can gather; anyone else would just stand there.
                 if !is_worker(units, entity) {
                     errors.push(format!(
@@ -509,16 +538,26 @@ fn compile_intent(
                     ));
                     continue;
                 }
-                commands
-                    .entity(entity)
-                    .try_insert((Order::Harvest(node), mark.order("harvest")));
+                issuer.issue(
+                    commands,
+                    me,
+                    pos,
+                    entity,
+                    Order::Harvest(node),
+                    mark.order("harvest"),
+                );
             }
         }
         Intent::Return { units: ids } => {
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
-                commands
-                    .entity(entity)
-                    .try_insert((Order::ReturnResources, mark.order("return")));
+            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
+                issuer.issue(
+                    commands,
+                    me,
+                    pos,
+                    entity,
+                    Order::ReturnResources,
+                    mark.order("return"),
+                );
             }
         }
         Intent::Follow { units: ids, target } => {
@@ -535,22 +574,28 @@ fn compile_intent(
                     return;
                 }
             };
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
+            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
                 if entity == leader {
                     continue; // a unit following itself would deadlock its own order
                 }
-                commands
-                    .entity(entity)
-                    .try_insert((Order::Follow(leader), mark.order("follow")));
+                issuer.issue(
+                    commands,
+                    me,
+                    pos,
+                    entity,
+                    Order::Follow(leader),
+                    mark.order("follow"),
+                );
             }
         }
         Intent::Stop { units: ids } => {
             // The established Stop: re-issue a Move to the unit's own spot,
-            // which halts it and clears any attack target.
+            // which halts it and clears any attack target. It is a direct
+            // order like any other — "halt" travels down the same wire as
+            // "advance", which is what stops latency from being escapable by
+            // spamming stop.
             for (entity, pos) in own_units(&ids, units, me, tag, errors) {
-                commands
-                    .entity(entity)
-                    .try_insert((Order::Move(pos), mark.order("stop")));
+                issuer.issue(commands, me, pos, entity, Order::Move(pos), mark.order("stop"));
             }
         }
         Intent::Build {
@@ -604,13 +649,22 @@ fn compile_intent(
                 return;
             }
             // economy.rs pays when the worker reaches the site, same as the UI.
-            commands.entity(entity).try_insert((
+            //
+            // EXEMPT from link latency, per docs/TEMPO.md §4's open question,
+            // answered as it recommends: the worker has to walk to the site
+            // anyway, so the delay would be invisible at the point of contact
+            // and would show up only as a slower economy. Taxing the build
+            // order taxes macro, and macro is not the thing reaction speed was
+            // winning. It still stamps its reason like every other verb.
+            issuer.issue_instant(
+                commands,
+                entity,
                 Order::Build {
                     kind: building_kind,
                     pos,
                 },
                 mark.order("build"),
-            ));
+            );
         }
         Intent::Upgrade { building } => {
             let Some(entity) = intent_entity(building) else {
@@ -921,8 +975,16 @@ fn compile_intent(
             // have one) or one of our finished buildings with an ability.
             // combat.rs owns the unlock/mana/cooldown verdict either way,
             // exactly as it does for the R and C hotkeys.
+            // Where the caster is standing, when it is a unit. `None` means a
+            // building caster, which needs no position: `abilities_of_building`
+            // is `is_hall`-only and a hall IS a command node, so its link is
+            // provably zero (`every_building_caster_is_a_command_node`).
+            let mut caster_pos: Option<Vec3> = None;
             let unit_list = match units.get(entity) {
-                Ok((_, u, team, _, _)) if *team == me => abilities_of_unit(u.kind),
+                Ok((_, u, team, tf, _)) if *team == me => {
+                    caster_pos = Some(tf.translation);
+                    abilities_of_unit(u.kind)
+                }
                 _ => &[][..],
             };
             let list = if !unit_list.is_empty() {
@@ -973,7 +1035,20 @@ fn compile_intent(
                     Some(reference.clone())
                 }
             };
-            events.casts.write(CastAbility { caster: entity, ability: selector });
+            // A DIRECT ORDER, and priced like one (docs/TEMPO.md §7). For a
+            // hero this computes zero — a hero is a command node, so hero
+            // micro is exactly as fast as it always was — and for a Sorcerer
+            // standing in the middle of a fight it costs what reaching that
+            // far costs. The player who would rather not pay it has the
+            // `autocast` verb, which is instant, and that is the whole design.
+            match caster_pos {
+                Some(pos) => {
+                    issuer.issue_cast(commands, &mut events.casts, me, pos, entity, selector)
+                }
+                None => {
+                    events.casts.write(CastAbility { caster: entity, ability: selector });
+                }
+            }
         }
         Intent::Buy { shop, item, hero } => {
             let Some(item) = parse_item(&item) else {
@@ -1363,8 +1438,16 @@ struct IntentRecord<'a> {
     source: &'a str,
     tag: &'a str,
     verb: &'a str,
-    /// The half a person reads.
+    /// The half a person reads. Carries a `(+N.Ns link)` suffix when Chain of
+    /// Command delayed the order — a world fact about how far the unit was
+    /// from its command structure, not a fact about how the intent was
+    /// spelled, so it belongs in the sentence rather than beside it.
     sentence: String,
+    /// Worst link latency this intent paid, in seconds. Absent (rather than
+    /// `0.0`) whenever nothing was delayed, so a `WC3_COMMAND_LATENCY`-off log
+    /// line is character-for-character a v1 log line.
+    #[serde(skip_serializing_if = "no_link")]
+    link: f32,
     /// The provenance string this intent stamps on the units it moves — the
     /// join key between this log and a snapshot's `units[].why`. Grep a unit's
     /// answer here and you land on the sentence that caused it. Absent for the
@@ -1382,6 +1465,10 @@ struct IntentRecord<'a> {
 
 fn no_errors(errs: &&[String]) -> bool {
     errs.is_empty()
+}
+
+fn no_link(link: &f32) -> bool {
+    *link <= 0.0
 }
 
 /// Header written once when a match opens its log.
@@ -1419,10 +1506,11 @@ impl IntentLog {
         }
     }
 
-    fn record(&mut self, now: f32, submission: &SubmitIntent, errors: &[String]) {
+    fn record(&mut self, now: f32, submission: &SubmitIntent, errors: &[String], raw_link: f32) {
         if self.path.is_none() || self.broken {
             return;
         }
+        let link = (raw_link * 10.0).round() / 10.0;
         let record = IntentRecord {
             wall_ms: wall_ms(),
             t: (now * 10.0).round() / 10.0,
@@ -1430,11 +1518,23 @@ impl IntentLog {
             source: submission.source.name(),
             tag: &submission.tag,
             verb: submission.intent.verb(),
-            sentence: submission.intent.sentence(),
+            sentence: link_sentence(&submission.intent, link),
+            link,
             why: submission.intent.provenance_verb().map(|verb| {
                 IntentMark {
+                    // ARRIVAL, not speech. This string is the join key
+                    // between this log and a snapshot's `units[].why`, so it
+                    // has to be character-for-character what the unit will
+                    // answer — and what the unit answers is stamped when the
+                    // order LANDS (`command::dispatch_pending`). The moment it
+                    // was spoken is not lost: it is this record's own `t`, and
+                    // `link` is the gap between the two.
+                    //
+                    // Raw rather than the rounded `link` above, so the two
+                    // renderings round identically instead of drifting by a
+                    // tenth.
+                    at: now + raw_link,
                     source: submission.source,
-                    at: now,
                 }
                 .order(verb)
                 .why()
@@ -1482,6 +1582,22 @@ impl IntentLog {
         writeln!(file, "{line}")?;
         file.flush()
     }
+}
+
+/// The sentence, plus what the chain of command charged to deliver it:
+///
+/// ```text
+/// [ 91.6s] Human/ui: 4 units attack-move to (12.0, -30.0) (+1.8s link)
+/// ```
+///
+/// A replay of a match played with `WC3_COMMAND_LATENCY` off is unannotated
+/// and therefore identical to a v1 replay.
+fn link_sentence(intent: &Intent, link: f32) -> String {
+    let sentence = intent.sentence();
+    if link <= 0.0 {
+        return sentence;
+    }
+    format!("{sentence} (+{link:.1}s link)")
 }
 
 fn wall_ms() -> u64 {
@@ -1625,17 +1741,24 @@ fn ground_order(
     me: Team,
     ground: Vec3,
     attack_move: bool,
+    issuer: &mut OrderIssuer,
 ) {
     let group = own_units(ids, units, me, tag, errors);
     let count = group.len();
-    for (i, (entity, _)) in group.into_iter().enumerate() {
+    for (i, (entity, pos)) in group.into_iter().enumerate() {
         let p = clamp_to_map(ground + formation_offset(i, count));
         let order = if attack_move {
             Order::AttackMove(p)
         } else {
             Order::Move(p)
         };
-        commands.entity(entity).try_insert((order, why));
+        // Each member pays its OWN link, measured where it is standing now —
+        // a group half in the base and half at the front arrives in two
+        // waves, which is the mechanic being honest rather than a bug. (The
+        // log's `why` names the WORST of them, so it joins against the last
+        // unit to receive the order; the rest answer with their own, earlier
+        // arrival.)
+        issuer.issue(commands, me, pos, entity, order, why);
     }
 }
 
@@ -1769,6 +1892,7 @@ pub fn set_autopilot(ai_controlled: &mut AiControlled, team: Team, on: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{CommandLatency, CommandNodes, PendingOrder};
 
     /// An app running the real compiler against a real (if bare) world.
     ///
@@ -1792,6 +1916,13 @@ mod tests {
             .add_event::<UseItem>()
             .add_event::<UpgradeBuilding>()
             .add_event::<StartResearch>()
+            // Chain of Command's two resources (docs/TEMPO.md §3). Defaulted
+            // rather than plugged in: the default is `on: false`, so the
+            // compiler behaves exactly as it did before latency existed and
+            // every assertion below is about compilation, not propagation.
+            // The tests that DO exercise propagation turn it on explicitly.
+            .init_resource::<CommandNodes>()
+            .init_resource::<CommandLatency>()
             .add_plugins(IntentPlugin);
         app.insert_resource(IntentLog {
             path: None,
@@ -1801,6 +1932,73 @@ mod tests {
         // Pin the fog mode: the ambient `WC3_FOG` must not decide an outcome.
         app.insert_resource(FogGrids::test_dark());
         app
+    }
+
+    /// **The new direct-order path pays, and nobody had to remember to make it
+    /// pay.** The ghost right-click (bead/polish) taught the human a gesture
+    /// that produces `Intent::Attack` against a remembered building. It landed
+    /// after Chain of Command was written, was never considered by it, and is
+    /// priced correctly anyway — because there is exactly one `Attack` arm and
+    /// exactly one place an order becomes real.
+    ///
+    /// This is the choke point (docs/INTENT.md) paying for itself: a new way of
+    /// speaking cannot accidentally arrive at a privileged speed.
+    #[test]
+    fn a_ghost_attack_pays_the_link_like_any_other_direct_order() {
+        let mut app = compiler_app();
+        // Latency on, and this team owns no command nodes — the severed-arm
+        // case, so any positive charge proves the path was priced at all.
+        app.insert_resource(CommandLatency { on: true, ..Default::default() })
+            .insert_resource(CommandNodes { nodes: Vec::new(), ready: true });
+
+        let barracks_at = Vec3::new(60.0, 0.0, 60.0);
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Order::Idle,
+            ))
+            .id();
+        let barracks = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Claude,
+                Transform::from_translation(barracks_at),
+                Health::new(700.0),
+            ))
+            .id();
+        remember(&mut app, Team::Human, barracks, BuildingKind::Barracks, barracks_at);
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Attack {
+                units: vec![soldier.to_bits()],
+                target: barracks.to_bits(),
+            },
+        ));
+        app.update();
+
+        // Still legal, and still validated in the frame it was spoken: the
+        // compiler's verdict is never what gets deferred.
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "the ghost attack must stay legal"
+        );
+        let pending = app
+            .world()
+            .entity(soldier)
+            .get::<PendingOrder>()
+            .expect("a direct attack from outside the chain of command must travel");
+        assert!(matches!(pending.order, Order::Attack(t) if t == barracks));
+        assert!(pending.link() > 0.0);
+        // ...and the soldier has not started marching yet.
+        assert!(
+            matches!(app.world().entity(soldier).get::<Order>(), Some(Order::Idle)),
+            "an in-transit attack must not disturb the unit yet"
+        );
     }
 
     /// Remember `building` (an enemy structure) in `team`'s grid, exactly as
