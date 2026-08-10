@@ -22,7 +22,10 @@ squad 0 (default posture: defend your base). Repoint squad 0 — or set it to
 Commands: `python3 tools/bridge_send.py --seat <SEAT> '<json array>'`.
 Each command: `{"type":..., ...}`. Errors come back in the next snapshot's
 `errors` — read them, they mean a command was rejected (dead unit, can't
-afford, not yours). `seq` is handled for you.
+afford, not yours). `seq` is handled for you. If `applied` is present in the
+next snapshot it is the other half of that verdict: `[{"cmd":"cmd 3","delay":1.8}]`
+says command 3 was accepted but took 1.8s to reach the units it named — see
+**The chain of command** below. Commands not listed there cost nothing.
 
 ## Command reference
 Unit orders (ids from state):
@@ -166,6 +169,50 @@ plan.
 The log ties the two together — an order's line in `intent_log.jsonl` carries
 the same `why` string it stamped, so a unit's answer and the sentence that
 caused it are one grep apart.
+
+## The chain of command — read `link` before you micro
+
+Only present when the match is played with command latency enabled. If your
+snapshot has no `command_nodes` key and your units have no `link`, this whole
+section is inert and you can ignore it.
+
+When it IS on: **a direct order to a unit does not take effect the moment you
+send it.** It arrives after a delay that grows with that unit's distance from
+your nearest *command node* — a finished hall, or a living hero. Standing orders
+do not pay: `squad`, `posture`, `retreat`, `leash`, `autocast`, `priority`,
+`template` all take effect at once, wherever the unit is. So does anything
+addressed to a building (`train`, `research`, `rally`, `upgrade`) and so does
+`build`.
+
+What to read, and what it means:
+
+| Field | Meaning |
+|---|---|
+| `command_nodes: [{pos, radius}]` | Your own nodes. A unit inside one of these circles takes orders for free. Your team only — you do not get to read theirs. |
+| `units[].link` | Seconds your *next* direct order to that unit would take to arrive. `0.0` = free. |
+| `units[].pending` | `true` = an order you already sent is still travelling to it. |
+| `applied: [{cmd, delay}]` | What the commands in your last batch actually cost, keyed by the same `cmd N` handle `errors` uses. Absent entries cost nothing. |
+
+Three rules worth having before you learn them the hard way:
+
+1. **Saying the same thing again does not restart the journey.** Re-sending an
+   unchanged order to a unit with `pending: true` is a no-op, not a reset — so
+   re-sending your whole batch each cycle is safe. Sending a *different* order
+   replaces the one in flight and pays again from zero. Latency is the price of
+   changing your mind at range, not a tax per command.
+2. **`pending: true` with `why: "idle"` is not a lost order.** A unit that has
+   finished its last task and not yet received the next one genuinely is idle,
+   and says so. Look at `pending`, not at `why`, to know whether something is
+   coming.
+3. **Doctrine is strictly faster than micro at range, by construction.** If you
+   are ordering units around at `link: 2.0`, you are playing two seconds behind
+   the fight. Set a `posture` on the squad instead: it re-tasks them every second
+   at machine speed, for free, wherever they are. Move a hero to the front and
+   you buy a free-orders bubble around it — at the price of putting your most
+   valuable unit in the most dangerous place.
+
+Losing every hall AND every hero severs the arm: every order then pays the
+maximum. That is a real way to lose a game that still looks winnable on paper.
 
 ## If your seat is `bridge/copilot`: you are a CO-COMMANDER
 

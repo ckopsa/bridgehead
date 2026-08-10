@@ -133,8 +133,9 @@ impl Plugin for IntentPlugin {
         app.add_event::<SubmitIntent>()
             .init_resource::<IntentErrors>()
             // Registered here rather than in CorePlugin for the same reason
-            // `IntentErrors` is: bridge.rs reads both, but this file is the
-            // only thing that ever writes them.
+            // `IntentErrors` is: bridge.rs reads all three, but this file is
+            // the only thing that ever writes them.
+            .init_resource::<IntentApplied>()
             .init_resource::<IntentJournal>()
             .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
@@ -327,6 +328,8 @@ fn apply_intents(
     mut squad_orders: ResMut<SquadOrders>,
     mut ai_controlled: ResMut<AiControlled>,
     mut error_log: ResMut<IntentErrors>,
+    // The positive half of the same channel: what each command cost to deliver.
+    mut applied_log: ResMut<IntentApplied>,
     mut log: ResMut<IntentLog>,
     mut journal: ResMut<IntentJournal>,
     mut feed: ResMut<GameEvents>,
@@ -413,6 +416,33 @@ fn apply_intents(
         if sink.len() > MAX_ERRORS {
             let overflow = sink.len() - MAX_ERRORS;
             sink.drain(..overflow);
+        }
+
+        // **The acknowledgement** (docs/TEMPO.md §4, issue 6). The human at the
+        // keyboard learns the link from the HUD; a commander on the wire has no
+        // HUD, so what it paid has to come back on the wire or it can only ever
+        // infer the mechanic from things going wrong.
+        //
+        // Bridge-sourced only — a UI gesture's seat is a person looking at the
+        // selection panel, and echoing their every right-click into the other
+        // seat's snapshot would be noise for a reader that is not there.
+        //
+        // Silence when nothing was charged, on the same reasoning the intent
+        // log omits its `link` field: an order that landed in the frame it was
+        // spoken has nothing to acknowledge, and this keeps the whole channel
+        // empty — and its wire key absent — whenever the feature is off.
+        if submission.source == IntentSource::Bridge && issuer.max_delay > 0.0 {
+            let sink = applied_log.get_mut(submission.team);
+            sink.push(AppliedCommand {
+                cmd: submission.tag.clone(),
+                delay: issuer.max_delay,
+            });
+            // Bounded exactly like the error sink beside it: a snapshot is a
+            // status report, not a transcript.
+            if sink.len() > MAX_ERRORS {
+                let overflow = sink.len() - MAX_ERRORS;
+                sink.drain(..overflow);
+            }
         }
     }
 }
@@ -1922,7 +1952,7 @@ pub fn set_autopilot(ai_controlled: &mut AiControlled, team: Team, on: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::{CommandLatency, CommandNodes, PendingOrder};
+    use crate::command::{CommandLatency, CommandNodes, PendingOrder, DEFAULT_HALL_RADIUS};
 
     /// An app running the real compiler against a real (if bare) world.
     ///
@@ -2024,6 +2054,104 @@ mod tests {
         assert!(
             matches!(app.world().entity(soldier).get::<Order>(), Some(Order::Idle)),
             "an in-transit attack must not disturb the unit yet"
+        );
+    }
+
+    /// **The acknowledgement** (docs/TEMPO.md §4, issue 6). A commander on the
+    /// wire has no HUD: if reaching a unit cost it two seconds, the only way it
+    /// can find that out is if the wire says so. `applied` is that answer, keyed
+    /// by the same `cmd N` handle the error channel already uses, so a batch's
+    /// refusals and its costs read as one verdict.
+    ///
+    /// The three cases in one test, because it is the *contrast* that is the
+    /// contract: a bridge command that paid is reported; the human's own gesture
+    /// is not (their acknowledgement is the selection panel, and echoing it onto
+    /// the wire would be noise for a reader who is not there); and a command
+    /// that cost nothing says nothing, which is what keeps the channel — and its
+    /// wire key — empty whenever the feature is off.
+    #[test]
+    fn a_bridge_command_is_told_what_reaching_its_units_cost() {
+        let mut app = compiler_app();
+        // The severed-arm case again: no nodes, so every direct order pays.
+        app.insert_resource(CommandLatency { on: true, ..Default::default() })
+            .insert_resource(CommandNodes { nodes: Vec::new(), ready: true });
+
+        let far = Vec3::new(60.0, 0.0, 60.0);
+        let spawn_soldier = |app: &mut App| {
+            app.world_mut()
+                .spawn((
+                    Unit { kind: UnitKind::Footman },
+                    Team::Human,
+                    Transform::from_translation(far),
+                    Order::Idle,
+                ))
+                .id()
+        };
+        let commanded = spawn_soldier(&mut app);
+        let clicked = spawn_soldier(&mut app);
+
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 3".to_string(),
+            intent: Intent::Move { units: vec![commanded.to_bits()], x: 0.0, z: 0.0 },
+        });
+        // The same sentence, from the seat with a screen.
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Move { units: vec![clicked.to_bits()], x: 0.0, z: 0.0 },
+        ));
+        app.update();
+
+        let charged = app
+            .world()
+            .entity(commanded)
+            .get::<PendingOrder>()
+            .expect("a direct order from outside the chain of command travels")
+            .link();
+        assert!(charged > 0.0);
+
+        let applied = app.world().resource::<IntentApplied>().get(Team::Human).clone();
+        assert_eq!(
+            applied.len(),
+            1,
+            "expected exactly the bridge command to be acknowledged, got {applied:?}"
+        );
+        assert_eq!(
+            applied[0].cmd, "cmd 3",
+            "the acknowledgement must name the command with the same handle the \
+             error channel uses, or the two cannot be joined"
+        );
+        assert!(
+            (applied[0].delay - charged).abs() < 1e-5,
+            "acknowledged {:.3}s but actually charged {charged:.3}s",
+            applied[0].delay
+        );
+
+        // A command that costs nothing is not worth a line: the same batch
+        // spoken from inside a command node's radius acknowledges silence.
+        app.insert_resource(CommandNodes {
+            nodes: vec![(Team::Human, far, DEFAULT_HALL_RADIUS)],
+            ready: true,
+        });
+        app.world_mut().resource_mut::<IntentApplied>().human.clear();
+        let inside = spawn_soldier(&mut app);
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: Intent::Move { units: vec![inside.to_bits()], x: 61.0, z: 61.0 },
+        });
+        app.update();
+
+        assert!(
+            app.world().entity(inside).get::<PendingOrder>().is_none(),
+            "an order given inside a node's radius must land at once"
+        );
+        assert!(
+            app.world().resource::<IntentApplied>().get(Team::Human).is_empty(),
+            "silence means instant — an order that paid nothing must not be \
+             acknowledged, or the wire gains a key with the feature off"
         );
     }
 
