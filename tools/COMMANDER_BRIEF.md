@@ -151,7 +151,6 @@ trainer, so cross-check against `requires`.
   charge (a slowed Raider is slower than a Footman) and the way you cover a retreat. Slow
   **refreshes rather than stacks**, so 2-3 Sorcerers buy frontage, not depth — a wall of them
   is wasted supply. Keep them behind the line; anything that reaches one kills it.
->>>>>>> bead/1qq4y0
 - Ranged units/towers outrange melee; footmen tank; workers fight terribly.
 - Towers shoot at enemy units in range on their own; Walls just block pathing and soak hits.
   Defense is a real strategy — and SIEGE is its counter: check the catalog for what outranges towers.

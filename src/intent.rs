@@ -204,6 +204,20 @@ pub struct IntentWorld<'w, 's> {
     researching: IntentResearching<'w, 's>,
 }
 
+/// The read-only world knowledge a compile consults: money, hero records,
+/// tiers, nav, research and fog. Bundled because `apply_intents` outgrew
+/// Bevy's 16-param ceiling the moment three sibling features landed at once —
+/// the same read/write split `CastLookup` uses in ui.rs.
+#[derive(SystemParam)]
+pub struct IntentTables<'w> {
+    economies: Res<'w, Economies>,
+    records: Res<'w, HeroRecords>,
+    tiers: Res<'w, TechTiers>,
+    nav: Res<'w, NavGrid>,
+    fog: Res<'w, FogGrids>,
+    team_research: Res<'w, TeamResearch>,
+}
+
 /// The events an intent can emit. ui.rs and bridge.rs each used to carry an
 /// identical four-writer bundle; collapsing them into one is the duplication
 /// this module exists to remove.
@@ -304,12 +318,7 @@ fn apply_intents(
     mut submissions: EventReader<SubmitIntent>,
     mut commands: Commands,
     time: Res<Time>,
-    economies: Res<Economies>,
-    records: Res<HeroRecords>,
-    tiers: Res<TechTiers>,
-    nav: Res<NavGrid>,
-    fog: Res<FogGrids>,
-    team_research: Res<TeamResearch>,
+    tables: IntentTables,
     mut squad_orders: ResMut<SquadOrders>,
     mut ai_controlled: ResMut<AiControlled>,
     mut error_log: ResMut<IntentErrors>,
@@ -336,15 +345,15 @@ fn apply_intents(
             &submission.tag,
             &mut errors,
             &mut ai_controlled,
-            &economies,
-            &records,
+            &tables.economies,
+            &tables.records,
             // The issuing team's tech tier: what hero slots it has open.
-            tiers.get(submission.team),
-            &nav,
-            &team_research,
+            tables.tiers.get(submission.team),
+            &tables.nav,
+            &tables.team_research,
             // The issuer's own fog: what *they* can see decides what they may
             // order, and neither seat gets to borrow the other's eyes.
-            fog.get(submission.team),
+            tables.fog.get(submission.team),
             &mut squad_orders,
             &mut commands,
             &mut events,
@@ -1736,6 +1745,7 @@ mod tests {
         app.init_resource::<Time>()
             .init_resource::<Economies>()
             .init_resource::<HeroRecords>()
+            .init_resource::<TechTiers>()
             .init_resource::<NavGrid>()
             .init_resource::<TeamResearch>()
             .init_resource::<SquadOrders>()
