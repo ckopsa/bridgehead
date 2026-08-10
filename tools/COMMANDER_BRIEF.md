@@ -63,7 +63,11 @@ The live snapshot's `unlocked` map tells you which entries' requirements you
 currently satisfy (e.g. Towers need a Barracks first).
 
 ## The rules of the world (not in the catalog)
-- Map ±100. Your base corner and the enemy's are opposite. **Win = destroy every enemy
+- Map ±100. Your base corner and the enemy's are opposite. **Read `map` in your snapshot**:
+  it names the layout, summarises what the ground does to a plan, and lists every `chokes`
+  entry — the only gaps through impassable terrain. On a map with chokes, walls/towers at a
+  ford are worth far more than anywhere else, and an army cannot be flanked off-road.
+- **Win = destroy every enemy
   PRODUCTION building (TownHall, Barracks, Workshop)** — farms/towers/walls/shops don't
   count; killing the war-making capacity ends it.
 - Workers harvest gold (mines) and lumber (trees) and auto-loop once ordered. ~70/30 gold/lumber split.
