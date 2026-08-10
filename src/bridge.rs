@@ -587,6 +587,19 @@ struct UnitOut {
     /// we can see their army, not their command structure.
     #[serde(skip_serializing_if = "Option::is_none")]
     squad: Option<Option<u8>>,
+    /// Own units only: this unit's answer to "why are you doing that?" —
+    /// `"order:move by bridge t=123"`, `"posture:push sq1"`,
+    /// `"template:Barracks#4294968163"`, `"policy:retreat t=210"`, `"idle"`.
+    /// Always present for your own units; never for the enemy's, because
+    /// reading an opponent's chain of command is reading their plan.
+    ///
+    /// The human's selection panel prints this same string for the same unit.
+    /// That is the point: introspection is part of the decision surface, so it
+    /// has to be equitable too, or one seat gets to ask a question the other
+    /// cannot. Join it against `intent_log.jsonl`'s `why` to find the sentence
+    /// that caused it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    why: Option<String>,
     /// Own units only, and only when at least one policy is set — the common
     /// case is "no doctrine", and an empty object per unit is pure noise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -862,6 +875,7 @@ type SnapshotUnits<'w, 's> = Query<
             Option<&'static RetreatPolicy>,
             Option<&'static LeashPolicy>,
             Option<&'static AutoCastPolicy>,
+            Option<&'static Provenance>,
         ),
         // Hero kit, Call-to-Arms state and per-ability cooldowns, nested for
         // the same reason.
@@ -989,7 +1003,7 @@ fn write_seat_snapshot(
         .iter()
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(|(e, unit, team, tf, health, order, move_to, carrying, hero, doctrine, kit)| {
-            let (squad, prio, retreat, leash, autocast) = doctrine;
+            let (squad, prio, retreat, leash, autocast, why) = doctrine;
             let (inventory, militia, cooldowns) = kit;
             let mine = *team == me;
             let has_policy =
@@ -1021,6 +1035,9 @@ fn write_seat_snapshot(
                 militia,
                 flying: is_flying_kind(unit.kind),
                 squad: mine.then(|| squad.map(|s| s.0)),
+                why: mine.then(|| {
+                    why.map_or_else(|| NO_PROVENANCE.to_string(), Provenance::why)
+                }),
                 policies: (mine && has_policy).then(|| PoliciesOut {
                     prio: prio.map(|p| p.0.iter().map(|c| target_class_name(*c)).collect()),
                     retreat: retreat

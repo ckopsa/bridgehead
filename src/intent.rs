@@ -343,6 +343,12 @@ fn apply_intents(
             submission.intent.clone(),
             submission.team,
             &submission.tag,
+            // Who is speaking and when. Every order this call mints stamps
+            // itself with this, so a unit can name the sentence that moved it.
+            IntentMark {
+                source: submission.source,
+                at: now,
+            },
             &mut errors,
             &mut ai_controlled,
             &tables.economies,
@@ -397,6 +403,7 @@ fn compile_intent(
     intent: Intent,
     me: Team,
     tag: &str,
+    mark: IntentMark,
     errors: &mut Vec<String>,
     ai_controlled: &mut AiControlled,
     economies: &Economies,
@@ -425,6 +432,7 @@ fn compile_intent(
                 commands,
                 errors,
                 tag,
+                mark.order("move"),
                 &ids,
                 units,
                 me,
@@ -437,6 +445,7 @@ fn compile_intent(
                 commands,
                 errors,
                 tag,
+                mark.order("attackmove"),
                 &ids,
                 units,
                 me,
@@ -478,7 +487,7 @@ fn compile_intent(
             for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 commands
                     .entity(entity)
-                    .try_insert(Order::Attack(target_entity));
+                    .try_insert((Order::Attack(target_entity), mark.order("attack")));
             }
         }
         Intent::Harvest { units: ids, target } => {
@@ -500,12 +509,16 @@ fn compile_intent(
                     ));
                     continue;
                 }
-                commands.entity(entity).try_insert(Order::Harvest(node));
+                commands
+                    .entity(entity)
+                    .try_insert((Order::Harvest(node), mark.order("harvest")));
             }
         }
         Intent::Return { units: ids } => {
             for (entity, _) in own_units(&ids, units, me, tag, errors) {
-                commands.entity(entity).try_insert(Order::ReturnResources);
+                commands
+                    .entity(entity)
+                    .try_insert((Order::ReturnResources, mark.order("return")));
             }
         }
         Intent::Follow { units: ids, target } => {
@@ -526,14 +539,18 @@ fn compile_intent(
                 if entity == leader {
                     continue; // a unit following itself would deadlock its own order
                 }
-                commands.entity(entity).try_insert(Order::Follow(leader));
+                commands
+                    .entity(entity)
+                    .try_insert((Order::Follow(leader), mark.order("follow")));
             }
         }
         Intent::Stop { units: ids } => {
             // The established Stop: re-issue a Move to the unit's own spot,
             // which halts it and clears any attack target.
             for (entity, pos) in own_units(&ids, units, me, tag, errors) {
-                commands.entity(entity).try_insert(Order::Move(pos));
+                commands
+                    .entity(entity)
+                    .try_insert((Order::Move(pos), mark.order("stop")));
             }
         }
         Intent::Build {
@@ -587,10 +604,13 @@ fn compile_intent(
                 return;
             }
             // economy.rs pays when the worker reaches the site, same as the UI.
-            commands.entity(entity).try_insert(Order::Build {
-                kind: building_kind,
-                pos,
-            });
+            commands.entity(entity).try_insert((
+                Order::Build {
+                    kind: building_kind,
+                    pos,
+                },
+                mark.order("build"),
+            ));
         }
         Intent::Upgrade { building } => {
             let Some(entity) = intent_entity(building) else {
@@ -1345,6 +1365,13 @@ struct IntentRecord<'a> {
     verb: &'a str,
     /// The half a person reads.
     sentence: String,
+    /// The provenance string this intent stamps on the units it moves — the
+    /// join key between this log and a snapshot's `units[].why`. Grep a unit's
+    /// answer here and you land on the sentence that caused it. Absent for the
+    /// verbs that install policy rather than behaviour (their reason shows up
+    /// later, as `policy:…`, on the frame doctrine.rs acts on it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    why: Option<String>,
     /// False when validation rejected some or all of it.
     ok: bool,
     #[serde(skip_serializing_if = "no_errors")]
@@ -1404,6 +1431,14 @@ impl IntentLog {
             tag: &submission.tag,
             verb: submission.intent.verb(),
             sentence: submission.intent.sentence(),
+            why: submission.intent.provenance_verb().map(|verb| {
+                IntentMark {
+                    source: submission.source,
+                    at: now,
+                }
+                .order(verb)
+                .why()
+            }),
             ok: errors.is_empty(),
             errors,
             intent: &submission.intent,
@@ -1584,6 +1619,7 @@ fn ground_order(
     commands: &mut Commands,
     errors: &mut Vec<String>,
     tag: &str,
+    why: Provenance,
     ids: &[IntentId],
     units: &IntentUnits,
     me: Team,
@@ -1599,7 +1635,7 @@ fn ground_order(
         } else {
             Order::Move(p)
         };
-        commands.entity(entity).try_insert(order);
+        commands.entity(entity).try_insert((order, why));
     }
 }
 

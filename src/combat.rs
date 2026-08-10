@@ -1483,6 +1483,13 @@ fn apply_damage(
             let dir = xz(home - tf.translation).normalize_or_zero();
             let dir = if dir.length_squared() < 1e-6 { Vec3::X } else { dir };
             let flee = clamp_to_map(tf.translation + dir * FLEE_DISTANCE);
+            // Deliberately NOT stamped with a `Provenance`. The panic flee is a
+            // `MoveTo` nudge and leaves the worker's `Order::Harvest` intact,
+            // so there is no order change for `doctrine::idle_instinct` to
+            // expire a stamp on — it would outlive the sprint and the worker
+            // would still be blaming a five-second detour ten minutes later.
+            // Its real answer, "I am harvesting because you told me to", stays
+            // true throughout. See docs/INTENT.md for the follow-up.
             commands
                 .entity(event.victim)
                 .try_insert(MoveTo { target: flee });

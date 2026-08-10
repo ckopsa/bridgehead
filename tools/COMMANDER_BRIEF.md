@@ -74,6 +74,95 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
 - `{"type":"surrender"}` — concede the match (opponent wins immediately). The honorable end to a
   hopeless position — no income, no army, no path back. Preferable to dragging out a decided game.
 
+## Speakable strategy: `tools/intent_compile.py`
+
+Everything above is the JSON. You can also just say it:
+
+```bash
+python3 tools/intent_compile.py --seat <SEAT> --send \
+  "hold the northwest ford, forage mid with the cavalry, retreat at 35%"
+```
+
+It reads your snapshot, compiles each clause into the SAME command objects
+documented above, and writes the batch with the next `seq` (exactly like
+`bridge_send.py`). It prints what it understood, per clause, to stderr:
+
+```
+  ok       'hold the northwest ford'   -> squad 1 defends (-60.0, 60.0) with 7 unit(s)
+  ok       'forage mid with the cavalry'-> squad 2 forages (0.0, 0.0) with 3 unit(s)
+  ok       'retreat at 35%'            -> 10 unit(s) fall back to (70.0, 70.0) below 35%
+```
+
+Why bother when you can write JSON? Because the phrases are shorter than the
+ids, and because places have names: `mid`, `our base`, `their base`, `the
+northwest ford` (any choke in `map.chokes`, by name), `the contested mine`,
+`the nearest bounty`, `the west`. Units too: `the cavalry`, `the siege`, `the
+hero`, `squad 2`, and the default — the whole army, never your workers.
+
+Unit and building vocabulary is read from your seat's `catalog.json` when it is
+there (it always is), so new content is speakable the day it ships — the tool
+learns that the Raider trains at the Barracks, or that a Sanctum trains
+Sorcerers, by reading the same file you do.
+
+**Two heroes, one word.** Hero slots climb the hall ladder, so at a Keep you
+field a Champion *and* a Priestess. `the hero` names the class, i.e. both:
+`autocast at 3`, `retreat at 35% with the hero` and `focus siege` all apply to
+both, which is what you want. The three verbs that take exactly **one** unit —
+`escort`, `buy`, `use` — refuse instead of guessing, and tell you the words
+that fix it:
+
+```
+  FAILED   'escort the hero with the footmen' -> 'the hero' is ambiguous — you
+           have 2 heroes; say the champion or the priestess
+```
+
+Say `the champion` or `the priestess`. `buy a potion for the priestess` fills
+in `buy`'s optional `hero` field for you; with only one hero alive it is
+omitted, exactly as before. The Sorcerer is a caster but **not** a hero, so
+`the hero` never sweeps it up — use `sorcerers`.
+
+- `--explain` prints the full vocabulary. **Read it once**; it is the list of
+  idioms that compile deterministically.
+- Anything it does not know, write by hand. It is a convenience over the schema
+  above, never a gate in front of it, and it never guesses: an unresolvable
+  place or an unknown noun is a reported error, not a silent whole-army move.
+- Conditionals ("strike when their hero falls") have no verb in this game —
+  there is no trigger system. The tool defers them and prints the command to
+  run when you see the condition in `events`.
+
+**Check the round trip.** Every intent, from either seat, is logged as one
+English sentence in `bridge/intent_log.jsonl`. If the sentence is not what you
+meant, the compile was wrong — and you can see that before the army arrives.
+
+## "Why are you doing that?" — `units[].why`
+
+Every one of your units carries the reason for its current behaviour, and
+reports it in the snapshot as a compact `why` string. The human player reads
+the identical string in their selection panel; neither seat can ask a question
+the other cannot.
+
+| `why` | means |
+|---|---|
+| `order:move by bridge t=123` | you ordered it, at game second 123 |
+| `order:attack by ui t=123` | the *human* ordered it — same verb, other seat |
+| `posture:push sq1` | squad 1's standing posture is moving it |
+| `policy:retreat t=210` | its retreat threshold fired; it is running home |
+| `template:Barracks#42` | it spawned with that building's doctrine template |
+| `rally:Barracks#42` | it spawned onto that building's rally point |
+| `script:wave` | the scripted AI is driving it (you are on `autopilot`) |
+| `instinct:auto-enroll` | nobody assigned it, so the engine pooled it in squad 0 |
+| `idle` | nothing to do — it has no reason at all |
+
+Use it. `why` is how you tell "my push stalled" (`posture:push sq1`, still) from
+"my push dissolved" (half the squad reading `policy:retreat`), and how you catch
+the classic mistake of ordering units one at a time and watching doctrine undo
+it next second. Enemy units never carry it: their chain of command is their
+plan.
+
+The log ties the two together — an order's line in `intent_log.jsonl` carries
+the same `why` string it stamped, so a unit's answer and the sentence that
+caused it are one grep apart.
+
 ## What you can build/train: read `<SEAT>/catalog.json`
 The FULL content catalog — every unit, building, ability, research and item:
 costs, stats, train/build times, what produces what, and what gates it.

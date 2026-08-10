@@ -1057,7 +1057,9 @@ fn think(
         if w.tag != Tag::Move {
             let a = (w.entity.index() % 8) as f32 * std::f32::consts::TAU / 8.0;
             let safe = base + Vec3::new(a.cos(), 0.0, a.sin()) * 6.0;
-            commands.entity(w.entity).try_insert(Order::Move(safe));
+            commands
+                .entity(w.entity)
+                .try_insert((Order::Move(safe), script("flee", now)));
         }
     }
 
@@ -1268,7 +1270,7 @@ fn think(
                     if let Some(builder) = pick_builder(&workers, &fleeing, site) {
                         commands
                             .entity(builder)
-                            .try_insert(Order::Build { kind, pos: site });
+                            .try_insert((Order::Build { kind, pos: site }, script("build", now)));
                         brain.pending_build = Some(builder);
                         busy_worker = Some(builder);
                         // economy.rs pays at placement; assume it lands.
@@ -1531,7 +1533,9 @@ fn think(
         if w.carrying {
             // Stranded with a full load (e.g. after a failed drop-off):
             // deliver it; economy.rs resumes the remembered node afterwards.
-            commands.entity(w.entity).try_insert(Order::ReturnResources);
+            commands
+                .entity(w.entity)
+                .try_insert((Order::ReturnResources, script("haul", now)));
             continue;
         }
         brain.harvest_counter = brain.harvest_counter.wrapping_add(1);
@@ -1544,7 +1548,9 @@ fn think(
         let node = nearest_node(nodes, w.pos, first)
             .or_else(|| nearest_node(nodes, w.pos, other_resource(first)));
         if let Some(node) = node {
-            commands.entity(w.entity).try_insert(Order::Harvest(node));
+            commands
+                .entity(w.entity)
+                .try_insert((Order::Harvest(node), script("harvest", now)));
         }
     }
 
@@ -1558,7 +1564,7 @@ fn think(
     let mut shift_skip: Vec<Entity> = fleeing.clone();
     shift_skip.extend(busy_worker);
     shift_skip.extend(brain.pending_build);
-    rebalance_mines(&mines, &workers, &shift_skip, nodes, commands);
+    rebalance_mines(&mines, &workers, &shift_skip, nodes, commands, now);
 
     // --- training ------------------------------------------------------------
     let mut worker_count = workers.len();
@@ -1904,7 +1910,7 @@ fn think(
         for u in &army {
             commands
                 .entity(u.entity)
-                .try_insert(Order::AttackMove(threat_pos));
+                .try_insert((Order::AttackMove(threat_pos), script("defend", now)));
         }
         return;
     }
@@ -1920,14 +1926,16 @@ fn think(
             for u in &army {
                 commands
                     .entity(u.entity)
-                    .try_insert(Order::AttackMove(brain.wave_target));
+                    .try_insert((Order::AttackMove(brain.wave_target), script("wave", now)));
             }
         } else {
             // Stragglers rejoin the push.
             let target = brain.wave_target;
             for u in &army {
                 if u.free() {
-                    commands.entity(u.entity).try_insert(Order::AttackMove(target));
+                    commands
+                        .entity(u.entity)
+                        .try_insert((Order::AttackMove(target), script("wave", now)));
                 }
             }
         }
@@ -1938,13 +1946,17 @@ fn think(
         brain.next_wave_size = (brain.next_wave_size + WAVE_SIZE_STEP).min(WAVE_SIZE_CAP);
         let target = brain.wave_target;
         for u in &army {
-            commands.entity(u.entity).try_insert(Order::AttackMove(target));
+            commands
+                .entity(u.entity)
+                .try_insert((Order::AttackMove(target), script("wave", now)));
         }
     } else {
         // Gather at the rally point while the army builds up.
         for u in &army {
             if u.free() && u.pos.distance(rally) > RALLY_ARRIVE_DIST {
-                commands.entity(u.entity).try_insert(Order::AttackMove(rally));
+                commands
+                    .entity(u.entity)
+                    .try_insert((Order::AttackMove(rally), script("rally", now)));
             }
         }
     }
@@ -1953,6 +1965,17 @@ fn think(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The scripted baseline's answer to "why are you doing that?".
+///
+/// `ai.rs` is not a seat (docs/INTENT.md: it writes `Order`s directly rather
+/// than submitting intents), so its orders get their own rung of the chain
+/// rather than borrowing a player's. That distinction is not cosmetic: under
+/// `autopilot` these units belong to a human's faction, and the panel should
+/// say the autopilot moved them, not that the human did.
+fn script(what: &'static str, now: f32) -> Provenance {
+    Provenance::new(Cause::Script { what }, now)
+}
 
 /// Ground-plane projection — mines and buildings sit at y=0, units do not.
 fn flat(v: Vec3) -> Vec3 {
@@ -2358,6 +2381,7 @@ fn rebalance_mines(
     skip: &[Entity],
     nodes: &NodeQuery,
     commands: &mut Commands,
+    now: f32,
 ) {
     // A mine with no finished hall near it is not a posting: sending workers
     // there would just make them haul their load back to the old base.
@@ -2409,7 +2433,7 @@ fn rebalance_mines(
     for (worker, _) in pool.into_iter().take(quota) {
         commands
             .entity(worker)
-            .try_insert(Order::Harvest(target.entity));
+            .try_insert((Order::Harvest(target.entity), script("harvest", now)));
     }
 }
 
