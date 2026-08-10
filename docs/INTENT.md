@@ -104,9 +104,9 @@ the schema.
 ### Abilities & items
 | Verb | Shape |
 |---|---|
-| `cast` | `{hero:id, ability?}` (alias `caster`) — hero or own ability building |
-| `buy` | `{shop:id, item:"HealingPotion"}` — buyer implied by team |
-| `use_item` | `{slot:0}` |
+| `cast` | `{hero:id, ability?}` (alias `caster`) — any own CASTER: hero, Sorcerer, or ability building |
+| `buy` | `{shop:id, item:"HealingPotion", hero?:id}` — `hero` optional, see below |
+| `use_item` | `{slot:0, hero?:id}` |
 
 The shop shelf is TIERED. `catalog.items[].tier` gives each item's required
 tech tier (1/2/3), and every own finished Shop reports the shelf with this
@@ -126,7 +126,7 @@ slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
 | `priority` | `{units:[id], classes:["Hero","Siege"]}` | `classes` empty |
 | `retreat` | `{units:[id], below:0.35, x, z}` | `below` 0/absent |
 | `leash` | `{units:[id], x, z, radius:20}` | `radius` ≤ 0 |
-| `autocast` | `{units:[id], min_enemies:3, ability?}` | `min_enemies` 0/absent |
+| `autocast` | `{units:[id], min_enemies:3, ability?}` — any own caster | `min_enemies` 0/absent |
 | `squad` | `{units:[id], id:1}` | `id` absent |
 | `posture` | `{id:1, posture:{type:"defend"\|"push"\|"escort"\|"forage", …}}` | `posture` absent |
 | `template` | `{building:id, squad, retreat, priority, autocast}` | all pieces absent |
@@ -150,6 +150,41 @@ all noise, so `"CallToArms"`, `"calltoarms"` and `"Call to Arms"` are one
 ability. (This was the last name in the language matched by
 `eq_ignore_ascii_case` instead — which accepted the first two spellings and
 rejected the third, the one a person actually types.)
+
+### Which hero an item verb means
+
+`buy` and `use_item` used to name no unit, because a team had at most one hero
+and there was nothing to disambiguate. Hero slots scale with the hall ladder
+now (`shared::hero_slots`), so a Keep team can field a Champion *and* a
+Priestess and "the team's hero" stopped being a well-defined phrase — the
+potion went to whichever one the query happened to yield first.
+
+Both verbs therefore take an optional `hero`. The rule is one pure function
+(`pick_item_hero`) with two clauses:
+
+* **named** — it must be one of *your* living heroes. A name that is not is
+  rejected with an error, never silently redirected: sending the item to a
+  different hero is exactly the bug the field exists to prevent.
+* **omitted** — the living hero with the **lowest entity id**. Sorted rather
+  than left to query order, so it is stable frame to frame and identical for
+  both seats; with one hero on the field it picks that hero, which is what
+  every call site written before hero slots already got. The field is
+  `skip_serializing_if = "Option::is_none"`, so the historical wire shape is
+  byte-identical for anyone who does not care.
+
+The two interfaces reach it from opposite ends, as usual. A commander types the
+id. The UI never has to: `use_item` names the caster whose bag the button was
+drawn from, and the Shop — whose card is a *building* selection, with no hero
+selected to read — sells to the last hero the player had selected (`last_hero`),
+falling back to the same lowest-id default. So the button that shows you the
+Priestess's potion is the button that drinks the Priestess's potion.
+
+**A caster is anything with an ability list**, not a hero. `cast` always asked
+`abilities_of_unit(kind)` rather than "does it carry a `Hero` component", so the
+Sorcerer needed no work there; `autocast` did test for a hero, and now asks the
+same question `cast` does. The consequence is that a unit with no mana and no
+level is a first-class caster on both seats: the human's `[T]` toggle and a
+commander's `autocast` command land on the identical `AutoCastPolicy`.
 
 There is one type for all three jobs: `shared::AbilitySelector` is the intent
 field, the `CastAbility` event payload and the wire form. A slot cannot be

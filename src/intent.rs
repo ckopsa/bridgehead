@@ -306,6 +306,7 @@ fn apply_intents(
     time: Res<Time>,
     economies: Res<Economies>,
     records: Res<HeroRecords>,
+    tiers: Res<TechTiers>,
     nav: Res<NavGrid>,
     fog: Res<FogGrids>,
     team_research: Res<TeamResearch>,
@@ -337,6 +338,8 @@ fn apply_intents(
             &mut ai_controlled,
             &economies,
             &records,
+            // The issuing team's tech tier: what hero slots it has open.
+            tiers.get(submission.team),
             &nav,
             &team_research,
             // The issuer's own fog: what *they* can see decides what they may
@@ -389,6 +392,7 @@ fn compile_intent(
     ai_controlled: &mut AiControlled,
     economies: &Economies,
     records: &HeroRecords,
+    tier: TechTier,
     nav: &NavGrid,
     team_research: &TeamResearch,
     fog: &FogGrid,
@@ -632,6 +636,49 @@ fn compile_intent(
                 errors.push(err);
                 return;
             }
+            // Hero slots. economy.rs is the authoritative gate (it enforces
+            // at the pay-point, where the money and the race conditions are);
+            // this is the same rule stated early so a seat gets an error
+            // string back instead of watching the item vanish unpaid off the
+            // front of its queue three seconds later.
+            //
+            // The count is living heroes PLUS every hero already sitting in
+            // any of this team's queues — the edge case that makes this worth
+            // writing at all: two halls each queuing a Priestess, or one hall
+            // queuing three Champions, are both "in flight" and neither is
+            // alive yet.
+            if is_hero_kind(kind) {
+                let mut held: Vec<UnitKind> = units
+                    .iter()
+                    .filter(|(_, u, t, _, _)| **t == me && is_hero_kind(u.kind))
+                    .map(|(_, u, _, _, _)| u.kind)
+                    .collect();
+                for (_, b_team, _, b_queue, _) in buildings.iter() {
+                    if *b_team != me {
+                        continue;
+                    }
+                    let Some(b_queue) = b_queue else { continue };
+                    held.extend(b_queue.queue.iter().copied().filter(|k| is_hero_kind(*k)));
+                }
+                match hero_slot_check(&held, kind, tier) {
+                    HeroSlotVerdict::Ok => {}
+                    HeroSlotVerdict::DuplicateClass => {
+                        errors.push(format!(
+                            "{tag}: {} already fielded or queued (heroes are one per class)",
+                            kind_name(kind)
+                        ));
+                        return;
+                    }
+                    HeroSlotVerdict::NoSlot { used, slots } => {
+                        errors.push(format!(
+                            "{tag}: hero slots full ({used}/{slots} at tier {}) — \
+                             upgrade a hall for another",
+                            tier.level()
+                        ));
+                        return;
+                    }
+                }
+            }
             let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
@@ -669,7 +716,7 @@ fn compile_intent(
             // full price (or worse, a first hero cheaply) depending on the
             // record. `is_hero_kind` is the same test economy.rs charges by.
             let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
-                let (g, l, _) = hero_train_cost(records, me);
+                let (g, l, _) = hero_train_cost(records, me, kind);
                 (g, l)
             } else {
                 let s = unit_stats(kind);
@@ -899,7 +946,7 @@ fn compile_intent(
             };
             events.casts.write(CastAbility { caster: entity, ability: selector });
         }
-        Intent::Buy { shop, item } => {
+        Intent::Buy { shop, item, hero } => {
             let Some(item) = parse_item(&item) else {
                 errors.push(format!("{tag}: unknown item '{item}'"));
                 return;
@@ -948,9 +995,14 @@ fn compile_intent(
                 ));
                 return;
             }
-            // The buyer is implied: a team fields exactly one hero.
-            let Some(hero) = own_hero(units, me) else {
-                errors.push(format!("{tag}: no living hero to buy for"));
+            // Which hero is buying: the one named, or the lowest-id living
+            // hero. A named hero that does not resolve has already logged its
+            // own error — do not silently sell to somebody else.
+            let named = hero;
+            let Some(hero) = own_hero(units, me, named, tag, errors) else {
+                if named.is_none() {
+                    errors.push(format!("{tag}: no living hero to buy for"));
+                }
                 return;
             };
             // economy.rs re-validates and pays (gold, free slot, distance-
@@ -961,7 +1013,7 @@ fn compile_intent(
                 item,
             });
         }
-        Intent::UseItem { slot } => {
+        Intent::UseItem { slot, hero } => {
             if slot >= INVENTORY_SLOTS {
                 errors.push(format!(
                     "{tag}: item slot {slot} out of range (0..{})",
@@ -969,8 +1021,11 @@ fn compile_intent(
                 ));
                 return;
             }
-            let Some(hero) = own_hero(units, me) else {
-                errors.push(format!("{tag}: no living hero to use an item"));
+            let named = hero;
+            let Some(hero) = own_hero(units, me, named, tag, errors) else {
+                if named.is_none() {
+                    errors.push(format!("{tag}: no living hero to use an item"));
+                }
                 return;
             };
             // combat.rs checks the slot is actually filled.
@@ -1082,18 +1137,21 @@ fn compile_intent(
         } => {
             let min_enemies = min_enemies.unwrap_or(0);
             for (entity, _) in own_units(&ids, units, me, tag, errors) {
-                // Any hero class can auto-cast; nothing else has an ability.
+                // Any CASTER can auto-cast — heroes were merely the only ones
+                // that existed when this verb was written. The gate is "does
+                // this kind have an ability list", which is the same question
+                // `Intent::Cast` already asks.
                 let Ok((_, unit, _, _, policy)) = units.get(entity) else {
                     continue;
                 };
-                if !is_hero_kind(unit.kind) {
+                let list = abilities_of_unit(unit.kind);
+                if list.is_empty() {
                     errors.push(format!(
-                        "{tag}: unit {} is not a hero",
+                        "{tag}: unit {} has no abilities",
                         entity.to_bits()
                     ));
                     continue;
                 }
-                let list = abilities_of_unit(unit.kind);
                 let slot = match &ability {
                     None => 0,
                     Some(reference) => match ability_slot(reference, list) {
@@ -1419,13 +1477,59 @@ fn own_unit(id: IntentId, units: &IntentUnits, me: Team) -> Option<(Entity, Vec3
     }
 }
 
-/// The seat's living hero, whichever class it plays. `buy` and `use_item` name
-/// no unit: a team has at most one hero, so there is nothing to disambiguate.
-fn own_hero(units: &IntentUnits, me: Team) -> Option<Entity> {
-    units
+/// Which of the seat's living heroes an item verb is about.
+///
+/// `named` is the intent's optional `hero` field. Given one, it must resolve to
+/// a living hero of this team — anything else is an error rather than a silent
+/// fall-back, because "the potion went to the wrong hero" is exactly the bug
+/// this parameter exists to prevent, and quietly substituting a different hero
+/// would reintroduce it.
+///
+/// Omitted, the tie-break is **the living hero with the lowest entity id**, and
+/// it is sorted rather than left to query order so it is stable frame to frame
+/// and identical for both seats. With one hero on the field — every call site
+/// that predates hero slots — it picks that hero, so omitting the field is
+/// exactly the old behaviour.
+fn own_hero(
+    units: &IntentUnits,
+    me: Team,
+    named: Option<IntentId>,
+    tag: &str,
+    errors: &mut Vec<String>,
+) -> Option<Entity> {
+    let heroes: Vec<Entity> = units
         .iter()
-        .find(|(_, u, team, _, _)| **team == me && is_hero_kind(u.kind))
+        .filter(|(_, u, team, _, _)| **team == me && is_hero_kind(u.kind))
         .map(|(entity, ..)| entity)
+        .collect();
+    match named {
+        // Naming a hero is a claim about a SPECIFIC entity. If the id does not
+        // resolve to a live entity at all, or resolves to something that is not
+        // one of this team's living heroes, that is an error — never a quiet
+        // fall-back to the default, which would hand the item to precisely the
+        // hero the caller was steering away from. (The first version of this
+        // function mapped an unresolvable id to `None` and then let the
+        // no-name branch pick the default; the live bridge check caught it.)
+        Some(id) => {
+            let picked = intent_entity(id).and_then(|e| pick_item_hero(&heroes, Some(e)));
+            if picked.is_none() {
+                errors.push(format!("{tag}: hero {id} not found/not yours"));
+            }
+            picked
+        }
+        None => pick_item_hero(&heroes, None),
+    }
+}
+
+/// The choice itself, as a pure function so it can be tested without a World:
+/// a NAMED hero must be one of this team's living heroes (no silent
+/// substitution — sending the potion to somebody else is the bug), and an
+/// unnamed one resolves to the lowest entity id.
+fn pick_item_hero(heroes: &[Entity], named: Option<Entity>) -> Option<Entity> {
+    match named {
+        Some(hero) => heroes.contains(&hero).then_some(hero),
+        None => heroes.iter().copied().min(),
+    }
 }
 
 /// Resolve a list of ids to living units of the seat's own team, recording one
@@ -2032,6 +2136,101 @@ mod tests {
         assert_eq!(
             back.sentence(),
             "attack-move 3 units to (12.5, -30.5)".to_string()
+        );
+    }
+
+    /// **Two heroes, one potion.** The whole reason `buy`/`use_item` grew a
+    /// `hero` field: hero slots scale with the hall ladder now, so a Keep team
+    /// fields a Champion AND a Priestess and "the team's hero" stopped being a
+    /// well-defined phrase. A named hero must win, and a wrong name must be
+    /// refused rather than quietly redirected — silently selling to the other
+    /// hero is precisely the bug this parameter exists to prevent.
+    #[test]
+    fn buy_targets_the_named_hero_when_a_team_fields_two() {
+        let champion = Entity::from_raw(11);
+        let priestess = Entity::from_raw(42);
+        let heroes = [champion, priestess];
+
+        // Named: the item goes where it was addressed, in either direction.
+        assert_eq!(pick_item_hero(&heroes, Some(priestess)), Some(priestess));
+        assert_eq!(pick_item_hero(&heroes, Some(champion)), Some(champion));
+
+        // Unnamed: the documented, stable tie-break — lowest entity id. It is
+        // deliberately not query order, so the two seats and successive frames
+        // all resolve the same hero.
+        assert_eq!(pick_item_hero(&heroes, None), Some(champion));
+        let reversed = [priestess, champion];
+        assert_eq!(
+            pick_item_hero(&reversed, None),
+            Some(champion),
+            "the default may not depend on iteration order",
+        );
+
+        // Back-compatible: with one hero, omitting the field picks that hero,
+        // which is exactly what every pre-slots call site already got.
+        assert_eq!(pick_item_hero(&[priestess], None), Some(priestess));
+
+        // A name that is not one of this team's living heroes is refused. The
+        // caller turns this `None` into an error string; what matters here is
+        // that it never falls through to somebody else's inventory.
+        let stranger = Entity::from_raw(99);
+        assert_eq!(pick_item_hero(&heroes, Some(stranger)), None);
+        assert_eq!(pick_item_hero(&[], Some(champion)), None);
+        assert_eq!(pick_item_hero(&[], None), None);
+
+        // The regression a live bridge run caught: "named a hero" and "named
+        // nothing" must never collapse into each other. An id that resolves to
+        // no entity at all is a NAMED request that failed — refusing it is the
+        // whole point — whereas `None` means "you pick". Written as the two
+        // distinct calls the caller makes, so the day someone flattens the
+        // unresolvable case back into `None` this fails instead of silently
+        // posting the potion to the wrong hero.
+        assert_eq!(
+            pick_item_hero(&heroes, Some(stranger)),
+            None,
+            "an id that is not one of my heroes must not resolve to my default",
+        );
+        assert_ne!(
+            pick_item_hero(&heroes, Some(stranger)),
+            pick_item_hero(&heroes, None),
+            "a failed name and an omitted name must not agree",
+        );
+    }
+
+    /// The field is optional on the wire and names the hero in the log, so an
+    /// old one-hero command still parses and a new one reads back as English.
+    #[test]
+    fn the_item_verbs_carry_an_optional_hero_on_the_wire() {
+        // Historical form: no `hero` key at all.
+        let legacy: Intent =
+            serde_json::from_str(r#"{"type":"buy","shop":1,"item":"HealingPotion"}"#).unwrap();
+        assert_eq!(legacy.sentence(), "buy HealingPotion at shop 1");
+        let legacy_use: Intent =
+            serde_json::from_str(r#"{"type":"use_item","slot":1}"#).unwrap();
+        assert_eq!(legacy_use.sentence(), "hero uses item in slot 1");
+
+        // Addressed form: round-trips, and the sentence says who.
+        let addressed = Intent::Buy {
+            shop: 1,
+            item: "HealingPotion".to_string(),
+            hero: Some(42),
+        };
+        let json = serde_json::to_string(&addressed).unwrap();
+        assert!(json.contains("\"hero\":42"), "the field must survive: {json}");
+        let back: Intent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sentence(), "hero 42 buys HealingPotion at shop 1");
+
+        let use_addressed = Intent::UseItem { slot: 0, hero: Some(42) };
+        let back: Intent =
+            serde_json::from_str(&serde_json::to_string(&use_addressed).unwrap()).unwrap();
+        assert_eq!(back.sentence(), "hero 42 uses item in slot 0");
+
+        // Omitting it must not serialize a null — the wire shape is unchanged
+        // for every command that does not care.
+        let plain = Intent::UseItem { slot: 0, hero: None };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"type":"use_item","slot":0}"#,
         );
     }
 

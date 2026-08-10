@@ -192,6 +192,24 @@ const BANNER_MIN_TARGETS: usize = 3;
 // 350, not 500: sim runs showed peak treasury in short games (~320) never
 // clears a 500 gate, so siege only appeared in long games — the opposite of
 // its purpose.
+/// Gold on hand before the script commits to an Arcane Sanctum. The Keep gate
+/// is doing most of the work already — this only stops the purchase coming out
+/// of an empty treasury the frame the upgrade lands.
+const SANCTUM_GOLD: u32 = 300;
+/// How many Sorcerers the script ever wants alive at once. A few, not a
+/// screen: `StatusKind::Slow` REFRESHES rather than stacks, so the fourth
+/// caster adds frontage and nothing else, and each one is 2 supply of almost
+/// no combat value.
+const MAX_SORCERERS: usize = 3;
+const SANCTUM_QUEUE_MAX: usize = 1;
+/// Fighting units (heroes excluded) the script wants on the field before it
+/// opens a SECOND hero slot. A Keep lands with the treasury already stretched,
+/// and a 400g/100l hero bought out of that leaves a base defended by two
+/// characters and twelve workers — which is exactly what the first tier-2 sim
+/// run produced. Reviving a hero the team already owns is not gated by this:
+/// a level-6 Champion at 250g is the best gold on the map.
+const SECOND_HERO_MIN_ARMY: usize = 6;
+
 const WORKSHOP_GOLD: u32 = 350;
 const WORKSHOP_QUEUE_MAX: usize = 2;
 /// Target mix: one Catapult per this many Barracks-produced line units.
@@ -576,6 +594,7 @@ fn tag_of(order: &Order) -> Tag {
 
 struct UnitInfo {
     entity: Entity,
+    kind: UnitKind,
     pos: Vec3,
     tag: Tag,
     moving: bool,
@@ -616,6 +635,9 @@ struct BuildingInfo {
     pos: Vec3,
     done: bool,
     queue_len: usize,
+    /// Sorcerers sitting in this building's queue — counted so the script's
+    /// caster cap sees production already in flight, not just bodies alive.
+    queued_sorcerers: usize,
     /// Already converting to its next tier — not a candidate for another
     /// upgrade order, and the reason the tier-up reserve can be released.
     upgrading: bool,
@@ -803,6 +825,7 @@ fn think(
     {
         let info = UnitInfo {
             entity,
+            kind: unit.kind,
             // Flattened to the ground plane. Every comparison below is a
             // ground-plane question ("is it near my base", "has it reached the
             // rally"), and a flyer's altitude would otherwise inflate all of
@@ -902,7 +925,9 @@ fn think(
     let mut own_buildings: Vec<BuildingInfo> = Vec::new();
     let mut enemy_buildings: Vec<Vec3> = Vec::new();
     let mut queued_supply: u32 = 0;
-    let mut hero_queued = false;
+    // Hero CLASSES already in this team's queues. A list, not a flag: slots
+    // scale with the hall ladder now, and the lock is per class.
+    let mut heroes_queued: Vec<UnitKind> = Vec::new();
     for (entity, building, team, tf, under, queue, upgrading, researching) in buildings.iter() {
         if *team != me {
             // Seen right now. Structures we merely REMEMBER are appended
@@ -915,10 +940,19 @@ fn think(
             continue;
         }
         let queue_len = queue.as_ref().map(|q| q.queue.len()).unwrap_or(0);
+        let mut queued_sorcerers = 0usize;
         if let Some(q) = queue.as_ref() {
             queued_supply += q.queue.iter().map(|k| unit_stats(*k).supply).sum::<u32>();
-            // Either hero class occupies the team's single hero slot.
-            hero_queued |= q.queue.iter().any(|k| is_hero_kind(*k));
+            // Hero classes already in flight — one slot each, and no class
+            // twice (see `hero_slots`).
+            for k in q.queue.iter() {
+                if is_hero_kind(*k) {
+                    heroes_queued.push(*k);
+                }
+                if *k == UnitKind::Sorcerer {
+                    queued_sorcerers += 1;
+                }
+            }
         }
         own_buildings.push(BuildingInfo {
             entity,
@@ -926,6 +960,7 @@ fn think(
             pos: tf.translation,
             done: under.is_none(),
             queue_len,
+            queued_sorcerers,
             upgrading: upgrading.is_some(),
             researching: researching.is_some(),
         });
@@ -1046,6 +1081,13 @@ fn think(
         // hall, build one" branch or plan a second expansion behind its back.
         let halls_total = own_buildings.iter().filter(|b| is_hall(b.kind)).count();
         let hall_going_up = own_buildings.iter().any(|b| is_hall(b.kind) && !b.done);
+        // The rung we actually hold right now — what tier-gated buildings ask.
+        let tier_now = own_buildings
+            .iter()
+            .filter(|b| b.done && is_hall(b.kind))
+            .map(|b| building_tier(b.kind))
+            .max()
+            .unwrap_or(0);
 
         // A second mining base, planned before it is affordable so the site is
         // already vetted (unclaimed, undefended-by-them, buildable) when the
@@ -1123,10 +1165,20 @@ fn think(
             Some(BuildingKind::Farm)
         } else if count_of(BuildingKind::Barracks) == 0 {
             Some(BuildingKind::Barracks)
+        } else if tier_now >= 2 && count_of(BuildingKind::Sanctum) == 0 && gold > SANCTUM_GOLD {
+            // The caster branch, and deliberately ABOVE the expansion. That
+            // looks like it contradicts "income first", and it does not: this
+            // is a ONE-OFF 150g/130l purchase gated behind a Keep the team has
+            // already spent 320g/160l reaching, while `expansion` is an
+            // unbounded series that re-arms every time a mine is claimed. Put
+            // below it, the Sanctum loses every roll forever — five straight
+            // sim runs reached tier 2 and finished with no caster ever built,
+            // which is a tier-2 unlock that has never been played.
+            Some(BuildingKind::Sanctum)
         } else if expansion.is_some() {
-            // Above the luxuries (second Barracks, Workshop) and below the
-            // army's first Barracks: income outlives any one more Footman, but
-            // a base with no defenders never gets to spend it.
+            // Above the remaining luxuries (second Barracks, Workshop) and
+            // below the army's first Barracks: income outlives any one more
+            // Footman, but a base with no defenders never gets to spend it.
             Some(BuildingKind::TownHall)
         } else if tower_wanted && air_alert {
             // The reactive Tower, and the only branch in this chain with no
@@ -1512,21 +1564,50 @@ fn think(
     let mut worker_count = workers.len();
     let mut orders: Vec<(Entity, UnitKind)> = Vec::new();
 
-    // One Champion per team: train the first once a Barracks is up, and revive
-    // a fallen one as soon as the (cheaper) price is affordable.
-    let mut want_hero = own_heroes.is_empty()
-        && !hero_queued
-        && (records.get(me).is_some()
-            || own_buildings.iter().any(|b| b.kind == BuildingKind::Barracks));
-    // The script plays the Champion, but a team's class is locked by whichever
-    // hero it fielded first (a commander sharing this team could have picked
-    // the Priestess). Queuing the locked class keeps economy.rs from dropping
-    // the item unpaid at the front of the queue.
-    let hero_kind = records.get(me).map_or(UnitKind::Hero, |rec| rec.kind);
-    let hero_supply = unit_stats(hero_kind).supply;
+    // Hero slots scale with the hall ladder — 1 at TownHall, 2 at Keep, 3 at
+    // Castle, distinct classes only (`hero_slots`). The script fills them in a
+    // fixed order: Champion first, Priestess as the second slot a Keep opens.
+    // Revival of a class it has already lost outranks opening a new one — a
+    // level-6 Champion at 250g is the best gold in the game.
+    const HERO_PICK_ORDER: [UnitKind; 2] = [UnitKind::Hero, UnitKind::Priestess];
+    let mut held_classes: Vec<UnitKind> = army
+        .iter()
+        .filter(|u| is_hero_kind(u.kind))
+        .map(|u| u.kind)
+        .collect();
+    held_classes.extend(heroes_queued.iter().copied());
+    let barracks_standing = own_buildings
+        .iter()
+        .any(|b| b.kind == BuildingKind::Barracks);
+    let slots_open = (held_classes.len() as u32) < hero_slots(TechTier::from_level(current_tier));
+    // Opening an ADDITIONAL slot is a luxury; filling the first one never was.
+    let fighters = army.iter().filter(|u| !is_hero_kind(u.kind)).count();
+    let can_open_another = held_classes.is_empty() || fighters >= SECOND_HERO_MIN_ARMY;
+    let candidates = |revivals_only: bool| {
+        HERO_PICK_ORDER.into_iter().find(|k| {
+            if held_classes.contains(k) {
+                return false;
+            }
+            let known = records.get(me, *k).is_some();
+            if revivals_only {
+                // Bringing back a hero this team already owns is always worth
+                // it — cheap, and it keeps a level the team already paid for.
+                known
+            } else {
+                // A brand-new hero class waits for a Barracks, exactly as the
+                // team's first one always did, and — if it would be the team's
+                // second — for an army that can hold the base while it trains.
+                !known && can_open_another && barracks_standing
+            }
+        })
+    };
+    let mut want_hero = slots_open
+        .then(|| candidates(true).or_else(|| candidates(false)))
+        .flatten();
 
-    if want_hero {
-        let (hero_gold, hero_lumber, _) = hero_train_cost(records, me);
+    if let Some(hero_kind) = want_hero {
+        let (hero_gold, hero_lumber, _) = hero_train_cost(records, me, hero_kind);
+        let hero_supply = unit_stats(hero_kind).supply;
         // Hero training and revival happen at any finished rung of the hall
         // ladder — a team that teched to Keep must not lose its hero.
         let hall = own_buildings.iter().find(|b| b.done && is_hall(b.kind));
@@ -1535,21 +1616,22 @@ fn think(
                 gold -= hero_gold;
                 lumber -= hero_lumber;
                 headroom -= hero_supply;
-                want_hero = false;
+                want_hero = None;
                 orders.push((hall.entity, hero_kind));
             }
         }
     }
 
-    // Still saving up? Ring-fence the Champion's price so continuous army
+    // Still saving up? Ring-fence the hero's price so continuous army
     // production doesn't keep the treasury permanently just below it. Supply is
     // deliberately NOT reserved: army units are what drives the farm trigger,
     // and holding 5 supply back would stall the whole build order.
-    let (mut reserve_gold, mut reserve_lumber) = if want_hero {
-        let (g, l, _) = hero_train_cost(records, me);
-        (g, l)
-    } else {
-        (0, 0)
+    let (mut reserve_gold, mut reserve_lumber) = match want_hero {
+        Some(kind) => {
+            let (g, l, _) = hero_train_cost(records, me, kind);
+            (g, l)
+        }
+        None => (0, 0),
     };
     // Same ring-fence for the expansion down payment, held both while saving
     // up and for the whole walk out to the site. Without it the Barracks
@@ -1633,10 +1715,28 @@ fn think(
         }
     }
 
-    for b in &own_buildings {
-        if !b.done {
-            continue;
-        }
+    // Sorcerers still owed against `MAX_SORCERERS`, counting the ones already
+    // in a queue so a two-Sanctum team can't double-order them.
+    let sorcerers_alive = army
+        .iter()
+        .filter(|u| u.kind == UnitKind::Sorcerer)
+        .count()
+        + own_buildings
+            .iter()
+            .map(|b| b.queued_sorcerers)
+            .sum::<usize>();
+    let mut sorcerers_wanted = MAX_SORCERERS.saturating_sub(sorcerers_alive);
+
+    // Production order matters, because this loop spends a shared treasury as
+    // it walks and whatever comes last gets what is left. The Sanctum goes
+    // FIRST: it wants three units in the whole match against a Barracks that
+    // wants one every few seconds, so in build order it always loses the race
+    // and the tier-2 unlock the team paid 150g/130l for never produces a
+    // single caster. Everything else keeps its historical relative order.
+    let mut production: Vec<&BuildingInfo> = own_buildings.iter().filter(|b| b.done).collect();
+    production.sort_by_key(|b| u8::from(b.kind != BuildingKind::Sanctum));
+
+    for b in production {
         // A Keep and a Castle are the hall, so worker production keys off the
         // ladder rather than the tier-1 kind — teching up must not stop the
         // economy that paid for it.
@@ -1699,6 +1799,22 @@ fn think(
                     headroom -= s.supply;
                     brain.army_counter = next;
                     orders.push((b.entity, kind));
+                }
+            }
+            BuildingKind::Sanctum => {
+                if b.queue_len >= SANCTUM_QUEUE_MAX || sorcerers_wanted == 0 {
+                    continue;
+                }
+                let s = unit_stats(UnitKind::Sorcerer);
+                if gold.saturating_sub(reserve_gold) >= s.cost_gold
+                    && lumber.saturating_sub(reserve_lumber) >= s.cost_lumber
+                    && headroom >= s.supply
+                {
+                    gold -= s.cost_gold;
+                    lumber -= s.cost_lumber;
+                    headroom -= s.supply;
+                    sorcerers_wanted -= 1;
+                    orders.push((b.entity, UnitKind::Sorcerer));
                 }
             }
             BuildingKind::Workshop => {

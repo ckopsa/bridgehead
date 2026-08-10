@@ -309,10 +309,13 @@ fn enforce_leash(
 fn auto_cast_abilities(
     tiers: Res<TechTiers>,
     mut casts: EventWriter<CastAbility>,
-    heroes: Query<(
+    // `Option<&Hero>`: casters, not heroes. The Sorcerer's Slow is the first
+    // ability on a unit that has no level and no mana, and an auto-caster that
+    // only knows how to drive heroes would have left it a statue.
+    casters: Query<(
         Entity,
         &AutoCastPolicy,
-        &Hero,
+        Option<&Hero>,
         &Unit,
         &Team,
         &Transform,
@@ -326,9 +329,9 @@ fn auto_cast_abilities(
     /// waits for allies that are properly in trouble rather than scratched.
     const HOT_FRAC: f32 = 0.6;
 
-    for (entity, policy, hero, unit, team, tf, cooldowns) in &heroes {
+    for (entity, policy, hero, unit, team, tf, cooldowns) in &casters {
         let list = abilities_of_unit(unit.kind);
-        let ctx = UnlockCtx::new(hero.level, tiers.get(*team));
+        let ctx = UnlockCtx::new(hero.map_or(0, |h| h.level), tiers.get(*team));
         for (index, min_targets) in policy.rules.iter().copied() {
             let Some(def) = list.get(index) else {
                 continue;
@@ -337,7 +340,7 @@ fn auto_cast_abilities(
                 continue;
             }
             // Same gate combat.rs applies when it executes the cast.
-            if !ability_ready(def, Some(hero), cooldowns, index) {
+            if !ability_ready(def, hero, cooldowns, index) {
                 continue;
             }
             let count = others
