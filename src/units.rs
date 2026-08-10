@@ -424,7 +424,9 @@ fn spawn_units(
             // Only heroes have an ability to auto-cast.
             if is_hero_kind(ev.kind) {
                 if let Some(min_enemies) = template.autocast {
-                    entity.insert(AutoCastPolicy { min_enemies });
+                    // Templates speak the v1 language (one number); it lands on
+                    // the trained unit's first ability slot.
+                    entity.insert(AutoCastPolicy::first(min_enemies));
                 }
             }
         }
@@ -1128,15 +1130,25 @@ fn steer_units(
     mut commands: Commands,
     time: Res<Time>,
     nav: Res<NavGrid>,
-    mut query: Query<(Entity, &Unit, &mut Transform, &mut MoveTo, &mut PathFollow)>,
+    mut query: Query<(
+        Entity,
+        &Unit,
+        &mut Transform,
+        &mut MoveTo,
+        &mut PathFollow,
+        Option<&StatusEffects>,
+    )>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
 
-    for (entity, unit, mut transform, mut move_to, mut path) in &mut query {
+    for (entity, unit, mut transform, mut move_to, mut path, status) in &mut query {
         let stats = unit_stats(unit.kind);
+        // Move speed is asked for, never looked up: Slow and Haste both land
+        // here, through shared.rs's one modifier function.
+        let effective = effective_unit_stats(unit.kind, status);
         let y = unit_y(unit.kind);
         let pos = transform.translation;
         let flat = Vec3::new(pos.x, 0.0, pos.z);
@@ -1177,7 +1189,7 @@ fn steer_units(
         let dist = to_wp.length();
         if dist > 1e-4 {
             let dir = to_wp / dist;
-            let step = (stats.speed * dt).min(dist);
+            let step = (effective.speed * dt).min(dist);
             transform.translation.x += dir.x * step;
             transform.translation.z += dir.z * step;
 

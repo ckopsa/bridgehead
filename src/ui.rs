@@ -22,6 +22,7 @@
 //! system can ever alias. The minimap systems use `With`/`Without` marker
 //! filters to stay provably disjoint.
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, SystemCursorIcon};
 use bevy::winit::cursor::CursorIcon;
@@ -318,11 +319,11 @@ enum CmdAction {
     Stop,
     Place(BuildingKind),
     Train(UnitKind),
-    /// The selected hero's ability, whatever `ability_of_unit` says it is
-    /// (every selected own hero casts its own).
-    CastHero,
-    /// The single selected own building's ability (`ability_of_building`).
-    CastBuilding,
+    /// Cast ability slot N of every selected own hero. One entry per UNLOCKED
+    /// slot, so a hero with two spells gets two buttons and two hotkeys.
+    CastHero(usize),
+    /// Cast ability slot N of the single selected own building.
+    CastBuilding(usize),
     /// Buy a consumable at the single selected own Shop, for the team's hero.
     Buy(ItemId),
     /// Consume the selected own hero's inventory slot.
@@ -634,16 +635,27 @@ impl CmdEntry {
     }
 }
 
+/// One castable ability of the current selection, ready for the card.
+#[derive(Clone, Copy)]
+struct AbilitySlot {
+    /// Slot in the caster's `abilities_of_*` list — the cast selector.
+    index: usize,
+    def: AbilityDef,
+    /// Off cooldown and (heroes) affordable.
+    ready: bool,
+    /// Seconds of cooldown left, for the caption.
+    cooldown: f32,
+}
+
 /// What the current selection can do about heroes, abilities and items.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct HeroCmds {
     /// Hero training offered by the selected town hall.
     train: Option<HeroTrain>,
-    /// A selected own hero: (its ability, ready, seconds of cooldown left).
-    ability: Option<(AbilityDef, bool, f32)>,
-    /// The single selected own completed building's ability, when it has one:
-    /// (ability, seconds of cooldown left).
-    building_ability: Option<(AbilityDef, f32)>,
+    /// The selected own hero's UNLOCKED abilities, in slot order.
+    abilities: Vec<AbilitySlot>,
+    /// The single selected own completed building's unlocked abilities.
+    building_abilities: Vec<AbilitySlot>,
     /// The single selected own completed Shop's buy state.
     shop: Option<ShopState>,
     /// Inventory of the selected own hero (all None when none is selected).
@@ -678,10 +690,11 @@ struct ShopState {
 /// name and tech gating all come from the shared tables via `build_cards`.
 ///
 /// Free letters only: every other command key in this file is
-/// A S R C B F H O L K N Q W E G V P T Z X, plus Esc / '.' / Ctrl+1-3;
+/// A S R C B F H O L K N Q W E G V P T Z X, plus the second/third ability
+/// slots Y U (hero) and J M (building), plus Esc / '.' / Ctrl+1-3;
 /// shared.rs owns F1-F4, ai.rs F9, the surrender hotkey F12, and terrain.rs
 /// the arrow keys. K (workshop) and N (shop) were picked against that whole
-/// list — J and U are the remaining unclaimed candidates.
+/// list — D and I are the remaining unclaimed candidates.
 fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
     match kind {
         BuildingKind::Barracks => Some((0, KeyCode::KeyB, "B")),
@@ -718,6 +731,23 @@ const TRAIN_KEYS: [(KeyCode, &str); 3] = [
 /// Inventory-slot hotkeys, by slot index.
 const ITEM_KEYS: [(KeyCode, &str); 2] = [(KeyCode::KeyZ, "Z"), (KeyCode::KeyX, "X")];
 
+/// Hero ability hotkeys, by ability slot. [R] is where the one hero ability
+/// has always lived, so a Champion or Priestess with a single spell is
+/// unchanged; a second and third spell get [Y] and [U].
+const HERO_ABILITY_KEYS: [(KeyCode, &str); 3] = [
+    (KeyCode::KeyR, "R"),
+    (KeyCode::KeyY, "Y"),
+    (KeyCode::KeyU, "U"),
+];
+
+/// Building ability hotkeys, by ability slot: [C] (Call to Arms today), then
+/// [J] and [M].
+const BUILDING_ABILITY_KEYS: [(KeyCode, &str); 3] = [
+    (KeyCode::KeyC, "C"),
+    (KeyCode::KeyJ, "J"),
+    (KeyCode::KeyM, "M"),
+];
+
 /// Ability button caption: the ability's own name, plus the countdown while it
 /// is cooling down. Works for hero and building casters alike.
 fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
@@ -728,11 +758,35 @@ fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
     }
 }
 
-/// Can this hero cast *its* ability right now? `Hero::ability_ready` prices
-/// every class at the Champion's 40 mana, which would light the button up for a
-/// Priestess sitting on 42 of the 45 Heal costs; combat.rs would then refuse.
-fn hero_ability_ready(hero: &Hero, def: &AbilityDef) -> bool {
-    hero.ability_cooldown <= 0.0 && hero.mana >= def.mana_cost
+/// Everything the command card needs to reason about casting: the team's tech
+/// tier (unlock predicates), each caster's per-ability cooldowns, and the
+/// outgoing event. Bundled because `command_input` was already sitting on
+/// Bevy's 16-system-parameter ceiling and ability v2 needed three more.
+#[derive(SystemParam)]
+struct CastParams<'w, 's> {
+    tiers: Res<'w, TechTiers>,
+    cooldowns: Query<'w, 's, &'static AbilityCooldowns>,
+    casts: EventWriter<'w, CastAbility>,
+}
+
+/// Every UNLOCKED ability of a caster, priced and cooled, ready for the card.
+/// The unlock test and the readiness test are shared.rs's, so a button is lit
+/// exactly when combat.rs would honour the cast — no second opinion here.
+fn ability_slots(
+    list: &'static [AbilityDef],
+    ctx: UnlockCtx,
+    hero: Option<&Hero>,
+    cooldowns: Option<&AbilityCooldowns>,
+) -> Vec<AbilitySlot> {
+    unlocked_abilities(list, ctx)
+        .into_iter()
+        .map(|index| AbilitySlot {
+            index,
+            def: list[index],
+            ready: ability_ready(&list[index], hero, cooldowns, index),
+            cooldown: cooldowns.map_or(0.0, |c| c.remaining(index)),
+        })
+        .collect()
 }
 
 /// The contextual command set for the current selection. Both the keyboard and
@@ -799,16 +853,20 @@ fn command_entries(
         }
     }
 
-    // The hero's ability, whichever class it is.
-    if let Some((def, ready, cooldown)) = hero.ability {
+    // The hero's abilities, whichever class it is and however many it has
+    // unlocked: one button per slot, in slot order, on [R] [Y] [U].
+    for slot in &hero.abilities {
+        let Some((key, hotkey)) = HERO_ABILITY_KEYS.get(slot.index).copied() else {
+            continue;
+        };
         let mut entry = CmdEntry::plain(
-            CmdAction::CastHero,
-            KeyCode::KeyR,
-            "R",
-            &ability_label(&def, cooldown),
+            CmdAction::CastHero(slot.index),
+            key,
+            hotkey,
+            &ability_label(&slot.def, slot.cooldown),
         );
-        entry.cost = format!("{:.0}mp", def.mana_cost);
-        entry.enabled = ready;
+        entry.cost = format!("{:.0}mp", slot.def.mana_cost);
+        entry.enabled = slot.ready;
         out.push(entry);
     }
 
@@ -866,15 +924,18 @@ fn command_entries(
                 }
             }
 
-            // The building's own active ability (TownHall: Call to Arms).
-            if let Some((def, cooldown)) = hero.building_ability {
+            // The building's own active abilities (TownHall: Call to Arms).
+            for slot in &hero.building_abilities {
+                let Some((key, hotkey)) = BUILDING_ABILITY_KEYS.get(slot.index).copied() else {
+                    continue;
+                };
                 let mut entry = CmdEntry::plain(
-                    CmdAction::CastBuilding,
-                    KeyCode::KeyC,
-                    "C",
-                    &ability_label(&def, cooldown),
+                    CmdAction::CastBuilding(slot.index),
+                    key,
+                    hotkey,
+                    &ability_label(&slot.def, slot.cooldown),
                 );
-                entry.enabled = cooldown <= 0.0;
+                entry.enabled = slot.ready;
                 out.push(entry);
             }
 
@@ -1787,8 +1848,8 @@ fn command_input(
     economies: Res<Economies>,
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
+    mut cast: CastParams,
     mut focus: EventWriter<CameraFocus>,
-    mut casts: EventWriter<CastAbility>,
     mut buys: EventWriter<BuyItem>,
     mut item_uses: EventWriter<UseItem>,
     pressed_buttons: Query<(&Interaction, &El), Changed<Interaction>>,
@@ -1815,7 +1876,6 @@ fn command_input(
             &Team,
             Option<&mut TrainingQueue>,
             Option<&UnderConstruction>,
-            Option<&AbilityCooldown>,
         ),
         With<Selected>,
     >,
@@ -1897,19 +1957,17 @@ fn command_input(
     // The one selected own building: its kind, whether it is finished, its
     // entity (buy/cast target) and its ability cooldown, if it has one.
     let single = match (b_iter.next(), b_iter.next()) {
-        (Some((e, b, t, _, uc, cd)), None) if *t == Team::Human => {
-            Some((e, b.kind, uc.is_none(), cd.map(|c| c.0)))
-        }
+        (Some((e, b, t, _, uc)), None) if *t == Team::Human => Some((e, b.kind, uc.is_none())),
         _ => None,
     };
-    let single_building = single.map(|(_, kind, done, _)| (kind, done));
+    let single_building = single.map(|(_, kind, done)| (kind, done));
 
     // Hero training is offered only while the team has neither a living
     // hero (of either class) nor one already queued in this building.
     let team_has_hero = all_units
         .iter()
         .any(|(_, u, t, _, _, _)| *t == Team::Human && is_hero_kind(u.kind));
-    let hero_in_queue = sel_buildings.iter().any(|(_, _, t, q, _, _)| {
+    let hero_in_queue = sel_buildings.iter().any(|(_, _, t, q, _)| {
         *t == Team::Human
             && q.map(|q| q.queue.iter().any(|k| is_hero_kind(*k)))
                 .unwrap_or(false)
@@ -1928,17 +1986,29 @@ fn command_input(
                 recorded: records.get(Team::Human).map(|r| r.kind),
             }
         }),
-        ability: own_heroes.first().and_then(|(_, kind, h, _)| {
-            ability_of_unit(*kind)
-                .map(|def| (def, hero_ability_ready(h, &def), h.ability_cooldown))
-        }),
-        building_ability: single.and_then(|(_, kind, done, cd)| {
-            (done)
-                .then(|| ability_of_building(kind))
-                .flatten()
-                .map(|def| (def, cd.unwrap_or(0.0)))
-        }),
-        shop: single.and_then(|(_, kind, done, _)| {
+        abilities: own_heroes
+            .first()
+            .map(|(entity, kind, hero, _)| {
+                ability_slots(
+                    abilities_of_unit(*kind),
+                    UnlockCtx::new(hero.level, cast.tiers.get(Team::Human)),
+                    Some(hero),
+                    cast.cooldowns.get(*entity).ok(),
+                )
+            })
+            .unwrap_or_default(),
+        building_abilities: single
+            .filter(|(_, _, done)| *done)
+            .map(|(entity, kind, _)| {
+                ability_slots(
+                    abilities_of_building(kind),
+                    UnlockCtx::building(cast.tiers.get(Team::Human)),
+                    None,
+                    cast.cooldowns.get(entity).ok(),
+                )
+            })
+            .unwrap_or_default(),
+        shop: single.and_then(|(_, kind, done)| {
             (done && kind == BuildingKind::Shop).then(|| ShopState {
                 hero: team_hero.is_some(),
                 room: team_hero.is_some_and(|(_, inv)| inv.0.iter().any(|s| s.is_none())),
@@ -2017,22 +2087,22 @@ fn command_input(
             }
             // Abilities: combat.rs owns the mana/cooldown verdict, exactly as
             // it does for the AI and the bridge.
-            CmdAction::CastHero => {
+            CmdAction::CastHero(index) => {
                 for (hero, _, _, _) in &own_heroes {
-                    casts.write(CastAbility { caster: *hero });
+                    cast.casts.write(CastAbility::index(*hero, index));
                 }
             }
-            CmdAction::CastBuilding => {
-                if let Some((entity, kind, true, _)) = single {
-                    if ability_of_building(kind).is_some() {
-                        casts.write(CastAbility { caster: entity });
+            CmdAction::CastBuilding(index) => {
+                if let Some((entity, kind, true)) = single {
+                    if index < abilities_of_building(kind).len() {
+                        cast.casts.write(CastAbility::index(entity, index));
                     }
                 }
             }
             CmdAction::Buy(item) => {
                 // economy.rs re-validates ownership, slots and gold; the card
                 // only greys the button so the player knows before clicking.
-                if let (Some((shop, BuildingKind::Shop, true, _)), Some((hero, _))) =
+                if let (Some((shop, BuildingKind::Shop, true)), Some((hero, _))) =
                     (single, team_hero)
                 {
                     buys.write(BuyItem { shop, hero, item });
@@ -2119,9 +2189,12 @@ fn command_input(
                 // Heroes only — a footman has nothing to auto-cast.
                 if doc.autocast == 0 {
                     for (hero, _, _, _) in &own_heroes {
-                        commands.entity(*hero).try_insert(AutoCastPolicy {
-                            min_enemies: AUTOCAST_MIN_ENEMIES,
-                        });
+                        // The card's one toggle governs the hero's FIRST
+                        // ability; per-ability rules are a bridge/doctrine
+                        // affordance until a hero ships with two spells.
+                        commands
+                            .entity(*hero)
+                            .try_insert(AutoCastPolicy::first(AUTOCAST_MIN_ENEMIES));
                     }
                 } else {
                     for (hero, _, _, _) in &own_heroes {
@@ -2145,7 +2218,7 @@ fn command_input(
                 if second.is_some() {
                     continue;
                 }
-                let Some((_, building, team, Some(mut queue), uc, _)) = first else {
+                let Some((_, building, team, Some(mut queue), uc)) = first else {
                     continue;
                 };
                 if *team != Team::Human || uc.is_some() || !trainable(building.kind).contains(&kind)
@@ -3183,6 +3256,7 @@ fn update_hud(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     ai_controlled: Res<AiControlled>,
+    tiers: Res<TechTiers>,
     // Latched the frame the match ends: was this an AI-vs-AI spectate?
     mut spectated: Local<Option<bool>>,
     mut texts: Query<(&Slot, &mut Text, &mut TextColor)>,
@@ -3218,10 +3292,12 @@ fn update_hud(
             &Team,
             Option<&TrainingQueue>,
             Option<&UnderConstruction>,
-            Option<&AbilityCooldown>,
+            Option<&AbilityCooldowns>,
         ),
         With<Selected>,
     >,
+    // Per-ability cooldowns of the selected hero, by entity.
+    cooldowns: Query<&AbilityCooldowns>,
 ) {
     let econ = *economies.get(Team::Human);
     let supply_blocked = econ.supply_cap > 0 && econ.supply_used >= econ.supply_cap;
@@ -3425,7 +3501,7 @@ fn update_hud(
             .iter()
             .next()
             .filter(|(_, _, _, t, _, _, _)| **t == Team::Human)
-            .map(|(_, b, _, _, _, uc, cd)| (b.kind, uc.is_none(), cd.map(|c| c.0)))
+            .map(|(_, b, _, _, _, uc, cd)| (b.kind, uc.is_none(), cd))
     } else {
         None
     };
@@ -3453,16 +3529,28 @@ fn update_hud(
                 recorded: records.get(Team::Human).map(|r| r.kind),
             }
         }),
-        ability: selected_hero.and_then(|(_, u, _, _, _, h, _, _, _, _, _, _)| {
-            let h = h?;
-            ability_of_unit(u.kind)
-                .map(|def| (def, hero_ability_ready(h, &def), h.ability_cooldown))
-        }),
-        building_ability: single.and_then(|(kind, done, cd)| {
-            done.then(|| ability_of_building(kind))
-                .flatten()
-                .map(|def| (def, cd.unwrap_or(0.0)))
-        }),
+        abilities: selected_hero
+            .and_then(|(e, u, _, _, _, h, _, _, _, _, _, _)| {
+                let hero = h?;
+                Some(ability_slots(
+                    abilities_of_unit(u.kind),
+                    UnlockCtx::new(hero.level, tiers.get(Team::Human)),
+                    Some(hero),
+                    cooldowns.get(e).ok(),
+                ))
+            })
+            .unwrap_or_default(),
+        building_abilities: single
+            .filter(|(_, done, _)| *done)
+            .map(|(kind, _, cd)| {
+                ability_slots(
+                    abilities_of_building(kind),
+                    UnlockCtx::building(tiers.get(Team::Human)),
+                    None,
+                    cd,
+                )
+            })
+            .unwrap_or_default(),
         shop: single.and_then(|(kind, done, _)| {
             (done && kind == BuildingKind::Shop).then(|| ShopState {
                 hero: team_has_hero,

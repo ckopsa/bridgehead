@@ -30,8 +30,12 @@ Production:
 - `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free; you pay on placement)
 - `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"}` (queue cap 7)
 - `{"type":"cancel","building":id,"index":n}`  `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}`
-- `{"type":"cast","hero":id}` — cast the caster's ability (heroes: their class ability;
-  a TownHall id works too: CallToArms turns nearby workers into fighters for 40s, 90s cooldown).
+- `{"type":"cast","hero":id}` — cast the caster's first available ability (heroes: their class
+  ability; a TownHall id works too: CallToArms turns nearby workers into fighters for 40s,
+  90s cooldown). Add `"ability":<index>` or `"ability":"Slam"` to pick a specific one — casters
+  can have several, each with its own cooldown and unlock condition. Every caster's slots are
+  listed in the snapshot as `units[].abilities` / `buildings[].abilities`
+  (`index`, `cd`, `unlocked`, `ready`, `requires`), and described in catalog `abilities`.
 - `{"type":"buy","shop":id,"item":"HealingPotion"|"TownPortal"}` — your living hero buys the item
   (2 inventory slots; see catalog `items`). `{"type":"use_item","slot":0}` consumes it.
   TownPortal teleports your hero + nearby own units to your nearest TownHall — the expansion-saver.
@@ -40,7 +44,9 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
   Hero (both hero types), Archer, Footman, Worker, Building, Siege (catapults), Cavalry (raiders).
 - `{"type":"retreat","units":[ids],"below":0.35,"x":..,"z":..}` — auto fall-back when hurt
 - `{"type":"leash","units":[ids],"x":..,"z":..,"radius":20}` — never chase/fight beyond anchor (radius 0 clears)
-- `{"type":"autocast","units":[hero_id],"min_enemies":3}` — hero slams automatically
+- `{"type":"autocast","units":[hero_id],"min_enemies":3}` — hero slams automatically. Add
+  `"ability":<index|"Name">` to govern a specific ability; each one keeps its own trigger, and
+  `min_enemies:0` clears just that rule.
 - `{"type":"squad","units":[ids],"id":1}` then `{"type":"posture","id":1,"posture":{"type":"defend","x":..,"z":..,"radius":18}}`
   (`"push"` with x/z, `"escort"` with `"unit":id`, or `"forage"` with x/z muster) — squads
   re-task themselves every second and ADVANCE COHESIVELY: a strung-out Push/Forage squad gathers before pressing on, so slow units set the pace and you arrive as one force. Defend postures are REACTIVE: enemies entering the radius
