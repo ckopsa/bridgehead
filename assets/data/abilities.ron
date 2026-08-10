@@ -5,6 +5,15 @@
 //                          catalog key, the bridge selector, the button
 //                          caption. Field meanings are on `AbilityDef` in
 //                          src/shared.rs.
+//                          `target` is OPTIONAL and defaults to `Caster` —
+//                          the effect centres on whoever cast it, which is
+//                          what every row meant before geometry existed. A
+//                          thrown spell says `target: Point(range: 9.0)`; a
+//                          single-target one says `target: Unit(range: 9.0)`.
+//                          `range` is caster-to-centre and `radius` blooms
+//                          from there, so total reach is range + radius, and
+//                          the loader refuses a targeted row whose range is
+//                          not positive.
 //   * `unit_casters`     — per `UnitKind`, the abilities it can ever cast, IN
 //                          SLOT ORDER. An ability's index in this list is its
 //                          handle everywhere (hotkey slot, cooldown slot,
@@ -130,10 +139,23 @@
         //   * duration 5s against a 9s cooldown — a 55% uptime on one
         //     Sorcerer. Long enough to decide a collision, short enough that a
         //     retreat covered by Slow is a real cost in tempo.
-        //   * radius 8.0, centred on the caster — one unit past the
-        //     Priestess's Heal and comfortably inside the Sorcerer's own 11
-        //     attack range, so a caster standing behind its line still catches
-        //     everything crashing into the front rank.
+        //   * target: Point(range: 9.0) with radius 4.5 — the number that
+        //     changed when geometry became data. Slow shipped as a radius-8
+        //     bubble centred on the Sorcerer, inflated to 8 purely because
+        //     there was no other way to reach the enemy; the arena finding was
+        //     the predictable one, that a Sorcerer who must stand within 8 of
+        //     a charge to slow it is a Sorcerer standing in the charge.
+        //     Targeted, the same spell is thrown 9 ahead and blooms 4.5 wide,
+        //     so its far edge reaches 13.5 — a longer reach than the bubble
+        //     ever had, from 9 further back, with a footprint barely a third
+        //     of the area. It is a better spell and a strictly worse blanket,
+        //     which is the trade a targeted AoE is supposed to make: it has to
+        //     be AIMED, and a bad aim catches nobody. 9 is a shade under the
+        //     Sorcerer's own 11 attack range, so the spell never asks the
+        //     caster to walk somewhere its attack would not.
+        //   * out of range is REFUSED, not walked into — see `AbilityTarget`
+        //     in src/shared.rs. Casting from behind your own line is the whole
+        //     point, so a caster that closed the gap by itself would undo it.
         //   * no mana — the Sorcerer is not a hero and carries no `Hero`
         //     component, so its only gate is `AbilityCooldowns`.
         //   * hits_air: true — this is a hex, not a shockwave.
@@ -145,14 +167,15 @@
         (
             name: "Slow",
             effect: ApplyStatus(status: Slow, targets: Enemies, also: None),
+            target: Point(range: 9.0),
             mana_cost: 0.0,
             cooldown: 9.0,
-            radius: 8.0,
+            radius: 4.5,
             power: 0.4,
             duration: 5.0,
             hits_air: true,
             unlock: Always,
-            description: "Slows every enemy within 8 of the Sorcerer by 40% (move AND attack speed) for 5s. Refreshes rather than stacks; no mana, 9s cooldown.",
+            description: "Cast at a point up to 9 away: slows every enemy within 4.5 of it by 40% (move AND attack speed) for 5s. Refreshes rather than stacks; no mana, 9s cooldown. Omit the point and the Sorcerer aims at the biggest clump it can reach.",
         ),
         // Dev-only second Champion ability, present only under
         // `WC3_STATUS_PROBE=1`. It exists so a real match can exercise the v2
@@ -189,6 +212,15 @@
         // and a Slow landed on a single Raider diving your workers is exactly
         // the moment the unit was built for. A caster whose entire value is
         // one debuff is worthless as a statue.
+        //
+        // v3 note for the balance bead: "in reach" grew when Slow became a
+        // thrown spell — from "within 8 of the caster" to "within 9 + 4.5",
+        // roughly a 70% longer trigger. min_targets is deliberately left at 1
+        // anyway, because the auto-pick always centres on the BIGGEST clump it
+        // can reach, so a lone scout only wastes the cooldown when it is the
+        // only thing on the field. If arena data says Sorcerers are caught on
+        // cooldown when the real charge lands, this number — not the geometry
+        // — is the knob.
         (kind: Sorcerer,  abilities: ["Slow"],              probe_abilities: [],            autocast: Some((ability: "Slow", min_targets: 1))),
     ],
 

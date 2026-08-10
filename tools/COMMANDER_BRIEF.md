@@ -49,6 +49,14 @@ Production:
   loosely — case, spaces, dashes and underscores are all noise, so `"Call to Arms"`,
   `"calltoarms"` and `"call_to_arms"` are one ability. The same holds for unit, building,
   item and research names, and for `priority` classes.
+- **Aiming a cast.** Catalog `abilities[].target` says where an ability lands: `"caster"`
+  (centred on the caster — every ability but one), `"point"` (send `"x"`/`"z"`), or `"unit"`
+  (send `"target":id`), within `abilities[].target_range` of the caster. `{"type":"cast",
+  "caster":id,"ability":"Slow","x":40,"z":-12}` throws Slow at a point. **Omit the aim and the
+  engine aims for you** — the reachable centre catching the most bodies the ability affects —
+  so `{"type":"cast","caster":id,"ability":"Slow"}` is still a good sentence, and it is the
+  same rule `autocast` uses. Out of range is **refused with both numbers**, never walked into:
+  your caster stays where you put it.
 - `{"type":"buy","shop":id,"item":"HealingPotion"|...,"hero":id}` — a hero buys the item
   (2 inventory slots; see catalog `items`). `{"type":"use_item","slot":0,"hero":id}` consumes it.
   **`hero` is optional but you want it once you field two.** Omitted, both verbs default to your
@@ -433,11 +441,14 @@ first), `unlocked` for ACTING.
   multipliers are keyed off the CLASS, so a Spearman's anti-cavalry bonus lands on the
   Knight and the Raider alike. `damage` with `attack_cooldown` gives you dps.
 - **Crowd control (tier 2).** An **Arcane Sanctum** (requires a Keep) trains **Sorcerers**:
-  fragile, barely fight, and auto-cast **Slow** — -40% move AND attack speed on every enemy
-  within 8 of the caster, 5s, 9s cooldown, no mana. It is the answer to a Raider or Knight
-  charge (a slowed Raider is slower than a Footman) and the way you cover a retreat. Slow
-  **refreshes rather than stacks**, so 2-3 Sorcerers buy frontage, not depth — a wall of them
-  is wasted supply. Keep them behind the line; anything that reaches one kills it.
+  fragile, barely fight, and auto-cast **Slow** — -40% move AND attack speed, 5s, 9s cooldown,
+  no mana. Slow is **thrown at a point up to 9 away and blooms 4.5 wide** (total reach 13.5),
+  so a Sorcerer slows a charge from *behind* your own line instead of standing in it. It is
+  the answer to a Raider or Knight charge (a slowed Raider is slower than a Footman) and the
+  way you cover a retreat. Slow **refreshes rather than stacks**, so 2-3 Sorcerers buy
+  frontage, not depth — a wall of them is wasted supply. Left on autocast they aim themselves
+  at the biggest clump in reach; keep them behind the line and they will never walk forward
+  to cast.
 - Ranged units/towers outrange melee; footmen tank; workers fight terribly.
 - Towers shoot at enemy units in range on their own; Walls just block pathing and soak hits.
   Defense is a real strategy — and SIEGE is its counter: check the catalog for what outranges towers.

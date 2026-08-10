@@ -1997,7 +1997,11 @@ fn think(
             // same frame it always did — but routing it here means the day the
             // script learns to hand-fire a Sorcerer, the third seat pays for
             // that reach automatically instead of quietly not paying.
-            issuer.issue_cast(commands, &mut events.casts, me, hero.pos, hero.entity, None);
+            // `None` aim: the Slam is caster-centred, so there is nothing to
+            // point it at. The day the script hand-fires a targeted ability it
+            // can pass a `CastTarget` here, or pass `None` and let the engine's
+            // auto-pick aim it — the same rule the auto-caster uses.
+            issuer.issue_cast(commands, &mut events.casts, me, hero.pos, hero.entity, None, None);
         }
     }
 

@@ -425,6 +425,11 @@ struct UiState {
     /// A posture waiting for the player to click its point on the ground.
     /// Same shape as `placement`: an armed mode the next left-click consumes.
     posture_place: Option<PostureArm>,
+    /// A TARGETED cast waiting for the player to click where it goes — the
+    /// third user of the same press-then-click vocabulary building placement
+    /// taught and postures borrowed. A `Caster`-geometry ability never arms
+    /// anything and fires on the key press exactly as it always did.
+    cast_place: Option<CastArm>,
     /// Round-robin cursor for the idle-worker hotkey.
     idle_cursor: usize,
     /// Left button went down inside the minimap and is still held.
@@ -735,6 +740,41 @@ impl PostureKind {
 struct PostureArm {
     squad: u8,
     kind: PostureKind,
+}
+
+/// One `cast` sentence, whatever supplied the aim. Written once because the
+/// hotkey, the command-card button and the armed click all compose the same
+/// object — and because it is exactly what a bridge commander types, which is
+/// the claim docs/INTENT.md makes about every gesture in this file.
+fn cast_here(caster: Entity, slot: usize, aim: Option<CastTarget>) -> Intent {
+    let (x, z, target) = match aim {
+        Some(CastTarget::Point(p)) => (Some(p.x), Some(p.z), None),
+        Some(CastTarget::Unit(e)) => (None, None, Some(intent_id(e))),
+        None => (None, None, None),
+    };
+    Intent::Cast {
+        hero: intent_id(caster),
+        ability: Some(AbilitySelector::Index(slot)),
+        x,
+        z,
+        target,
+    }
+}
+
+/// A targeted-cast button waiting for its click. Like [`PostureArm`], the
+/// casters are resolved at PRESS time rather than at click time: the sentence
+/// the player is composing must not change under them if a unit dies or the
+/// selection shifts between the key and the click.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct CastArm {
+    /// Everyone who will cast — one `Intent::Cast` each, all at the same aim.
+    casters: Vec<Entity>,
+    /// Slot, because the UI is index-native and the hotkey IS the slot.
+    slot: usize,
+    /// Ability name, for the hint line the player reads while aiming.
+    name: &'static str,
+    /// True for `AbilityTarget::Unit`: the click names a unit, not ground.
+    wants_unit: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1701,6 +1741,21 @@ fn command_entries(
         // design. Its readiness is already in the label's cooldown timer.
         if slot.def.mana_cost > 0.0 {
             entry.cost = format!("{:.0}mp", slot.def.mana_cost);
+        }
+        // A targeted ability's cost line says what the key will ASK FOR,
+        // exactly as a posture's does — the player has to learn "press, then
+        // click" once, and then it is the same gesture everywhere. The reach
+        // is on the line too, because the click that lands outside it is
+        // refused rather than obeyed.
+        if let Some(range) = slot.def.target.range() {
+            entry.cost = format!(
+                "{} <= {range:.0}",
+                if slot.def.target.wants_unit() {
+                    "click a unit"
+                } else {
+                    "click ground"
+                }
+            );
         }
         entry.enabled = slot.ready;
         out.push(entry);
@@ -3446,7 +3501,9 @@ fn command_input(
     // Escape cancels every transient mode, innermost first, and finally backs
     // out of the doctrine page — so Escape always means "one step out".
     if keys.just_pressed(hotkeys::CANCEL) {
-        if ui.placement.is_some() {
+        if ui.cast_place.is_some() {
+            ui.cast_place = None;
+        } else if ui.placement.is_some() {
             ui.placement = None;
             ui.wall_chain.clear();
         } else if ui.posture_place.is_some() {
@@ -3834,27 +3891,67 @@ fn command_input(
             // slot, so the UI is index-native; a commander may name the same
             // slot by id. Both spellings are the same intent.
             CmdAction::CastHero(index) => {
+                // The geometry decides whether this key IS the cast or merely
+                // arms it. Read from the first caster's table: the button only
+                // exists for a slot they have, and a slot's geometry is a
+                // property of the ability, not of who is holding it.
+                let def = own_casters
+                    .first()
+                    .and_then(|(_, kind, _, _)| abilities_of_unit(*kind).get(index).copied());
+                let Some(def) = def else { continue };
+                if def.target.is_targeted() {
+                    // Only the casters this aim is actually FOR. A mixed
+                    // selection shares one hotkey column, so slot 1 can be a
+                    // Sorcerer's Slow and a Champion's Warcry at once; sending
+                    // the click's point to both would aim a spell that has
+                    // nowhere to put it and earn a rejection the player never
+                    // asked for. The armed gesture belongs to the units whose
+                    // slot has the geometry the player is aiming.
+                    let casters: Vec<Entity> = own_casters
+                        .iter()
+                        .filter(|(_, kind, _, _)| {
+                            abilities_of_unit(*kind)
+                                .get(index)
+                                .is_some_and(|d| d.target == def.target)
+                        })
+                        .map(|(e, _, _, _)| *e)
+                        .collect();
+                    if casters.is_empty() {
+                        continue;
+                    }
+                    ui.cast_place = Some(CastArm {
+                        casters,
+                        slot: index,
+                        name: def.name,
+                        wants_unit: def.target.wants_unit(),
+                    });
+                    ui.attack_move_armed = false;
+                    ui.placement = None;
+                    ui.posture_place = None;
+                    continue;
+                }
                 for (hero, _, _, _) in &own_casters {
-                    say(
-                        &mut submissions,
-                        Intent::Cast {
-                            hero: intent_id(*hero),
-                            ability: Some(AbilitySelector::Index(index)),
-                        },
-                    );
+                    say(&mut submissions, cast_here(*hero, index, None));
                 }
             }
             CmdAction::CastBuilding(index) => {
                 if let Some((entity, kind, true, _)) = single {
-                    if index < abilities_of_building(kind).len() {
-                        say(
-                            &mut submissions,
-                            Intent::Cast {
-                                hero: intent_id(entity),
-                                ability: Some(AbilitySelector::Index(index)),
-                            },
-                        );
+                    let Some(def) = abilities_of_building(kind).get(index).copied() else {
+                        continue;
+                    };
+                    if def.target.is_targeted() {
+                        ui.cast_place = Some(CastArm {
+                            casters: vec![entity],
+                            slot: index,
+                            name: def.name,
+                            wants_unit: def.target.wants_unit(),
+                        });
+                        ui.attack_move_armed = false;
+                        ui.placement = None;
+                        ui.posture_place = None;
+                        continue;
                     }
+                    say(&mut submissions, cast_here(entity, index, None));
                 }
             }
             CmdAction::Buy(item) => {
@@ -4069,6 +4166,7 @@ fn command_input(
                 ui.placement = None;
                 ui.wall_chain.clear();
                 ui.posture_place = None;
+                ui.cast_place = None;
             }
             CmdAction::SetPosture(kind) => {
                 let Some(squad) = resolve_squad(&mut submissions) else {
@@ -4082,6 +4180,7 @@ fn command_input(
                 ui.attack_move_armed = false;
                 ui.placement = None;
                 ui.wall_chain.clear();
+                ui.cast_place = None;
             }
             CmdAction::ClearPosture => {
                 // Clearing a posture leaves membership intact: the squad stops
@@ -4728,6 +4827,60 @@ fn left_mouse(
                     return;
                 }
 
+                // Targeted cast. The command card armed a slot; this click
+                // supplies the place, and the pair becomes exactly the
+                // sentence a commander sends as
+                // {"type":"cast","caster":7,"ability":"Slow","x":..,"z":..}.
+                //
+                // Placed AFTER placement and posture and before attack-move
+                // for no deeper reason than that the armed modes are mutually
+                // exclusive — each arming clears the others — so the order is
+                // about reading, not precedence.
+                if let Some(arm) = ui.cast_place.clone() {
+                    if arm.wants_unit {
+                        // Same picker Escort uses, but over BOTH teams: the
+                        // shipping targeted abilities are debuffs, and a
+                        // picker that only saw your own units could not aim
+                        // one. Who it may legally affect is the effect's
+                        // question, asked in combat.rs.
+                        let picked = ground.and_then(|g| {
+                            let ray = cursor_ray(camera, cam_tf, cursor);
+                            let mut best: Option<(Entity, f32)> = None;
+                            for (e, tf, _, _, _) in &units {
+                                let d = dist_xz(
+                                    tf.translation,
+                                    pick_point_for(ray, g, tf.translation.y),
+                                );
+                                if d <= UNIT_PICK_RADIUS && best.is_none_or(|(_, bd)| d < bd) {
+                                    best = Some((e, d));
+                                }
+                            }
+                            best.map(|(e, _)| e)
+                        });
+                        // A miss leaves it armed, for the reason Escort does.
+                        if let Some(victim) = picked {
+                            for caster in &arm.casters {
+                                say(
+                                    &mut submissions,
+                                    cast_here(*caster, arm.slot, Some(CastTarget::Unit(victim))),
+                                );
+                            }
+                            ui.cast_place = None;
+                        }
+                        return;
+                    }
+                    if let Some(g) = ground {
+                        for caster in &arm.casters {
+                            say(
+                                &mut submissions,
+                                cast_here(*caster, arm.slot, Some(CastTarget::Point(g))),
+                            );
+                        }
+                    }
+                    ui.cast_place = None;
+                    return;
+                }
+
                 // Attack-move click.
                 if ui.attack_move_armed {
                     if let Some(ground) = ground {
@@ -4913,11 +5066,16 @@ fn right_mouse(
     }
 
     // Right-click on the world always cancels transient modes first.
-    if ui.placement.is_some() || ui.attack_move_armed || ui.posture_place.is_some() {
+    if ui.placement.is_some()
+        || ui.attack_move_armed
+        || ui.posture_place.is_some()
+        || ui.cast_place.is_some()
+    {
         ui.placement = None;
         ui.wall_chain.clear();
         ui.attack_move_armed = false;
         ui.posture_place = None;
+        ui.cast_place = None;
         return;
     }
 
@@ -6727,6 +6885,17 @@ fn update_hud(
             s.cost_gold,
             s.cost_lumber,
             tail
+        )
+    } else if let Some(arm) = ui.cast_place.as_ref() {
+        format!(
+            "{} armed: left-click {} (Right-click / Esc cancels) - out of range is refused, \
+             the caster will not walk in",
+            arm.name,
+            if arm.wants_unit {
+                "the unit to cast it on - misses keep trying"
+            } else {
+                "where it lands"
+            }
         )
     } else if let Some(arm) = ui.posture_place {
         format!(

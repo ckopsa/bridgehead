@@ -37,7 +37,8 @@ use serde::Deserialize;
 use std::sync::LazyLock;
 
 use crate::shared::{
-    normalize_name, status_probe_enabled, upgrade_root, AbilityDef, AbilityEffect, BuildingKind,
+    normalize_name, status_probe_enabled, upgrade_root, AbilityDef, AbilityEffect, AbilityTarget,
+    BuildingKind,
     BuildingStats, ItemDef, ItemId, ResearchKind, ResearchStep, TechTier, UnitKind,
     UnitStats,
     AbilityUnlock, ALL_BUILDING_KINDS, ALL_ITEMS, ALL_RESEARCH_KINDS, ALL_UNIT_KINDS,
@@ -148,6 +149,13 @@ pub struct BuildingRow {
 struct AbilityDefRow {
     name: String,
     effect: AbilityEffect,
+    /// Where the effect is centred. DEFAULTED, unlike every other field here:
+    /// `AbilityTarget::Caster` is what every row meant before geometry was a
+    /// thing, so the caster-centred majority stays silent and only a thrown
+    /// spell says `target: Point(range: 9.0)`. A row that omits it reads
+    /// exactly as it did before this field existed.
+    #[serde(default)]
+    target: AbilityTarget,
     mana_cost: f32,
     cooldown: f32,
     radius: f32,
@@ -163,6 +171,7 @@ impl From<AbilityDefRow> for AbilityDef {
         let AbilityDefRow {
             name,
             effect,
+            target,
             mana_cost,
             cooldown,
             radius,
@@ -175,6 +184,7 @@ impl From<AbilityDefRow> for AbilityDef {
         AbilityDef {
             name: leak(name),
             effect,
+            target,
             mana_cost,
             cooldown,
             radius,
@@ -625,6 +635,14 @@ fn check_values(t: &Tables, defs: &[AbilityDef]) -> Vec<String> {
         if matches!(def.effect, AbilityEffect::ApplyStatus { .. }) {
             positive(&mut p, &what, "duration", def.duration);
         }
+        // Geometry. A targeted ability with no reach is a spell that can only
+        // ever be cast on the caster's own feet — which is a `Caster` row
+        // written the long way round, and far more likely a typo. Catching it
+        // here means the aimer and the range check never have to consider a
+        // zero or negative range at all.
+        if let Some(range) = def.target.range() {
+            positive(&mut p, &what, "target range", range);
+        }
         ability_names.push(normalize_name(def.name));
     }
     duplicates("abilities.ron", "name", &ability_names, &mut p);
@@ -934,6 +952,47 @@ mod tests {
             .flat_map(|r| r.abilities.iter().chain(r.probe_abilities.iter()))
             .chain(file.building_casters.iter().flat_map(|r| r.abilities.iter()))
             .all(|name| file.defs.iter().any(|d| &d.name == name)));
+    }
+
+    /// **Geometry survives the round trip, and the default is silence.**
+    /// The whole reason `target` is a defaulted field is that a caster-centred
+    /// row should read exactly as it did before geometry existed — so the
+    /// shipped file must have precisely one row that mentions it.
+    #[test]
+    fn ability_geometry_loads_from_ron_and_defaults_to_caster() {
+        let file: AbilityFile = ron::from_str(&source("abilities.ron", ABILITIES_RON))
+            .expect("shipped abilities.ron parses");
+        let targeted: Vec<(&str, AbilityTarget)> = file
+            .defs
+            .iter()
+            .filter(|d| d.target.is_targeted())
+            .map(|d| (d.name.as_str(), d.target))
+            .collect();
+        assert_eq!(
+            targeted,
+            vec![("Slow", AbilityTarget::Point { range: 9.0 })],
+            "Slow is the only row that should spell out a geometry; every other \
+             row must be riding the `Caster` default"
+        );
+        // And the default really is Caster rather than merely absent.
+        let slam = file.defs.iter().find(|d| d.name == "Slam").unwrap();
+        assert_eq!(slam.target, AbilityTarget::Caster);
+    }
+
+    /// A targeted ability with no reach can only ever be cast on the caster's
+    /// own feet — a `Caster` row written the long way round, and far more
+    /// likely a typo. The loader refuses it, so the aimer never has to think
+    /// about a zero range.
+    #[test]
+    fn a_targeted_ability_with_no_reach_is_refused() {
+        let tables = load_for_test();
+        let mut broken = unit_abilities(UnitKind::Sorcerer)[0];
+        broken.target = AbilityTarget::Point { range: 0.0 };
+        let problems = check_values(&tables, &[broken]);
+        assert!(
+            problems.iter().any(|m| m.contains("target range")),
+            "{problems:?}"
+        );
     }
 
     /// A fresh parse of the shipped files, for tests that need to break one.
