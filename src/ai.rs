@@ -18,7 +18,10 @@
 
 use crate::command::{CommandLink, OrderIssuer};
 use crate::shared::*;
-use bevy::ecs::system::SystemParam;
+// The map's published geography. Read-only, and the same three facts a bridge
+// commander is handed in every snapshot (`map.chokepoints`) — the scripted AI
+// is not being told anything a seat isn't.
+use crate::terrain::active_map;
 use bevy::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -61,11 +64,153 @@ const SPEARMAN_EVERY_NTH: u32 = 4;
 /// can, and that difference is the point.
 const KNIGHT_EVERY_NTH: u32 = 7;
 
+/// ---- Reactive composition ------------------------------------------------
+///
+/// The script has no scouting *memory* and is not allowed one: everything below
+/// keys off units this team can SEE THIS TICK through its own fog grid, and
+/// decays on a timer afterwards. Two decaying counters, no planner.
+///
+/// Why fog and not `GameEvents`: the feed's whole vocabulary is own-side facts —
+/// "lost 3 Footman near (x,z)", "hero low: 40%", "N hostiles near base",
+/// "squad 2 wiped". It never names an ENEMY unit kind, so it cannot tell the
+/// script that the thing killing it was a Raider rather than a Catapult. The
+/// fog grid can, and reading it is the same honesty the rest of `think` already
+/// obeys (`fog.sees` gates every enemy fact in the snapshot below).
+///
+/// Think ticks an alert stays live after the last sighting. At
+/// `THINK_INTERVAL` = 1s this is ~50 seconds — long enough to actually change
+/// the mix coming out of a Barracks (a Footman is ~20s of queue), short enough
+/// that one dead scout flyer doesn't rebuild the army.
+const ALERT_TICKS: u32 = 50;
+/// Archer cadence while enemy AIR has been seen. Replaces `ARCHER_EVERY_NTH`,
+/// so roughly half the Barracks output becomes anti-air instead of a third.
+const ARCHER_EVERY_NTH_AIR: u32 = 2;
+/// Spearman cadence while enemy CAVALRY (Raider or Knight) has been seen.
+const SPEARMAN_EVERY_NTH_CAVALRY: u32 = 2;
+/// ...and the cadence it degrades to when BOTH alerts are live at once. With
+/// air and cavalry on the field the Archer rule already owns every second slot,
+/// so leaving the Spearman rule at 2 would starve it to nothing; 3 keeps a
+/// visible screen in front of the archers without out-bidding them.
+const SPEARMAN_EVERY_NTH_BOTH: u32 = 3;
+
+/// ---- Static defense ------------------------------------------------------
+///
+/// Towers cost no supply. That is the whole danger: every other purchase in
+/// this file competes with the army for a supply cap that farms have to be
+/// built to raise, and a Tower competes with nothing. An AI allowed to answer
+/// "am I safe?" with "one more Tower" builds twenty-five of them, never pushes,
+/// and turns the scripted matchup — the decisive 5-20 minute baseline every
+/// balance run measures against — into a mutual siege that ends on the time
+/// cap. So the count is capped by construction, not by budget:
+/// `tower_quota` can never return more than `MAX_TOWERS`, and the build branch
+/// re-checks the same cap against what is actually standing.
+//
+// ONE, not two, and this number was measured rather than chosen. Against the
+// pre-bead baseline the `open` map converges in 7.1 / 7.1 / 7.2 / 8.4 minutes —
+// four runs, all decisive, remarkably tight. With two base towers a side it
+// went 6.7 / 10.3 / 23.3 / 25.0-and-timed-out: a 550 HP emplacement that shoots
+// 16 at range 16 does not merely cost 110 gold, it makes a 6-14 unit wave
+// bounce, and when BOTH scripted sides own that, neither can ever close and the
+// match runs to the cap with two intact economies staring at each other. That
+// is precisely the turtle failure this file is not allowed to have. Notably the
+// `crossings` runs stayed decisive (5.5-12.4) with the same code, because there
+// the towers go to a ford instead of the front door — which is the clearest
+// possible evidence that the problem was base defense, not the spending.
+const BASELINE_TOWERS: usize = 1;
+/// Hard ceiling on towers the script will ever own, baseline plus reactive.
+/// Four is one more than the rules below can currently ask for (2 baseline + 1
+/// on air contact): the slack is deliberate, so a future reactive rule has room
+/// to exist without anybody having to remember that the ceiling was implicit.
+const MAX_TOWERS: usize = 4;
+/// Gold in hand before the AI spends 110g/80l on a baseline Tower. A reactive
+/// (air-contact) Tower ignores this: by the time a Gryphon is overhead, "we
+/// cannot afford to answer it" is not a position, it is a loss.
+// 240 -> 350, alongside the second-hall gate below. Both exist to push the
+// baseline tower late and make it come out of genuine surplus, for the pacing
+// reason recorded on BASELINE_TOWERS.
+const TOWER_GOLD: u32 = 350;
+
+/// ---- Fortifying a crossing ----------------------------------------------
+///
+/// On a map that publishes chokepoints, a Tower in the base ring is a Tower
+/// pointed at nothing: everything that will ever attack us has to walk through
+/// a ford first. So towers go to the ford instead — but only a ford we already
+/// live next to. Distance from our nearest hall to the ford, above which the
+/// script gives up and fortifies home. On `crossings` the two flank fords ARE
+/// the neutral gold mines, so this fires exactly once the expansion lands: the
+/// same building then guards the second mine and the crossing, which is the
+/// map's central claim ("taking a second mine and holding a crossing are the
+/// same decision") turned into behaviour. The centre ford sits ~99 from either
+/// start position; walking a lone worker out there to plant one tower in the
+/// middle of the map is how a script donates 110 gold.
+const FORD_HOLD_RADIUS: f32 = 45.0;
+/// How far back from the gap's centre the emplacement sits, measured toward
+/// our own side. A Tower shoots 16 and sees 20, so standing off keeps the whole
+/// opening covered while putting the structure behind the fight rather than in
+/// it.
+const FORD_STANDOFF: f32 = 9.0;
+/// Wall segments the script will plant beside a ford tower. Two, ever.
+const FORD_WALLS: usize = 2;
+/// ...and only in a gap at least this wide. A wall is 2 wide and a tower is 3;
+/// dropping them into the 16-wide centre ford would start narrowing the one
+/// route our OWN army uses to attack with, and an AI that walls itself in is
+/// the turtle failure mode wearing a different hat. The flank fords are 30
+/// wide, so this admits them and nothing else.
+const FORD_WALL_MIN_WIDTH: f32 = 20.0;
+/// Offsets along the barrier from the tower, where wall segments go.
+const FORD_WALL_OFFSETS: [f32; 2] = [-5.0, 5.0];
+/// Radius around the hold point counted as "at this crossing" when the script
+/// asks whether it has already garrisoned the ford.
+const FORD_AREA: f32 = 14.0;
+/// Rings searched outward from an emplacement's ideal spot. Much tighter than
+/// `BUILD_RING_RADII`: a Tower wants to be AT a place, and a Tower 12 units off
+/// its ford is a Tower covering the wrong ground.
+const EMPLACE_RING_RADII: [f32; 4] = [3.0, 5.0, 8.0, 12.0];
+
+/// ---- Shop and hero items -------------------------------------------------
+///
+/// Gold in hand before the AI spends 75g/60l on a Shop, and a Keep standing.
+/// The Shop is the cheapest building in the game after a Farm, but it produces
+/// nothing: it is a *conversion* — surplus gold into hero uptime — so it is
+/// gated like every other surplus purchase here.
+const SHOP_GOLD: u32 = 300;
+/// Hero HP fraction at or below which the script drinks a held potion.
+const POTION_HP_FRAC: f32 = 0.5;
+/// Gold in hand before the script restocks the 100g potion — its own price plus
+/// a Footman's worth of change, so buying one is never the reason a Barracks
+/// went idle.
+const POTION_RICH_GOLD: u32 = 200;
+/// "Idle-rich": gold in hand before the script buys the 50g Boots. Boots are a
+/// convenience, the last thing on the shelf worth buying, so the bar is high.
+const BOOTS_RICH_GOLD: u32 = 350;
+/// Gold in hand before the script buys the 125g tier-2 Banner.
+const BANNER_RICH_GOLD: u32 = 300;
+/// Enemies within `BANNER_RADIUS` of the hero that make a fight worth a Banner.
+const BANNER_MIN_TARGETS: usize = 3;
+
 /// Siege. A Workshop is a luxury: only once a Barracks stands and the treasury
 /// is comfortably ahead of army production does the AI branch into siege.
 // 350, not 500: sim runs showed peak treasury in short games (~320) never
 // clears a 500 gate, so siege only appeared in long games — the opposite of
 // its purpose.
+/// Gold on hand before the script commits to an Arcane Sanctum. The Keep gate
+/// is doing most of the work already — this only stops the purchase coming out
+/// of an empty treasury the frame the upgrade lands.
+const SANCTUM_GOLD: u32 = 300;
+/// How many Sorcerers the script ever wants alive at once. A few, not a
+/// screen: `StatusKind::Slow` REFRESHES rather than stacks, so the fourth
+/// caster adds frontage and nothing else, and each one is 2 supply of almost
+/// no combat value.
+const MAX_SORCERERS: usize = 3;
+const SANCTUM_QUEUE_MAX: usize = 1;
+/// Fighting units (heroes excluded) the script wants on the field before it
+/// opens a SECOND hero slot. A Keep lands with the treasury already stretched,
+/// and a 400g/100l hero bought out of that leaves a base defended by two
+/// characters and twelve workers — which is exactly what the first tier-2 sim
+/// run produced. Reviving a hero the team already owns is not gated by this:
+/// a level-6 Champion at 250g is the best gold on the map.
+const SECOND_HERO_MIN_ARMY: usize = 6;
+
 const WORKSHOP_GOLD: u32 = 350;
 const WORKSHOP_QUEUE_MAX: usize = 2;
 /// Target mix: one Catapult per this many Barracks-produced line units.
@@ -140,10 +285,33 @@ const WORKER_FLEE_RADIUS: f32 = 10.0;
 const KEEP_MIN_ARMY: usize = 6;
 /// The Castle is a late-game surplus purchase, so it wants a standing army...
 const CASTLE_MIN_ARMY: usize = 6;
-/// ...and this much gold still in the bank AFTER paying for it. Tuned down
-/// from 400 against sims: games converge in 8-12 minutes and the mines run dry
-/// before that, so a stricter test meant tier 3 simply never happened.
-const CASTLE_SPARE_GOLD: u32 = 300;
+/// ...and this much gold still in the bank AFTER paying for it.
+//
+// 300 -> 60. The old gate was `army >= 6 && gold - 480 >= 300`, i.e. 780 gold
+// in hand at the instant of a think tick, on top of 240 lumber. Across every
+// sim on record that number was reached exactly never: the scripted economy
+// runs two Barracks flat out and converges the match in 7-13 minutes, and its
+// peak treasury in that window is a few hundred. So tier 3 was unreachable in
+// practice — Knights and Gryphon Riders were content the baseline could not
+// produce, and the whole tier-3 branch of this file had never once executed.
+//
+// The fix is not "make the Castle cheap", it is "ask the right question". A
+// Castle is worth buying when the economy behind it is *durable*, and the
+// script already has two hard, observable proofs of durability that it was
+// throwing away: an attack-research rung finished (the forge only exists at
+// Keep, and only bought a rung out of surplus), or a second mining base
+// standing. Either one means the treasury has already survived a real
+// withdrawal. Given that proof, the leftover-gold test can drop to a token
+// buffer — it is there so the Castle is never the last gold in the bank, not
+// as a second durability test.
+const CASTLE_SPARE_GOLD: u32 = 60;
+/// Gold in hand before the Castle's price may be ring-fenced against army
+/// production. The reserve is the dangerous half of this feature: holding 480g
+/// and 240l back from the Barracks in a game that will never reach it is how a
+/// script stops building units and loses to its own ambition. So the latch only
+/// arms once the bank is already within striking distance — half the price —
+/// exactly the guard `RESEARCH_SPARE_GOLD` puts on the research reserve.
+const CASTLE_LATCH_GOLD: u32 = 240;
 /// Gold in hand before the AI spends 140g/80l on a Blacksmith.
 // 180, not 260. The forge sits below the Workshop in the `want` chain, and the
 // Workshop's own gate is `gold > 350` — so the window in which the chain even
@@ -302,6 +470,22 @@ struct AiBrain {
     /// research forever and never do it. Cleared on the next thought once the
     /// order lands, because research is paid the instant it is accepted.
     research_pending: bool,
+    /// An item is wanted at the Shop but not yet affordable. Same ring-fence,
+    /// smallest stake: a 125g Banner is one Footman, and one Footman is exactly
+    /// what continuous production spends it on. Latched only when the bank is
+    /// already at least half the price (`item_reserve`), so a poor game never
+    /// quietly stops training to save for a consumable.
+    item_pending: bool,
+    /// Think ticks of "enemy air has been seen" left. Set to `ALERT_TICKS` on
+    /// every sighting through our own fog, decremented once per thought. Not a
+    /// memory of WHERE — a decaying flag, nothing more.
+    air_alert: u32,
+    /// Same, for enemy cavalry (Raider or Knight).
+    cavalry_alert: u32,
+    /// Whether each alert was live at the last thought, so the trace logs the
+    /// shift starting and ending once instead of every second.
+    air_alert_logged: bool,
+    cavalry_alert_logged: bool,
     harvest_counter: u32,
     army_counter: u32,
     /// Catapults queued so far — paced against `army_counter`.
@@ -321,6 +505,11 @@ impl AiBrain {
             last_tier: 1,
             tierup_pending: false,
             research_pending: false,
+            item_pending: false,
+            air_alert: 0,
+            cavalry_alert: 0,
+            air_alert_logged: false,
+            cavalry_alert_logged: false,
             harvest_counter: 0,
             army_counter: 0,
             siege_counter: 0,
@@ -406,6 +595,7 @@ fn tag_of(order: &Order) -> Tag {
 
 struct UnitInfo {
     entity: Entity,
+    kind: UnitKind,
     pos: Vec3,
     tag: Tag,
     moving: bool,
@@ -427,12 +617,28 @@ impl UnitInfo {
     }
 }
 
+/// One of our living heroes, with everything the ability and shop rules ask of
+/// it. Split out from `UnitInfo` because a hero is the only unit the script
+/// treats as an individual.
+struct HeroInfo {
+    entity: Entity,
+    pos: Vec3,
+    /// Slot-0 ability off cooldown and affordable.
+    ready: bool,
+    /// Health as a fraction of max — what the potion rule reads.
+    frac: f32,
+    inventory: Inventory,
+}
+
 struct BuildingInfo {
     entity: Entity,
     kind: BuildingKind,
     pos: Vec3,
     done: bool,
     queue_len: usize,
+    /// Sorcerers sitting in this building's queue — counted so the script's
+    /// caster cap sees production already in flight, not just bodies alive.
+    queued_sorcerers: usize,
     /// Already converting to its next tier — not a candidate for another
     /// upgrade order, and the reason the tier-up reserve can be released.
     upgrading: bool,
@@ -479,6 +685,10 @@ type UnitQuery<'w, 's> = Query<
         Option<&'static Carrying>,
         Option<&'static Hero>,
         Option<&'static AbilityCooldowns>,
+        // Hero-only, both of them: what the shop rules read (units.rs puts an
+        // empty `Inventory` on a hero at spawn and on nothing else).
+        &'static Health,
+        Option<&'static Inventory>,
     ),
 >;
 
@@ -499,14 +709,25 @@ type BuildingQuery<'w, 's> = Query<
 
 type NodeQuery<'w, 's> = Query<'w, 's, (Entity, &'static ResourceNode, &'static Transform)>;
 
-/// The events one think tick can emit. Bundled the same way intent.rs bundles
-/// `IntentEvents`: three writers were three of `ai_think`'s sixteen system
-/// params, and Chain of Command needed one of those slots back.
-#[derive(SystemParam)]
-pub struct AiEvents<'w> {
+/// Every event the scripted commander can send, in one parameter.
+///
+/// Bundled rather than listed because Bevy caps a system's parameter list and
+/// `ai_think` had reached it — but also because this IS the AI's whole output
+/// surface. The script mutates nothing directly except `Order` components; each
+/// field below is one of the five things it is allowed to ASK the engine for,
+/// through the identical event the player's hotkey sends.
+#[derive(bevy::ecs::system::SystemParam)]
+struct AiEvents<'w> {
+    /// Hero abilities (the Champion's Slam).
     casts: EventWriter<'w, CastAbility>,
+    /// Hall tier-ups.
     upgrades: EventWriter<'w, UpgradeBuilding>,
-    start_research: EventWriter<'w, StartResearch>,
+    /// Blacksmith research rungs.
+    research: EventWriter<'w, StartResearch>,
+    /// Shop purchases.
+    buys: EventWriter<'w, BuyItem>,
+    /// Spending a consumable out of the hero's inventory.
+    uses: EventWriter<'w, UseItem>,
 }
 
 /// Drives one think tick for every team the AI is currently playing.
@@ -604,12 +825,20 @@ fn think(
     let mut enemy_any: Vec<Vec3> = Vec::new();
     // Enemies standing ON the ground: the only ones a Slam can touch.
     let mut enemy_ground: Vec<Vec3> = Vec::new();
-    // Own living heroes: (entity, position, ability ready).
-    let mut own_heroes: Vec<(Entity, Vec3, bool)> = Vec::new();
+    // Own living heroes.
+    let mut own_heroes: Vec<HeroInfo> = Vec::new();
+    // Did we LOOK AT enemy air / enemy cavalry this tick? Two bits, refreshed
+    // from scratch every thought; the memory is the decaying counter on the
+    // brain, not these.
+    let mut saw_air = false;
+    let mut saw_cavalry = false;
 
-    for (entity, unit, team, tf, order, move_to, carrying, hero, cooldowns) in units.iter() {
+    for (entity, unit, team, tf, order, move_to, carrying, hero, cooldowns, health, inventory) in
+        units.iter()
+    {
         let info = UnitInfo {
             entity,
+            kind: unit.kind,
             // Flattened to the ground plane. Every comparison below is a
             // ground-plane question ("is it near my base", "has it reached the
             // rally"), and a flyer's altitude would otherwise inflate all of
@@ -632,7 +861,17 @@ fn think(
                 let ready = abilities_of_unit(unit.kind)
                     .first()
                     .is_some_and(|def| ability_ready(def, Some(hero), cooldowns, 0));
-                own_heroes.push((entity, info.pos, ready));
+                own_heroes.push(HeroInfo {
+                    entity,
+                    pos: info.pos,
+                    ready,
+                    frac: if health.max > 0.0 {
+                        health.current / health.max
+                    } else {
+                        1.0
+                    },
+                    inventory: inventory.copied().unwrap_or_default(),
+                });
             }
             // Everything that isn't a Worker is army: heroes, Archers,
             // Catapults and Raiders all join waves with no extra wiring.
@@ -647,8 +886,15 @@ fn think(
             // everything below — defence, worker flight, Slam timing — was
             // reading the ECS directly and now reads what this team can see.
             enemy_any.push(info.pos);
-            if !is_flying_kind(unit.kind) {
+            if is_flying_kind(unit.kind) {
+                saw_air = true;
+            } else {
                 enemy_ground.push(info.pos);
+            }
+            // The two reactions. Both are pure sight: a kind we are looking at
+            // right now, never a kind we were killed by ten seconds ago.
+            if matches!(unit.kind, UnitKind::Raider | UnitKind::Knight) {
+                saw_cavalry = true;
             }
             // Workers don't hunt, and neither does anything that cannot shoot
             // downward — so neither should make a harvest crew run.
@@ -658,10 +904,43 @@ fn think(
         }
     }
 
+    // --- reactive alerts (two decaying counters, no planner) ------------------
+    // A sighting refills the counter; a thought without one drains it. That is
+    // the entire mechanism: the script cannot say where the cavalry was, how
+    // much of it there was, or where it is going. It can only say "there was
+    // some, recently", and buy accordingly for a while.
+    brain.air_alert = tick_alert(brain.air_alert, saw_air);
+    brain.cavalry_alert = tick_alert(brain.cavalry_alert, saw_cavalry);
+    let air_alert = brain.air_alert > 0;
+    let cavalry_alert = brain.cavalry_alert > 0;
+    let (archer_nth, spearman_nth) = reactive_cadences(air_alert, cavalry_alert);
+    // One line when a shift starts and one when it lapses, so a sim trace shows
+    // the reaction without having to be re-derived from the unit mix.
+    for (live, logged, what, mix) in [
+        (air_alert, &mut brain.air_alert_logged, "enemy AIR", "Archers"),
+        (
+            cavalry_alert,
+            &mut brain.cavalry_alert_logged,
+            "enemy CAVALRY",
+            "Spearmen",
+        ),
+    ] {
+        if live != *logged {
+            if live {
+                info!("[ai {me:?}] {what} sighted — shifting the mix toward {mix}");
+            } else {
+                info!("[ai {me:?}] {what} contact has lapsed — mix back to standard");
+            }
+            *logged = live;
+        }
+    }
+
     let mut own_buildings: Vec<BuildingInfo> = Vec::new();
     let mut enemy_buildings: Vec<Vec3> = Vec::new();
     let mut queued_supply: u32 = 0;
-    let mut hero_queued = false;
+    // Hero CLASSES already in this team's queues. A list, not a flag: slots
+    // scale with the hall ladder now, and the lock is per class.
+    let mut heroes_queued: Vec<UnitKind> = Vec::new();
     for (entity, building, team, tf, under, queue, upgrading, researching) in buildings.iter() {
         if *team != me {
             // Seen right now. Structures we merely REMEMBER are appended
@@ -674,10 +953,19 @@ fn think(
             continue;
         }
         let queue_len = queue.as_ref().map(|q| q.queue.len()).unwrap_or(0);
+        let mut queued_sorcerers = 0usize;
         if let Some(q) = queue.as_ref() {
             queued_supply += q.queue.iter().map(|k| unit_stats(*k).supply).sum::<u32>();
-            // Either hero class occupies the team's single hero slot.
-            hero_queued |= q.queue.iter().any(|k| is_hero_kind(*k));
+            // Hero classes already in flight — one slot each, and no class
+            // twice (see `hero_slots`).
+            for k in q.queue.iter() {
+                if is_hero_kind(*k) {
+                    heroes_queued.push(*k);
+                }
+                if *k == UnitKind::Sorcerer {
+                    queued_sorcerers += 1;
+                }
+            }
         }
         own_buildings.push(BuildingInfo {
             entity,
@@ -685,6 +973,7 @@ fn think(
             pos: tf.translation,
             done: under.is_none(),
             queue_len,
+            queued_sorcerers,
             upgrading: upgrading.is_some(),
             researching: researching.is_some(),
         });
@@ -805,6 +1094,13 @@ fn think(
         // hall, build one" branch or plan a second expansion behind its back.
         let halls_total = own_buildings.iter().filter(|b| is_hall(b.kind)).count();
         let hall_going_up = own_buildings.iter().any(|b| is_hall(b.kind) && !b.done);
+        // The rung we actually hold right now — what tier-gated buildings ask.
+        let tier_now = own_buildings
+            .iter()
+            .filter(|b| b.done && is_hall(b.kind))
+            .map(|b| building_tier(b.kind))
+            .max()
+            .unwrap_or(0);
 
         // A second mining base, planned before it is affordable so the site is
         // already vetted (unclaimed, undefended-by-them, buildable) when the
@@ -824,17 +1120,86 @@ fn think(
             None
         };
 
+        // --- static defense ---------------------------------------------------
+        // A Keep standing is the "the opening is over" line the whole file
+        // already uses; two towers is what the base gets for reaching it, and a
+        // third is what an enemy flyer buys itself by being seen. `count_of`
+        // (scaffolding included) is what stops a 25s build from being ordered
+        // four times while the first one goes up.
+        let keep_standing = own_buildings
+            .iter()
+            .any(|b| b.done && is_hall(b.kind) && building_tier(b.kind) >= 2);
+        let towers_standing = count_of(BuildingKind::Tower);
+        // Two independent ceilings, and the tighter one wins: the rules' own
+        // quota, and the hard cap that exists so no future rule can talk this
+        // script into a fortress. See `MAX_TOWERS`.
+        let tower_wanted = wants_tower(
+            done_count(BuildingKind::Barracks) >= 1,
+            towers_standing,
+            keep_standing,
+            air_alert,
+        );
+
+        // The crossing worth holding, if this map has one and we live by it.
+        // Every hall counts, expansions included — that is the point.
+        let own_halls: Vec<Vec3> = own_buildings
+            .iter()
+            .filter(|b| is_hall(b.kind) && b.done)
+            .map(|b| b.pos)
+            .collect();
+        let ford = ford_hold_point(&active_map().chokepoints(), &own_halls);
+        // Is the ford already garrisoned? Walls are a screen for a tower that
+        // exists, never a fortification on their own.
+        let ford_tower = ford.as_ref().is_some_and(|f| {
+            own_buildings
+                .iter()
+                .any(|b| b.kind == BuildingKind::Tower && xz_dist(b.pos, f.hold) < FORD_AREA)
+        });
+        let ford_walls = ford.as_ref().map_or(0, |f| {
+            own_buildings
+                .iter()
+                .filter(|b| b.kind == BuildingKind::Wall && xz_dist(b.pos, f.hold) < FORD_AREA)
+                .count()
+        });
+        let wall_wanted = ford_tower
+            && ford.as_ref().is_some_and(|f| !ford_wall_sites(f).is_empty())
+            && ford_walls < FORD_WALLS
+            && gold > TOWER_GOLD;
+
+        // A Shop is a conversion, not production: surplus gold into hero
+        // uptime. Bottom of the chain, Keep-gated, bank-gated, one ever.
+        let shop_wanted = keep_standing
+            && count_of(BuildingKind::Shop) == 0
+            && gold > SHOP_GOLD;
+
         let want = if halls_total == 0 {
             Some(BuildingKind::TownHall)
         } else if headroom < SUPPLY_BUFFER && !under_construction(BuildingKind::Farm) {
             Some(BuildingKind::Farm)
         } else if count_of(BuildingKind::Barracks) == 0 {
             Some(BuildingKind::Barracks)
+        } else if tier_now >= 2 && count_of(BuildingKind::Sanctum) == 0 && gold > SANCTUM_GOLD {
+            // The caster branch, and deliberately ABOVE the expansion. That
+            // looks like it contradicts "income first", and it does not: this
+            // is a ONE-OFF 150g/130l purchase gated behind a Keep the team has
+            // already spent 320g/160l reaching, while `expansion` is an
+            // unbounded series that re-arms every time a mine is claimed. Put
+            // below it, the Sanctum loses every roll forever — five straight
+            // sim runs reached tier 2 and finished with no caster ever built,
+            // which is a tier-2 unlock that has never been played.
+            Some(BuildingKind::Sanctum)
         } else if expansion.is_some() {
-            // Above the luxuries (second Barracks, Workshop) and below the
-            // army's first Barracks: income outlives any one more Footman, but
-            // a base with no defenders never gets to spend it.
+            // Above the remaining luxuries (second Barracks, Workshop) and
+            // below the army's first Barracks: income outlives any one more
+            // Footman, but a base with no defenders never gets to spend it.
             Some(BuildingKind::TownHall)
+        } else if tower_wanted && air_alert {
+            // The reactive Tower, and the only branch in this chain with no
+            // gold gate of its own. A flyer cannot be walked around, blocked,
+            // or out-ranged by anything the Barracks makes in time; a Tower is
+            // the answer that is already standing when it arrives. "We could
+            // not afford to answer air" is not a position worth protecting.
+            Some(BuildingKind::Tower)
         } else if gold > SECOND_BARRACKS_GOLD && count_of(BuildingKind::Barracks) < MAX_BARRACKS {
             Some(BuildingKind::Barracks)
         } else if done_count(BuildingKind::Barracks) >= 1
@@ -859,6 +1224,24 @@ fn think(
             // branch here spells its prerequisite — ai.rs hand-rolls its gates
             // and economy.rs enforces the real one at placement.
             Some(BuildingKind::Blacksmith)
+        } else if shop_wanted {
+            // 75g/60l, the cheapest thing left on this list, and like the forge
+            // above it its benefit travels with the army instead of guarding
+            // one patch of dirt. Same argument, same side of the towers.
+            Some(BuildingKind::Shop)
+        } else if tower_wanted && halls >= 2 && gold > TOWER_GOLD {
+            // The baseline tower, at the bottom of the chain. Everything above
+            // either earns money, makes soldiers, or makes soldiers better; a
+            // Tower does none of the three, and the scripted AI is judged on
+            // whether it attacks.
+            //
+            // `halls >= 2` — fortify only what a second income is paying for.
+            // A base that has not expanded yet cannot spare the gold OR the
+            // tempo, and buying static defense out of a single mine is how the
+            // scripted matchup stops converging (see BASELINE_TOWERS).
+            Some(BuildingKind::Tower)
+        } else if wall_wanted {
+            Some(BuildingKind::Wall)
         } else {
             None
         };
@@ -880,9 +1263,19 @@ fn think(
                 // An expansion hall goes next to its mine, not next to home —
                 // the whole point is a short haul at the *new* patch.
                 let expanding = kind == BuildingKind::TownHall && expansion.is_some();
-                let site = match &expansion {
-                    Some(plan) if expanding => Some(plan.site),
-                    _ => pick_site(nav, anchor, stats.size + BUILD_PADDING),
+                let footprint = stats.size + BUILD_PADDING;
+                // Three siting rules, in order of how much the placement
+                // matters: an expansion goes to its mine, an emplacement goes
+                // to the ford it is there to hold, everything else goes in a
+                // ring around the base like it always did.
+                let site = match (&expansion, kind, &ford) {
+                    (Some(plan), _, _) if expanding => Some(plan.site),
+                    (_, BuildingKind::Tower, Some(f)) => pick_spot(nav, f.hold, footprint)
+                        .or_else(|| pick_site(nav, anchor, footprint)),
+                    (_, BuildingKind::Wall, Some(f)) => ford_wall_sites(f)
+                        .into_iter()
+                        .find(|p| nav.rect_is_free(*p, footprint)),
+                    _ => pick_site(nav, anchor, footprint),
                 };
                 if let Some(site) = site {
                     if let Some(builder) = pick_builder(&workers, &fleeing, site) {
@@ -914,6 +1307,41 @@ fn think(
                             stats.cost_gold,
                             stats.cost_lumber,
                         );
+                        // Emplacements get their own line: which crossing, how
+                        // far from its centre, and whether it was the baseline
+                        // pair or an answer to something in the air. This is
+                        // the evidence a sim run is read for.
+                        if matches!(kind, BuildingKind::Tower | BuildingKind::Wall) {
+                            match &ford {
+                                Some(f) => info!(
+                                    "[ai {me:?}] fortifying the {}: {} at ({:.0},{:.0}), {:.0} back \
+                                     from the crossing ({} of {}{})",
+                                    f.name,
+                                    building_name(kind),
+                                    site.x,
+                                    site.z,
+                                    xz_dist(site, f.hold),
+                                    towers_standing + 1,
+                                    tower_quota(keep_standing, air_alert),
+                                    if air_alert { ", air contact" } else { "" },
+                                ),
+                                None => info!(
+                                    "[ai {me:?}] {} at ({:.0},{:.0}) — no crossing to hold, \
+                                     fortifying the base ({} of {})",
+                                    building_name(kind),
+                                    site.x,
+                                    site.z,
+                                    towers_standing + 1,
+                                    tower_quota(keep_standing, air_alert),
+                                ),
+                            }
+                        }
+                        if kind == BuildingKind::Shop {
+                            info!(
+                                "[ai {me:?}] Shop at ({:.0},{:.0}) — hero items are open",
+                                site.x, site.z
+                            );
+                        }
                         if let (true, Some(plan)) = (expanding, &expansion) {
                             brain.expansion_pending = true;
                             info!(
@@ -983,19 +1411,28 @@ fn think(
         if let Some(hall) = main_hall {
             if let Some((cost_gold, cost_lumber, _)) = upgrade_cost(hall.kind) {
                 let tier = building_tier(hall.kind);
+                // The two proofs of a durable economy the Castle asks for.
+                // Both are things that ALREADY HAPPENED and cost real money —
+                // a finished attack rung, or a second mining base standing —
+                // which is why either is allowed to stand in for the enormous
+                // cash-on-hand test that used to make tier 3 unreachable.
+                let attack_researched = team_research.get(me).level(ResearchKind::Attack) >= 1;
+                let expanded = halls >= 2;
                 let wanted = match tier {
                     // Keep: as soon as the opening is genuinely over.
                     1 => barracks_up && army.len() >= KEEP_MIN_ARMY,
-                    // Castle: a late luxury, and only out of surplus — the
-                    // gold test is against what is left AFTER the price, so a
-                    // Castle never comes out of the army budget.
-                    _ => {
-                        army.len() >= CASTLE_MIN_ARMY
-                            && gold.saturating_sub(cost_gold) >= CASTLE_SPARE_GOLD
-                    }
+                    // Castle: the ambition, asked without reference to cash so
+                    // the reserve below can be what actually accumulates it.
+                    _ => castle_is_the_plan(army.len(), attack_researched, expanded),
+                };
+                // Affordable AND still out of surplus. The Keep has no surplus
+                // test — it is the tier-up that pays for itself.
+                let payable = match tier {
+                    1 => true,
+                    _ => wants_castle(army.len(), gold, cost_gold, attack_researched, expanded),
                 };
                 if wanted {
-                    if gold >= cost_gold && lumber >= cost_lumber {
+                    if payable && gold >= cost_gold && lumber >= cost_lumber {
                         gold -= cost_gold;
                         lumber -= cost_lumber;
                         events.upgrades.write(UpgradeBuilding {
@@ -1012,10 +1449,17 @@ fn think(
                             hall.pos.z,
                             army.len(),
                         );
-                    } else {
+                    } else if tier == 1 || gold >= CASTLE_LATCH_GOLD {
                         // Ring-fence: hold the price out of the army's reach
                         // until the deliveries add up, or the Barracks will
                         // keep the treasury a Footman short of it forever.
+                        //
+                        // The Keep latches unconditionally — it is 320g in the
+                        // fourth minute and the script always gets there. The
+                        // Castle has to prove it is close first
+                        // (`CASTLE_LATCH_GOLD`): 480g/240l held back from a
+                        // treasury that will never reach it is not saving, it
+                        // is a production halt with good intentions.
                         brain.tierup_pending = true;
                         tierup_reserve = (cost_gold, cost_lumber);
                     }
@@ -1066,7 +1510,7 @@ fn think(
                 if spare && lumber >= step.cost_lumber {
                     gold -= step.cost_gold;
                     lumber -= step.cost_lumber;
-                    events.start_research.write(StartResearch {
+                    events.research.write(StartResearch {
                         building: forge.entity,
                         kind,
                     });
@@ -1139,21 +1583,50 @@ fn think(
     let mut worker_count = workers.len();
     let mut orders: Vec<(Entity, UnitKind)> = Vec::new();
 
-    // One Champion per team: train the first once a Barracks is up, and revive
-    // a fallen one as soon as the (cheaper) price is affordable.
-    let mut want_hero = own_heroes.is_empty()
-        && !hero_queued
-        && (records.get(me).is_some()
-            || own_buildings.iter().any(|b| b.kind == BuildingKind::Barracks));
-    // The script plays the Champion, but a team's class is locked by whichever
-    // hero it fielded first (a commander sharing this team could have picked
-    // the Priestess). Queuing the locked class keeps economy.rs from dropping
-    // the item unpaid at the front of the queue.
-    let hero_kind = records.get(me).map_or(UnitKind::Hero, |rec| rec.kind);
-    let hero_supply = unit_stats(hero_kind).supply;
+    // Hero slots scale with the hall ladder — 1 at TownHall, 2 at Keep, 3 at
+    // Castle, distinct classes only (`hero_slots`). The script fills them in a
+    // fixed order: Champion first, Priestess as the second slot a Keep opens.
+    // Revival of a class it has already lost outranks opening a new one — a
+    // level-6 Champion at 250g is the best gold in the game.
+    const HERO_PICK_ORDER: [UnitKind; 2] = [UnitKind::Hero, UnitKind::Priestess];
+    let mut held_classes: Vec<UnitKind> = army
+        .iter()
+        .filter(|u| is_hero_kind(u.kind))
+        .map(|u| u.kind)
+        .collect();
+    held_classes.extend(heroes_queued.iter().copied());
+    let barracks_standing = own_buildings
+        .iter()
+        .any(|b| b.kind == BuildingKind::Barracks);
+    let slots_open = (held_classes.len() as u32) < hero_slots(TechTier::from_level(current_tier));
+    // Opening an ADDITIONAL slot is a luxury; filling the first one never was.
+    let fighters = army.iter().filter(|u| !is_hero_kind(u.kind)).count();
+    let can_open_another = held_classes.is_empty() || fighters >= SECOND_HERO_MIN_ARMY;
+    let candidates = |revivals_only: bool| {
+        HERO_PICK_ORDER.into_iter().find(|k| {
+            if held_classes.contains(k) {
+                return false;
+            }
+            let known = records.get(me, *k).is_some();
+            if revivals_only {
+                // Bringing back a hero this team already owns is always worth
+                // it — cheap, and it keeps a level the team already paid for.
+                known
+            } else {
+                // A brand-new hero class waits for a Barracks, exactly as the
+                // team's first one always did, and — if it would be the team's
+                // second — for an army that can hold the base while it trains.
+                !known && can_open_another && barracks_standing
+            }
+        })
+    };
+    let mut want_hero = slots_open
+        .then(|| candidates(true).or_else(|| candidates(false)))
+        .flatten();
 
-    if want_hero {
-        let (hero_gold, hero_lumber, _) = hero_train_cost(records, me);
+    if let Some(hero_kind) = want_hero {
+        let (hero_gold, hero_lumber, _) = hero_train_cost(records, me, hero_kind);
+        let hero_supply = unit_stats(hero_kind).supply;
         // Hero training and revival happen at any finished rung of the hall
         // ladder — a team that teched to Keep must not lose its hero.
         let hall = own_buildings.iter().find(|b| b.done && is_hall(b.kind));
@@ -1162,21 +1635,22 @@ fn think(
                 gold -= hero_gold;
                 lumber -= hero_lumber;
                 headroom -= hero_supply;
-                want_hero = false;
+                want_hero = None;
                 orders.push((hall.entity, hero_kind));
             }
         }
     }
 
-    // Still saving up? Ring-fence the Champion's price so continuous army
+    // Still saving up? Ring-fence the hero's price so continuous army
     // production doesn't keep the treasury permanently just below it. Supply is
     // deliberately NOT reserved: army units are what drives the farm trigger,
     // and holding 5 supply back would stall the whole build order.
-    let (mut reserve_gold, mut reserve_lumber) = if want_hero {
-        let (g, l, _) = hero_train_cost(records, me);
-        (g, l)
-    } else {
-        (0, 0)
+    let (mut reserve_gold, mut reserve_lumber) = match want_hero {
+        Some(kind) => {
+            let (g, l, _) = hero_train_cost(records, me, kind);
+            (g, l)
+        }
+        None => (0, 0),
     };
     // Same ring-fence for the expansion down payment, held both while saving
     // up and for the whole walk out to the site. Without it the Barracks
@@ -1194,10 +1668,94 @@ fn think(
     reserve_gold += research_reserve.0;
     reserve_lumber += research_reserve.1;
 
-    for b in &own_buildings {
-        if !b.done {
-            continue;
+    // --- the Shop ------------------------------------------------------------
+    // Four rules, documented on `item_plan`. Placed here, after every other
+    // reserve is known, because an item is the smallest deferred purchase in
+    // the file and therefore the one most easily eaten: 125 gold is one
+    // Footman, so without holding the price back the script would decide to buy
+    // a Banner every second for the rest of the match and never own one. Two
+    // different questions about money are being asked, deliberately:
+    //   * is the BANK healthy enough that a consumable is a reasonable idea
+    //     (`gold`, passed to `item_plan` as discretion);
+    //   * can we pay for it out of what nothing else has already claimed
+    //     (`gold - reserve_gold`).
+    // A "yes, no" answer is exactly what the ring-fence exists for.
+    brain.item_pending = false;
+    let shop = own_buildings
+        .iter()
+        .find(|b| b.done && b.kind == BuildingKind::Shop);
+    if let (Some(shop), Some(hero)) = (shop, own_heroes.first()) {
+        let tier = tech_tier_for(own_buildings.iter().filter(|b| b.done).map(|b| b.kind));
+        // "A real fight", the same shape as the Slam rule: a clump on the hero.
+        let engaged = enemy_any
+            .iter()
+            .filter(|e| e.distance(hero.pos) <= BANNER_RADIUS)
+            .count()
+            >= BANNER_MIN_TARGETS;
+        // "About to march": the wave-launch condition from the military section
+        // below, asked one section early. Boots last 15s and the walk is longer,
+        // so the only non-wasteful moment to drink them is the moment the army
+        // turns around.
+        let marching =
+            threat.is_none() && !brain.wave_active && army.len() >= brain.next_wave_size;
+        match item_plan(tier, gold, hero.frac, hero.inventory, engaged, marching) {
+            Some(ItemAction::Use(slot)) => {
+                let what = hero.inventory.0[slot].map_or("?", |id| item_def(id).name);
+                info!(
+                    "[ai {me:?}] hero uses {what} (hp {:.0}%{}{})",
+                    hero.frac * 100.0,
+                    if engaged { ", in a fight" } else { "" },
+                    if marching { ", marching out" } else { "" },
+                );
+                events.uses.write(UseItem {
+                    hero: hero.entity,
+                    slot,
+                });
+            }
+            Some(ItemAction::Buy(id)) => {
+                let def = item_def(id);
+                if gold.saturating_sub(reserve_gold) >= def.cost_gold {
+                    gold -= def.cost_gold;
+                    info!(
+                        "[ai {me:?}] hero buys {} for {}g (bank {gold}g after)",
+                        def.name, def.cost_gold
+                    );
+                    events.buys.write(BuyItem {
+                        shop: shop.entity,
+                        hero: hero.entity,
+                        item: id,
+                    });
+                } else {
+                    brain.item_pending = true;
+                    reserve_gold += def.cost_gold;
+                }
+            }
+            None => {}
         }
+    }
+
+    // Sorcerers still owed against `MAX_SORCERERS`, counting the ones already
+    // in a queue so a two-Sanctum team can't double-order them.
+    let sorcerers_alive = army
+        .iter()
+        .filter(|u| u.kind == UnitKind::Sorcerer)
+        .count()
+        + own_buildings
+            .iter()
+            .map(|b| b.queued_sorcerers)
+            .sum::<usize>();
+    let mut sorcerers_wanted = MAX_SORCERERS.saturating_sub(sorcerers_alive);
+
+    // Production order matters, because this loop spends a shared treasury as
+    // it walks and whatever comes last gets what is left. The Sanctum goes
+    // FIRST: it wants three units in the whole match against a Barracks that
+    // wants one every few seconds, so in build order it always loses the race
+    // and the tier-2 unlock the team paid 150g/130l for never produces a
+    // single caster. Everything else keeps its historical relative order.
+    let mut production: Vec<&BuildingInfo> = own_buildings.iter().filter(|b| b.done).collect();
+    production.sort_by_key(|b| u8::from(b.kind != BuildingKind::Sanctum));
+
+    for b in production {
         // A Keep and a Castle are the hall, so worker production keys off the
         // ladder rather than the tier-1 kind — teching up must not stop the
         // economy that paid for it.
@@ -1234,17 +1792,12 @@ fn think(
                 // `current_tier` is the highest completed hall rung, so this is
                 // exactly the condition `unit_requires` will re-check on pay.
                 let knight_ok = current_tier >= 3;
-                let wanted = if knight_ok && next % KNIGHT_EVERY_NTH == 0 {
-                    UnitKind::Knight
-                } else if raider_ok && next % RAIDER_EVERY_NTH == 0 {
-                    UnitKind::Raider
-                } else if next % ARCHER_EVERY_NTH == 0 {
-                    UnitKind::Archer
-                } else if next % SPEARMAN_EVERY_NTH == 0 {
-                    UnitKind::Spearman
-                } else {
-                    UnitKind::Footman
-                };
+                // `archer_nth` / `spearman_nth` are the standing cadences until
+                // this team has actually LOOKED at a flyer or a horse, at which
+                // point the relevant one tightens for ~50 thoughts and then
+                // relaxes again. That is the entire reaction: same catalog,
+                // same rule, a different number for a while.
+                let wanted = pick_army_kind(next, knight_ok, raider_ok, archer_nth, spearman_nth);
                 let affordable = |k: UnitKind| {
                     let s = unit_stats(k);
                     gold.saturating_sub(reserve_gold) >= s.cost_gold
@@ -1265,6 +1818,22 @@ fn think(
                     headroom -= s.supply;
                     brain.army_counter = next;
                     orders.push((b.entity, kind));
+                }
+            }
+            BuildingKind::Sanctum => {
+                if b.queue_len >= SANCTUM_QUEUE_MAX || sorcerers_wanted == 0 {
+                    continue;
+                }
+                let s = unit_stats(UnitKind::Sorcerer);
+                if gold.saturating_sub(reserve_gold) >= s.cost_gold
+                    && lumber.saturating_sub(reserve_lumber) >= s.cost_lumber
+                    && headroom >= s.supply
+                {
+                    gold -= s.cost_gold;
+                    lumber -= s.cost_lumber;
+                    headroom -= s.supply;
+                    sorcerers_wanted -= 1;
+                    orders.push((b.entity, UnitKind::Sorcerer));
                 }
             }
             BuildingKind::Workshop => {
@@ -1312,10 +1881,10 @@ fn think(
                     orders.push((b.entity, kind));
                 }
             }
-            // Non-producing buildings (and any future kinds the scripted AI
-            // doesn't know how to use) train nothing. Deliberately included:
-            // the Shop — items, like Call to Arms militia, are commander
-            // tools; the script never builds one and never shops.
+            // Non-producing buildings train nothing — Farms, Towers, Walls,
+            // the forge, and the Shop, whose output is bought rather than
+            // queued (see the Shop section above, which runs before this loop
+            // precisely so its price is already out of the army's budget).
             _ => {}
         }
     }
@@ -1330,10 +1899,11 @@ fn think(
     // Slam whenever a worthwhile clump is standing on the Champion. Same event
     // the player's R hotkey sends; combat.rs validates mana and cooldown.
     let slam_radius = HERO_ABILITY_RADIUS + SLAM_RADIUS_SLACK;
-    for (hero, pos, ready) in &own_heroes {
-        if !ready {
+    for hero in &own_heroes {
+        if !hero.ready {
             continue;
         }
+        let pos = &hero.pos;
         // Ground enemies only: the Slam is a ground shockwave, so a clump of
         // flyers overhead must not talk the Champion into spending his mana on
         // an empty patch of dirt.
@@ -1342,7 +1912,12 @@ fn think(
             .filter(|e| e.distance(*pos) <= slam_radius)
             .count();
         if nearby >= SLAM_MIN_TARGETS {
-            events.casts.write(CastAbility::new(*hero));
+            // Through the issuer like everything else the script orders. A
+            // hero IS a command node, so this computes zero and fires in the
+            // same frame it always did — but routing it here means the day the
+            // script learns to hand-fire a Sorcerer, the third seat pays for
+            // that reach automatically instead of quietly not paying.
+            issuer.issue_cast(commands, &mut events.casts, me, hero.pos, hero.entity, None);
         }
     }
 
@@ -1408,6 +1983,260 @@ fn think(
 /// Ground-plane projection — mines and buildings sit at y=0, units do not.
 fn flat(v: Vec3) -> Vec3 {
     Vec3::new(v.x, 0.0, v.z)
+}
+
+// ---------------------------------------------------------------------------
+// Decisions, as pure functions
+//
+// Everything below is a rule the script follows, written so it can be READ and
+// TESTED without an ECS. `think` above is a long function that queries the
+// world; these are the parts of it that are actually opinions, and an opinion
+// that cannot be unit-tested is an opinion that drifts.
+// ---------------------------------------------------------------------------
+
+/// Is the Castle worth buying right now?
+///
+/// `attack_researched` and `expanded` are the two proofs of a durable economy
+/// (see `CASTLE_SPARE_GOLD`); either will do, and without one of them the
+/// script stays at Keep no matter how the treasury looks on a single tick. The
+/// gold test is against what is LEFT after paying, so tier 3 never comes out of
+/// the army's budget — the same shape as every other surplus purchase here.
+/// Is a Castle the right AMBITION? Deliberately asks nothing about cash.
+///
+/// Splitting the ambition from the payment is the whole reason tier 3 became
+/// reachable. The old rule folded both into one test, so the Castle was only
+/// ever "wanted" on a tick where it was already affordable — which meant the
+/// ring-fence below could never fire, which meant the Barracks spent every
+/// delivery, which meant the treasury never got there. Exactly the trap the
+/// Keep, the expansion and the research rung all have a reserve to escape;
+/// tier 3 was simply the one purchase that had been left out of the pattern.
+fn castle_is_the_plan(army: usize, attack_researched: bool, expanded: bool) -> bool {
+    army >= CASTLE_MIN_ARMY && (attack_researched || expanded)
+}
+
+/// ...and may we pay for it out of surplus right now? Against what is LEFT
+/// after the price, so a Castle is never the last coin in the bank.
+fn wants_castle(
+    army: usize,
+    gold: u32,
+    cost_gold: u32,
+    attack_researched: bool,
+    expanded: bool,
+) -> bool {
+    castle_is_the_plan(army, attack_researched, expanded)
+        && gold.saturating_sub(cost_gold) >= CASTLE_SPARE_GOLD
+}
+
+/// How many Towers the script wants standing, baseline plus reactive.
+///
+/// The `.min` is the load-bearing line of this whole bead: a Tower costs no
+/// supply, so nothing else in the file stops the count from climbing. Callers
+/// re-check `MAX_TOWERS` against what is standing anyway — belt and braces on
+/// the one number that, if it slipped, would quietly convert the scripted
+/// baseline into a turtle.
+fn tower_quota(keep_standing: bool, air_alert: bool) -> usize {
+    let baseline = if keep_standing { BASELINE_TOWERS } else { 0 };
+    let reactive = usize::from(air_alert);
+    (baseline + reactive).min(MAX_TOWERS)
+}
+
+/// Should the script order another Tower? `towers_standing` counts scaffolding
+/// too, so a 25-second build is never ordered twice. The `MAX_TOWERS` test is
+/// redundant against `tower_quota` today and stays anyway: this is the
+/// predicate an editor will reach for when adding a reactive rule, and it must
+/// be impossible to raise the ceiling by accident from here.
+fn wants_tower(
+    barracks_done: bool,
+    towers_standing: usize,
+    keep_standing: bool,
+    air_alert: bool,
+) -> bool {
+    barracks_done
+        && towers_standing < tower_quota(keep_standing, air_alert)
+        && towers_standing < MAX_TOWERS
+}
+
+/// One think tick of an alert counter: a sighting refills it, silence drains
+/// it one tick at a time. The whole of the script's "memory" of the enemy.
+fn tick_alert(alert: u32, seen: bool) -> u32 {
+    if seen {
+        ALERT_TICKS
+    } else {
+        alert.saturating_sub(1)
+    }
+}
+
+/// The Archer and Spearman cadences in force, given the two decaying alerts.
+/// Lower is more frequent; these replace `ARCHER_EVERY_NTH` /
+/// `SPEARMAN_EVERY_NTH` wholesale while an alert is live.
+fn reactive_cadences(air_alert: bool, cavalry_alert: bool) -> (u32, u32) {
+    let archer = if air_alert {
+        ARCHER_EVERY_NTH_AIR
+    } else {
+        ARCHER_EVERY_NTH
+    };
+    let spearman = match (cavalry_alert, air_alert) {
+        (true, true) => SPEARMAN_EVERY_NTH_BOTH,
+        (true, false) => SPEARMAN_EVERY_NTH_CAVALRY,
+        (false, _) => SPEARMAN_EVERY_NTH,
+    };
+    (archer, spearman)
+}
+
+/// What the Barracks queues as its `next`th item. Order is priority order:
+/// the tier-3 line-breaker, then cavalry, then the two reactive slots.
+fn pick_army_kind(
+    next: u32,
+    knight_ok: bool,
+    raider_ok: bool,
+    archer_nth: u32,
+    spearman_nth: u32,
+) -> UnitKind {
+    if knight_ok && next % KNIGHT_EVERY_NTH == 0 {
+        UnitKind::Knight
+    } else if raider_ok && next % RAIDER_EVERY_NTH == 0 {
+        UnitKind::Raider
+    } else if next % archer_nth == 0 {
+        UnitKind::Archer
+    } else if next % spearman_nth == 0 {
+        UnitKind::Spearman
+    } else {
+        UnitKind::Footman
+    }
+}
+
+/// A crossing worth fortifying, and where the emplacement stands.
+struct FordHold {
+    /// Where the Tower goes: back from the gap, on our side of it.
+    hold: Vec3,
+    /// Unit vector along the barrier, i.e. across the opening. Wall segments
+    /// are spaced along this.
+    along: Vec3,
+    /// The opening's width, which decides whether walls are allowed at all.
+    width: f32,
+    name: &'static str,
+}
+
+/// Pick the crossing to fortify: the (ford, own hall) pair with the shortest
+/// distance between them, provided that distance is inside `FORD_HOLD_RADIUS`.
+///
+/// "Nearest ford to a hall we already own" rather than "nearest ford to our
+/// start" is what keeps this honest about what a script can hold. On
+/// `crossings` the flank fords ARE the neutral expansions, so this returns
+/// nothing until the expansion lands and then returns the ford that expansion
+/// is sitting on — the tower guards the second mine and the crossing with one
+/// purchase. `None` on a map with no chokepoints, and `None` when every ford is
+/// a long undefended walk away; both fall back to the ordinary base ring.
+fn ford_hold_point(chokes: &[crate::terrain::ChokePoint], halls: &[Vec3]) -> Option<FordHold> {
+    let mut best: Option<(f32, &crate::terrain::ChokePoint, Vec3)> = None;
+    for choke in chokes {
+        for hall in halls {
+            let d = xz_dist(choke.pos, *hall);
+            if d > FORD_HOLD_RADIUS {
+                continue;
+            }
+            if best.is_none_or(|(bd, _, _)| d < bd) {
+                best = Some((d, choke, *hall));
+            }
+        }
+    }
+    let (_, choke, hall) = best?;
+    // Toward our own side of the gap. A hall sitting exactly on the ford (it
+    // cannot, the mine is there) would leave no direction; fall back to the
+    // gap centre rather than to a NaN.
+    let across = (flat(hall) - flat(choke.pos)).normalize_or_zero();
+    let hold = flat(choke.pos) + across * FORD_STANDOFF;
+    // Perpendicular in the ground plane: the barrier runs across our approach.
+    let along = Vec3::new(across.z, 0.0, -across.x);
+    Some(FordHold {
+        hold,
+        along,
+        width: choke.width,
+        name: choke.name,
+    })
+}
+
+/// Candidate wall spots beside a ford tower — a short screen on the barrier
+/// line, never a plug. Empty for a gap too narrow to give up any of.
+fn ford_wall_sites(hold: &FordHold) -> Vec<Vec3> {
+    if hold.width < FORD_WALL_MIN_WIDTH {
+        return Vec::new();
+    }
+    FORD_WALL_OFFSETS
+        .iter()
+        .map(|off| hold.hold + hold.along * *off)
+        .collect()
+}
+
+/// One thing to do at the Shop this tick.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum ItemAction {
+    /// Buy it if we can pay, ring-fence its price if we cannot.
+    Buy(ItemId),
+    /// Drink/plant what is already in that inventory slot.
+    Use(usize),
+}
+
+/// The scripted shopping list, in strict priority order. Four rules, no state:
+///
+/// 1. **Drink at half health.** The one rule that is not about money. A hero is
+///    a team's biggest single investment and the only unit that gets *worse*
+///    permanently when it dies (revival costs and the level is at risk), so a
+///    held potion at 50% is spent, not saved.
+/// 2. **Plant the Banner in a real fight** — tier 2 only, and only with a
+///    genuine clump on the hero, using the same "is this worth a cooldown"
+///    shape as the Slam rule.
+/// 3. **Boots when marching**, i.e. on the tick a wave launches: the haste is
+///    15 seconds and the walk is longer than that, so spending it at the moment
+///    the army turns toward the enemy is the only timing that isn't waste.
+/// 4. **Restock**, cheapest need first: always hold a potion; then a Banner if
+///    we are tier 2 and rich; then Boots if we are richer still.
+///
+/// `gold` here gates DISCRETION, not affordability — the caller decides whether
+/// to pay or to ring-fence, exactly like the tier-up and research reserves.
+fn item_plan(
+    tier: TechTier,
+    gold: u32,
+    hero_frac: f32,
+    inv: Inventory,
+    engaged: bool,
+    marching: bool,
+) -> Option<ItemAction> {
+    let slot_of = |id: ItemId| inv.0.iter().position(|s| *s == Some(id));
+
+    if hero_frac <= POTION_HP_FRAC {
+        if let Some(slot) = slot_of(ItemId::HealingPotion) {
+            return Some(ItemAction::Use(slot));
+        }
+    }
+    if engaged {
+        if let Some(slot) = slot_of(ItemId::BannerOfCommand) {
+            return Some(ItemAction::Use(slot));
+        }
+    }
+    if marching {
+        if let Some(slot) = slot_of(ItemId::BootsOfSpeed) {
+            return Some(ItemAction::Use(slot));
+        }
+    }
+
+    // Restocking needs a free slot; two consumables is the whole inventory.
+    if inv.0.iter().all(|s| s.is_some()) {
+        return None;
+    }
+    let want = |id: ItemId, rich: u32| {
+        item_unlocked(id, tier) && slot_of(id).is_none() && gold >= rich
+    };
+    if want(ItemId::HealingPotion, POTION_RICH_GOLD) {
+        return Some(ItemAction::Buy(ItemId::HealingPotion));
+    }
+    if want(ItemId::BannerOfCommand, BANNER_RICH_GOLD) {
+        return Some(ItemAction::Buy(ItemId::BannerOfCommand));
+    }
+    if want(ItemId::BootsOfSpeed, BOOTS_RICH_GOLD) {
+        return Some(ItemAction::Buy(ItemId::BootsOfSpeed));
+    }
+    None
 }
 
 fn xz_dist(a: Vec3, b: Vec3) -> f32 {
@@ -1702,6 +2531,29 @@ fn pick_builder(workers: &[UnitInfo], skip: &[Entity], site: Vec3) -> Option<Ent
     best.or(best_busy).map(|(_, e)| e)
 }
 
+/// The free spot NEAREST `center`, searching outward in tight rings — the
+/// placement rule for a structure whose whole value is where it stands. Falls
+/// back to `None` if the ground around it is full, and the caller then uses the
+/// ordinary base ring.
+fn pick_spot(nav: &NavGrid, center: Vec3, footprint: f32) -> Option<Vec3> {
+    let limit = MAP_HALF - footprint;
+    let ok = |p: Vec3| p.x.abs() <= limit && p.z.abs() <= limit && nav.rect_is_free(p, footprint);
+    let center = flat(center);
+    if ok(center) {
+        return Some(center);
+    }
+    for radius in EMPLACE_RING_RADII {
+        for spoke in 0..BUILD_RING_SPOKES {
+            let a = spoke as f32 * std::f32::consts::TAU / BUILD_RING_SPOKES as f32;
+            let p = center + Vec3::new(a.cos(), 0.0, a.sin()) * radius;
+            if ok(p) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 /// Rings of candidate spots around `anchor`, nearest-to-map-center first so the
 /// base expands outward toward the middle instead of walling itself in.
 fn pick_site(nav: &NavGrid, anchor: Vec3, footprint: f32) -> Option<Vec3> {
@@ -1727,12 +2579,465 @@ fn pick_site(nav: &NavGrid, anchor: Vec3, footprint: f32) -> Option<Vec3> {
 
 // ---------------------------------------------------------------------------
 // Tests
+//
+// The scripted AI is the baseline every balance run is measured against, so the
+// thing worth pinning is not "does it compile" but "does it still hold the
+// opinions it was tuned to hold". Each test below names a failure that has
+// actually happened, or one the design notes above exist to prevent.
 // ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::command::{CommandLatency, CommandNodes, PendingOrder, DEFAULT_HALL_RADIUS};
+    use crate::terrain::{ChokePoint, MapKind};
+
+    // -- Castle trigger (wc3clone-0m8) ------------------------------------
+
+    /// The regression this bead exists for: the old gate was `gold - 480 >=
+    /// 300`, i.e. 780 gold in hand on a single tick, and no scripted match ever
+    /// banked that. Tier 3 must now be reachable at a treasury the script
+    /// actually reaches.
+    #[test]
+    fn castle_is_reachable_at_a_realistic_treasury() {
+        let cost = building_stats(BuildingKind::Castle).cost_gold;
+        // 560 gold: a real peak for a scripted economy that has already paid
+        // for a research rung. Under the old rule this was a hard no.
+        assert!(560 < cost + 300, "sanity: this is below the OLD bar");
+        assert!(wants_castle(8, 560, cost, true, false));
+        assert!(wants_castle(8, 560, cost, false, true));
+    }
+
+    /// The bug that made the loosening necessary in the first place, as a test.
+    /// The ambition must be expressible while BROKE — that is the only state in
+    /// which a reserve does anything, and without a reserve continuous Barracks
+    /// production keeps the treasury permanently a Footman short of 480 gold.
+    #[test]
+    fn the_castle_can_be_wanted_before_it_can_be_afforded() {
+        let cost = building_stats(BuildingKind::Castle).cost_gold;
+        assert!(castle_is_the_plan(8, true, false));
+        assert!(
+            !wants_castle(8, CASTLE_LATCH_GOLD, cost, true, false),
+            "not payable yet"
+        );
+        assert!(
+            castle_is_the_plan(8, true, false),
+            "...but still the plan, which is what arms the ring-fence"
+        );
+        // And the latch only arms once the bank is genuinely within reach, so a
+        // poor game never quietly stops training to save for a hall it will
+        // never buy.
+        assert!(CASTLE_LATCH_GOLD < cost);
+        assert!(CASTLE_LATCH_GOLD >= cost / 2);
+    }
+
+    /// ...but not on gold alone. Without a finished research rung or a second
+    /// mining base, a one-tick spike in the treasury proves nothing, and a
+    /// Castle bought out of a spike is a Castle bought instead of an army.
+    #[test]
+    fn castle_needs_a_proof_of_durable_income() {
+        let cost = building_stats(BuildingKind::Castle).cost_gold;
+        assert!(!wants_castle(8, 2000, cost, false, false));
+        assert!(!wants_castle(CASTLE_MIN_ARMY - 1, 2000, cost, true, true));
+    }
+
+    /// The leftover-gold test survives the loosening: a Castle is still never
+    /// the last coin in the bank.
+    #[test]
+    fn castle_still_comes_out_of_surplus() {
+        let cost = building_stats(BuildingKind::Castle).cost_gold;
+        assert!(!wants_castle(8, cost, cost, true, true));
+        assert!(!wants_castle(8, cost + CASTLE_SPARE_GOLD - 1, cost, true, true));
+        assert!(wants_castle(8, cost + CASTLE_SPARE_GOLD, cost, true, true));
+    }
+
+    // -- Tower cap (wc3clone-7gv) ------------------------------------------
+
+    /// Towers cost no supply, which is the only reason a cap has to exist at
+    /// all. No combination of inputs may ask for more than `MAX_TOWERS`, and no
+    /// number of standing towers may talk `wants_tower` into one more.
+    #[test]
+    fn the_tower_fortress_is_unreachable() {
+        for keep in [false, true] {
+            for air in [false, true] {
+                assert!(tower_quota(keep, air) <= MAX_TOWERS);
+                for standing in 0..30usize {
+                    let wanted = wants_tower(true, standing, keep, air);
+                    assert!(
+                        !wanted || standing < MAX_TOWERS,
+                        "asked for tower #{} past the cap",
+                        standing + 1
+                    );
+                }
+            }
+        }
+        // 25 towers is the specific failure mode this guards; so is 5.
+        assert!(!wants_tower(true, MAX_TOWERS, true, true));
+        assert!(!wants_tower(true, 25, true, true));
+    }
+
+    /// No towers before there is a Barracks to gate them, none before the Keep
+    /// that marks the end of the opening — and exactly one extra for air.
+    #[test]
+    fn tower_quota_is_baseline_plus_one_for_air() {
+        assert_eq!(tower_quota(false, false), 0);
+        assert_eq!(tower_quota(true, false), BASELINE_TOWERS);
+        assert_eq!(tower_quota(true, true), BASELINE_TOWERS + 1);
+        // Air is an emergency: it buys a tower even at tier 1.
+        assert_eq!(tower_quota(false, true), 1);
+        assert!(!wants_tower(false, 0, true, true), "needs a Barracks first");
+        // The cap leaves headroom for exactly one future reactive rule.
+        assert!(BASELINE_TOWERS + 1 <= MAX_TOWERS);
+    }
+
+    // -- Reactive mix (wc3clone-7gv, wc3clone-20d) -------------------------
+
+    /// A sighting refills the counter; silence drains it one thought at a time
+    /// and it lands on zero rather than wrapping.
+    #[test]
+    fn alerts_refill_on_sight_and_decay_to_nothing() {
+        assert_eq!(tick_alert(0, true), ALERT_TICKS);
+        assert_eq!(tick_alert(ALERT_TICKS, false), ALERT_TICKS - 1);
+        let mut a = tick_alert(0, true);
+        for _ in 0..ALERT_TICKS {
+            a = tick_alert(a, false);
+        }
+        assert_eq!(a, 0, "alert must lapse, or the reaction is permanent");
+        assert_eq!(tick_alert(0, false), 0, "must not wrap");
+    }
+
+    #[test]
+    fn cadences_tighten_only_for_what_was_seen() {
+        assert_eq!(
+            reactive_cadences(false, false),
+            (ARCHER_EVERY_NTH, SPEARMAN_EVERY_NTH)
+        );
+        assert_eq!(
+            reactive_cadences(true, false),
+            (ARCHER_EVERY_NTH_AIR, SPEARMAN_EVERY_NTH)
+        );
+        assert_eq!(
+            reactive_cadences(false, true),
+            (ARCHER_EVERY_NTH, SPEARMAN_EVERY_NTH_CAVALRY)
+        );
+        // Both at once: the Archer rule already owns every second slot, so the
+        // Spearman rule steps aside to 3 rather than being starved to zero.
+        assert_eq!(
+            reactive_cadences(true, true),
+            (ARCHER_EVERY_NTH_AIR, SPEARMAN_EVERY_NTH_BOTH)
+        );
+    }
+
+    /// Count what 24 Barracks items actually come out as. The point of the
+    /// reaction is that the ARMY changes, not that a constant changed.
+    fn mix(air: bool, cavalry: bool) -> (usize, usize, usize) {
+        let (a_nth, s_nth) = reactive_cadences(air, cavalry);
+        let (mut archers, mut spears, mut footmen) = (0, 0, 0);
+        for next in 1..=24u32 {
+            match pick_army_kind(next, false, false, a_nth, s_nth) {
+                UnitKind::Archer => archers += 1,
+                UnitKind::Spearman => spears += 1,
+                UnitKind::Footman => footmen += 1,
+                other => panic!("ungated {other:?} in a tier-1 mix"),
+            }
+        }
+        (archers, spears, footmen)
+    }
+
+    #[test]
+    fn air_contact_really_produces_more_archers() {
+        let (base_archers, _, _) = mix(false, false);
+        let (air_archers, _, _) = mix(true, false);
+        assert!(
+            air_archers > base_archers,
+            "air alert produced {air_archers} archers vs {base_archers} baseline"
+        );
+        assert_eq!(air_archers, 12, "half the line, out of 24");
+    }
+
+    #[test]
+    fn cavalry_contact_really_produces_more_spearmen() {
+        let (_, base_spears, _) = mix(false, false);
+        let (_, cav_spears, _) = mix(false, true);
+        assert!(
+            cav_spears > base_spears,
+            "cavalry alert produced {cav_spears} spearmen vs {base_spears} baseline"
+        );
+    }
+
+    /// The failure mode of stacking two reactions: one rule eats every slot and
+    /// the other silently stops existing. Both must still show up.
+    #[test]
+    fn both_alerts_at_once_still_produce_both_answers() {
+        let (archers, spears, footmen) = mix(true, true);
+        assert!(
+            archers > 0 && spears > 0,
+            "{archers} archers, {spears} spearmen"
+        );
+        assert!(
+            footmen > 0,
+            "a reaction must not replace the line entirely — the script is a \
+             baseline, not a counter-picker"
+        );
+    }
+
+    /// Reactions never unlock anything: the tier gates still own the roster.
+    #[test]
+    fn reactions_cannot_smuggle_in_gated_units() {
+        for next in 1..=40u32 {
+            let k = pick_army_kind(next, false, false, 2, 2);
+            assert!(!matches!(k, UnitKind::Knight | UnitKind::Raider));
+        }
+        assert_eq!(
+            pick_army_kind(KNIGHT_EVERY_NTH, true, false, 3, 4),
+            UnitKind::Knight
+        );
+    }
+
+    // -- Ford fortification (wc3clone-j0d) ---------------------------------
+
+    fn ford(name: &'static str, pos: Vec3, width: f32) -> ChokePoint {
+        ChokePoint { name, pos, width }
+    }
+
+    /// `open` publishes no chokepoints, and the script must then behave exactly
+    /// as it did before this bead — base ring, no ford logic.
+    #[test]
+    fn no_chokepoints_means_no_ford_to_hold() {
+        assert!(ford_hold_point(&[], &[HUMAN_BASE]).is_none());
+        assert!(MapKind::Open.chokepoints().is_empty());
+        assert!(ford_hold_point(&MapKind::Open.chokepoints(), &[HUMAN_BASE]).is_none());
+    }
+
+    /// A crossing on the far side of the map is not "ours" just because it is
+    /// the nearest one. Walking a lone worker 99 units to plant one tower in
+    /// the middle of the map is how a script donates 110 gold.
+    #[test]
+    fn a_ford_we_do_not_live_by_is_left_alone() {
+        let far = ford("centre", Vec3::ZERO, 16.0);
+        assert!(ford_hold_point(&[far], &[HUMAN_BASE]).is_none());
+        // On the real map, from the real start position: nothing to hold yet.
+        assert!(
+            ford_hold_point(&MapKind::Crossings.chokepoints(), &[HUMAN_BASE]).is_none(),
+            "the centre ford is ~99 from spawn; fortifying it is not a plan"
+        );
+    }
+
+    /// ...and the moment the expansion lands ON a flank ford — which on
+    /// `crossings` is the same decision, because the flank fords ARE the
+    /// neutral mines — that ford becomes the one we hold.
+    #[test]
+    fn the_expansion_ford_is_the_one_we_fortify() {
+        let chokes = MapKind::Crossings.chokepoints();
+        // An expansion hall by the north-west neutral mine at (-60, 60).
+        let expo = Vec3::new(-60.0, 0.0, 72.0);
+        let hold = ford_hold_point(&chokes, &[HUMAN_BASE, expo]).expect("a ford to hold");
+        let picked = chokes
+            .iter()
+            .find(|c| c.name == hold.name)
+            .expect("named an actual chokepoint");
+        assert!(
+            xz_dist(picked.pos, expo) <= FORD_HOLD_RADIUS,
+            "picked {} at {:?}, {:.0} from the expansion",
+            hold.name,
+            picked.pos,
+            xz_dist(picked.pos, expo)
+        );
+        // The emplacement stands back from the gap, on OUR side of it.
+        assert!((xz_dist(hold.hold, picked.pos) - FORD_STANDOFF).abs() < 0.01);
+        assert!(
+            xz_dist(hold.hold, expo) < xz_dist(picked.pos, expo),
+            "the tower must sit behind the crossing, not in front of it"
+        );
+        // ...and still covers the gap: a Tower shoots 16.
+        let range = building_stats(BuildingKind::Tower)
+            .attack
+            .expect("towers shoot")
+            .range;
+        assert!(xz_dist(hold.hold, picked.pos) < range);
+    }
+
+    /// Walls narrow a gap, and the gap is also the route our OWN army attacks
+    /// through. The narrow centre ford gets a tower and nothing else.
+    #[test]
+    fn walls_never_plug_a_narrow_crossing() {
+        let hall = Vec3::new(-12.0, 0.0, -12.0);
+        let narrow = ford_hold_point(&[ford("centre", Vec3::ZERO, 16.0)], &[hall]).unwrap();
+        assert!(narrow.width < FORD_WALL_MIN_WIDTH);
+        assert!(ford_wall_sites(&narrow).is_empty());
+
+        let wide = ford_hold_point(&[ford("flank", Vec3::ZERO, 30.0)], &[hall]).unwrap();
+        let sites = ford_wall_sites(&wide);
+        assert_eq!(sites.len(), FORD_WALLS);
+        // Beside the tower along the barrier, symmetric, and well inside the
+        // gap's half-width so the opening survives them.
+        for s in &sites {
+            assert!((xz_dist(*s, wide.hold) - FORD_WALL_OFFSETS[1].abs()).abs() < 0.01);
+            let along_axis = (*s - wide.hold).normalize().dot(wide.along).abs();
+            assert!(
+                (along_axis - 1.0).abs() < 0.01,
+                "walls line up with the barrier"
+            );
+        }
+        let total: f32 = building_stats(BuildingKind::Wall).size * FORD_WALLS as f32
+            + building_stats(BuildingKind::Tower).size;
+        assert!(
+            total < wide.width * 0.5,
+            "the garrison may not eat half the crossing"
+        );
+    }
+
+    /// An emplacement goes where it is needed, not "somewhere near the base".
+    #[test]
+    fn emplacements_are_placed_at_the_spot_not_near_it() {
+        let nav = NavGrid::default();
+        let target = Vec3::new(-30.0, 0.0, 20.0);
+        assert_eq!(pick_spot(&nav, target, 5.0), Some(target));
+        let mut blocked = NavGrid::default();
+        blocked.set_blocked_rect(target, 6.0, true);
+        let shifted = pick_spot(&blocked, target, 5.0).expect("a spot nearby");
+        assert!(shifted != target);
+        assert!(xz_dist(shifted, target) <= EMPLACE_RING_RADII[EMPLACE_RING_RADII.len() - 1] + 0.01);
+    }
+
+    // -- Shop and items (wc3clone-vsc) --------------------------------------
+
+    const EMPTY: Inventory = Inventory([None, None]);
+    fn held(a: Option<ItemId>, b: Option<ItemId>) -> Inventory {
+        Inventory([a, b])
+    }
+
+    /// Rule 1, and the only rule that is not about money.
+    #[test]
+    fn a_held_potion_is_drunk_at_half_health() {
+        let inv = held(Some(ItemId::HealingPotion), None);
+        assert_eq!(
+            item_plan(TechTier::T1, 0, 0.5, inv, false, false),
+            Some(ItemAction::Use(0))
+        );
+        assert_eq!(
+            item_plan(TechTier::T1, 0, 0.2, inv, false, false),
+            Some(ItemAction::Use(0))
+        );
+        // A healthy hero holds on to it.
+        assert!(!matches!(
+            item_plan(TechTier::T1, 0, 0.9, inv, false, false),
+            Some(ItemAction::Use(_))
+        ));
+    }
+
+    /// Drinking outranks shopping: a dying hero does not go window-shopping
+    /// with a potion in its pocket.
+    #[test]
+    fn using_beats_buying() {
+        let inv = held(Some(ItemId::HealingPotion), None);
+        assert_eq!(
+            item_plan(TechTier::T3, 5000, 0.3, inv, true, true),
+            Some(ItemAction::Use(0))
+        );
+    }
+
+    #[test]
+    fn the_banner_is_planted_in_a_fight_and_needs_tier_two() {
+        let inv = held(Some(ItemId::BannerOfCommand), None);
+        assert_eq!(
+            item_plan(TechTier::T2, 0, 1.0, inv, true, false),
+            Some(ItemAction::Use(0))
+        );
+        // No fight, no banner.
+        assert!(!matches!(
+            item_plan(TechTier::T2, 0, 1.0, inv, false, false),
+            Some(ItemAction::Use(_))
+        ));
+        // Tier 1 buys the potion and then stops: nothing else on the shelf is
+        // both unlocked and worth the script's gold.
+        assert_eq!(
+            item_plan(TechTier::T1, 5000, 1.0, EMPTY, false, false),
+            Some(ItemAction::Buy(ItemId::HealingPotion)),
+        );
+        assert_eq!(
+            item_plan(
+                TechTier::T1,
+                BANNER_RICH_GOLD,
+                1.0,
+                held(Some(ItemId::HealingPotion), None),
+                false,
+                false
+            ),
+            None,
+            "the Banner is tier 2 — tier 1 must not reach for it"
+        );
+    }
+
+    #[test]
+    fn boots_are_drunk_when_the_wave_marches_out() {
+        let inv = held(Some(ItemId::BootsOfSpeed), None);
+        assert_eq!(
+            item_plan(TechTier::T1, 0, 1.0, inv, false, true),
+            Some(ItemAction::Use(0))
+        );
+        assert!(!matches!(
+            item_plan(TechTier::T1, 0, 1.0, inv, false, false),
+            Some(ItemAction::Use(_))
+        ));
+    }
+
+    /// Restocking order is priority order, and every rung has a bank gate: a
+    /// Shop must never be the reason a Barracks went quiet.
+    #[test]
+    fn restocking_is_cheapest_need_first_and_never_broke() {
+        // Poor: nothing at all, even with an empty inventory and a Shop up.
+        assert_eq!(item_plan(TechTier::T3, 50, 1.0, EMPTY, false, false), None);
+        // The potion is the first thing the script ever buys.
+        assert_eq!(
+            item_plan(TechTier::T3, POTION_RICH_GOLD, 1.0, EMPTY, false, false),
+            Some(ItemAction::Buy(ItemId::HealingPotion))
+        );
+        let stocked = held(Some(ItemId::HealingPotion), None);
+        // Then the Banner, once tier 2 and the bank can stand it...
+        assert_eq!(
+            item_plan(TechTier::T2, BANNER_RICH_GOLD, 1.0, stocked, false, false),
+            Some(ItemAction::Buy(ItemId::BannerOfCommand))
+        );
+        // ...and Boots only when genuinely idle-rich.
+        assert_eq!(
+            item_plan(TechTier::T1, BOOTS_RICH_GOLD, 1.0, stocked, false, false),
+            Some(ItemAction::Buy(ItemId::BootsOfSpeed))
+        );
+        assert!(BOOTS_RICH_GOLD > item_def(ItemId::BootsOfSpeed).cost_gold);
+        assert!(POTION_RICH_GOLD > item_def(ItemId::HealingPotion).cost_gold);
+    }
+
+    /// Two slots is the whole inventory; a full hero stops shopping.
+    #[test]
+    fn a_full_inventory_buys_nothing() {
+        let full = held(Some(ItemId::HealingPotion), Some(ItemId::BootsOfSpeed));
+        assert_eq!(item_plan(TechTier::T3, 9999, 1.0, full, false, false), None);
+        // ...but still uses what it holds.
+        assert_eq!(
+            item_plan(TechTier::T3, 9999, 0.4, full, false, false),
+            Some(ItemAction::Use(0))
+        );
+    }
+
+    /// The script never buys the two map-control items. Both are commander
+    /// tools — a Town Portal is a decision about when to leave a fight, and the
+    /// Scroll is a decision about where the whole army should be. A dumb
+    /// baseline that owned them would be spending them at random.
+    #[test]
+    fn the_script_leaves_the_commander_items_on_the_shelf() {
+        for gold in [200, 500, 1000, 5000] {
+            for tier in [TechTier::T1, TechTier::T2, TechTier::T3] {
+                let plan = item_plan(tier, gold, 1.0, EMPTY, false, false);
+                assert!(!matches!(
+                    plan,
+                    Some(ItemAction::Buy(ItemId::TownPortal))
+                        | Some(ItemAction::Buy(ItemId::ScrollOfMassTeleport))
+                ));
+            }
+        }
+    }
+
+    // -- Chain of Command, third seat (docs/TEMPO.md §3) -------------------
 
     /// A world with just enough around it for one scripted think tick, and a
     /// Claude team whose only command node is its own hall.
@@ -1750,16 +3055,11 @@ mod tests {
             .add_event::<CastAbility>()
             .add_event::<UpgradeBuilding>()
             .add_event::<StartResearch>()
-            .insert_resource(CommandLatency {
-                on: latency_on,
-                ..Default::default()
-            })
+            .add_event::<BuyItem>()
+            .add_event::<UseItem>()
+            .insert_resource(CommandLatency { on: latency_on, ..Default::default() })
             .insert_resource(CommandNodes {
-                nodes: vec![(
-                    Team::Claude,
-                    Team::Claude.base_pos(),
-                    DEFAULT_HALL_RADIUS,
-                )],
+                nodes: vec![(Team::Claude, Team::Claude.base_pos(), DEFAULT_HALL_RADIUS)],
                 ready: true,
             })
             .add_systems(Update, ai_think);
@@ -1775,6 +3075,9 @@ mod tests {
                 Team::Claude,
                 Transform::from_translation(Team::Human.base_pos()),
                 Order::Idle,
+                // `UnitQuery` requires it — a unit with no `Health` is
+                // invisible to the scripted commander entirely.
+                Health::new(100.0),
             ))
             .id()
     }

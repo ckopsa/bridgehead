@@ -43,7 +43,10 @@
 //! | `move`, `attackmove`, `attack`, `harvest`, `return`, `follow`, `stop` | **pays** | A direct order to a named unit standing somewhere. This is the set docs/TEMPO.md means by "a direct `Order` written by a player interface". |
 //! | `build` | exempt | docs/TEMPO.md's open question, answered as it recommends: the worker walks to the site anyway, so the latency is invisible and just taxes the economy. |
 //! | `train`, `upgrade`, `cancel`, `research`, `rally` | exempt | Addressed to a *building*, which is standing in your base next to a command node by definition. Production is not micro. |
-//! | `cast`, `use_item`, `buy` | exempt | Every caster the game has **is** a command node (a hero) or **sits on** one (`abilities_of_building` is `is_hall`-only), and items live in a hero's inventory. The computed latency would be identically zero, so charging it would be ceremony. `every_caster_is_a_command_node` pins that claim: add a caster that is not a node and the test fails, which is the signal to revisit this row. |
+//! | `cast` (unit caster) | **pays** | A direct order to a named unit, like any other. This row *used* to read "exempt", on the honest grounds that every caster in the game either was a command node (a hero) or sat on one (a hall), so the computed link was identically zero — and a test pinned that claim so it could not rot silently. The Sorcerer arrived and the test failed, which is the system working: the identity broke, the framework did not. Hand-firing Slow on a Sorcerer standing in the middle of a fight is *exactly* reaching past your chain of command at the point of contact. For heroes and halls it still computes zero, so CallToArms and TownPortal are untouched. |
+//! | `cast` (building caster) | exempt | `abilities_of_building` is `is_hall`-only, and a hall IS a command node, so the link is provably zero. `every_building_caster_is_a_command_node` keeps that honest the same way the old test did. |
+//! | `autocast` | exempt | Doctrine — and this is the row that makes the Sorcerer interesting rather than annoying. Turning the debuff into standing policy costs nothing and runs at machine speed; hand-firing it at range costs the link. C4 ("doctrine strictly better than micro at range") landing on a new unit for free, by construction. |
+//! | `use_item`, `buy` | exempt | Items live in a hero's inventory and a hero is a node; `buy` is a transaction with a shop, not a unit order. Both verbs now take an optional `hero`, and every hero a team can field is a node, so the link is zero however the field is spelled. |
 //! | `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt | Doctrine. Standing orders ARE the fast path — that is the mechanism, not an exception to it. |
 //! | `autopilot`, `surrender` | exempt | Match level, not a unit order. |
 //!
@@ -126,6 +129,28 @@ pub struct PendingOrder {
 
 impl PendingOrder {
     /// Seconds of latency this order is paying, in total.
+    pub fn link(&self) -> f32 {
+        self.ready_at - self.issued_at
+    }
+}
+
+/// A player-issued **cast** in transit — the ability half of [`PendingOrder`].
+///
+/// It is a separate component rather than an `Order` variant because casting
+/// is an event in this codebase, not a standing order: combat.rs owns the
+/// mana/cooldown/unlock verdict and reaches it when the cast actually fires.
+/// Deferring the event rather than the verdict is what makes a late cast fizzle
+/// honestly — if the mana ran out while the order was travelling, the ability
+/// does not go off, exactly as if the player had been slow.
+#[derive(Component, Clone, Debug)]
+pub struct PendingCast {
+    /// Which ability, in the one selector type the whole game names slots with.
+    pub ability: Option<AbilitySelector>,
+    pub ready_at: f32,
+    pub issued_at: f32,
+}
+
+impl PendingCast {
     pub fn link(&self) -> f32 {
         self.ready_at - self.issued_at
     }
@@ -406,6 +431,48 @@ impl OrderIssuer<'_> {
         });
     }
 
+    /// **A direct cast at a unit caster.** Same curve, same rule, same
+    /// idempotence as an order: for a hero (a node) this fires in the frame it
+    /// was asked for, and for a Sorcerer standing in a fight it takes as long
+    /// to reach as any other instruction would.
+    ///
+    /// The event writer is passed in rather than held, so the zero-delay path
+    /// is the exact `casts.write(...)` it replaced.
+    pub fn issue_cast(
+        &mut self,
+        commands: &mut Commands,
+        casts: &mut EventWriter<CastAbility>,
+        team: Team,
+        pos: Vec3,
+        entity: Entity,
+        ability: Option<AbilitySelector>,
+    ) {
+        let delay = self.delay(team, pos);
+        if delay <= 0.0 {
+            casts.write(CastAbility { caster: entity, ability });
+            return;
+        }
+        self.max_delay = self.max_delay.max(delay);
+        let pending = PendingCast {
+            ability,
+            ready_at: self.now + delay,
+            issued_at: self.now,
+        };
+        commands.queue(move |world: &mut World| {
+            let Ok(mut entity) = world.get_entity_mut(entity) else {
+                return;
+            };
+            // Asking twice for the ability already on its way is one request,
+            // for the same reason repeating an order is — see `issue`.
+            if let Some(existing) = entity.get::<PendingCast>() {
+                if existing.ability == pending.ability {
+                    return;
+                }
+            }
+            entity.insert(pending);
+        });
+    }
+
     /// **An exempt direct order** (see the verb table): applied now. It still
     /// cancels anything in transit, because an order a player has superseded
     /// must not land on top of the one that replaced it.
@@ -457,6 +524,7 @@ impl Plugin for CommandPlugin {
                     // frame lands first, so a fresh direct order issued in the
                     // same frame still wins.
                     dispatch_pending.before(crate::intent::IntentApply),
+                    dispatch_pending_casts.before(crate::intent::IntentApply),
                 )
                     .run_if(latency_enabled),
             )
@@ -551,6 +619,29 @@ fn dispatch_pending(
     }
 }
 
+/// Casts that have finished travelling become real `CastAbility` events —
+/// the same event the player's hotkey, the bridge's `cast` and doctrine's
+/// auto-caster all send. combat.rs cannot tell which of them fired it, and
+/// reaches its mana/cooldown verdict now, on arrival.
+fn dispatch_pending_casts(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut casts: EventWriter<CastAbility>,
+    pending: Query<(Entity, &PendingCast)>,
+) {
+    let now = time.elapsed_secs();
+    for (entity, cast) in &pending {
+        if now < cast.ready_at {
+            continue;
+        }
+        casts.write(CastAbility {
+            caster: entity,
+            ability: cast.ability.clone(),
+        });
+        commands.entity(entity).try_remove::<PendingCast>();
+    }
+}
+
 /// Periodic telemetry: how much of the map is currently out of arm's reach.
 ///
 /// The scripted `ai.rs` is not a player, so it writes nothing to
@@ -564,15 +655,21 @@ fn report_link_load(
     time: Res<Time>,
     latency: Res<CommandLatency>,
     nodes: Res<CommandNodes>,
-    pending: Query<(&PendingOrder, &Team)>,
+    pending: Query<&PendingOrder>,
+    casting: Query<&PendingCast>,
 ) {
     let mut count = 0u32;
     let mut total = 0.0f32;
     let mut worst = 0.0f32;
-    for (order, _) in &pending {
+    // Orders and casts together: both are instructions a seat has spoken and
+    // is waiting on, and a sweep that counted only one of them would
+    // understate exactly the case (a caster hand-fired at range) the cast row
+    // was re-derived for.
+    let links = pending.iter().map(|o| o.link()).chain(casting.iter().map(|c| c.link()));
+    for link in links {
         count += 1;
-        total += order.link();
-        worst = worst.max(order.link());
+        total += link;
+        worst = worst.max(link);
     }
     if count == 0 {
         return;
@@ -758,6 +855,66 @@ mod tests {
         );
     }
 
+    /// **Every living hero is a node, however many a team fields.** Hero slots
+    /// per tier (bead/1qq4y0) turned "your hero" into "your heroes", and a
+    /// second hero is a second mobile command node — a real strategic object,
+    /// because it lets a team run two fast-hands zones at once and puts two
+    /// expensive units in two dangerous places to do it.
+    ///
+    /// `refresh_command_nodes` collects the whole `With<Hero>` query rather
+    /// than "the" hero, so this works by construction; the test is here so it
+    /// keeps working, and so the dead-hero rule is pinned alongside it.
+    #[test]
+    fn every_living_hero_is_its_own_command_node() {
+        let mut app = App::new();
+        app.insert_resource(tuned())
+            .init_resource::<CommandNodes>()
+            .add_systems(Update, refresh_command_nodes);
+
+        let spots = [at(-40.0, 0.0), at(0.0, 40.0), at(50.0, -50.0)];
+        let heroes: Vec<Entity> = spots
+            .iter()
+            .map(|spot| {
+                app.world_mut()
+                    .spawn((
+                        Hero::from_record(None),
+                        Team::Human,
+                        Transform::from_translation(*spot),
+                        Health::new(100.0),
+                    ))
+                    .id()
+            })
+            .collect();
+
+        app.update();
+
+        let nodes = app.world().resource::<CommandNodes>().clone();
+        assert_eq!(
+            nodes.own(Team::Human).count(),
+            spots.len(),
+            "each living hero must contribute its own command node"
+        );
+        // Each one is genuinely usable as a node: standing on any of the three
+        // is free, and the enemy team gets nothing from them.
+        for spot in spots {
+            assert_eq!(nodes.slack(Team::Human, spot), Some(0.0));
+            assert_eq!(nodes.slack(Team::Claude, spot), None);
+        }
+
+        // Kill the middle one: its node goes with it, the other two remain.
+        app.world_mut()
+            .entity_mut(heroes[1])
+            .insert(Health { current: 0.0, max: 100.0 });
+        app.update();
+
+        let nodes = app.world().resource::<CommandNodes>().clone();
+        assert_eq!(nodes.own(Team::Human).count(), spots.len() - 1);
+        assert!(
+            nodes.slack(Team::Human, spots[1]).unwrap_or(0.0) > 0.0,
+            "a dead hero commands nothing"
+        );
+    }
+
     /// A far-from-home order is held, then dispatched — and while it is in
     /// transit the unit's `Order` is untouched, so it keeps doing what it was
     /// doing. This is the mechanic in one test.
@@ -929,34 +1086,130 @@ mod tests {
         assert!(pending.link() > 0.0);
     }
 
-    /// The claim the verb table makes about `cast`/`use_item`: every caster in
-    /// the game either IS a command node or SITS on one, so charging those
-    /// verbs latency would always compute zero. If someone adds an ability to a
-    /// building that is not a hall — or to a non-hero unit — this test fails,
-    /// which is the signal to move that row of the table.
+    /// The surviving half of an identity that used to cover both halves.
+    ///
+    /// `cast` was originally exempt because EVERY caster in the game either was
+    /// a command node (a hero) or sat on one (a hall), so the link was provably
+    /// zero and charging it would have been ceremony. The old test asserted
+    /// exactly that, so the claim could not rot in silence — and it didn't: the
+    /// Sorcerer landed, the test failed, and the `cast` row was re-derived
+    /// (unit casts pay; see `a_non_hero_caster_pays_the_link`).
+    ///
+    /// The *building* half still holds and is still load-bearing: it is why
+    /// Call to Arms is instant, which docs/TEMPO.md §C5 promised by name. Give
+    /// an ability to a building that is not a hall and this fails — the signal
+    /// to price that caster like a unit.
     #[test]
-    fn every_caster_is_a_command_node() {
+    fn every_building_caster_is_a_command_node() {
         for kind in ALL_BUILDING_KINDS {
             if abilities_of_building(kind).is_empty() {
                 continue;
             }
             assert!(
                 is_hall(kind),
-                "{} casts but is not a command node — the `cast` row of \
-                 command.rs's verb table no longer holds",
+                "{} casts but is not a command node — Call to Arms is only \
+                 instant because every building caster stands at a node",
                 building_name(kind)
             );
         }
-        for kind in ALL_UNIT_KINDS {
-            if abilities_of_unit(kind).is_empty() {
-                continue;
-            }
-            assert!(
-                is_hero_kind(kind),
-                "{} casts but is not a hero, so it is not a command node — the \
-                 `cast` row of command.rs's verb table no longer holds",
-                kind_name(kind)
-            );
+    }
+
+    /// The re-derivation, as a test. A hero is a command node, so hero micro is
+    /// as fast as it ever was; a Sorcerer is a unit standing in a fight, so
+    /// hand-firing its ability at range costs what reaching that far costs.
+    ///
+    /// The pair matters more than either half: it is the whole mechanism
+    /// applied to a caster the mechanism was not designed around, and it comes
+    /// out where C4 says it should — with `autocast` (instant, doctrine) the
+    /// better way to use a Sorcerer than hand-firing it from across the map.
+    #[test]
+    fn a_non_hero_caster_pays_the_link() {
+        let lat = tuned();
+        let base = Team::Human.base_pos();
+        let front = at(0.0, 0.0);
+        // A hero at the front is itself a node; the Sorcerer beside it is not.
+        let nodes = cache(vec![(Team::Human, base, lat.hall_radius)]);
+
+        // The Sorcerer is a caster and is NOT a hero — the fact that broke the
+        // old identity. If this stops being true the re-derivation needs
+        // revisiting, so assert it rather than assume it.
+        assert!(!abilities_of_unit(UnitKind::Sorcerer).is_empty());
+        assert!(!is_hero_kind(UnitKind::Sorcerer));
+
+        let sorcerer_link = lat.delay_for_slack(nodes.slack(Team::Human, front));
+        assert!(
+            sorcerer_link > 0.0,
+            "a Sorcerer mid-map must pay to be hand-fired"
+        );
+
+        // ...and a hero standing in exactly the same spot pays nothing,
+        // because the hero brings the chain of command with it.
+        let with_hero = cache(vec![
+            (Team::Human, base, lat.hall_radius),
+            (Team::Human, front, lat.hero_radius),
+        ]);
+        assert_eq!(
+            lat.delay_for_slack(with_hero.slack(Team::Human, front)),
+            0.0,
+            "hero micro must stay free at the hero — docs/TEMPO.md §C5"
+        );
+    }
+
+    /// A cast at range is held and then fires, exactly as an order is — and
+    /// asking twice for the ability already on its way does not restart it.
+    #[test]
+    fn a_distant_cast_arrives_late() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .insert_resource(tuned())
+            .insert_resource(cache(Vec::new()))
+            .add_event::<CastAbility>()
+            .add_systems(Update, dispatch_pending_casts);
+
+        let far = at(60.0, 60.0);
+        let sorcerer = app
+            .world_mut()
+            .spawn((Team::Human, Transform::from_translation(far)))
+            .id();
+
+        let world = app.world_mut();
+        let latency = *world.resource::<CommandLatency>();
+        let nodes = world.resource::<CommandNodes>().clone();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        {
+            let mut commands = Commands::new(&mut queue, world);
+            // No writer needed on the delayed path; a zero-delay cast would
+            // have gone straight out through it instead.
+            let mut issuer = OrderIssuer {
+                nodes: &nodes,
+                latency: &latency,
+                now: 0.0,
+                max_delay: 0.0,
+            };
+            let pending = PendingCast {
+                ability: None,
+                ready_at: issuer.now + issuer.delay(Team::Human, far),
+                issued_at: issuer.now,
+            };
+            assert!(pending.link() > 0.0);
+            commands.entity(sorcerer).try_insert(pending);
         }
+        queue.apply(world);
+
+        // Nothing fires while it is travelling.
+        app.update();
+        assert!(
+            app.world().entity(sorcerer).get::<PendingCast>().is_some(),
+            "the cast fired before it arrived"
+        );
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(tuned().max + 0.1));
+        app.update();
+        assert!(
+            app.world().entity(sorcerer).get::<PendingCast>().is_none(),
+            "the cast never arrived"
+        );
     }
 }

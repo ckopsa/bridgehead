@@ -620,17 +620,46 @@ a substitution inside `compile_intent`'s order arms and nothing else. The
 | `move`, `attackmove`, `attack`, `harvest`, `return`, `follow`, `stop` | **pays** |
 | `build` | exempt — §4's open question, answered as recommended |
 | `train`, `upgrade`, `cancel`, `research`, `rally` | exempt — addressed to a building, which stands at a node |
-| `cast`, `use_item`, `buy` | exempt — see below |
+| `cast` | **pays** for a unit caster, exempt for a building one — see below |
+| `use_item`, `buy` | exempt |
 | `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt — doctrine IS the fast path |
 | `autopilot`, `surrender` | exempt — match level |
 
-The `cast` row is not a carve-out, it is an identity: every caster in the game
-either *is* a command node (a hero) or *sits on* one (`abilities_of_building` is
-`is_hall`-only), so a computed link would be zero for all of them. §C5's claim
-that CallToArms and TownPortal "survive by construction" is therefore literally
-true rather than a design intention, and
-`command::tests::every_caster_is_a_command_node` fails the build if anyone adds
-a caster that breaks it.
+The `cast` row was originally not a carve-out but an identity: every caster in
+the game either *was* a command node (a hero) or *sat on* one, so a computed
+link would be zero for all of them, and charging it would have been ceremony.
+`every_caster_is_a_command_node` asserted exactly that so the claim could not
+rot in silence.
+
+**It rotted, and the test caught it.** The Sorcerer (bead/1qq4y0) is a caster
+that is not a hero — it stands in the middle of an army and debuffs. The test
+failed on the merge, which is the system working: the *identity* broke, the
+*framework* did not. Re-derived from the framework, the answer is unambiguous
+and the row moved:
+
+- **`cast` at a unit caster pays.** Hand-firing Slow on a Sorcerer in the middle
+  of a fight is precisely "reaching past your chain of command at the point of
+  contact", which is the thing this mechanism exists to price. For a hero it
+  still computes zero — a hero *is* a node — so hero micro is exactly as fast as
+  it was, and §C5's promise about TownPortal is untouched.
+- **`cast` at a building caster stays exempt**, because `abilities_of_building`
+  is still `is_hall`-only and a hall is a node. `every_building_caster_is_a_command_node`
+  is the old test, narrowed to the half that still holds, and it is what keeps
+  CallToArms instant.
+- **`autocast` stays exempt**, and this is the row that makes the Sorcerer
+  *interesting* rather than annoying: turning the debuff into standing policy
+  costs nothing and runs at machine speed, while hand-firing it at range costs
+  the link. C4 — "doctrine strictly better than micro at range" — landing on a
+  unit the design never anticipated, for free. The Sorcerer is even *born* with
+  an autocast policy, so the fast path is the default and the slow path is the
+  deliberate one.
+
+Mechanically a cast is an event rather than a component, so the delayed form is
+a second component, `PendingCast`, and a second dispatcher. Deferring the event
+rather than the verdict is what makes a late cast fizzle honestly: combat.rs
+reaches its mana/cooldown decision when the cast *arrives*, so an ability whose
+mana was spent while the order travelled simply does not go off — exactly as if
+the player had been slow.
 
 **The curve** is the recommended step plus ramp, with per-node radii so the
 phase-3 Outpost is one arm of `building_node_radius`:
@@ -699,3 +728,56 @@ cap means the armies have marched off the end of their own chain of command.
 mechanic reads as input lag, which is exactly why the default stays off — and
 the forward Outpost (phase 3), which is one table entry in
 `building_node_radius` when its bead comes up.
+
+### Reconciled against master (bead/polish, bead/ai-bundle, bead/1qq4y0)
+
+Three beads landed while this one was in flight. What each cost is worth
+recording, because two of the three cost nothing and the reason is the same
+reason in both cases.
+
+**The ghost right-click (bead/polish) was priced without being touched.** It is
+a genuinely new direct-order path — the human can now attack a *remembered*
+building the picker previously refused — and it arrived after this mechanism was
+designed, with no knowledge of it. It pays the link correctly anyway, because it
+compiles to `Intent::Attack` and there is exactly one `Attack` arm.
+`a_ghost_attack_pays_the_link_like_any_other_direct_order` pins it. This is the
+choke point (docs/INTENT.md) paying for itself: **a new way of speaking cannot
+accidentally arrive at a privileged speed.** Had this bead been the 23-site
+refactor §4 budgeted, the ghost path would have been site 24 and nobody would
+have noticed.
+
+**ai.rs grew by ~1250 lines and needed no re-wiring.** Towers, ford
+fortification, reactive mixes, the Castle trigger rework and Shop usage all
+landed in the same function this bead had edited, and the merge left all ten
+issue sites intact with zero direct `try_insert(Order::…)` remaining in the
+file. The new AI *does* re-assert standing decisions more aggressively than the
+one this was written against — which would have made the livelock above worse,
+not better, and is a good argument for having fixed it as a rule rather than as
+a special case. Its new `buy`/`use_item` calls are exempt on the same row as
+every other seat's, and its Slam now goes through `issue_cast`: zero for a hero,
+but the day the script learns to hand-fire a Sorcerer it pays for that reach
+automatically instead of quietly not paying. Master had independently invented
+the same `AiEvents` bundle this bead needed for the parameter ceiling, which is
+two people finding the same wall.
+
+**Multiple heroes are multiple mobile nodes.** Hero slots per tier means a team
+can field more than one, and `refresh_command_nodes` collects the whole
+`With<Hero>` query rather than "the" hero, so this works by construction —
+`every_living_hero_is_its_own_command_node` keeps it working and pins the
+dead-hero rule beside it. It is a real strategic object: two heroes are two
+fast-hands zones, bought by putting two expensive units in two dangerous places.
+
+**One thing for the calibration bead, stated plainly.** On the merged master,
+latency-on lengthens matches enough to matter: on `open`, 7 flag-off runs all
+finished decisively in 390–810s, while 7 flag-on runs gave 5 decisive
+(390–1050s) and 2 that hit the 1800s cap. The caps are *not* stuck armies —
+the telemetry shows no orders in transit through the late game, both armies are
+alive, and both treasuries are banking lumber with the gold mines dry. They are
+the mine-exhaustion stalemate, reached because slower propagation means slower
+armies means fewer decisive engagements before the map runs out of gold. Master
+also added towers and ford fortification in the meantime, which push the same
+way. The honest reading is that the defaults chosen here were calibrated against
+a pre-tower AI and are probably a notch too heavy for the current one; the dial
+to turn first is `WC3_LINK_HALL_RADIUS` up rather than `WC3_LINK_STEP` down,
+because the complaint is reach rather than reaction. That is issue 8's decision
+to make with a sweep, not this bead's to make with seven runs.

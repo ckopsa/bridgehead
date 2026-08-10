@@ -79,6 +79,7 @@ can find are different questions, and the gap between them is where scouting liv
 | Spearman | 18 | 2.6 | a picket must see the riders coming — but still short of the Raider's 24, so cavalry keeps the initiative |
 | Catapult | 14 | 20 | **sees less than it shoots** — siege needs spotters |
 | Raider | 24 | 2.2 | **the scout**: sees far, can barely hit anything |
+| Sorcerer | 18 | 11 | a caster whose spell is an 8-unit bubble around itself must see the charge coming from further out than it can throw it |
 | Knight | 20 | 2.4 | shock cavalry closing at 9.5 has to see the shape it is about to hit — so it out-sees the 18 of the spear picket that counters it, but stays short of the Raider's 24: the hammer, not the scout |
 | **Gryphon Rider** | **26** | 6 | **the widest eye in the game**, equal to a TownHall's — altitude is an observation post, fog is XZ only, so height costs a flyer nothing and buys it reach. A hall's worth of vision that *moves*, and Castle-gated because sight this good has to arrive late |
 | Hero (Champion) | 20 | 2.4 | leaders see |
@@ -91,7 +92,9 @@ can find are different questions, and the gap between them is where scouting liv
 | TownHall | 26 | a base is a team's permanent eyes |
 | Tower | 20 | exceeds its 16 attack range — never shoots at what the team cannot see |
 | Barracks | 18 | |
+| Arcane Sanctum | 18 | level with the Barracks — the caster's drill yard, not a watchtower |
 | Workshop | 16 | |
+| Blacksmith | 14 | a forge looks at its own anvil |
 | Shop | 14 | |
 | Farm | 12 | |
 | Wall | 8 | |
@@ -205,11 +208,21 @@ did leak:
   silently rather than reported as news you did not witness.
 
 **Attack orders are gated both ways.** A `state.json` that will not show you an enemy must
-not accept an `attack` command against it either, or the filtering is decoration.
-`bridge.rs` rejects attack targets that are neither visible nor a remembered structure
-(`target N is not visible`); `ui.rs` applies the identical gate to right-click targeting
-and to the hover ring — a hover highlight over an invisible enemy would be a perfect
-enemy detector, sweep the cursor across the fog and watch the crosshair light up.
+not accept an `attack` command against it either, or the filtering is decoration. The
+gate is `knows_entity` — visible now **or** a remembered structure — and `intent.rs`
+applies it to whoever is speaking (`target N is not visible`).
+
+`ui.rs`'s pickers apply the identical rule, in both of its halves. Enemy **units** are
+gated on `sees`: they are never remembered, and a hover highlight over an invisible one
+would be a perfect enemy detector — sweep the cursor across the fog and watch the
+crosshair light up. Enemy **buildings** are clickable while visible *or* while the team
+remembers them, because that is what the compiler accepts: the right-click picker and the
+hover ring both read `FogGrid::ghosts()`, the very iterator that draws the ghost boxes, so
+what can be clicked is what is on screen and the target id handed to `Intent::Attack` is
+the `RememberedBuilding.id` a commander would type. Driving the ring off the *record*
+rather than the live entity is deliberate — a ring that appeared only for buildings still
+standing would answer "is it still there?", and only walking back over the rubble is
+allowed to answer that. See docs/INTENT.md, "The residual asymmetry".
 
 **The scripted AI needed a minimal explore behaviour.** Before fog, "attack the enemy
 base" could never be wrong because the enemy base was always in the snapshot. Now an
