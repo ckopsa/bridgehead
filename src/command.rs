@@ -102,11 +102,7 @@ pub const MAX_ENV: &str = "WC3_LINK_MAX";
 pub const DEFAULT_HALL_RADIUS: f32 = 30.0;
 pub const DEFAULT_HERO_RADIUS: f32 = 18.0;
 pub const DEFAULT_STEP: f32 = 0.6;
-// 0.01, not 0.02: the 45-run calibration sweep (docs/TEMPO.md §calibration)
-// showed the cap binding at half the contested ground at 0.02 — the curve
-// stopped discriminating. At 0.01 the ramp reaches past base-to-base and the
-// cap is left to mean a severed chain of command.
-pub const DEFAULT_PER_UNIT: f32 = 0.01;
+pub const DEFAULT_PER_UNIT: f32 = 0.02;
 pub const DEFAULT_MAX: f32 = 3.0;
 
 // ---------------------------------------------------------------------------
