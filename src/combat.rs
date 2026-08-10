@@ -115,6 +115,15 @@ struct Shockwave {
 #[derive(Component)]
 struct HasHealthBar;
 
+/// The status ring currently worn by a buffed/debuffed unit: which child
+/// entity draws it and which kind it is coloured for. One ring per unit —
+/// stacking five glows would be less legible, not more.
+#[derive(Component)]
+struct StatusRing {
+    ring: Entity,
+    kind: StatusKind,
+}
+
 /// Root of a health bar (child of the owner, billboarded each frame).
 #[derive(Component)]
 struct HealthBarRoot {
@@ -144,6 +153,9 @@ struct CombatAssets {
     /// Same ring, tinted per ability effect (heal = green, militia = yellow).
     shock_heal_mat: Handle<StandardMaterial>,
     shock_militia_mat: Handle<StandardMaterial>,
+    /// One material per `StatusKind`, in `ALL_STATUS_KINDS` order — the ring
+    /// worn by a buffed or debuffed unit.
+    status_mats: Vec<Handle<StandardMaterial>>,
 }
 
 impl CombatAssets {
@@ -162,7 +174,19 @@ impl CombatAssets {
             AbilityEffect::Damage => &self.shock_mat,
             AbilityEffect::Heal => &self.shock_heal_mat,
             AbilityEffect::Militia => &self.shock_militia_mat,
+            // A status ability paints its ring in the colour its effect wears
+            // on the affected units — one legend for the cast and the buff.
+            AbilityEffect::ApplyStatus { status, .. } => self.status_mat(status),
         }
+    }
+    /// Ring material for a status kind (also used for the persistent ring under
+    /// an affected unit). Built once at startup, one per kind.
+    fn status_mat(&self, kind: StatusKind) -> &Handle<StandardMaterial> {
+        let i = ALL_STATUS_KINDS
+            .iter()
+            .position(|k| *k == kind)
+            .unwrap_or(0);
+        &self.status_mats[i]
     }
     fn hp_mat(&self, frac: f32) -> &Handle<StandardMaterial> {
         let last = self.hp_mats.len().saturating_sub(1);
@@ -203,6 +227,7 @@ impl Plugin for CombatPlugin {
                 (
                     attach_health_bars.run_if(on_timer(Duration::from_millis(150))),
                     update_health_bars,
+                    update_status_rings,
                 )
                     .chain(),
             )
@@ -267,6 +292,19 @@ fn setup_combat_assets(
     let shock_mat = ring_mat(1.0, 0.86, 0.35);
     let shock_heal_mat = ring_mat(0.35, 1.0, 0.5);
     let shock_militia_mat = ring_mat(1.0, 0.95, 0.2);
+    // Status rings sit on the ground under a unit all the time, so they are a
+    // touch more solid than a shockwave that flashes and is gone.
+    let status_mats: Vec<Handle<StandardMaterial>> = ALL_STATUS_KINDS
+        .iter()
+        .map(|kind| {
+            materials.add(StandardMaterial {
+                base_color: kind.tint().with_alpha(0.85),
+                unlit: true,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            })
+        })
+        .collect();
 
     commands.insert_resource(CombatAssets {
         quad,
@@ -280,6 +318,7 @@ fn setup_combat_assets(
         shock_mat,
         shock_heal_mat,
         shock_militia_mat,
+        status_mats,
     });
 }
 
@@ -381,6 +420,30 @@ fn handle_attack_orders(
 
 /// Rank of a candidate's class in a focus-fire list: lower is juicier,
 /// unlisted classes sort after everything named.
+/// The counter-triangle, in one place: how much of an attacker's listed damage
+/// actually lands on this target.
+///
+/// Keyed off `TargetClass` rather than off `UnitKind` equality, so adding a
+/// second siege engine or a second mounted kind is a line in
+/// `TargetClass::of`, not a new branch here. At most one multiplier applies —
+/// a building is never cavalry — so they can never compound.
+fn type_damage_mult(stats: &UnitStats, target_kind: Option<UnitKind>, is_building: bool) -> f32 {
+    // Structures are classified structure-first, as they were before this was
+    // a table: whatever else is true of the thing, if it has a Building
+    // component the siege multiplier is the one that matters.
+    let class = if is_building {
+        Some(TargetClass::Building)
+    } else {
+        TargetClass::of(target_kind, false)
+    };
+    match class {
+        Some(TargetClass::Building) => stats.vs_building_mult,
+        Some(TargetClass::Siege) => stats.vs_siege_mult,
+        Some(TargetClass::Cavalry) => stats.vs_cavalry_mult,
+        _ => 1.0,
+    }
+}
+
 fn priority_rank(class: Option<TargetClass>, priority: &TargetPriority) -> usize {
     match class {
         Some(class) => priority
@@ -533,6 +596,7 @@ fn engagement(
         Option<&Hero>,
         Option<&LeashPolicy>,
         Option<&Militia>,
+        Option<&StatusEffects>,
     )>,
     // GlobalTransform (not Transform) so this never conflicts with the mutable
     // attacker query — attackers can themselves be targets.
@@ -540,8 +604,20 @@ fn engagement(
 ) {
     let dt = time.delta_secs();
 
-    for (entity, unit, team, mut tf, order, at, mut state, move_to, hero, leash, militia) in
-        &mut attackers
+    for (
+        entity,
+        unit,
+        team,
+        mut tf,
+        order,
+        at,
+        mut state,
+        move_to,
+        hero,
+        leash,
+        militia,
+        status,
+    ) in &mut attackers
     {
         state.cooldown = (state.cooldown - dt).max(0.0);
         state.repath = (state.repath - dt).max(0.0);
@@ -576,6 +652,10 @@ fn engagement(
         }
 
         let stats = unit_stats(unit.kind);
+        // Everything a buff or debuff can touch comes from the ONE modifier
+        // function — never off `stats` directly. `stats.range`,
+        // `vs_building_mult` and friends are unmodifiable, so they stay raw.
+        let effective = effective_unit_stats(unit.kind, status);
         let target_pos = target_gt.translation();
         let my_pos = tf.translation;
         let reach = stats.range + target_radius(target_building);
@@ -632,28 +712,31 @@ fn engagement(
         if state.cooldown > 0.0 {
             continue;
         }
-        state.cooldown = stats.attack_cooldown.max(0.1);
+        // A slowed unit swings slower: the cooldown it re-arms with is the
+        // effective one, so the debuff shows up in dps without a second rule.
+        state.cooldown = effective.attack_cooldown.max(0.1);
 
-        // Heroes hit harder every level; siege engines hit buildings harder
-        // still, and cavalry hits siege engines harder still. The target type
-        // is known here, so projectiles are minted carrying the already-
-        // multiplied damage — a catapult boulder homing on a structure lands
-        // for the full siege amount.
-        let type_mult = if target_building.is_some() {
-            stats.vs_building_mult
-        } else if target_unit.map(|u| u.kind) == Some(UnitKind::Catapult) {
-            stats.vs_siege_mult
-        } else {
-            1.0
-        };
+        // Heroes hit harder every level; the type multipliers stack the
+        // counter-triangle on top of that. The target type is known here, so
+        // projectiles are minted carrying the already-multiplied damage — a
+        // catapult boulder homing on a structure lands for the full siege
+        // amount.
+        let type_mult = type_damage_mult(
+            &stats,
+            target_unit.map(|u| u.kind),
+            target_building.is_some(),
+        );
         // A worker under Call to Arms swings a militia weapon, not a pickaxe.
         let base_damage = if unit.kind == UnitKind::Worker && militia.is_some() {
             MILITIA_DAMAGE
         } else {
             stats.damage
         };
-        let damage_amount =
-            base_damage * hero.map_or(1.0, |h| Hero::damage_mult(h.level)) * type_mult;
+        let damage_amount = base_damage
+            * hero.map_or(1.0, |h| Hero::damage_mult(h.level))
+            * type_mult
+            // Outgoing damage buffs (Warcry and friends) land here.
+            * effective.damage_mult;
 
         if stats.projectile {
             let origin = my_pos + Vec3::Y * 1.3;
@@ -769,12 +852,22 @@ fn tower_fire(
     mut commands: Commands,
     time: Res<Time>,
     assets: Res<CombatAssets>,
-    mut towers: Query<(Entity, &Building, &Team, &Transform, &mut TowerState), Without<UnderConstruction>>,
+    mut towers: Query<
+        (
+            Entity,
+            &Building,
+            &Team,
+            &Transform,
+            &mut TowerState,
+            Option<&StatusEffects>,
+        ),
+        Without<UnderConstruction>,
+    >,
     targets: Query<(&Team, &GlobalTransform, &Health, &Unit), (With<Unit>, Without<Building>)>,
 ) {
     let dt = time.delta_secs();
 
-    for (entity, building, team, tf, mut state) in &mut towers {
+    for (entity, building, team, tf, mut state, status) in &mut towers {
         state.cooldown = (state.cooldown - dt).max(0.0);
 
         let Some(attack) = building_stats(building.kind).attack else {
@@ -804,7 +897,10 @@ fn tower_fire(
         if state.cooldown > 0.0 {
             continue;
         }
-        state.cooldown = attack.cooldown.max(0.1);
+        // Emplacements are buffable too — one law, one call, whether the thing
+        // holding the weapon has legs or foundations.
+        let effective = effective_stats(BaseStats::of_building_attack(&attack), status);
+        state.cooldown = effective.attack_cooldown.max(0.1);
 
         let origin = tf.translation + Vec3::Y * TOWER_MUZZLE_HEIGHT;
         let aim = target_pos + Vec3::Y * 1.0;
@@ -823,7 +919,7 @@ fn tower_fire(
                 // shot by a tower retaliates INTO the tower — melee units path
                 // to it and start sieging, which is the behaviour we want.
                 owner: entity,
-                damage: attack.damage,
+                damage: attack.damage * effective.damage_mult,
                 speed: PROJECTILE_SPEED,
                 life: PROJECTILE_LIFETIME,
             },
@@ -840,16 +936,23 @@ struct ResolvedCast {
     def: AbilityDef,
     team: Team,
     center: Vec3,
-    /// `def.power` after hero level scaling (Militia ignores it — it's seconds).
+    /// `def.power` after hero level scaling (Militia and ApplyStatus ignore the
+    /// scaling — theirs is a duration and a magnitude, not a damage number).
     power: f32,
 }
 
-/// Execute `CastAbility` for BOTH caster families:
+/// Execute `CastAbility` for BOTH caster families, v2 style:
 ///
-///   * units — the ability comes from `ability_of_unit(kind)`, gated on the
-///     hero's mana and `Hero.ability_cooldown`, scaled by hero level;
-///   * buildings — `ability_of_building(kind)`, gated on an `AbilityCooldown`
-///     component (inserted lazily on the first cast), no mana, no scaling.
+///   * units — the ability list comes from `abilities_of_unit(kind)`; the
+///     event's selector picks a slot (`None` = first unlocked), and the cast is
+///     gated on that slot's `AbilityCooldowns` entry plus the hero's mana;
+///   * buildings — `abilities_of_building(kind)`, same list/selector/cooldown
+///     machinery, no mana and no level scaling.
+///
+/// Unlocks are evaluated here, once, against the caster's own level and its
+/// team's tech tier — so a locked ability cannot be cast by the UI, the AI, the
+/// auto-caster or a bridge commander, and none of them need their own copy of
+/// the rule.
 ///
 /// The `&mut Hero` here is the module's only mutable hero access; `engagement`
 /// reads heroes in a different system, so the two can never alias.
@@ -858,55 +961,67 @@ fn cast_abilities(
     mut commands: Commands,
     time: Res<Time>,
     assets: Res<CombatAssets>,
+    tiers: Res<TechTiers>,
     mut events: EventReader<CastAbility>,
     mut damage: EventWriter<DamageEvent>,
-    mut unit_casters: Query<(&Unit, &mut Hero, &Team, &Transform)>,
+    // `Without<Building>` is load-bearing: heroes and ability buildings now
+    // share the `AbilityCooldowns` component, so the two caster queries need an
+    // explicit disjointness proof to both take it mutably (B0001).
+    mut unit_casters: Query<
+        (&Unit, &mut Hero, &Team, &Transform, Option<&mut AbilityCooldowns>),
+        Without<Building>,
+    >,
     mut building_casters: Query<
-        (&Building, &Team, &Transform, Option<&mut AbilityCooldown>),
+        (&Building, &Team, &Transform, Option<&mut AbilityCooldowns>),
         Without<UnderConstruction>,
     >,
     mut affected: Query<
-        (Entity, &Team, &GlobalTransform, &mut Health, Option<&Unit>),
+        (
+            Entity,
+            &Team,
+            &GlobalTransform,
+            &mut Health,
+            Option<&Unit>,
+            Option<&mut StatusEffects>,
+        ),
         Or<(With<Unit>, With<Building>)>,
     >,
 ) {
     let now = time.elapsed_secs();
 
     for ev in events.read() {
-        // --- resolve the caster (unit first, then building) ----------------
-        let resolved = if let Ok((unit, mut hero, team, tf)) = unit_casters.get_mut(ev.caster) {
-            let Some(def) = ability_of_unit(unit.kind) else {
+        // --- resolve the caster, then the ability --------------------------
+        let resolved = if let Ok((unit, mut hero, team, tf, cooldowns)) =
+            unit_casters.get_mut(ev.caster)
+        {
+            let list = abilities_of_unit(unit.kind);
+            let ctx = UnlockCtx::new(hero.level, tiers.get(*team));
+            let Some(index) = resolve_ability(list, ev.ability.as_ref(), ctx) else {
                 continue;
             };
-            if hero.ability_cooldown > 0.0 || hero.mana < def.mana_cost {
+            let def = list[index];
+            if !ability_ready(&def, Some(&hero), cooldowns.as_deref(), index) {
                 continue;
             }
             hero.mana = (hero.mana - def.mana_cost).max(0.0);
-            hero.ability_cooldown = def.cooldown;
+            start_cooldown(&mut commands, ev.caster, cooldowns, index, def.cooldown);
             ResolvedCast {
                 def,
                 team: *team,
                 center: tf.translation,
                 power: def.power * Hero::damage_mult(hero.level),
             }
-        } else if let Ok((building, team, tf, cooldown)) = building_casters.get_mut(ev.caster) {
-            let Some(def) = ability_of_building(building.kind) else {
+        } else if let Ok((building, team, tf, cooldowns)) = building_casters.get_mut(ev.caster) {
+            let list = abilities_of_building(building.kind);
+            let ctx = UnlockCtx::building(tiers.get(*team));
+            let Some(index) = resolve_ability(list, ev.ability.as_ref(), ctx) else {
                 continue;
             };
-            match cooldown {
-                Some(mut cooldown) => {
-                    if cooldown.0 > 0.0 {
-                        continue;
-                    }
-                    cooldown.0 = def.cooldown;
-                }
-                // First cast ever: the component appears already spent.
-                None => {
-                    commands
-                        .entity(ev.caster)
-                        .try_insert(AbilityCooldown(def.cooldown));
-                }
+            let def = list[index];
+            if !ability_ready(&def, None, cooldowns.as_deref(), index) {
+                continue;
             }
+            start_cooldown(&mut commands, ev.caster, cooldowns, index, def.cooldown);
             ResolvedCast { def, team: *team, center: tf.translation, power: def.power }
         } else {
             continue;
@@ -915,7 +1030,7 @@ fn cast_abilities(
         let ResolvedCast { def, team, center, power } = resolved;
 
         // --- apply the effect ----------------------------------------------
-        for (entity, other_team, gt, mut health, unit) in &mut affected {
+        for (entity, other_team, gt, mut health, unit, status) in &mut affected {
             if health.current <= 0.0 || xz_dist(center, gt.translation()) > def.radius {
                 continue;
             }
@@ -948,6 +1063,31 @@ fn cast_abilities(
                         .entity(entity)
                         .try_insert(Militia { until: now + def.power });
                 }
+                // The whole point of (A) meeting (B): a status ability is a
+                // table row. `power` is the magnitude, `duration` the seconds,
+                // `targets` says who — and shared.rs expires it.
+                AbilityEffect::ApplyStatus { status: kind, targets } => {
+                    let matches = match targets {
+                        AbilityTargets::Enemies => other_team != &team && unit.is_some(),
+                        AbilityTargets::Allies => other_team == &team && unit.is_some(),
+                        AbilityTargets::OwnWorkers => {
+                            other_team == &team && unit.map(|u| u.kind) == Some(UnitKind::Worker)
+                        }
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    let effect =
+                        StatusEffect::new(kind, def.power, now, def.duration, StatusSource::Ability);
+                    match status {
+                        Some(mut existing) => existing.apply(effect),
+                        None => {
+                            let mut fresh = StatusEffects::new();
+                            fresh.apply(effect);
+                            commands.entity(entity).try_insert(fresh);
+                        }
+                    }
+                }
             }
         }
 
@@ -958,6 +1098,25 @@ fn cast_abilities(
                 .with_scale(Vec3::new(SHOCKWAVE_START, 0.5, SHOCKWAVE_START)),
             Shockwave { age: 0.0, radius: def.radius },
         ));
+    }
+}
+
+/// Put one ability slot on cooldown, creating the store on the caster's first
+/// cast. Heroes and buildings share it, so this is written once.
+fn start_cooldown(
+    commands: &mut Commands,
+    caster: Entity,
+    cooldowns: Option<Mut<AbilityCooldowns>>,
+    index: usize,
+    secs: f32,
+) {
+    match cooldowns {
+        Some(mut cooldowns) => cooldowns.start(index, secs),
+        None => {
+            let mut fresh = AbilityCooldowns::default();
+            fresh.start(index, secs);
+            commands.entity(caster).try_insert(fresh);
+        }
     }
 }
 
@@ -1014,7 +1173,8 @@ fn use_items(
                 let hall = halls
                     .iter()
                     .filter(|(building, hall_team, _)| {
-                        building.kind == BuildingKind::TownHall && *hall_team == team
+                        // Any rung of the hall ladder is home.
+                        is_hall(building.kind) && *hall_team == team
                     })
                     .map(|(_, _, hall_tf)| hall_tf.translation)
                     .min_by(|a, b| {
@@ -1094,6 +1254,9 @@ fn apply_damage(
     time: Res<Time>,
     mut events: EventReader<DamageEvent>,
     mut healths: Query<&mut Health>,
+    // Read-only status lookup, disjoint from `healths` (different component),
+    // so damage reduction costs nothing but a get.
+    shields: Query<&StatusEffects>,
     victims: Query<(
         &Unit,
         &Team,
@@ -1105,13 +1268,18 @@ fn apply_damage(
     attackers: Query<(&Team, Option<&Unit>), Or<(With<Unit>, With<Building>)>>,
 ) {
     for event in events.read() {
+        // Incoming damage goes through the same law as outgoing damage:
+        // whatever armour buffs the victim is carrying are applied HERE, once,
+        // at the single point where health is subtracted.
+        let taken = effective_stats(BaseStats::STATIC, shields.get(event.victim).ok())
+            .damage_taken_mult;
         let Ok(mut health) = healths.get_mut(event.victim) else {
             continue;
         };
         if health.current <= 0.0 {
             continue;
         }
-        health.current -= event.amount;
+        health.current -= event.amount * taken;
         // Everything that takes a hit — unit, hero, building — is stamped, so
         // shared.rs's out-of-combat regen restarts its clock from here.
         commands
@@ -1147,6 +1315,76 @@ fn apply_damage(
                 commands
                     .entity(event.victim)
                     .try_insert((AttackTarget(event.attacker), CombatState::default()));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status rings: what a buff or a debuff LOOKS like
+// ---------------------------------------------------------------------------
+//
+// A status effect that only exists in the numbers is a status effect the
+// player cannot play around. The cheapest legible marker with the primitives
+// already here is the shockwave torus, shrunk to body size and parked under the
+// unit's feet as a child (so it inherits position and dies with its owner).
+//
+// One ring per unit, coloured by `StatusEffects::dominant` — debuffs outrank
+// buffs, because "why is my footman crawling" is the more urgent question.
+
+/// World radius of the ring drawn under an affected unit.
+const STATUS_RING_RADIUS: f32 = 1.35;
+/// Local Y of the ring inside the unit's (scaled) root — just above the ground.
+const STATUS_RING_DROP: f32 = -0.42;
+
+/// Attach, recolour and remove status rings. Runs every frame but touches only
+/// units whose effect set actually changed state, so an unbuffed army costs one
+/// query iteration and nothing else.
+fn update_status_rings(
+    mut commands: Commands,
+    assets: Res<CombatAssets>,
+    affected: Query<(Entity, &Transform, Option<&StatusEffects>, Option<&StatusRing>), With<Unit>>,
+    mut ring_mats: Query<&mut MeshMaterial3d<StandardMaterial>>,
+) {
+    for (entity, tf, status, ring) in &affected {
+        let wanted = status.and_then(|s| s.dominant());
+        match (wanted, ring) {
+            // Nothing to show, nothing shown.
+            (None, None) => {}
+            // Effects all gone: take the ring away.
+            (None, Some(ring)) => {
+                commands.entity(ring.ring).try_despawn();
+                commands.entity(entity).try_remove::<StatusRing>();
+            }
+            // Newly affected: hang a ring under it.
+            (Some(kind), None) => {
+                // The root is scaled by UNIT_SCALE (heroes more), so the child
+                // divides that back out to land at a constant world radius.
+                let scale = STATUS_RING_RADIUS / tf.scale.x.max(0.01);
+                let ring = commands
+                    .spawn((
+                        Mesh3d(assets.ring_mesh.clone()),
+                        MeshMaterial3d(assets.status_mat(kind).clone()),
+                        Transform::from_xyz(0.0, STATUS_RING_DROP, 0.0)
+                            .with_scale(Vec3::new(scale, scale * 0.35, scale)),
+                    ))
+                    .id();
+                commands
+                    .entity(entity)
+                    .try_insert(StatusRing { ring, kind })
+                    .add_child(ring);
+            }
+            // Still affected: only repaint when the dominant kind changed.
+            (Some(kind), Some(ring)) => {
+                if ring.kind == kind {
+                    continue;
+                }
+                if let Ok(mut material) = ring_mats.get_mut(ring.ring) {
+                    material.0 = assets.status_mat(kind).clone();
+                }
+                commands
+                    .entity(entity)
+                    .try_insert(StatusRing { ring: ring.ring, kind });
             }
         }
     }
@@ -1267,5 +1505,192 @@ fn update_health_bars(
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Balance probe
+// ---------------------------------------------------------------------------
+//
+// A melee engagement in this game is arithmetic: two blocks close, then trade
+// `damage * type_mult` every `attack_cooldown` until one block is gone.
+// Movement decides *when* that starts, not who wins it. So the counter
+// triangle can be checked without a World — this steps the real stat tables
+// through the real multiplier rule and reports who is left standing.
+//
+// The numbers it guards are the ones that make the Spearman a counter rather
+// than a strictly-better Footman: it must beat cavalry it could never catch,
+// and it must lose to the same gold spent on Footmen.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One combatant's mutable state.
+    struct Fighter {
+        hp: f32,
+        cooldown: f32,
+    }
+
+    /// Outcome of a block-vs-block fight: surviving HP on each side.
+    struct Outcome {
+        a_hp: Vec<f32>,
+        b_hp: Vec<f32>,
+    }
+
+    impl Outcome {
+        fn a_alive(&self) -> usize {
+            self.a_hp.iter().filter(|hp| **hp > 0.0).count()
+        }
+        fn b_alive(&self) -> usize {
+            self.b_hp.iter().filter(|hp| **hp > 0.0).count()
+        }
+        /// Winning side's remaining HP as a fraction of what it started with —
+        /// "convincingly" should be a number, not a vibe.
+        fn a_hp_fraction(&self, kind: UnitKind, n: usize) -> f32 {
+            self.a_hp.iter().sum::<f32>() / (unit_stats(kind).hp * n as f32)
+        }
+    }
+
+    /// Step `a_n` units of one kind against `b_n` of another until one side is
+    /// wiped (or two game-minutes pass, meaning neither side can finish).
+    ///
+    /// Both sides resolve simultaneously, so nobody wins on initiative, and
+    /// each attacker round-robins onto a living enemy rather than focus-firing
+    /// — the game has no focus-fire order either, and perfect focus fire would
+    /// hand every fight to whichever side merely brought more bodies.
+    fn engage(a_kind: UnitKind, a_n: usize, b_kind: UnitKind, b_n: usize) -> Outcome {
+        const DT: f32 = 0.02;
+        const TIMEOUT: f32 = 120.0;
+
+        let (a_stats, b_stats) = (unit_stats(a_kind), unit_stats(b_kind));
+        let a_hit = a_stats.damage * type_damage_mult(&a_stats, Some(b_kind), false);
+        let b_hit = b_stats.damage * type_damage_mult(&b_stats, Some(a_kind), false);
+
+        let mut a: Vec<Fighter> = (0..a_n)
+            .map(|_| Fighter { hp: a_stats.hp, cooldown: 0.0 })
+            .collect();
+        let mut b: Vec<Fighter> = (0..b_n)
+            .map(|_| Fighter { hp: b_stats.hp, cooldown: 0.0 })
+            .collect();
+
+        let mut t = 0.0;
+        while t < TIMEOUT {
+            let a_live: Vec<usize> = (0..a.len()).filter(|i| a[*i].hp > 0.0).collect();
+            let b_live: Vec<usize> = (0..b.len()).filter(|i| b[*i].hp > 0.0).collect();
+            if a_live.is_empty() || b_live.is_empty() {
+                break;
+            }
+
+            // Collect both sides' swings before applying either, so a fighter
+            // that dies this tick still lands the blow it had already earned.
+            let mut into_b = vec![0.0f32; b.len()];
+            let mut into_a = vec![0.0f32; a.len()];
+            for (slot, i) in a_live.iter().enumerate() {
+                if a[*i].cooldown <= 0.0 {
+                    a[*i].cooldown = a_stats.attack_cooldown;
+                    into_b[b_live[slot % b_live.len()]] += a_hit;
+                } else {
+                    a[*i].cooldown -= DT;
+                }
+            }
+            for (slot, i) in b_live.iter().enumerate() {
+                if b[*i].cooldown <= 0.0 {
+                    b[*i].cooldown = b_stats.attack_cooldown;
+                    into_a[a_live[slot % a_live.len()]] += b_hit;
+                } else {
+                    b[*i].cooldown -= DT;
+                }
+            }
+            for (f, dmg) in a.iter_mut().zip(into_a) {
+                f.hp -= dmg;
+            }
+            for (f, dmg) in b.iter_mut().zip(into_b) {
+                f.hp -= dmg;
+            }
+            t += DT;
+        }
+
+        Outcome {
+            a_hp: a.iter().map(|f| f.hp.max(0.0)).collect(),
+            b_hp: b.iter().map(|f| f.hp.max(0.0)).collect(),
+        }
+    }
+
+    /// The multiplier table is keyed off `TargetClass`, and exactly one
+    /// multiplier may ever apply to a swing.
+    #[test]
+    fn type_multipliers_follow_target_class() {
+        let spear = unit_stats(UnitKind::Spearman);
+        assert_eq!(
+            type_damage_mult(&spear, Some(UnitKind::Raider), false),
+            5.0,
+            "the Spearman's whole reason to exist"
+        );
+        assert_eq!(type_damage_mult(&spear, Some(UnitKind::Footman), false), 1.0);
+        assert_eq!(type_damage_mult(&spear, Some(UnitKind::Catapult), false), 1.0);
+        assert_eq!(type_damage_mult(&spear, None, true), 1.0);
+
+        // The pre-existing counters must survive the move onto TargetClass.
+        let raider = unit_stats(UnitKind::Raider);
+        assert_eq!(type_damage_mult(&raider, Some(UnitKind::Catapult), false), 2.0);
+        assert_eq!(type_damage_mult(&raider, Some(UnitKind::Footman), false), 1.0);
+        let catapult = unit_stats(UnitKind::Catapult);
+        assert_eq!(type_damage_mult(&catapult, None, true), 6.0);
+    }
+
+    /// A 90g Spearman beats a 170g Raider one-on-one, and not by a hair —
+    /// a counter nobody trusts is not a counter.
+    #[test]
+    fn spearman_beats_raider_one_on_one() {
+        let out = engage(UnitKind::Spearman, 1, UnitKind::Raider, 1);
+        assert_eq!(out.b_alive(), 0, "the Raider should die");
+        assert_eq!(out.a_alive(), 1, "the Spearman should live");
+        let left = out.a_hp_fraction(UnitKind::Spearman, 1);
+        assert!(
+            // Measured: 0.30 of its 160 hp. The margin is the design — wide
+            // enough that a player believes the counter, narrow enough that
+            // walking one Spearman at a Raider is not free.
+            left > 0.25,
+            "Spearman should finish comfortably ahead, had {left:.3} left",
+        );
+    }
+
+    /// ...and is not a general-purpose upgrade: the same gold spent on
+    /// Footmen beats a bigger block of Spearmen, so the cheap unit only pays
+    /// off against the thing it is pointed at.
+    #[test]
+    fn equal_gold_footmen_beat_spearmen() {
+        // 270 gold each way: 2 Footmen (135g) vs 3 Spearmen (90g).
+        assert_eq!(unit_stats(UnitKind::Footman).cost_gold * 2, 270);
+        assert_eq!(unit_stats(UnitKind::Spearman).cost_gold * 3, 270);
+        let out = engage(UnitKind::Footman, 2, UnitKind::Spearman, 3);
+        assert_eq!(out.b_alive(), 0, "the Spearmen should be wiped");
+        // Measured: 1 of the 2 Footmen survives, on 24% of the pair's HP. Not
+        // a rout in either direction — Spearmen are cheap enough that massing
+        // them is a real option, just never a *free* one.
+        assert!(out.a_alive() > 0, "at least one Footman should live");
+    }
+
+    /// The straight duel, for the record: a Footman handles a Spearman easily.
+    #[test]
+    fn footman_beats_spearman_one_on_one() {
+        let out = engage(UnitKind::Footman, 1, UnitKind::Spearman, 1);
+        assert_eq!(out.b_alive(), 0);
+        assert!(
+            out.a_hp_fraction(UnitKind::Footman, 1) > 0.5,
+            "and without dropping below half"
+        );
+    }
+
+    /// The same gold pointed at what it counters: 270g of Spearmen erases the
+    /// cavalry it meets without losing a body.
+    #[test]
+    fn equal_gold_spearmen_beat_raiders() {
+        // 270g buys 1.59 Raiders; 1 Raider vs 3 Spearmen is the closest
+        // whole-unit trade, and it is still a rout.
+        let out = engage(UnitKind::Spearman, 3, UnitKind::Raider, 1);
+        assert_eq!(out.b_alive(), 0);
+        assert_eq!(out.a_alive(), 3, "cavalry should not even take one with it");
     }
 }

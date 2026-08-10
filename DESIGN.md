@@ -30,16 +30,36 @@ Win by destroying all enemy buildings.
   it into `state.json` for an external commander, ui.rs draws it as HUD
   notifications for the player. A feed with two producers is two feeds, and two
   feeds is an information advantage for whichever side has the better one.
+  It also owns two frameworks every content bead builds on:
+  * **Status effects** — `StatusKind` (Slow/Haste/ArmorBuff/DamageBuff/
+    HealOverTime), `StatusEffect`, the `StatusEffects` component, and
+    `effective_stats(BaseStats, Option<&StatusEffects>)`, **the one modifier
+    function**: units.rs and combat.rs ask it for move speed, attack cooldown
+    and damage dealt/taken instead of reading the stat tables. Debuffs refresh,
+    buffs stack, magnitudes are capped per kind, and `tick_status_effects`
+    expires everything centrally (combat.rs draws the ground ring).
+  * **Abilities v2** — `abilities_of_unit` / `abilities_of_building` return a
+    LIST per caster; each `AbilityDef` carries an `AbilityUnlock` predicate
+    (always / hero level / `TechTier`) and an effect that may be
+    `ApplyStatus`. `CastAbility { caster, ability: Option<AbilitySelector> }`
+    picks a slot (`None` = first unlocked); cooldowns live per slot in
+    `AbilityCooldowns` and auto-cast rules per slot in `AutoCastPolicy`.
+    `tech_tier_for` derives the team's `TechTier` from the highest hall rung it
+    has standing (`is_hall` + `building_tier`), so a completed Keep opens every
+    `TeamTier(T2)` ability and losing it closes them again.
 - `intent.rs` (v2): the **intent compiler** — the single place a player's
-  meaning becomes game state. `shared::Intent` is the vocabulary (23 verbs,
+  meaning becomes game state. `shared::Intent` is the vocabulary (24 verbs,
   serde-serializable, wire-identical to the bridge protocol); `ui.rs` compiles
   mouse gestures into it and `bridge.rs` deserializes `commands.json` into it,
-  and neither may mutate the world any other way. Also writes the per-match
-  intent log (`bridge/intent_log.jsonl`): every intent as an English sentence
-  plus its serialized form, so a replay reads the same regardless of who was
-  playing. Engine follow-through (economy/combat/doctrine) and the scripted
-  `ai.rs` are not players and still write components directly. Ordering is via
-  the `IntentApply` system set. See docs/INTENT.md.
+  and neither may mutate the world any other way. It is also where fog stops
+  being a rendering choice and becomes a rule: an `attack` on a target the
+  issuing team cannot see or remember is refused for BOTH interfaces. Writes
+  the per-match intent log (`bridge/intent_log.jsonl`): every intent as an
+  English sentence plus its serialized form, so a replay reads the same
+  regardless of who was playing. Engine follow-through (economy/combat/
+  doctrine) and the scripted `ai.rs` are not players and still write components
+  directly. Ordering is via the `IntentApply` system set, itself
+  `.after(FogSet)`. See docs/INTENT.md.
 - `terrain.rs`: ground, doodads, resource nodes (gold mines at
   `GOLD_MINE_POSITIONS`, tree clusters), lighting, **RTS camera** (spawns the
   `MainCamera`), blocks trees/mines in `NavGrid`, and owns the **map layout**:
@@ -63,11 +83,11 @@ Win by destroying all enemy buildings.
   `SpawnUnitEvent` near the building when done, refunds nothing on death).
 - `ui.rs`: selection (left click + drag box over own units/buildings), right-click
   context orders (enemy → Attack, resource node → Harvest for workers, ground →
-  Move; A+click → AttackMove), building placement mode with ghost + affordability,
-  training hotkeys/buttons on selected production
-  buildings, doctrine toggles on the command card — all of which *compile to
-  `Intent` values and submit them*; ui.rs mutates no game state itself. Plus the
-  top resource bar,
+  Move; A+click → AttackMove), building placement mode with ghost + affordability
+  training hotkeys/buttons on selected production buildings, `[U]` tier-up,
+  hero/building ability hotkeys, doctrine toggles — all of which *compile to
+  `Intent` values and submit them*; ui.rs mutates no game state itself. Plus
+  the top resource bar,
   selection info panel, game-over banner from `GameOver`, top-right alert stack
   rendering `GameEvents::feed(Team::Human)` (severity colours, fade-out, Space
   or click focuses the camera via `CameraFocus`).
@@ -123,6 +143,12 @@ Win by destroying all enemy buildings.
   alive; when following `Order::Attack(target)`/`Harvest(target)`, always
   `if let Ok(..) = query.get(target)` and fall back to Idle if the target is gone.
 - `Query::single()`/`single_mut()` return `Result` in 0.16 — use `let Ok(x) = q.single() else { return; }`.
+- **`GlobalTransform` is only propagated in `PostUpdate`.** Any ROOT entity you
+  spawn *or* teleport during `Update` must seed/update its own
+  `GlobalTransform::from(transform)` in the same statement that writes the
+  `Transform` — otherwise every `GlobalTransform` reader that frame (combat.rs
+  reads positions that way) sees the origin for a fresh spawn, or the stale
+  pre-teleport position for a mover.
 
 ## Verification
 

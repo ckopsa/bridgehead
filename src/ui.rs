@@ -22,7 +22,11 @@
 //! system can ever alias. The minimap systems use `With`/`Without` marker
 //! filters to stay provably disjoint.
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
+use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::render_asset::RenderAssetUsages;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::{PrimaryWindow, SystemCursorIcon};
 use bevy::winit::cursor::CursorIcon;
 use std::collections::{HashMap, VecDeque};
@@ -118,11 +122,19 @@ impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiState>()
             .init_resource::<Notifications>()
-            .add_systems(Startup, (setup_ui, setup_hover).chain())
+            // `setup_fog` after `setup_ui`: it parents the minimap's fog layer
+            // to the `MinimapRoot` that `setup_ui` spawns.
+            .add_systems(Startup, (setup_ui, setup_hover, setup_fog).chain())
             .add_systems(
                 Update,
                 (
                     minimap_static_markers,
+                    // Fog first, so everything downstream in this chain — the
+                    // pickers, the minimap, the hover ring — reads the same
+                    // visibility the player is looking at.
+                    apply_fog_visibility,
+                    update_fog_overlay,
+                    sync_building_ghosts,
                     surrender_hotkey,
                     command_input,
                     panel_clicks,
@@ -147,7 +159,8 @@ impl Plugin for UiPlugin {
                     // runs after all of them, so a click is compiled in the
                     // frame it happened rather than the next one.
                     .chain()
-                    .before(IntentApply),
+                    .before(IntentApply)
+                    .after(FogSet),
             );
     }
 }
@@ -315,19 +328,30 @@ enum Slot {
 // Commands (shared by hotkeys and command-card buttons)
 // ---------------------------------------------------------------------------
 
+// The command card used to carry a four-writer `CardActions` bundle —
+// `CastAbility`, `BuyItem`, `UseItem`, `UpgradeBuilding` — field for field
+// identical to the one bridge.rs carried. Both are gone: the card emits
+// `SubmitIntent` and nothing else, and intent.rs owns the four writers. Two
+// interfaces that had independently converged on the same bundle are exactly
+// the duplication the intent layer exists to remove, and dropping it also
+// bought `command_input` three parameters of headroom against Bevy's ceiling.
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CmdAction {
     AttackMove,
     Stop,
     Place(BuildingKind),
     Train(UnitKind),
-    /// The selected hero's ability, whatever `ability_of_unit` says it is
-    /// (every selected own hero casts its own).
-    CastHero,
-    /// The single selected own building's ability (`ability_of_building`).
-    CastBuilding,
+    /// Cast ability slot N of every selected own hero. One entry per UNLOCKED
+    /// slot, so a hero with two spells gets two buttons and two hotkeys.
+    CastHero(usize),
+    /// Cast ability slot N of the single selected own building.
+    CastBuilding(usize),
     /// Buy a consumable at the single selected own Shop, for the team's hero.
     Buy(ItemId),
+    /// Convert the single selected own building into its next tier in place.
+    /// Carries the RESULT, so the button can name what you get.
+    Upgrade(BuildingKind),
     /// Consume the selected own hero's inventory slot.
     UseSlot(usize),
     /// Doctrine: toggle `LeashPolicy` on the whole own-unit selection.
@@ -613,7 +637,9 @@ impl CmdEntry {
         if !requirements_met(reqs, completed.iter().copied()) {
             let missing = reqs
                 .iter()
-                .find(|r| !completed.contains(r))
+                // Tier-aware like `requirements_met`, so a card never reads
+                // "needs Keep" to a player who is standing on a Castle.
+                .find(|r| !completed.iter().any(|owned| building_satisfies(*owned, **r)))
                 .copied()
                 .unwrap_or(BuildingKind::TownHall);
             self.locked = true;
@@ -637,18 +663,32 @@ impl CmdEntry {
     }
 }
 
+/// One castable ability of the current selection, ready for the card.
+#[derive(Clone, Copy)]
+struct AbilitySlot {
+    /// Slot in the caster's `abilities_of_*` list — the cast selector.
+    index: usize,
+    def: AbilityDef,
+    /// Off cooldown and (heroes) affordable.
+    ready: bool,
+    /// Seconds of cooldown left, for the caption.
+    cooldown: f32,
+}
+
 /// What the current selection can do about heroes, abilities and items.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct HeroCmds {
     /// Hero training offered by the selected town hall.
     train: Option<HeroTrain>,
-    /// A selected own hero: (its ability, ready, seconds of cooldown left).
-    ability: Option<(AbilityDef, bool, f32)>,
-    /// The single selected own completed building's ability, when it has one:
-    /// (ability, seconds of cooldown left).
-    building_ability: Option<(AbilityDef, f32)>,
+    /// The selected own hero's UNLOCKED abilities, in slot order.
+    abilities: Vec<AbilitySlot>,
+    /// The single selected own completed building's unlocked abilities.
+    building_abilities: Vec<AbilitySlot>,
     /// The single selected own completed Shop's buy state.
     shop: Option<ShopState>,
+    /// The single selected own completed building's available tier-up, when it
+    /// has one and is not already converting: `(result kind, gold, lumber)`.
+    upgrade: Option<(BuildingKind, u32, u32)>,
     /// Inventory of the selected own hero (all None when none is selected).
     items: [Option<ItemId>; 2],
 }
@@ -681,10 +721,11 @@ struct ShopState {
 /// name and tech gating all come from the shared tables via `build_cards`.
 ///
 /// Free letters only: every other command key in this file is
-/// A S R C B F H O L K N Q W E G V P T Z X, plus Esc / '.' / Ctrl+1-3;
+/// A S R C B F H O L K N Q W E G V P T Z X U, plus the second/third ability
+/// slots Y D (hero) and J M (building), plus Esc / '.' / Ctrl+1-3;
 /// shared.rs owns F1-F4, ai.rs F9, the surrender hotkey F12, and terrain.rs
 /// the arrow keys. K (workshop) and N (shop) were picked against that whole
-/// list — J and U are the remaining unclaimed candidates.
+/// list — I is the only remaining unclaimed letter.
 fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
     match kind {
         BuildingKind::Barracks => Some((0, KeyCode::KeyB, "B")),
@@ -694,6 +735,9 @@ fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
         BuildingKind::Wall => Some((4, KeyCode::KeyL, "L")),
         BuildingKind::Workshop => Some((5, KeyCode::KeyK, "K")),
         BuildingKind::Shop => Some((6, KeyCode::KeyN, "N")),
+        // Reached by upgrading a hall, never by placing one — no build card,
+        // and `build_cards` filters on `building_placeable` besides.
+        BuildingKind::Keep | BuildingKind::Castle => None,
     }
 }
 
@@ -702,6 +746,7 @@ fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
 fn build_cards() -> Vec<(u8, BuildingKind, KeyCode, &'static str)> {
     let mut cards: Vec<(u8, BuildingKind, KeyCode, &'static str)> = ALL_BUILDING_KINDS
         .into_iter()
+        .filter(|kind| building_placeable(*kind))
         .filter_map(|kind| {
             build_card_slot(kind).map(|(slot, key, hotkey)| (slot, kind, key, hotkey))
         })
@@ -710,16 +755,39 @@ fn build_cards() -> Vec<(u8, BuildingKind, KeyCode, &'static str)> {
     cards
 }
 
-/// Production hotkeys, by index into `trainable()`: Q, W, E. A Shop trains
-/// nothing, so its buy buttons reuse the same letters without colliding.
-const TRAIN_KEYS: [(KeyCode, &str); 3] = [
+/// Production hotkeys, by index into `trainable()`: Q, W, E, R. A Shop trains
+/// nothing, so its buy buttons reuse the same letters without colliding, and
+/// the hero's [R] lives on a unit selection, never a building one.
+const TRAIN_KEYS: [(KeyCode, &str); 4] = [
     (KeyCode::KeyQ, "Q"),
     (KeyCode::KeyW, "W"),
     (KeyCode::KeyE, "E"),
+    (KeyCode::KeyR, "R"),
 ];
 
 /// Inventory-slot hotkeys, by slot index.
 const ITEM_KEYS: [(KeyCode, &str); 2] = [(KeyCode::KeyZ, "Z"), (KeyCode::KeyX, "X")];
+
+/// Hero ability hotkeys, by ability slot. [R] is where the one hero ability
+/// has always lived, so a Champion or Priestess with a single spell is
+/// unchanged; a second and third spell get [Y] and [U].
+const HERO_ABILITY_KEYS: [(KeyCode, &str); 3] = [
+    (KeyCode::KeyR, "R"),
+    (KeyCode::KeyY, "Y"),
+    // Slot 3 was [U] until the upgrade bead claimed U for the tier-up button.
+    // A building's tier-up and a hero's third spell are never on the same card
+    // (one needs a building selected, the other a hero), but a hotkey the
+    // player has to think about is already broken — so this moved to [D].
+    (KeyCode::KeyD, "D"),
+];
+
+/// Building ability hotkeys, by ability slot: [C] (Call to Arms today), then
+/// [J] and [M].
+const BUILDING_ABILITY_KEYS: [(KeyCode, &str); 3] = [
+    (KeyCode::KeyC, "C"),
+    (KeyCode::KeyJ, "J"),
+    (KeyCode::KeyM, "M"),
+];
 
 /// Ability button caption: the ability's own name, plus the countdown while it
 /// is cooling down. Works for hero and building casters alike.
@@ -731,11 +799,36 @@ fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
     }
 }
 
-/// Can this hero cast *its* ability right now? `Hero::ability_ready` prices
-/// every class at the Champion's 40 mana, which would light the button up for a
-/// Priestess sitting on 42 of the 45 Heal costs; combat.rs would then refuse.
-fn hero_ability_ready(hero: &Hero, def: &AbilityDef) -> bool {
-    hero.ability_cooldown <= 0.0 && hero.mana >= def.mana_cost
+/// What the command card READS to decide whether an ability is castable: the
+/// team's tech tier (the `TeamTier` unlock predicate) and each caster's
+/// per-ability cooldowns, looked up by entity so the big selection queries keep
+/// their shape. The matching WRITES live in `CardActions` — two bundles because
+/// `command_input` is near Bevy's 16-parameter ceiling and these five params
+/// would otherwise blow through it.
+#[derive(SystemParam)]
+struct CastLookup<'w, 's> {
+    tiers: Res<'w, TechTiers>,
+    cooldowns: Query<'w, 's, &'static AbilityCooldowns>,
+}
+
+/// Every UNLOCKED ability of a caster, priced and cooled, ready for the card.
+/// The unlock test and the readiness test are shared.rs's, so a button is lit
+/// exactly when combat.rs would honour the cast — no second opinion here.
+fn ability_slots(
+    list: &'static [AbilityDef],
+    ctx: UnlockCtx,
+    hero: Option<&Hero>,
+    cooldowns: Option<&AbilityCooldowns>,
+) -> Vec<AbilitySlot> {
+    unlocked_abilities(list, ctx)
+        .into_iter()
+        .map(|index| AbilitySlot {
+            index,
+            def: list[index],
+            ready: ability_ready(&list[index], hero, cooldowns, index),
+            cooldown: cooldowns.map_or(0.0, |c| c.remaining(index)),
+        })
+        .collect()
 }
 
 /// The contextual command set for the current selection. Both the keyboard and
@@ -748,7 +841,7 @@ fn hero_ability_ready(hero: &Hero, def: &AbilityDef) -> bool {
 ///   fighters             A S | G V P                       (5)
 ///   hero                 A S R | Z X (carried items) | G V P T   (<=9)
 ///   town hall            Q(Worker) W/E(hero class) C(CallToArms)
-///   barracks             Q(Footman) W(Archer) E(Raider)    (3)
+///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman)  (4)
 ///   workshop             Q(Catapult)                       (1)
 ///   shop                 Q(Potion) W(Portal)               (2)
 ///
@@ -802,16 +895,20 @@ fn command_entries(
         }
     }
 
-    // The hero's ability, whichever class it is.
-    if let Some((def, ready, cooldown)) = hero.ability {
+    // The hero's abilities, whichever class it is and however many it has
+    // unlocked: one button per slot, in slot order, on [R] [Y] [U].
+    for slot in &hero.abilities {
+        let Some((key, hotkey)) = HERO_ABILITY_KEYS.get(slot.index).copied() else {
+            continue;
+        };
         let mut entry = CmdEntry::plain(
-            CmdAction::CastHero,
-            KeyCode::KeyR,
-            "R",
-            &ability_label(&def, cooldown),
+            CmdAction::CastHero(slot.index),
+            key,
+            hotkey,
+            &ability_label(&slot.def, slot.cooldown),
         );
-        entry.cost = format!("{:.0}mp", def.mana_cost);
-        entry.enabled = ready;
+        entry.cost = format!("{:.0}mp", slot.def.mana_cost);
+        entry.enabled = slot.ready;
         out.push(entry);
     }
 
@@ -869,16 +966,34 @@ fn command_entries(
                 }
             }
 
-            // The building's own active ability (TownHall: Call to Arms).
-            if let Some((def, cooldown)) = hero.building_ability {
+            // The building's own active abilities (TownHall: Call to Arms).
+            for slot in &hero.building_abilities {
+                let Some((key, hotkey)) = BUILDING_ABILITY_KEYS.get(slot.index).copied() else {
+                    continue;
+                };
                 let mut entry = CmdEntry::plain(
-                    CmdAction::CastBuilding,
-                    KeyCode::KeyC,
-                    "C",
-                    &ability_label(&def, cooldown),
+                    CmdAction::CastBuilding(slot.index),
+                    key,
+                    hotkey,
+                    &ability_label(&slot.def, slot.cooldown),
                 );
-                entry.enabled = cooldown <= 0.0;
+                entry.enabled = slot.ready;
                 out.push(entry);
+            }
+
+            // Tier up in place. [U] because it is the last free letter that
+            // says what it does; the card has room here because a hall spends
+            // at most four slots on training and Call to Arms.
+            if let Some((to, gold, lumber)) = hero.upgrade {
+                out.push(
+                    CmdEntry::plain(
+                        CmdAction::Upgrade(to),
+                        KeyCode::KeyU,
+                        "U",
+                        &format!("Upgrade: {}", building_name(to)),
+                    )
+                    .priced(gold, lumber),
+                );
             }
 
             // A Shop sells to the team's one hero: dark without a hero, with a
@@ -965,6 +1080,7 @@ fn unit_name(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Catapult",
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
+        UnitKind::Spearman => "Spearman",
     }
 }
 
@@ -988,6 +1104,8 @@ fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Wall",
         BuildingKind::Workshop => "Workshop",
         BuildingKind::Shop => "Shop",
+        BuildingKind::Keep => "Keep",
+        BuildingKind::Castle => "Castle",
     }
 }
 
@@ -1117,12 +1235,22 @@ fn hp_color(frac: f32) -> Color {
     }
 }
 
+/// Can the player see that spot right now? The one question every picker and
+/// every marker in this file asks before letting the interface acknowledge an
+/// enemy. Always the Human grid — this file only ever renders for the human,
+/// even when a script is driving that faction.
+fn fog_sees(fog: &FogGrids, pos: Vec3) -> bool {
+    fog.get(Team::Human).sees(pos)
+}
+
+/// Shift a colour toward white. A NEGATIVE amount darkens instead, which is
+/// how remembered enemy structures are drawn — hence the clamp at both ends.
 fn lighten(c: Color, amount: f32) -> Color {
     let s = c.to_srgba();
     Color::srgb(
-        (s.red + amount).min(1.0),
-        (s.green + amount).min(1.0),
-        (s.blue + amount).min(1.0),
+        (s.red + amount).clamp(0.0, 1.0),
+        (s.green + amount).clamp(0.0, 1.0),
+        (s.blue + amount).clamp(0.0, 1.0),
     )
 }
 
@@ -1143,16 +1271,18 @@ fn apply_selection(
     }
 }
 
+/// Issue a Move / AttackMove to a group with the usual formation spread.
 // ---------------------------------------------------------------------------
 // Speaking the shared language
 //
 // Every gesture below compiles to a `shared::Intent` and submits it. The UI no
-// longer writes `Order`s, doctrine components, training queues or rally points
-// itself — intent.rs does, from the same values a bridge commander sends as
-// JSON. What is left here is the *gesture*: deciding which units a right-click
-// meant, which worker is nearest the build site, what "guard" implies as an
-// anchor and a radius. That translation is the human interface's real job, and
-// the sentence it produces is indistinguishable from the AI's.
+// longer writes `Order`s, doctrine components, training queues, rally points
+// or ability/upgrade events itself — intent.rs does, from the same values a
+// bridge commander sends as JSON. What is left here is the *gesture*: deciding
+// which units a right-click meant, which worker is nearest the build site,
+// what "guard" implies as an anchor and a radius, which ability slot a hotkey
+// names. That translation is the human interface's real job, and the sentence
+// it produces is indistinguishable from the AI's.
 // ---------------------------------------------------------------------------
 
 /// Name a group of entities in the shared language.
@@ -1186,6 +1316,11 @@ fn ground_intent(
             Intent::Move { units, x, z }
         },
     );
+}
+
+/// Pull the entities out of a `(Entity, UnitKind, carrying)` selection slice.
+fn entities_of(sel: &[(Entity, UnitKind, bool)]) -> Vec<Entity> {
+    sel.iter().map(|(e, _, _)| *e).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,6 +1609,9 @@ fn spawn_minimap(console: &mut ChildSpawnerCommands) {
                 },
                 BackgroundColor(Color::NONE),
                 BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+                // Above the fog layer — where the camera is looking is never
+                // hidden from the player.
+                ZIndex(3),
                 MinimapViewport,
             ));
         });
@@ -1805,6 +1943,7 @@ fn command_input(
     economies: Res<Economies>,
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
+    cast: CastLookup,
     mut focus: EventWriter<CameraFocus>,
     mut submissions: EventWriter<SubmitIntent>,
     pressed_buttons: Query<(&Interaction, &El), Changed<Interaction>>,
@@ -1832,7 +1971,9 @@ fn command_input(
             &Team,
             Option<&TrainingQueue>,
             Option<&UnderConstruction>,
-            Option<&AbilityCooldown>,
+            // Per-ability cooldowns are read through `CastLookup` by entity, so
+            // this query stays free of them.
+            Option<&Upgrading>,
         ),
         With<Selected>,
     >,
@@ -1916,8 +2057,8 @@ fn command_input(
     // The one selected own building: its kind, whether it is finished, its
     // entity (buy/cast target) and its ability cooldown, if it has one.
     let single = match (b_iter.next(), b_iter.next()) {
-        (Some((e, b, t, _, uc, cd)), None) if *t == Team::Human => {
-            Some((e, b.kind, uc.is_none(), cd.map(|c| c.0)))
+        (Some((e, b, t, _, uc, up)), None) if *t == Team::Human => {
+            Some((e, b.kind, uc.is_none(), up.is_some()))
         }
         _ => None,
     };
@@ -1947,21 +2088,39 @@ fn command_input(
                 recorded: records.get(Team::Human).map(|r| r.kind),
             }
         }),
-        ability: own_heroes.first().and_then(|(_, kind, h, _)| {
-            ability_of_unit(*kind)
-                .map(|def| (def, hero_ability_ready(h, &def), h.ability_cooldown))
-        }),
-        building_ability: single.and_then(|(_, kind, done, cd)| {
-            (done)
-                .then(|| ability_of_building(kind))
-                .flatten()
-                .map(|def| (def, cd.unwrap_or(0.0)))
-        }),
+        abilities: own_heroes
+            .first()
+            .map(|(entity, kind, hero, _)| {
+                ability_slots(
+                    abilities_of_unit(*kind),
+                    UnlockCtx::new(hero.level, cast.tiers.get(Team::Human)),
+                    Some(hero),
+                    cast.cooldowns.get(*entity).ok(),
+                )
+            })
+            .unwrap_or_default(),
+        building_abilities: single
+            .filter(|(_, _, done, _)| *done)
+            .map(|(entity, kind, _, _)| {
+                ability_slots(
+                    abilities_of_building(kind),
+                    UnlockCtx::building(cast.tiers.get(Team::Human)),
+                    None,
+                    cast.cooldowns.get(entity).ok(),
+                )
+            })
+            .unwrap_or_default(),
         shop: single.and_then(|(_, kind, done, _)| {
             (done && kind == BuildingKind::Shop).then(|| ShopState {
                 hero: team_hero.is_some(),
                 room: team_hero.is_some_and(|(_, inv)| inv.0.iter().any(|s| s.is_none())),
             })
+        }),
+        upgrade: single.and_then(|(_, kind, done, upgrading)| {
+            (done && !upgrading)
+                .then(|| upgrade_cost(kind).zip(building_upgrades_to(kind)))
+                .flatten()
+                .map(|((gold, lumber, _), to)| (to, gold, lumber))
         }),
         items: own_heroes.first().map(|(_, _, _, inv)| inv.0).unwrap_or_default(),
     };
@@ -2032,25 +2191,29 @@ fn command_input(
                 ui.wall_chain.clear();
                 ui.attack_move_armed = false;
             }
-            // Abilities: combat.rs owns the mana/cooldown verdict, exactly as
-            // it does for the AI and the bridge.
-            CmdAction::CastHero => {
+            // Abilities: combat.rs owns the unlock/mana/cooldown verdict,
+            // exactly as it does for the AI and the bridge. The hotkey IS the
+            // slot, so the UI is index-native; a commander may name the same
+            // slot by id. Both spellings are the same intent.
+            CmdAction::CastHero(index) => {
                 for (hero, _, _, _) in &own_heroes {
                     say(
                         &mut submissions,
                         Intent::Cast {
                             hero: intent_id(*hero),
+                            ability: Some(AbilitySelector::Index(index)),
                         },
                     );
                 }
             }
-            CmdAction::CastBuilding => {
+            CmdAction::CastBuilding(index) => {
                 if let Some((entity, kind, true, _)) = single {
-                    if ability_of_building(kind).is_some() {
+                    if index < abilities_of_building(kind).len() {
                         say(
                             &mut submissions,
                             Intent::Cast {
                                 hero: intent_id(entity),
+                                ability: Some(AbilitySelector::Index(index)),
                             },
                         );
                     }
@@ -2068,6 +2231,20 @@ fn command_input(
                             item: item_def(item).name.to_string(),
                         },
                     );
+                }
+            }
+            CmdAction::Upgrade(to) => {
+                // economy.rs owns the verdict and the money, exactly as it does
+                // for the bridge's `upgrade` command and the AI's tier-up.
+                if let Some((entity, kind, true, false)) = single {
+                    if building_upgrades_to(kind) == Some(to) {
+                        say(
+                            &mut submissions,
+                            Intent::Upgrade {
+                                building: intent_id(entity),
+                            },
+                        );
+                    }
                 }
             }
             CmdAction::UseSlot(slot) => {
@@ -2129,7 +2306,9 @@ fn command_input(
                     let rally = all_buildings
                         .iter()
                         .filter(|(b, t, _, under)| {
-                            **t == Team::Human && b.kind == BuildingKind::TownHall && !under
+                            // Any rung of the hall ladder is a place to fall
+                            // back to.
+                            **t == Team::Human && is_hall(b.kind) && !under
                         })
                         .map(|(_, _, tf, _)| tf.translation)
                         .min_by(|a, b| {
@@ -2183,6 +2362,11 @@ fn command_input(
                 if own_heroes.is_empty() {
                     continue;
                 }
+                // The card's one toggle governs the hero's FIRST ability;
+                // per-ability rules are a bridge/doctrine affordance until a
+                // hero ships with two spells. `ability: None` is exactly how
+                // the language says "slot 0", so the card and a bare bridge
+                // `autocast` are the same sentence.
                 let units: Vec<IntentId> =
                     own_heroes.iter().map(|(e, _, _, _)| intent_id(*e)).collect();
                 say(
@@ -2194,6 +2378,7 @@ fn command_input(
                         } else {
                             0 // "clear"
                         }),
+                        ability: None,
                     },
                 );
             }
@@ -2213,13 +2398,17 @@ fn command_input(
                 if second.is_some() {
                     continue;
                 }
-                let Some((entity, building, team, Some(queue), uc, _)) = first else {
+                let Some((entity, building, team, Some(queue), uc, upgrading)) = first else {
                     continue;
                 };
                 if *team != Team::Human || uc.is_some() || !trainable(building.kind).contains(&kind)
                 {
                     continue;
                 }
+                // Queuing into a hall mid-upgrade is allowed on purpose — the
+                // queue survives the conversion, it just doesn't advance. What
+                // is NOT allowed is queuing into scaffolding (`uc`, above).
+                let _ = upgrading;
                 let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
                     let (g, l, _) = hero_train_cost(&records, Team::Human);
                     (g, l)
@@ -2671,6 +2860,7 @@ fn right_mouse(
         Has<UnderConstruction>,
     )>,
     nodes: Query<(Entity, &Transform, &ResourceNode)>,
+    fog: Res<FogGrids>,
 ) {
     if !buttons.just_pressed(MouseButton::Right) || game_over.0.is_some() {
         return;
@@ -2724,6 +2914,13 @@ fn right_mouse(
         }
         match team {
             Team::Claude => {
+                // An enemy the fog is hiding is not clickable. The bridge
+                // rejects `attack` orders against unseen ids for the same
+                // reason: a target you cannot be shown must not be a target
+                // you can name, or the filtering is decoration.
+                if !fog_sees(&fog, tf.translation) {
+                    continue;
+                }
                 if enemy.is_none_or(|(_, bd)| d < bd) {
                     enemy = Some((e, d));
                 }
@@ -2746,12 +2943,15 @@ fn right_mouse(
         }
         match team {
             Team::Claude => {
+                if !fog_sees(&fog, tf.translation) {
+                    continue;
+                }
                 if !hit_enemy_unit && enemy.is_none_or(|(_, bd)| d < bd) {
                     enemy = Some((e, d));
                 }
             }
             Team::Human => {
-                if b.kind == BuildingKind::TownHall && !under && own_depot.is_none_or(|bd| d < bd) {
+                if is_hall(b.kind) && !under && own_depot.is_none_or(|bd| d < bd) {
                     own_depot = Some(d);
                 }
             }
@@ -2877,11 +3077,6 @@ fn right_mouse(
 
     // --- plain ground move with formation spread -------------------------
     ground_intent(&mut submissions, &entities_of(&selected_units), ground, false);
-}
-
-/// Pull the entities out of a `(Entity, UnitKind, carrying)` selection slice.
-fn entities_of(sel: &[(Entity, UnitKind, bool)]) -> Vec<Entity> {
-    sel.iter().map(|(e, _, _)| *e).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3077,10 +3272,14 @@ fn minimap_static_markers(
     let Ok(root) = root.single() else {
         return;
     };
+    // Gold mines draw ABOVE the fog layer, trees below it. Mine positions are
+    // map geography — they ship unfiltered in every bridge snapshot, so hiding
+    // them from the player would be the asymmetry running backwards. Tree
+    // clusters are scenery and can sit in the dark like the rest of it.
     for (tf, node) in &nodes {
-        let (size, color) = match node.kind {
-            ResourceKind::Gold => (5.0, Color::srgb(1.0, 0.82, 0.25)),
-            ResourceKind::Lumber => (2.0, Color::srgb(0.16, 0.42, 0.18)),
+        let (size, color, z) = match node.kind {
+            ResourceKind::Gold => (5.0, Color::srgb(1.0, 0.82, 0.25), 2),
+            ResourceKind::Lumber => (2.0, Color::srgb(0.16, 0.42, 0.18), 0),
         };
         let p = world_to_minimap(tf.translation);
         commands.spawn((
@@ -3093,6 +3292,7 @@ fn minimap_static_markers(
                 ..default()
             },
             BackgroundColor(color),
+            ZIndex(z),
             MinimapStatic,
             ChildOf(root),
         ));
@@ -3113,6 +3313,9 @@ fn minimap_static_markers(
                 ..default()
             },
             BackgroundColor(rock),
+            // Above the fog: the map's layout is public information, and the
+            // snapshot's `map.chokes` says so to the other player.
+            ZIndex(2),
             MinimapStatic,
             ChildOf(root),
         ));
@@ -3123,20 +3326,346 @@ fn minimap_static_markers(
 /// Bounty caches: a bright-gold dot that pulses so it stands out from the
 /// static gold-mine dots it shares a colour family with. Same pooled pattern as
 /// `update_minimap` (mutate in place, never despawn) on its own small pool.
+// ---------------------------------------------------------------------------
+// Fog of war — the player's renderer of `shared::FogGrids`
+// ---------------------------------------------------------------------------
+//
+// Nothing here decides anything. shared.rs computes one grid per team at ~4 Hz
+// and bridge.rs filters a commander's snapshot through it; these systems draw
+// the identical grid for the player at the keyboard. That is the whole point:
+// if this file made its own judgement about what the human may see, the game
+// would have two definitions of knowability again, and the one the machine got
+// would quietly be the better one.
+//
+// Three renderings of the same array:
+//
+//   * a translucent black quad over the whole ground plane, textured with the
+//     grid itself — one 100x100 image, one entity, linearly filtered so the
+//     boundary is soft rather than a staircase of nav cells;
+//   * the SAME image on the minimap as an `ImageNode` (flipped, because the
+//     minimap puts +Z up while the texture puts +Z at the bottom), so the two
+//     views can never disagree;
+//   * translucent boxes standing in for enemy structures the player has
+//     scouted and can no longer see.
+//
+// And one system that is not drawing at all but hiding: `apply_fog_visibility`
+// takes enemy units and buildings out of the 3D scene entirely. Health bars are
+// children of their owner, so they inherit the hidden state for free.
+
+/// Opaque enough to read as "nothing known", not so opaque that the map's
+/// shape stops being legible under it.
+const FOG_UNEXPLORED_ALPHA: f32 = 0.88;
+/// Terrain remembered, contents not. Deliberately a long way from both
+/// neighbours so the three states are told apart at a glance.
+const FOG_EXPLORED_ALPHA: f32 = 0.44;
+/// Above the ground plane and its cosmetic patches (0.02-0.046) and above the
+/// selection/hover rings (0.08/0.1), below the placement ghost's box. Low
+/// enough that it reads as lying ON the ground rather than hanging over it.
+const FOG_PLANE_Y: f32 = 0.16;
+
+/// The single ground-plane fog quad.
+#[derive(Component)]
+struct FogPlane;
+
+/// The minimap's fog image node.
+#[derive(Component)]
+struct MinimapFog;
+
+/// A pooled stand-in for an enemy structure the player remembers but cannot
+/// currently see.
+#[derive(Component)]
+struct BuildingGhost;
+
+#[derive(Resource)]
+struct FogAssets {
+    /// Shared by the world quad's material and the minimap node — the literal
+    /// "computed once, rendered twice".
+    image: Handle<Image>,
+    ghost_mesh: Handle<Mesh>,
+    ghost_mat: Handle<StandardMaterial>,
+}
+
+/// Build the fog texture, the quad that wears it, and the minimap node that
+/// wears the same one. Runs after `setup_ui` because it needs `MinimapRoot`.
+fn setup_fog(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    minimap: Query<Entity, With<MinimapRoot>>,
+) {
+    // One texel per nav cell: fog reuses the nav grid's geometry all the way
+    // out to the screen.
+    let image = images.add(Image::new_fill(
+        Extent3d {
+            width: GRID_DIM as u32,
+            height: GRID_DIM as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        // Start fully dark: the first `update_fog_overlay` lights the opening
+        // position, and an unpainted first frame should hide the map rather
+        // than reveal it.
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    ));
+
+    // A hand-built quad rather than `Plane3d`, so the UV mapping is pinned to
+    // the grid's own convention (u along +X, v along +Z) instead of whatever
+    // the mesh builder happens to emit.
+    let mut quad = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    quad.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![
+            [-MAP_HALF, 0.0, -MAP_HALF],
+            [MAP_HALF, 0.0, -MAP_HALF],
+            [MAP_HALF, 0.0, MAP_HALF],
+            [-MAP_HALF, 0.0, MAP_HALF],
+        ],
+    );
+    quad.insert_attribute(
+        Mesh::ATTRIBUTE_UV_0,
+        vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    );
+    quad.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4]);
+    quad.insert_indices(Indices::U32(vec![0, 2, 1, 0, 3, 2]));
+
+    let fog_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(image.clone()),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        // The quad is viewed from above, but leaving culling off costs nothing
+        // and removes winding as a failure mode.
+        cull_mode: None,
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(meshes.add(quad)),
+        MeshMaterial3d(fog_mat),
+        Transform::from_xyz(0.0, FOG_PLANE_Y, 0.0),
+        FogPlane,
+    ));
+
+    let ghost_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    // Washed-out and translucent: a memory should never be mistaken for a
+    // sighting.
+    let ghost_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.62, 0.38, 0.36, 0.40),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+
+    if let Ok(root) = minimap.single() {
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Px(MINIMAP_PX),
+                height: Val::Px(MINIMAP_PX),
+                ..default()
+            },
+            ImageNode {
+                image: image.clone(),
+                // The minimap draws +Z upward; the texture stores +Z downward.
+                flip_y: true,
+                ..default()
+            },
+            // Above the pooled dots (which are spawned later and would
+            // otherwise win), below the camera viewport outline.
+            ZIndex(1),
+            MinimapFog,
+            ChildOf(root),
+        ));
+    }
+
+    commands.insert_resource(FogAssets {
+        image,
+        ghost_mesh,
+        ghost_mat,
+    });
+}
+
+/// Repaint the fog texture from the human's grid. Cheap enough to do every
+/// frame (40 KB) and doing so keeps the overlay in lockstep with the 4 Hz
+/// recompute without a second clock to get out of sync.
+fn update_fog_overlay(
+    fog: Res<FogGrids>,
+    assets: Res<FogAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut plane: Query<&mut Visibility, With<FogPlane>>,
+    mut minimap_fog: Query<&mut Node, With<MinimapFog>>,
+) {
+    // `WC3_FOG=0`: take the overlay off the screen entirely rather than
+    // painting a fully transparent one every frame.
+    if !fog.enabled() {
+        for mut vis in &mut plane {
+            if *vis != Visibility::Hidden {
+                *vis = Visibility::Hidden;
+            }
+        }
+        for mut node in &mut minimap_fog {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+        }
+        return;
+    }
+
+    let Some(image) = images.get_mut(&assets.image) else {
+        return;
+    };
+    let Some(data) = image.data.as_mut() else {
+        return;
+    };
+    for (i, cell) in fog.get(Team::Human).cells().iter().enumerate() {
+        let alpha = match cell {
+            CellVis::Unexplored => FOG_UNEXPLORED_ALPHA,
+            CellVis::Explored => FOG_EXPLORED_ALPHA,
+            CellVis::Visible => 0.0,
+        };
+        // Texel layout is `NavGrid::idx` order, which is exactly the grid's
+        // own iteration order — no transposition anywhere in the pipeline.
+        data[i * 4 + 3] = (alpha * 255.0) as u8;
+    }
+}
+
+/// Take enemy units and buildings the player cannot see out of the 3D scene.
+///
+/// The same rule bridge.rs applies to a seat's snapshot, applied to the
+/// player's eyes: an enemy is drawn only while visible, and a scouted
+/// structure is replaced by a ghost (below) rather than left standing — which
+/// matters, because leaving the real building rendered would keep reporting
+/// its health and its destruction to somebody with nothing watching it.
+fn apply_fog_visibility(
+    fog: Res<FogGrids>,
+    mut units: Query<(&Team, &Transform, &mut Visibility), (With<Unit>, Without<Building>)>,
+    mut buildings: Query<(&Team, &Transform, &mut Visibility), (With<Building>, Without<Unit>)>,
+    mut trees: Query<
+        (&ResourceNode, &Transform, &mut Visibility),
+        (Without<Unit>, Without<Building>),
+    >,
+) {
+    if !fog.enabled() {
+        return;
+    }
+    let grid = fog.get(Team::Human);
+
+    // Tree clusters are hidden until their ground has been EXPLORED (not
+    // seen — terrain is remembered), for a reason that is as much correctness
+    // as polish: the fog overlay is a flat quad lying on the ground plane, so
+    // anything tall enough pokes through it and a forest in never-visited
+    // terrain would stand there fully lit above a black floor. Gold mines are
+    // exempt: mine positions are public geography, they ship unfiltered in
+    // every bridge snapshot, and the minimap draws them above the fog for the
+    // same reason.
+    for (node, tf, mut vis) in &mut trees {
+        if node.kind == ResourceKind::Gold {
+            if *vis != Visibility::Inherited {
+                *vis = Visibility::Inherited;
+            }
+            continue;
+        }
+        let want = if grid.known(tf.translation) {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+    let apply = |team: &Team, tf: &Transform, vis: &mut Visibility| {
+        let want = if *team == Team::Human || grid.sees(tf.translation) {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    };
+    for (team, tf, mut vis) in &mut units {
+        apply(team, tf, &mut vis);
+    }
+    for (team, tf, mut vis) in &mut buildings {
+        apply(team, tf, &mut vis);
+    }
+}
+
+/// Pooled translucent boxes where the player remembers enemy structures.
+/// Position, footprint and existence come from the shared grid's memory, so
+/// what the player sees standing in the fog is precisely what a bridge
+/// commander receives as a `last_seen` building record.
+fn sync_building_ghosts(
+    mut commands: Commands,
+    fog: Res<FogGrids>,
+    assets: Res<FogAssets>,
+    mut ghosts: Query<(&mut Transform, &mut Visibility), With<BuildingGhost>>,
+) {
+    let wanted: Vec<(Vec3, f32)> = if fog.enabled() {
+        fog.get(Team::Human)
+            .ghosts()
+            .map(|g| (g.pos, building_stats(g.kind).size))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut used = 0usize;
+    for (mut tf, mut vis) in &mut ghosts {
+        match wanted.get(used) {
+            Some((pos, size)) => {
+                let height = size * 0.6;
+                tf.translation = Vec3::new(pos.x, height * 0.5, pos.z);
+                tf.scale = Vec3::new(*size, height, *size);
+                if *vis != Visibility::Inherited {
+                    *vis = Visibility::Inherited;
+                }
+            }
+            None => {
+                if *vis != Visibility::Hidden {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+        used += 1;
+    }
+    // Grow the pool; never shrink it (same discipline as the minimap dots).
+    for _ in used..wanted.len() {
+        commands.spawn((
+            Mesh3d(assets.ghost_mesh.clone()),
+            MeshMaterial3d(assets.ghost_mat.clone()),
+            Transform::from_xyz(0.0, -50.0, 0.0),
+            Visibility::Hidden,
+            BuildingGhost,
+        ));
+    }
+}
+
 fn update_minimap_bounties(
     mut commands: Commands,
     time: Res<Time>,
     root: Query<Entity, With<MinimapRoot>>,
     bounties: Query<&Transform, With<Bounty>>,
+    fog: Res<FogGrids>,
     mut markers: Query<&mut Node, With<MinimapBounty>>,
 ) {
     let Ok(root) = root.single() else {
         return;
     };
+    let grid = fog.get(Team::Human);
     // 5px to 6px and back, ~2.5 rad/s — a slow, unmistakable throb.
     let size = 5.5 + 0.5 * (time.elapsed_secs() * 2.5).sin();
+    // Only caches the player can see, matching the `bounties` array a bridge
+    // commander gets. Treasure is neutral, but noticing it is not free.
     let wanted: Vec<Vec2> = bounties
         .iter()
+        .filter(|tf| grid.sees(tf.translation))
         .map(|tf| world_to_minimap(tf.translation))
         .collect();
 
@@ -3177,6 +3706,7 @@ fn update_minimap(
     camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     units: Query<(&Transform, &Team, Has<Hero>), (With<Unit>, Without<Building>)>,
     buildings: Query<(&Transform, &Team), (With<Building>, Without<Unit>)>,
+    fog: Res<FogGrids>,
     mut markers: Query<
         (&mut Node, &mut BackgroundColor),
         (With<MinimapMarker>, Without<MinimapViewport>),
@@ -3186,10 +3716,19 @@ fn update_minimap(
     let Ok(root) = root.single() else {
         return;
     };
+    let grid = fog.get(Team::Human);
+    // The minimap is the most tempting place in the game to cheat, because a
+    // dot costs nothing to draw and reveals everything. Same rule as the 3D
+    // scene and the same rule as a bridge snapshot: ours always, theirs only
+    // while seen.
+    let known = |team: &Team, p: Vec3| *team == Team::Human || grid.sees(p);
 
     // Desired dots: units first, then buildings (drawn later == on top).
     let mut wanted: Vec<(Vec2, f32, Color)> = Vec::new();
     for (tf, team, is_hero) in &units {
+        if !known(team, tf.translation) {
+            continue;
+        }
         // Heroes read as bigger, brighter dots.
         let (size, color) = if is_hero {
             (5.0, lighten(team.color(), 0.35))
@@ -3199,10 +3738,23 @@ fn update_minimap(
         wanted.push((world_to_minimap(tf.translation), size, color));
     }
     for (tf, team) in &buildings {
+        if !known(team, tf.translation) {
+            continue;
+        }
         wanted.push((
             world_to_minimap(tf.translation),
             6.0,
             lighten(team.color(), 0.12),
+        ));
+    }
+    // Scouted enemy structures, dimmed. They also sit under the `Explored`
+    // shading of the fog layer, so a remembered base reads as distinctly
+    // fainter than one being looked at.
+    for ghost in grid.ghosts() {
+        wanted.push((
+            world_to_minimap(ghost.pos),
+            6.0,
+            lighten(ghost.team.color(), -0.35),
         ));
     }
 
@@ -3294,6 +3846,7 @@ fn update_hud(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     ai_controlled: Res<AiControlled>,
+    tiers: Res<TechTiers>,
     // Latched the frame the match ends: was this an AI-vs-AI spectate?
     mut spectated: Local<Option<bool>>,
     mut texts: Query<(&Slot, &mut Text, &mut TextColor)>,
@@ -3329,10 +3882,13 @@ fn update_hud(
             &Team,
             Option<&TrainingQueue>,
             Option<&UnderConstruction>,
-            Option<&AbilityCooldown>,
+            Option<&Upgrading>,
         ),
         With<Selected>,
     >,
+    // Per-ability cooldowns of the selected caster (hero or building), by
+    // entity — one lookup serves both, so neither selection query carries it.
+    cooldowns: Query<&AbilityCooldowns>,
 ) {
     let econ = *economies.get(Team::Human);
     let supply_blocked = econ.supply_cap > 0 && econ.supply_used >= econ.supply_cap;
@@ -3425,7 +3981,9 @@ fn update_hud(
             }
         }
     } else if total == 1 && building_count == 1 {
-        if let Some((_, building, health, team, queue, under, _)) = sel_buildings.iter().next() {
+        if let Some((_, building, health, team, queue, under, upgrading)) =
+            sel_buildings.iter().next()
+        {
             show_single = true;
             name = building_name(building.kind).to_string();
             portrait_letter = initial(&name);
@@ -3453,7 +4011,34 @@ fn update_hud(
                 } else if stats.supply_provided > 0 {
                     stats_text = format!("Supply +{}", stats.supply_provided);
                 }
-                if let Some(queue) = queue {
+                // A building on an upgrade ladder always says which rung it is
+                // on — the tier is what tech requirements are written against.
+                if building_tier(building.kind) > 1 || building_upgrades_to(building.kind).is_some()
+                {
+                    let tier = format!("Tier {}", building_tier(building.kind));
+                    stats_text = if stats_text.is_empty() {
+                        tier
+                    } else {
+                        format!("{stats_text}    {tier}")
+                    };
+                }
+                if let Some(up) = upgrading {
+                    // The conversion owns the progress bar and the status line
+                    // while it runs: training is frozen, so reporting it would
+                    // show a percentage that never moves.
+                    let total = up.total.max(0.001);
+                    prog = ((total - up.remaining) / total).clamp(0.0, 1.0);
+                    show_prog = true;
+                    extra_text = format!(
+                        "Upgrading to {}: {:.0}%   (training paused, {} queued)",
+                        building_name(up.to),
+                        prog * 100.0,
+                        queue.map(|q| q.queue.len()).unwrap_or(0)
+                    );
+                    for kind in queue.iter().flat_map(|q| q.queue.iter()) {
+                        queue_letters.push(initial(unit_name(*kind)));
+                    }
+                } else if let Some(queue) = queue {
                     for kind in queue.queue.iter() {
                         queue_letters.push(initial(unit_name(*kind)));
                     }
@@ -3536,11 +4121,11 @@ fn update_hud(
             .iter()
             .next()
             .filter(|(_, _, _, t, _, _, _)| **t == Team::Human)
-            .map(|(_, b, _, _, _, uc, cd)| (b.kind, uc.is_none(), cd.map(|c| c.0)))
+            .map(|(e, b, _, _, _, uc, up)| (e, b.kind, uc.is_none(), up.is_some()))
     } else {
         None
     };
-    let single_building = single.map(|(kind, done, _)| (kind, done));
+    let single_building = single.map(|(_, kind, done, _)| (kind, done));
 
     // Hero commands: the ability of a selected hero (whichever class), the
     // train/revive button on a town hall while the team is hero-less, the
@@ -3564,17 +4149,35 @@ fn update_hud(
                 recorded: records.get(Team::Human).map(|r| r.kind),
             }
         }),
-        ability: selected_hero.and_then(|(_, u, _, _, _, h, _, _, _, _, _, _)| {
-            let h = h?;
-            ability_of_unit(u.kind)
-                .map(|def| (def, hero_ability_ready(h, &def), h.ability_cooldown))
-        }),
-        building_ability: single.and_then(|(kind, done, cd)| {
-            done.then(|| ability_of_building(kind))
+        abilities: selected_hero
+            .and_then(|(e, u, _, _, _, h, _, _, _, _, _, _)| {
+                let hero = h?;
+                Some(ability_slots(
+                    abilities_of_unit(u.kind),
+                    UnlockCtx::new(hero.level, tiers.get(Team::Human)),
+                    Some(hero),
+                    cooldowns.get(e).ok(),
+                ))
+            })
+            .unwrap_or_default(),
+        building_abilities: single
+            .filter(|(_, _, done, _)| *done)
+            .map(|(entity, kind, _, _)| {
+                ability_slots(
+                    abilities_of_building(kind),
+                    UnlockCtx::building(tiers.get(Team::Human)),
+                    None,
+                    cooldowns.get(entity).ok(),
+                )
+            })
+            .unwrap_or_default(),
+        upgrade: single.and_then(|(_, kind, done, upgrading)| {
+            (done && !upgrading)
+                .then(|| upgrade_cost(kind).zip(building_upgrades_to(kind)))
                 .flatten()
-                .map(|def| (def, cd.unwrap_or(0.0)))
+                .map(|((gold, lumber, _), to)| (to, gold, lumber))
         }),
-        shop: single.and_then(|(kind, done, _)| {
+        shop: single.and_then(|(_, kind, done, _)| {
             (done && kind == BuildingKind::Shop).then(|| ShopState {
                 hero: team_has_hero,
                 room: team_hero
@@ -3890,6 +4493,7 @@ fn hover_feedback(
     buildings: Query<(&Transform, &Team, &Building), Without<HoverRing>>,
     nodes: Query<(&Transform, &ResourceNode)>,
     selected: Query<&Unit, With<Selected>>,
+    fog: Res<FogGrids>,
     mut ring: Query<
         (
             &mut Transform,
@@ -3927,6 +4531,13 @@ fn hover_feedback(
                     let ray = cursor_ray(cam, cam_tf, cursor);
                     let mut best_unit: Option<(f32, Vec3, Team)> = None;
                     for (tf, team) in &units {
+                        // A hover ring over an invisible enemy would be a
+                        // perfect enemy detector — sweep the cursor across the
+                        // fog and watch the crosshair light up. Same gate as
+                        // the click that follows it.
+                        if *team != Team::Human && !fog_sees(&fog, tf.translation) {
+                            continue;
+                        }
                         let d = dist_xz(
                             tf.translation,
                             pick_point_for(ray, ground, tf.translation.y),
@@ -3948,6 +4559,9 @@ fn hover_feedback(
                     } else {
                         let mut best_bld: Option<(f32, Vec3, Team, f32)> = None;
                         for (tf, team, building) in &buildings {
+                            if *team != Team::Human && !fog_sees(&fog, tf.translation) {
+                                continue;
+                            }
                             let r = building_stats(building.kind).size * 0.5;
                             let d = dist_xz(tf.translation, ground);
                             if d <= r && best_bld.is_none_or(|(bd, _, _, _)| d < bd) {

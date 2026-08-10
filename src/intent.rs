@@ -7,7 +7,9 @@
 //!
 //!   * `ui.rs` compiles mouse gestures, hotkeys and command-card buttons into
 //!     `Intent` values — a right-click on an enemy is an `Intent::Attack`, the
-//!     `V` key is an `Intent::Retreat` with the parameters the gesture implies.
+//!     `V` key is an `Intent::Retreat` with the parameters the gesture implies,
+//!     `[U]` is an `Intent::Upgrade`, `[R]`/`[Y]`/`[D]` are `Intent::Cast` with
+//!     an ability slot.
 //!   * `bridge.rs` deserializes `commands.json` straight into `Intent` values;
 //!     the wire format *is* the schema, so the protocol did not change when the
 //!     compiler moved here.
@@ -15,8 +17,9 @@
 //! Everything downstream of this file is unchanged: the compiler writes the
 //! same `Order` components, `TrainingQueue` pushes, `RallyPoint`s, doctrine
 //! components, `SquadOrders` entries and `CastAbility`/`BuyItem`/`UseItem`/
-//! `Surrender` events that `bridge.rs::apply_batch` used to write inline.
-//! units.rs, combat.rs, economy.rs and doctrine.rs cannot tell the difference.
+//! `UpgradeBuilding`/`Surrender` events that `bridge.rs::apply_batch` and
+//! `ui.rs`'s fifteen call sites used to write separately. units.rs, combat.rs,
+//! economy.rs and doctrine.rs cannot tell the difference.
 //!
 //! ## The fairness invariant
 //!
@@ -28,21 +31,33 @@
 //!
 //! Two things are deliberately *not* players and stay as they are:
 //!
-//!   * **Engine systems.** economy.rs's harvest follow-through, combat.rs's
-//!     chase, doctrine.rs's squad re-tasking and retreat triggers are the
-//!     engine executing standing policy at machine speed. They write `Order`s
-//!     directly and always will — that asymmetry *is* the tempo design
+//!   * **Engine systems.** economy.rs's harvest follow-through and payments,
+//!     combat.rs's chase, doctrine.rs's squad re-tasking and retreat triggers
+//!     are the engine executing standing policy at machine speed. They write
+//!     `Order`s directly and always will — that asymmetry *is* the tempo design
 //!     (see docs/TEMPO.md §C4).
 //!   * **The scripted `ai.rs`.** It is engine baseline, not a seat: it still
-//!     writes `Order`s and `TrainingQueue` pushes directly. This is a known
-//!     asymmetry, documented in docs/INTENT.md, and the natural next bead.
+//!     writes `Order`s, queue pushes and `UpgradeBuilding` directly. This is a
+//!     known asymmetry, documented in docs/INTENT.md, and the natural next bead.
+//!
+//! ## Knowability
+//!
+//! The compiler is where fog of war stops being a rendering choice and becomes
+//! a rule. `Intent::Attack` is refused against a target the issuing team cannot
+//! see or remember (`FogGrid::knows_entity`), for *both* interfaces, because a
+//! snapshot that will not show you an enemy must not accept orders against it
+//! either. That check used to live in bridge.rs and therefore bound one seat;
+//! it now binds whoever is speaking. See docs/INTENT.md for the one residual
+//! gap (the human's right-click picker is strictly narrower than the rule).
 //!
 //! ## Ordering
 //!
-//! `apply_intents` runs in the `IntentApply` set. bridge.rs orders its poll
-//! before it and its snapshot after it, so a batch read this frame is applied
-//! this frame and its validation errors ride out in the same snapshot — the
-//! behaviour the protocol has always had.
+//! `apply_intents` runs in the `IntentApply` set, `.after(FogSet)` — the same
+//! discipline every other fog consumer follows, so an intent is judged against
+//! this frame's visibility and never the previous frame's. bridge.rs orders its
+//! poll before the set and its snapshot after it, so a batch read this frame is
+//! applied this frame and its validation errors ride out in the same snapshot.
+//! ui.rs's whole input chain runs before the set.
 //!
 //! ## The log
 //!
@@ -93,7 +108,10 @@ impl Plugin for IntentPlugin {
         app.add_event::<SubmitIntent>()
             .init_resource::<IntentErrors>()
             .insert_resource(IntentLog::from_env())
-            .add_systems(Update, apply_intents.in_set(IntentApply));
+            // `.after(FogSet)`: an intent is judged against the visibility its
+            // issuer has right now, the same grid the snapshot and the HUD are
+            // about to show them.
+            .add_systems(Update, apply_intents.in_set(IntentApply).after(FogSet));
     }
 }
 
@@ -101,32 +119,68 @@ impl Plugin for IntentPlugin {
 // The world the compiler is allowed to touch
 // ---------------------------------------------------------------------------
 
-/// Entity first so a seat's own hero can be *found*, not just checked — `buy`
+/// Entity first so a team's own hero can be *found*, not just checked — `buy`
 /// and `use_item` name no unit and infer it from the team.
+type IntentUnits<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Unit,
+        &'static Team,
+        &'static Transform,
+        // Read-only: `autocast` edits ONE rule of a policy that may already
+        // hold others, so the applier has to see the current one.
+        Option<&'static AutoCastPolicy>,
+    ),
+>;
+
+type IntentBuildings<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Building,
+        &'static Team,
+        Option<&'static UnderConstruction>,
+        Option<&'static mut TrainingQueue>,
+        Option<&'static Upgrading>,
+    ),
+>;
+
+/// Anything that can be attacked: a live unit or building with a team. The
+/// `Transform` is carried so an attack order can be checked against the
+/// issuer's fog — an id a player could never have learned is not a legal
+/// target, whichever interface names it.
+type IntentTargets<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Team,
+        Option<&'static Unit>,
+        Option<&'static Building>,
+        &'static Transform,
+    ),
+>;
+
+type IntentNodes<'w, 's> = Query<'w, 's, &'static ResourceNode>;
+
 #[derive(SystemParam)]
 pub struct IntentWorld<'w, 's> {
-    units: Query<'w, 's, (Entity, &'static Unit, &'static Team, &'static Transform)>,
-    buildings: Query<
-        'w,
-        's,
-        (
-            &'static Building,
-            &'static Team,
-            Option<&'static UnderConstruction>,
-            Option<&'static mut TrainingQueue>,
-        ),
-    >,
-    /// Anything that can be attacked: a live unit or building with a team.
-    targets: Query<
-        'w,
-        's,
-        (
-            &'static Team,
-            Option<&'static Unit>,
-            Option<&'static Building>,
-        ),
-    >,
-    nodes: Query<'w, 's, &'static ResourceNode>,
+    units: IntentUnits<'w, 's>,
+    buildings: IntentBuildings<'w, 's>,
+    targets: IntentTargets<'w, 's>,
+    nodes: IntentNodes<'w, 's>,
+}
+
+/// The events an intent can emit. ui.rs and bridge.rs each used to carry an
+/// identical four-writer bundle; collapsing them into one is the duplication
+/// this module exists to remove.
+#[derive(SystemParam)]
+pub struct IntentEvents<'w> {
+    casts: EventWriter<'w, CastAbility>,
+    buys: EventWriter<'w, BuyItem>,
+    item_uses: EventWriter<'w, UseItem>,
+    upgrades: EventWriter<'w, UpgradeBuilding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,13 +198,12 @@ fn apply_intents(
     economies: Res<Economies>,
     records: Res<HeroRecords>,
     nav: Res<NavGrid>,
+    fog: Res<FogGrids>,
     mut squad_orders: ResMut<SquadOrders>,
     mut ai_controlled: ResMut<AiControlled>,
     mut error_log: ResMut<IntentErrors>,
     mut log: ResMut<IntentLog>,
-    mut casts: EventWriter<CastAbility>,
-    mut buys: EventWriter<BuyItem>,
-    mut item_uses: EventWriter<UseItem>,
+    mut events: IntentEvents,
     mut world: IntentWorld,
 ) {
     // Owned copies: the compiler needs `&mut` on resources the reader borrows
@@ -163,7 +216,7 @@ fn apply_intents(
     for submission in batch {
         let mut errors: Vec<String> = Vec::new();
         compile_intent(
-            &submission.intent,
+            submission.intent.clone(),
             submission.team,
             &submission.tag,
             &mut errors,
@@ -171,11 +224,12 @@ fn apply_intents(
             &economies,
             &records,
             &nav,
+            // The issuer's own fog: what *they* can see decides what they may
+            // order, and neither seat gets to borrow the other's eyes.
+            fog.get(submission.team),
             &mut squad_orders,
             &mut commands,
-            &mut casts,
-            &mut buys,
-            &mut item_uses,
+            &mut events,
             &mut world,
         );
         log.record(now, &submission, &errors);
@@ -189,16 +243,18 @@ fn apply_intents(
 }
 
 /// Apply one intent. `me` is the issuing team: every ownership check, economy
-/// read and squad key below is taken against it, so the same code runs for a
-/// human gesture and a bridge command without either being able to touch the
-/// other faction.
+/// read, fog query and squad key below is taken against it, so the same code
+/// runs for a human gesture and a bridge command without either being able to
+/// touch the other faction.
 ///
 /// Errors are appended rather than returned so that a partially-valid intent
 /// (six live units and one corpse) still does what it can, exactly as the
-/// bridge always did.
+/// bridge always did. `tag` prefixes them — `"cmd 3"` for a bridge batch,
+/// `"ui"` for a gesture — which is what keeps the bridge's historical error
+/// strings byte-identical.
 #[allow(clippy::too_many_arguments)]
 fn compile_intent(
-    intent: &Intent,
+    intent: Intent,
     me: Team,
     tag: &str,
     errors: &mut Vec<String>,
@@ -206,23 +262,30 @@ fn compile_intent(
     economies: &Economies,
     records: &HeroRecords,
     nav: &NavGrid,
+    fog: &FogGrid,
     squad_orders: &mut SquadOrders,
     commands: &mut Commands,
-    casts: &mut EventWriter<CastAbility>,
-    buys: &mut EventWriter<BuyItem>,
-    item_uses: &mut EventWriter<UseItem>,
+    events: &mut IntentEvents,
     world: &mut IntentWorld,
 ) {
+    // Named locally so the arms below read exactly as they did when this was
+    // one interface's private applier.
+    let IntentWorld {
+        units,
+        buildings,
+        targets,
+        nodes,
+    } = world;
     match intent {
         Intent::Move { units: ids, x, z } => {
             ground_order(
                 commands,
                 errors,
                 tag,
-                ids,
-                world,
+                &ids,
+                units,
                 me,
-                Vec3::new(*x, 0.0, *z),
+                Vec3::new(x, 0.0, z),
                 false,
             );
         }
@@ -231,21 +294,21 @@ fn compile_intent(
                 commands,
                 errors,
                 tag,
-                ids,
-                world,
+                &ids,
+                units,
                 me,
-                Vec3::new(*x, 0.0, *z),
+                Vec3::new(x, 0.0, z),
                 true,
             );
         }
         Intent::Attack { units: ids, target } => {
-            let Some(target_entity) = intent_entity(*target) else {
+            let Some(target_entity) = intent_entity(target) else {
                 errors.push(format!("{tag}: target {target} not found"));
                 return;
             };
-            match world.targets.get(target_entity) {
-                Ok((team, unit, building)) => {
-                    // Only the issuer's enemy is a legal attack target.
+            match targets.get(target_entity) {
+                Ok((team, unit, building, tf)) => {
+                    // Only the seat's enemy is a legal attack target.
                     if *team != me.enemy() {
                         errors.push(format!("{tag}: target {target} is your own"));
                         return;
@@ -254,45 +317,58 @@ fn compile_intent(
                         errors.push(format!("{tag}: target {target} is not attackable"));
                         return;
                     }
+                    // Fog cuts both ways: a snapshot that will not show you
+                    // an enemy must not accept orders against it either,
+                    // or the filtering is decoration. Visible now, or a
+                    // structure we remember, is the whole legal set — the
+                    // same set the player can click on.
+                    if !fog.knows_entity(target, tf.translation) {
+                        errors.push(format!("{tag}: target {target} is not visible"));
+                        return;
+                    }
                 }
                 Err(_) => {
                     errors.push(format!("{tag}: target {target} not found"));
                     return;
                 }
             }
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 commands
                     .entity(entity)
                     .try_insert(Order::Attack(target_entity));
             }
         }
         Intent::Harvest { units: ids, target } => {
-            // Resource nodes are neutral: either team may harvest any of them.
-            let node = match intent_entity(*target).filter(|e| world.nodes.get(*e).is_ok()) {
+            // Resource nodes are neutral: either seat may harvest any of
+            // them.
+            let node = match intent_entity(target).filter(|e| nodes.get(*e).is_ok()) {
                 Some(node) => node,
                 None => {
                     errors.push(format!("{tag}: resource node {target} not found"));
                     return;
                 }
             };
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 // Only workers can gather; anyone else would just stand there.
-                if !is_worker(world, entity) {
-                    errors.push(format!("{tag}: unit {} is not a Worker", entity.to_bits()));
+                if !is_worker(units, entity) {
+                    errors.push(format!(
+                        "{tag}: unit {} is not a Worker",
+                        entity.to_bits()
+                    ));
                     continue;
                 }
                 commands.entity(entity).try_insert(Order::Harvest(node));
             }
         }
         Intent::Return { units: ids } => {
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 commands.entity(entity).try_insert(Order::ReturnResources);
             }
         }
         Intent::Follow { units: ids, target } => {
-            let leader = match intent_entity(*target) {
-                Some(e) => match world.units.get(e) {
-                    Ok((_, _, team, _)) if *team == me => e,
+            let leader = match intent_entity(target) {
+                Some(e) => match units.get(e) {
+                    Ok((_, _, team, _, _)) if *team == me => e,
                     _ => {
                         errors.push(format!("{tag}: unit {target} not found/not yours"));
                         return;
@@ -303,7 +379,7 @@ fn compile_intent(
                     return;
                 }
             };
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 if entity == leader {
                     continue; // a unit following itself would deadlock its own order
                 }
@@ -313,7 +389,7 @@ fn compile_intent(
         Intent::Stop { units: ids } => {
             // The established Stop: re-issue a Move to the unit's own spot,
             // which halts it and clears any attack target.
-            for (entity, pos) in own_units(ids, world, me, tag, errors) {
+            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
                 commands.entity(entity).try_insert(Order::Move(pos));
             }
         }
@@ -323,33 +399,33 @@ fn compile_intent(
             x,
             z,
         } => {
-            let Some(building_kind) = parse_building_kind(kind) else {
+            let Some(building_kind) = parse_building_kind(&kind) else {
                 errors.push(format!("{tag}: unknown building kind '{kind}'"));
                 return;
             };
-            let Some((entity, _)) = own_unit(*worker, world, me) else {
+            let Some((entity, _)) = own_unit(worker, units, me) else {
                 errors.push(format!("{tag}: unit {worker} not found/not yours"));
                 return;
             };
-            if !is_worker(world, entity) {
+            if !is_worker(units, entity) {
                 errors.push(format!("{tag}: unit {worker} is not a Worker"));
                 return;
             }
-            // Same tech gate economy.rs applies at placement — reported here so
-            // the player learns why instead of watching a worker walk out and
-            // come back empty-handed.
+            // Same tech gate economy.rs applies at placement — reported
+            // here so the commander learns why instead of watching a
+            // worker walk out and come back empty-handed.
             if let Some(err) = requirement_error(
                 tag,
                 building_name(building_kind),
                 building_requires(building_kind),
-                &completed_kinds(world, me),
+                &completed_kinds(buildings, me),
             ) {
                 errors.push(err);
                 return;
             }
             let stats = building_stats(building_kind);
             // Snap to nav-cell boundaries exactly like the placement ghost.
-            let pos = snap_footprint(clamp_to_map(Vec3::new(*x, 0.0, *z)), stats.size);
+            let pos = snap_footprint(clamp_to_map(Vec3::new(x, 0.0, z)), stats.size);
             if !nav.rect_is_free(pos, stats.size) {
                 errors.push(format!(
                     "{tag}: site ({:.1}, {:.1}) is blocked for {kind}",
@@ -367,30 +443,70 @@ fn compile_intent(
                 ));
                 return;
             }
-            // economy.rs pays when the worker reaches the site.
+            // economy.rs pays when the worker reaches the site, same as the UI.
             commands.entity(entity).try_insert(Order::Build {
                 kind: building_kind,
                 pos,
             });
         }
+        Intent::Upgrade { building } => {
+            let Some(entity) = intent_entity(building) else {
+                errors.push(format!("{tag}: building {building} not found/not yours"));
+                return;
+            };
+            let Ok((b, team, under, _, upgrading)) = buildings.get(entity) else {
+                errors.push(format!("{tag}: building {building} not found/not yours"));
+                return;
+            };
+            if *team != me {
+                errors.push(format!("{tag}: building {building} not found/not yours"));
+                return;
+            }
+            if under.is_some() {
+                errors.push(format!("{tag}: building {building} is under construction"));
+                return;
+            }
+            if upgrading.is_some() {
+                errors.push(format!("{tag}: building {building} is already upgrading"));
+                return;
+            }
+            let name = building_name(b.kind);
+            let Some((cost_gold, cost_lumber, _)) = upgrade_cost(b.kind) else {
+                errors.push(format!("{tag}: {name} has no upgrade"));
+                return;
+            };
+            if !economies.get(me).can_afford(cost_gold, cost_lumber) {
+                let to = building_name(
+                    building_upgrades_to(b.kind).expect("a cost implies a next tier"),
+                );
+                errors.push(format!(
+                    "{tag}: cannot afford {to} ({cost_gold}g {cost_lumber}l)"
+                ));
+                return;
+            }
+            // economy.rs takes the money and starts the conversion — the
+            // same single owner of every payment the UI goes through.
+            events.upgrades.write(UpgradeBuilding { building: entity });
+        }
         Intent::Train { building, unit } => {
-            let Some(kind) = parse_unit_kind(unit) else {
+            let Some(kind) = parse_unit_kind(&unit) else {
                 errors.push(format!("{tag}: unknown unit kind '{unit}'"));
                 return;
             };
             // Read the tech state before taking the mutable borrow of the
             // producing building below.
-            let completed = completed_kinds(world, me);
-            if let Some(err) = requirement_error(tag, kind_name(kind), unit_requires(kind), &completed)
+            let completed = completed_kinds(buildings, me);
+            if let Some(err) =
+                requirement_error(tag, kind_name(kind), unit_requires(kind), &completed)
             {
                 errors.push(err);
                 return;
             }
-            let Some(entity) = intent_entity(*building) else {
+            let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((b, team, under, queue)) = world.buildings.get_mut(entity) else {
+            let Ok((b, team, under, queue, _)) = buildings.get_mut(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -403,7 +519,10 @@ fn compile_intent(
                 return;
             }
             if !trainable(b.kind).contains(&kind) {
-                errors.push(format!("{tag}: {} cannot train {unit}", building_name(b.kind)));
+                errors.push(format!(
+                    "{tag}: {} cannot train {unit}",
+                    building_name(b.kind)
+                ));
                 return;
             }
             let Some(mut queue) = queue else {
@@ -414,8 +533,12 @@ fn compile_intent(
                 errors.push(format!("{tag}: training queue full ({MAX_QUEUE})"));
                 return;
             }
-            // The Champion is priced by `hero_train_cost` (full, then revival).
-            let (cost_gold, cost_lumber) = if kind == UnitKind::Hero {
+            // Hero classes are priced by `hero_train_cost` (full, then
+            // revival) — every hero kind, not just the Champion: pricing
+            // the Priestess off her raw stats let a seat buy a revival at
+            // full price (or worse, a first hero cheaply) depending on the
+            // record. `is_hero_kind` is the same test economy.rs charges by.
+            let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
                 let (g, l, _) = hero_train_cost(records, me);
                 (g, l)
             } else {
@@ -432,12 +555,11 @@ fn compile_intent(
             queue.queue.push_back(kind);
         }
         Intent::Cancel { building, index } => {
-            let index = *index;
-            let Some(entity) = intent_entity(*building) else {
+            let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((_, team, _, queue)) = world.buildings.get_mut(entity) else {
+            let Ok((_, team, _, queue, _)) = buildings.get_mut(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -464,11 +586,11 @@ fn compile_intent(
             z,
             target,
         } => {
-            let Some(entity) = intent_entity(*building) else {
+            let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((b, team, _, _)) = world.buildings.get(entity) else {
+            let Ok((b, team, _, _, _)) = buildings.get(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -477,20 +599,23 @@ fn compile_intent(
                 return;
             }
             if trainable(b.kind).is_empty() {
-                errors.push(format!("{tag}: {} produces no units", building_name(b.kind)));
+                errors.push(format!(
+                    "{tag}: {} produces no units",
+                    building_name(b.kind)
+                ));
                 return;
             }
             let rally = match (x, z, target) {
                 (Some(x), Some(z), _) => {
-                    Some(RallyTarget::Ground(clamp_to_map(Vec3::new(*x, 0.0, *z))))
+                    Some(RallyTarget::Ground(clamp_to_map(Vec3::new(x, 0.0, z))))
                 }
-                (_, _, Some(id)) => match intent_entity(*id) {
-                    // A resource node (neutral, so either team may name one)
-                    // makes new workers start gathering; one of our own units
-                    // makes new units follow it.
-                    Some(e) if world.nodes.get(e).is_ok() => Some(RallyTarget::Node(e)),
-                    Some(e) => match world.units.get(e) {
-                        Ok((_, _, team, _)) if *team == me => Some(RallyTarget::Unit(e)),
+                (_, _, Some(id)) => match intent_entity(id) {
+                    // A resource node (neutral, so either seat may name
+                    // one) makes new workers start gathering; one of our
+                    // own units makes new units follow it.
+                    Some(e) if nodes.get(e).is_ok() => Some(RallyTarget::Node(e)),
+                    Some(e) => match units.get(e) {
+                        Ok((_, _, team, _, _)) if *team == me => Some(RallyTarget::Unit(e)),
                         _ => None,
                     },
                     None => None,
@@ -506,31 +631,40 @@ fn compile_intent(
                 )),
             }
         }
-        Intent::Cast { hero } => {
-            let Some(entity) = intent_entity(*hero) else {
+        Intent::Cast { hero, ability } => {
+            let Some(entity) = intent_entity(hero) else {
                 errors.push(format!("{tag}: caster {hero} not found/not yours"));
                 return;
             };
             // A caster is either one of our heroes (any class — the Hero
-            // component and `ability_of_unit` agree on which kinds have an
-            // ability) or one of our finished buildings with an ability.
-            // combat.rs owns the mana/cooldown verdict either way.
-            let unit_caster = matches!(
-                world.units.get(entity),
-                Ok((_, u, team, _)) if *team == me && ability_of_unit(u.kind).is_some()
-            );
-            if !unit_caster {
-                match world.buildings.get(entity) {
-                    Ok((b, team, under, _)) if *team == me => {
+            // component and the unit ability table agree on which kinds
+            // have one) or one of our finished buildings with an ability.
+            // combat.rs owns the unlock/mana/cooldown verdict either way,
+            // exactly as it does for the R and C hotkeys.
+            let unit_list = match units.get(entity) {
+                Ok((_, u, team, _, _)) if *team == me => abilities_of_unit(u.kind),
+                _ => &[][..],
+            };
+            let list = if !unit_list.is_empty() {
+                unit_list
+            } else {
+                match buildings.get(entity) {
+                    Ok((b, team, under, _, _)) if *team == me => {
                         if under.is_some() {
-                            errors.push(format!("{tag}: building {hero} is under construction"));
+                            errors.push(format!(
+                                "{tag}: building {hero} is under construction"
+                            ));
                             return;
                         }
-                        if ability_of_building(b.kind).is_none() {
-                            errors
-                                .push(format!("{tag}: {} has no ability", building_name(b.kind)));
+                        let list = abilities_of_building(b.kind);
+                        if list.is_empty() {
+                            errors.push(format!(
+                                "{tag}: {} has no ability",
+                                building_name(b.kind)
+                            ));
                             return;
                         }
+                        list
                     }
                     _ => {
                         errors.push(format!(
@@ -539,19 +673,38 @@ fn compile_intent(
                         return;
                     }
                 }
-            }
-            casts.write(CastAbility { caster: entity });
+            };
+            // A named slot is checked for EXISTENCE here so a typo is an
+            // error instead of a silent no-op; whether it is unlocked and
+            // off cooldown stays combat.rs's call.
+            let selector = match &ability {
+                None => None,
+                Some(reference) => {
+                    if ability_slot(reference, list).is_none() {
+                        errors.push(format!(
+                            "{tag}: caster {hero} has no ability {reference:?} (has {})",
+                            list.iter()
+                                .map(|d| d.name)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                        return;
+                    }
+                    Some(reference.clone())
+                }
+            };
+            events.casts.write(CastAbility { caster: entity, ability: selector });
         }
         Intent::Buy { shop, item } => {
-            let Some(item) = parse_item(item) else {
+            let Some(item) = parse_item(&item) else {
                 errors.push(format!("{tag}: unknown item '{item}'"));
                 return;
             };
-            let Some(entity) = intent_entity(*shop) else {
+            let Some(entity) = intent_entity(shop) else {
                 errors.push(format!("{tag}: building {shop} not found/not yours"));
                 return;
             };
-            let Ok((b, team, under, _)) = world.buildings.get(entity) else {
+            let Ok((b, team, under, _, _)) = buildings.get(entity) else {
                 errors.push(format!("{tag}: building {shop} not found/not yours"));
                 return;
             };
@@ -560,7 +713,10 @@ fn compile_intent(
                 return;
             }
             if b.kind != BuildingKind::Shop {
-                errors.push(format!("{tag}: {} does not sell items", building_name(b.kind)));
+                errors.push(format!(
+                    "{tag}: {} does not sell items",
+                    building_name(b.kind)
+                ));
                 return;
             }
             if under.is_some() {
@@ -568,19 +724,19 @@ fn compile_intent(
                 return;
             }
             // The buyer is implied: a team fields exactly one hero.
-            let Some(hero) = own_hero(world, me) else {
+            let Some(hero) = own_hero(units, me) else {
                 errors.push(format!("{tag}: no living hero to buy for"));
                 return;
             };
-            // economy.rs re-validates and pays.
-            buys.write(BuyItem {
+            // economy.rs re-validates and pays (gold, free slot, distance-
+            // free just like the UI's Shop card).
+            events.buys.write(BuyItem {
                 shop: entity,
                 hero,
                 item,
             });
         }
         Intent::UseItem { slot } => {
-            let slot = *slot;
             if slot >= INVENTORY_SLOTS {
                 errors.push(format!(
                     "{tag}: item slot {slot} out of range (0..{})",
@@ -588,25 +744,25 @@ fn compile_intent(
                 ));
                 return;
             }
-            let Some(hero) = own_hero(world, me) else {
+            let Some(hero) = own_hero(units, me) else {
                 errors.push(format!("{tag}: no living hero to use an item"));
                 return;
             };
             // combat.rs checks the slot is actually filled.
-            item_uses.write(UseItem { hero, slot });
+            events.item_uses.write(UseItem { hero, slot });
         }
         Intent::Autopilot { on } => {
-            // Only ever the issuing faction.
-            set_autopilot(ai_controlled, me, *on);
+            // Only ever this seat's own faction.
+            set_autopilot(ai_controlled, me, on);
             info!(
-                "intent: autopilot {} for {:?} — scripted AI {} the macro game",
-                if *on { "ON" } else { "OFF" },
+                "bridge: autopilot {} for {:?} — scripted AI {} the macro game",
+                if on { "ON" } else { "OFF" },
                 me,
-                if *on { "takes over" } else { "releases" }
+                if on { "takes over" } else { "releases" }
             );
         }
         Intent::Surrender => {
-            info!("intent: {me:?} surrenders");
+            info!("bridge: {:?} seat surrenders", me);
             commands.send_event(Surrender { team: me });
         }
         Intent::Priority {
@@ -614,15 +770,16 @@ fn compile_intent(
             classes,
         } => {
             // One bad class name invalidates the whole list rather than
-            // silently installing a priority order nobody asked for.
-            let parsed = match parse_target_classes(classes) {
+            // silently installing a priority order the commander didn't ask
+            // for.
+            let parsed = match parse_target_classes(&classes) {
                 Ok(parsed) => parsed,
                 Err(name) => {
                     errors.push(format!("{tag}: unknown target class '{name}'"));
                     return;
                 }
             };
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 let mut ec = commands.entity(entity);
                 if parsed.is_empty() {
                     ec.try_remove::<TargetPriority>();
@@ -646,14 +803,14 @@ fn compile_intent(
                 return;
             }
             let rally = match (x, z) {
-                (Some(x), Some(z)) => Some(clamp_to_map(Vec3::new(*x, 0.0, *z))),
+                (Some(x), Some(z)) => Some(clamp_to_map(Vec3::new(x, 0.0, z))),
                 _ => None,
             };
             if !clear && rally.is_none() {
                 errors.push(format!("{tag}: retreat needs a rally x/z"));
                 return;
             }
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 let mut ec = commands.entity(entity);
                 match rally {
                     Some(rally) if !clear => {
@@ -674,14 +831,14 @@ fn compile_intent(
             let radius = radius.unwrap_or(0.0);
             let clear = !(radius > 0.0);
             let anchor = match (x, z) {
-                (Some(x), Some(z)) => Some(clamp_to_map(Vec3::new(*x, 0.0, *z))),
+                (Some(x), Some(z)) => Some(clamp_to_map(Vec3::new(x, 0.0, z))),
                 _ => None,
             };
             if !clear && anchor.is_none() {
                 errors.push(format!("{tag}: leash needs an anchor x/z"));
                 return;
             }
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 let mut ec = commands.entity(entity);
                 match anchor {
                     Some(anchor) if !clear => {
@@ -696,28 +853,57 @@ fn compile_intent(
         Intent::Autocast {
             units: ids,
             min_enemies,
+            ability,
         } => {
             let min_enemies = min_enemies.unwrap_or(0);
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 // Any hero class can auto-cast; nothing else has an ability.
-                if !matches!(world.units.get(entity), Ok((_, u, _, _)) if is_hero_kind(u.kind)) {
-                    errors.push(format!("{tag}: unit {} is not a hero", entity.to_bits()));
+                let Ok((_, unit, _, _, policy)) = units.get(entity) else {
+                    continue;
+                };
+                if !is_hero_kind(unit.kind) {
+                    errors.push(format!(
+                        "{tag}: unit {} is not a hero",
+                        entity.to_bits()
+                    ));
                     continue;
                 }
-                let mut ec = commands.entity(entity);
+                let list = abilities_of_unit(unit.kind);
+                let slot = match &ability {
+                    None => 0,
+                    Some(reference) => match ability_slot(reference, list) {
+                        Some(slot) => slot,
+                        None => {
+                            errors.push(format!(
+                                "{tag}: unit {} has no ability {reference:?}",
+                                entity.to_bits()
+                            ));
+                            continue;
+                        }
+                    },
+                };
+                // Edit ONE rule and keep the rest: a hero told to auto-heal
+                // does not thereby stop auto-slamming.
+                let mut next = policy.cloned().unwrap_or_default();
                 if min_enemies == 0 {
+                    next.clear_ability(slot);
+                } else {
+                    next.set(slot, min_enemies);
+                }
+                let mut ec = commands.entity(entity);
+                if next.is_empty() {
                     ec.try_remove::<AutoCastPolicy>();
                 } else {
-                    ec.try_insert(AutoCastPolicy { min_enemies });
+                    ec.try_insert(next);
                 }
             }
         }
         Intent::Squad { units: ids, id } => {
-            for (entity, _) in own_units(ids, world, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors) {
                 let mut ec = commands.entity(entity);
                 match id {
                     Some(id) => {
-                        ec.try_insert(SquadId(*id));
+                        ec.try_insert(SquadId(id));
                     }
                     None => {
                         ec.try_remove::<SquadId>();
@@ -726,40 +912,43 @@ fn compile_intent(
             }
         }
         Intent::Posture { id, posture } => {
-            // Squad ids are per-team, so red's squad 1 and blue's squad 1 are
-            // different squads.
+            // Squad ids are per-team, so red's squad 1 and blue's squad 1
+            // are different squads.
             let posture = match posture {
                 None => {
                     // Clearing a posture leaves membership intact: the squad
                     // simply stops being re-tasked.
-                    squad_orders.0.remove(&(me, *id));
+                    squad_orders.0.remove(&(me, id));
                     return;
                 }
                 Some(PostureIntent::Defend { x, z, radius }) => {
-                    if !(*radius > 0.0) {
-                        errors.push(format!("{tag}: defend radius must be > 0, got {radius}"));
+                    if !(radius > 0.0) {
+                        errors.push(format!(
+                            "{tag}: defend radius must be > 0, got {radius}"
+                        ));
                         return;
                     }
                     SquadPosture::Defend {
-                        pos: clamp_to_map(Vec3::new(*x, 0.0, *z)),
-                        radius: *radius,
+                        pos: clamp_to_map(Vec3::new(x, 0.0, z)),
+                        radius,
                     }
                 }
                 Some(PostureIntent::Push { x, z }) => SquadPosture::Push {
-                    pos: clamp_to_map(Vec3::new(*x, 0.0, *z)),
+                    pos: clamp_to_map(Vec3::new(x, 0.0, z)),
                 },
                 Some(PostureIntent::Forage { x, z }) => SquadPosture::Forage {
-                    muster: clamp_to_map(Vec3::new(*x, 0.0, *z)),
+                    muster: clamp_to_map(Vec3::new(x, 0.0, z)),
                 },
                 Some(PostureIntent::Escort { unit }) => {
-                    let Some((target, _)) = own_unit(*unit, world, me) else {
-                        errors.push(format!("{tag}: unit {unit} not found/not yours"));
+                    let Some((target, _)) = own_unit(unit, units, me) else {
+                        errors
+                            .push(format!("{tag}: unit {unit} not found/not yours"));
                         return;
                     };
                     SquadPosture::Escort { unit: target }
                 }
             };
-            squad_orders.0.insert((me, *id), posture);
+            squad_orders.0.insert((me, id), posture);
         }
         Intent::Template {
             building,
@@ -770,11 +959,11 @@ fn compile_intent(
         } => {
             // Only our own, finished, unit-producing buildings can carry a
             // template — anywhere else it would never be read.
-            let Some(entity) = intent_entity(*building) else {
+            let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((b, team, under, queue)) = world.buildings.get(entity) else {
+            let Ok((b, team, under, queue, _)) = buildings.get(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -787,13 +976,16 @@ fn compile_intent(
                 return;
             }
             if queue.is_none() {
-                errors.push(format!("{tag}: {} has no training queue", building_name(b.kind)));
+                errors.push(format!(
+                    "{tag}: {} has no training queue",
+                    building_name(b.kind)
+                ));
                 return;
             }
-            // Same class parsing (and same all-or-nothing rule) as `priority`;
-            // an empty list means "no priority piece".
+            // Same class parsing (and same all-or-nothing rule) as the
+            // `priority` command; an empty list means "no priority piece".
             let priority = match priority {
-                Some(names) => match parse_target_classes(names) {
+                Some(names) => match parse_target_classes(&names) {
                     Ok(parsed) => (!parsed.is_empty()).then_some(parsed),
                     Err(name) => {
                         errors.push(format!("{tag}: unknown target class '{name}'"));
@@ -806,7 +998,8 @@ fn compile_intent(
                 Some(r) => {
                     if !(r.below > 0.0 && r.below < 1.0) {
                         errors.push(format!(
-                            "{tag}: template retreat 'below' must be a fraction in (0,1), got {}",
+                            "{tag}: template retreat 'below' must be a fraction in (0,1), \
+                             got {}",
                             r.below
                         ));
                         return;
@@ -822,7 +1015,7 @@ fn compile_intent(
             let autocast = autocast.filter(|n| *n > 0);
 
             let template = DoctrineTemplate {
-                squad: *squad,
+                squad,
                 retreat,
                 priority,
                 autocast,
@@ -982,36 +1175,39 @@ fn team_name(team: Team) -> &'static str {
 // Helpers — the validation vocabulary shared by every intent
 // ---------------------------------------------------------------------------
 
-/// Flip one faction's scripted-AI flag. Never the other's.
-pub fn set_autopilot(ai_controlled: &mut AiControlled, team: Team, on: bool) {
-    match team {
-        Team::Human => ai_controlled.human = on,
-        Team::Claude => ai_controlled.claude = on,
+/// Resolve a selector to a slot of `list`, unlocked or not — `autocast` writes
+/// rules for abilities a hero has not levelled into yet, and that is fine.
+/// Whether a slot is unlocked, funded and off cooldown stays combat.rs's call.
+fn ability_slot(sel: &AbilitySelector, list: &[AbilityDef]) -> Option<usize> {
+    match sel {
+        AbilitySelector::Index(i) => (*i < list.len()).then_some(*i),
+        AbilitySelector::Id(id) => ability_index_by_id(list, id),
     }
 }
 
-/// Resolve one id to a living unit of the issuing team.
-fn own_unit(id: IntentId, world: &IntentWorld, me: Team) -> Option<(Entity, Vec3)> {
+/// Resolve one id to a living unit of the seat's own team.
+fn own_unit(id: IntentId, units: &IntentUnits, me: Team) -> Option<(Entity, Vec3)> {
     let entity = intent_entity(id)?;
-    match world.units.get(entity) {
-        Ok((_, _, team, tf)) if *team == me => Some((entity, tf.translation)),
+    match units.get(entity) {
+        Ok((_, _, team, tf, _)) if *team == me => Some((entity, tf.translation)),
         _ => None,
     }
 }
 
-fn own_hero(world: &IntentWorld, me: Team) -> Option<Entity> {
-    world
-        .units
+/// The seat's living hero, whichever class it plays. `buy` and `use_item` name
+/// no unit: a team has at most one hero, so there is nothing to disambiguate.
+fn own_hero(units: &IntentUnits, me: Team) -> Option<Entity> {
+    units
         .iter()
-        .find(|(_, u, team, _)| **team == me && is_hero_kind(u.kind))
+        .find(|(_, u, team, _, _)| **team == me && is_hero_kind(u.kind))
         .map(|(entity, ..)| entity)
 }
 
-/// Resolve a list of ids to living units of the issuing team, recording one
+/// Resolve a list of ids to living units of the seat's own team, recording one
 /// error per id that doesn't qualify (an enemy's unit included).
 fn own_units(
     ids: &[IntentId],
-    world: &IntentWorld,
+    units: &IntentUnits,
     me: Team,
     tag: &str,
     errors: &mut Vec<String>,
@@ -1022,7 +1218,7 @@ fn own_units(
     }
     let mut out = Vec::with_capacity(ids.len());
     for &id in ids {
-        match own_unit(id, world, me) {
+        match own_unit(id, units, me) {
             Some(found) => out.push(found),
             None => errors.push(format!("{tag}: unit {id} not found/not yours")),
         }
@@ -1030,53 +1226,33 @@ fn own_units(
     out
 }
 
-/// The team's completed (not under construction) buildings — the input to
-/// every requirement check on the intent path.
-fn completed_kinds(world: &IntentWorld, me: Team) -> Vec<BuildingKind> {
-    world
-        .buildings
+/// The seat's completed (not under construction) buildings — the input to
+/// every requirement check on the command path.
+fn completed_kinds(buildings: &IntentBuildings, me: Team) -> Vec<BuildingKind> {
+    buildings
         .iter()
-        .filter(|(_, team, under, _)| **team == me && under.is_none())
+        .filter(|(_, team, under, _, _)| **team == me && under.is_none())
         .map(|(building, ..)| building.kind)
         .collect()
 }
 
-fn is_worker(world: &IntentWorld, entity: Entity) -> bool {
-    matches!(world.units.get(entity), Ok((_, u, _, _)) if u.kind == UnitKind::Worker)
+fn is_worker(units: &IntentUnits, entity: Entity) -> bool {
+    matches!(units.get(entity), Ok((_, u, _, _, _)) if u.kind == UnitKind::Worker)
 }
 
-/// `None` when `reqs` are satisfied, otherwise the error line to report, e.g.
-/// `"cmd 3: Tower requires Barracks"`.
-fn requirement_error(
-    tag: &str,
-    what: &'static str,
-    reqs: &[BuildingKind],
-    completed: &[BuildingKind],
-) -> Option<String> {
-    if requirements_met(reqs, completed.iter().copied()) {
-        return None;
-    }
-    let missing: Vec<&str> = reqs
-        .iter()
-        .filter(|r| !completed.contains(r))
-        .map(|r| building_name(*r))
-        .collect();
-    Some(format!("{tag}: {what} requires {}", missing.join(" + ")))
-}
-
-/// Move / AttackMove for a group, spread over the shared formation grid.
+/// Move / AttackMove for a group, spread over the UI's formation grid.
 #[allow(clippy::too_many_arguments)]
 fn ground_order(
     commands: &mut Commands,
     errors: &mut Vec<String>,
     tag: &str,
     ids: &[IntentId],
-    world: &IntentWorld,
+    units: &IntentUnits,
     me: Team,
     ground: Vec3,
     attack_move: bool,
 ) {
-    let group = own_units(ids, world, me, tag, errors);
+    let group = own_units(ids, units, me, tag, errors);
     let count = group.len();
     for (i, (entity, _)) in group.into_iter().enumerate() {
         let p = clamp_to_map(ground + formation_offset(i, count));
@@ -1123,7 +1299,47 @@ pub fn snap_footprint(p: Vec3, size: f32) -> Vec3 {
     )
 }
 
-// --- name parsing: the vocabulary's spelling rules ---------------------------
+/// `None` when `reqs` are satisfied, otherwise the error line to report, e.g.
+/// `"cmd 3: Tower requires Barracks"`.
+fn requirement_error(
+    tag: &str,
+    what: &'static str,
+    reqs: &[BuildingKind],
+    completed: &[BuildingKind],
+) -> Option<String> {
+    if requirements_met(reqs, completed.iter().copied()) {
+        return None;
+    }
+    // Tier-aware, exactly like `requirements_met`: a Castle covers a "requires
+    // Keep", so it must not be listed as the thing you are missing.
+    let missing: Vec<&str> = reqs
+        .iter()
+        .filter(|r| !completed.iter().any(|owned| building_satisfies(*owned, **r)))
+        .map(|r| building_name(*r))
+        .collect();
+    Some(format!("{tag}: {what} requires {}", missing.join(" + ")))
+}
+
+/// Parse a whole class list, all-or-nothing: `Err(name)` names the first
+/// unknown class so the caller can reject the command outright rather than
+/// install a focus-fire order nobody asked for.
+pub fn parse_target_classes(names: &[String]) -> Result<Vec<TargetClass>, String> {
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        match parse_target_class(name) {
+            Some(class) => out.push(class),
+            None => return Err(name.clone()),
+        }
+    }
+    Ok(out)
+}
+
+pub fn parse_target_class(name: &str) -> Option<TargetClass> {
+    ALL_TARGET_CLASSES
+        .iter()
+        .copied()
+        .find(|c| c.name().eq_ignore_ascii_case(name))
+}
 
 /// Loose form of a name on the wire: case, spaces, dashes and underscores are
 /// all noise, so `"town_hall"`, `"Town Hall"` and `"townhall"` are one name.
@@ -1135,8 +1351,8 @@ fn normalize_name(name: &str) -> String {
 }
 
 /// Both parsers match against the catalog's own ids (`shared::kind_name` /
-/// `building_name`), so a kind added to the shared enums is orderable the
-/// moment it exists — no table here to fall out of date.
+/// `building_name`), so a kind added to the shared enums is orderable through
+/// the bridge the moment it exists — no table here to fall out of date.
 pub fn parse_unit_kind(name: &str) -> Option<UnitKind> {
     let wanted = normalize_name(name);
     ALL_UNIT_KINDS
@@ -1160,26 +1376,14 @@ pub fn parse_item(name: &str) -> Option<ItemId> {
         .find(|id| normalize_name(item_def(*id).name) == wanted)
 }
 
-/// Parse a whole class list, all-or-nothing: `Err(name)` names the first
-/// unknown class so the caller can reject the intent outright rather than
-/// install a focus-fire order nobody asked for.
-pub fn parse_target_classes(names: &[String]) -> Result<Vec<TargetClass>, String> {
-    let mut out = Vec::with_capacity(names.len());
-    for name in names {
-        match parse_target_class(name) {
-            Some(class) => out.push(class),
-            None => return Err(name.clone()),
-        }
+/// Hand a faction to (or take it from) the scripted macro AI.
+pub fn set_autopilot(ai_controlled: &mut AiControlled, team: Team, on: bool) {
+    match team {
+        Team::Claude => ai_controlled.claude = on,
+        Team::Human => ai_controlled.human = on,
     }
-    Ok(out)
 }
 
-pub fn parse_target_class(name: &str) -> Option<TargetClass> {
-    ALL_TARGET_CLASSES
-        .iter()
-        .copied()
-        .find(|c| c.name().eq_ignore_ascii_case(name))
-}
 
 #[cfg(test)]
 mod tests {
@@ -1199,11 +1403,14 @@ mod tests {
             r#"{"type":"stop","units":[1]}"#,
             r#"{"type":"build","worker":1,"kind":"Farm","x":0.0,"z":0.0}"#,
             r#"{"type":"train","building":1,"unit":"Footman"}"#,
+            r#"{"type":"upgrade","building":1}"#,
             r#"{"type":"cancel","building":1,"index":0}"#,
             r#"{"type":"rally","building":1,"x":1.0,"z":2.0}"#,
             r#"{"type":"rally","building":1,"target":7}"#,
             r#"{"type":"cast","hero":1}"#,
             r#"{"type":"cast","caster":1}"#,
+            r#"{"type":"cast","hero":1,"ability":2}"#,
+            r#"{"type":"cast","hero":1,"ability":"Slam"}"#,
             r#"{"type":"buy","shop":1,"item":"HealingPotion"}"#,
             r#"{"type":"use_item","slot":0}"#,
             r#"{"type":"autopilot","on":true}"#,
@@ -1213,6 +1420,8 @@ mod tests {
             r#"{"type":"retreat","units":[1],"below":0.35,"x":1.0,"z":2.0}"#,
             r#"{"type":"leash","units":[1],"x":1.0,"z":2.0,"radius":20.0}"#,
             r#"{"type":"autocast","units":[1],"min_enemies":3}"#,
+            r#"{"type":"autocast","units":[1],"min_enemies":3,"ability":1}"#,
+            r#"{"type":"autocast","units":[1],"min_enemies":3,"ability":"Heal"}"#,
             r#"{"type":"squad","units":[1],"id":1}"#,
             r#"{"type":"squad","units":[1]}"#,
             r#"{"type":"posture","id":1,"posture":{"type":"defend","x":1.0,"z":2.0,"radius":18.0}}"#,
@@ -1224,8 +1433,8 @@ mod tests {
             r#"{"type":"template","building":1}"#,
         ];
         for case in cases {
-            let parsed: Intent =
-                serde_json::from_str(case).unwrap_or_else(|e| panic!("{case} failed to parse: {e}"));
+            let parsed: Intent = serde_json::from_str(case)
+                .unwrap_or_else(|e| panic!("{case} failed to parse: {e}"));
             // Every intent renders a sentence and re-serializes with its verb
             // as the `type` tag — the property the replay log depends on.
             assert!(!parsed.sentence().is_empty(), "{case} had no sentence");
@@ -1236,6 +1445,44 @@ mod tests {
                 "{case} re-serialized under a different tag"
             );
         }
+    }
+
+    /// The ability selector is untagged on the wire: a bare number is a slot
+    /// index, a bare string is an ability id. Both must survive a round trip,
+    /// because the log is what a replay reads back.
+    #[test]
+    fn ability_selectors_round_trip_untagged() {
+        let by_index: Intent =
+            serde_json::from_str(r#"{"type":"cast","hero":5,"ability":2}"#).unwrap();
+        let by_id: Intent =
+            serde_json::from_str(r#"{"type":"cast","hero":5,"ability":"Slam"}"#).unwrap();
+        let bare: Intent = serde_json::from_str(r#"{"type":"cast","hero":5}"#).unwrap();
+        assert_eq!(by_index.sentence(), "5 casts ability slot 2");
+        assert_eq!(by_id.sentence(), "5 casts Slam");
+        assert_eq!(bare.sentence(), "5 casts its ability");
+
+        // Untagged means the JSON carries the bare value, not a wrapper.
+        let v = serde_json::to_value(&by_id).unwrap();
+        assert_eq!(v.get("ability").and_then(|a| a.as_str()), Some("Slam"));
+        let v = serde_json::to_value(&by_index).unwrap();
+        assert_eq!(v.get("ability").and_then(|a| a.as_u64()), Some(2));
+        // Omitted stays omitted, so a v1 log line is still a v1 log line.
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(v.get("ability").is_none());
+    }
+
+    #[test]
+    fn upgrade_is_one_verb_for_both_seats() {
+        let typed: Intent = serde_json::from_str(r#"{"type":"upgrade","building":77}"#).unwrap();
+        let gesture = Intent::Upgrade { building: 77 };
+        assert_eq!(
+            serde_json::to_value(&gesture).unwrap(),
+            serde_json::to_value(&typed).unwrap()
+        );
+        assert_eq!(
+            gesture.sentence(),
+            "building 77 upgrades to its next tier"
+        );
     }
 
     /// A round trip through JSON must not change what an intent means — this
@@ -1284,6 +1531,21 @@ mod tests {
         assert_eq!(gesture.sentence(), typed.sentence());
         assert_eq!(gesture.sentence(), "2 units hold within 18 of (12.0, -8.0)");
 
+        // [Y] — the hero's second ability. The UI is index-native because a
+        // hotkey IS a slot; a commander may say the same thing by name. Both
+        // spellings are the same verb on the same caster.
+        let gesture = Intent::Cast {
+            hero: 5,
+            ability: Some(AbilitySelector::Index(1)),
+        };
+        let typed: Intent =
+            serde_json::from_str(r#"{"type":"cast","hero":5,"ability":1}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(&gesture).unwrap(),
+            serde_json::to_value(&typed).unwrap()
+        );
+        assert_eq!(gesture.sentence(), typed.sentence());
+
         // Right-click on an enemy with three units selected.
         let gesture = Intent::Attack {
             units: vec![1, 2, 3],
@@ -1298,10 +1560,40 @@ mod tests {
         assert_eq!(gesture.sentence(), typed.sentence());
     }
 
+    /// The player-facing surface is a projection of the catalog, not a list
+    /// maintained alongside it: a kind added to `ALL_UNIT_KINDS` and
+    /// `trainable()` becomes orderable with no change here at all. This is the
+    /// property that lets both kinds of player — the one reading a command
+    /// card and the one reading `state.json` — discover new content the same
+    /// way, so it is worth a test rather than a comment. (Moved here from
+    /// bridge.rs with the parser: it is the vocabulary's property now, not one
+    /// interface's.)
+    #[test]
+    fn every_unit_kind_is_orderable_by_name() {
+        for kind in ALL_UNIT_KINDS {
+            assert_eq!(
+                parse_unit_kind(kind_name(kind)),
+                Some(kind),
+                "{} is in the catalog but not orderable",
+                kind_name(kind)
+            );
+        }
+        // Players type what they like; names are normalized, not matched raw.
+        assert_eq!(parse_unit_kind("spearman"), Some(UnitKind::Spearman));
+        assert_eq!(parse_unit_kind("Spear Man"), Some(UnitKind::Spearman));
+        assert_eq!(parse_unit_kind("pikeman"), None);
+    }
+
     #[test]
     fn names_parse_loosely() {
-        assert_eq!(parse_building_kind("town_hall"), Some(BuildingKind::TownHall));
-        assert_eq!(parse_building_kind("Town Hall"), Some(BuildingKind::TownHall));
+        assert_eq!(
+            parse_building_kind("town_hall"),
+            Some(BuildingKind::TownHall)
+        );
+        assert_eq!(
+            parse_building_kind("Town Hall"),
+            Some(BuildingKind::TownHall)
+        );
         assert_eq!(parse_unit_kind("footman"), Some(UnitKind::Footman));
         assert_eq!(parse_item("town portal"), Some(ItemId::TownPortal));
         assert_eq!(parse_target_class("siege"), Some(TargetClass::Siege));

@@ -42,6 +42,14 @@ const ARCHER_EVERY_NTH: u32 = 3;
 /// Every Nth army unit is a Raider instead — cavalry to chase siege and
 /// workers. Checked before the Archer slot, so the 15th unit is a Raider.
 const RAIDER_EVERY_NTH: u32 = 5;
+/// Every Nth army unit is a Spearman — checked last, so it only takes slots
+/// the Raider and Archer rules left alone (~1 in 6 of actual Barracks output).
+/// A flat fraction rather than a reaction to scouted cavalry: the script has
+/// no memory of what it has seen, and a standing hedge in front of the archers
+/// is worth its 90 gold as cheap hit points even in a match where the enemy
+/// never mounts up. Reacting properly is a commander's job, and a commander
+/// gets the same unit through the same catalog.
+const SPEARMAN_EVERY_NTH: u32 = 4;
 
 /// Siege. A Workshop is a luxury: only once a Barracks stands and the treasury
 /// is comfortably ahead of army production does the AI branch into siege.
@@ -102,6 +110,16 @@ const WAVE_TIMEOUT: f32 = 90.0;
 const DEFEND_RADIUS: f32 = 30.0;
 /// Workers this close to an enemy combat unit run home.
 const WORKER_FLEE_RADIUS: f32 = 10.0;
+/// Army units on the field before the AI spends 320g/160l on a Keep. Low on
+/// purpose: the tier-up is meant to land in the 4-6 minute window, right after
+/// the first Barracks has produced a real squad, not once the game is decided.
+const KEEP_MIN_ARMY: usize = 6;
+/// The Castle is a late-game surplus purchase, so it wants a standing army...
+const CASTLE_MIN_ARMY: usize = 6;
+/// ...and this much gold still in the bank AFTER paying for it. Tuned down
+/// from 400 against sims: games converge in 8-12 minutes and the mines run dry
+/// before that, so a stricter test meant tier 3 simply never happened.
+const CASTLE_SPARE_GOLD: u32 = 300;
 /// Slam is worth casting once this many enemies stand in (or just outside) it.
 const SLAM_MIN_TARGETS: usize = 3;
 /// Slack added to `HERO_ABILITY_RADIUS` when counting slam targets.
@@ -122,7 +140,9 @@ impl Plugin for AiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AiState>()
             .add_systems(Startup, ai_apply_env)
-            .add_systems(Update, (ai_toggle_hotkey, ai_think));
+            // `ai_think` after `FogSet`: the scripted commander plans from
+            // this frame's visibility, exactly like the bridge seats.
+            .add_systems(Update, (ai_toggle_hotkey, ai_think.after(FogSet)));
     }
 }
 
@@ -137,9 +157,19 @@ struct AiBrain {
     /// trip, or the Barracks spends it en route and the build is refused on
     /// arrival (observed: three expansions ordered, none placed, income zero).
     expansion_pending: bool,
-    /// Own TownHall count at the last thought — logged on change, which is how
-    /// an expansion completing (or being razed) shows up in a sim trace.
+    /// Own hall count at the last thought — logged on change, which is how an
+    /// expansion completing (or being razed) shows up in a sim trace.
     last_halls: usize,
+    /// Highest hall tier we held at the last thought, logged on change so a
+    /// tier-up is visible in a sim trace without reading the event feed.
+    last_tier: u32,
+    /// A tier-up is wanted but not yet paid for. Ring-fences the price against
+    /// army production for the same reason the expansion does: continuous
+    /// Footmen keep a treasury permanently a few gold short of a 320g upgrade,
+    /// and the AI would "want" to tech forever. Unlike the expansion this
+    /// clears on the very next thought once the order lands, because an
+    /// upgrade is paid the instant it is accepted — nobody has to walk there.
+    tierup_pending: bool,
     harvest_counter: u32,
     army_counter: u32,
     /// Catapults queued so far — paced against `army_counter`.
@@ -156,6 +186,8 @@ impl AiBrain {
             pending_build: None,
             expansion_pending: false,
             last_halls: 0,
+            last_tier: 1,
+            tierup_pending: false,
             harvest_counter: 0,
             army_counter: 0,
             siege_counter: 0,
@@ -268,6 +300,9 @@ struct BuildingInfo {
     pos: Vec3,
     done: bool,
     queue_len: usize,
+    /// Already converting to its next tier — not a candidate for another
+    /// upgrade order, and the reason the tier-up reserve can be released.
+    upgrading: bool,
 }
 
 /// A living gold mine, seen from one team's point of view.
@@ -307,6 +342,7 @@ type UnitQuery<'w, 's> = Query<
         Option<&'static MoveTo>,
         Option<&'static Carrying>,
         Option<&'static Hero>,
+        Option<&'static AbilityCooldowns>,
     ),
 >;
 
@@ -320,6 +356,7 @@ type BuildingQuery<'w, 's> = Query<
         &'static Transform,
         Option<&'static UnderConstruction>,
         Option<&'static mut TrainingQueue>,
+        Option<&'static Upgrading>,
     ),
 >;
 
@@ -335,8 +372,10 @@ fn ai_think(
     economies: Res<Economies>,
     records: Res<HeroRecords>,
     nav: Res<NavGrid>,
+    fog: Res<FogGrids>,
     mut commands: Commands,
     mut casts: EventWriter<CastAbility>,
+    mut upgrades: EventWriter<UpgradeBuilding>,
     units: UnitQuery,
     mut buildings: BuildingQuery,
     nodes: NodeQuery,
@@ -366,8 +405,10 @@ fn ai_think(
             &economies,
             &records,
             &nav,
+            fog.get(team),
             &mut commands,
             &mut casts,
+            &mut upgrades,
             &units,
             &mut buildings,
             &nodes,
@@ -384,8 +425,13 @@ fn think(
     economies: &Economies,
     records: &HeroRecords,
     nav: &NavGrid,
+    // This team's fog. Every enemy fact below is drawn through it, so the
+    // scripted commander plans from the same picture a bridge commander is
+    // sent and the same one the player is shown.
+    fog: &FogGrid,
     commands: &mut Commands,
     casts: &mut EventWriter<CastAbility>,
+    upgrades: &mut EventWriter<UpgradeBuilding>,
     units: &UnitQuery,
     buildings: &mut BuildingQuery,
     nodes: &NodeQuery,
@@ -402,7 +448,7 @@ fn think(
     // Own living heroes: (entity, position, ability ready).
     let mut own_heroes: Vec<(Entity, Vec3, bool)> = Vec::new();
 
-    for (entity, unit, team, tf, order, move_to, carrying, hero) in units.iter() {
+    for (entity, unit, team, tf, order, move_to, carrying, hero, cooldowns) in units.iter() {
         let info = UnitInfo {
             entity,
             // Flattened to the ground plane. Every comparison below is a
@@ -421,7 +467,13 @@ fn think(
         };
         if *team == me {
             if let Some(hero) = hero {
-                own_heroes.push((entity, info.pos, hero.ability_ready()));
+                // "Can the Champion slam right now" is asked of the ability
+                // table, not of a hard-coded mana number: slot 0 is whatever
+                // this hero class's first ability is.
+                let ready = abilities_of_unit(unit.kind)
+                    .first()
+                    .is_some_and(|def| ability_ready(def, Some(hero), cooldowns, 0));
+                own_heroes.push((entity, info.pos, ready));
             }
             // Everything that isn't a Worker is army: heroes, Archers,
             // Catapults and Raiders all join waves with no extra wiring.
@@ -429,7 +481,12 @@ fn think(
                 UnitKind::Worker => workers.push(info),
                 _ => army.push(info),
             }
-        } else {
+        } else if fog.sees(info.pos) {
+            // Enemy units enter the plan only while somebody of ours is
+            // looking at them, and are never remembered afterwards. This is
+            // the single line that ends the omniscient-commander asymmetry:
+            // everything below — defence, worker flight, Slam timing — was
+            // reading the ECS directly and now reads what this team can see.
             enemy_any.push(info.pos);
             if !is_flying_kind(unit.kind) {
                 enemy_ground.push(info.pos);
@@ -446,9 +503,15 @@ fn think(
     let mut enemy_buildings: Vec<Vec3> = Vec::new();
     let mut queued_supply: u32 = 0;
     let mut hero_queued = false;
-    for (entity, building, team, tf, under, queue) in buildings.iter() {
+    for (entity, building, team, tf, under, queue, upgrading) in buildings.iter() {
         if *team != me {
-            enemy_buildings.push(tf.translation);
+            // Seen right now. Structures we merely REMEMBER are appended
+            // straight after, because a building does not walk away: acting on
+            // a scouted barracks long after the scout died is memory, not
+            // cheating, and it is exactly what a human does.
+            if fog.sees(tf.translation) {
+                enemy_buildings.push(tf.translation);
+            }
             continue;
         }
         let queue_len = queue.as_ref().map(|q| q.queue.len()).unwrap_or(0);
@@ -463,8 +526,10 @@ fn think(
             pos: tf.translation,
             done: under.is_none(),
             queue_len,
+            upgrading: upgrading.is_some(),
         });
     }
+    enemy_buildings.extend(fog.ghosts().map(|g| g.pos));
 
     // Gold mines, tagged with whether our economy already reaches them. Trees
     // are deliberately ignored: lumber clusters are dense and near the base,
@@ -477,7 +542,9 @@ fn think(
         let pos = flat(tf.translation);
         let hall_within = |done_only: bool| {
             own_buildings.iter().any(|b| {
-                b.kind == BuildingKind::TownHall
+                // Any rung of the ladder is a drop-off, so upgrading the hall
+                // by a mine never un-claims that mine.
+                is_hall(b.kind)
                     && (b.done || !done_only)
                     && xz_dist(b.pos, pos) < MINE_CLAIM_RADIUS
             })
@@ -496,7 +563,7 @@ fn think(
     let claimed_gold: u32 = mines.iter().filter(|m| m.claimed).map(|m| m.remaining).sum();
     let halls = own_buildings
         .iter()
-        .filter(|b| b.kind == BuildingKind::TownHall && b.done)
+        .filter(|b| is_hall(b.kind) && b.done)
         .count();
     if halls != brain.last_halls {
         info!(
@@ -573,14 +640,17 @@ fn think(
         let under_construction = |kind: BuildingKind| {
             own_buildings.iter().any(|b| b.kind == kind && !b.done)
         };
+        // Hall bookkeeping walks the whole ladder: a base whose TownHall
+        // became a Keep still has a hall, and must not re-open the "we have no
+        // hall, build one" branch or plan a second expansion behind its back.
+        let halls_total = own_buildings.iter().filter(|b| is_hall(b.kind)).count();
+        let hall_going_up = own_buildings.iter().any(|b| is_hall(b.kind) && !b.done);
 
         // A second mining base, planned before it is affordable so the site is
         // already vetted (unclaimed, undefended-by-them, buildable) when the
         // money lands. `None` while a TownHall is already going up: one
         // expansion at a time, like every other line in this build order.
-        let expansion = if count_of(BuildingKind::TownHall) > 0
-            && !under_construction(BuildingKind::TownHall)
-        {
+        let expansion = if halls_total > 0 && !hall_going_up {
             plan_expansion(
                 me,
                 &own_buildings,
@@ -594,7 +664,7 @@ fn think(
             None
         };
 
-        let want = if count_of(BuildingKind::TownHall) == 0 {
+        let want = if halls_total == 0 {
             Some(BuildingKind::TownHall)
         } else if headroom < SUPPLY_BUFFER && !under_construction(BuildingKind::Farm) {
             Some(BuildingKind::Farm)
@@ -629,7 +699,7 @@ fn think(
                 // main base area has been razed.
                 let anchor = own_buildings
                     .iter()
-                    .find(|b| b.kind == BuildingKind::TownHall)
+                    .find(|b| is_hall(b.kind))
                     .or_else(|| own_buildings.first())
                     .map(|b| b.pos)
                     .unwrap_or(base);
@@ -663,6 +733,97 @@ fn think(
                                 plan.claimed_gold,
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- tier up the main hall ------------------------------------------------
+    // The minimal scripted tech ladder: once the opening is over (a Barracks
+    // standing and a real army on the field) push one hall to Keep, and much
+    // later, if the treasury is genuinely fat, to Castle. Deliberately modest —
+    // the point is that tiers actually OCCUR in scripted matches, so tier-gated
+    // content has something to gate on and era-validation runs have something
+    // to measure. Income comes first: an expansion in flight blocks a tier-up,
+    // because a second mine pays for every future Keep and a Keep pays for none.
+    let hall_upgrading = own_buildings.iter().any(|b| is_hall(b.kind) && b.upgrading);
+    let current_tier = own_buildings
+        .iter()
+        .filter(|b| is_hall(b.kind) && b.done)
+        .map(|b| building_tier(b.kind))
+        .max()
+        .unwrap_or(0);
+    if current_tier != brain.last_tier {
+        info!(
+            "[ai {me:?}] hall tier: {} -> {current_tier}",
+            brain.last_tier
+        );
+        brain.last_tier = current_tier;
+    }
+
+    // The hall we push up the ladder: the highest rung we hold, nearest home
+    // among equals — so the tier climbs on one main base instead of creeping
+    // sideways across every expansion.
+    let mut main_hall: Option<&BuildingInfo> = None;
+    for b in &own_buildings {
+        if !b.done || !is_hall(b.kind) || b.upgrading {
+            continue;
+        }
+        let better = main_hall.is_none_or(|cur| {
+            let (cur_tier, b_tier) = (building_tier(cur.kind), building_tier(b.kind));
+            b_tier > cur_tier
+                || (b_tier == cur_tier && xz_dist(b.pos, base) < xz_dist(cur.pos, base))
+        });
+        if better {
+            main_hall = Some(b);
+        }
+    }
+
+    let barracks_up = own_buildings
+        .iter()
+        .any(|b| b.kind == BuildingKind::Barracks && b.done);
+    let mut tierup_reserve = (0u32, 0u32);
+    brain.tierup_pending = false;
+    if !hall_upgrading && !saving_for_expansion && !brain.expansion_pending {
+        if let Some(hall) = main_hall {
+            if let Some((cost_gold, cost_lumber, _)) = upgrade_cost(hall.kind) {
+                let tier = building_tier(hall.kind);
+                let wanted = match tier {
+                    // Keep: as soon as the opening is genuinely over.
+                    1 => barracks_up && army.len() >= KEEP_MIN_ARMY,
+                    // Castle: a late luxury, and only out of surplus — the
+                    // gold test is against what is left AFTER the price, so a
+                    // Castle never comes out of the army budget.
+                    _ => {
+                        army.len() >= CASTLE_MIN_ARMY
+                            && gold.saturating_sub(cost_gold) >= CASTLE_SPARE_GOLD
+                    }
+                };
+                if wanted {
+                    if gold >= cost_gold && lumber >= cost_lumber {
+                        gold -= cost_gold;
+                        lumber -= cost_lumber;
+                        upgrades.write(UpgradeBuilding {
+                            building: hall.entity,
+                        });
+                        info!(
+                            "[ai {me:?}] teching up: {} -> {} at ({:.0},{:.0}) for \
+                             {cost_gold}g {cost_lumber}l (army {})",
+                            building_name(hall.kind),
+                            building_name(
+                                building_upgrades_to(hall.kind).expect("a cost implies a tier")
+                            ),
+                            hall.pos.x,
+                            hall.pos.z,
+                            army.len(),
+                        );
+                    } else {
+                        // Ring-fence: hold the price out of the army's reach
+                        // until the deliveries add up, or the Barracks will
+                        // keep the treasury a Footman short of it forever.
+                        brain.tierup_pending = true;
+                        tierup_reserve = (cost_gold, cost_lumber);
                     }
                 }
             }
@@ -731,9 +892,9 @@ fn think(
 
     if want_hero {
         let (hero_gold, hero_lumber, _) = hero_train_cost(records, me);
-        let hall = own_buildings
-            .iter()
-            .find(|b| b.done && b.kind == BuildingKind::TownHall);
+        // Hero training and revival happen at any finished rung of the hall
+        // ladder — a team that teched to Keep must not lose its hero.
+        let hall = own_buildings.iter().find(|b| b.done && is_hall(b.kind));
         if let Some(hall) = hall {
             if gold >= hero_gold && lumber >= hero_lumber && headroom >= hero_supply {
                 gold -= hero_gold;
@@ -764,25 +925,32 @@ fn think(
         reserve_gold += stats.cost_gold;
         reserve_lumber += stats.cost_lumber;
     }
+    // ...and for a tier-up we have decided on but cannot yet pay for.
+    reserve_gold += tierup_reserve.0;
+    reserve_lumber += tierup_reserve.1;
 
     for b in &own_buildings {
         if !b.done {
             continue;
         }
-        match b.kind {
-            BuildingKind::TownHall => {
-                if worker_count >= TARGET_WORKERS || b.queue_len > 0 {
-                    continue;
-                }
-                let s = unit_stats(UnitKind::Worker);
-                if gold >= s.cost_gold && lumber >= s.cost_lumber && headroom >= s.supply {
-                    gold -= s.cost_gold;
-                    lumber -= s.cost_lumber;
-                    headroom -= s.supply;
-                    worker_count += 1;
-                    orders.push((b.entity, UnitKind::Worker));
-                }
+        // A Keep and a Castle are the hall, so worker production keys off the
+        // ladder rather than the tier-1 kind — teching up must not stop the
+        // economy that paid for it.
+        if is_hall(b.kind) {
+            if worker_count >= TARGET_WORKERS || b.queue_len > 0 {
+                continue;
             }
+            let s = unit_stats(UnitKind::Worker);
+            if gold >= s.cost_gold && lumber >= s.cost_lumber && headroom >= s.supply {
+                gold -= s.cost_gold;
+                lumber -= s.cost_lumber;
+                headroom -= s.supply;
+                worker_count += 1;
+                orders.push((b.entity, UnitKind::Worker));
+            }
+            continue;
+        }
+        match b.kind {
             BuildingKind::Barracks => {
                 if b.queue_len >= BARRACKS_QUEUE_MAX {
                     continue;
@@ -800,6 +968,8 @@ fn think(
                     UnitKind::Raider
                 } else if next % ARCHER_EVERY_NTH == 0 {
                     UnitKind::Archer
+                } else if next % SPEARMAN_EVERY_NTH == 0 {
+                    UnitKind::Spearman
                 } else {
                     UnitKind::Footman
                 };
@@ -856,7 +1026,7 @@ fn think(
     }
 
     for (entity, kind) in orders {
-        if let Ok((_, _, _, _, _, Some(mut queue))) = buildings.get_mut(entity) {
+        if let Ok((_, _, _, _, _, Some(mut queue), _)) = buildings.get_mut(entity) {
             queue.queue.push_back(kind);
         }
     }
@@ -877,7 +1047,7 @@ fn think(
             .filter(|e| e.distance(*pos) <= slam_radius)
             .count();
         if nearby >= SLAM_MIN_TARGETS {
-            casts.write(CastAbility { caster: *hero });
+            casts.write(CastAbility::new(*hero));
         }
     }
 
@@ -899,8 +1069,7 @@ fn think(
         } else if now - brain.wave_started > WAVE_TIMEOUT {
             // Stalled push: re-aim at whatever enemy building is closest.
             let centroid = army.iter().fold(Vec3::ZERO, |a, u| a + u.pos) / army.len() as f32;
-            brain.wave_target =
-                nearest_pos(&enemy_buildings, centroid).unwrap_or(me.enemy().base_pos());
+            brain.wave_target = wave_objective(me, fog, nav, &enemy_buildings, centroid);
             brain.wave_started = now;
             for u in &army {
                 commands
@@ -919,7 +1088,7 @@ fn think(
     } else if army.len() >= brain.next_wave_size {
         brain.wave_active = true;
         brain.wave_started = now;
-        brain.wave_target = nearest_pos(&enemy_buildings, base).unwrap_or(me.enemy().base_pos());
+        brain.wave_target = wave_objective(me, fog, nav, &enemy_buildings, base);
         brain.next_wave_size = (brain.next_wave_size + WAVE_SIZE_STEP).min(WAVE_SIZE_CAP);
         let target = brain.wave_target;
         for u in &army {
@@ -980,7 +1149,7 @@ fn plan_expansion(
 
     let home = own_buildings
         .iter()
-        .find(|b| b.kind == BuildingKind::TownHall)
+        .find(|b| is_hall(b.kind))
         .map(|b| b.pos)
         .unwrap_or(me.base_pos());
     let enemy_base = me.enemy().base_pos();
@@ -1177,6 +1346,41 @@ fn nearest_pos(candidates: &[Vec3], from: Vec3) -> Option<Vec3> {
                 .partial_cmp(&b.distance(from))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
+}
+
+/// Where a wave marches, in strict order of preference:
+///
+/// 1. the nearest enemy structure this team KNOWS about — seen right now, or
+///    remembered from a scout that has since died;
+/// 2. failing that, the opponent's starting base, as long as we have never
+///    actually looked at it. It is the one enemy position every player is born
+///    knowing, and walking there is both an attack and a scouting run;
+/// 3. failing that, the nearest patch of map this team has never seen.
+///
+/// Clause 3 is what keeps fog from turning into a stalemate machine, and it is
+/// the minimal explore behaviour the scripted AI needed to survive this change.
+/// Before fog, "attack the enemy base" could never be wrong, because the enemy
+/// base was always in the snapshot. Now an opponent that loses its main and
+/// lives on an unscouted expansion is genuinely lost — and an army that only
+/// ever walks to a place it has already confirmed is empty would never find
+/// it, so the match would run to the time cap with both sides intact. Sweeping
+/// the unexplored is the cheapest behaviour that makes the win condition
+/// reachable again; it is not clever, and it is not meant to be.
+fn wave_objective(
+    me: Team,
+    fog: &FogGrid,
+    nav: &NavGrid,
+    known_enemy_buildings: &[Vec3],
+    from: Vec3,
+) -> Vec3 {
+    if let Some(target) = nearest_pos(known_enemy_buildings, from) {
+        return target;
+    }
+    let their_home = me.enemy().base_pos();
+    if !fog.known(their_home) {
+        return their_home;
+    }
+    nearest_unexplored(fog, from, nav).unwrap_or(their_home)
 }
 
 /// Prefer an idle worker, otherwise the nearest one that is merely harvesting.

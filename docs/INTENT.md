@@ -33,7 +33,11 @@ There is now one list of verbs and one compiler.
 `ui.rs` and `bridge.rs` contain zero writes to `Order`, `TrainingQueue`,
 `RallyPoint`, `TargetPriority`, `RetreatPolicy`, `LeashPolicy`,
 `AutoCastPolicy`, `SquadId`, `DoctrineTemplate` or `SquadOrders`, and zero
-sends of `CastAbility` / `BuyItem` / `UseItem` / `Surrender`. Both write
+sends of `CastAbility` / `BuyItem` / `UseItem` / `UpgradeBuilding` /
+`Surrender`. Both files used to carry a *field-for-field identical* four-writer
+`SystemParam` bundle (`CardActions` in ui.rs, `CmdEvents` in bridge.rs) —
+independent convergence on the same shape, which is exactly the duplication
+this layer removes. Both are gone; intent.rs owns the four writers. Both write
 `SubmitIntent` events and nothing else. This is grep-checkable, and checking it
 is the point: the invariant is only worth having if a regression is visible.
 
@@ -70,7 +74,7 @@ player expressing anything, so it stays where it is.
 
 ## The vocabulary
 
-23 verbs, grouped by what they are for. The serde shape **is** the bridge's
+24 verbs, grouped by what they are for. The serde shape **is** the bridge's
 historical wire format — tag is `type`, entity ids are `Entity::to_bits`,
 positions are flat `x`/`z` — so `commands.json` parses straight into `Intent`
 with no translation layer. Backward compatibility is not an adapter here; it is
@@ -92,13 +96,14 @@ the schema.
 |---|---|
 | `build` | `{worker:id, kind:"Farm", x, z}` |
 | `train` | `{building:id, unit:"Footman"}` |
+| `upgrade` | `{building:id}` — tier up in place (TownHall→Keep→Castle) |
 | `cancel` | `{building:id, index:n}` |
 | `rally` | `{building:id, x, z}` or `{building:id, target:id}` |
 
 ### Abilities & items
 | Verb | Shape |
 |---|---|
-| `cast` | `{hero:id}` (alias `caster`) — hero or own ability building |
+| `cast` | `{hero:id, ability?}` (alias `caster`) — hero or own ability building |
 | `buy` | `{shop:id, item:"HealingPotion"}` — buyer implied by team |
 | `use_item` | `{slot:0}` |
 
@@ -108,7 +113,7 @@ the schema.
 | `priority` | `{units:[id], classes:["Hero","Siege"]}` | `classes` empty |
 | `retreat` | `{units:[id], below:0.35, x, z}` | `below` 0/absent |
 | `leash` | `{units:[id], x, z, radius:20}` | `radius` ≤ 0 |
-| `autocast` | `{units:[id], min_enemies:3}` | `min_enemies` 0/absent |
+| `autocast` | `{units:[id], min_enemies:3, ability?}` | `min_enemies` 0/absent |
 | `squad` | `{units:[id], id:1}` | `id` absent |
 | `posture` | `{id:1, posture:{type:"defend"\|"push"\|"escort"\|"forage", …}}` | `posture` absent |
 | `template` | `{building:id, squad, retreat, priority, autocast}` | all pieces absent |
@@ -118,6 +123,21 @@ the schema.
 |---|---|
 | `autopilot` | `{on:true}` — hand this faction to the scripted AI |
 | `surrender` | `{}` |
+
+### The ability selector
+
+`cast` and `autocast` take an optional `ability`, and it is **untagged** on the
+wire: a bare `2` is a slot index, a bare `"Slam"` is an ability id
+(case-insensitive). Omit it and you get the caster's first unlocked ability —
+so `{"type":"cast","hero":123}` means exactly what it always meant.
+
+There is one type for all three jobs: `shared::AbilitySelector` is the intent
+field, the `CastAbility` event payload and the wire form. A slot cannot be
+named three slightly different ways because there is only one way to name it.
+The two interfaces reach it from opposite ends and meet in the middle: the UI
+is **index-native** (a hotkey *is* a slot — `[R]`/`[Y]`/`[D]` for heroes,
+`[C]`/`[J]`/`[M]` for buildings), while a commander reading the snapshot
+naturally writes the id. Both spellings compile to the same value.
 
 Every clear-form is spelled *inside* the verb rather than as a separate verb.
 That is what lets a coarse UI toggle and a parameterised bridge command land on
@@ -147,6 +167,43 @@ right-click on a gold mine with a mixed selection submits a `harvest` for the
 workers and a `move` for everyone else, which is what it always meant.
 
 ---
+
+## Knowability: where fog validation lives
+
+Fog of war (docs/FOG.md) is "one rule of knowability, computed once, rendered
+twice". The compiler is where that rule stops being about *rendering*.
+
+`Intent::Attack` is refused when the issuing team cannot see or remember the
+target — `FogGrid::knows_entity(id, pos)`, meaning visible now **or** a
+remembered structure — with the error `cmd N: target X is not visible`. That
+check used to live in `bridge.rs::apply_batch`, where it bound exactly one
+seat. It now binds whoever is speaking, which is the only version of the rule
+worth having: a snapshot that will not show you an enemy must not accept orders
+against it either, or the filtering is decoration.
+
+Mechanically this mostly *formalises* what was already true — the human's
+right-click picker skips fogged enemies, so a human could not click one anyway.
+The value is that it is now enforced in one place for both seats instead of
+being a property of two independent pieces of code that happened to agree.
+
+`attack` is the only verb that consults fog, matching master's behaviour
+exactly. `harvest`, `follow`, `rally` and `posture escort` name neutral nodes
+or the issuer's own units, which need no visibility test.
+
+### The one residual asymmetry
+
+The compiler's rule is `knows_entity` (visible **or** remembered structure).
+The human's right-click picker uses `sees` (visible only). So a *remembered but
+currently unseen* enemy building is a legal target for a bridge commander and
+un-clickable for the human. The compiler would accept the human's intent
+happily — the UI simply has no gesture that produces it.
+
+That is a real capability gap in the direction THESIS.md cares about (the AI
+can express something the human cannot), and it is now visible precisely
+because there is one rule to compare the gestures against. Closing it is a UI
+job — let a right-click on a building ghost produce an `Intent::Attack` — and
+it is filed as follow-up rather than fixed here, because this bead is a
+refactor and that would be new behaviour.
 
 ## The replay log
 
@@ -253,11 +310,15 @@ Verified end-to-end against a live `WC3_BRIDGE=1` seat driven by
   `BuildingOut`, `MeOut`, `MapOut`, `SquadOut` and every other snapshot struct
   — the diff against master touches none of them.
 - Every historical command shape still parses, including the `caster` alias on
-  `cast` and the `use_item` rename (`intent::tests::legacy_wire_commands_parse`
-  covers all 23 verbs and their optional-field forms).
+  `cast`, the `use_item` rename and the untagged ability selector
+  (`intent::tests::legacy_wire_commands_parse` covers all 24 verbs and their
+  optional-field forms).
 - `seq` gating, `last_seq`, the 4 Hz poll and the 1 Hz snapshot are untouched.
 - `tools/bridge_send.py`, `tools/bridge_view.py`, `tools/bridge_wait.py` and
   every COMMANDER_BRIEF.md flow work without modification.
+- Verified live after the master merge: `upgrade` and both spellings of a
+  selector-form `cast` flow through the compiler and land in the log, and the
+  16-key snapshot (15 + `fog`) is byte-shape identical.
 
 No new commands were added, and none were removed. **This bead changed no game
 behaviour** — it changed how many places can cause it.
@@ -276,6 +337,15 @@ behaviour** — it changed how many places can cause it.
   treats source as descriptive rather than authoritative. `IntentSource` will
   want a third variant, and conflict policy (last-writer-wins vs. veto) is the
   real design question, not plumbing.
+- **Closing the ghost-attack gap.** Give the human a gesture for attacking a
+  remembered enemy building, so the picker matches the compiler's `knows_entity`
+  rule (see above). Small, and it removes the one place the AI can currently
+  express something the human cannot.
+- **Ability ids parse inconsistently.** Unit, building and item names go
+  through `normalize_name` (case, spaces, dashes and underscores are all
+  noise), but ability ids use plain `eq_ignore_ascii_case` — so `"CallToArms"`
+  and `"calltoarms"` work while `"Call to Arms"` does not. Pre-existing, and
+  now more visible for sitting next to the other parsers in one file.
 - **Chain of Command (docs/TEMPO.md).** The spike asked for "a single choke
   point where player commands become engine orders" and budgeted 23 call sites
   across three files. There is now one function. `PendingOrder` latency becomes

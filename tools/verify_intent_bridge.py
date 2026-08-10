@@ -22,8 +22,19 @@ LOG = "bridge/intent_log.jsonl"
 EXPECTED_TOP_KEYS = {
     "t", "my_team", "seq_applied", "errors", "game_over", "me", "map",
     "unlocked", "units", "buildings", "squads", "bounties", "mines",
-    "trees_near", "events",
+    "trees_near", "events", "fog",
 }
+
+
+def upgrade_price(st):
+    """What the catalog says the hall's next tier costs."""
+    with open(os.path.join(SEAT, "catalog.json")) as f:
+        cat = json.load(f)
+    for b in cat["buildings"]:
+        up = b.get("upgrades_to")
+        if b["id"] == "TownHall" and up:
+            return up["cost_gold"], up["cost_lumber"]
+    raise SystemExit("FAIL: catalog has no TownHall upgrade")
 
 
 def read_state():
@@ -75,7 +86,10 @@ def main():
     assert workers and halls, "FAIL: expected workers and a town hall"
 
     movers = [u["id"] for u in workers[:2]]
+    harvesters = [u["id"] for u in workers[2:5]]
     hall = halls[0]["id"]
+    assert st["trees_near"], "FAIL: no trees in the snapshot"
+    tree = st["trees_near"][0]["id"]
 
     # A batch mixing every intent family, valid and invalid, so both the
     # success path and the error channel are exercised in one go.
@@ -88,10 +102,19 @@ def main():
         {"type": "squad", "units": movers, "id": 2},
         {"type": "posture", "id": 2,
          "posture": {"type": "defend", "x": 60.0, "z": 60.0, "radius": 15.0}},
+        # --- verbs the master merge added -----------------------------------
+        # Lumber for the tier-up below: this seat has no AI earning it.
+        {"type": "harvest", "units": harvesters, "target": tree},
+        # `cast` with an ability selector, in both spellings. The TownHall's
+        # Call to Arms is slot 0, so the index form is legal and the id form
+        # names the same slot.
+        {"type": "cast", "caster": hall, "ability": 0},
+        {"type": "cast", "caster": hall, "ability": "calltoarms"},
         # --- deliberately invalid, to prove the error channel is unchanged --
         {"type": "attack", "units": movers, "target": 999999},
         {"type": "build", "worker": movers[0], "kind": "Nonsense", "x": 0, "z": 0},
         {"type": "priority", "units": movers, "classes": ["Wizard"]},
+        {"type": "cast", "caster": hall, "ability": "Fireball"},
         {"type": "nonsense_verb", "units": movers},
     ])
     st = wait_for_seq(seq)
@@ -105,6 +128,8 @@ def main():
     assert any("target 999999 not found" in e for e in errs), "FAIL: missing attack error"
     assert any("unknown building kind 'Nonsense'" in e for e in errs), "FAIL: missing build error"
     assert any("unknown target class 'Wizard'" in e for e in errs), "FAIL: missing class error"
+    assert any("has no ability" in e and "Fireball" in e for e in errs), \
+        "FAIL: missing ability-selector error"
     assert any("unrecognized command" in e for e in errs), "FAIL: missing parse error"
     assert all(e.startswith("cmd ") for e in errs), f"FAIL: error prefix changed: {errs}"
     print(f"[4] {len(errs)} validation errors, all with historical `cmd <i>:` prefix")
@@ -129,6 +154,25 @@ def main():
     print(f"[5] effects confirmed: order={[u['order'] for u in moved]}, squad=2, "
           f"retreat+prio policies set, queue={hall_out['queue']}")
 
+    # --- second batch: the tier-up, once the lumber is actually in ----------
+    gold, lumber = upgrade_price(st)
+    print(f"[6] waiting on {gold}g {lumber}l for the tier-up...")
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        st = read_state()
+        if st["me"]["gold"] >= gold and st["me"]["lumber"] >= lumber:
+            break
+        time.sleep(1.0)
+    else:
+        raise SystemExit("FAIL: never accumulated enough for the upgrade")
+    seq = send([{"type": "upgrade", "building": hall}])
+    st = wait_for_seq(seq)
+    assert not [e for e in st["errors"] if "upgrade" in e or "afford" in e], \
+        f"FAIL: upgrade rejected: {st['errors']}"
+    hall_out = next(b for b in st["buildings"] if b["id"] == hall)
+    print(f"[7] upgrade accepted at {st['me']['gold']}g {st['me']['lumber']}l; "
+          f"hall now {hall_out['kind']}")
+
     # --- the replay spine ---------------------------------------------------
     with open(LOG) as f:
         lines = [json.loads(l) for l in f if l.strip()]
@@ -143,12 +187,19 @@ def main():
     ok = [r for r in records if r["ok"]]
     bad = [r for r in records if not r["ok"]]
     verbs_ok = {r["verb"] for r in ok}
-    for verb in ("move", "rally", "train", "retreat", "priority", "squad", "posture"):
+    for verb in ("move", "rally", "train", "retreat", "priority", "squad",
+                 "posture", "upgrade", "cast"):
         assert verb in verbs_ok, f"FAIL: '{verb}' intent was never applied cleanly"
-    assert {r["verb"] for r in bad} == {"attack", "build", "priority"}, \
+    assert {r["verb"] for r in bad} == {"attack", "build", "priority", "cast"}, \
         f"FAIL: unexpected rejected verbs {[r['verb'] for r in bad]}"
+    # The untagged ability selector must survive the round trip into the log.
+    casts = [r for r in ok if r["verb"] == "cast"]
+    assert any(r["intent"].get("ability") == 0 for r in casts), \
+        "FAIL: index selector lost in the log"
+    assert any(r["intent"].get("ability") == "calltoarms" for r in casts), \
+        "FAIL: id selector lost in the log"
     assert all(r["source"] == "bridge" for r in records), "FAIL: source mislabelled"
-    print(f"[6] intent log: {len(records)} records ({len(ok)} applied, {len(bad)} rejected)")
+    print(f"[8] intent log: {len(records)} records ({len(ok)} applied, {len(bad)} rejected)")
     print("    sentences:")
     for r in records:
         mark = " " if r["ok"] else "!"

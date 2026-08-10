@@ -37,17 +37,44 @@
 //!
 //! The bridge does not act on the world at all any more. It deserializes each
 //! command into a `shared::Intent` and submits it; intent.rs validates and
-//! applies it — the very same compiler the human's mouse gestures go through.
-//! That is stronger than the old promise that the bridge "acts only through the
-//! primitives the UI uses", because it is no longer a promise: there is one
-//! implementation, so the two seats cannot drift apart. See docs/INTENT.md.
+//! applies it — the very same compiler the human's mouse gestures go through,
+//! with the same ownership checks, the same fog rule and the same error
+//! strings. That is stronger than the old promise that the bridge "acts only
+//! through the primitives the UI uses", because it is no longer a promise:
+//! there is one implementation, so the two seats cannot drift apart.
+//! See docs/INTENT.md.
 //!
 //! The wire format did not change, because the wire format *is* the schema:
 //! `Intent`'s serde shape is the historical command shape, field for field.
 //!
-//! Enemy units and buildings are reported in the snapshot (full vision parity
-//! with the scripted AI) but enemy gold/lumber never is — and a seat only ever
-//! sees its *own* squads and policies, never the opponent's command structure.
+//! Enemy gold/lumber is never reported, and a seat only ever sees its *own*
+//! squads and policies, never the opponent's command structure.
+//!
+//! FOG OF WAR. Every seat's snapshot is filtered through that seat's team's
+//! `shared::FogGrid` — the same grid ui.rs paints for the player at the
+//! keyboard. The bridge does not decide what is knowable; it renders a
+//! decision made once in shared.rs. Concretely:
+//!
+//!   * enemy `units` appear only while currently visible. They are not
+//!     remembered: an army that walks out of sight is simply gone from the
+//!     snapshot, because a remembered army is a lie a commander would act on.
+//!   * enemy `buildings` appear as themselves while visible, and afterwards as
+//!     REMEMBERED GHOSTS carrying a `last_seen` game-time stamp and the hp/
+//!     queue state observed at that moment. A ghost can be stale — a razed
+//!     barracks keeps its ghost until somebody looks at the spot again. Own
+//!     buildings never carry `last_seen`, so the field's presence is exactly
+//!     the "this is memory, not observation" flag.
+//!   * `bounties` only while visible (see below).
+//!   * `mines`, `trees_near`, `map` are unfiltered map GEOGRAPHY (see below).
+//!
+//! `WC3_FOG=0` restores the old omniscient snapshot with no other change.
+//! The top-level `fog` object reports which mode is in force plus this seat's
+//! explored/visible fraction of the map.
+//!
+//! The other half of the fog rule — refusing an `attack` on a target the seat
+//! cannot see or remember, with the error `cmd N: target X is not visible` —
+//! now lives in intent.rs, because it binds *whoever is speaking* rather than
+//! this file's seat. The behaviour and the string are unchanged.
 //!
 //! Everything in a snapshot is relative to the seat that receives it: `me` is
 //! the seat's economy, `my_team` names it, `trees_near` are the trees nearest
@@ -56,11 +83,10 @@
 //!
 //! Beyond one-shot orders the commander can also install *doctrine*: standing
 //! policies (`priority`, `retreat`, `leash`, `autocast`) and squads
-//! (`squad`, `posture`). These are intents like any other; the compiler writes
-//! the components and the `SquadOrders` resource, and doctrine.rs and combat.rs
-//! act on them. Setting a policy is therefore as cheap as any other command,
-//! and a commander that polls slowly still gets sensible behaviour between
-//! polls.
+//! (`squad`, `posture`). The bridge only writes those components and the
+//! `SquadOrders` resource — doctrine.rs and combat.rs act on them. Setting a
+//! policy is therefore as cheap as any other command, and a commander that
+//! polls slowly still gets sensible behaviour between polls.
 //!
 //! Even a commander that says nothing gets an army: doctrine.rs enrols every
 //! unassigned army unit (workers excepted) into squad 0 and seeds it a `Defend`
@@ -76,6 +102,19 @@
 //! snapshot reports only `buildings[].template: true` for own buildings that
 //! carry one — the commander wrote the details, it knows them.
 //!
+//! Tech tiers are the `upgrade` command: `{"type":"upgrade","building":<id>}`
+//! converts one of our own finished buildings into the next rung of its ladder
+//! in place (`catalog.buildings[].upgrades_to` says which, at what price, for
+//! how long). It is validated like `build` and `train` — ours, finished, has a
+//! next tier, not already converting, affordable — and paid in full the moment
+//! it is accepted, because no worker has to walk anywhere first. The building
+//! keeps its id, position, footprint, rally, template and training queue; what
+//! it loses is production TIME, since a converting building trains nothing.
+//! The snapshot answers back with `buildings[].tier`, `buildings[].upgrading`
+//! (`{to, remaining}`) and the seat's headline `me.tier`. Requirements are
+//! compared by tier, not by kind, so a Castle satisfies anything that asks for
+//! a Keep.
+//!
 //! The catalog is static, so tech *availability* rides along with every
 //! snapshot instead: a top-level `unlocked` map answers "may I build/train this
 //! right now?" for every catalog entry, computed from the seat's own completed
@@ -90,9 +129,22 @@
 //! inventory. The snapshot answers back with `units[].items`,
 //! `units[].militia` and `buildings[].ability_cd`.
 //!
+//! MAP GEOGRAPHY IS PUBLIC, and always was: the `map` block (layout, summary,
+//! chokepoints), `mines` (position and remaining gold) and `trees_near` ship
+//! unfiltered to both seats, exactly as ui.rs paints mines and the terrain
+//! barrier on the minimap from the first frame. Fog hides what the opponent is
+//! DOING, not where the map's furniture sits. Mine `remaining` is the one
+//! deliberate concession: it is the shared clock the whole economy is timed
+//! against (expansion windows, "mines run dry"), both `plan_expansion` and a
+//! commander budget against it, and scouting reveals it anyway — hiding it
+//! would buy a little intel and cost the design principle it serves.
+//!
 //! Bounty caches (bounty.rs) ride along as a top-level `bounties` array —
-//! `pos`, `gold` and `expires_in` — identical for both seats, because treasure
-//! glowing on the ground is public information. The event feed reports them
+//! `pos`, `gold` and `expires_in` — but only while the seat's team can SEE
+//! them. A cache is treasure on open ground, not geography, and open ground
+//! nobody is looking at tells you nothing. This is a real gameplay change:
+//! a Forage squad now hunts only what its team has eyes on. The event feed
+//! reports them
 //! *unattributed*: `"bounty spawned: 300g @(x,z)"` when one appears, and
 //! `"bounty gone @(x,z)"` when one disappears before its deadline, which means
 //! somebody claimed it. The bridge deliberately does not say who: a claim
@@ -161,14 +213,19 @@ impl Plugin for BridgePlugin {
             .add_systems(Startup, bridge_startup)
             .add_systems(
                 Update,
-                // Poll, compile, snapshot — in that order, so a batch read this
-                // frame is applied this frame and its validation errors ride
-                // out in the snapshot written the same frame. The middle step
-                // belongs to intent.rs now; the bridge only brackets it.
+                // Poll, compile, snapshot — in that order, so a batch read
+                // this frame is applied this frame and its validation errors
+                // ride out in the snapshot written the same frame. The middle
+                // step belongs to intent.rs now; the bridge only brackets it.
+                // After `FogSet`: both the snapshot a seat reads and the orders
+                // it may issue are filtered through this frame's fog, never
+                // the previous frame's. (`IntentApply` is itself `.after(FogSet)`,
+                // so the compiler judges visibility against the same grid.)
                 (
                     poll_commands.before(IntentApply),
                     write_snapshot.after(IntentApply),
                 )
+                    .after(FogSet)
                     .run_if(bridge_enabled),
             );
     }
@@ -337,7 +394,6 @@ fn write_catalog(dir: &Path, json: &str) {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Snapshot: world -> bridge/<seat>/state.json
 // ---------------------------------------------------------------------------
@@ -356,6 +412,9 @@ struct StateOut {
     /// where its impassable terrain can be crossed. The human sees the canyon
     /// on screen and on the minimap; this is the same fact in JSON.
     map: MapOut,
+    /// What this seat can currently know. Read it before concluding anything
+    /// from an empty `units` list.
+    fog: FogOut,
     /// `catalog.json` entry id -> may this seat build/train it right now?
     /// Every unit and building in the catalog appears, whether or not it has
     /// requirements, so a commander can gate its build order on one lookup.
@@ -365,8 +424,8 @@ struct StateOut {
     squads: Vec<SquadOut>,
     mines: Vec<MineOut>,
     trees_near: Vec<TreeOut>,
-    /// Live bounty caches, identical for both seats — treasure on the ground is
-    /// public information.
+    /// Bounty caches this seat can currently SEE. Treasure on the ground is
+    /// public information to whoever is looking at that ground.
     bounties: Vec<BountyOut>,
     /// `[[game_time, message], ...]`, oldest first — see `diff_events`.
     events: Vec<(f32, String)>,
@@ -405,6 +464,10 @@ struct MeOut {
     supply_cap: u32,
     /// Fraction of each gold delivery you actually receive (upkeep tax).
     upkeep_rate: f32,
+    /// Highest hall tier you have STANDING and finished: 1 TownHall, 2 Keep,
+    /// 3 Castle. The one number tier-gated content is written against; the
+    /// per-building `tier` field says where each hall individually sits.
+    tier: u32,
     hero_record: Option<HeroRecordOut>,
     hero_cost: CostOut,
 }
@@ -457,6 +520,58 @@ struct UnitOut {
     /// case is "no doctrine", and an empty object per unit is pure noise.
     #[serde(skip_serializing_if = "Option::is_none")]
     policies: Option<PoliciesOut>,
+    /// Own casters only: every ability this unit HAS, with its slot index, its
+    /// own cooldown and whether it is unlocked yet. This is what a `cast`
+    /// command's optional `ability` field selects from. Absent for units with
+    /// no abilities and for the opponent's army.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    abilities: Vec<AbilityOut>,
+}
+
+/// One ability slot of one caster, as the commander sees it. The catalog says
+/// what an ability DOES; this says whether this caster can use it right now.
+#[derive(Serialize)]
+struct AbilityOut {
+    /// `AbilityDef::name` — accepted as the `ability` field of a `cast`.
+    id: &'static str,
+    /// Slot index — also accepted as the `ability` field of a `cast`.
+    index: usize,
+    /// Seconds until this slot may be cast again (0 = ready).
+    cd: f32,
+    /// Has this caster met the unlock condition?
+    unlocked: bool,
+    /// Unlocked, off cooldown, and affordable (heroes pay mana).
+    ready: bool,
+    mana_cost: f32,
+    /// The unlock condition, verbatim, when it is not yet met.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires: Option<String>,
+}
+
+/// Build the per-caster ability view. One function for heroes and buildings —
+/// the readiness rule is shared.rs's, so the snapshot can never promise a cast
+/// combat.rs would refuse.
+fn abilities_out(
+    list: &'static [AbilityDef],
+    ctx: UnlockCtx,
+    hero: Option<&Hero>,
+    cooldowns: Option<&AbilityCooldowns>,
+) -> Vec<AbilityOut> {
+    list.iter()
+        .enumerate()
+        .map(|(index, def)| {
+            let unlocked = ability_unlocked(def, ctx);
+            AbilityOut {
+                id: def.name,
+                index,
+                cd: r1(cooldowns.map_or(0.0, |c| c.remaining(index))),
+                unlocked,
+                ready: unlocked && ability_ready(def, hero, cooldowns, index),
+                mana_cost: r1(def.mana_cost),
+                requires: (!unlocked).then(|| unlock_label(def.unlock)),
+            }
+        })
+        .collect()
 }
 
 /// Mirror of the doctrine components, in the same shape the `priority` /
@@ -489,6 +604,9 @@ struct HeroOut {
     xp_next: f32,
     mana: f32,
     max_mana: f32,
+    /// Cooldown of the hero's FIRST ability. Kept as a scalar for readers
+    /// written against the one-ability world; `UnitOut::abilities` carries the
+    /// full per-slot picture.
     cd: f32,
 }
 
@@ -503,23 +621,58 @@ struct BuildingOut {
     done: bool,
     queue: Vec<&'static str>,
     progress: f32,
-    /// Own buildings with an active ability only: seconds until it may be cast
-    /// again (0 = ready). Absent for buildings that have no ability.
+    /// Own buildings with an active ability only: seconds until the FIRST one
+    /// may be cast again (0 = ready). Absent for buildings that have no
+    /// ability. `abilities` below is the per-slot version.
     #[serde(skip_serializing_if = "Option::is_none")]
     ability_cd: Option<f32>,
+    /// Own ability buildings only: every slot, with unlock and cooldown state.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    abilities: Vec<AbilityOut>,
     /// Own production buildings only, and only when a `template` command has
     /// installed a `DoctrineTemplate`: a flag, not the contents — the
     /// commander that set the template already knows what is in it.
     #[serde(skip_serializing_if = "is_false")]
     template: bool,
+    /// Rung on this building's upgrade ladder — 1 for everything not on one.
+    /// Not secret: a Keep looks like a Keep to anyone LOOKING at it. Under fog
+    /// that qualifier does the work — an unseen building is not in this array
+    /// at all, and a remembered one reports the tier it wore when last
+    /// observed, which is exactly what a scout brings home.
+    tier: u32,
+    /// Present only while this building is converting to its next tier. The
+    /// `upgrade` command starts one; while it runs the building trains nothing
+    /// (the queue is frozen, not cancelled). Never set on a remembered ghost:
+    /// a conversion is a live thing, and a stale progress bar would be
+    /// invented intelligence rather than preserved intelligence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upgrading: Option<UpgradeOut>,
+    /// Present ONLY on remembered enemy structures: the game time at which
+    /// this seat last actually saw it. Everything else in the record is the
+    /// state observed at that moment and may since have changed — including
+    /// the building having upgraded to a higher tier, or been destroyed.
+    /// Absent means "observed right now".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen: Option<f32>,
+}
+
+/// An in-place upgrade in progress, as it appears in a snapshot.
+#[derive(Serialize)]
+struct UpgradeOut {
+    /// Catalog id of what it is becoming.
+    to: &'static str,
+    /// Seconds left on the conversion.
+    remaining: f32,
 }
 
 fn is_false(flag: &bool) -> bool {
     !*flag
 }
 
-/// A live bounty cache. Neutral information: both seats get the identical
-/// list, exactly as both players see the same glow on the ground.
+/// A live bounty cache. Neutral but not free: the treasure belongs to nobody,
+/// and seeing the glow on the ground still costs you eyes on that ground. A
+/// cache is listed only while this seat's team can see it, exactly as the
+/// player at the keyboard sees a glow only outside the fog.
 #[derive(Serialize)]
 struct BountyOut {
     pos: [f32; 2],
@@ -536,6 +689,17 @@ struct BountySnap {
     pos: [f32; 2],
     gold: u32,
     expires_at: f32,
+}
+
+/// How much of the map this seat has ever seen / can see right now, plus the
+/// mode in force. Not a gameplay input — a legibility one, so a commander (and
+/// an after-action report) can tell "I have no information" apart from "there
+/// is nothing there", which are the same empty `units` array otherwise.
+#[derive(Serialize)]
+struct FogOut {
+    enabled: bool,
+    explored: f32,
+    visible: f32,
 }
 
 #[derive(Serialize)]
@@ -574,8 +738,13 @@ type SnapshotUnits<'w, 's> = Query<
             Option<&'static LeashPolicy>,
             Option<&'static AutoCastPolicy>,
         ),
-        // Hero kit & Call-to-Arms state, nested for the same reason.
-        (Option<&'static Inventory>, Has<Militia>),
+        // Hero kit, Call-to-Arms state and per-ability cooldowns, nested for
+        // the same reason.
+        (
+            Option<&'static Inventory>,
+            Has<Militia>,
+            Option<&'static AbilityCooldowns>,
+        ),
     ),
 >;
 
@@ -591,7 +760,8 @@ type SnapshotBuildings<'w, 's> = Query<
         Option<&'static UnderConstruction>,
         Option<&'static TrainingQueue>,
         Option<&'static DoctrineTemplate>,
-        Option<&'static AbilityCooldown>,
+        Option<&'static AbilityCooldowns>,
+        Option<&'static Upgrading>,
     ),
 >;
 
@@ -610,7 +780,9 @@ fn write_snapshot(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     squad_orders: Res<SquadOrders>,
+    tiers: Res<TechTiers>,
     feed: Res<GameEvents>,
+    fog: Res<FogGrids>,
     intent_errors: Res<IntentErrors>,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
@@ -625,6 +797,8 @@ fn write_snapshot(
             continue;
         }
         seat.force_snapshot = false;
+        // The seat's own team's fog — the whole point of a per-seat snapshot.
+        let seat_fog = fog.get(seat.team);
         write_seat_snapshot(
             seat,
             now,
@@ -632,7 +806,9 @@ fn write_snapshot(
             &records,
             &game_over,
             &squad_orders,
+            &tiers,
             &feed,
+            (fog.enabled(), seat_fog),
             intent_errors.get(seat.team),
             &units,
             &buildings,
@@ -652,7 +828,9 @@ fn write_seat_snapshot(
     records: &HeroRecords,
     game_over: &GameOver,
     squad_orders: &SquadOrders,
+    tiers: &TechTiers,
     feed: &GameEvents,
+    fog: (bool, &FogGrid),
     // Per-command validation errors this team's intents produced, from the
     // shared compiler. Reported alongside the seat's own batch-level errors.
     intent_errors: &[String],
@@ -662,13 +840,18 @@ fn write_seat_snapshot(
     bounties: &SnapshotBounties,
 ) {
     let me = seat.team;
+    let (fog_enabled, fog) = fog;
 
-    // Full vision of both armies; doctrine only for our own units.
+    // Our own army, plus whatever of theirs we can see RIGHT NOW. Enemy units
+    // are never remembered: a stale unit position is not information, it is a
+    // decoy, and a commander acting on one has been lied to by its own
+    // interface. Doctrine only for our own units, as before.
     let mut units_out: Vec<UnitOut> = units
         .iter()
+        .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(|(e, unit, team, tf, health, order, move_to, carrying, hero, doctrine, kit)| {
             let (squad, prio, retreat, leash, autocast) = doctrine;
-            let (inventory, militia) = kit;
+            let (inventory, militia, cooldowns) = kit;
             let mine = *team == me;
             let has_policy =
                 prio.is_some() || retreat.is_some() || leash.is_some() || autocast.is_some();
@@ -688,7 +871,7 @@ fn write_seat_snapshot(
                     xp_next: r1(Hero::xp_to_next(h.level)),
                     mana: r1(h.mana),
                     max_mana: r1(Hero::max_mana(h.level)),
-                    cd: r1(h.ability_cooldown),
+                    cd: r1(cooldowns.map_or(0.0, |c| c.remaining(0))),
                 }),
                 items: inventory.map(|inv| {
                     inv.0
@@ -704,16 +887,32 @@ fn write_seat_snapshot(
                     retreat: retreat
                         .map(|r| [r1(r.below_frac), r1(r.rally.x), r1(r.rally.z)]),
                     leash: leash.map(|l| [r1(l.anchor.x), r1(l.anchor.z), r1(l.radius)]),
-                    autocast: autocast.map(|a| a.min_enemies),
+                    autocast: autocast.and_then(|a| a.primary()),
                 }),
+                // Our own casters only: abilities we can actually order.
+                abilities: if mine {
+                    abilities_out(
+                        abilities_of_unit(unit.kind),
+                        UnlockCtx::new(hero.map_or(0, |h| h.level), tiers.get(me)),
+                        hero,
+                        cooldowns,
+                    )
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect();
     units_out.sort_by_key(|u| u.id);
 
+    // Ours, plus enemy structures we can see now. Ones we have seen before and
+    // cannot see now are appended below as remembered ghosts, so the array is
+    // "everything this seat has grounds to believe is standing".
     let mut buildings_out: Vec<BuildingOut> = buildings
         .iter()
-        .map(|(e, building, team, tf, health, under, queue, template, cooldown)| BuildingOut {
+        .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
+        .map(
+            |(e, building, team, tf, health, under, queue, template, cooldown, upgrading)| BuildingOut {
             id: e.to_bits(),
             team: team_name(*team),
             kind: building_name(building.kind),
@@ -726,18 +925,66 @@ fn write_seat_snapshot(
                 .unwrap_or_default(),
             progress: r1(queue.map(|q| q.progress).unwrap_or(0.0)),
             // Our own casters only: an ability we can actually order.
-            ability_cd: (*team == me && ability_of_building(building.kind).is_some())
-                .then(|| r1(cooldown.map(|c| c.0).unwrap_or(0.0))),
+            ability_cd: (*team == me && !abilities_of_building(building.kind).is_empty())
+                .then(|| r1(cooldown.map_or(0.0, |c| c.remaining(0)))),
+            abilities: if *team == me {
+                abilities_out(
+                    abilities_of_building(building.kind),
+                    UnlockCtx::building(tiers.get(me)),
+                    None,
+                    cooldown,
+                )
+            } else {
+                Vec::new()
+            },
             // Never for the opponent: a template is command structure.
             template: *team == me && template.is_some(),
-        })
+            tier: building_tier(building.kind),
+            upgrading: upgrading.map(|u| UpgradeOut {
+                to: building_name(u.to),
+                remaining: r1(u.remaining),
+            }),
+            // Observed this instant.
+            last_seen: None,
+            },
+        )
         .collect();
+
+    // Memory. Everything this seat scouted and can no longer see, reported at
+    // the state it was in when last observed and stamped with when that was.
+    // `queue`/`progress`/`ability_cd` are deliberately empty rather than
+    // stale: a production queue is a live thing, and remembering one would be
+    // inventing intelligence rather than preserving it. The building's
+    // existence, kind, place and health are what a scout actually brings home.
+    for ghost in fog.ghosts() {
+        buildings_out.push(BuildingOut {
+            id: ghost.id,
+            team: team_name(ghost.team),
+            kind: building_name(ghost.kind),
+            pos: [r1(ghost.pos.x), r1(ghost.pos.z)],
+            hp: ghost.hp,
+            max_hp: ghost.max_hp,
+            done: ghost.done,
+            queue: Vec::new(),
+            progress: 0.0,
+            ability_cd: None,
+            abilities: Vec::new(),
+            template: false,
+            // The tier it wore when last observed. A hall that has since been
+            // upgraded behind our back still reports the old rung — the memory
+            // is stale in exactly the way the scouting report was.
+            tier: building_tier(ghost.kind),
+            // Never on a ghost: see the field's doc.
+            upgrading: None,
+            last_seen: Some(ghost.last_seen),
+        });
+    }
     buildings_out.sort_by_key(|b| b.id);
 
     // Tech state, for this seat only: what its completed buildings unlock.
     let completed: Vec<BuildingKind> = buildings
         .iter()
-        .filter(|(_, _, team, _, _, under, _, _, _)| **team == me && under.is_none())
+        .filter(|(_, _, team, _, _, under, _, _, _, _)| **team == me && under.is_none())
         .map(|(_, building, ..)| building.kind)
         .collect();
     let unlocked = unlocked_map(&completed);
@@ -794,9 +1041,11 @@ fn write_seat_snapshot(
         })
         .collect();
 
-    // Bounty caches, sorted by id so both seats serialize the same order.
+    // Bounty caches this seat can see, sorted by id so a seat serializes the
+    // same order every tick. The two seats' lists now legitimately differ.
     let mut bounty_snaps: Vec<BountySnap> = bounties
         .iter()
+        .filter(|(_, _, tf)| fog.sees(tf.translation))
         .map(|(e, bounty, tf)| BountySnap {
             id: e.to_bits(),
             pos: [r1(tf.translation.x), r1(tf.translation.z)],
@@ -847,6 +1096,12 @@ fn write_seat_snapshot(
             supply_used: eco.supply_used,
             supply_cap: eco.supply_cap,
             upkeep_rate: upkeep_rate(eco.supply_used),
+            tier: completed
+                .iter()
+                .filter(|k| is_hall(**k))
+                .map(|k| building_tier(*k))
+                .max()
+                .unwrap_or(0),
             hero_record: records.get(me).map(|r| HeroRecordOut {
                 level: r.level,
                 xp: r1(r.xp),
@@ -870,6 +1125,11 @@ fn write_seat_snapshot(
                     width: r1(c.width),
                 })
                 .collect(),
+        },
+        fog: FogOut {
+            enabled: fog_enabled,
+            explored: r1(fog.explored_frac()),
+            visible: r1(fog.visible_frac()),
         },
         unlocked,
         units: units_out,
@@ -913,9 +1173,15 @@ fn write_seat_snapshot(
 fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
     let mut out = BTreeMap::new();
     for kind in ALL_BUILDING_KINDS {
+        // An upgrade-only kind is never "buildable", however much tech you
+        // have: the honest answer to "may I place this right now" is no, and
+        // the route to one is the catalog's `upgrades_to` plus the `upgrade`
+        // command. Reporting `true` here would send a commander to a `build`
+        // that always bounces.
         out.insert(
             building_name(kind),
-            requirements_met(building_requires(kind), completed.iter().copied()),
+            building_placeable(kind)
+                && requirements_met(building_requires(kind), completed.iter().copied()),
         );
     }
     for kind in ALL_UNIT_KINDS {
@@ -926,7 +1192,6 @@ fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
     }
     out
 }
-
 
 // ---------------------------------------------------------------------------
 // Squad membership
@@ -957,16 +1222,17 @@ fn squad_members(units_out: &[UnitOut]) -> HashMap<u8, usize> {
 // This file used to be where a command became game state. It is not any more.
 // The bridge's whole job on this side is now transport and protocol: read the
 // file, honour `seq`, deserialize each command into a `shared::Intent`, and
-// submit it. intent.rs validates it and applies it — the same compiler the
-// human's mouse gestures go through, so neither seat has a private path into
-// the world.
+// submit it. intent.rs validates and applies it — the same compiler the
+// human's mouse gestures go through, with the same fog rule, the same
+// ownership checks and the same error strings.
 //
 // The wire format did not change, because the wire format *is* the schema:
 // `Intent`'s serde shape is the historical command shape, tag for tag and
-// field for field, `caster` alias and `use_item` rename included.
-// `tools/bridge_send.py`, `bridge_view.py` and every COMMANDER_BRIEF.md flow
-// keep working untouched, and rejected commands come back as the same strings
-// in the same `errors` array, still prefixed `cmd <i>`.
+// field for field, `caster` alias, `use_item` rename and untagged ability
+// selector included. `tools/bridge_send.py`, `bridge_view.py` and every
+// COMMANDER_BRIEF.md flow keep working untouched, and rejected commands come
+// back as the same strings in the same `errors` array, still prefixed
+// `cmd <i>`.
 
 #[derive(Deserialize)]
 struct Batch {
@@ -979,7 +1245,9 @@ struct Batch {
 /// Read each seat's `commands.json` and submit its contents as intents.
 ///
 /// Ordered `.before(IntentApply)`, so everything submitted here is compiled
-/// before this frame's snapshot is written.
+/// before this frame's snapshot is written — the protocol's long-standing
+/// promise that a batch applied this frame is visible in that frame's
+/// snapshot, including its errors.
 fn poll_commands(
     real: Res<Time<Real>>,
     mut bridge: ResMut<Bridge>,
@@ -1109,5 +1377,25 @@ fn posture_name(posture: &SquadPosture) -> String {
         SquadPosture::Forage { muster } => {
             format!("forage@({:.1},{:.1})", muster.x, muster.z)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `every_unit_kind_is_orderable_by_name` moved to intent.rs with the name
+    // parsers it exercises — the property it guards is now a property of the
+    // shared vocabulary rather than of this file.
+
+    /// The Barracks really does offer the Spearman, so the order has somewhere
+    /// to land.
+    #[test]
+    fn barracks_trains_the_spearman() {
+        assert!(trainable(BuildingKind::Barracks).contains(&UnitKind::Spearman));
+        assert!(
+            unit_requires(UnitKind::Spearman).is_empty(),
+            "the tier-1 answer to cavalry must not itself be tech-gated"
+        );
     }
 }
