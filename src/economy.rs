@@ -551,6 +551,12 @@ fn spawn_buildings(
                     max: stats.hp,
                 },
                 tf,
+                // Same one-frame propagation hole as units (see units.rs):
+                // GlobalTransform is only filled in during PostUpdate, so a
+                // building spawned in Update reads as being at the world
+                // origin for the rest of the frame. Buildings are roots, so
+                // their GlobalTransform is just their Transform — seed it.
+                GlobalTransform::from(tf),
                 Visibility::default(),
             ))
             .id();

@@ -382,6 +382,16 @@ fn spawn_units(
             Mesh3d(body),
             MeshMaterial3d(body_mat),
             transform,
+            // Bevy only propagates Transform -> GlobalTransform in PostUpdate,
+            // so a unit spawned during Update would read as sitting at the
+            // world origin for the rest of that frame. Combat reads positions
+            // through GlobalTransform (it needs a read-only alias while it
+            // mutates attacker Transforms), which made every fresh spawn look
+            // like it had teleported to (0,0,0) — towers near the origin got a
+            // free bolt on it. A unit is always a root entity, so its
+            // GlobalTransform simply IS its Transform; seed it here and the
+            // hole never opens.
+            GlobalTransform::from(transform),
             Name::new(match ev.kind {
                 UnitKind::Worker => "Worker",
                 UnitKind::Footman => "Footman",
