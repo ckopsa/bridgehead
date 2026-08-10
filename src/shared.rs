@@ -150,6 +150,14 @@ pub enum UnitKind {
     /// The game's first non-hero caster: a fragile tier-2 support unit whose
     /// whole job is the `Slow` debuff. Trained at the Arcane Sanctum.
     Sorcerer,
+    /// Castle-gated heavy shock cavalry: the tier-3 line-breaker. Raw stats and
+    /// speed with no type bonus at all — and `TargetClass::Cavalry`, so the
+    /// 90-gold Spearman is still the answer.
+    Knight,
+    /// Castle-gated air capstone: the first `flying: true` kind. Ignores the
+    /// nav grid, hits ground and air, and can only be answered by something
+    /// that shoots.
+    GryphonRider,
 }
 
 /// Hero-class unit kinds (carry the `Hero` component, occupy one of the team's
@@ -171,6 +179,11 @@ pub enum BuildingKind {
     Workshop,
     /// Item vendor: heroes buy consumables here.
     Shop,
+    /// Tier 2 forge: researches the team-wide attack and armor ladders
+    /// (`ResearchKind`). Requires a Keep. Trains nothing — it converts a bank
+    /// balance into a permanent multiplier on every soldier the team will ever
+    /// field, which is the one thing an economic lead could not previously buy.
+    Blacksmith,
     /// Tier 2 of the town hall ladder. Never placed — a TownHall upgrades into
     /// one in place (see `building_upgrades_to`). Trains everything the hall
     /// trained, and is the tech gate future tier-2 content names.
@@ -182,7 +195,7 @@ pub enum BuildingKind {
     Sanctum,
 }
 
-pub const ALL_UNIT_KINDS: [UnitKind; 9] = [
+pub const ALL_UNIT_KINDS: [UnitKind; 11] = [
     UnitKind::Worker,
     UnitKind::Footman,
     UnitKind::Archer,
@@ -192,8 +205,10 @@ pub const ALL_UNIT_KINDS: [UnitKind; 9] = [
     UnitKind::Priestess,
     UnitKind::Spearman,
     UnitKind::Sorcerer,
+    UnitKind::Knight,
+    UnitKind::GryphonRider,
 ];
-pub const ALL_BUILDING_KINDS: [BuildingKind; 10] = [
+pub const ALL_BUILDING_KINDS: [BuildingKind; 11] = [
     BuildingKind::TownHall,
     BuildingKind::Barracks,
     BuildingKind::Farm,
@@ -201,6 +216,7 @@ pub const ALL_BUILDING_KINDS: [BuildingKind; 10] = [
     BuildingKind::Wall,
     BuildingKind::Workshop,
     BuildingKind::Shop,
+    BuildingKind::Blacksmith,
     BuildingKind::Keep,
     BuildingKind::Castle,
     BuildingKind::Sanctum,
@@ -407,6 +423,60 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             // is already being ridden down.
             vision: 18.0,
         },
+        // Tier 3, Castle-gated, Barracks-trained: the line-breaker. Its whole
+        // design is that it has NO type multiplier — no anti-siege bonus (that
+        // stays the Raider's job), no anti-anything. What 270 gold buys is raw
+        // numbers: 350 hp and 29.6 dps, more than double a Footman's on both
+        // counts, at a speed nothing but cavalry can disengage from.
+        //
+        // And it is `TargetClass::Cavalry`, which is the point of the whole
+        // exercise: the counter to the most expensive melee unit in the game is
+        // still the cheapest, a 90-gold Spearman, because the triangle is drawn
+        // on classes rather than on tiers. Equal gold — one Knight against
+        // three Spearmen — the spear line wins and pays one body for it. A tech
+        // advantage buys tempo and reach, never immunity to a counter.
+        //
+        // Melee, so `can_hit_air: false`: a Knight army that never built an
+        // archer is helpless under a Gryphon, which is the other half of this
+        // bead's lesson.
+        UnitKind::Knight => UnitStats {
+            cost_gold: 270, cost_lumber: 60, supply: 4, hp: 350.0, damage: 34.0,
+            range: 2.4, attack_cooldown: 1.15, speed: 9.5, train_time: 20.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            // A shock line that closes at 9.5 needs to see the shape of what it
+            // is about to hit, so it out-sees the 18 of the spear picket that
+            // answers it. Still short of the Raider's 24: the Knight is the
+            // hammer, not the scout, and the light cavalry keeps its one
+            // remaining job.
+            vision: 20.0,
+        },
+        // Tier 3, Castle-gated, Workshop-trained: the flyer capstone, and the
+        // first kind in the game with `flying: true`. It ignores the nav grid
+        // entirely, so no wall, forest, canyon or tower net is a door it has to
+        // use, and it hits both planes.
+        //
+        // The price of that is paid in raw numbers, deliberately: 280 gold and
+        // 120 lumber buys 15.4 dps — barely more than the two Archers the same
+        // gold buys — because what a flyer is actually purchasing is that most
+        // of the enemy army cannot fight it at all. Every stat here is set
+        // against one target: 280 gold of Gryphon must LOSE to 270 gold of
+        // Archers. 200 hp is what makes that true, so massed ranged stays the
+        // answer to air and a flyer is a scalpel rather than an autowin.
+        UnitKind::GryphonRider => UnitStats {
+            cost_gold: 280, cost_lumber: 120, supply: 5, hp: 200.0, damage: 20.0,
+            range: 6.0, attack_cooldown: 1.3, speed: 9.0, train_time: 28.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: true, can_hit_air: true, can_hit_ground: true,
+            // Altitude is the oldest observation post there is, and fog is XZ
+            // only (docs/FOG.md), so height costs a flyer nothing and buys it
+            // reach. 26 is the widest eye any unit has — equal to a TownHall's,
+            // which is the comparison worth making: a Gryphon is a hall's worth
+            // of vision that MOVES, and scouting one across the map is the
+            // single best information purchase in the game. It is also why the
+            // unit is Castle-gated and 280 gold: sight this good arrives late.
+            vision: 26.0,
+        },
     }
 }
 
@@ -475,6 +545,16 @@ pub fn building_stats(kind: BuildingKind) -> BuildingStats {
         BuildingKind::Shop => BuildingStats {
             cost_gold: 75, cost_lumber: 60, hp: 400.0, build_time: 15.0,
             supply_provided: 0, size: 4.0, attack: None, vision: 14.0,
+        },
+        // Vision 14: a forge is a workplace, not a watchtower. Deliberately at
+        // the bottom of the table alongside the Shop — per docs/FOG.md, sight
+        // is what a structure is FOR, and this one is for hammering. A team
+        // that wants eyes buys a Tower; a Blacksmith planted forward buys its
+        // owner almost nothing, which is exactly right for a building whose
+        // whole value is a number that follows the army wherever it goes.
+        BuildingKind::Blacksmith => BuildingStats {
+            cost_gold: 140, cost_lumber: 80, hp: 600.0, build_time: 24.0,
+            supply_provided: 0, size: 5.0, attack: None, vision: 14.0,
         },
         // Tier 2/3 halls. `cost_*` and `build_time` are the price and duration
         // of the UPGRADE STEP that produces them, not of a placement — these
@@ -645,16 +725,37 @@ pub struct UpgradeBuilding {
     pub building: Entity,
 }
 
+/// Ask a forge to begin the next rung of a research ladder. Written by
+/// intent.rs (for both player seats) and ai.rs; economy.rs validates, pays and
+/// inserts `Researching` — the same division of labour as `UpgradeBuilding`,
+/// and the reason "all money in the game is spent in economy.rs" stays true.
+///
+/// The LEVEL is not on the event: it is always the team's current level plus
+/// one, resolved by economy.rs at the instant it takes the money. Carrying a
+/// level would let two events queued in one frame both claim to produce
+/// level 2.
+#[derive(Event, Debug)]
+pub struct StartResearch {
+    pub building: Entity,
+    pub kind: ResearchKind,
+}
+
 /// Tech requirements: completed buildings a team must own before this
 /// building may be PLACED. economy.rs enforces at placement; ui.rs greys the
 /// button; bridge.rs reports and validates.
 pub fn building_requires(kind: BuildingKind) -> &'static [BuildingKind] {
     match kind {
         BuildingKind::Tower | BuildingKind::Workshop => &[BuildingKind::Barracks],
-        // Tier-2 gate, expressed as the RUNG rather than as a `TechTier`:
-        // `requirements_met` compares tiers through `building_satisfies`, so a
-        // Castle satisfies this for free and losing the Keep closes it again.
+        // Both tier-2 gates, expressed as the RUNG rather than as a
+        // `TechTier`: `requirements_met` compares tiers through
+        // `building_satisfies`, so a Castle satisfies them for free and losing
+        // the Keep closes them again.
         BuildingKind::Sanctum => &[BuildingKind::Keep],
+        // Research is the reward for teching, not an opening build: gating it
+        // behind the Keep means the 100g/50l first level is a choice made
+        // *after* the 320g/160l hall upgrade, so nobody buys +1 attack instead
+        // of their second barracks in the first four minutes.
+        BuildingKind::Blacksmith => &[BuildingKind::Keep],
         _ => &[],
     }
 }
@@ -666,6 +767,11 @@ pub fn unit_requires(kind: UnitKind) -> &'static [BuildingKind] {
         // before any reactive defense could finish. Workshop-gating makes
         // cavalry the mid-game flanking tool it was designed as.
         UnitKind::Raider => &[BuildingKind::Workshop],
+        // The tier-3 pair. Gating on the Castle rather than on a new building
+        // is what makes the hall ladder worth climbing: `requirements_met` uses
+        // `building_satisfies`, so this is a tier comparison, and a fourth rung
+        // added later would satisfy it for free.
+        UnitKind::Knight | UnitKind::GryphonRider => &[BuildingKind::Castle],
         _ => &[],
     }
 }
@@ -773,6 +879,255 @@ impl TechTiers {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Research: the bank-to-power conversion
+// ---------------------------------------------------------------------------
+//
+// Everything else a team can buy is a THING — a unit that can die, a building
+// that can be razed, an item that gets consumed. Research is the one purchase
+// that buys a *property of the faction*: it is retroactive to every soldier
+// already standing, applies to every soldier trained afterwards, cannot be
+// killed, and survives the Blacksmith that produced it. That is deliberate and
+// it is the whole point of the mechanic. Every AAR in this repo that read
+// "Human ended with 2,400 banked gold and lost anyway" was describing a game
+// with no sink that converts money into fighting strength faster than a
+// production queue can. This is that sink.
+//
+// The shape of the design, and why:
+//
+//   * **Flat, not percentage.** +1 damage per swing and −1 damage per hit
+//     taken. A percentage would scale with whatever the biggest number on the
+//     field is (a Catapult's 6x siege multiplier, a level-10 hero) and turn
+//     research into a rich-get-richer multiplier on an existing lead. Flat
+//     bonuses are worth proportionally MORE to cheap line infantry — +3 on a
+//     Footman's 12 is +25%, on a Hero's 24 it is +12.5% — so the ladder
+//     rewards the player who has an army over the player who has a deathball.
+//   * **Applied after the multipliers, never through them.** See
+//     `EffectiveStats::bonus_damage`.
+//   * **Units only, never structures.** Attack research does not arm Towers and
+//     armor research does not thicken walls. Research equips the army; masonry
+//     is what a Keep upgrade is for. Without this rule a turtle could buy 3
+//     levels of armor and make every building in the base 25% harder to raze,
+//     which is a fortification upgrade wearing a research label.
+//   * **A floor of `MIN_DAMAGE_PER_HIT`.** Three levels of armor against a
+//     Spearman's 6 damage is a 50% reduction; against a Worker's 5 it is 60%.
+//     Neither can ever reach zero, so no amount of research makes a team immune
+//     to anything, and chip damage always chips.
+
+/// The two team-wide ladders a Blacksmith researches. Ids here are what the
+/// `research` intent's `upgrade` field accepts and what the catalog exports.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ResearchKind {
+    /// +1 flat damage per level on every attack a UNIT makes.
+    Attack,
+    /// −1 flat damage per level on every hit a UNIT takes.
+    Armor,
+}
+
+pub const ALL_RESEARCH_KINDS: [ResearchKind; 2] = [ResearchKind::Attack, ResearchKind::Armor];
+
+/// Top of both ladders. The bonus at max is +3/−3.
+pub const RESEARCH_MAX_LEVEL: u32 = 3;
+
+/// No hit, however armoured the victim, ever lands for less than this. The
+/// floor that keeps armor a discount rather than an immunity.
+pub const MIN_DAMAGE_PER_HIT: f32 = 1.0;
+
+impl ResearchKind {
+    /// Wire id: the `upgrade` field of a `research` intent, and the catalog id.
+    pub fn id(self) -> &'static str {
+        match self {
+            ResearchKind::Attack => "attack",
+            ResearchKind::Armor => "armor",
+        }
+    }
+    /// What a HUD button and a log line call it.
+    pub fn label(self) -> &'static str {
+        match self {
+            ResearchKind::Attack => "Weapon Smithing",
+            ResearchKind::Armor => "Armor Plating",
+        }
+    }
+    /// Stable slot in `ResearchState`, and the order the command card lays the
+    /// buttons out in.
+    pub fn index(self) -> usize {
+        match self {
+            ResearchKind::Attack => 0,
+            ResearchKind::Armor => 1,
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            ResearchKind::Attack => {
+                "+1 damage per level on every attack made by one of your UNITS. Flat and \
+                 applied last, so it is never multiplied by a Catapult's siege bonus or a \
+                 hero's level. Does not arm Towers — research equips the army."
+            }
+            ResearchKind::Armor => {
+                "-1 damage per level from every hit taken by one of your UNITS, floored at \
+                 1 damage per hit. Does not protect buildings — a Keep upgrade is what \
+                 thickens masonry."
+            }
+        }
+    }
+}
+
+/// One rung of a research ladder: what it costs and how long the forge is busy.
+#[derive(Clone, Copy, Debug)]
+pub struct ResearchStep {
+    /// The level this step produces (1..=`RESEARCH_MAX_LEVEL`).
+    pub level: u32,
+    pub cost_gold: u32,
+    pub cost_lumber: u32,
+    /// Seconds of forge time, timed exactly like a training queue item.
+    pub research_time: f32,
+}
+
+/// Cost and duration of advancing a ladder TO `level`. `None` above the cap or
+/// at level 0 — the one table, so catalog, UI, intent validation, economy and
+/// the AI all quote the same numbers.
+///
+/// The escalation is deliberately steeper in lumber than in gold (2x, 2x)
+/// because gold is the resource a winning economy floods with; a team that
+/// wants all three rungs has to have kept workers on trees, not just on the
+/// mine it is out-expanding you at.
+pub fn research_step(kind: ResearchKind, level: u32) -> Option<ResearchStep> {
+    if level == 0 || level > RESEARCH_MAX_LEVEL {
+        return None;
+    }
+    // Both ladders share a price list: a game where armor is cheaper than
+    // attack is a game where everybody buys armor first, and the interesting
+    // decision (do I want to kill faster or die slower?) disappears into
+    // arithmetic.
+    let (cost_gold, cost_lumber, research_time) = match level {
+        1 => (100, 50, 40.0),
+        2 => (175, 100, 55.0),
+        _ => (250, 150, 70.0),
+    };
+    let _ = kind;
+    Some(ResearchStep {
+        level,
+        cost_gold,
+        cost_lumber,
+        research_time,
+    })
+}
+
+/// The flat bonus a ladder at `level` confers. Linear on purpose: a commander
+/// reading "attack 2" should be able to add 2 to a damage number in their head
+/// without consulting a table.
+pub fn research_bonus(kind: ResearchKind, level: u32) -> f32 {
+    let _ = kind;
+    level.min(RESEARCH_MAX_LEVEL) as f32
+}
+
+/// Which building kind researches a ladder. One function so a second forge (or
+/// moving a ladder to another building) is a data change.
+pub fn research_building(kind: ResearchKind) -> BuildingKind {
+    let _ = kind;
+    BuildingKind::Blacksmith
+}
+
+/// Can this building kind run research at all? What the command card asks
+/// before drawing research buttons and what the compiler asks before accepting
+/// a `research` intent.
+pub fn building_researches(kind: BuildingKind) -> &'static [ResearchKind] {
+    match kind {
+        BuildingKind::Blacksmith => &ALL_RESEARCH_KINDS,
+        _ => &[],
+    }
+}
+
+/// One team's completed research. Levels only ever go up: unlike `TechTier`,
+/// which is recounted from standing buildings every frame, research is a LATCH.
+/// Razing the forge does not unlearn the metallurgy, and that asymmetry is the
+/// reason research is worth its price — a Keep upgrade you can be denied by
+/// losing the hall, a completed upgrade nobody can take back.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ResearchState {
+    levels: [u32; ALL_RESEARCH_KINDS.len()],
+}
+
+impl ResearchState {
+    pub fn level(&self, kind: ResearchKind) -> u32 {
+        self.levels[kind.index()]
+    }
+    /// Advance a ladder by one rung, saturating at the cap. Returns the new
+    /// level, or `None` if it was already maxed.
+    pub fn advance(&mut self, kind: ResearchKind) -> Option<u32> {
+        let slot = &mut self.levels[kind.index()];
+        if *slot >= RESEARCH_MAX_LEVEL {
+            return None;
+        }
+        *slot += 1;
+        Some(*slot)
+    }
+    /// The step that would come next, or `None` at the cap.
+    pub fn next_step(&self, kind: ResearchKind) -> Option<ResearchStep> {
+        research_step(kind, self.level(kind) + 1)
+    }
+    /// Flat damage this team adds to every unit attack.
+    pub fn attack_bonus(&self) -> f32 {
+        research_bonus(ResearchKind::Attack, self.level(ResearchKind::Attack))
+    }
+    /// Flat damage this team subtracts from every hit one of its units takes.
+    pub fn armor_bonus(&self) -> f32 {
+        research_bonus(ResearchKind::Armor, self.level(ResearchKind::Armor))
+    }
+    /// Both numbers in the shape the stat law wants them.
+    pub fn bonus(&self) -> ResearchBonus {
+        ResearchBonus {
+            bonus_damage: self.attack_bonus(),
+            flat_armor: self.armor_bonus(),
+        }
+    }
+}
+
+/// Per-team research levels. Written in exactly one place (economy.rs, when a
+/// `Researching` timer runs out) and read by combat.rs through the stat law,
+/// by the UI, by the snapshot and by the AI.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct TeamResearch {
+    pub human: ResearchState,
+    pub claude: ResearchState,
+}
+
+impl TeamResearch {
+    pub fn get(&self, team: Team) -> ResearchState {
+        match team {
+            Team::Human => self.human,
+            Team::Claude => self.claude,
+        }
+    }
+    pub fn get_mut(&mut self, team: Team) -> &mut ResearchState {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+}
+
+/// A forge working. `intent.rs` inserts it (after economy.rs has taken the
+/// money), economy.rs ticks it and applies the level on completion — the same
+/// division of labour as `Upgrading` and `Order::Build`.
+///
+/// **One at a time, and concurrent requests are REJECTED, not queued.** A
+/// queue here would let a team pre-commit its whole research plan in one click
+/// and then walk away, which turns the interesting part (spending 250 gold now
+/// versus three more Footmen now) into a single early decision. Rejecting
+/// makes every rung its own choice, and the answer to "I want both ladders at
+/// once" is the same answer an RTS gives to "I want two units at once": build
+/// a second building.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Researching {
+    pub kind: ResearchKind,
+    /// The level this will produce when it finishes.
+    pub to_level: u32,
+    pub remaining: f32,
+    /// Full duration, so a renderer can show a fraction.
+    pub total: f32,
+}
+
 /// What each building can train.
 pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
     match kind {
@@ -785,15 +1140,35 @@ pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
         // Spearman is appended rather than slotted next to the Footman on
         // purpose: production hotkeys are positional, and moving Archer off W
         // to make room would retrain every existing pair of hands.
+        // Appended, never inserted, for the reason above: the Knight takes the
+        // fifth slot rather than displacing anyone's muscle memory.
         BuildingKind::Barracks => &[
             UnitKind::Footman,
             UnitKind::Archer,
             UnitKind::Raider,
             UnitKind::Spearman,
+            UnitKind::Knight,
         ],
-        BuildingKind::Workshop => &[UnitKind::Catapult],
+        // The Gryphon trains here rather than out of a new Aviary, and that is
+        // a design choice, not a shortcut. The Workshop is already the building
+        // whose entire job is "the answer to a tower turtle" — siege is the
+        // ground answer, air is the one that refuses to use the door. Putting
+        // both behind one 140g/100l investment keeps the building count flat,
+        // keeps the tech decision legible (one branch, two answers), and means
+        // a team that scouted a Workshop still does not know which is coming.
+        BuildingKind::Workshop => &[UnitKind::Catapult, UnitKind::GryphonRider],
+        // The Blacksmith trains nothing on purpose. It is the first building in
+        // the game whose entire output is a number, which also means it does
+        // NOT count as a production building for the win condition
+        // (`check_game_over` asks `!trainable(kind).is_empty()`) — a team down
+        // to one forge has already lost, and a Blacksmith should not be able to
+        // keep a dead match alive.
+        BuildingKind::Farm
+        | BuildingKind::Tower
+        | BuildingKind::Wall
+        | BuildingKind::Shop
+        | BuildingKind::Blacksmith => &[],
         BuildingKind::Sanctum => &[UnitKind::Sorcerer],
-        BuildingKind::Farm | BuildingKind::Tower | BuildingKind::Wall | BuildingKind::Shop => &[],
     }
 }
 
@@ -817,6 +1192,8 @@ pub fn kind_name(kind: UnitKind) -> &'static str {
         UnitKind::Priestess => "Priestess",
         UnitKind::Spearman => "Spearman",
         UnitKind::Sorcerer => "Sorcerer",
+        UnitKind::Knight => "Knight",
+        UnitKind::GryphonRider => "GryphonRider",
     }
 }
 
@@ -829,6 +1206,7 @@ pub fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Wall",
         BuildingKind::Workshop => "Workshop",
         BuildingKind::Shop => "Shop",
+        BuildingKind::Blacksmith => "Blacksmith",
         BuildingKind::Keep => "Keep",
         BuildingKind::Castle => "Castle",
         BuildingKind::Sanctum => "Sanctum",
@@ -844,7 +1222,9 @@ pub fn unit_description(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it.",
         UnitKind::Raider => "Fast cavalry: 2x damage vs Catapults, excels at worker raids and map control. Melts under massed fire.",
         UnitKind::Priestess => "Support hero: ranged attack, Heal ability (AoE ally healing). Occupies one hero slot — a Keep lets her stand alongside a Champion; revival preserves her own level.",
-        UnitKind::Spearman => "Cheap anti-cavalry line: 5x damage vs Raiders, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
+        UnitKind::Spearman => "Cheap anti-cavalry line: 5x damage vs Raiders and Knights, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
+        UnitKind::Knight => "Requires a Castle. Heavy shock cavalry: 350 hp at speed 9.5, no type bonus, just the best raw stats on the field. Breaks Footman and Archer lines at equal gold. Counter it with Spearmen — the Knight is cavalry, so it takes 5x from a spear, and 270g of Knight loses to 270g of Spearmen. Melee: cannot touch air.",
+        UnitKind::GryphonRider => "Requires a Castle; trained at the Workshop. Flying: ignores walls, forests and chokepoints entirely, and attacks both ground and air. Melee units and Catapults CANNOT hit it at all — only Archers, the Priestess and Towers can. Counter it with massed Archers: 270g of Archers beats one Gryphon. Sees 26, the widest eye in the game.",
         UnitKind::Sorcerer => "Tier-2 caster (Arcane Sanctum, requires a Keep): auto-casts Slow, a -40% move and attack speed debuff on every enemy within 8 for 5s. Blunts cavalry charges and covers retreats. Barely fights; keep it behind the line.",
     }
 }
@@ -864,13 +1244,21 @@ pub fn building_description(kind: BuildingKind) -> &'static str {
             "Tier 3 hall: the top of the ladder. A third hero slot (unusable until a third \
              hero class ships). Satisfies every hall requirement below it."
         }
-        BuildingKind::Barracks => "Trains Footmen, Archers and Spearmen (and Raiders, once a Workshop stands).",
+        BuildingKind::Barracks => "Trains Footmen, Archers and Spearmen (Raiders once a Workshop stands, Knights once a Castle does).",
         BuildingKind::Farm => "+6 supply. Build ahead of the cap or production stalls.",
         BuildingKind::Tower => "Static defense: shoots arrows at enemies in range.",
         BuildingKind::Wall => "Cheap blocking segment. No function except HP in the way.",
-        BuildingKind::Workshop => "Siege works: trains Catapults. The answer to tower turtles.",
+        BuildingKind::Workshop => "Siege works: trains Catapults, and Gryphon Riders once a Castle stands. Both answers to a tower turtle — one knocks the door down, the other flies over it.",
         BuildingKind::Shop => "Item vendor: heroes buy consumables here (see catalog items).",
         BuildingKind::Sanctum => "Arcane Sanctum: trains Sorcerers. Requires a Keep — the first thing a hall upgrade unlocks.",
+        BuildingKind::Blacksmith => {
+            "Tier 2 forge (requires a Keep). Researches the two team-wide ladders in \
+             catalog.research: Attack (+1/+2/+3 flat damage on every UNIT attack) and \
+             Armor (+1/+2/+3 flat damage reduction on every UNIT hit taken, never below \
+             1 damage per hit). Bonuses are permanent, retroactive to units already \
+             alive, and survive the Blacksmith's death. One research at a time per \
+             forge; build a second Blacksmith to run both ladders at once."
+        }
     }
 }
 
@@ -964,6 +1352,10 @@ pub struct CatalogAbility {
     pub effect: &'static str,
     /// Status kind applied, for `effect == "status"`.
     pub status: Option<&'static str>,
+    /// A second status the same cast lays down, with its own magnitude —
+    /// `[kind, magnitude]`. Only Sanctuary has one today. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status2: Option<(&'static str, f32)>,
     pub mana_cost: f32,
     pub cooldown: f32,
     pub radius: f32,
@@ -996,11 +1388,47 @@ pub struct CatalogStatus {
     pub description: &'static str,
 }
 
+/// One rung of a research ladder, as the catalog exports it.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogResearchLevel {
+    /// The level this step produces (1-based).
+    pub level: u32,
+    pub cost_gold: u32,
+    pub cost_lumber: u32,
+    /// Seconds the forge is busy. Timed exactly like a training queue item.
+    pub research_time: f32,
+    /// The flat bonus the team holds ONCE this level is complete (cumulative,
+    /// not incremental — level 2 reads 2.0, not another 1.0).
+    pub bonus: f32,
+}
+
+/// A team-wide passive upgrade ladder. The CURRENT level is deliberately not
+/// here: the catalog is static content written once at startup, and a level is
+/// match state. Read it from the snapshot (`me.research`) instead.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogResearch {
+    /// Wire id — what the `research` command's `upgrade` field accepts.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Catalog id of the building that researches it.
+    pub researched_at: &'static str,
+    pub max_level: u32,
+    /// What the bonus applies to, in one phrase — the answer to "do my towers
+    /// get this?" without reading the source. See `description` for why.
+    pub applies_to: &'static str,
+    pub levels: Vec<CatalogResearchLevel>,
+    pub description: &'static str,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct CatalogItem {
     pub id: &'static str,
     pub cost_gold: u32,
     pub sold_at: &'static str,
+    /// Team tech tier needed to buy it: 1, 2 or 3. A Shop stocks the whole
+    /// shelf from the moment it is built; this is what decides which rungs a
+    /// given team may actually take off it.
+    pub tier: u32,
     pub description: &'static str,
 }
 
@@ -1009,6 +1437,9 @@ pub struct Catalog {
     pub units: Vec<CatalogUnit>,
     pub buildings: Vec<CatalogBuilding>,
     pub abilities: Vec<CatalogAbility>,
+    /// The team-wide passive ladders a Blacksmith buys. Costs and durations
+    /// only — current levels are match state and live in the snapshot.
+    pub research: Vec<CatalogResearch>,
     pub items: Vec<CatalogItem>,
     /// The status-effect vocabulary: what a buff/debuff means and how it
     /// stacks, so a commander can reason about them without reading the source.
@@ -1094,6 +1525,7 @@ pub fn game_catalog() -> Catalog {
                 index,
                 effect: a.effect.name(),
                 status: a.effect.status().map(|s| s.name()),
+                status2: a.effect.extra_status().map(|(k, m)| (k.name(), m)),
                 mana_cost: a.mana_cost,
                 cooldown: a.cooldown,
                 radius: a.radius,
@@ -1116,6 +1548,28 @@ pub fn game_catalog() -> Catalog {
             }
             out
         },
+        research: ALL_RESEARCH_KINDS
+            .iter()
+            .map(|&k| CatalogResearch {
+                id: k.id(),
+                name: k.label(),
+                researched_at: building_name(research_building(k)),
+                max_level: RESEARCH_MAX_LEVEL,
+                applies_to: "units only (not buildings or towers)",
+                levels: (1..=RESEARCH_MAX_LEVEL)
+                    .filter_map(|level| {
+                        research_step(k, level).map(|s| CatalogResearchLevel {
+                            level: s.level,
+                            cost_gold: s.cost_gold,
+                            cost_lumber: s.cost_lumber,
+                            research_time: s.research_time,
+                            bonus: research_bonus(k, level),
+                        })
+                    })
+                    .collect(),
+                description: k.description(),
+            })
+            .collect(),
         items: ALL_ITEMS
             .iter()
             .map(|&id| {
@@ -1124,6 +1578,7 @@ pub fn game_catalog() -> Catalog {
                     id: d.name,
                     cost_gold: d.cost_gold,
                     sold_at: building_name(BuildingKind::Shop),
+                    tier: d.tier.level(),
                     description: d.description,
                 }
             })
@@ -1524,6 +1979,26 @@ impl BaseStats {
     }
 }
 
+/// The team-wide half of the stat law's input: what this entity's OWNER has
+/// researched. Zeroes for anything research does not touch (buildings, towers),
+/// which is how "research equips the army, not the masonry" is spelled at the
+/// call site rather than buried in a branch inside the law.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResearchBonus {
+    /// Flat damage added to each attack this entity makes.
+    pub bonus_damage: f32,
+    /// Flat damage subtracted from each hit this entity takes.
+    pub flat_armor: f32,
+}
+
+impl ResearchBonus {
+    /// Nothing researched, or research does not apply here.
+    pub const NONE: ResearchBonus = ResearchBonus {
+        bonus_damage: 0.0,
+        flat_armor: 0.0,
+    };
+}
+
 /// What the simulation must actually use.
 #[derive(Clone, Copy, Debug)]
 pub struct EffectiveStats {
@@ -1537,6 +2012,19 @@ pub struct EffectiveStats {
     pub damage_taken_mult: f32,
     /// HP per second this entity regains from HealOverTime.
     pub heal_per_second: f32,
+    /// Flat damage ADDED to each attack, from attack research. Added AFTER
+    /// every multiplier — `damage_mult`, a hero's level bonus, a Catapult's
+    /// 6x vs buildings — precisely so that none of them can amplify it. +3
+    /// attack is +3 damage on every swing in the game, whoever swings it and
+    /// whatever they swing at. Multiplying it instead would make the upgrade
+    /// worth +18 to a Catapult hitting a wall and +3 to a Footman hitting a
+    /// man, which is a siege upgrade wearing an army upgrade's label.
+    pub bonus_damage: f32,
+    /// Flat damage SUBTRACTED from each incoming hit, from armor research.
+    /// Applied after `damage_taken_mult`, at the single point health is
+    /// subtracted, and floored at `MIN_DAMAGE_PER_HIT` so no stack of armour
+    /// ever makes a unit immune.
+    pub flat_armor: f32,
 }
 
 /// **THE modifier function.** One law, one place. `units.rs` asks it for move
@@ -1549,13 +2037,37 @@ pub struct EffectiveStats {
 /// reciprocal of attack speed, so it is divided, not multiplied — that is the
 /// whole reason this arithmetic lives in one function instead of five call
 /// sites). Haste is legs only.
+/// Statuses only — for everything research does not touch (buildings taking a
+/// hit, tower weapons). Exactly `effective_stats_with(base, status,
+/// ResearchBonus::NONE)`, named so that "no research applies here" is a
+/// deliberate statement at the call site rather than a forgotten argument.
 pub fn effective_stats(base: BaseStats, status: Option<&StatusEffects>) -> EffectiveStats {
+    effective_stats_with(base, status, ResearchBonus::NONE)
+}
+
+/// **THE modifier function**, in full: the one place a base stat, a status
+/// effect and a team's research meet. Everything downstream — move speed,
+/// attack cooldown, damage dealt, damage taken — is read off the struct this
+/// returns, never off `unit_stats(kind)` and never off `TeamResearch` directly.
+///
+/// The two inputs are deliberately different shapes because they are different
+/// kinds of fact: a `StatusEffects` is a component ON the entity, `ResearchBonus`
+/// is a property of the team that OWNS it. Multiplicative modifiers compose in
+/// the multipliers; research composes as the two flat terms, which is what
+/// keeps a percentage buff from ever scaling a flat upgrade.
+pub fn effective_stats_with(
+    base: BaseStats,
+    status: Option<&StatusEffects>,
+    research: ResearchBonus,
+) -> EffectiveStats {
     let mut out = EffectiveStats {
         speed: base.speed,
         attack_cooldown: base.attack_cooldown,
         damage_mult: 1.0,
         damage_taken_mult: 1.0,
         heal_per_second: 0.0,
+        bonus_damage: research.bonus_damage,
+        flat_armor: research.flat_armor,
     };
     let Some(status) = status else {
         return out;
@@ -1578,6 +2090,36 @@ pub fn effective_stats(base: BaseStats, status: Option<&StatusEffects>) -> Effec
 /// Convenience wrapper for the common "a unit of kind K with these effects".
 pub fn effective_unit_stats(kind: UnitKind, status: Option<&StatusEffects>) -> EffectiveStats {
     effective_stats(BaseStats::of_unit(kind), status)
+}
+
+/// The same, for a unit whose owning team has researched something. This is
+/// what combat.rs uses for every unit swing; the research-free wrapper above
+/// remains for callers that only want speed (units.rs) or that are asking on
+/// behalf of a structure.
+pub fn effective_unit_stats_with(
+    kind: UnitKind,
+    status: Option<&StatusEffects>,
+    research: ResearchBonus,
+) -> EffectiveStats {
+    effective_stats_with(BaseStats::of_unit(kind), status, research)
+}
+
+/// Damage actually subtracted from a victim's health, given the raw amount,
+/// the victim's incoming-damage multiplier and its team's armor research.
+///
+/// One function because the floor is easy to forget and expensive to get wrong:
+/// without it three levels of armor would take a Worker's 5-damage swing to 2
+/// and a Spearman's 6 to 3, and a fourth level (or a stacking armor buff on top)
+/// would reach zero and make the victim literally unkillable by that attacker.
+/// The floor is `MIN_DAMAGE_PER_HIT` *or the unarmoured amount, whichever is
+/// smaller* — armor must never round a hit UP. A 0.5-damage tick stays 0.5
+/// against three levels of plate; only a hit that started above the floor can
+/// be pushed down to it. That subtlety is why this is a function and not an
+/// expression at the call site.
+pub fn damage_after_armor(raw: f32, damage_taken_mult: f32, flat_armor: f32) -> f32 {
+    let full = raw * damage_taken_mult;
+    let floor = MIN_DAMAGE_PER_HIT.min(full.max(0.0));
+    (full - flat_armor).max(floor)
 }
 
 /// Units (heroes included) heal this fraction of max HP per second once out
@@ -1684,7 +2226,9 @@ pub enum AbilityTargets {
     OwnWorkers,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// `Eq` is out: `ApplyStatus::also` carries a magnitude, and a magnitude is an
+// f32. Nothing compares ability effects for hashing or set membership.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AbilityEffect {
     /// AoE damage around the caster (scaled by hero level).
     Damage,
@@ -1699,6 +2243,15 @@ pub enum AbilityEffect {
     ApplyStatus {
         status: StatusKind,
         targets: AbilityTargets,
+        /// A SECOND status laid down by the same cast, with its own magnitude.
+        /// Everything else — radius, targets, duration — is shared with the
+        /// primary status, because it is one cast.
+        ///
+        /// This is the framework's only concession to the Priestess ultimate:
+        /// Sanctuary both heals over time AND hardens, and "two abilities on
+        /// one button" or "an ability that casts another ability" would both
+        /// have cost more than one optional pair. `None` for every other row.
+        also: Option<(StatusKind, f32)>,
     },
 }
 
@@ -1718,6 +2271,21 @@ impl AbilityEffect {
             AbilityEffect::ApplyStatus { status, .. } => Some(status),
             _ => None,
         }
+    }
+    /// The optional second status and its magnitude — see `ApplyStatus::also`.
+    pub fn extra_status(self) -> Option<(StatusKind, f32)> {
+        match self {
+            AbilityEffect::ApplyStatus { also, .. } => also,
+            _ => None,
+        }
+    }
+    /// Does this effect restore HP (instantly or over time)? Auto-cast asks,
+    /// so that a healing ability waits for someone who is actually hurt
+    /// instead of firing at a column of full-health allies.
+    pub fn heals(self) -> bool {
+        matches!(self, AbilityEffect::Heal)
+            || self.status() == Some(StatusKind::HealOverTime)
+            || self.extra_status().map(|(k, _)| k) == Some(StatusKind::HealOverTime)
     }
 }
 
@@ -1800,6 +2368,58 @@ const CALL_TO_ARMS: AbilityDef = AbilityDef {
     description: "Own workers near the TownHall become fighters for 40s.",
 };
 
+// --- hero ultimates: the second ability of each class, at hero level 5 ------
+//
+// Both are pure table rows: `ApplyStatus` at `Allies`, an `AbilityUnlock::
+// HeroLevel(5)` predicate, their own cooldown slot. Nothing in combat.rs,
+// ui.rs, doctrine.rs or bridge.rs knows their names.
+//
+// They are also the reason a leveled hero is worth a war of its own. A team
+// that keeps its Champion alive to level 5 gets a 45s army-wide damage spike;
+// a team that kills it takes that away for the whole revive-and-relevel arc.
+
+/// Champion ultimate. Radius and duration are tuned so it is an ENGAGEMENT
+/// button, not a permanent aura: 8s of +30% inside 8 units, once every 45s.
+const WARCRY: AbilityDef = AbilityDef {
+    name: "Warcry",
+    effect: AbilityEffect::ApplyStatus {
+        status: StatusKind::DamageBuff,
+        targets: AbilityTargets::Allies,
+        also: None,
+    },
+    mana_cost: 75.0,
+    cooldown: 45.0,
+    radius: 8.0,
+    power: 0.30,
+    duration: 8.0,
+    // A shout carries. Unlike the Slam this is not a ground shockwave, so the
+    // team's air units are inside the buff like everyone else.
+    hits_air: true,
+    unlock: AbilityUnlock::HeroLevel(5),
+    description: "Ultimate: allies around the Champion deal +30% damage for 8s. Hero level 5.",
+};
+
+/// Priestess ultimate: the two-status row. 15 HP/s is roughly a Footman's
+/// health bar over the full 6s, and the 25% reduction is what makes the heal
+/// out-race incoming fire instead of merely trailing it.
+const SANCTUARY: AbilityDef = AbilityDef {
+    name: "Sanctuary",
+    effect: AbilityEffect::ApplyStatus {
+        status: StatusKind::HealOverTime,
+        targets: AbilityTargets::Allies,
+        also: Some((StatusKind::ArmorBuff, 0.25)),
+    },
+    mana_cost: 90.0,
+    cooldown: 60.0,
+    radius: 7.0,
+    power: 15.0,
+    duration: 6.0,
+    hits_air: true,
+    unlock: AbilityUnlock::HeroLevel(5),
+    description: "Ultimate: allies around the Priestess regain 15 HP/s and take 25% less damage \
+                  for 6s. Hero level 5.",
+};
+
 /// Dev-only second Champion ability, present only under `WC3_STATUS_PROBE=1`.
 /// It exists so a real match can exercise the v2 path end to end — a second
 /// ability on a caster, a level-gated unlock, its own cooldown slot, an
@@ -1810,6 +2430,7 @@ const PROBE_CHILL: AbilityDef = AbilityDef {
     effect: AbilityEffect::ApplyStatus {
         status: StatusKind::Slow,
         targets: AbilityTargets::Enemies,
+        also: None,
     },
     mana_cost: 10.0,
     cooldown: 8.0,
@@ -1861,6 +2482,11 @@ const SLOW: AbilityDef = AbilityDef {
     effect: AbilityEffect::ApplyStatus {
         status: StatusKind::Slow,
         targets: AbilityTargets::Enemies,
+        // Slow is one debuff and nothing else. The `also` slot exists for the
+        // Priestess ultimate, which genuinely is two effects on one button;
+        // stapling a second status onto crowd control would make the game's
+        // cheapest debuff its most complicated one.
+        also: None,
     },
     mana_cost: 0.0,
     cooldown: 9.0,
@@ -1874,9 +2500,9 @@ const SLOW: AbilityDef = AbilityDef {
 };
 
 const NO_ABILITIES: [AbilityDef; 0] = [];
-const HERO_ABILITIES: [AbilityDef; 1] = [SLAM];
-const HERO_ABILITIES_PROBE: [AbilityDef; 2] = [SLAM, PROBE_CHILL];
-const PRIESTESS_ABILITIES: [AbilityDef; 1] = [HEAL];
+const HERO_ABILITIES: [AbilityDef; 2] = [SLAM, WARCRY];
+const HERO_ABILITIES_PROBE: [AbilityDef; 3] = [SLAM, WARCRY, PROBE_CHILL];
+const PRIESTESS_ABILITIES: [AbilityDef; 2] = [HEAL, SANCTUARY];
 const SORCERER_ABILITIES: [AbilityDef; 1] = [SLOW];
 const TOWNHALL_ABILITIES: [AbilityDef; 1] = [CALL_TO_ARMS];
 
@@ -1986,6 +2612,37 @@ pub fn ability_index_by_id(list: &[AbilityDef], id: &str) -> Option<usize> {
     list.iter().position(|def| def.name.eq_ignore_ascii_case(id))
 }
 
+/// Enemies inside Warcry's radius (and allies to buff) before the scripted
+/// commander thinks the shout is worth its 45s.
+pub const WARCRY_MIN_TARGETS: u32 = 4;
+/// Hurt allies inside Sanctuary's radius before it is worth its 60s.
+pub const SANCTUARY_MIN_TARGETS: u32 = 3;
+
+/// Standing auto-cast doctrine a MACHINE-DRIVEN team gets for free, per hero
+/// class: the ultimate slots and their trigger counts.
+///
+/// Ultimates are the one part of the kit a scripted commander cannot be
+/// trusted to spend by hand — they are long-cooldown, situational, and worth
+/// nothing cast early. So they are doctrine, not script: ai.rs installs these
+/// rules on the heroes of any team it is actually driving, and doctrine.rs's
+/// auto-caster fires them under the same unlock/cooldown/mana gate a player's
+/// button obeys. A human or bridge-driven team gets nothing here and keeps
+/// full manual control.
+///
+/// Slots are resolved BY NAME, so a row inserted ahead of an ultimate moves
+/// the rule with it. Slot 0 (Slam / Heal) is deliberately absent: that is the
+/// player's `T` toggle and the scripted AI's own explicit cast.
+pub fn machine_autocast_rules(kind: UnitKind) -> Vec<(usize, u32)> {
+    let list = abilities_of_unit(kind);
+    [
+        ("Warcry", WARCRY_MIN_TARGETS),
+        ("Sanctuary", SANCTUARY_MIN_TARGETS),
+    ]
+    .iter()
+    .filter_map(|(id, min)| ability_index_by_id(list, id).map(|index| (index, *min)))
+    .collect()
+}
+
 /// Which ability of `list` a cast request means. `None` selector = the first
 /// unlocked one; an explicit selector that names a locked or missing ability
 /// resolves to `None` and the cast is refused by the caller.
@@ -2089,13 +2746,30 @@ pub const MILITIA_DAMAGE: f32 = 16.0;
 pub enum ItemId {
     HealingPotion,
     TownPortal,
+    BootsOfSpeed,
+    BannerOfCommand,
+    ScrollOfMassTeleport,
 }
 
-pub const ALL_ITEMS: [ItemId; 2] = [ItemId::HealingPotion, ItemId::TownPortal];
+/// The shop shelf, in shelf order: tier 1 first, then the gated rungs. The
+/// command card, the catalog and the bridge all walk this array, so the order
+/// here IS the order a player and a commander see.
+pub const ALL_ITEMS: [ItemId; 5] = [
+    ItemId::HealingPotion,
+    ItemId::TownPortal,
+    ItemId::BootsOfSpeed,
+    ItemId::BannerOfCommand,
+    ItemId::ScrollOfMassTeleport,
+];
 
 pub struct ItemDef {
     pub name: &'static str,
     pub cost_gold: u32,
+    /// Team tech tier required to BUY this. The shelf is tiered for the same
+    /// reason the ability list is: a Shop built in the first two minutes must
+    /// not sell the late-game map-control scroll. `item_unlocked` is the one
+    /// place the comparison happens.
+    pub tier: TechTier,
     pub description: &'static str,
 }
 
@@ -2104,18 +2778,64 @@ pub fn item_def(id: ItemId) -> ItemDef {
         ItemId::HealingPotion => ItemDef {
             name: "HealingPotion",
             cost_gold: 100,
+            tier: TechTier::T1,
             description: "Instantly restores 150 HP to the hero.",
         },
         ItemId::TownPortal => ItemDef {
             name: "TownPortal",
             cost_gold: 150,
+            tier: TechTier::T1,
             description: "Teleports the hero and nearby own units to the nearest own TownHall.",
+        },
+        ItemId::BootsOfSpeed => ItemDef {
+            name: "BootsOfSpeed",
+            cost_gold: 50,
+            tier: TechTier::T1,
+            description: "Hastes the hero: +40% move speed for 15s.",
+        },
+        ItemId::BannerOfCommand => ItemDef {
+            name: "BannerOfCommand",
+            cost_gold: 125,
+            tier: TechTier::T2,
+            description: "Plants a banner: own units within 8 take 30% less damage for 10s.",
+        },
+        ItemId::ScrollOfMassTeleport => ItemDef {
+            name: "ScrollOfMassTeleport",
+            cost_gold: 250,
+            tier: TechTier::T3,
+            description: "Recalls the hero and EVERY own non-worker unit on the map to the \
+                          hall nearest the hero.",
         },
     }
 }
 
+/// May a team at `tier` buy `id`? Asked by economy.rs (which pays), by the
+/// command card (which greys the button), by the bridge validator (which
+/// explains the refusal) and by the snapshot (which reports `locked`), so the
+/// four can never disagree about what is on the shelf.
+pub fn item_unlocked(id: ItemId, tier: TechTier) -> bool {
+    tier >= item_def(id).tier
+}
+
 pub const POTION_HEAL: f32 = 150.0;
 pub const PORTAL_RADIUS: f32 = 8.0;
+
+/// Boots of Speed: a Haste status on the hero alone, through the ordinary
+/// status framework — so it stacks with, and expires like, every other buff.
+pub const BOOTS_HASTE: f32 = 0.40;
+pub const BOOTS_DURATION: f32 = 15.0;
+
+/// Banner of Command: an ArmorBuff on own units around the hero. Shorter than
+/// it is wide — it is a "hold this fight" button, not a march buff.
+pub const BANNER_ARMOR: f32 = 0.30;
+pub const BANNER_DURATION: f32 = 10.0;
+pub const BANNER_RADIUS: f32 = 8.0;
+
+/// Scroll of Mass Teleport's radius. Deliberately larger than the map's
+/// diagonal (`MAP_HALF * 2 * sqrt(2)`), so the single radius test in units.rs
+/// includes every own unit wherever it stands: "map-wide" is expressed as a
+/// number in the existing mechanism, not as a second code path.
+pub const MASS_TELEPORT_RADIUS: f32 = MAP_HALF * 4.0;
 
 /// Two consumable slots, heroes only. units.rs inserts it empty at hero spawn.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -2145,6 +2865,11 @@ pub struct TeleportRequest {
     pub center: Entity,
     pub radius: f32,
     pub dest: Vec3,
+    /// Leave workers where they stand. A Town Portal at radius 8 sweeps up
+    /// whatever is beside the hero and that is fine; a MAP-WIDE recall that
+    /// also emptied every gold mine would be an economy wipe disguised as a
+    /// map-control item. `center` itself always rides, worker or not.
+    pub army_only: bool,
 }
 
 /// XP granted to nearby enemy heroes when this thing dies.
@@ -2374,7 +3099,11 @@ impl TargetClass {
             (Some(UnitKind::Footman) | Some(UnitKind::Spearman), _) => Some(TargetClass::Footman),
             (Some(UnitKind::Worker), _) => Some(TargetClass::Worker),
             (Some(UnitKind::Catapult), _) => Some(TargetClass::Siege),
-            (Some(UnitKind::Raider), _) => Some(TargetClass::Cavalry),
+            // The Knight rides in under the same class as the Raider, which is
+            // the entire counter-triangle in one line: `vs_cavalry_mult` is
+            // keyed off the CLASS, so a Spearman's 5x lands on a 270g tier-3
+            // Knight exactly as hard as on a 170g tier-2 Raider.
+            (Some(UnitKind::Raider) | Some(UnitKind::Knight), _) => Some(TargetClass::Cavalry),
             (None, true) => Some(TargetClass::Building),
             _ => None,
         }
@@ -3489,6 +4218,22 @@ pub enum Intent {
         building: IntentId,
         index: usize,
     },
+    /// Start the next rung of a team-wide research ladder at one of our own
+    /// finished Blacksmiths (`catalog.research`). `upgrade` is a ladder id —
+    /// `"attack"` or `"armor"`, parsed like every other name in the protocol
+    /// (case, spaces, dashes and underscores are noise).
+    ///
+    /// Paid in full the moment it is accepted, exactly like `upgrade`. The
+    /// level it produces is always *current + 1*: a commander cannot name a
+    /// level, because skipping rungs is not a thing the game can do and
+    /// accepting a number that has only one legal value is a way to spell it
+    /// wrong. Refused if the forge is already researching something — one job
+    /// per Blacksmith, and requests are rejected rather than queued (see
+    /// `Researching`).
+    Research {
+        building: IntentId,
+        upgrade: String,
+    },
     /// Where units this building trains should go. `x`/`z` for ground, or
     /// `target` for a resource node (new workers harvest it) or an own unit
     /// (new units follow it).
@@ -3517,15 +4262,28 @@ pub enum Intent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ability: Option<AbilitySelector>,
     },
-    /// Buy a consumable at one of our own finished Shops. The buyer is implied:
-    /// a team has at most one living hero, and only heroes carry an inventory.
+    /// Buy a consumable at one of our own finished Shops.
+    ///
+    /// `hero` names WHICH of your heroes is buying. It used to be implied,
+    /// because a team had at most one — but hero slots scale with the hall
+    /// ladder now (`hero_slots`), so a Keep team fielding a Champion AND a
+    /// Priestess had a coin-flip about which inventory a potion landed in.
+    /// Omit it and the tie-break is documented and stable: **the living hero
+    /// with the lowest entity id**, which is the same hero every existing
+    /// one-hero call site already got. Back-compatible by construction.
     Buy {
         shop: IntentId,
         item: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hero: Option<IntentId>,
     },
+    /// Consume the item in one of a hero's inventory slots. `hero` picks which
+    /// hero's bag, with the same default as `Buy`.
     #[serde(rename = "use_item")]
     UseItem {
         slot: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hero: Option<IntentId>,
     },
 
     // --- doctrine: standing policy, executed by the engine at machine speed ---
@@ -3639,6 +4397,7 @@ impl Intent {
             Intent::Train { .. } => "train",
             Intent::Upgrade { .. } => "upgrade",
             Intent::Cancel { .. } => "cancel",
+            Intent::Research { .. } => "research",
             Intent::Rally { .. } => "rally",
             Intent::Cast { .. } => "cast",
             Intent::Buy { .. } => "buy",
@@ -3713,6 +4472,9 @@ impl Intent {
             Intent::Cancel { building, index } => {
                 format!("building {building} cancels queue slot {index}")
             }
+            Intent::Research { building, upgrade } => {
+                format!("building {building} researches {upgrade}")
+            }
             Intent::Rally {
                 building,
                 x,
@@ -3728,8 +4490,14 @@ impl Intent {
             Intent::Cast { hero, ability } => {
                 format!("{hero} casts {}", ability_name(ability))
             }
-            Intent::Buy { shop, item } => format!("buy {item} at shop {shop}"),
-            Intent::UseItem { slot } => format!("hero uses item in slot {slot}"),
+            Intent::Buy { shop, item, hero } => match hero {
+                Some(hero) => format!("hero {hero} buys {item} at shop {shop}"),
+                None => format!("buy {item} at shop {shop}"),
+            },
+            Intent::UseItem { slot, hero } => match hero {
+                Some(hero) => format!("hero {hero} uses item in slot {slot}"),
+                None => format!("hero uses item in slot {slot}"),
+            },
             Intent::Priority { units, classes } => {
                 if classes.is_empty() {
                     format!("{} clear focus-fire priority", group(units))
@@ -4095,6 +4863,7 @@ impl Plugin for CorePlugin {
             .init_resource::<ExternallyCommanded>()
             .init_resource::<SquadOrders>()
             .init_resource::<TechTiers>()
+            .init_resource::<TeamResearch>()
             .init_resource::<GameEvents>()
             .init_resource::<FogGrids>()
             .add_event::<SpawnUnitEvent>()
@@ -4108,6 +4877,7 @@ impl Plugin for CorePlugin {
             .add_event::<UseItem>()
             .add_event::<TeleportRequest>()
             .add_event::<UpgradeBuilding>()
+            .add_event::<StartResearch>()
             .add_systems(Startup, (initial_spawns, apply_env_speed, log_fog_mode))
             .add_systems(
                 Update,
@@ -4403,7 +5173,7 @@ fn status_probe(
         );
     }
 
-    // Keep asking the Champion for its SECOND ability by explicit index. The
+    // Keep asking the Champion for its probe ability by explicit slot. The
     // executor refuses while it is locked, on cooldown, or short of mana; every
     // cast that does land slows whatever is standing around it.
     if now >= *next_cast {
@@ -4413,10 +5183,12 @@ fn status_probe(
                 continue;
             }
             let list = abilities_of_unit(unit.kind);
-            if list.len() > 1 {
+            // By NAME, not by slot: the ultimates bead put Warcry in slot 1,
+            // and the probe still means the probe.
+            if let Some(index) = ability_index_by_id(list, "ProbeChill") {
                 let ctx = UnlockCtx::new(hero.level, tiers.get(*team));
-                if ability_unlocked(&list[1], ctx) {
-                    casts.write(CastAbility::index(entity, 1));
+                if ability_unlocked(&list[index], ctx) {
+                    casts.write(CastAbility::index(entity, index));
                 }
             }
         }
@@ -5462,6 +6234,7 @@ mod tests {
                 effect: AbilityEffect::ApplyStatus {
                     status: StatusKind::DamageBuff,
                     targets: AbilityTargets::Allies,
+                    also: None,
                 },
                 mana_cost: 50.0,
                 cooldown: 30.0,
@@ -5593,6 +6366,231 @@ mod tests {
         assert_eq!(policy.primary(), Some(5));
         policy.clear_ability(1);
         assert!(policy.is_empty());
+    }
+
+    // --- hero ultimates (T3 content) -----------------------------------------
+
+    #[test]
+    fn each_hero_class_has_an_ultimate_in_slot_one_at_level_five() {
+        for (kind, id) in [(UnitKind::Hero, "Warcry"), (UnitKind::Priestess, "Sanctuary")] {
+            let list = abilities_of_unit(kind);
+            assert_eq!(list[1].name, id, "{id} must be the second slot");
+            assert_eq!(list[1].unlock, AbilityUnlock::HeroLevel(5));
+            // The unlock is a CLIFF at 5, and the tier ladder has no say in it:
+            // a T3 team with a level-4 hero still has no ultimate.
+            for level in 0..5 {
+                assert!(
+                    !ability_unlocked(&list[1], UnlockCtx::new(level, TechTier::T3)),
+                    "{id} must stay locked at hero level {level}"
+                );
+            }
+            assert!(ability_unlocked(&list[1], UnlockCtx::new(5, TechTier::T1)));
+            // Slot 0 is untouched — an ultimate never displaces the basic kit.
+            assert!(ability_unlocked(&list[0], UnlockCtx::new(1, TechTier::T1)));
+            // `None` selector still means "the first ability I can use", so a
+            // level-5 hero's old one-button call sites did not silently move.
+            assert_eq!(first_unlocked_ability(list, UnlockCtx::new(5, TechTier::T3)), Some(0));
+            // The ultimate is reachable by id, which is what the bridge sends.
+            assert_eq!(
+                resolve_ability(list, Some(&AbilitySelector::Id(id.to_lowercase())), UnlockCtx::new(5, TechTier::T1)),
+                Some(1)
+            );
+            assert_eq!(
+                resolve_ability(list, Some(&AbilitySelector::Id(id.to_string())), UnlockCtx::new(4, TechTier::T3)),
+                None,
+                "{id} must be unreachable below level 5"
+            );
+            // Its own cooldown slot: firing the ultimate never blocks Slam/Heal.
+            let mut cds = AbilityCooldowns::default();
+            cds.start(1, list[1].cooldown);
+            assert!(!ability_ready(&list[1], None, Some(&cds), 1));
+            assert!(ability_ready(&list[0], None, Some(&cds), 0));
+        }
+    }
+
+    #[test]
+    fn sanctuary_is_one_cast_carrying_two_statuses() {
+        let sanctuary = abilities_of_unit(UnitKind::Priestess)[1];
+        assert_eq!(sanctuary.effect.status(), Some(StatusKind::HealOverTime));
+        assert_eq!(
+            sanctuary.effect.extra_status(),
+            Some((StatusKind::ArmorBuff, 0.25))
+        );
+        assert!(sanctuary.effect.heals());
+        // Warcry is the single-status shape, and is NOT a heal — the auto-cast
+        // trigger keys off exactly this.
+        let warcry = abilities_of_unit(UnitKind::Hero)[1];
+        assert_eq!(warcry.effect.extra_status(), None);
+        assert!(!warcry.effect.heals());
+        assert!(SLAM.effect.extra_status().is_none() && !SLAM.effect.heals());
+        assert!(HEAL.effect.heals());
+    }
+
+    #[test]
+    fn ultimate_and_item_magnitudes_arrive_through_effective_stats() {
+        let footman = BaseStats::of_unit(UnitKind::Footman);
+        let base = unit_stats(UnitKind::Footman);
+
+        // Warcry: +30% outgoing damage for 8s.
+        let warcry = abilities_of_unit(UnitKind::Hero)[1];
+        let mut buffed = StatusEffects::new();
+        buffed.apply(StatusEffect::new(
+            warcry.effect.status().unwrap(),
+            warcry.power,
+            0.0,
+            warcry.duration,
+            StatusSource::Ability,
+        ));
+        assert!((effective_stats(footman, Some(&buffed)).damage_mult - 1.30).abs() < 1e-6);
+
+        // Sanctuary: both statuses, one cast, one duration.
+        let sanctuary = abilities_of_unit(UnitKind::Priestess)[1];
+        let (extra, magnitude) = sanctuary.effect.extra_status().unwrap();
+        let mut warded = StatusEffects::new();
+        warded.apply(StatusEffect::new(
+            sanctuary.effect.status().unwrap(),
+            sanctuary.power,
+            0.0,
+            sanctuary.duration,
+            StatusSource::Ability,
+        ));
+        warded.apply(StatusEffect::new(
+            extra,
+            magnitude,
+            0.0,
+            sanctuary.duration,
+            StatusSource::Ability,
+        ));
+        let eff = effective_stats(footman, Some(&warded));
+        assert!((eff.heal_per_second - 15.0).abs() < 1e-6);
+        assert!((eff.damage_taken_mult - 0.75).abs() < 1e-6);
+        // Both instances die on the same tick — one cast, one expiry.
+        assert!(warded.expire(sanctuary.duration + 0.01));
+        assert!(warded.is_empty());
+
+        // Boots of Speed: +40% legs, and legs only.
+        let mut hasted = StatusEffects::new();
+        hasted.apply(StatusEffect::new(
+            StatusKind::Haste,
+            BOOTS_HASTE,
+            0.0,
+            BOOTS_DURATION,
+            StatusSource::Item,
+        ));
+        let eff = effective_stats(footman, Some(&hasted));
+        assert!((eff.speed - base.speed * 1.40).abs() < 1e-4);
+        assert!((eff.attack_cooldown - base.attack_cooldown).abs() < 1e-6);
+
+        // Banner of Command: 30% off incoming damage.
+        let mut shielded = StatusEffects::new();
+        shielded.apply(StatusEffect::new(
+            StatusKind::ArmorBuff,
+            BANNER_ARMOR,
+            0.0,
+            BANNER_DURATION,
+            StatusSource::Item,
+        ));
+        assert!((effective_stats(footman, Some(&shielded)).damage_taken_mult - 0.70).abs() < 1e-6);
+    }
+
+    #[test]
+    fn machine_autocast_covers_the_ultimates_and_nothing_else() {
+        let champion = machine_autocast_rules(UnitKind::Hero);
+        assert_eq!(champion, vec![(1, WARCRY_MIN_TARGETS)]);
+        let priestess = machine_autocast_rules(UnitKind::Priestess);
+        assert_eq!(priestess, vec![(1, SANCTUARY_MIN_TARGETS)]);
+        // Slot 0 stays the player's `T` toggle / the script's own cast.
+        assert!(champion.iter().all(|(index, _)| *index != 0));
+        assert!(machine_autocast_rules(UnitKind::Footman).is_empty());
+        // Installing them leaves any hand-set slot-0 rule alone.
+        let mut policy = AutoCastPolicy::first(3);
+        for (index, min) in machine_autocast_rules(UnitKind::Hero) {
+            policy.set(index, min);
+        }
+        assert_eq!(policy.min_enemies_for(0), Some(3));
+        assert_eq!(policy.min_enemies_for(1), Some(WARCRY_MIN_TARGETS));
+    }
+
+    // --- the tiered shop shelf -----------------------------------------------
+
+    #[test]
+    fn the_shop_shelf_is_tiered_and_gating_is_one_rule() {
+        // The shelf, as designed: two starter consumables and the boots at T1,
+        // the banner at the Keep, the mass-teleport scroll at the Castle.
+        let expected = [
+            (ItemId::HealingPotion, 100, TechTier::T1),
+            (ItemId::TownPortal, 150, TechTier::T1),
+            (ItemId::BootsOfSpeed, 50, TechTier::T1),
+            (ItemId::BannerOfCommand, 125, TechTier::T2),
+            (ItemId::ScrollOfMassTeleport, 250, TechTier::T3),
+        ];
+        assert_eq!(ALL_ITEMS.len(), expected.len());
+        for (id, cost, tier) in expected {
+            let def = item_def(id);
+            assert_eq!(def.cost_gold, cost, "{} price", def.name);
+            assert_eq!(def.tier, tier, "{} tier", def.name);
+            // Gating is `tier >= required`, and nothing else: a team at or
+            // above the rung may buy, a team below may not, at every rung.
+            for team_tier in [TechTier::T1, TechTier::T2, TechTier::T3] {
+                assert_eq!(
+                    item_unlocked(id, team_tier),
+                    team_tier >= tier,
+                    "{} at {}",
+                    def.name,
+                    team_tier.name()
+                );
+            }
+        }
+        // The rungs a fresh team can reach are exactly the T1 ones — the
+        // regression this bead exists to prevent is a Shop built at minute two
+        // selling the late-game scroll.
+        let at_start: Vec<&str> = ALL_ITEMS
+            .iter()
+            .filter(|id| item_unlocked(**id, TechTier::T1))
+            .map(|id| item_def(*id).name)
+            .collect();
+        assert_eq!(at_start, ["HealingPotion", "TownPortal", "BootsOfSpeed"]);
+        // Tier is a property of what is STANDING: the same team that could buy
+        // the scroll with a Castle up cannot once it is rubble.
+        let with_castle = tech_tier_for([BuildingKind::TownHall, BuildingKind::Castle].into_iter());
+        let after_loss = tech_tier_for([BuildingKind::TownHall].into_iter());
+        assert!(item_unlocked(ItemId::ScrollOfMassTeleport, with_castle));
+        assert!(!item_unlocked(ItemId::ScrollOfMassTeleport, after_loss));
+        assert!(item_unlocked(ItemId::HealingPotion, after_loss));
+    }
+
+    #[test]
+    fn mass_teleport_spans_the_map_and_the_catalog_carries_the_shelf() {
+        // "Map-wide" is a radius, not a special case: the scroll's radius has
+        // to beat the longest possible distance between two units.
+        let diagonal = (MAP_HALF * 2.0) * std::f32::consts::SQRT_2;
+        assert!(MASS_TELEPORT_RADIUS > diagonal);
+        assert!(PORTAL_RADIUS < diagonal, "the Town Portal stays local");
+
+        let catalog = game_catalog();
+        assert_eq!(catalog.items.len(), ALL_ITEMS.len());
+        for id in ALL_ITEMS {
+            let def = item_def(id);
+            let row = catalog
+                .items
+                .iter()
+                .find(|i| i.id == def.name)
+                .unwrap_or_else(|| panic!("{} missing from the catalog", def.name));
+            assert_eq!(row.tier, def.tier.level());
+            assert_eq!(row.cost_gold, def.cost_gold);
+            assert_eq!(row.sold_at, building_name(BuildingKind::Shop));
+        }
+        // The ultimates and their second status reach the catalog too, so a
+        // commander reading catalog.json alone knows Sanctuary does two things.
+        for id in ["Warcry", "Sanctuary"] {
+            let row = catalog.abilities.iter().find(|a| a.id == id).expect(id);
+            assert_eq!(row.index, 1);
+            assert_eq!(row.unlock, "hero level 5");
+            assert_eq!(row.effect, "status");
+        }
+        let sanctuary = catalog.abilities.iter().find(|a| a.id == "Sanctuary").unwrap();
+        assert_eq!(sanctuary.status, Some("HealOverTime"));
+        assert_eq!(sanctuary.status2, Some(("ArmorBuff", 0.25)));
     }
 
     #[test]
@@ -5768,6 +6766,7 @@ mod tests {
             AbilityEffect::ApplyStatus {
                 status: StatusKind::Slow,
                 targets: AbilityTargets::Enemies,
+                also: None,
             },
             "Slow must reach the status framework through ApplyStatus, not a new variant",
         );
@@ -6005,6 +7004,74 @@ mod tests {
         );
     }
 
+    /// Where hero SLOTS meet hero ULTIMATES: with two heroes on the field the
+    /// unlock predicate has to read the level of the hero it is asked about,
+    /// and revival has to hand back that hero's own progression.
+    ///
+    /// The failure this pins is specific and was reachable: while records were
+    /// one-per-team, a Champion's level answered for the Priestess too, so a
+    /// level-6 Champion would have unlocked Sanctuary on a level-1 Priestess
+    /// the moment she was trained. Records are per class, so each hero's
+    /// ultimate opens on its own XP — and survives its own death.
+    #[test]
+    fn each_hero_class_unlocks_its_own_ultimate_from_its_own_record() {
+        let team = Team::Human;
+        let mut records = HeroRecords::default();
+
+        // A veteran Champion and a brand-new Priestess.
+        records.set(team, HeroRecord { level: 6, xp: 40.0, kind: UnitKind::Hero });
+        records.set(team, HeroRecord { level: 1, xp: 0.0, kind: UnitKind::Priestess });
+
+        let ultimate = |kind: UnitKind| {
+            let list = abilities_of_unit(kind);
+            *list
+                .iter()
+                .find(|d| matches!(d.unlock, AbilityUnlock::HeroLevel(_)))
+                .expect("both hero classes ship a level-gated ultimate")
+        };
+        let champion_ult = ultimate(UnitKind::Hero);
+        let priestess_ult = ultimate(UnitKind::Priestess);
+        assert_eq!(champion_ult.name, "Warcry");
+        assert_eq!(priestess_ult.name, "Sanctuary");
+
+        // Each hero is rebuilt from ITS OWN record, exactly as units.rs does.
+        let champion = Hero::from_record(records.get(team, UnitKind::Hero));
+        let priestess = Hero::from_record(records.get(team, UnitKind::Priestess));
+        assert_eq!(champion.level, 6);
+        assert_eq!(priestess.level, 1);
+
+        // T3 in hand, so nothing here is a tier gate in disguise.
+        let ctx = |h: &Hero| UnlockCtx::new(h.level, TechTier::T3);
+        assert!(
+            ability_unlocked(&champion_ult, ctx(&champion)),
+            "a level-6 Champion has earned Warcry",
+        );
+        assert!(
+            !ability_unlocked(&priestess_ult, ctx(&priestess)),
+            "a level-1 Priestess must NOT inherit the Champion's level",
+        );
+
+        // She levels to 5 and it opens — then she dies, and revival restores
+        // her own record, so the ultimate is still hers.
+        records.set(team, HeroRecord { level: 5, xp: 10.0, kind: UnitKind::Priestess });
+        let revived = Hero::from_record(records.get(team, UnitKind::Priestess));
+        assert_eq!(revived.level, 5);
+        assert!(
+            ability_unlocked(&priestess_ult, ctx(&revived)),
+            "Sanctuary must survive a revival, because the level does",
+        );
+        // ...and the Champion's own record is untouched by any of it.
+        assert_eq!(records.get(team, UnitKind::Hero).map(|r| r.level), Some(6));
+
+        // Both ultimates coexist: two classes, two slots, one team, one match.
+        assert_eq!(hero_slots(TechTier::T2), 2);
+        assert_eq!(
+            hero_slot_check(&[UnitKind::Hero], UnitKind::Priestess, TechTier::T2),
+            HeroSlotVerdict::Ok,
+            "a Keep team may field both ultimates at once",
+        );
+    }
+
     /// Records are per CLASS now, and so is the price: a team fielding a
     /// level-6 Champion still pays full freight for its first Priestess, and
     /// reviving the Champion is not discounted by the Priestess existing.
@@ -6068,5 +7135,228 @@ mod tests {
             Some(2)
         );
         assert!(records.list(Team::Claude).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Research
+    // -----------------------------------------------------------------------
+
+    /// Costs and durations climb strictly with the rung, on every ladder. A
+    /// flat or non-monotonic price list would make level 3 the obvious opening
+    /// purchase and the whole escalation decorative.
+    #[test]
+    fn research_costs_escalate_strictly_on_every_ladder() {
+        for kind in ALL_RESEARCH_KINDS {
+            let steps: Vec<ResearchStep> = (1..=RESEARCH_MAX_LEVEL)
+                .map(|l| research_step(kind, l).expect("every rung up to the cap exists"))
+                .collect();
+            assert_eq!(steps.len() as u32, RESEARCH_MAX_LEVEL);
+            for pair in steps.windows(2) {
+                let (lo, hi) = (&pair[0], &pair[1]);
+                assert_eq!(hi.level, lo.level + 1, "{} rungs are contiguous", kind.id());
+                assert!(hi.cost_gold > lo.cost_gold, "{} gold escalates", kind.id());
+                assert!(hi.cost_lumber > lo.cost_lumber, "{} lumber escalates", kind.id());
+                assert!(
+                    hi.research_time > lo.research_time,
+                    "{} takes longer each rung",
+                    kind.id()
+                );
+            }
+            // Every rung costs both resources: research is deliberately not
+            // purchasable out of a pure gold economy.
+            assert!(steps.iter().all(|s| s.cost_gold > 0 && s.cost_lumber > 0));
+        }
+    }
+
+    /// The cap holds from both directions: `research_step` refuses to quote a
+    /// price above it, and `advance` refuses to climb past it however many
+    /// times it is called.
+    #[test]
+    fn research_levels_stop_at_the_cap() {
+        for kind in ALL_RESEARCH_KINDS {
+            assert!(research_step(kind, 0).is_none(), "level 0 is not a rung");
+            assert!(
+                research_step(kind, RESEARCH_MAX_LEVEL + 1).is_none(),
+                "{} has nothing above the cap",
+                kind.id()
+            );
+
+            let mut state = ResearchState::default();
+            assert_eq!(state.level(kind), 0);
+            for expected in 1..=RESEARCH_MAX_LEVEL {
+                assert!(state.next_step(kind).is_some(), "a rung remains below the cap");
+                assert_eq!(state.advance(kind), Some(expected));
+                assert_eq!(state.level(kind), expected);
+            }
+            // Saturated: further advances are refused and change nothing.
+            assert!(state.next_step(kind).is_none(), "nothing left to buy");
+            assert_eq!(state.advance(kind), None);
+            assert_eq!(state.level(kind), RESEARCH_MAX_LEVEL);
+            assert_eq!(
+                research_bonus(kind, state.level(kind)),
+                RESEARCH_MAX_LEVEL as f32
+            );
+        }
+    }
+
+    /// The two ladders are independent: buying attack does not move armor.
+    #[test]
+    fn research_ladders_advance_independently() {
+        let mut state = ResearchState::default();
+        state.advance(ResearchKind::Attack);
+        state.advance(ResearchKind::Attack);
+        assert_eq!(state.attack_bonus(), 2.0);
+        assert_eq!(state.armor_bonus(), 0.0);
+        assert_eq!(state.bonus().bonus_damage, 2.0);
+        assert_eq!(state.bonus().flat_armor, 0.0);
+    }
+
+    /// The whole point of the mechanic, measured end to end through the stat
+    /// law: a Footman with attack research swings for exactly +N, and a Footman
+    /// with armor research takes exactly -N. Flat, not scaled.
+    #[test]
+    fn research_shifts_effective_damage_by_exactly_the_flat_bonus() {
+        let kind = UnitKind::Footman;
+        let base = unit_stats(kind).damage;
+
+        let mut attacker = ResearchState::default();
+        let mut victim = ResearchState::default();
+        for level in 1..=RESEARCH_MAX_LEVEL {
+            attacker.advance(ResearchKind::Attack);
+            victim.advance(ResearchKind::Armor);
+            let bonus = level as f32;
+
+            // Outgoing: the swing is base + N.
+            let out = effective_unit_stats_with(kind, None, attacker.bonus());
+            assert_eq!(out.bonus_damage, bonus);
+            assert_eq!(base * out.damage_mult + out.bonus_damage, base + bonus);
+
+            // Incoming: the hit lands for base - N.
+            let inc = effective_unit_stats_with(kind, None, victim.bonus());
+            assert_eq!(inc.flat_armor, bonus);
+            assert_eq!(
+                damage_after_armor(base, inc.damage_taken_mult, inc.flat_armor),
+                base - bonus
+            );
+        }
+
+        // Both at once: +3 attack against +3 armor is a wash, exactly.
+        let out = effective_unit_stats_with(kind, None, attacker.bonus());
+        let inc = effective_unit_stats_with(kind, None, victim.bonus());
+        let swing = base * out.damage_mult + out.bonus_damage;
+        assert_eq!(
+            damage_after_armor(swing, inc.damage_taken_mult, inc.flat_armor),
+            base
+        );
+    }
+
+    /// A flat bonus must never be caught by a multiplier. A Catapult's 6x vs
+    /// buildings would turn +3 into +18 if the term were added before the
+    /// multiply — this pins the order of operations combat.rs uses.
+    #[test]
+    fn attack_research_is_never_multiplied_by_a_type_bonus() {
+        let mut state = ResearchState::default();
+        for _ in 0..RESEARCH_MAX_LEVEL {
+            state.advance(ResearchKind::Attack);
+        }
+        let stats = unit_stats(UnitKind::Catapult);
+        let eff = effective_unit_stats_with(UnitKind::Catapult, None, state.bonus());
+        // The arithmetic combat.rs performs, verbatim in shape.
+        let vs_building =
+            stats.damage * stats.vs_building_mult * eff.damage_mult + eff.bonus_damage;
+        assert_eq!(vs_building, stats.damage * 6.0 + 3.0);
+        assert_ne!(vs_building, (stats.damage + 3.0) * 6.0);
+    }
+
+    /// Armor is a discount, never an immunity: the floor holds even when the
+    /// research would otherwise erase a weak attack, and it never rounds a hit
+    /// UP.
+    #[test]
+    fn armor_floors_damage_without_ever_raising_it() {
+        let mut state = ResearchState::default();
+        for _ in 0..RESEARCH_MAX_LEVEL {
+            state.advance(ResearchKind::Armor);
+        }
+        let armor = state.armor_bonus();
+
+        // A Worker's 5-damage swing is heavily reduced but still lands.
+        let worker = unit_stats(UnitKind::Worker).damage;
+        assert_eq!(damage_after_armor(worker, 1.0, armor), worker - armor);
+        // An attack weaker than the armour is floored, not zeroed or negated.
+        assert_eq!(damage_after_armor(2.0, 1.0, armor), MIN_DAMAGE_PER_HIT);
+        assert_eq!(damage_after_armor(0.5, 1.0, armor), 0.5, "never rounded up");
+        // Unresearched teams are completely unaffected by the new pipeline.
+        assert_eq!(damage_after_armor(12.0, 1.0, 0.0), 12.0);
+    }
+
+    /// The forge sits at tier 2, is placeable, trains nothing, and therefore
+    /// cannot keep a losing team alive under the win condition.
+    #[test]
+    fn the_blacksmith_is_a_tier_two_support_building() {
+        let kind = BuildingKind::Blacksmith;
+        assert!(building_placeable(kind), "workers place it");
+        assert_eq!(building_requires(kind), &[BuildingKind::Keep]);
+        assert!(trainable(kind).is_empty(), "not a production building");
+        assert_eq!(building_researches(kind), &ALL_RESEARCH_KINDS);
+        assert!(building_stats(kind).vision > 0.0, "every building sees");
+
+        // A Keep satisfies it, a TownHall does not, and a Castle does — the
+        // tier comparison, not kind equality.
+        assert!(!requirements_met(
+            building_requires(kind),
+            [BuildingKind::TownHall].into_iter()
+        ));
+        assert!(requirements_met(
+            building_requires(kind),
+            [BuildingKind::Keep].into_iter()
+        ));
+        assert!(requirements_met(
+            building_requires(kind),
+            [BuildingKind::Castle].into_iter()
+        ));
+
+        // Nothing else researches, so a `research` command naming any other
+        // building is refused by the same table the card draws from.
+        for other in ALL_BUILDING_KINDS.into_iter().filter(|k| *k != kind) {
+            assert!(
+                building_researches(other).is_empty(),
+                "{other:?} is not a forge"
+            );
+        }
+    }
+
+    /// The catalog carries enough to plan a research investment without
+    /// reading the source, and deliberately does NOT carry a current level.
+    #[test]
+    fn the_catalog_exports_every_research_rung() {
+        let catalog = game_catalog();
+        assert_eq!(catalog.research.len(), ALL_RESEARCH_KINDS.len());
+        for entry in &catalog.research {
+            let kind = ALL_RESEARCH_KINDS
+                .into_iter()
+                .find(|k| k.id() == entry.id)
+                .expect("catalog ids are ladder ids");
+            assert_eq!(entry.researched_at, building_name(BuildingKind::Blacksmith));
+            assert_eq!(entry.max_level, RESEARCH_MAX_LEVEL);
+            assert_eq!(entry.levels.len() as u32, RESEARCH_MAX_LEVEL);
+            for (i, level) in entry.levels.iter().enumerate() {
+                let step = research_step(kind, i as u32 + 1).expect("a rung per level");
+                assert_eq!(level.level, step.level);
+                assert_eq!(level.cost_gold, step.cost_gold);
+                assert_eq!(level.cost_lumber, step.cost_lumber);
+                assert_eq!(level.research_time, step.research_time);
+                // Cumulative, not incremental: level 2 reads 2.
+                assert_eq!(level.bonus, level.level as f32);
+            }
+        }
+        // The forge itself appears in the building catalog, gated on the Keep.
+        let forge = catalog
+            .buildings
+            .iter()
+            .find(|b| b.id == "Blacksmith")
+            .expect("the forge is catalog content");
+        assert_eq!(forge.requires, vec!["Keep"]);
+        assert!(forge.trains.is_empty());
+        assert!(forge.placeable);
     }
 }

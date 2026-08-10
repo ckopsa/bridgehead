@@ -38,12 +38,18 @@ Production:
   can have several, each with its own cooldown and unlock condition. Every caster's slots are
   listed in the snapshot as `units[].abilities` / `buildings[].abilities`
   (`index`, `cd`, `unlocked`, `ready`, `requires`), and described in catalog `abilities`.
-- `{"type":"buy","shop":id,"item":"HealingPotion"|"TownPortal"}` — your living hero buys the item
-  (2 inventory slots; see catalog `items`). `{"type":"use_item","slot":0}` consumes it.
-  TownPortal teleports your hero + nearby own units to your nearest TownHall — the expansion-saver.
+- `{"type":"buy","shop":id,"item":"HealingPotion"|...,"hero":id}` — a hero buys the item
+  (2 inventory slots; see catalog `items`). `{"type":"use_item","slot":0,"hero":id}` consumes it.
+  **`hero` is optional but you want it once you field two.** Omitted, both verbs default to your
+  living hero with the LOWEST id — fine with one hero, a coin flip with a Champion and a
+  Priestess. Name the hero and the item lands in that hero's bag; name one that is not a living
+  hero of yours and the command is REJECTED rather than redirected, so a typo can never hand
+  your potion to the wrong character.
+  TownPortal teleports that hero + nearby own units to your nearest TownHall — the expansion-saver.
 Doctrine (standing orders, executed continuously — USE THESE, they fight for you between your turns):
 - `{"type":"priority","units":[ids],"classes":[...]}` — focus-fire order ([] clears). Valid classes:
-  Hero (both hero types), Archer, Footman, Worker, Building, Siege (catapults), Cavalry (raiders).
+  Hero (both hero types), Archer (also Sorcerers — the fragile ranged back rank), Footman,
+  Worker, Building, Siege (catapults), Cavalry (raiders and knights).
 - `{"type":"retreat","units":[ids],"below":0.35,"x":..,"z":..}` — auto fall-back when hurt
 - `{"type":"leash","units":[ids],"x":..,"z":..,"radius":20}` — never chase/fight beyond anchor (radius 0 clears)
 - `{"type":"autocast","units":[caster_ids],"min_enemies":3}` — any CASTER fires on its own

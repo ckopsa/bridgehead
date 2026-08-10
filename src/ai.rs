@@ -50,6 +50,14 @@ const RAIDER_EVERY_NTH: u32 = 5;
 /// never mounts up. Reacting properly is a commander's job, and a commander
 /// gets the same unit through the same catalog.
 const SPEARMAN_EVERY_NTH: u32 = 4;
+/// Every Nth army unit is a Knight, but ONLY once a Castle stands. Checked
+/// first, so a tier-3 team's Barracks really does put a 270g line-breaker on
+/// the field instead of a fourth Footman — and checked at 7, so it is roughly
+/// one unit in seven and never the backbone. The script has no scouting memory
+/// and cannot tell a Spearman screen from an Archer line, so it must not lean
+/// on a unit that a 90-gold counter deletes; a commander reading the catalog
+/// can, and that difference is the point.
+const KNIGHT_EVERY_NTH: u32 = 7;
 
 /// Siege. A Workshop is a luxury: only once a Barracks stands and the treasury
 /// is comfortably ahead of army production does the AI branch into siege.
@@ -78,6 +86,20 @@ const WORKSHOP_GOLD: u32 = 350;
 const WORKSHOP_QUEUE_MAX: usize = 2;
 /// Target mix: one Catapult per this many Barracks-produced line units.
 const CATAPULT_PER_ARMY: u32 = 4;
+/// Every Nth Workshop item is a Gryphon Rider instead of a Catapult, once a
+/// Castle stands AND the bank is genuinely fat. Kept deliberately RARE.
+///
+/// The scripted AI does not build Towers (known gap, wc3clone-7gv) and does not
+/// mass Archers on purpose, so in an AI-vs-AI match neither side reliably holds
+/// the counter to air. A script that spent freely on flyers would therefore win
+/// on a unit the baseline cannot answer, and the scripted matchup would stop
+/// being the decisive, readable baseline the era runs measure against. So air
+/// appears — tier-3 content that never shows up is not content — but only out
+/// of surplus, and only about one Workshop item in three.
+const GRYPHON_EVERY_NTH: u32 = 3;
+/// ...and only with this much gold banked after the reserve. A Gryphon is the
+/// last thing the script buys, never the thing it saves for.
+const GRYPHON_BANK_GOLD: u32 = 700;
 
 /// Building placement: rings of candidate offsets around the base.
 const BUILD_PADDING: f32 = 2.0;
@@ -138,6 +160,31 @@ const CASTLE_MIN_ARMY: usize = 6;
 /// from 400 against sims: games converge in 8-12 minutes and the mines run dry
 /// before that, so a stricter test meant tier 3 simply never happened.
 const CASTLE_SPARE_GOLD: u32 = 300;
+/// Gold in hand before the AI spends 140g/80l on a Blacksmith.
+// 180, not 260. The forge sits below the Workshop in the `want` chain, and the
+// Workshop's own gate is `gold > 350` — so the window in which the chain even
+// REACHES the forge is the band between the two thresholds, plus whatever is
+// left once a Workshop already stands. Sim runs at 260 built the forge once, at
+// t=520 in a match that ended at t=530, and never researched anything: the
+// scripted economy banks lumber and runs gold-poor (1135 lumber unspent against
+// 20 gold in one trace), so a gold gate set by eye is a gate that never opens.
+const BLACKSMITH_GOLD: u32 = 180;
+/// Gold left AFTER paying for a research rung. The whole justification for the
+/// mechanic is converting a SURPLUS into fighting strength, so the test is
+/// against what remains, exactly like `CASTLE_SPARE_GOLD` — research must never
+/// come out of the army budget, or a scripted opponent that researches is
+/// simply a scripted opponent with fewer footmen.
+// 120 for the same reason as above: at 200 a level-1 rung needed 300 gold in
+// hand at the moment a forge happened to be idle, which in an 8-minute match
+// coincided approximately never.
+const RESEARCH_SPARE_GOLD: u32 = 120;
+/// Army on the field before research is worth buying. A +1 attack upgrade
+/// applied to two Footmen is 2 damage a swing; applied to a dozen it is the
+/// reason the fight is won. Research pays off in proportion to how much army
+/// it is multiplying, so the AI waits until it has one. Set to `KEEP_MIN_ARMY`:
+/// the same "the opening is genuinely over" test the tier-up uses, and research
+/// cannot start before the Keep that gates the forge anyway.
+const RESEARCH_MIN_ARMY: usize = KEEP_MIN_ARMY;
 /// Slam is worth casting once this many enemies stand in (or just outside) it.
 const SLAM_MIN_TARGETS: usize = 3;
 /// Slack added to `HERO_ABILITY_RADIUS` when counting slam targets.
@@ -160,7 +207,83 @@ impl Plugin for AiPlugin {
             .add_systems(Startup, ai_apply_env)
             // `ai_think` after `FogSet`: the scripted commander plans from
             // this frame's visibility, exactly like the bridge seats.
-            .add_systems(Update, (ai_toggle_hotkey, ai_think.after(FogSet)));
+            .add_systems(
+                Update,
+                (ai_toggle_hotkey, seed_machine_autocast, ai_think.after(FogSet)),
+            );
+    }
+}
+
+/// Own heroes and whatever auto-cast doctrine they already carry.
+type HeroPolicyQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Unit,
+        &'static Team,
+        &'static Health,
+        Option<&'static AutoCastPolicy>,
+    ),
+    With<Hero>,
+>;
+
+/// Standing ultimate doctrine for the heroes of teams THIS module is driving.
+///
+/// The scripted commander casts Slam by hand (it knows what a clump of enemies
+/// on the Champion is worth). Ultimates are a different kind of decision —
+/// long cooldown, situational, worthless when spent early — so instead of
+/// scripting them, the AI writes an `AutoCastPolicy` and lets doctrine.rs's
+/// auto-caster decide, under exactly the gate a player's button obeys:
+///
+///   * Warcry — 4+ own units AND 4+ enemies inside radius 8 (doctrine.rs asks
+///     the offensive-buff question twice, so it never fires at a worker line);
+///   * Sanctuary — 3+ own units below 60% HP inside radius 7.
+///
+/// Rules are named, not numbered (`machine_autocast_rules`), and installed
+/// only while the team is machine-driven: flip F9 or take a seat on the bridge
+/// and the rules stop being re-applied, so a human or an LLM commander keeps
+/// its ultimates in its own hands. Idempotent — once the rules match, nothing
+/// is written.
+fn seed_machine_autocast(
+    ai_controlled: Res<AiControlled>,
+    mut commands: Commands,
+    heroes: HeroPolicyQuery,
+) {
+    for (entity, unit, team, health, policy) in &heroes {
+        let driving = match team {
+            Team::Human => ai_controlled.human,
+            Team::Claude => ai_controlled.claude,
+        };
+        if !driving || health.current <= 0.0 {
+            continue;
+        }
+        let wanted = machine_autocast_rules(unit.kind);
+        if wanted
+            .iter()
+            .all(|(index, min)| policy.and_then(|p| p.min_enemies_for(*index)) == Some(*min))
+        {
+            continue;
+        }
+        let mut next = policy.cloned().unwrap_or_default();
+        for (index, min) in &wanted {
+            next.set(*index, *min);
+        }
+        // One line per hero (so, per revive): the standing doctrine a
+        // machine-driven team just acquired, by ability name rather than slot.
+        let list = abilities_of_unit(unit.kind);
+        info!(
+            "{team:?}: ultimate auto-cast doctrine installed — {}",
+            wanted
+                .iter()
+                .map(|(index, min)| format!(
+                    "{} at {min}+ targets",
+                    list.get(*index).map_or("?", |d| d.name)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        commands.entity(entity).try_insert(next);
     }
 }
 
@@ -188,6 +311,13 @@ struct AiBrain {
     /// clears on the very next thought once the order lands, because an
     /// upgrade is paid the instant it is accepted — nobody has to walk there.
     tierup_pending: bool,
+    /// A research rung is wanted but not yet paid for. Same ring-fence as
+    /// `tierup_pending`, and for the identical reason: continuous Footman
+    /// production keeps a treasury permanently a few gold short of a 175g
+    /// upgrade, so without holding the price back the AI would "want" to
+    /// research forever and never do it. Cleared on the next thought once the
+    /// order lands, because research is paid the instant it is accepted.
+    research_pending: bool,
     harvest_counter: u32,
     army_counter: u32,
     /// Catapults queued so far — paced against `army_counter`.
@@ -206,6 +336,7 @@ impl AiBrain {
             last_halls: 0,
             last_tier: 1,
             tierup_pending: false,
+            research_pending: false,
             harvest_counter: 0,
             army_counter: 0,
             siege_counter: 0,
@@ -325,6 +456,9 @@ struct BuildingInfo {
     /// Already converting to its next tier — not a candidate for another
     /// upgrade order, and the reason the tier-up reserve can be released.
     upgrading: bool,
+    /// This forge is mid-job. One research at a time per Blacksmith, so a busy
+    /// forge is not a candidate for another order.
+    researching: bool,
 }
 
 /// A living gold mine, seen from one team's point of view.
@@ -379,6 +513,7 @@ type BuildingQuery<'w, 's> = Query<
         Option<&'static UnderConstruction>,
         Option<&'static mut TrainingQueue>,
         Option<&'static Upgrading>,
+        Option<&'static Researching>,
     ),
 >;
 
@@ -398,6 +533,8 @@ fn ai_think(
     mut commands: Commands,
     mut casts: EventWriter<CastAbility>,
     mut upgrades: EventWriter<UpgradeBuilding>,
+    mut start_research: EventWriter<StartResearch>,
+    team_research: Res<TeamResearch>,
     units: UnitQuery,
     mut buildings: BuildingQuery,
     nodes: NodeQuery,
@@ -431,6 +568,8 @@ fn ai_think(
             &mut commands,
             &mut casts,
             &mut upgrades,
+            &mut start_research,
+            &team_research,
             &units,
             &mut buildings,
             &nodes,
@@ -454,6 +593,8 @@ fn think(
     commands: &mut Commands,
     casts: &mut EventWriter<CastAbility>,
     upgrades: &mut EventWriter<UpgradeBuilding>,
+    start_research: &mut EventWriter<StartResearch>,
+    team_research: &TeamResearch,
     units: &UnitQuery,
     buildings: &mut BuildingQuery,
     nodes: &NodeQuery,
@@ -528,7 +669,7 @@ fn think(
     // Hero CLASSES already in this team's queues. A list, not a flag: slots
     // scale with the hall ladder now, and the lock is per class.
     let mut heroes_queued: Vec<UnitKind> = Vec::new();
-    for (entity, building, team, tf, under, queue, upgrading) in buildings.iter() {
+    for (entity, building, team, tf, under, queue, upgrading, researching) in buildings.iter() {
         if *team != me {
             // Seen right now. Structures we merely REMEMBER are appended
             // straight after, because a building does not walk away: acting on
@@ -562,6 +703,7 @@ fn think(
             queue_len,
             queued_sorcerers,
             upgrading: upgrading.is_some(),
+            researching: researching.is_some(),
         });
     }
     enemy_buildings.extend(fog.ghosts().map(|g| g.pos));
@@ -737,6 +879,20 @@ fn think(
             // ever — including one still under construction — so the AI can't
             // spam a second while the first is going up.
             Some(BuildingKind::Workshop)
+        } else if done_count(BuildingKind::Blacksmith) == 0
+            && count_of(BuildingKind::Blacksmith) == 0
+            && own_buildings
+                .iter()
+                .any(|b| b.done && is_hall(b.kind) && building_tier(b.kind) >= 2)
+            && gold > BLACKSMITH_GOLD
+        {
+            // Research branch, below siege on purpose: a Catapult answers a
+            // tower line that a +1 sword never will, and the forge is the more
+            // patient purchase of the two. Gated on a STANDING tier-2 hall
+            // rather than on `building_requires`, matching how every other
+            // branch here spells its prerequisite — ai.rs hand-rolls its gates
+            // and economy.rs enforces the real one at placement.
+            Some(BuildingKind::Blacksmith)
         } else {
             None
         };
@@ -772,6 +928,20 @@ fn think(
                         // economy.rs pays at placement; assume it lands.
                         gold = gold.saturating_sub(stats.cost_gold);
                         lumber = lumber.saturating_sub(stats.cost_lumber);
+                        // Every placement the script orders, in one line. The
+                        // expansion branch logs its own richer version below;
+                        // this is what makes the rest of the build order — the
+                        // Workshop, the forge, the farms — visible in a sim
+                        // trace at all, instead of having to be inferred from
+                        // which units showed up later.
+                        debug!(
+                            "[ai {me:?}] building {} at ({:.0},{:.0}) for {}g {}l",
+                            building_name(kind),
+                            site.x,
+                            site.z,
+                            stats.cost_gold,
+                            stats.cost_lumber,
+                        );
                         if let (true, Some(plan)) = (expanding, &expansion) {
                             brain.expansion_pending = true;
                             info!(
@@ -877,6 +1047,74 @@ fn think(
                         brain.tierup_pending = true;
                         tierup_reserve = (cost_gold, cost_lumber);
                     }
+                }
+            }
+        }
+    }
+
+    // --- research at the forge ------------------------------------------------
+    // Modest and strictly out of surplus, in the spirit of the tier-up above:
+    // attack first, then armor, one rung at a time, and never while an
+    // expansion or a tier-up is already holding money back. Attack leads
+    // because the scripted AI attacks — it pushes waves at a fixed cadence, and
+    // a wave that kills faster takes fewer losses, which is armor's benefit
+    // arriving by a shorter road.
+    let mut research_reserve = (0u32, 0u32);
+    brain.research_pending = false;
+    if !saving_for_expansion
+        && !brain.expansion_pending
+        && !brain.tierup_pending
+        && army.len() >= RESEARCH_MIN_ARMY
+    {
+        // An idle forge: finished, and not already working. Two Blacksmiths
+        // would let the script run both ladders at once; it never builds a
+        // second, so in practice this picks the one.
+        let forge = own_buildings
+            .iter()
+            .find(|b| b.done && !b.researching && !building_researches(b.kind).is_empty());
+        if let Some(forge) = forge {
+            let levels = team_research.get(me);
+            // Attack before armor, but the LOWEST rung first: attack 1, armor
+            // 1, attack 2, armor 2, and so on. Two reasons. The cheap reason is
+            // price — rung 1 of each ladder is 200g/100l for +1/+1, where
+            // attack 1-2-3 alone is 525g/300l for +3 and nothing else. The real
+            // reason is that flat bonuses compound against each other: +1
+            // attack and +1 armor together shift a Footman trade further than
+            // +2 attack does, because the first also subtracts from what comes
+            // back. Attack still leads every tie, so a script that only ever
+            // affords one rung buys the one that makes its waves hit harder.
+            let wanted = ALL_RESEARCH_KINDS
+                .into_iter()
+                .filter_map(|k| levels.next_step(k).map(|step| (k, step)))
+                .min_by_key(|(_, step)| step.level);
+            if let Some((kind, step)) = wanted {
+                // The surplus test is against what is left AFTER the price, so
+                // a research rung can never be bought out of the army's budget.
+                let spare = gold.saturating_sub(step.cost_gold) >= RESEARCH_SPARE_GOLD;
+                if spare && lumber >= step.cost_lumber {
+                    gold -= step.cost_gold;
+                    lumber -= step.cost_lumber;
+                    start_research.write(StartResearch {
+                        building: forge.entity,
+                        kind,
+                    });
+                    info!(
+                        "[ai {me:?}] researching {} {} at ({:.0},{:.0}) for {}g {}l (army {})",
+                        kind.label(),
+                        step.level,
+                        forge.pos.x,
+                        forge.pos.z,
+                        step.cost_gold,
+                        step.cost_lumber,
+                        army.len(),
+                    );
+                } else if gold >= RESEARCH_SPARE_GOLD {
+                    // Close enough to be worth saving for. The gate keeps the
+                    // ring-fence from latching in a game where the treasury
+                    // never gets near the price at all — a permanently held
+                    // reserve would quietly stop army production instead.
+                    brain.research_pending = true;
+                    research_reserve = (step.cost_gold, step.cost_lumber);
                 }
             }
         }
@@ -1010,6 +1248,9 @@ fn think(
     // ...and for a tier-up we have decided on but cannot yet pay for.
     reserve_gold += tierup_reserve.0;
     reserve_lumber += tierup_reserve.1;
+    // ...and for a research rung we have decided on but cannot yet pay for.
+    reserve_gold += research_reserve.0;
+    reserve_lumber += research_reserve.1;
 
     // Sorcerers still owed against `MAX_SORCERERS`, counting the ones already
     // in a queue so a two-Sanctum team can't double-order them.
@@ -1064,7 +1305,14 @@ fn think(
                 let raider_ok = own_buildings
                     .iter()
                     .any(|ob| ob.kind == BuildingKind::Workshop && ob.done);
-                let wanted = if raider_ok && next % RAIDER_EVERY_NTH == 0 {
+                // Knights are Castle-gated the same way, and for the same
+                // reason: an unpayable item at the front stalls the Barracks.
+                // `current_tier` is the highest completed hall rung, so this is
+                // exactly the condition `unit_requires` will re-check on pay.
+                let knight_ok = current_tier >= 3;
+                let wanted = if knight_ok && next % KNIGHT_EVERY_NTH == 0 {
+                    UnitKind::Knight
+                } else if raider_ok && next % RAIDER_EVERY_NTH == 0 {
                     UnitKind::Raider
                 } else if next % ARCHER_EVERY_NTH == 0 {
                     UnitKind::Archer
@@ -1121,16 +1369,39 @@ fn think(
                 if brain.siege_counter * CATAPULT_PER_ARMY > brain.army_counter {
                     continue;
                 }
-                let s = unit_stats(UnitKind::Catapult);
-                if gold.saturating_sub(reserve_gold) >= s.cost_gold
-                    && lumber.saturating_sub(reserve_lumber) >= s.cost_lumber
-                    && headroom >= s.supply
-                {
+                // Air out of surplus only: a Castle standing, the bank fat, and
+                // the siege counter on its every-Nth beat. Everything else the
+                // Workshop makes is still a Catapult, and a Gryphon the script
+                // cannot pay for silently degrades back to one rather than
+                // parking an unaffordable item at the front of the queue.
+                let want_air = current_tier >= 3
+                    && gold.saturating_sub(reserve_gold) >= GRYPHON_BANK_GOLD
+                    && brain.siege_counter % GRYPHON_EVERY_NTH == 0;
+                let kind = if want_air {
+                    UnitKind::GryphonRider
+                } else {
+                    UnitKind::Catapult
+                };
+                let affordable = |k: UnitKind| {
+                    let s = unit_stats(k);
+                    gold.saturating_sub(reserve_gold) >= s.cost_gold
+                        && lumber.saturating_sub(reserve_lumber) >= s.cost_lumber
+                        && headroom >= s.supply
+                };
+                let kind = if affordable(kind) {
+                    Some(kind)
+                } else if kind != UnitKind::Catapult && affordable(UnitKind::Catapult) {
+                    Some(UnitKind::Catapult)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    let s = unit_stats(kind);
                     gold -= s.cost_gold;
                     lumber -= s.cost_lumber;
                     headroom -= s.supply;
                     brain.siege_counter = brain.siege_counter.wrapping_add(1);
-                    orders.push((b.entity, UnitKind::Catapult));
+                    orders.push((b.entity, kind));
                 }
             }
             // Non-producing buildings (and any future kinds the scripted AI
@@ -1142,7 +1413,7 @@ fn think(
     }
 
     for (entity, kind) in orders {
-        if let Ok((_, _, _, _, _, Some(mut queue), _)) = buildings.get_mut(entity) {
+        if let Ok((_, _, _, _, _, Some(mut queue), _, _)) = buildings.get_mut(entity) {
             queue.queue.push_back(kind);
         }
     }

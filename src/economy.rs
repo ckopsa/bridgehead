@@ -6,6 +6,8 @@
 //!   * `Order::Build` follow-through for workers (walk, pay, place)
 //!   * `Order::Harvest` / `Order::ReturnResources` gather loop
 //!   * `TrainingQueue` processing (pays when an item becomes the front item)
+//!   * `StartResearch` at a Blacksmith (pays, then ticks `Researching` and
+//!     raises the team's `TeamResearch` level when the clock runs out)
 //!   * `BuyItem` at a Shop (pays and fills a hero's inventory slot)
 //!
 //! All money in the game is spent here: `ui.rs` / `ai.rs` only check affordability.
@@ -51,6 +53,8 @@ impl Plugin for EconomyPlugin {
                 construction_progress,
                 start_upgrades,
                 upgrade_progress,
+                start_research,
+                research_progress,
                 order_changed,
                 build_sites,
                 harvest_loop,
@@ -495,6 +499,54 @@ fn setup_economy_assets(
             Part {
                 mesh: meshes.add(Cuboid::new(0.5, 2.6, 0.5)),
                 tf: Transform::from_xyz(-1.7, 1.5, -1.7),
+                mat: 1,
+            },
+        ],
+    );
+
+    // --- Blacksmith: forge hall + fat chimney + anvil on a stump -------------
+    // Footprint 5, like the Workshop, and deliberately distinguished from it by
+    // VERTICAL mass rather than plan: the Workshop is a low shed with a cog on
+    // its flank, the Blacksmith is a squat hall with the tallest chimney on the
+    // field. At a glance across a base the two never read as each other, which
+    // matters because they are the two tier-gated support buildings and a
+    // player checking "did I build the forge yet" is doing it from the camera.
+    parts.insert(
+        BuildingKind::Blacksmith,
+        vec![
+            // Forge hall.
+            Part {
+                mesh: meshes.add(Cuboid::new(4.6, 2.6, 4.6)),
+                tf: Transform::from_xyz(0.0, 1.3, 0.0),
+                mat: 0,
+            },
+            // Roof slab.
+            Part {
+                mesh: meshes.add(Cuboid::new(5.2, 0.4, 5.2)),
+                tf: Transform::from_xyz(0.0, 2.8, 0.0),
+                mat: 1,
+            },
+            // The chimney: broad and tall, the building's whole silhouette.
+            Part {
+                mesh: meshes.add(Cuboid::new(1.4, 3.0, 1.4)),
+                tf: Transform::from_xyz(-1.3, 4.3, -1.3),
+                mat: 2,
+            },
+            // Chimney cap, so the stack reads as a stack and not a pillar.
+            Part {
+                mesh: meshes.add(Cuboid::new(1.8, 0.3, 1.8)),
+                tf: Transform::from_xyz(-1.3, 5.9, -1.3),
+                mat: 1,
+            },
+            // Anvil: a small block on a cylindrical stump, out front.
+            Part {
+                mesh: meshes.add(Cylinder::new(0.45, 0.7)),
+                tf: Transform::from_xyz(1.8, 0.35, 2.0),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(1.1, 0.45, 0.5)),
+                tf: Transform::from_xyz(1.8, 0.92, 2.0),
                 mat: 1,
             },
         ],
@@ -979,6 +1031,197 @@ fn upgrade_progress(
             *team,
             time.elapsed_secs(),
             format!("{} upgrade complete @({:.1},{:.1})", building_name(to), pos.x, pos.z),
+            EventSeverity::Info,
+            Some(pos),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Research — the bank-to-power conversion
+// ---------------------------------------------------------------------------
+//
+// Structurally identical to the tier-up above: an event asks, this module
+// validates and pays, a component ticks, and completion is announced to the
+// owner's feed only. The one difference is where the result lands — a tier-up
+// changes the BUILDING, a research changes the TEAM, and the building it was
+// bought at is thereafter irrelevant (it can be razed; the levels stay).
+
+/// Take the money and start the clock. Re-validates everything intent.rs
+/// checked, because an event can be stale by a frame and because ai.rs writes
+/// this event directly — the same reason `start_upgrades` re-validates.
+///
+/// **This system, not the compiler, is the authority on "one job at a time."**
+/// intent.rs checks `Researching` too, but that component is inserted through
+/// `Commands` and therefore does not exist until the next flush — so a batch
+/// that says `research attack` and `research armor` in the same frame passes
+/// the compiler's check twice and arrives here as two events. Observed live
+/// through the bridge: a five-command batch charged the team for three rungs
+/// and delivered one. The two `claimed`/`started` sets below are what close
+/// that, and they are the reason the money is spent here rather than there.
+#[allow(clippy::too_many_arguments)]
+fn start_research(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut events: EventReader<StartResearch>,
+    mut economies: ResMut<Economies>,
+    mut feed: ResMut<GameEvents>,
+    research: Res<TeamResearch>,
+    buildings: Query<(
+        &Building,
+        &Team,
+        &Transform,
+        Option<&UnderConstruction>,
+        Option<&Upgrading>,
+        Option<&Researching>,
+    )>,
+) {
+    // Forges already given a job by an earlier event in THIS drain, and
+    // (team, ladder) pairs already started in it. Both are needed: the first
+    // stops one forge taking two jobs, the second stops two forges buying the
+    // same level twice — `research` is read-only here, so without it both
+    // would resolve `next_step` to the same rung and the team would pay
+    // 100 + 100 for a level that should have cost 100 + 175.
+    let mut claimed: std::collections::HashSet<Entity> = std::collections::HashSet::new();
+    let mut started: std::collections::HashSet<(Team, ResearchKind)> =
+        std::collections::HashSet::new();
+    for ev in events.read() {
+        let Ok((building, team, tf, under, upgrading, busy)) = buildings.get(ev.building) else {
+            debug!("StartResearch: {:?} is not a building", ev.building);
+            continue;
+        };
+        if !building_researches(building.kind).contains(&ev.kind) {
+            debug!(
+                "StartResearch: {} cannot research {}",
+                building_name(building.kind),
+                ev.kind.id()
+            );
+            continue;
+        }
+        if under.is_some() || upgrading.is_some() {
+            debug!("StartResearch: {:?} is not ready to work", ev.building);
+            continue;
+        }
+        // `busy` is last frame's truth; `claimed` is this frame's. Both are
+        // tested here and only RECORDED after the payment succeeds, so an
+        // unaffordable request never locks a forge out for its own frame.
+        if busy.is_some() || claimed.contains(&ev.building) {
+            debug!("StartResearch: {:?} is already researching", ev.building);
+            continue;
+        }
+        if started.contains(&(*team, ev.kind)) {
+            debug!(
+                "StartResearch: {:?} already started {} this frame",
+                team,
+                ev.kind.id()
+            );
+            continue;
+        }
+        // The level is resolved HERE, at the instant of payment, not on the
+        // event — so two events arriving in one frame cannot both buy level 2.
+        // (The second finds the forge busy on the next frame; a second forge
+        // would find the level already advanced.)
+        let Some(step) = research.get(*team).next_step(ev.kind) else {
+            debug!(
+                "StartResearch: {:?} {} is already at max level",
+                team,
+                ev.kind.id()
+            );
+            continue;
+        };
+        if !economies.get_mut(*team).pay(step.cost_gold, step.cost_lumber) {
+            debug!(
+                "StartResearch: {:?} cannot afford {} {} ({}g {}l)",
+                team,
+                ev.kind.id(),
+                step.level,
+                step.cost_gold,
+                step.cost_lumber
+            );
+            continue;
+        }
+
+        // Paid for and committed: only now do the frame-local guards close.
+        claimed.insert(ev.building);
+        started.insert((*team, ev.kind));
+        commands.entity(ev.building).try_insert(Researching {
+            kind: ev.kind,
+            to_level: step.level,
+            remaining: step.research_time,
+            total: step.research_time,
+        });
+        let pos = flat(tf.translation);
+        info!(
+            "[{:?}] research started: {} {} at ({:.0},{:.0}) — {}g {}l, {:.0}s",
+            team,
+            ev.kind.label(),
+            step.level,
+            pos.x,
+            pos.z,
+            step.cost_gold,
+            step.cost_lumber,
+            step.research_time
+        );
+        // Own feed only, exactly like a tier-up: the enemy learns you upgraded
+        // by being hit harder, not by being told.
+        feed.push(
+            *team,
+            time.elapsed_secs(),
+            format!("{} {} research started", ev.kind.label(), step.level),
+            EventSeverity::Info,
+            Some(pos),
+        );
+    }
+}
+
+/// Tick every forge; on completion raise the team's level and announce it.
+fn research_progress(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut research: ResMut<TeamResearch>,
+    mut feed: ResMut<GameEvents>,
+    mut query: Query<(Entity, &Team, &Transform, &mut Researching)>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    for (entity, team, tf, mut job) in &mut query {
+        job.remaining -= dt;
+        if job.remaining > 0.0 {
+            continue;
+        }
+        commands.entity(entity).try_remove::<Researching>();
+        // `advance` is the only writer of a research level in the whole
+        // codebase, and it saturates — so even a duplicated completion cannot
+        // push a ladder past its cap.
+        let Some(level) = research.get_mut(*team).advance(job.kind) else {
+            debug!(
+                "research: {:?} {} completed but was already capped",
+                team,
+                job.kind.id()
+            );
+            continue;
+        };
+        let pos = flat(tf.translation);
+        let bonus = research_bonus(job.kind, level);
+        info!(
+            "[{:?}] research complete: {} level {level} (+{bonus:.0}) — applies to every unit, \
+             now and forever",
+            team,
+            job.kind.label()
+        );
+        feed.push(
+            *team,
+            time.elapsed_secs(),
+            format!(
+                "{} {level} complete: {} to every unit",
+                job.kind.label(),
+                match job.kind {
+                    ResearchKind::Attack => format!("+{bonus:.0} damage"),
+                    ResearchKind::Armor => format!("-{bonus:.0} damage taken"),
+                }
+            ),
             EventSeverity::Info,
             Some(pos),
         );
@@ -1603,6 +1846,7 @@ fn training_queues(
 fn buy_items(
     mut events: EventReader<BuyItem>,
     mut economies: ResMut<Economies>,
+    tiers: Res<TechTiers>,
     shops: Query<(&Building, &Team, Option<&UnderConstruction>)>,
     // Gated on `Inventory`, which units.rs only puts on heroes.
     mut heroes: Query<(&Team, &Health, &mut Inventory)>,
@@ -1639,6 +1883,20 @@ fn buy_items(
         };
 
         let def = item_def(ev.item);
+        // The shelf is tiered. This is the authoritative check — the command
+        // card greys the button and the bridge validator explains the refusal,
+        // but a team that has just LOST its Castle stops being able to buy the
+        // scroll here, on the same frame, without anyone telling it.
+        if !item_unlocked(ev.item, tiers.get(*hero_team)) {
+            debug!(
+                "BuyItem: {:?} is {} but {} needs {}",
+                hero_team,
+                tiers.get(*hero_team).name(),
+                def.name,
+                def.tier.name()
+            );
+            continue;
+        }
         if !economies.get_mut(*hero_team).pay(def.cost_gold, 0) {
             debug!(
                 "BuyItem: {:?} cannot afford {} ({} gold)",

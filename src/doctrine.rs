@@ -24,6 +24,14 @@
 //! pooled, reactive army instead of a field of statues; a commander that does
 //! speak simply overwrites the seeded posture, and the seeding never writes
 //! over an entry that already exists.
+//!
+//! Who this runs for: **whoever set the policy.** Retreat, leash and auto-cast
+//! were always team-blind; squad postures were not, and until docs/TEMPO.md
+//! §2.0 found it, `run_squad_postures` early-returned on every team a machine
+//! was not driving. A human's posture was stored and ignored. The gate is now
+//! the posture map itself — a squad with a live entry executes — with one
+//! carve-out for `DEFAULT_SQUAD`, which is the machine's anti-idle floor
+//! rather than anything a player said. See `run_squad_postures`.
 
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
@@ -317,6 +325,9 @@ fn auto_cast_abilities(
 ) {
     /// A hurt ally is one below this fraction of max HP.
     const HEAL_FRAC: f32 = 0.7;
+    /// A heal-over-time is a 60s commitment, not a 12s top-up, so Sanctuary
+    /// waits for allies that are properly in trouble rather than scratched.
+    const HOT_FRAC: f32 = 0.6;
 
     for (entity, policy, hero, unit, team, tf, cooldowns) in &casters {
         let list = abilities_of_unit(unit.kind);
@@ -357,7 +368,16 @@ fn auto_cast_abilities(
                         AbilityEffect::Militia => false,
                         AbilityEffect::ApplyStatus { targets, .. } => match targets {
                             AbilityTargets::Enemies => *other_team != team,
-                            AbilityTargets::Allies => *other_team == team,
+                            // An ally buff that HEALS counts only allies who
+                            // need healing — same reasoning as `Heal` above,
+                            // asked of what the effect does rather than of
+                            // which ability it is.
+                            AbilityTargets::Allies => {
+                                *other_team == team
+                                    && (!def.effect.heals()
+                                        || (health.max > 0.0
+                                            && health.current < health.max * HOT_FRAC))
+                            }
                             AbilityTargets::OwnWorkers => {
                                 *other_team == team && other_unit.kind == UnitKind::Worker
                             }
@@ -366,9 +386,36 @@ fn auto_cast_abilities(
                 })
                 .count() as u32;
             // A trigger of 0 still needs someone to affect — never cast at air.
-            if count >= min_targets.max(1) {
-                casts.write(CastAbility::index(entity, index));
+            if count < min_targets.max(1) {
+                continue;
             }
+            // An OFFENSIVE ally buff (Warcry) is worth nothing without a
+            // fight: without this a Champion walking past its own worker line
+            // would burn its 45s ultimate on mining. So the same threshold is
+            // asked twice — enough allies to buff AND enough enemies to fight.
+            // Defensive and healing ally buffs need no such second opinion.
+            if matches!(
+                def.effect,
+                AbilityEffect::ApplyStatus {
+                    status: StatusKind::DamageBuff,
+                    targets: AbilityTargets::Allies,
+                    ..
+                }
+            ) {
+                let enemies = others
+                    .iter()
+                    .filter(|(other_team, other_tf, health, other_unit)| {
+                        *other_team != team
+                            && health.current > 0.0
+                            && xz_dist(tf.translation, other_tf.translation) <= def.radius
+                            && (def.hits_air || !is_flying_kind(other_unit.kind))
+                    })
+                    .count() as u32;
+                if enemies < min_targets.max(1) {
+                    continue;
+                }
+            }
+            casts.write(CastAbility::index(entity, index));
         }
     }
 }
@@ -461,9 +508,21 @@ fn run_squad_postures(
     let mut lapsed: Vec<(Team, u8)> = Vec::new();
 
     for ((team, squad), posture) in postures {
-        // A team a human took back mid-game (F9) keeps its posture entries in
-        // the map, but they stop EXECUTING — the mouse outranks the doctrine.
-        if !machine_driven(&ai, &external, team) {
+        // THE OPT-IN TEST (docs/TEMPO.md §2.0, follow-up 2). This used to be
+        // `!machine_driven(...) { continue }`, which meant a human's squad
+        // posture was stored and then ignored — THESIS.md's "standing orders
+        // run at machine speed for whichever player set them" was true for one
+        // seat only. Now the posture map IS the opt-in: a squad with a live
+        // entry executes, whoever wrote it, and a unit with no squad (or a
+        // squad with no posture) is never touched. A human who assigns nothing
+        // still keeps their units exactly where they put them.
+        //
+        // The one exception is `DEFAULT_SQUAD`: that entry is not something a
+        // player said, it is the anti-idle floor `default_squad_autonomy`
+        // seeds to compensate for a slow machine commander. It stays
+        // machine-only, which is also the F9 handback rule — take a team back
+        // from the AI and you inherit its squads but not its autopilot floor.
+        if squad == DEFAULT_SQUAD && !machine_driven(&ai, &external, team) {
             continue;
         }
         // Escort dies -> the posture lapses so the strategic layer sees it
@@ -627,6 +686,172 @@ fn recover_retreaters(
         let threshold = (policy.below_frac + 0.10).min(1.0);
         if health.current / health.max >= threshold {
             commands.entity(entity).try_remove::<Retreating>();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A world with just the doctrine resources and no scripted AI on either
+    /// seat, so `machine_driven` is false for `Team::Human` — i.e. the human is
+    /// at the keyboard, which is exactly the case the old gate refused to serve.
+    fn world() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<SquadOrders>()
+            .init_resource::<FogGrids>()
+            .init_resource::<ExternallyCommanded>()
+            .insert_resource(AiControlled { human: false, claude: false });
+        app
+    }
+
+    fn spawn_footman(app: &mut App, team: Team, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                team,
+                Transform::from_translation(at),
+                Health::new(100.0),
+                Order::Idle,
+            ))
+            .id()
+    }
+
+    fn order_of(app: &App, entity: Entity) -> Order {
+        app.world().entity(entity).get::<Order>().cloned().unwrap()
+    }
+
+    /// docs/TEMPO.md §2.0, the bug this bead exists to fix: a posture set by a
+    /// HUMAN team (nothing machine-driven anywhere) must actually execute. On
+    /// master this assertion fails — the member sits on `Order::Idle` forever.
+    #[test]
+    fn a_human_teams_posture_executes() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+
+        let objective = Vec3::new(30.0, 0.0, 30.0);
+        let unit = spawn_footman(&mut app, Team::Human, Vec3::new(-60.0, 0.0, -60.0));
+        app.world_mut().entity_mut(unit).insert(SquadId(1));
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+
+        app.update();
+
+        match order_of(&app, unit) {
+            Order::AttackMove(p) => assert!(
+                xz_dist(p, objective) <= SQUAD_ARRIVE,
+                "human squad ordered to {p:?}, expected the objective {objective:?}"
+            ),
+            other => panic!("human squad posture did not execute: {other:?}"),
+        }
+    }
+
+    /// The other half of the opt-in test: a human unit that nobody enrolled in
+    /// anything is never yanked around, even while a squad posture exists for
+    /// some other squad on the same team.
+    #[test]
+    fn an_unassigned_human_unit_is_left_alone() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+
+        let stray = spawn_footman(&mut app, Team::Human, Vec3::new(-60.0, 0.0, -60.0));
+        let member = spawn_footman(&mut app, Team::Human, Vec3::new(-58.0, 0.0, -60.0));
+        app.world_mut().entity_mut(member).insert(SquadId(2));
+        app.world_mut().resource_mut::<SquadOrders>().0.insert(
+            (Team::Human, 2),
+            SquadPosture::Push { pos: Vec3::new(30.0, 0.0, 30.0) },
+        );
+
+        app.update();
+
+        assert!(
+            matches!(order_of(&app, stray), Order::Idle),
+            "a human unit with no squad was re-tasked by doctrine"
+        );
+        assert!(matches!(order_of(&app, member), Order::AttackMove(_)));
+    }
+
+    /// The auto-enrol + seed floor exists to compensate for a slow MACHINE
+    /// commander, so it stays machine-only: a human's idle units must not
+    /// self-organise into `DEFAULT_SQUAD` behind their back.
+    #[test]
+    fn machine_seeding_stays_machine_only() {
+        let mut app = world();
+        app.add_systems(Update, default_squad_autonomy);
+
+        let human = spawn_footman(&mut app, Team::Human, Vec3::new(-60.0, 0.0, -60.0));
+        let claude = spawn_footman(&mut app, Team::Claude, Vec3::new(60.0, 0.0, 60.0));
+        app.world_mut().resource_mut::<AiControlled>().claude = true;
+
+        app.update();
+
+        assert!(
+            app.world().entity(human).get::<SquadId>().is_none(),
+            "a human unit was auto-enrolled in the default squad"
+        );
+        assert_eq!(
+            app.world().entity(claude).get::<SquadId>().copied(),
+            Some(SquadId(DEFAULT_SQUAD)),
+            "a machine-driven unit should still land in the default squad"
+        );
+        let orders = app.world().resource::<SquadOrders>();
+        assert!(
+            !orders.0.contains_key(&(Team::Human, DEFAULT_SQUAD)),
+            "the human team got a seeded posture it never asked for"
+        );
+        assert!(orders.0.contains_key(&(Team::Claude, DEFAULT_SQUAD)));
+    }
+
+    /// F9 handback. Autopilot enrols the team's units and seeds the floor;
+    /// hand the team back and the *player's own* squads keep running at machine
+    /// speed (that is the whole point of the bead), while the autopilot's
+    /// anti-idle floor stops — you inherit the army, not the autopilot.
+    #[test]
+    fn f9_handback_keeps_human_squads_and_drops_the_machine_floor() {
+        let mut app = world();
+        app.add_systems(Update, (default_squad_autonomy, run_squad_postures).chain());
+        app.world_mut().resource_mut::<AiControlled>().human = true;
+
+        let home = Team::Human.base_pos();
+        let floor_member = spawn_footman(&mut app, Team::Human, home + Vec3::new(80.0, 0.0, 0.0));
+        let mine = spawn_footman(&mut app, Team::Human, Vec3::new(-60.0, 0.0, -60.0));
+        app.world_mut().entity_mut(mine).insert(SquadId(1));
+        let objective = Vec3::new(30.0, 0.0, 30.0);
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+
+        // --- under autopilot: both the floor and the player's squad run -----
+        app.update();
+        assert_eq!(
+            app.world().entity(floor_member).get::<SquadId>().copied(),
+            Some(SquadId(DEFAULT_SQUAD))
+        );
+        assert!(matches!(order_of(&app, floor_member), Order::AttackMove(_)));
+        assert!(matches!(order_of(&app, mine), Order::AttackMove(_)));
+
+        // --- F9: the human takes the team back ------------------------------
+        app.world_mut().resource_mut::<AiControlled>().human = false;
+        app.world_mut().entity_mut(floor_member).insert(Order::Idle);
+        app.world_mut().entity_mut(mine).insert(Order::Idle);
+        app.update();
+
+        assert!(
+            matches!(order_of(&app, floor_member), Order::Idle),
+            "the autopilot's anti-idle floor kept commanding a team the human took back"
+        );
+        match order_of(&app, mine) {
+            Order::AttackMove(p) => assert!(xz_dist(p, objective) <= SQUAD_ARRIVE),
+            other => panic!("a human-set posture stopped executing after handback: {other:?}"),
         }
     }
 }

@@ -80,6 +80,8 @@ can find are different questions, and the gap between them is where scouting liv
 | Catapult | 14 | 20 | **sees less than it shoots** — siege needs spotters |
 | Raider | 24 | 2.2 | **the scout**: sees far, can barely hit anything |
 | Sorcerer | 18 | 11 | a caster whose spell is an 8-unit bubble around itself must see the charge coming from further out than it can throw it |
+| Knight | 20 | 2.4 | shock cavalry closing at 9.5 has to see the shape it is about to hit — so it out-sees the 18 of the spear picket that counters it, but stays short of the Raider's 24: the hammer, not the scout |
+| **Gryphon Rider** | **26** | 6 | **the widest eye in the game**, equal to a TownHall's — altitude is an observation post, fog is XZ only, so height costs a flyer nothing and buys it reach. A hall's worth of vision that *moves*, and Castle-gated because sight this good has to arrive late |
 | Hero (Champion) | 20 | 2.4 | leaders see |
 | Priestess | 18 | 10 | |
 
@@ -92,6 +94,7 @@ can find are different questions, and the gap between them is where scouting liv
 | Barracks | 18 | |
 | Arcane Sanctum | 18 | level with the Barracks — the caster's drill yard, not a watchtower |
 | Workshop | 16 | |
+| Blacksmith | 14 | a forge looks at its own anvil |
 | Shop | 14 | |
 | Farm | 12 | |
 | Wall | 8 | |

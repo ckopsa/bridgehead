@@ -164,12 +164,19 @@ type IntentTargets<'w, 's> = Query<
 
 type IntentNodes<'w, 's> = Query<'w, 's, &'static ResourceNode>;
 
+/// Forges currently working. A separate query rather than a sixth column on
+/// `IntentBuildings` on purpose: `research` is the only verb that asks, and
+/// widening the shared tuple would rewrite every `buildings.get` destructure
+/// in this file for one caller's benefit.
+type IntentResearching<'w, 's> = Query<'w, 's, &'static Researching>;
+
 #[derive(SystemParam)]
 pub struct IntentWorld<'w, 's> {
     units: IntentUnits<'w, 's>,
     buildings: IntentBuildings<'w, 's>,
     targets: IntentTargets<'w, 's>,
     nodes: IntentNodes<'w, 's>,
+    researching: IntentResearching<'w, 's>,
 }
 
 /// The events an intent can emit. ui.rs and bridge.rs each used to carry an
@@ -181,6 +188,7 @@ pub struct IntentEvents<'w> {
     buys: EventWriter<'w, BuyItem>,
     item_uses: EventWriter<'w, UseItem>,
     upgrades: EventWriter<'w, UpgradeBuilding>,
+    research: EventWriter<'w, StartResearch>,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +208,7 @@ fn apply_intents(
     tiers: Res<TechTiers>,
     nav: Res<NavGrid>,
     fog: Res<FogGrids>,
+    team_research: Res<TeamResearch>,
     mut squad_orders: ResMut<SquadOrders>,
     mut ai_controlled: ResMut<AiControlled>,
     mut error_log: ResMut<IntentErrors>,
@@ -227,6 +236,7 @@ fn apply_intents(
             // The issuing team's tech tier: what hero slots it has open.
             tiers.get(submission.team),
             &nav,
+            &team_research,
             // The issuer's own fog: what *they* can see decides what they may
             // order, and neither seat gets to borrow the other's eyes.
             fog.get(submission.team),
@@ -266,6 +276,7 @@ fn compile_intent(
     records: &HeroRecords,
     tier: TechTier,
     nav: &NavGrid,
+    team_research: &TeamResearch,
     fog: &FogGrid,
     squad_orders: &mut SquadOrders,
     commands: &mut Commands,
@@ -279,6 +290,7 @@ fn compile_intent(
         buildings,
         targets,
         nodes,
+        researching,
     } = world;
     match intent {
         Intent::Move { units: ids, x, z } => {
@@ -627,6 +639,80 @@ fn compile_intent(
                 queue.progress = 0.0;
             }
         }
+        Intent::Research { building, upgrade } => {
+            let Some(kind) = parse_research_kind(&upgrade) else {
+                errors.push(format!("{tag}: unknown research '{upgrade}'"));
+                return;
+            };
+            let Some(entity) = intent_entity(building) else {
+                errors.push(format!("{tag}: building {building} not found/not yours"));
+                return;
+            };
+            let Ok((b, team, under, _, upgrading)) = buildings.get(entity) else {
+                errors.push(format!("{tag}: building {building} not found/not yours"));
+                return;
+            };
+            // Ownership first, and phrased identically to every other building
+            // verb: a seat must not be able to tell "not yours" from "does not
+            // exist", or the error message becomes a scouting tool.
+            if *team != me {
+                errors.push(format!("{tag}: building {building} not found/not yours"));
+                return;
+            }
+            if !building_researches(b.kind).contains(&kind) {
+                errors.push(format!(
+                    "{tag}: {} cannot research {}",
+                    building_name(b.kind),
+                    kind.id()
+                ));
+                return;
+            }
+            if under.is_some() {
+                errors.push(format!("{tag}: building {building} is under construction"));
+                return;
+            }
+            // A forge converting into something else is not a forge right now.
+            // Unreachable today (no ladder runs through a Blacksmith) and
+            // checked anyway, because `Upgrading` freezes training for the same
+            // reason and the two ought to agree.
+            if upgrading.is_some() {
+                errors.push(format!("{tag}: building {building} is already upgrading"));
+                return;
+            }
+            // One job per forge, rejected rather than queued — see `Researching`.
+            if let Ok(active) = researching.get(entity) {
+                errors.push(format!(
+                    "{tag}: building {building} is already researching {} ({:.0}s left)",
+                    active.kind.id(),
+                    active.remaining.max(0.0)
+                ));
+                return;
+            }
+            let level = team_research.get(me).level(kind);
+            let Some(step) = research_step(kind, level + 1) else {
+                errors.push(format!(
+                    "{tag}: {} is already at max level ({RESEARCH_MAX_LEVEL})",
+                    kind.id()
+                ));
+                return;
+            };
+            if !economies.get(me).can_afford(step.cost_gold, step.cost_lumber) {
+                errors.push(format!(
+                    "{tag}: cannot afford {} {} ({}g {}l)",
+                    kind.id(),
+                    step.level,
+                    step.cost_gold,
+                    step.cost_lumber
+                ));
+                return;
+            }
+            // economy.rs takes the money and starts the clock — the same single
+            // owner of every payment `upgrade` and `build` go through.
+            events.research.write(StartResearch {
+                building: entity,
+                kind,
+            });
+        }
         Intent::Rally {
             building,
             x,
@@ -742,7 +828,7 @@ fn compile_intent(
             };
             events.casts.write(CastAbility { caster: entity, ability: selector });
         }
-        Intent::Buy { shop, item } => {
+        Intent::Buy { shop, item, hero } => {
             let Some(item) = parse_item(&item) else {
                 errors.push(format!("{tag}: unknown item '{item}'"));
                 return;
@@ -770,9 +856,35 @@ fn compile_intent(
                 errors.push(format!("{tag}: building {shop} is under construction"));
                 return;
             }
-            // The buyer is implied: a team fields exactly one hero.
-            let Some(hero) = own_hero(units, me) else {
-                errors.push(format!("{tag}: no living hero to buy for"));
+            // The shelf is tiered. Derived from our standing completed
+            // buildings by the same function that feeds `TechTiers`, so this
+            // needs no extra resource and cannot disagree with economy.rs's
+            // authoritative check — it only turns a silent race-log into a
+            // sentence a commander can act on.
+            let def = item_def(item);
+            let tier = tech_tier_for(
+                buildings
+                    .iter()
+                    .filter(|(_, team, under, _, _)| **team == me && under.is_none())
+                    .map(|(b, _, _, _, _)| b.kind),
+            );
+            if !item_unlocked(item, tier) {
+                errors.push(format!(
+                    "{tag}: {} requires tier {} (you are {})",
+                    def.name,
+                    def.tier.name(),
+                    tier.name()
+                ));
+                return;
+            }
+            // Which hero is buying: the one named, or the lowest-id living
+            // hero. A named hero that does not resolve has already logged its
+            // own error — do not silently sell to somebody else.
+            let named = hero;
+            let Some(hero) = own_hero(units, me, named, tag, errors) else {
+                if named.is_none() {
+                    errors.push(format!("{tag}: no living hero to buy for"));
+                }
                 return;
             };
             // economy.rs re-validates and pays (gold, free slot, distance-
@@ -783,7 +895,7 @@ fn compile_intent(
                 item,
             });
         }
-        Intent::UseItem { slot } => {
+        Intent::UseItem { slot, hero } => {
             if slot >= INVENTORY_SLOTS {
                 errors.push(format!(
                     "{tag}: item slot {slot} out of range (0..{})",
@@ -791,8 +903,11 @@ fn compile_intent(
                 ));
                 return;
             }
-            let Some(hero) = own_hero(units, me) else {
-                errors.push(format!("{tag}: no living hero to use an item"));
+            let named = hero;
+            let Some(hero) = own_hero(units, me, named, tag, errors) else {
+                if named.is_none() {
+                    errors.push(format!("{tag}: no living hero to use an item"));
+                }
                 return;
             };
             // combat.rs checks the slot is actually filled.
@@ -1244,13 +1359,59 @@ fn own_unit(id: IntentId, units: &IntentUnits, me: Team) -> Option<(Entity, Vec3
     }
 }
 
-/// The seat's living hero, whichever class it plays. `buy` and `use_item` name
-/// no unit: a team has at most one hero, so there is nothing to disambiguate.
-fn own_hero(units: &IntentUnits, me: Team) -> Option<Entity> {
-    units
+/// Which of the seat's living heroes an item verb is about.
+///
+/// `named` is the intent's optional `hero` field. Given one, it must resolve to
+/// a living hero of this team — anything else is an error rather than a silent
+/// fall-back, because "the potion went to the wrong hero" is exactly the bug
+/// this parameter exists to prevent, and quietly substituting a different hero
+/// would reintroduce it.
+///
+/// Omitted, the tie-break is **the living hero with the lowest entity id**, and
+/// it is sorted rather than left to query order so it is stable frame to frame
+/// and identical for both seats. With one hero on the field — every call site
+/// that predates hero slots — it picks that hero, so omitting the field is
+/// exactly the old behaviour.
+fn own_hero(
+    units: &IntentUnits,
+    me: Team,
+    named: Option<IntentId>,
+    tag: &str,
+    errors: &mut Vec<String>,
+) -> Option<Entity> {
+    let heroes: Vec<Entity> = units
         .iter()
-        .find(|(_, u, team, _, _)| **team == me && is_hero_kind(u.kind))
+        .filter(|(_, u, team, _, _)| **team == me && is_hero_kind(u.kind))
         .map(|(entity, ..)| entity)
+        .collect();
+    match named {
+        // Naming a hero is a claim about a SPECIFIC entity. If the id does not
+        // resolve to a live entity at all, or resolves to something that is not
+        // one of this team's living heroes, that is an error — never a quiet
+        // fall-back to the default, which would hand the item to precisely the
+        // hero the caller was steering away from. (The first version of this
+        // function mapped an unresolvable id to `None` and then let the
+        // no-name branch pick the default; the live bridge check caught it.)
+        Some(id) => {
+            let picked = intent_entity(id).and_then(|e| pick_item_hero(&heroes, Some(e)));
+            if picked.is_none() {
+                errors.push(format!("{tag}: hero {id} not found/not yours"));
+            }
+            picked
+        }
+        None => pick_item_hero(&heroes, None),
+    }
+}
+
+/// The choice itself, as a pure function so it can be tested without a World:
+/// a NAMED hero must be one of this team's living heroes (no silent
+/// substitution — sending the potion to somebody else is the bug), and an
+/// unnamed one resolves to the lowest entity id.
+fn pick_item_hero(heroes: &[Entity], named: Option<Entity>) -> Option<Entity> {
+    match named {
+        Some(hero) => heroes.contains(&hero).then_some(hero),
+        None => heroes.iter().copied().min(),
+    }
 }
 
 /// Resolve a list of ids to living units of the seat's own team, recording one
@@ -1417,6 +1578,17 @@ pub fn parse_building_kind(name: &str) -> Option<BuildingKind> {
         .find(|k| normalize_name(building_name(*k)) == wanted)
 }
 
+/// Research ladders parse off the catalog's own ids, and off their display
+/// names as well: a commander reading `catalog.research` sees both `"attack"`
+/// and `"Weapon Smithing"` on the entry, and either ought to work. The same
+/// `normalize_name` as everything else, so `"weapon_smithing"` lands too.
+pub fn parse_research_kind(name: &str) -> Option<ResearchKind> {
+    let wanted = normalize_name(name);
+    ALL_RESEARCH_KINDS.into_iter().find(|k| {
+        normalize_name(k.id()) == wanted || normalize_name(k.label()) == wanted
+    })
+}
+
 /// Items parse off the catalog's own ids too (`item_def(..).name`), so
 /// `"town_portal"`, `"Town Portal"` and `"TownPortal"` are one item.
 pub fn parse_item(name: &str) -> Option<ItemId> {
@@ -1455,6 +1627,8 @@ mod tests {
             r#"{"type":"train","building":1,"unit":"Footman"}"#,
             r#"{"type":"upgrade","building":1}"#,
             r#"{"type":"cancel","building":1,"index":0}"#,
+            r#"{"type":"research","building":1,"upgrade":"attack"}"#,
+            r#"{"type":"research","building":1,"upgrade":"armor"}"#,
             r#"{"type":"rally","building":1,"x":1.0,"z":2.0}"#,
             r#"{"type":"rally","building":1,"target":7}"#,
             r#"{"type":"cast","hero":1}"#,
@@ -1551,6 +1725,153 @@ mod tests {
             back.sentence(),
             "attack-move 3 units to (12.5, -30.5)".to_string()
         );
+    }
+
+    /// **Two heroes, one potion.** The whole reason `buy`/`use_item` grew a
+    /// `hero` field: hero slots scale with the hall ladder now, so a Keep team
+    /// fields a Champion AND a Priestess and "the team's hero" stopped being a
+    /// well-defined phrase. A named hero must win, and a wrong name must be
+    /// refused rather than quietly redirected — silently selling to the other
+    /// hero is precisely the bug this parameter exists to prevent.
+    #[test]
+    fn buy_targets_the_named_hero_when_a_team_fields_two() {
+        let champion = Entity::from_raw(11);
+        let priestess = Entity::from_raw(42);
+        let heroes = [champion, priestess];
+
+        // Named: the item goes where it was addressed, in either direction.
+        assert_eq!(pick_item_hero(&heroes, Some(priestess)), Some(priestess));
+        assert_eq!(pick_item_hero(&heroes, Some(champion)), Some(champion));
+
+        // Unnamed: the documented, stable tie-break — lowest entity id. It is
+        // deliberately not query order, so the two seats and successive frames
+        // all resolve the same hero.
+        assert_eq!(pick_item_hero(&heroes, None), Some(champion));
+        let reversed = [priestess, champion];
+        assert_eq!(
+            pick_item_hero(&reversed, None),
+            Some(champion),
+            "the default may not depend on iteration order",
+        );
+
+        // Back-compatible: with one hero, omitting the field picks that hero,
+        // which is exactly what every pre-slots call site already got.
+        assert_eq!(pick_item_hero(&[priestess], None), Some(priestess));
+
+        // A name that is not one of this team's living heroes is refused. The
+        // caller turns this `None` into an error string; what matters here is
+        // that it never falls through to somebody else's inventory.
+        let stranger = Entity::from_raw(99);
+        assert_eq!(pick_item_hero(&heroes, Some(stranger)), None);
+        assert_eq!(pick_item_hero(&[], Some(champion)), None);
+        assert_eq!(pick_item_hero(&[], None), None);
+
+        // The regression a live bridge run caught: "named a hero" and "named
+        // nothing" must never collapse into each other. An id that resolves to
+        // no entity at all is a NAMED request that failed — refusing it is the
+        // whole point — whereas `None` means "you pick". Written as the two
+        // distinct calls the caller makes, so the day someone flattens the
+        // unresolvable case back into `None` this fails instead of silently
+        // posting the potion to the wrong hero.
+        assert_eq!(
+            pick_item_hero(&heroes, Some(stranger)),
+            None,
+            "an id that is not one of my heroes must not resolve to my default",
+        );
+        assert_ne!(
+            pick_item_hero(&heroes, Some(stranger)),
+            pick_item_hero(&heroes, None),
+            "a failed name and an omitted name must not agree",
+        );
+    }
+
+    /// The field is optional on the wire and names the hero in the log, so an
+    /// old one-hero command still parses and a new one reads back as English.
+    #[test]
+    fn the_item_verbs_carry_an_optional_hero_on_the_wire() {
+        // Historical form: no `hero` key at all.
+        let legacy: Intent =
+            serde_json::from_str(r#"{"type":"buy","shop":1,"item":"HealingPotion"}"#).unwrap();
+        assert_eq!(legacy.sentence(), "buy HealingPotion at shop 1");
+        let legacy_use: Intent =
+            serde_json::from_str(r#"{"type":"use_item","slot":1}"#).unwrap();
+        assert_eq!(legacy_use.sentence(), "hero uses item in slot 1");
+
+        // Addressed form: round-trips, and the sentence says who.
+        let addressed = Intent::Buy {
+            shop: 1,
+            item: "HealingPotion".to_string(),
+            hero: Some(42),
+        };
+        let json = serde_json::to_string(&addressed).unwrap();
+        assert!(json.contains("\"hero\":42"), "the field must survive: {json}");
+        let back: Intent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sentence(), "hero 42 buys HealingPotion at shop 1");
+
+        let use_addressed = Intent::UseItem { slot: 0, hero: Some(42) };
+        let back: Intent =
+            serde_json::from_str(&serde_json::to_string(&use_addressed).unwrap()).unwrap();
+        assert_eq!(back.sentence(), "hero 42 uses item in slot 0");
+
+        // Omitting it must not serialize a null — the wire shape is unchanged
+        // for every command that does not care.
+        let plain = Intent::UseItem { slot: 0, hero: None };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"type":"use_item","slot":0}"#,
+        );
+    }
+
+    /// The research verb, from both ends. The Blacksmith card's [Q] and a
+    /// commander's JSON are the same intent and the same log sentence — the
+    /// claim docs/INTENT.md exists to keep checkable, applied to the newest
+    /// verb rather than only the old ones.
+    #[test]
+    fn a_research_gesture_and_a_research_command_are_the_same_intent() {
+        // [Q] on a selected Blacksmith. ui.rs spells the ladder with the
+        // catalog id, which is exactly what a commander types.
+        let gesture = Intent::Research {
+            building: 77,
+            upgrade: ResearchKind::Attack.id().to_string(),
+        };
+        let typed: Intent =
+            serde_json::from_str(r#"{"type":"research","building":77,"upgrade":"attack"}"#)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&gesture).unwrap(),
+            serde_json::to_value(&typed).unwrap()
+        );
+        assert_eq!(gesture.sentence(), typed.sentence());
+        assert_eq!(gesture.sentence(), "building 77 researches attack");
+        assert_eq!(gesture.verb(), "research");
+    }
+
+    /// Ladder names parse the same loose way every other name on the wire does,
+    /// by id or by display name, and nothing else gets through.
+    #[test]
+    fn research_names_parse_by_id_or_label() {
+        assert_eq!(parse_research_kind("attack"), Some(ResearchKind::Attack));
+        assert_eq!(parse_research_kind("Attack"), Some(ResearchKind::Attack));
+        assert_eq!(parse_research_kind("armor"), Some(ResearchKind::Armor));
+        assert_eq!(parse_research_kind("ARMOR"), Some(ResearchKind::Armor));
+        // The catalog's display name, in every spelling `normalize_name` folds.
+        assert_eq!(
+            parse_research_kind("Weapon Smithing"),
+            Some(ResearchKind::Attack)
+        );
+        assert_eq!(
+            parse_research_kind("weapon_smithing"),
+            Some(ResearchKind::Attack)
+        );
+        assert_eq!(
+            parse_research_kind("armor-plating"),
+            Some(ResearchKind::Armor)
+        );
+        // ...and nothing else. A typo is a rejected command with a sentence in
+        // the log, not a silently mis-bought upgrade.
+        assert_eq!(parse_research_kind("armour"), None);
+        assert_eq!(parse_research_kind("damage"), None);
+        assert_eq!(parse_research_kind(""), None);
     }
 
     /// The claim the whole module exists to make: a human gesture and a bridge
