@@ -3,7 +3,7 @@
 //! Modules communicate exclusively through the types, events, and resources here.
 
 use bevy::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
@@ -1884,7 +1884,14 @@ pub fn ability_ready(
 }
 
 /// Which ability a `CastAbility` means. Omit it for "the first one I can use".
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// This is also the wire form: `Intent::Cast`/`Intent::Autocast` carry it
+/// directly, and it serializes *untagged* — a bare `2` or a bare `"Slam"`,
+/// which is what a commander already reads out of the snapshot. One type for
+/// the event, the intent and the protocol, so a slot cannot be named three
+/// slightly different ways.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(untagged)]
 pub enum AbilitySelector {
     /// Slot in the caster's `abilities_of_*` list.
     Index(usize),
@@ -3148,6 +3155,522 @@ impl Economies {
         }
     }
     pub fn get_mut(&mut self, team: Team) -> &mut Economy {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Intent — the shared strategic language
+//
+// This is the whole vocabulary of things a *player* can mean, as one
+// serializable type. It lives here, next to the catalog and the doctrine
+// components, because it is the cross-interface contract: ui.rs compiles mouse
+// gestures into these values, bridge.rs deserializes commands.json into the
+// same values, and intent.rs is the only thing that turns them into ECS state.
+//
+// The fairness invariant this exists to enforce: *there is no player-facing
+// mutation path except an Intent.* Whatever the human can express, the bridge
+// commander can express, because both are spelling words from this one list.
+//
+// The serde shape is deliberately the bridge's historical wire format — the
+// tag is `type`, ids are `Entity::to_bits`, positions are flat `x`/`z` — so
+// `commands.json` parses straight into `Intent` with no translation layer, and
+// the replay log's serialized form is a command an operator could replay by
+// hand. Backward compatibility is not an adapter here; it is the schema.
+// ---------------------------------------------------------------------------
+
+/// An entity as it appears in the shared language: `Entity::to_bits`. Both
+/// interfaces name units by this id — the bridge because it always did, the UI
+/// because naming them the same way is what makes the two logs comparable.
+pub type IntentId = u64;
+
+pub fn intent_id(entity: Entity) -> IntentId {
+    entity.to_bits()
+}
+
+/// Ids on the wire are `Entity::to_bits`; invalid bit patterns resolve to None
+/// instead of panicking.
+pub fn intent_entity(id: IntentId) -> Option<Entity> {
+    Entity::try_from_bits(id).ok()
+}
+
+/// Everything a player can mean.
+///
+/// Grouped by what it is for: unit orders, production, the doctrine layer that
+/// runs at machine speed for whoever set it, abilities and items, and the two
+/// match-level statements. Adding a verb here is adding it to *both* seats at
+/// once, which is the point.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Intent {
+    // --- unit orders ---
+    Move {
+        units: Vec<IntentId>,
+        x: f32,
+        z: f32,
+    },
+    AttackMove {
+        units: Vec<IntentId>,
+        x: f32,
+        z: f32,
+    },
+    Attack {
+        units: Vec<IntentId>,
+        target: IntentId,
+    },
+    /// Gold mines and trees alike; workers only.
+    Harvest {
+        units: Vec<IntentId>,
+        target: IntentId,
+    },
+    Return {
+        units: Vec<IntentId>,
+    },
+    Follow {
+        units: Vec<IntentId>,
+        target: IntentId,
+    },
+    /// Halt in place and drop any attack target.
+    Stop {
+        units: Vec<IntentId>,
+    },
+
+    // --- production ---
+    Build {
+        worker: IntentId,
+        kind: String,
+        x: f32,
+        z: f32,
+    },
+    Train {
+        building: IntentId,
+        unit: String,
+    },
+    /// Convert one of our own finished buildings into its next tier IN PLACE
+    /// (`catalog.buildings[].upgrades_to`). Paid in full the moment it is
+    /// accepted; the building keeps its position, footprint, rally and
+    /// training queue, but trains nothing until the conversion finishes.
+    Upgrade {
+        building: IntentId,
+    },
+    Cancel {
+        building: IntentId,
+        index: usize,
+    },
+    /// Where units this building trains should go. `x`/`z` for ground, or
+    /// `target` for a resource node (new workers harvest it) or an own unit
+    /// (new units follow it).
+    Rally {
+        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<IntentId>,
+    },
+
+    // --- abilities & items ---
+    /// Cast one of the caster's abilities. The caster is a hero or one of our
+    /// own finished ability buildings (the TownHall's Call to Arms). `hero` is
+    /// the historical field name; `caster` says what it really means now.
+    ///
+    /// `ability` picks a slot — the integer index or the ability id (`"Slam"`,
+    /// case-insensitive). OMIT IT for the caster's first unlocked ability, so
+    /// `{"type":"cast","hero":123}` means exactly what it always meant. The UI
+    /// is index-native (each hotkey is a slot); the bridge speaks both.
+    Cast {
+        #[serde(alias = "caster")]
+        hero: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ability: Option<AbilitySelector>,
+    },
+    /// Buy a consumable at one of our own finished Shops. The buyer is implied:
+    /// a team has at most one living hero, and only heroes carry an inventory.
+    Buy {
+        shop: IntentId,
+        item: String,
+    },
+    #[serde(rename = "use_item")]
+    UseItem {
+        slot: usize,
+    },
+
+    // --- doctrine: standing policy, executed by the engine at machine speed ---
+    /// Focus-fire order. An empty/omitted `classes` clears the policy.
+    Priority {
+        units: Vec<IntentId>,
+        #[serde(default)]
+        classes: Vec<String>,
+    },
+    /// Break off below `below` (a fraction in the open range 0..1) and fall
+    /// back to x/z. `below` omitted, null, or 0 clears the policy.
+    Retreat {
+        units: Vec<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        below: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+    },
+    /// Anchor to x/z within `radius`. `radius <= 0` clears the policy.
+    Leash {
+        units: Vec<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radius: Option<f32>,
+    },
+    /// Heroes only. `min_enemies` omitted, null, or 0 clears the rule.
+    /// `ability` names the slot the rule governs; omitted, it means the first
+    /// slot, which is what it always meant. Rules are per-slot: a hero told to
+    /// auto-heal does not thereby stop auto-slamming.
+    Autocast {
+        units: Vec<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_enemies: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ability: Option<AbilitySelector>,
+    },
+    /// Squad membership. `id` omitted or null removes the units from any squad.
+    Squad {
+        units: Vec<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u8>,
+    },
+    /// What a squad is for. `posture` omitted or null clears the entry, which
+    /// leaves the members where they are without disbanding the squad.
+    Posture {
+        id: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        posture: Option<PostureIntent>,
+    },
+    /// Standing doctrine for everything a production building trains from now
+    /// on. Each piece is independent and absolute: whatever is given replaces
+    /// the whole template, and every piece omitted or null is left unset. An
+    /// intent with no pieces at all removes the template entirely.
+    Template {
+        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        squad: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retreat: Option<RetreatIntent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        autocast: Option<u32>,
+    },
+
+    // --- match level ---
+    /// Hand this faction to the scripted AI (or take it back).
+    Autopilot {
+        on: bool,
+    },
+    /// Concede: the opponent wins immediately.
+    Surrender,
+}
+
+/// The `retreat` piece of a `template` intent.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct RetreatIntent {
+    pub below: f32,
+    pub x: f32,
+    pub z: f32,
+}
+
+/// The inner object of a `posture` intent.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum PostureIntent {
+    Defend { x: f32, z: f32, radius: f32 },
+    Push { x: f32, z: f32 },
+    Escort { unit: IntentId },
+    /// Hunt bounty caches; x/z is the muster point held while none exist.
+    Forage { x: f32, z: f32 },
+}
+
+impl Intent {
+    /// The verb, as it appears in the wire format and in the replay log.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Intent::Move { .. } => "move",
+            Intent::AttackMove { .. } => "attackmove",
+            Intent::Attack { .. } => "attack",
+            Intent::Harvest { .. } => "harvest",
+            Intent::Return { .. } => "return",
+            Intent::Follow { .. } => "follow",
+            Intent::Stop { .. } => "stop",
+            Intent::Build { .. } => "build",
+            Intent::Train { .. } => "train",
+            Intent::Upgrade { .. } => "upgrade",
+            Intent::Cancel { .. } => "cancel",
+            Intent::Rally { .. } => "rally",
+            Intent::Cast { .. } => "cast",
+            Intent::Buy { .. } => "buy",
+            Intent::UseItem { .. } => "use_item",
+            Intent::Priority { .. } => "priority",
+            Intent::Retreat { .. } => "retreat",
+            Intent::Leash { .. } => "leash",
+            Intent::Autocast { .. } => "autocast",
+            Intent::Squad { .. } => "squad",
+            Intent::Posture { .. } => "posture",
+            Intent::Template { .. } => "template",
+            Intent::Autopilot { .. } => "autopilot",
+            Intent::Surrender => "surrender",
+        }
+    }
+
+    /// One English sentence saying what this intent means.
+    ///
+    /// This is the half of the replay log a person reads. It deliberately does
+    /// not mention who issued it or how: an intent written by a mouse and an
+    /// intent written by JSON produce the *same sentence*, which is the whole
+    /// claim this module exists to make checkable.
+    pub fn sentence(&self) -> String {
+        fn at(x: f32, z: f32) -> String {
+            format!("({x:.1}, {z:.1})")
+        }
+        fn group(units: &[IntentId]) -> String {
+            match units.len() {
+                1 => format!("unit {}", units[0]),
+                n => format!("{n} units"),
+            }
+        }
+        /// How a sentence names an ability slot. The id reads as itself; a
+        /// bare index has no name to give, so it says which slot it is.
+        fn ability_name(sel: &Option<AbilitySelector>) -> String {
+            match sel {
+                None => "its ability".to_string(),
+                Some(AbilitySelector::Id(id)) => id.clone(),
+                Some(AbilitySelector::Index(i)) => format!("ability slot {i}"),
+            }
+        }
+        match self {
+            Intent::Move { units, x, z } => {
+                format!("move {} to {}", group(units), at(*x, *z))
+            }
+            Intent::AttackMove { units, x, z } => {
+                format!("attack-move {} to {}", group(units), at(*x, *z))
+            }
+            Intent::Attack { units, target } => {
+                format!("{} attack {target}", group(units))
+            }
+            Intent::Harvest { units, target } => {
+                format!("{} harvest node {target}", group(units))
+            }
+            Intent::Return { units } => format!("{} return cargo", group(units)),
+            Intent::Follow { units, target } => {
+                format!("{} follow {target}", group(units))
+            }
+            Intent::Stop { units } => format!("{} hold position", group(units)),
+            Intent::Build {
+                worker,
+                kind,
+                x,
+                z,
+            } => format!("worker {worker} builds {kind} at {}", at(*x, *z)),
+            Intent::Train { building, unit } => {
+                format!("building {building} trains {unit}")
+            }
+            Intent::Upgrade { building } => {
+                format!("building {building} upgrades to its next tier")
+            }
+            Intent::Cancel { building, index } => {
+                format!("building {building} cancels queue slot {index}")
+            }
+            Intent::Rally {
+                building,
+                x,
+                z,
+                target,
+            } => match (x, z, target) {
+                (Some(x), Some(z), _) => {
+                    format!("building {building} rallies to {}", at(*x, *z))
+                }
+                (_, _, Some(t)) => format!("building {building} rallies onto {t}"),
+                _ => format!("building {building} rally (unspecified)"),
+            },
+            Intent::Cast { hero, ability } => {
+                format!("{hero} casts {}", ability_name(ability))
+            }
+            Intent::Buy { shop, item } => format!("buy {item} at shop {shop}"),
+            Intent::UseItem { slot } => format!("hero uses item in slot {slot}"),
+            Intent::Priority { units, classes } => {
+                if classes.is_empty() {
+                    format!("{} clear focus-fire priority", group(units))
+                } else {
+                    format!("{} focus {}", group(units), classes.join(" > "))
+                }
+            }
+            Intent::Retreat { units, below, x, z } => match (below, x, z) {
+                (Some(b), Some(x), Some(z)) if *b > 0.0 => format!(
+                    "{} fall back to {} below {:.0}% health",
+                    group(units),
+                    at(*x, *z),
+                    b * 100.0
+                ),
+                _ => format!("{} clear retreat policy", group(units)),
+            },
+            Intent::Leash { units, x, z, radius } => match (x, z, radius) {
+                (Some(x), Some(z), Some(r)) if *r > 0.0 => format!(
+                    "{} hold within {r:.0} of {}",
+                    group(units),
+                    at(*x, *z)
+                ),
+                _ => format!("{} clear leash", group(units)),
+            },
+            Intent::Autocast {
+                units,
+                min_enemies,
+                ability,
+            } => match min_enemies {
+                Some(n) if *n > 0 => format!(
+                    "{} auto-cast {} at {n}+ enemies",
+                    group(units),
+                    ability_name(ability)
+                ),
+                _ => format!(
+                    "{} clear auto-cast for {}",
+                    group(units),
+                    ability_name(ability)
+                ),
+            },
+            Intent::Squad { units, id } => match id {
+                Some(id) => format!("{} join squad {id}", group(units)),
+                None => format!("{} leave their squad", group(units)),
+            },
+            Intent::Posture { id, posture } => match posture {
+                None => format!("squad {id} stands down (posture cleared)"),
+                Some(PostureIntent::Defend { x, z, radius }) => {
+                    format!("squad {id} defends {} within {radius:.0}", at(*x, *z))
+                }
+                Some(PostureIntent::Push { x, z }) => {
+                    format!("squad {id} pushes to {}", at(*x, *z))
+                }
+                Some(PostureIntent::Escort { unit }) => {
+                    format!("squad {id} escorts {unit}")
+                }
+                Some(PostureIntent::Forage { x, z }) => {
+                    format!("squad {id} forages, mustering at {}", at(*x, *z))
+                }
+            },
+            Intent::Template {
+                building,
+                squad,
+                retreat,
+                priority,
+                autocast,
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(s) = squad {
+                    parts.push(format!("squad {s}"));
+                }
+                if let Some(r) = retreat {
+                    parts.push(format!(
+                        "retreat below {:.0}% to {:.1},{:.1}",
+                        r.below * 100.0,
+                        r.x,
+                        r.z
+                    ));
+                }
+                if let Some(p) = priority {
+                    parts.push(format!("focus {}", p.join(" > ")));
+                }
+                if let Some(a) = autocast {
+                    parts.push(format!("auto-cast at {a}+"));
+                }
+                if parts.is_empty() {
+                    format!("building {building} clears its doctrine template")
+                } else {
+                    format!(
+                        "building {building} stamps every unit it trains with {}",
+                        parts.join(", ")
+                    )
+                }
+            }
+            Intent::Autopilot { on } => {
+                if *on {
+                    "hand the faction to the scripted AI".to_string()
+                } else {
+                    "take the faction back from the scripted AI".to_string()
+                }
+            }
+            Intent::Surrender => "surrender the match".to_string(),
+        }
+    }
+}
+
+/// Who spelled the intent. The compiler treats every source identically — this
+/// is recorded for the replay log, not consulted for authority.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum IntentSource {
+    /// A human gesture in ui.rs (mouse, hotkey, command card).
+    Ui,
+    /// A command batch through the file bridge.
+    Bridge,
+}
+
+impl IntentSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            IntentSource::Ui => "ui",
+            IntentSource::Bridge => "bridge",
+        }
+    }
+}
+
+/// Submit an intent for validation and application. **This is the only
+/// player-facing way to change the game.** ui.rs and bridge.rs write it;
+/// intent.rs is the only reader.
+#[derive(Event, Clone, Debug)]
+pub struct SubmitIntent {
+    /// The faction the intent is issued on behalf of. Every ownership check in
+    /// the compiler is taken against this, so no interface can reach across.
+    pub team: Team,
+    pub source: IntentSource,
+    /// Prefix for validation errors — `"cmd 3"` for the fourth command of a
+    /// bridge batch, `"ui"` for a gesture. Keeps the bridge's historical error
+    /// strings byte-identical.
+    pub tag: String,
+    pub intent: Intent,
+}
+
+impl SubmitIntent {
+    /// A gesture from the human at the keyboard.
+    pub fn ui(team: Team, intent: Intent) -> Self {
+        SubmitIntent {
+            team,
+            source: IntentSource::Ui,
+            tag: "ui".to_string(),
+            intent,
+        }
+    }
+}
+
+/// Validation failures from the last intents each team submitted, in
+/// submission order. bridge.rs copies its seat's list into the next snapshot's
+/// `errors`; the compiler only ever appends.
+#[derive(Resource, Default)]
+pub struct IntentErrors {
+    pub human: Vec<String>,
+    pub claude: Vec<String>,
+}
+
+impl IntentErrors {
+    pub fn get(&self, team: Team) -> &Vec<String> {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+    pub fn get_mut(&mut self, team: Team) -> &mut Vec<String> {
         match team {
             Team::Human => &mut self.human,
             Team::Claude => &mut self.claude,

@@ -31,6 +31,7 @@ use bevy::window::{PrimaryWindow, SystemCursorIcon};
 use bevy::winit::cursor::CursorIcon;
 use std::collections::{HashMap, VecDeque};
 
+use crate::intent::IntentApply;
 use crate::shared::*;
 
 // ---------------------------------------------------------------------------
@@ -45,8 +46,6 @@ const TREE_PICK_RADIUS: f32 = 2.0;
 const MINE_PICK_RADIUS: f32 = 3.5;
 /// Minimum pixel travel before a left-drag becomes a rubber-band box.
 const DRAG_THRESHOLD: f32 = 8.0;
-/// Spacing of the move-order formation grid.
-const FORMATION_SPACING: f32 = 2.6;
 /// Maximum queued units per production building.
 const MAX_QUEUE: usize = 7;
 
@@ -156,7 +155,11 @@ impl Plugin for UiPlugin {
                     update_notifications,
                     update_hud,
                 )
+                    // Every gesture system here submits intents; the compiler
+                    // runs after all of them, so a click is compiled in the
+                    // frame it happened rather than the next one.
                     .chain()
+                    .before(IntentApply)
                     .after(FogSet),
             );
     }
@@ -325,19 +328,13 @@ enum Slot {
 // Commands (shared by hotkeys and command-card buttons)
 // ---------------------------------------------------------------------------
 
-/// Every event the command card can emit, in one system param.
-///
-/// `command_input` already reads most of the world to decide what the current
-/// selection can do, and Bevy caps a system at 16 parameters — bundling the
-/// writers keeps room for the next command that needs one instead of spending
-/// the last slot on it.
-#[derive(SystemParam)]
-struct CardActions<'w> {
-    casts: EventWriter<'w, CastAbility>,
-    buys: EventWriter<'w, BuyItem>,
-    item_uses: EventWriter<'w, UseItem>,
-    upgrades: EventWriter<'w, UpgradeBuilding>,
-}
+// The command card used to carry a four-writer `CardActions` bundle —
+// `CastAbility`, `BuyItem`, `UseItem`, `UpgradeBuilding` — field for field
+// identical to the one bridge.rs carried. Both are gone: the card emits
+// `SubmitIntent` and nothing else, and intent.rs owns the four writers. Two
+// interfaces that had independently converged on the same bundle are exactly
+// the duplication the intent layer exists to remove, and dropping it also
+// bought `command_input` three parameters of headroom against Bevy's ceiling.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CmdAction {
@@ -1274,34 +1271,56 @@ fn apply_selection(
     }
 }
 
-/// Grid offsets around a click point so a group doesn't stack on one spot.
-fn formation_offset(index: usize, count: usize) -> Vec3 {
-    if count <= 1 {
-        return Vec3::ZERO;
-    }
-    let cols = (count as f32).sqrt().ceil().max(1.0) as usize;
-    let rows = count.div_ceil(cols);
-    let col = index % cols;
-    let row = index / cols;
-    Vec3::new(
-        (col as f32 - (cols as f32 - 1.0) * 0.5) * FORMATION_SPACING,
-        0.0,
-        (row as f32 - (rows as f32 - 1.0) * 0.5) * FORMATION_SPACING,
-    )
+/// Issue a Move / AttackMove to a group with the usual formation spread.
+// ---------------------------------------------------------------------------
+// Speaking the shared language
+//
+// Every gesture below compiles to a `shared::Intent` and submits it. The UI no
+// longer writes `Order`s, doctrine components, training queues, rally points
+// or ability/upgrade events itself — intent.rs does, from the same values a
+// bridge commander sends as JSON. What is left here is the *gesture*: deciding
+// which units a right-click meant, which worker is nearest the build site,
+// what "guard" implies as an anchor and a radius, which ability slot a hotkey
+// names. That translation is the human interface's real job, and the sentence
+// it produces is indistinguishable from the AI's.
+// ---------------------------------------------------------------------------
+
+/// Name a group of entities in the shared language.
+fn ids(group: &[Entity]) -> Vec<IntentId> {
+    group.iter().copied().map(intent_id).collect()
 }
 
-/// Issue a Move / AttackMove to a group with the usual formation spread.
-fn issue_ground_order(commands: &mut Commands, group: &[Entity], ground: Vec3, attack_move: bool) {
-    let count = group.len();
-    for (i, e) in group.iter().enumerate() {
-        let p = clamp_to_map(ground + formation_offset(i, count));
-        let order = if attack_move {
-            Order::AttackMove(p)
-        } else {
-            Order::Move(p)
-        };
-        commands.entity(*e).try_insert(order);
+/// Submit one intent on behalf of the player at the keyboard.
+fn say(submissions: &mut EventWriter<SubmitIntent>, intent: Intent) {
+    submissions.write(SubmitIntent::ui(Team::Human, intent));
+}
+
+/// Move / AttackMove for a group. intent.rs applies the formation spread and
+/// the map clamp, so a mouse drag and a bridge `move` land in the same shape.
+fn ground_intent(
+    submissions: &mut EventWriter<SubmitIntent>,
+    group: &[Entity],
+    ground: Vec3,
+    attack_move: bool,
+) {
+    if group.is_empty() {
+        return;
     }
+    let units = ids(group);
+    let (x, z) = (ground.x, ground.z);
+    say(
+        submissions,
+        if attack_move {
+            Intent::AttackMove { units, x, z }
+        } else {
+            Intent::Move { units, x, z }
+        },
+    );
+}
+
+/// Pull the entities out of a `(Entity, UnitKind, carrying)` selection slice.
+fn entities_of(sel: &[(Entity, UnitKind, bool)]) -> Vec<Entity> {
+    sel.iter().map(|(e, _, _)| *e).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1926,7 +1945,7 @@ fn command_input(
     game_over: Res<GameOver>,
     cast: CastLookup,
     mut focus: EventWriter<CameraFocus>,
-    mut acts: CardActions,
+    mut submissions: EventWriter<SubmitIntent>,
     pressed_buttons: Query<(&Interaction, &El), Changed<Interaction>>,
     selected: Query<Entity, With<Selected>>,
     sel_units: Query<
@@ -1944,16 +1963,16 @@ fn command_input(
         ),
         With<Selected>,
     >,
-    mut sel_buildings: Query<
+    // Read-only now: the training queue is pushed by intent.rs, never here.
+    sel_buildings: Query<
         (
             Entity,
             &Building,
             &Team,
-            Option<&mut TrainingQueue>,
+            Option<&TrainingQueue>,
             Option<&UnderConstruction>,
             // Per-ability cooldowns are read through `CastLookup` by entity, so
-            // this query stays free of them and no borrow outlives the
-            // `iter_mut` the train command needs.
+            // this query stays free of them.
             Option<&Upgrading>,
         ),
         With<Selected>,
@@ -2006,6 +2025,8 @@ fn command_input(
         .filter(|(_, _, t, _, _, _, _, _, _, _)| **t == Team::Human)
         .map(|(e, _, _, tf, _, _, _, _, _, _)| (e, tf.translation))
         .collect();
+    // The same selection, named the way the shared language names units.
+    let own_ids = || -> Vec<IntentId> { own_units.iter().map(|(e, _)| intent_id(*e)).collect() };
     let has_worker = sel_units
         .iter()
         .any(|(_, u, t, _, _, _, _, _, _, _)| *t == Team::Human && u.kind == UnitKind::Worker);
@@ -2155,10 +2176,8 @@ fn command_input(
                 ui.placement = None;
             }
             CmdAction::Stop => {
-                // Re-issuing a move to the unit's own position halts it and
-                // clears any attack target; combat.rs re-acquires afterwards.
-                for (e, pos) in &own_units {
-                    commands.entity(*e).try_insert(Order::Move(*pos));
+                if !own_units.is_empty() {
+                    say(&mut submissions, Intent::Stop { units: own_ids() });
                 }
                 ui.attack_move_armed = false;
             }
@@ -2172,27 +2191,46 @@ fn command_input(
                 ui.wall_chain.clear();
                 ui.attack_move_armed = false;
             }
-            // Abilities: combat.rs owns the mana/cooldown verdict, exactly as
-            // it does for the AI and the bridge.
+            // Abilities: combat.rs owns the unlock/mana/cooldown verdict,
+            // exactly as it does for the AI and the bridge. The hotkey IS the
+            // slot, so the UI is index-native; a commander may name the same
+            // slot by id. Both spellings are the same intent.
             CmdAction::CastHero(index) => {
                 for (hero, _, _, _) in &own_heroes {
-                    acts.casts.write(CastAbility::index(*hero, index));
+                    say(
+                        &mut submissions,
+                        Intent::Cast {
+                            hero: intent_id(*hero),
+                            ability: Some(AbilitySelector::Index(index)),
+                        },
+                    );
                 }
             }
             CmdAction::CastBuilding(index) => {
                 if let Some((entity, kind, true, _)) = single {
                     if index < abilities_of_building(kind).len() {
-                        acts.casts.write(CastAbility::index(entity, index));
+                        say(
+                            &mut submissions,
+                            Intent::Cast {
+                                hero: intent_id(entity),
+                                ability: Some(AbilitySelector::Index(index)),
+                            },
+                        );
                     }
                 }
             }
             CmdAction::Buy(item) => {
                 // economy.rs re-validates ownership, slots and gold; the card
                 // only greys the button so the player knows before clicking.
-                if let (Some((shop, BuildingKind::Shop, true, _)), Some((hero, _))) =
-                    (single, team_hero)
-                {
-                    acts.buys.write(BuyItem { shop, hero, item });
+                // The buyer is implied by the team, exactly as on the bridge.
+                if let (Some((shop, BuildingKind::Shop, true, _)), Some(_)) = (single, team_hero) {
+                    say(
+                        &mut submissions,
+                        Intent::Buy {
+                            shop: intent_id(shop),
+                            item: item_def(item).name.to_string(),
+                        },
+                    );
                 }
             }
             CmdAction::Upgrade(to) => {
@@ -2200,18 +2238,30 @@ fn command_input(
                 // for the bridge's `upgrade` command and the AI's tier-up.
                 if let Some((entity, kind, true, false)) = single {
                     if building_upgrades_to(kind) == Some(to) {
-                        acts.upgrades.write(UpgradeBuilding { building: entity });
+                        say(
+                            &mut submissions,
+                            Intent::Upgrade {
+                                building: intent_id(entity),
+                            },
+                        );
                     }
                 }
             }
             CmdAction::UseSlot(slot) => {
-                if let Some((hero, _, _, _)) = own_heroes.first() {
-                    acts.item_uses.write(UseItem { hero: *hero, slot });
+                if own_heroes.first().is_some() {
+                    say(&mut submissions, Intent::UseItem { slot });
                 }
             }
-            // --- doctrine toggles: every mutation goes through Commands, so
-            // no new &mut query can ever alias the reads above (B0001).
+            // --- doctrine toggles ------------------------------------------
+            // These are the clearest case of a gesture *compiling*: the card
+            // offers one key, the language wants parameters, so the UI works
+            // out the anchor, the threshold and the rally point from what is
+            // selected and submits the same parameterised intent the bridge
+            // spells out by hand. Same verb, same object, same log line.
             CmdAction::ToggleGuard => {
+                if own_units.is_empty() {
+                    continue;
+                }
                 if doc.leashed == 0 {
                     // Anchor on the centre of mass of the group being told to
                     // hold: "guard where you stand".
@@ -2220,20 +2270,33 @@ fn command_input(
                         .fold(Vec3::ZERO, |acc, (_, p)| acc + *p)
                         / own_units.len().max(1) as f32;
                     let anchor = clamp_to_map(centroid);
-                    for (e, _) in &own_units {
-                        commands.entity(*e).try_insert(LeashPolicy {
-                            anchor,
-                            radius: GUARD_RADIUS,
-                        });
-                    }
+                    say(
+                        &mut submissions,
+                        Intent::Leash {
+                            units: own_ids(),
+                            x: Some(anchor.x),
+                            z: Some(anchor.z),
+                            radius: Some(GUARD_RADIUS),
+                        },
+                    );
                 } else {
                     // Mixed selection: any leash at all means "release all".
-                    for (e, _) in &own_units {
-                        commands.entity(*e).try_remove::<LeashPolicy>();
-                    }
+                    // Radius 0 is how the language spells "clear".
+                    say(
+                        &mut submissions,
+                        Intent::Leash {
+                            units: own_ids(),
+                            x: None,
+                            z: None,
+                            radius: Some(0.0),
+                        },
+                    );
                 }
             }
             CmdAction::ToggleFallback => {
+                if own_units.is_empty() {
+                    continue;
+                }
                 if doc.fallback == 0 {
                     let centroid = own_units
                         .iter()
@@ -2254,51 +2317,70 @@ fn command_input(
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         })
                         .unwrap_or(HUMAN_BASE);
-                    let rally = Vec3::new(rally.x, 0.0, rally.z);
-                    for (e, _) in &own_units {
-                        commands.entity(*e).try_insert(RetreatPolicy {
-                            below_frac: FALLBACK_FRAC,
-                            rally,
-                        });
-                    }
+                    say(
+                        &mut submissions,
+                        Intent::Retreat {
+                            units: own_ids(),
+                            below: Some(FALLBACK_FRAC),
+                            x: Some(rally.x),
+                            z: Some(rally.z),
+                        },
+                    );
                 } else {
-                    for (e, _) in &own_units {
-                        commands.entity(*e).try_remove::<RetreatPolicy>();
-                    }
+                    // `below: 0` is how the language spells "clear".
+                    say(
+                        &mut submissions,
+                        Intent::Retreat {
+                            units: own_ids(),
+                            below: Some(0.0),
+                            x: None,
+                            z: None,
+                        },
+                    );
                 }
             }
             CmdAction::CyclePriority => {
-                // The whole selection lands on the same preset, derived from
-                // the first unit, so repeated presses stay in lock-step.
-                match priority_component(doc.prio.next()) {
-                    Some(priority) => {
-                        for (e, _) in &own_units {
-                            commands.entity(*e).try_insert(priority.clone());
-                        }
-                    }
-                    None => {
-                        for (e, _) in &own_units {
-                            commands.entity(*e).try_remove::<TargetPriority>();
-                        }
-                    }
+                if own_units.is_empty() {
+                    continue;
                 }
+                // The whole selection lands on the same preset, derived from
+                // the first unit, so repeated presses stay in lock-step. An
+                // empty class list is how the language spells "clear".
+                let classes = priority_component(doc.prio.next())
+                    .map(|p| p.0.iter().map(|c| c.name().to_string()).collect())
+                    .unwrap_or_default();
+                say(
+                    &mut submissions,
+                    Intent::Priority {
+                        units: own_ids(),
+                        classes,
+                    },
+                );
             }
             CmdAction::ToggleAutoCast => {
                 // Heroes only — a footman has nothing to auto-cast.
-                if doc.autocast == 0 {
-                    for (hero, _, _, _) in &own_heroes {
-                        // The card's one toggle governs the hero's FIRST
-                        // ability; per-ability rules are a bridge/doctrine
-                        // affordance until a hero ships with two spells.
-                        commands
-                            .entity(*hero)
-                            .try_insert(AutoCastPolicy::first(AUTOCAST_MIN_ENEMIES));
-                    }
-                } else {
-                    for (hero, _, _, _) in &own_heroes {
-                        commands.entity(*hero).try_remove::<AutoCastPolicy>();
-                    }
+                if own_heroes.is_empty() {
+                    continue;
                 }
+                // The card's one toggle governs the hero's FIRST ability;
+                // per-ability rules are a bridge/doctrine affordance until a
+                // hero ships with two spells. `ability: None` is exactly how
+                // the language says "slot 0", so the card and a bare bridge
+                // `autocast` are the same sentence.
+                let units: Vec<IntentId> =
+                    own_heroes.iter().map(|(e, _, _, _)| intent_id(*e)).collect();
+                say(
+                    &mut submissions,
+                    Intent::Autocast {
+                        units,
+                        min_enemies: Some(if doc.autocast == 0 {
+                            AUTOCAST_MIN_ENEMIES
+                        } else {
+                            0 // "clear"
+                        }),
+                        ability: None,
+                    },
+                );
             }
             CmdAction::Train(kind) => {
                 // One hero per team — never let a second one be queued, and
@@ -2311,12 +2393,12 @@ fn command_input(
                         continue;
                     }
                 }
-                let mut iter = sel_buildings.iter_mut();
+                let mut iter = sel_buildings.iter();
                 let (first, second) = (iter.next(), iter.next());
                 if second.is_some() {
                     continue;
                 }
-                let Some((_, building, team, Some(mut queue), uc, upgrading)) = first else {
+                let Some((entity, building, team, Some(queue), uc, upgrading)) = first else {
                     continue;
                 };
                 if *team != Team::Human || uc.is_some() || !trainable(building.kind).contains(&kind)
@@ -2335,9 +2417,18 @@ fn command_input(
                     (s.cost_gold, s.cost_lumber)
                 };
                 let affordable = economies.get(Team::Human).can_afford(cost_gold, cost_lumber);
-                // Economy pays when training starts; we only gate for UX.
+                // These stay here as *UX* gates: a click that can't work is
+                // dropped silently rather than logged as a rejected intent.
+                // intent.rs re-checks all of them regardless — this only keeps
+                // a greyed-out button from filling the error channel.
                 if affordable && queue.queue.len() < MAX_QUEUE {
-                    queue.queue.push_back(kind);
+                    say(
+                        &mut submissions,
+                        Intent::Train {
+                            building: intent_id(entity),
+                            unit: kind_name(kind).to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -2352,10 +2443,11 @@ fn panel_clicks(
     mut commands: Commands,
     ui: Res<UiState>,
     game_over: Res<GameOver>,
+    mut submissions: EventWriter<SubmitIntent>,
     pressed_buttons: Query<(&Interaction, &El), Changed<Interaction>>,
     selected: Query<Entity, With<Selected>>,
     alive: Query<Entity, Or<(With<Unit>, With<Building>)>>,
-    mut queues: Query<&mut TrainingQueue, With<Selected>>,
+    queues: Query<(Entity, &TrainingQueue), With<Selected>>,
 ) {
     if game_over.0.is_some() {
         return;
@@ -2377,17 +2469,20 @@ fn panel_clicks(
                 if i >= ui.queue_len {
                     continue;
                 }
-                let mut iter = queues.iter_mut();
+                let mut iter = queues.iter();
                 let (first, second) = (iter.next(), iter.next());
                 if second.is_some() {
                     continue;
                 }
-                let Some(mut queue) = first else { continue };
+                let Some((entity, queue)) = first else { continue };
                 if i < queue.queue.len() {
-                    queue.queue.remove(i);
-                    if i == 0 {
-                        queue.progress = 0.0;
-                    }
+                    say(
+                        &mut submissions,
+                        Intent::Cancel {
+                            building: intent_id(entity),
+                            index: i,
+                        },
+                    );
                 }
             }
             _ => {}
@@ -2441,12 +2536,12 @@ fn control_groups(
 // ---------------------------------------------------------------------------
 
 fn minimap_input(
-    mut commands: Commands,
     mut ui: ResMut<UiState>,
     buttons: Res<ButtonInput<MouseButton>>,
     game_over: Res<GameOver>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut focus: EventWriter<CameraFocus>,
+    mut submissions: EventWriter<SubmitIntent>,
     sel_units: Query<(Entity, &Team), (With<Selected>, With<Unit>)>,
 ) {
     let Ok(window) = windows.single() else {
@@ -2496,7 +2591,7 @@ fn minimap_input(
         }
         let attack_move = ui.attack_move_armed;
         ui.attack_move_armed = false;
-        issue_ground_order(&mut commands, &group, ground, attack_move);
+        ground_intent(&mut submissions, &group, ground, attack_move);
     }
 }
 
@@ -2513,6 +2608,7 @@ fn left_mouse(
     nav: Res<NavGrid>,
     economies: Res<Economies>,
     game_over: Res<GameOver>,
+    mut submissions: EventWriter<SubmitIntent>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     units: Query<(Entity, &Transform, &Unit, &Team, Has<Selected>)>,
@@ -2581,9 +2677,15 @@ fn left_mouse(
                         };
 
                         if let Some(worker) = worker {
-                            commands
-                                .entity(worker)
-                                .try_insert(Order::Build { kind, pos });
+                            say(
+                                &mut submissions,
+                                Intent::Build {
+                                    worker: intent_id(worker),
+                                    kind: building_name(kind).to_string(),
+                                    x: pos.x,
+                                    z: pos.z,
+                                },
+                            );
                             if chaining {
                                 ui.wall_chain.push(worker);
                             } else {
@@ -2603,7 +2705,7 @@ fn left_mouse(
                             .map(|(e, _, _, _, _)| e)
                             .collect();
                         group.sort_by_key(|e| e.index());
-                        issue_ground_order(&mut commands, &group, ground, true);
+                        ground_intent(&mut submissions, &group, ground, true);
                     }
                     ui.attack_move_armed = false;
                     return;
@@ -2742,10 +2844,10 @@ fn left_mouse(
 
 #[allow(clippy::type_complexity)]
 fn right_mouse(
-    mut commands: Commands,
     mut ui: ResMut<UiState>,
     buttons: Res<ButtonInput<MouseButton>>,
     game_over: Res<GameOver>,
+    mut submissions: EventWriter<SubmitIntent>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     units: Query<(Entity, &Transform, &Unit, &Team, Has<Selected>, Has<Carrying>)>,
@@ -2881,82 +2983,100 @@ fn right_mouse(
         if rally_buildings.is_empty() {
             return;
         }
-        let target = if let Some((n, _)) = node {
-            RallyTarget::Node(n)
+        // The rally intent names one target the same three ways the bridge
+        // does: a node id, an own-unit id, or bare ground coordinates.
+        let (x, z, target) = if let Some((n, _)) = node {
+            (None, None, Some(intent_id(n)))
         } else if let Some((u, _)) = own_unit {
-            RallyTarget::Unit(u)
+            (None, None, Some(intent_id(u)))
         } else {
-            RallyTarget::Ground(clamp_to_map(ground))
+            (Some(ground.x), Some(ground.z), None)
         };
         for e in rally_buildings {
-            commands.entity(e).try_insert(RallyPoint { target });
+            say(
+                &mut submissions,
+                Intent::Rally {
+                    building: intent_id(e),
+                    x,
+                    z,
+                    target,
+                },
+            );
         }
         return;
     }
 
     // --- enemy under the cursor? -----------------------------------------
     if let Some((target, _)) = enemy {
-        for (e, _, _) in &selected_units {
-            commands.entity(*e).try_insert(Order::Attack(target));
-        }
+        say(
+            &mut submissions,
+            Intent::Attack {
+                units: ids(&entities_of(&selected_units)),
+                target: intent_id(target),
+            },
+        );
         return;
     }
 
     // --- resource node: workers harvest, everyone else walks over ---------
+    // A compound gesture is two sentences, not a special case: the workers
+    // get a harvest intent and the escorts get a move intent, each with the
+    // formation spread intent.rs applies to any group.
     if let Some((target, _)) = node {
-        let mut movers = 0usize;
-        let non_workers = selected_units
+        let (workers, others): (Vec<_>, Vec<_>) = selected_units
             .iter()
-            .filter(|(_, k, _)| *k != UnitKind::Worker)
-            .count();
-        for (e, kind, _) in &selected_units {
-            if *kind == UnitKind::Worker {
-                commands.entity(*e).try_insert(Order::Harvest(target));
-            } else {
-                let p = clamp_to_map(ground + formation_offset(movers, non_workers));
-                movers += 1;
-                commands.entity(*e).try_insert(Order::Move(p));
-            }
+            .copied()
+            .partition(|(_, k, _)| *k == UnitKind::Worker);
+        if !workers.is_empty() {
+            say(
+                &mut submissions,
+                Intent::Harvest {
+                    units: ids(&entities_of(&workers)),
+                    target: intent_id(target),
+                },
+            );
         }
+        ground_intent(&mut submissions, &entities_of(&others), ground, false);
         return;
     }
 
     // --- own town hall + loaded workers: drop the cargo off ---------------
     let carriers = selected_units.iter().filter(|(_, _, c)| *c).count();
     if own_depot.is_some() && carriers > 0 {
-        let mut movers = 0usize;
-        let others = selected_units.len() - carriers;
-        for (e, _, carrying) in &selected_units {
-            if *carrying {
-                commands.entity(*e).try_insert(Order::ReturnResources);
-            } else {
-                let p = clamp_to_map(ground + formation_offset(movers, others));
-                movers += 1;
-                commands.entity(*e).try_insert(Order::Move(p));
-            }
-        }
+        let (loaded, others): (Vec<_>, Vec<_>) =
+            selected_units.iter().copied().partition(|(_, _, c)| *c);
+        say(
+            &mut submissions,
+            Intent::Return {
+                units: ids(&entities_of(&loaded)),
+            },
+        );
+        ground_intent(&mut submissions, &entities_of(&others), ground, false);
         return;
     }
 
     // --- own unit under the cursor: the rest of the selection escorts it ---
     if let Some((leader, _)) = own_unit {
-        let mut issued = false;
-        for (e, _, _) in &selected_units {
-            if *e == leader {
-                continue; // the leader keeps whatever it was doing
-            }
-            commands.entity(*e).try_insert(Order::Follow(leader));
-            issued = true;
-        }
-        if issued {
+        let followers: Vec<Entity> = selected_units
+            .iter()
+            .map(|(e, _, _)| *e)
+            .filter(|e| *e != leader) // the leader keeps whatever it was doing
+            .collect();
+        if !followers.is_empty() {
+            say(
+                &mut submissions,
+                Intent::Follow {
+                    units: ids(&followers),
+                    target: intent_id(leader),
+                },
+            );
             return;
         }
         // Only the clicked unit was selected — fall through to a plain move.
     }
 
     // --- plain ground move with formation spread -------------------------
-    let group: Vec<Entity> = selected_units.iter().map(|(e, _, _)| *e).collect();
-    issue_ground_order(&mut commands, &group, ground, false);
+    ground_intent(&mut submissions, &entities_of(&selected_units), ground, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -4512,7 +4632,7 @@ fn surrender_hotkey(
     time: Res<Time>,
     game_over: Res<GameOver>,
     mut armed_at: Local<Option<f32>>,
-    mut surrenders: EventWriter<Surrender>,
+    mut submissions: EventWriter<SubmitIntent>,
 ) {
     if game_over.0.is_some() || !keys.just_pressed(KeyCode::F12) {
         return;
@@ -4520,7 +4640,7 @@ fn surrender_hotkey(
     let now = time.elapsed_secs();
     match *armed_at {
         Some(t) if now - t < 3.0 => {
-            surrenders.write(Surrender { team: Team::Human });
+            say(&mut submissions, Intent::Surrender);
             *armed_at = None;
         }
         _ => {
