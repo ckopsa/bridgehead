@@ -393,15 +393,24 @@ fn think(
     // --- snapshot the world (read-only) --------------------------------------
     let mut workers: Vec<UnitInfo> = Vec::new();
     let mut army: Vec<UnitInfo> = Vec::new();
+    // Enemies that can shoot at a worker (what makes a mine unsafe).
     let mut enemy_combat: Vec<Vec3> = Vec::new();
+    // Every enemy, air included — a flyer over the base is still an incursion.
     let mut enemy_any: Vec<Vec3> = Vec::new();
+    // Enemies standing ON the ground: the only ones a Slam can touch.
+    let mut enemy_ground: Vec<Vec3> = Vec::new();
     // Own living heroes: (entity, position, ability ready).
     let mut own_heroes: Vec<(Entity, Vec3, bool)> = Vec::new();
 
     for (entity, unit, team, tf, order, move_to, carrying, hero) in units.iter() {
         let info = UnitInfo {
             entity,
-            pos: tf.translation,
+            // Flattened to the ground plane. Every comparison below is a
+            // ground-plane question ("is it near my base", "has it reached the
+            // rally"), and a flyer's altitude would otherwise inflate all of
+            // them — a flying unit hovering exactly on the rally point would
+            // read as 6 units short of it and never count as arrived.
+            pos: Vec3::new(tf.translation.x, 0.0, tf.translation.z),
             tag: order.map(tag_of).unwrap_or(Tag::Idle),
             moving: move_to.is_some(),
             carrying: carrying.is_some(),
@@ -422,7 +431,12 @@ fn think(
             }
         } else {
             enemy_any.push(info.pos);
-            if unit.kind != UnitKind::Worker {
+            if !is_flying_kind(unit.kind) {
+                enemy_ground.push(info.pos);
+            }
+            // Workers don't hunt, and neither does anything that cannot shoot
+            // downward — so neither should make a harvest crew run.
+            if unit.kind != UnitKind::Worker && unit_stats(unit.kind).can_hit_ground {
                 enemy_combat.push(info.pos);
             }
         }
@@ -855,7 +869,10 @@ fn think(
         if !ready {
             continue;
         }
-        let nearby = enemy_any
+        // Ground enemies only: the Slam is a ground shockwave, so a clump of
+        // flyers overhead must not talk the Champion into spending his mana on
+        // an empty patch of dirt.
+        let nearby = enemy_ground
             .iter()
             .filter(|e| e.distance(*pos) <= slam_radius)
             .count();

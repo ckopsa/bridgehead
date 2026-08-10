@@ -203,37 +203,102 @@ pub struct UnitStats {
     pub vs_building_mult: f32,
     /// Damage multiplier against Catapults (cavalry's anti-siege role).
     pub vs_siege_mult: f32,
+
+    // --- movement plane & attack envelope ---------------------------------
+    /// Airborne: ignores the `NavGrid` entirely (straight-line paths over
+    /// trees, mines, walls and buildings), renders at `FLYER_ALTITUDE`, and
+    /// only jostles other flyers. The third answer to a tower turtle, after
+    /// siege and cavalry: it simply refuses to use the door.
+    pub flying: bool,
+    /// May this kind attack AIRBORNE targets? The counter-triangle's spine:
+    /// melee weapons cannot reach a flyer, missiles can.
+    pub can_hit_air: bool,
+    /// May this kind attack GROUND targets (units and buildings)? Every
+    /// current kind can; the flag exists so a pure interceptor is data, not a
+    /// code change.
+    pub can_hit_ground: bool,
 }
 
+/// How high above the ground plane flying units are drawn and held. Chosen to
+/// clear every building silhouette while staying well inside the camera's
+/// parallax budget, so a flyer still reads as being "over" the cell it
+/// occupies. Range checks are all XZ, so altitude never changes a weapon's
+/// effective reach.
+pub const FLYER_ALTITUDE: f32 = 6.0;
+
+/// Does this kind fly? The single source of truth every module asks.
+pub fn is_flying_kind(kind: UnitKind) -> bool {
+    unit_stats(kind).flying
+}
+
+/// Is this *target* airborne? Buildings never are, so the whole question
+/// collapses to "is it a flying unit". Pass the target's `Unit` kind if it has
+/// one — `None` means a building.
+pub fn target_is_air(kind: Option<UnitKind>) -> bool {
+    kind.is_some_and(is_flying_kind)
+}
+
+/// May `attacker` engage a target at the given altitude? combat.rs consults
+/// this during acquisition, before every swing, and before retaliating, so a
+/// melee unit can never lock onto something it is physically unable to reach.
+pub fn unit_can_hit(attacker: UnitKind, target_is_air: bool) -> bool {
+    let stats = unit_stats(attacker);
+    if target_is_air {
+        stats.can_hit_air
+    } else {
+        stats.can_hit_ground
+    }
+}
+
+/// Anti-air is decided by ONE rule, applied to every kind below: a weapon that
+/// leaves the hand can hit a flyer, a weapon swung by hand cannot. So archers,
+/// the Priestess and towers shoot air; footmen, raiders, workers, militia and
+/// the melee Champion cannot. Catapults are the deliberate exception to
+/// "projectile == anti-air": siege is a ground bombardment weapon, and keeping
+/// it air-blind is what makes flyers the clean counter to a siege push (which
+/// is in turn the counter to the tower turtle flyers also bypass). Every
+/// counter has a counter.
 pub fn unit_stats(kind: UnitKind) -> UnitStats {
     match kind {
         UnitKind::Worker => UnitStats {
             cost_gold: 75, cost_lumber: 0, supply: 1, hp: 60.0, damage: 5.0,
             range: 1.8, attack_cooldown: 1.5, speed: 8.0, train_time: 8.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
         },
         UnitKind::Footman => UnitStats {
             cost_gold: 135, cost_lumber: 0, supply: 2, hp: 140.0, damage: 12.0,
             range: 2.0, attack_cooldown: 1.2, speed: 7.0, train_time: 12.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
         },
+        // The line's anti-air: a footman screen is helpless overhead, archers
+        // behind it are not.
         UnitKind::Archer => UnitStats {
             cost_gold: 90, cost_lumber: 30, supply: 2, hp: 70.0, damage: 14.0,
             range: 14.0, attack_cooldown: 1.5, speed: 7.0, train_time: 12.0, projectile: true,
             vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
         },
         // Base (level 1) stats; damage/HP grow per level — see `Hero`.
+        // The Champion swings a greatsword: no reach into the air, and its
+        // Slam is a ground shockwave (see `ability_of_unit`). A team that
+        // plays the melee hero needs archers or towers to answer flyers.
         UnitKind::Hero => UnitStats {
             cost_gold: 400, cost_lumber: 100, supply: 5, hp: 320.0, damage: 24.0,
             range: 2.4, attack_cooldown: 1.1, speed: 7.5, train_time: 25.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Outranges towers (20 vs 16) and pulverizes structures, but 15 damage
         // vs units, 110 hp, and 4.5 speed means anything that reaches it wins.
+        // Ground-only by design: a boulder lobbed at a wall cannot track a
+        // flyer, so an all-in siege push is the thing air raiders punish.
         UnitKind::Catapult => UnitStats {
             cost_gold: 180, cost_lumber: 120, supply: 3, hp: 110.0, damage: 15.0,
             range: 20.0, attack_cooldown: 3.0, speed: 4.5, train_time: 22.0, projectile: true,
             vs_building_mult: 6.0, vs_siege_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Speed is the weapon: dives catapults (2x) and worker lines, melts
         // under focused fire. Gold-heavy so it competes with footmen for budget.
@@ -241,12 +306,16 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             cost_gold: 170, cost_lumber: 30, supply: 3, hp: 130.0, damage: 16.0,
             range: 2.2, attack_cooldown: 1.1, speed: 10.5, train_time: 16.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 2.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
         },
         // Ranged support hero: heals instead of slams. Base (level 1) stats.
+        // Her bolts track upward, so the support hero is also the hero answer
+        // to air.
         UnitKind::Priestess => UnitStats {
             cost_gold: 400, cost_lumber: 100, supply: 5, hp: 240.0, damage: 14.0,
             range: 10.0, attack_cooldown: 1.4, speed: 7.5, train_time: 25.0, projectile: true,
             vs_building_mult: 1.0, vs_siege_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
         },
     }
 }
@@ -257,6 +326,10 @@ pub struct BuildingAttack {
     pub damage: f32,
     pub range: f32,
     pub cooldown: f32,
+    /// May this emplacement shoot airborne targets? Towers can — static
+    /// defense is the one thing a flyer cannot simply walk around, so a base
+    /// that invested in towers is never helpless against air.
+    pub can_hit_air: bool,
 }
 
 pub struct BuildingStats {
@@ -289,7 +362,9 @@ pub fn building_stats(kind: BuildingKind) -> BuildingStats {
         BuildingKind::Tower => BuildingStats {
             cost_gold: 110, cost_lumber: 80, hp: 550.0, build_time: 25.0,
             supply_provided: 0, size: 3.0,
-            attack: Some(BuildingAttack { damage: 16.0, range: 16.0, cooldown: 1.3 }),
+            attack: Some(BuildingAttack {
+                damage: 16.0, range: 16.0, cooldown: 1.3, can_hit_air: true,
+            }),
         },
         BuildingKind::Wall => BuildingStats {
             cost_gold: 25, cost_lumber: 10, hp: 300.0, build_time: 8.0,
@@ -415,6 +490,11 @@ pub struct CatalogUnit {
     pub speed: f32,
     pub train_time: f32,
     pub vs_building_mult: f32,
+    /// Airborne: ignores terrain and buildings when moving, and can only be
+    /// attacked by things whose `can_hit_air` is true.
+    pub flying: bool,
+    pub can_hit_air: bool,
+    pub can_hit_ground: bool,
     pub trained_at: &'static str,
     pub requires: Vec<&'static str>,
     pub description: &'static str,
@@ -425,6 +505,7 @@ pub struct CatalogAttack {
     pub damage: f32,
     pub range: f32,
     pub cooldown: f32,
+    pub can_hit_air: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -452,6 +533,7 @@ pub struct CatalogAbility {
     pub cooldown: f32,
     pub radius: f32,
     pub power: f32,
+    pub hits_air: bool,
     pub description: &'static str,
 }
 
@@ -496,6 +578,9 @@ pub fn game_catalog() -> Catalog {
                     speed: s.speed,
                     train_time: s.train_time,
                     vs_building_mult: s.vs_building_mult,
+                    flying: s.flying,
+                    can_hit_air: s.can_hit_air,
+                    can_hit_ground: s.can_hit_ground,
                     trained_at: trainer_of(k),
                     requires: unit_requires(k).iter().map(|b| building_name(*b)).collect(),
                     description: unit_description(k),
@@ -518,6 +603,7 @@ pub fn game_catalog() -> Catalog {
                         damage: a.damage,
                         range: a.range,
                         cooldown: a.cooldown,
+                        can_hit_air: a.can_hit_air,
                     }),
                     built_by: "Worker",
                     requires: building_requires(k).iter().map(|b| building_name(*b)).collect(),
@@ -543,6 +629,7 @@ pub fn game_catalog() -> Catalog {
                         cooldown: a.cooldown,
                         radius: a.radius,
                         power: a.power,
+                        hits_air: a.hits_air,
                         description: a.description,
                     });
                 }
@@ -557,6 +644,7 @@ pub fn game_catalog() -> Catalog {
                         cooldown: a.cooldown,
                         radius: a.radius,
                         power: a.power,
+                        hits_air: a.hits_air,
                         description: a.description,
                     });
                 }
@@ -800,6 +888,11 @@ pub struct AbilityDef {
     pub radius: f32,
     /// Damage / heal amount, or duration seconds for Militia.
     pub power: f32,
+    /// Does the effect reach AIRBORNE units in its radius? A shockwave that
+    /// travels along the ground does not; healing light does. combat.rs
+    /// filters by this, and doctrine.rs will not auto-cast at targets the
+    /// ability cannot affect.
+    pub hits_air: bool,
     pub description: &'static str,
 }
 
@@ -812,7 +905,10 @@ pub fn ability_of_unit(kind: UnitKind) -> Option<AbilityDef> {
             cooldown: HERO_ABILITY_COOLDOWN,
             radius: HERO_ABILITY_RADIUS,
             power: HERO_ABILITY_DAMAGE,
-            description: "AoE damage around the Champion, scales with level.",
+            // The Champion slams the ground. Flyers overhead feel nothing —
+            // the melee hero's air answer is his archers, not his ability.
+            hits_air: false,
+            description: "AoE damage around the Champion (ground only), scales with level.",
         }),
         UnitKind::Priestess => Some(AbilityDef {
             name: "Heal",
@@ -821,7 +917,9 @@ pub fn ability_of_unit(kind: UnitKind) -> Option<AbilityDef> {
             cooldown: 12.0,
             radius: 8.0,
             power: 60.0,
-            description: "Restores HP to all allies around the Priestess, scales with level.",
+            // Healing light reaches up: air allies are still your allies.
+            hits_air: true,
+            description: "Restores HP to all allies around the Priestess, air included, scales with level.",
         }),
         _ => None,
     }
@@ -836,6 +934,8 @@ pub fn ability_of_building(kind: BuildingKind) -> Option<AbilityDef> {
             cooldown: 90.0,
             radius: 16.0,
             power: 40.0,
+            // Workers are ground units, so this never had an air question.
+            hits_air: false,
             description: "Own workers near the TownHall become fighters for 40s.",
         }),
         _ => None,
@@ -1018,9 +1118,14 @@ pub enum TargetClass {
     Siege,
     /// Raiders and future fast flankers.
     Cavalry,
+    /// Anything airborne, whatever else it is. Flying outranks every other
+    /// classification because "can I even shoot it" is the first question a
+    /// focus-fire list has to answer — "prioritise Air" is the doctrine that
+    /// turns an archer line into dedicated anti-air.
+    Air,
 }
 
-pub const ALL_TARGET_CLASSES: [TargetClass; 7] = [
+pub const ALL_TARGET_CLASSES: [TargetClass; 8] = [
     TargetClass::Hero,
     TargetClass::Archer,
     TargetClass::Footman,
@@ -1028,10 +1133,18 @@ pub const ALL_TARGET_CLASSES: [TargetClass; 7] = [
     TargetClass::Building,
     TargetClass::Siege,
     TargetClass::Cavalry,
+    TargetClass::Air,
 ];
 
 impl TargetClass {
     pub fn of(unit: Option<UnitKind>, building: bool) -> Option<TargetClass> {
+        // Altitude first, and derived from the stat table rather than from a
+        // list of kinds: any future flying kind is classifiable — and so
+        // focus-fireable — the moment its stats say `flying: true`, with no
+        // edit here.
+        if target_is_air(unit) {
+            return Some(TargetClass::Air);
+        }
         match (unit, building) {
             // Both hero classes are "Hero" for targeting purposes.
             (Some(UnitKind::Hero) | Some(UnitKind::Priestess), _) => Some(TargetClass::Hero),
@@ -1053,6 +1166,7 @@ impl TargetClass {
             TargetClass::Building => "Building",
             TargetClass::Siege => "Siege",
             TargetClass::Cavalry => "Cavalry",
+            TargetClass::Air => "Air",
         }
     }
 }
@@ -1419,8 +1533,37 @@ pub fn machine_driven(ai: &AiControlled, external: &ExternallyCommanded, team: T
 
 /// Project the cursor onto the Y=0 ground plane.
 pub fn cursor_to_ground(camera: &Camera, cam_tf: &GlobalTransform, cursor: Vec2) -> Option<Vec3> {
-    let ray = camera.viewport_to_world(cam_tf, cursor).ok()?;
-    let dist = ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Y))?;
+    cursor_to_plane(camera, cam_tf, cursor, 0.0)
+}
+
+/// Project the cursor onto the horizontal plane at height `y`.
+///
+/// Picking a flying unit needs this: the camera looks down at a fixed pitch,
+/// so the ground point under the cursor and the point at `FLYER_ALTITUDE`
+/// under the same cursor are several world units apart. Testing an airborne
+/// unit against the y=0 projection would make it unclickable — and a unit a
+/// bridge commander can order but a human cannot click is exactly the
+/// interface asymmetry this game exists to remove.
+pub fn cursor_to_plane(
+    camera: &Camera,
+    cam_tf: &GlobalTransform,
+    cursor: Vec2,
+    y: f32,
+) -> Option<Vec3> {
+    let ray = cursor_ray(camera, cam_tf, cursor)?;
+    ray_at_height(ray, y)
+}
+
+/// The cursor's world-space ray. Useful when one click must be tested against
+/// several different heights (units on the ground, units in the air) — compute
+/// the ray once, then call `ray_at_height` per candidate.
+pub fn cursor_ray(camera: &Camera, cam_tf: &GlobalTransform, cursor: Vec2) -> Option<Ray3d> {
+    camera.viewport_to_world(cam_tf, cursor).ok()
+}
+
+/// Where a precomputed cursor ray crosses the horizontal plane at height `y`.
+pub fn ray_at_height(ray: Ray3d, y: f32) -> Option<Vec3> {
+    let dist = ray.intersect_plane(Vec3::new(0.0, y, 0.0), InfinitePlane3d::new(Vec3::Y))?;
     Some(ray.get_point(dist))
 }
 

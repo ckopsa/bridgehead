@@ -212,6 +212,14 @@ fn claim_bounties(
     for (entity, bounty, tf) in &bounties {
         let pos = tf.translation;
         let mut best: Option<(f32, Team)> = None;
+        // AIR CLAIMS: DELIBERATELY ALLOWED. `flat_dist` ignores height and the
+        // query has no kind filter, so a flyer passing over a cache takes it.
+        // Kept that way on purpose — a fast, terrain-ignoring raider that can
+        // reach the contested ring first turns every escalating cache into a
+        // race the ground army has to answer, and the answer (archers, towers
+        // near the ring) is exactly the anti-air investment flyers are meant
+        // to provoke. Contesting bounties is the flyer's economic role, not a
+        // loophole.
         for (team, unit_tf, health) in &units {
             if health.current <= 0.0 {
                 continue; // dying this frame; apply_death hasn't run yet

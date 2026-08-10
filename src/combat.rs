@@ -299,6 +299,11 @@ fn xz_dist_sq(a: Vec3, b: Vec3) -> f32 {
     xz(a - b).length_squared()
 }
 
+/// Is this candidate airborne? Buildings never are.
+fn is_air(unit: Option<&Unit>) -> bool {
+    target_is_air(unit.map(|u| u.kind))
+}
+
 /// Radius used for range checks against a target.
 fn target_radius(building: Option<&Building>) -> f32 {
     match building {
@@ -413,7 +418,7 @@ fn acquire_targets(
         Or<(With<Unit>, With<Building>)>,
     >,
 ) {
-    let list: Vec<(Entity, Team, Vec3, Option<TargetClass>, bool)> = candidates
+    let list: Vec<(Entity, Team, Vec3, Option<TargetClass>, bool, bool)> = candidates
         .iter()
         .filter(|(_, _, _, health, _, _)| health.current > 0.0)
         .map(|(entity, team, tf, _, unit, building)| {
@@ -423,6 +428,7 @@ fn acquire_targets(
                 tf.translation,
                 TargetClass::of(unit.map(|u| u.kind), building.is_some()),
                 building.is_some(),
+                is_air(unit),
             )
         })
         .collect();
@@ -460,8 +466,14 @@ fn acquire_targets(
         let siege = unit.kind == UnitKind::Catapult && priority.is_none();
         // (priority rank, distance²) — lowest rank wins, distance breaks ties.
         let mut best: Option<(usize, f32, Entity)> = None;
-        for (cand, cand_team, cand_pos, cand_class, cand_is_building) in &list {
+        for (cand, cand_team, cand_pos, cand_class, cand_is_building, cand_is_air) in &list {
             if *cand == entity || *cand_team == *team {
+                continue;
+            }
+            // A weapon that cannot reach this altitude never even sees the
+            // target: no acquisition means no chase, no deadlock, and no
+            // footman jogging under a Gryphon for the rest of the match.
+            if !unit_can_hit(unit.kind, *cand_is_air) {
                 continue;
             }
             // Leashed units simply cannot see anything past their tether.
@@ -548,6 +560,17 @@ fn engagement(
             continue;
         };
         if target_hp.current <= 0.0 || *target_team == *team {
+            clear_target(&mut commands, entity, order);
+            continue;
+        }
+        // THE deadlock guard. Acquisition already refuses unreachable
+        // altitudes, but an EXPLICIT `Order::Attack` from a player or a
+        // commander bypasses acquisition entirely — and a footman told to kill
+        // a Gryphon would otherwise chase it across the map forever, never in
+        // range, never giving up. Drop it instead: `clear_target` turns the
+        // order back into Idle, and the unit re-acquires something it can
+        // actually kill on the next acquisition tick.
+        if !unit_can_hit(unit.kind, is_air(target_unit)) {
             clear_target(&mut commands, entity, order);
             continue;
         }
@@ -693,7 +716,10 @@ fn tower_acquire(
     mut towers: Query<(&Building, &Team, &Transform, &mut TowerState), Without<UnderConstruction>>,
     // Units only (see the module note above); `Without<Building>` keeps this
     // provably disjoint from the tower query.
-    candidates: Query<(Entity, &Team, &GlobalTransform, &Health), (With<Unit>, Without<Building>)>,
+    candidates: Query<
+        (Entity, &Team, &GlobalTransform, &Health, &Unit),
+        (With<Unit>, Without<Building>),
+    >,
 ) {
     for (building, team, tf, mut state) in &mut towers {
         let Some(attack) = building_stats(building.kind).attack else {
@@ -704,10 +730,11 @@ fn tower_acquire(
 
         // Current target still worth shooting?
         if let Some(current) = state.target {
-            let still_good = candidates.get(current).is_ok_and(|(_, t, gt, hp)| {
+            let still_good = candidates.get(current).is_ok_and(|(_, t, gt, hp, unit)| {
                 hp.current > 0.0
                     && *t != *team
                     && xz_dist_sq(pos, gt.translation()) < max_dist_sq
+                    && (attack.can_hit_air || !is_flying_kind(unit.kind))
             });
             if still_good {
                 continue;
@@ -716,8 +743,12 @@ fn tower_acquire(
         }
 
         let mut best: Option<(f32, Entity)> = None;
-        for (cand, cand_team, cand_gt, health) in &candidates {
+        for (cand, cand_team, cand_gt, health, cand_unit) in &candidates {
             if *cand_team == *team || health.current <= 0.0 {
+                continue;
+            }
+            // Emplacements that cannot elevate simply do not see air.
+            if !attack.can_hit_air && is_flying_kind(cand_unit.kind) {
                 continue;
             }
             let d = xz_dist_sq(pos, cand_gt.translation());
@@ -739,7 +770,7 @@ fn tower_fire(
     time: Res<Time>,
     assets: Res<CombatAssets>,
     mut towers: Query<(Entity, &Building, &Team, &Transform, &mut TowerState), Without<UnderConstruction>>,
-    targets: Query<(&Team, &GlobalTransform, &Health), (With<Unit>, Without<Building>)>,
+    targets: Query<(&Team, &GlobalTransform, &Health, &Unit), (With<Unit>, Without<Building>)>,
 ) {
     let dt = time.delta_secs();
 
@@ -753,11 +784,15 @@ fn tower_fire(
             continue;
         };
         // The target may have died or been despawned since acquisition.
-        let Ok((target_team, target_gt, target_hp)) = targets.get(target) else {
+        let Ok((target_team, target_gt, target_hp, target_unit)) = targets.get(target) else {
             state.target = None;
             continue;
         };
         if target_hp.current <= 0.0 || *target_team == *team {
+            state.target = None;
+            continue;
+        }
+        if !attack.can_hit_air && is_flying_kind(target_unit.kind) {
             state.target = None;
             continue;
         }
@@ -882,6 +917,12 @@ fn cast_abilities(
         // --- apply the effect ----------------------------------------------
         for (entity, other_team, gt, mut health, unit) in &mut affected {
             if health.current <= 0.0 || xz_dist(center, gt.translation()) > def.radius {
+                continue;
+            }
+            // Ground AoE stops at the ground: the Champion's Slam passes
+            // harmlessly under a flyer, while the Priestess's Heal reaches up
+            // to one. Both are `hits_air` in the ability table, not code here.
+            if !def.hits_air && is_air(unit) {
                 continue;
             }
             match def.effect {
@@ -1061,7 +1102,7 @@ fn apply_damage(
         Option<&AttackTarget>,
         Option<&Militia>,
     )>,
-    attackers: Query<&Team, Or<(With<Unit>, With<Building>)>>,
+    attackers: Query<(&Team, Option<&Unit>), Or<(With<Unit>, With<Building>)>>,
 ) {
     for event in events.read() {
         let Ok(mut health) = healths.get_mut(event.victim) else {
@@ -1098,9 +1139,11 @@ fn apply_damage(
             continue;
         }
 
-        // Fight back if the attacker is still alive and hostile.
-        if let Ok(attacker_team) = attackers.get(event.attacker) {
-            if *attacker_team != *team {
+        // Fight back if the attacker is still alive, hostile, and actually
+        // reachable — being strafed from the air is not a reason for a footman
+        // to lock onto something it can never swing at.
+        if let Ok((attacker_team, attacker_unit)) = attackers.get(event.attacker) {
+            if *attacker_team != *team && unit_can_hit(unit.kind, is_air(attacker_unit)) {
                 commands
                     .entity(event.victim)
                     .try_insert((AttackTarget(event.attacker), CombatState::default()));
