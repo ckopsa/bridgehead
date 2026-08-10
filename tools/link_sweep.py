@@ -80,7 +80,15 @@ LINK_LINE = re.compile(
     r"mean link (?P<mean>[\d.]+)s, worst (?P<worst>[\d.]+)s "
     r"\(cap (?P<cap>[\d.]+)s\), (?P<nodes>\d+) command nodes standing"
 )
-DECISIVE = re.compile(r"headless: game over — (?P<winner>\w+) wins — exiting")
+# The tail of this line has grown twice — first the reason, then the game clock
+# — and each time an exact-match pattern here silently reclassified every
+# decisive run as a crash. Anchor on the part that carries the verdict and let
+# the rest be optional, so old sweep logs still parse and the next addition is
+# not a bug. tools/arena_run.py reads the same line for duration and reason.
+DECISIVE = re.compile(
+    r"headless: game over — (?P<winner>\w+) wins"
+    r"(?: \((?P<reason>\w+)\))?(?: at t=(?P<t>[\d.]+)s)?"
+)
 TIMECAP = re.compile(r"headless: time cap [\d.]+s — timeout verdict: (?P<verdict>[^(]+)")
 
 # A run whose in-transit queue is empty for this fraction of the match tail is

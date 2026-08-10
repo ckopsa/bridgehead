@@ -109,6 +109,15 @@ the final rounds were won by the player who banked longest and committed *once,
 completely*. Strategy emerged, was written down by the players, and shaped the next
 round — exactly what a real game's community does, at machine speed.
 
+That evidence is now a file rather than a memory. `arena/ledger.jsonl` records every
+round as what it actually was — a **hypothesis test**, declaring the ruleset it ran
+under, who sat in which seat, the question it was run to answer, and, separately from
+the result, what the result licensed anyone to believe. A series that can be queried
+(`tools/arena.py series`, `rounds --hypothesis`, `lessons`) is a series that can be
+argued with, including by us: the rounds that proved nothing are marked as proving
+nothing, and everything the record cannot recover is named rather than guessed. See
+docs/ARENA.md.
+
 ## The wager
 
 If this works, "playing with an AI" stops meaning *against a bot* or *carried by an
