@@ -1611,8 +1611,20 @@ pub struct CatalogAbility {
     /// `[kind, magnitude]`. Only Sanctuary has one today. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status2: Option<(&'static str, f32)>,
+    /// **Geometry**: `"caster"`, `"point"` or `"unit"` — where the `radius`
+    /// is centred. `"caster"` takes no target payload; `"point"` takes
+    /// `x`/`z`; `"unit"` takes `target`. Omit the payload on any of them and
+    /// the engine aims for you (biggest reachable clump of whatever the
+    /// ability affects).
+    pub target: &'static str,
+    /// How far from the caster the centre may be, for a targeted ability.
+    /// Null for `"caster"`. The spell's total reach is `target_range + radius`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_range: Option<f32>,
     pub mana_cost: f32,
     pub cooldown: f32,
+    /// How far the effect spreads from its CENTRE — which is the caster only
+    /// for `target == "caster"`.
     pub radius: f32,
     pub power: f32,
     /// Seconds the applied status lasts (0 for instant effects).
@@ -1809,6 +1821,8 @@ pub fn game_catalog() -> Catalog {
                 effect: a.effect.name(),
                 status: a.effect.status().map(|s| s.name()),
                 status2: a.effect.extra_status().map(|(k, m)| (k.name(), m)),
+                target: a.target.name(),
+                target_range: a.target.range(),
                 mana_cost: a.mana_cost,
                 cooldown: a.cooldown,
                 radius: a.radius,
@@ -2522,6 +2536,159 @@ pub enum AbilityTargets {
     OwnWorkers,
 }
 
+/// **Where an ability's effect lands** — the geometry half of an `AbilityDef`,
+/// answering the question `AbilityTargets` does not: not *who* the radius
+/// catches, but *where the radius is centred*.
+///
+/// v2 had exactly one answer, `Caster`, and it was baked into combat.rs rather
+/// than written down. That made every AoE a bubble the caster stands in the
+/// middle of, which is a fine shape for a Champion who wants to be in the
+/// middle and a fatal one for a Sorcerer who does not: the fog/arena finding
+/// was that Sorcerers die on the front line because the only way to land Slow
+/// on the enemy was to walk into them. Geometry as data fixes that without
+/// touching the effect, the status framework or the cooldown store.
+///
+/// `range` is measured from the caster to the CENTRE of the effect; the
+/// effect's own `radius` then spreads from there, so a `Point { range: 9 }`
+/// ability with `radius: 4.5` reaches a body 13.5 away — the caster's reach is
+/// range, the spell's reach is range + radius.
+// `Unit` has no shipping ability behind it yet — Slow is the first targeted
+// row and a point is the right shape for an AoE debuff. The variant, its wire
+// name, its UI click and its tests exist so that the first single-target
+// spell (a nuke, a polymorph, a targeted heal) is a table row, exactly as
+// `AbilityTargets::Allies` waited for the ultimates.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AbilityTarget {
+    /// Centred on the caster. The v2 behaviour and the default for every row
+    /// that does not say otherwise: no range, no target, nothing to click.
+    Caster,
+    /// Cast at a ground point within `range` of the caster.
+    Point { range: f32 },
+    /// Cast on a specific unit within `range`; the effect centres on wherever
+    /// that unit is standing when the cast resolves.
+    Unit { range: f32 },
+}
+
+impl AbilityTarget {
+    /// Wire name for the catalog and the snapshot.
+    pub fn name(self) -> &'static str {
+        match self {
+            AbilityTarget::Caster => "caster",
+            AbilityTarget::Point { .. } => "point",
+            AbilityTarget::Unit { .. } => "unit",
+        }
+    }
+    /// How far from the caster the centre may be. `None` for `Caster`, whose
+    /// centre is the caster and therefore always at range zero.
+    pub fn range(self) -> Option<f32> {
+        match self {
+            AbilityTarget::Caster => None,
+            AbilityTarget::Point { range } | AbilityTarget::Unit { range } => Some(range),
+        }
+    }
+    /// Does this ability need a target chosen — by the player's click, the
+    /// commander's payload, or the auto-pick?
+    pub fn is_targeted(self) -> bool {
+        !matches!(self, AbilityTarget::Caster)
+    }
+    /// Does the target have to be a UNIT (rather than bare ground)?
+    pub fn wants_unit(self) -> bool {
+        matches!(self, AbilityTarget::Unit { .. })
+    }
+}
+
+/// The target actually chosen for one cast — the payload half of
+/// [`AbilityTarget`]. `None` on a `CastAbility` means "you pick", which for a
+/// `Caster` ability is the only possible answer and for a targeted one invokes
+/// the auto-pick ([`best_cast_focus`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CastTarget {
+    /// A ground point. Y is ignored — everything here is measured in XZ.
+    Point(Vec3),
+    /// A unit; the effect centres on where it is standing when the cast fires.
+    Unit(Entity),
+}
+
+/// **The auto-pick.** Given the positions of everything this cast would
+/// actually affect, choose the centre that catches the most of them.
+///
+/// This is the one rule behind three doors, so that a Sorcerer left on
+/// auto-cast, a commander who sends `{"type":"cast","ability":"Slow"}` with no
+/// coordinates, and a player who has not clicked yet all get the same answer:
+///
+///   * each body proposes a centre: itself if the caster can reach it, and
+///     otherwise **the furthest point towards it the caster can reach**. That
+///     clamp is what makes the auto-pick as long-armed as a human's click —
+///     a clump 11 away is still catchable by a spell with 9 of range and 4.5
+///     of radius, and an aimer that only ever centred ON a body would have
+///     refused a shot the player can obviously take;
+///   * the centre that catches the most bodies within `radius` wins, so a
+///     debuff lands on the clump and a heal lands on the knot of wounded;
+///   * ties go to the centre NEAREST the caster, which keeps the choice stable
+///     frame to frame and biases a caster towards the fight in front of it
+///     rather than the identical one further away.
+///
+/// `candidates` are already filtered by the caller to the entities the effect
+/// would affect (right team, right kind, air-legal, and — for a heal — hurt),
+/// because that predicate lives with the effect and differs per caller. A
+/// caller that needs the aim to be an actual BODY rather than a point (an
+/// `AbilityTarget::Unit` ability) must additionally pre-filter to candidates
+/// within `range`, which makes the clamp a no-op and the returned index a
+/// unit it may legally name.
+///
+/// Returns the index of the body the aim was derived from, the centre itself,
+/// and how many bodies that centre catches — or `None` when the spell would
+/// catch nobody, in which case it is not worth making and no cooldown is
+/// spent.
+pub fn best_cast_focus(
+    caster: Vec3,
+    range: f32,
+    radius: f32,
+    candidates: &[Vec3],
+) -> Option<(usize, Vec3, u32)> {
+    /// Distance on the ground plane — height never counts towards a spell's
+    /// reach, exactly as it never counts in combat.rs's own `xz_dist`.
+    fn xz_dist(a: Vec3, b: Vec3) -> f32 {
+        Vec2::new(a.x - b.x, a.z - b.z).length()
+    }
+    let mut best: Option<(usize, Vec3, u32, f32)> = None;
+    for (i, &body) in candidates.iter().enumerate() {
+        let reach = xz_dist(caster, body);
+        // As far towards it as the arm goes. The caster's own height is kept
+        // so the centre sits on the caster's plane, exactly as an explicit
+        // point does.
+        let focus = if reach <= range {
+            body
+        } else {
+            let dir = Vec2::new(body.x - caster.x, body.z - caster.z).normalize_or_zero();
+            Vec3::new(caster.x + dir.x * range, caster.y, caster.z + dir.y * range)
+        };
+        let caught = candidates
+            .iter()
+            .filter(|&&other| xz_dist(focus, other) <= radius)
+            .count() as u32;
+        // A centre that catches nobody is not an aim. This is also what keeps
+        // a body beyond `range + radius` from proposing anything: the clamped
+        // point towards it is too far short to touch even that body.
+        if caught == 0 {
+            continue;
+        }
+        let distance = xz_dist(caster, focus);
+        let better = match best {
+            None => true,
+            // More bodies wins; equal bodies, the nearer centre wins.
+            Some((_, _, best_caught, best_dist)) => {
+                caught > best_caught || (caught == best_caught && distance < best_dist)
+            }
+        };
+        if better {
+            best = Some((i, focus, caught, distance));
+        }
+    }
+    best.map(|(i, focus, caught, _)| (i, focus, caught))
+}
+
 // `Eq` is out: `ApplyStatus::also` carries a magnitude, and a magnitude is an
 // f32. Nothing compares ability effects for hashing or set membership.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -2604,8 +2771,16 @@ pub struct AbilityDef {
     /// Stable id: the catalog key, the bridge selector, the button caption.
     pub name: &'static str,
     pub effect: AbilityEffect,
+    /// **Where the radius is centred.** `AbilityTarget::Caster` is the default
+    /// in every sense that matters — it is what every row said implicitly
+    /// before this field existed, and what a row means when its author has no
+    /// opinion. A `Point`/`Unit` row additionally carries how far the caster
+    /// may throw it.
+    pub target: AbilityTarget,
     pub mana_cost: f32,
     pub cooldown: f32,
+    /// How far the effect spreads from its centre — which is the caster for a
+    /// `Caster` row and the chosen point/unit for a targeted one.
     pub radius: f32,
     /// Damage / heal amount, duration seconds for Militia, or the status
     /// MAGNITUDE for `ApplyStatus`.
@@ -2624,6 +2799,7 @@ pub struct AbilityDef {
 const SLAM: AbilityDef = AbilityDef {
     name: "Slam",
     effect: AbilityEffect::Damage,
+    target: AbilityTarget::Caster,
     mana_cost: HERO_ABILITY_COST,
     cooldown: HERO_ABILITY_COOLDOWN,
     radius: HERO_ABILITY_RADIUS,
@@ -2639,6 +2815,7 @@ const SLAM: AbilityDef = AbilityDef {
 const HEAL: AbilityDef = AbilityDef {
     name: "Heal",
     effect: AbilityEffect::Heal,
+    target: AbilityTarget::Caster,
     mana_cost: 45.0,
     cooldown: 12.0,
     radius: 8.0,
@@ -2653,6 +2830,7 @@ const HEAL: AbilityDef = AbilityDef {
 const CALL_TO_ARMS: AbilityDef = AbilityDef {
     name: "CallToArms",
     effect: AbilityEffect::Militia,
+    target: AbilityTarget::Caster,
     mana_cost: 0.0,
     cooldown: 90.0,
     radius: 16.0,
@@ -2683,6 +2861,7 @@ const WARCRY: AbilityDef = AbilityDef {
         targets: AbilityTargets::Allies,
         also: None,
     },
+    target: AbilityTarget::Caster,
     mana_cost: 75.0,
     cooldown: 45.0,
     radius: 8.0,
@@ -2705,6 +2884,7 @@ const SANCTUARY: AbilityDef = AbilityDef {
         targets: AbilityTargets::Allies,
         also: Some((StatusKind::ArmorBuff, 0.25)),
     },
+    target: AbilityTarget::Caster,
     mana_cost: 90.0,
     cooldown: 60.0,
     radius: 7.0,
@@ -2728,6 +2908,7 @@ const PROBE_CHILL: AbilityDef = AbilityDef {
         targets: AbilityTargets::Enemies,
         also: None,
     },
+    target: AbilityTarget::Caster,
     mana_cost: 10.0,
     cooldown: 8.0,
     radius: 9.0,
@@ -2755,12 +2936,19 @@ const PROBE_CHILL: AbilityDef = AbilityDef {
 ///   * **duration 5s** against a **9s cooldown** — a 55% uptime on one
 ///     Sorcerer. Long enough to decide a collision, short enough that a
 ///     retreat covered by Slow is a real cost in tempo rather than a free out.
-///   * **radius 8.0, centred on the caster** — a small AoE rather than a
-///     single target, because the ability framework's only geometry is "around
-///     the caster" (see the framework-gap note in the bead report). 8.0 is one
-///     unit past the Priestess's Heal and comfortably inside the Sorcerer's
-///     own 11 attack range, so a caster standing behind its line still catches
-///     everything crashing into the front rank without being in the front rank.
+///   * **`Point { range: 9.0 }`, radius 4.5** — and this is the number that
+///     changed when geometry became data. Slow shipped as a radius-8 bubble
+///     centred on the Sorcerer, inflated to 8 purely to compensate for having
+///     no other way to reach the enemy; the arena finding was the predictable
+///     one, that a Sorcerer who must stand within 8 of a charge to slow it is
+///     a Sorcerer standing in the charge. Targeted, the same spell is thrown 9
+///     ahead and blooms 4.5 wide, so its far edge reaches 13.5 — a longer
+///     reach than the bubble ever had, from 9 further back than the bubble
+///     ever allowed, with a footprint barely half the area. It is a better
+///     spell and a strictly worse blanket, which is the trade a targeted AoE
+///     is supposed to make: it now has to be AIMED, and a bad aim catches
+///     nobody. 9 is a shade under the Sorcerer's own 11 attack range, so the
+///     spell never asks the caster to walk somewhere its attack would not.
 ///   * **no mana** — the Sorcerer is not a hero and carries no `Hero`
 ///     component, so its only gate is `AbilityCooldowns`, exactly like the
 ///     TownHall's Call to Arms. `ability_ready` already treats a mana-less
@@ -2784,15 +2972,20 @@ const SLOW: AbilityDef = AbilityDef {
         // cheapest debuff its most complicated one.
         also: None,
     },
+    // The Sorcerer's whole problem was reach. It has it now: cast at a point
+    // up to 9 away, and stand behind your own line while you do it.
+    target: AbilityTarget::Point { range: 9.0 },
     mana_cost: 0.0,
     cooldown: 9.0,
-    radius: 8.0,
+    radius: 4.5,
     power: 0.4,
     duration: 5.0,
     hits_air: true,
     unlock: AbilityUnlock::Always,
-    description: "Slows every enemy within 8 of the Sorcerer by 40% (move AND attack speed) \
-                  for 5s. Refreshes rather than stacks; no mana, 9s cooldown.",
+    description: "Cast at a point up to 9 away: slows every enemy within 4.5 of it by 40% \
+                  (move AND attack speed) for 5s. Refreshes rather than stacks; no mana, \
+                  9s cooldown. Omit the point and the Sorcerer aims at the biggest clump \
+                  it can reach.",
 };
 
 const NO_ABILITIES: [AbilityDef; 0] = [];
@@ -2843,9 +3036,18 @@ pub fn abilities_of_unit(kind: UnitKind) -> &'static [AbilityDef] {
 /// disturbs the ability tables above.
 pub fn default_autocast(kind: UnitKind) -> Option<(usize, u32)> {
     match kind {
-        // One enemy in the bubble is enough: the cooldown is the only cost,
-        // and a Slow landed on a single Raider diving your workers is exactly
-        // the moment the unit was built for.
+        // One enemy in reach is enough: the cooldown is the only cost, and a
+        // Slow landed on a single Raider diving your workers is exactly the
+        // moment the unit was built for.
+        //
+        // v3 note for the balance bead: "in reach" grew when Slow became a
+        // thrown spell — from "within 8 of the caster" to "within 9 + 4.5",
+        // roughly a 70% longer trigger. The threshold is deliberately left at
+        // 1 anyway, because the auto-pick always centres on the BIGGEST clump
+        // it can reach, so a scout only wastes the cooldown when it is the
+        // only thing on the field. If arena data says Sorcerers are caught on
+        // cooldown when the real charge lands, this number — not the geometry
+        // — is the knob.
         UnitKind::Sorcerer => Some((0, 1)),
         _ => None,
     }
@@ -4642,11 +4844,40 @@ pub enum Intent {
     /// case-insensitive). OMIT IT for the caster's first unlocked ability, so
     /// `{"type":"cast","hero":123}` means exactly what it always meant. The UI
     /// is index-native (each hotkey is a slot); the bridge speaks both.
+    ///
+    /// **Where it lands** depends on the ability's `catalog.abilities[].target`:
+    ///
+    ///   * `"caster"` — centred on the caster. Send nothing else; `x`/`z`/
+    ///     `target` are ignored, so an old-form `cast` is still exactly what it
+    ///     always was.
+    ///   * `"point"` — send `x` and `z` for a ground point within
+    ///     `target_range` of the caster.
+    ///   * `"unit"` — send `target`, the id of the unit to cast it on, again
+    ///     within `target_range`.
+    ///
+    /// **Omit the payload on a targeted ability and the engine aims it**: the
+    /// centre that catches the most bodies the ability would affect, among
+    /// those the caster can reach, nearest one winning ties. That is the same
+    /// rule an auto-cast Sorcerer uses, so `{"type":"cast","caster":7,
+    /// "ability":"Slow"}` is a legal and sensible sentence — you are saying
+    /// "slow them", not "slow nothing".
+    ///
+    /// Out of range is REFUSED with an error naming both distances, not walked
+    /// into: a caster that closed the gap by itself would undo the reason
+    /// targeted casting exists.
     Cast {
         #[serde(alias = "caster")]
         hero: IntentId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ability: Option<AbilitySelector>,
+        /// Ground point for a `"point"` ability. Both `x` and `z` or neither.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        /// Victim/beneficiary for a `"unit"` ability.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<IntentId>,
     },
     /// Buy a consumable at one of our own finished Shops.
     ///
@@ -4895,8 +5126,18 @@ impl Intent {
                 (_, _, Some(t)) => format!("building {building} rallies onto {t}"),
                 _ => format!("building {building} rally (unspecified)"),
             },
-            Intent::Cast { hero, ability } => {
-                format!("{hero} casts {}", ability_name(ability))
+            // The sentence carries the AIM, because "who cast what" stopped
+            // being the whole story the moment a cast could miss by being
+            // pointed somewhere else. A log line that read `7 casts Slow` for
+            // both a clump-shattering hit and a shot at empty ground would
+            // hide the only decision the caster made.
+            Intent::Cast { hero, ability, x, z, target } => {
+                let aim = match (x, z, target) {
+                    (Some(x), Some(z), _) => format!(" at {}", at(*x, *z)),
+                    (_, _, Some(t)) => format!(" on {t}"),
+                    _ => String::new(),
+                };
+                format!("{hero} casts {}{aim}", ability_name(ability))
             }
             Intent::Buy { shop, item, hero } => match hero {
                 Some(hero) => format!("hero {hero} buys {item} at shop {shop}"),
@@ -5400,25 +5641,40 @@ pub struct Surrender {
 /// `ability: None` means "the first ability this caster has unlocked" — the v1
 /// meaning of the event — so nothing that only knows about one ability per
 /// caster had to change.
+/// `target: None` is the same kind of promise: for a `AbilityTarget::Caster`
+/// ability it is the only answer there is, and for a targeted one it means
+/// "aim it for me" — combat.rs runs [`best_cast_focus`] over everything the
+/// effect could affect within range. Every pre-existing writer of this event
+/// therefore keeps working unchanged, and an auto-cast Sorcerer aims itself.
 #[derive(Event, Clone, Debug)]
 pub struct CastAbility {
     pub caster: Entity,
     pub ability: Option<AbilitySelector>,
+    /// Where to centre it. `None` = the ability's own default (the caster, or
+    /// the auto-pick for a targeted ability). Ignored by a `Caster` ability,
+    /// which has nowhere else to be.
+    pub target: Option<CastTarget>,
 }
 
 #[allow(dead_code)]
 impl CastAbility {
-    /// Backward-compatible cast: the caster's first unlocked ability.
+    /// Backward-compatible cast: the caster's first unlocked ability, aimed by
+    /// the engine.
     pub fn new(caster: Entity) -> Self {
-        CastAbility { caster, ability: None }
+        CastAbility { caster, ability: None, target: None }
     }
     /// Cast a specific slot of the caster's ability list.
     pub fn index(caster: Entity, index: usize) -> Self {
-        CastAbility { caster, ability: Some(AbilitySelector::Index(index)) }
+        CastAbility { caster, ability: Some(AbilitySelector::Index(index)), target: None }
     }
     /// Cast an ability by `AbilityDef::name` (what the bridge sends).
     pub fn id(caster: Entity, id: impl Into<String>) -> Self {
-        CastAbility { caster, ability: Some(AbilitySelector::Id(id.into())) }
+        CastAbility { caster, ability: Some(AbilitySelector::Id(id.into())), target: None }
+    }
+    /// Aim this cast at a chosen point or unit.
+    pub fn at(mut self, target: CastTarget) -> Self {
+        self.target = Some(target);
+        self
     }
 }
 
@@ -7193,6 +7449,185 @@ mod tests {
         assert!(abilities_of_building(BuildingKind::Barracks).is_empty());
     }
 
+    // --- ability framework v3: geometry ------------------------------------
+
+    /// **The back-compat claim, as a table sweep rather than a promise.**
+    /// Adding geometry to `AbilityDef` must not have moved a single existing
+    /// ability off the caster — the whole v2 catalogue is `Caster` except the
+    /// one row this bead deliberately re-aimed.
+    #[test]
+    fn every_ability_is_caster_centred_except_the_one_that_was_retargeted() {
+        let mut targeted: Vec<(&str, &str, Option<f32>)> = Vec::new();
+        for &k in &ALL_UNIT_KINDS {
+            for a in abilities_of_unit(k) {
+                if a.target.is_targeted() {
+                    targeted.push((a.name, a.target.name(), a.target.range()));
+                }
+            }
+        }
+        for &k in &ALL_BUILDING_KINDS {
+            for a in abilities_of_building(k) {
+                assert_eq!(
+                    a.target,
+                    AbilityTarget::Caster,
+                    "{} is cast by a building, which has nowhere to walk to",
+                    a.name
+                );
+            }
+        }
+        targeted.sort_by(|a, b| a.0.cmp(b.0));
+        targeted.dedup();
+        assert_eq!(
+            targeted,
+            vec![("Slow", "point", Some(9.0))],
+            "Slow is the only targeted ability in the game; every other row must \
+             still centre on its caster"
+        );
+        // And `Caster` rows carry no range, so nothing can accidentally
+        // range-check an ability that has no reach to check.
+        assert_eq!(AbilityTarget::Caster.range(), None);
+        assert!(!AbilityTarget::Caster.is_targeted());
+    }
+
+    /// **The rebalance, in numbers.** Slow stopped being a bubble the Sorcerer
+    /// stands in the middle of and became a spell it throws. The trade is the
+    /// point: a smaller footprint, a longer reach, and — the number that
+    /// matters — the caster no longer has to be anywhere near the victim.
+    #[test]
+    fn slow_reaches_further_than_it_ever_did_from_further_back() {
+        let slow = abilities_of_unit(UnitKind::Sorcerer)[0];
+        let AbilityTarget::Point { range } = slow.target else {
+            panic!("Slow is cast at a point");
+        };
+        assert_eq!(range, 9.0);
+        assert_eq!(slow.radius, 4.5);
+
+        // v2: a radius-8 bubble on the caster. Total reach 8, and the caster
+        // had to be within 8 of whatever it wanted to slow.
+        const OLD_RADIUS: f32 = 8.0;
+        assert!(
+            range + slow.radius > OLD_RADIUS,
+            "the targeted spell must reach FURTHER ({} vs {OLD_RADIUS}) or the \
+             rebalance is a nerf wearing a feature's clothes",
+            range + slow.radius
+        );
+        // The Sorcerer's own attack range is the honesty check: a spell that
+        // asked it to walk closer than its gun does would be no improvement.
+        let reach = unit_stats(UnitKind::Sorcerer).range;
+        assert!(
+            range <= reach,
+            "Slow's {range} range must not exceed the Sorcerer's own {reach}"
+        );
+        // Smaller blanket: area scales with the square.
+        assert!(slow.radius * slow.radius < OLD_RADIUS * OLD_RADIUS * 0.4);
+        // Everything that made it Slow is untouched — this bead moved geometry
+        // and nothing else.
+        assert_eq!(slow.power, 0.4);
+        assert_eq!(slow.duration, 5.0);
+        assert_eq!(slow.cooldown, 9.0);
+        assert_eq!(slow.mana_cost, 0.0);
+        assert!(slow.hits_air);
+    }
+
+    /// **The auto-pick rule**, stated as the three things it promises: only a
+    /// reachable body may be the centre, the biggest clump wins, and ties go
+    /// to the nearest.
+    #[test]
+    fn the_auto_pick_takes_the_biggest_clump_it_can_reach() {
+        let caster = Vec3::ZERO;
+        // Two clumps. A pair at ~5 away, a trio at ~8 away.
+        let pair = [Vec3::new(5.0, 0.0, 0.0), Vec3::new(6.0, 0.0, 0.0)];
+        let trio = [
+            Vec3::new(0.0, 0.0, 8.0),
+            Vec3::new(1.0, 0.0, 8.0),
+            Vec3::new(0.0, 0.0, 9.0),
+        ];
+        let all: Vec<Vec3> = pair.iter().chain(trio.iter()).copied().collect();
+
+        // Range 9, radius 4.5 — Slow's numbers. The trio wins on count even
+        // though the pair is nearer.
+        let (index, focus, caught) =
+            best_cast_focus(caster, 9.0, 4.5, &all).expect("something in range");
+        assert_eq!(caught, 3, "the aim must be the clump, not the nearest body");
+        assert!(trio.contains(&all[index]), "derived from the trio");
+        assert_eq!(focus, all[index], "a reachable body IS the centre, unclamped");
+
+        // Shorten the reach until the trio is past `range + radius` entirely:
+        // the aim falls back to what the caster can still touch rather than to
+        // nothing. (At range 3 the far edge is 7.5, short of the trio at 8.)
+        let (index, _, caught) =
+            best_cast_focus(caster, 3.0, 4.5, &all).expect("the pair is still in reach");
+        assert_eq!(caught, 2);
+        assert!(pair.contains(&all[index]));
+
+        // Nothing in reach at all ⇒ no aim ⇒ (in combat.rs) no cast and no
+        // cooldown spent.
+        assert!(best_cast_focus(caster, 0.4, 4.5, &all).is_none());
+        assert!(best_cast_focus(caster, 100.0, 4.5, &[]).is_none());
+
+        // Ties break on distance: two equal clumps, the near one wins, and the
+        // answer is stable when the slice order is reversed.
+        let twins = [Vec3::new(4.0, 0.0, 0.0), Vec3::new(-4.0, 0.0, 0.0)];
+        let (near, _, _) = best_cast_focus(Vec3::new(1.0, 0.0, 0.0), 9.0, 1.0, &twins).unwrap();
+        assert_eq!(twins[near], Vec3::new(4.0, 0.0, 0.0));
+        let flipped = [twins[1], twins[0]];
+        let (near, _, _) = best_cast_focus(Vec3::new(1.0, 0.0, 0.0), 9.0, 1.0, &flipped).unwrap();
+        assert_eq!(flipped[near], Vec3::new(4.0, 0.0, 0.0));
+    }
+
+    /// **The clamp**, which is the difference between an aimer as long-armed
+    /// as the player and one that is not. A clump sitting just past `range`
+    /// is still catchable — the aim slides up to the caster's reach along the
+    /// line towards it — and a clump past `range + radius` genuinely is not.
+    #[test]
+    fn the_auto_pick_reaches_as_far_as_a_players_click_would() {
+        let caster = Vec3::ZERO;
+        // Slow's numbers: reach 9, bloom 4.5, so the far edge is 13.5.
+        let (range, radius) = (9.0, 4.5);
+
+        // A charge arriving at 11-13: no body is within 9, so a body-only
+        // aimer finds nothing. The clamp aims at 9 and catches all three.
+        let charge = [
+            Vec3::new(0.0, 0.0, 11.0),
+            Vec3::new(1.0, 0.0, 11.5),
+            Vec3::new(0.0, 0.0, 13.0),
+        ];
+        let (_, focus, caught) =
+            best_cast_focus(caster, range, radius, &charge).expect("a clamped aim exists");
+        assert_eq!(caught, 3, "all three are inside 4.5 of the clamped centre");
+        assert!(
+            (focus.length() - range).abs() < 1e-3,
+            "the centre sits exactly at the caster's reach, at {focus:?}"
+        );
+
+        // Past the far edge, and nothing is caught at all.
+        let distant = [Vec3::new(0.0, 0.0, 14.0)];
+        assert!(best_cast_focus(caster, range, radius, &distant).is_none());
+        // Exactly on the far edge is still a hit.
+        let edge = [Vec3::new(0.0, 0.0, range + radius)];
+        assert_eq!(best_cast_focus(caster, range, radius, &edge).unwrap().2, 1);
+    }
+
+    /// The catalog is the commander's only documentation, so geometry has to
+    /// be *in* it — an ability whose target shape you cannot read is one you
+    /// can only aim by trial and error.
+    #[test]
+    fn the_catalog_publishes_target_shape_and_range() {
+        let catalog = game_catalog();
+        let slow = catalog
+            .abilities
+            .iter()
+            .find(|a| a.id == "Slow")
+            .expect("the Sorcerer's Slow is in the catalog");
+        assert_eq!(slow.target, "point");
+        assert_eq!(slow.target_range, Some(9.0));
+        assert_eq!(slow.radius, 4.5);
+
+        let slam = catalog.abilities.iter().find(|a| a.id == "Slam").unwrap();
+        assert_eq!(slam.target, "caster");
+        assert_eq!(slam.target_range, None, "a caster-centred row publishes no range");
+    }
+
     /// A synthetic two-ability caster: the shape every content bead will use.
     fn two_ability_list() -> [AbilityDef; 2] {
         [
@@ -7204,6 +7639,7 @@ mod tests {
                     targets: AbilityTargets::Allies,
                     also: None,
                 },
+                target: AbilityTarget::Caster,
                 mana_cost: 50.0,
                 cooldown: 30.0,
                 radius: 10.0,
