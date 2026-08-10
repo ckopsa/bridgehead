@@ -646,6 +646,7 @@ a substitution inside `compile_intent`'s order arms and nothing else. The
 | `cast` | **pays** for a unit caster, exempt for a building one — see below |
 | `use_item`, `buy` | exempt |
 | `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt — doctrine IS the fast path |
+| `trigger_set`, `trigger_clear` | exempt — arming a rule is doctrine, and the rule's own firing is too (below) |
 | `autopilot`, `surrender` | exempt — match level |
 
 The `cast` row was originally not a carve-out but an identity: every caster in
@@ -683,6 +684,31 @@ rather than the verdict is what makes a late cast fizzle honestly: combat.rs
 reaches its mana/cooldown decision when the cast *arrives*, so an ability whose
 mana was spent while the order travelled simply does not go off — exactly as if
 the player had been slow.
+
+**Triggers pay nothing, and that is the point** (`wc3clone-pec`, v3). A
+`trigger_set` arms a condition the engine watches at 4 Hz; when it fires, the
+engine submits the stored intent through the ordinary compiler. That submission
+is **exempt from the link**, whatever verb it carries — a trigger-fired `move`
+lands in the frame it fired even from the far corner with no halls standing.
+
+The row is derived from this table's own rule rather than carved out of it.
+*Standing orders are local; direct orders travel*, because a unit under standing
+policy already has its orders and does not need to ask. A trigger is standing
+policy whose condition happened to come true: the commander reached the unit
+when they ARMED it, and charging the link again on firing would price one reach
+twice.
+
+It also extends C4 one rung. "Doctrine is strictly better than micro at range"
+was an argument about *continuous* work; with triggers exempt, *pre-arming a
+rule is strictly better than hand-answering an alarm at range* — the same
+incentive, now covering reaction. That is the whole reason a commander should
+want triggers rather than a faster poll loop, and it is a fact about the world
+(you thought ahead) rather than a fact about the referee.
+
+Mechanically it is `CommandLink::exempt_issuer` — a second constructor rather
+than a boolean on the first, so "who is allowed to skip the link" is a named
+decision with the reasoning attached to it. `SubmitIntent::trigger` is what
+selects it, and that field is set by exactly one caller (`trigger.rs`).
 
 **The curve** is the recommended step plus ramp, with per-node radii so the
 phase-3 Outpost is one arm of `building_node_radius`:

@@ -85,9 +85,89 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
 - `{"type":"template","building":id,"squad":1,"retreat":{"below":0.35,"x":..,"z":..},"priority":["Hero",...],"autocast":3}`
   — stamp standing doctrine on a production building: every unit it trains spawns WITH these
   policies (null/omitted pieces skipped; all null clears). Set once, stop re-issuing per spawn.
+Triggers (CONTINGENT standing orders — see the section below; this is the shape):
+- `{"type":"trigger_set","name":"home-guard","when":{...},"then":{<any intent>},"repeat":30}`
+  — the engine watches `when` at 4 Hz and submits `then` itself. `repeat` omitted = fires once.
+- `{"type":"trigger_clear","name":"home-guard"}` — disarm one. Omit `name` to clear all of them.
 - `{"type":"autopilot","on":true}` — hand your whole faction to the scripted AI (emergency only).
 - `{"type":"surrender"}` — concede the match (opponent wins immediately). The honorable end to a
   hopeless position — no income, no army, no path back. Preferable to dragging out a decided game.
+
+## Triggers: make the engine react for you
+
+**This is the single biggest thing you can do about your own latency.** You poll
+every ~15 seconds. Between polls the engine runs the game. Doctrine already
+fights for you continuously; a trigger makes it *react* for you — a condition it
+checks four times a second and an intent it submits the instant the condition
+holds. The order lands in the frame the rule fired, and it **pays no command
+link** (see the chain-of-command section) because you reached the unit when you
+armed the rule, not when it fired.
+
+Arm your standing plans at the top of the match and stop spending polls on
+alarms you already know how to answer.
+
+Rules: max **8** armed at once. Re-using a `name` replaces that rule in place
+(free — the cap counts names, so tune all you like). A trigger cannot arm or
+clear another trigger. Your armed rules come back in the snapshot's `triggers`
+array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
+`sentence` — and every fire writes a line into `events`:
+
+    trigger home-guard fired: squad 1 defends (-70.0, -70.0) within 26
+
+### The nine predicates
+
+| `when` | means |
+|---|---|
+| `{"type":"base_under_attack"}` | any of YOUR buildings damaged in the last 8s |
+| `{"type":"hero_below","frac":0.35}` | any of your living heroes under that fraction |
+| `{"type":"squad_below","id":1,"frac":0.5}` | squad 1's POOLED health under that (false if the squad is empty) |
+| `{"type":"enemy_sighted","class":"Siege","count":3}` | you can SEE that many enemies now (`class` optional; fog-honest) |
+| `{"type":"bounty_spawned"}` | a cache you can see is on the map |
+| `{"type":"mine_dry"}` | a dry gold mine within 40 of one of your finished halls |
+| `{"type":"tier_reached","tier":2}` | your tech tier |
+| `{"type":"unit_count","kind":"Footman","count":8}` | your living count of one unit kind |
+| `{"type":"game_time","at":360}` | the match clock, in seconds |
+
+There is nothing here about the enemy's gold, tech or hero health — the snapshot
+does not carry those for either seat, so no predicate can.
+
+### Three recipes worth arming in your first batch
+
+**1. Home guard** — the army comes home when the base burns. Repeating, because
+a base is raided more than once.
+
+```json
+{"type":"trigger_set","name":"home-guard","repeat":30,
+ "when":{"type":"base_under_attack"},
+ "then":{"type":"posture","id":1,
+         "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}
+```
+
+**2. Hero save** — the hero walks out before it dies. Your hero is a command
+node and a hero slot; losing it is the most expensive single event in a match,
+and it happens inside one poll cycle.
+
+```json
+{"type":"trigger_set","name":"hero-save","repeat":45,
+ "when":{"type":"hero_below","frac":0.35},
+ "then":{"type":"move","units":[<hero id>],"x":-70.0,"z":-70.0}}
+```
+
+**3. Expansion alarm** — take the next base the moment the current one runs out,
+without watching `mines[].remaining` every poll. Fires once, which is right: you
+only need telling the first time.
+
+```json
+{"type":"trigger_set","name":"expand",
+ "when":{"type":"mine_dry"},
+ "then":{"type":"build","worker":<worker id>,"kind":"TownHall","x":0.0,"z":-60.0}}
+```
+
+A caution that applies to all three: `then` is frozen when you arm it, so ids in
+it are ids that may die. Prefer `posture` on a **squad** over a list of unit ids
+where you can — a squad survives its members. And a trigger whose action is
+refused when it fires reports that in your `errors` array tagged
+`trigger:<name>`, so check there if a rule seems to do nothing.
 
 ## Speakable strategy: `tools/intent_compile.py`
 
@@ -224,7 +304,7 @@ maximum. That is a real way to lose a game that still looks winnable on paper.
 
 ## If your seat is `bridge/copilot`: you are a CO-COMMANDER
 
-Everything above still applies — same 25 verbs, same snapshot, same fog, same
+Everything above still applies — same 27 verbs, same snapshot, same fog, same
 `bridge_send.py`. One thing changes, and it is the important one: **you are not
 the faction.** A human is playing this faction with a mouse, and you are sitting
 next to them. Your snapshot's top-level `copilot` block confirms it:

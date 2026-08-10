@@ -4127,6 +4127,325 @@ pub fn intent_entity(id: IntentId) -> Option<Entity> {
     Entity::try_from_bits(id).ok()
 }
 
+// ---------------------------------------------------------------------------
+// Triggers: 'when' as a first-class word
+// ---------------------------------------------------------------------------
+//
+// Doctrine is CONTINUOUS standing policy — retreat below 35%, hold this ring,
+// focus the siege — and the engine runs it at machine speed for whoever set it.
+// A trigger is the CONTINGENT half of the same idea: a condition the engine
+// watches and an intent it submits the instant the condition holds. Both exist
+// for the same reason (THESIS.md principle 3, "the engine does what is fast"),
+// and the gap between them was the one thing a commander could only do by
+// polling: read `events`, notice the base is burning, and answer 13 seconds
+// later. A trigger prices that reaction at the engine's 250ms instead.
+//
+// The ACTION is any `Intent`. That is the design: a trigger adds no second
+// vocabulary, it defers the one that already exists, and a fired trigger goes
+// through the ordinary compiler with the ordinary validation, the ordinary
+// error channel and the ordinary replay log.
+
+/// Longest trigger name the language accepts, in bytes.
+///
+/// Short on purpose, and the reason is [`Cause`]: a trigger's name is part of
+/// the answer a unit gives to "why are you doing that?", and that answer is a
+/// `Copy` enum of scalars with no allocation in it. A bounded inline name keeps
+/// that property. It is also plenty — a name is a label on a piece of doctrine,
+/// not a sentence.
+pub const TRIGGER_NAME_MAX: usize = 24;
+
+/// The most triggers one team may have armed at once.
+///
+/// **Eight is doctrine, not programming.** The cap is the whole difference
+/// between "standing policy a commander can hold in their head" and "a
+/// scripting language with no debugger". Every trigger is a rule that fires
+/// without anybody watching; a player who cannot recite their own rules has
+/// stopped commanding and started debugging, and the losing AAR would blame the
+/// engine. Eight also fits: the human's readout is one HUD line, the snapshot's
+/// `triggers` array is something a model re-reads every poll, and the evaluator
+/// sweeps the whole set at 4 Hz without anyone having to think about cost.
+///
+/// Replacing a trigger by name is free — the cap counts distinct names, so
+/// tuning one rule never costs a slot.
+pub const MAX_TRIGGERS_PER_TEAM: usize = 8;
+
+/// A trigger's name as a `Copy` scalar, so [`Cause`] stays allocation-free.
+///
+/// ASCII only, non-empty, at most [`TRIGGER_NAME_MAX`] bytes. Names are
+/// compared and stored exactly as given: they are labels a commander chose, and
+/// silently folding `Home Guard` into `home-guard` would make `trigger_clear`
+/// guess which rule was meant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TriggerName {
+    bytes: [u8; TRIGGER_NAME_MAX],
+    len: u8,
+}
+
+impl TriggerName {
+    /// `None` for empty, over-long, or non-ASCII-printable names. Rejecting
+    /// rather than truncating: a truncated name is a name `trigger_clear`
+    /// cannot spell.
+    pub fn new(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.len() > TRIGGER_NAME_MAX {
+            return None;
+        }
+        if !raw.bytes().all(|b| (0x21..=0x7e).contains(&b) || b == b' ') {
+            return None;
+        }
+        let mut bytes = [0u8; TRIGGER_NAME_MAX];
+        bytes[..raw.len()].copy_from_slice(raw.as_bytes());
+        Some(TriggerName {
+            bytes,
+            len: raw.len() as u8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Safe by construction: `new` is the only constructor and it accepts
+        // printable ASCII only.
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("?")
+    }
+}
+
+impl std::fmt::Display for TriggerName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// **The predicate vocabulary.** Every arm is answerable from state the engine
+/// already keeps, for the team that armed it, at any instant — no new
+/// bookkeeping, no event subscriptions, no history beyond what a component
+/// already carries. That constraint is what keeps the set small enough to be
+/// doctrine rather than a query language.
+///
+/// Exact semantics are in `trigger.rs`, next to the code that evaluates them,
+/// and restated in docs/INTENT.md.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TriggerWhen {
+    /// Any of our own **buildings** took damage within
+    /// `BASE_ATTACK_WINDOW_S` (`LastDamaged`). Buildings only: a skirmish in
+    /// midfield is not the base being attacked.
+    BaseUnderAttack,
+    /// Any of our own living heroes is below `frac` of max health.
+    HeroBelow { frac: f32 },
+    /// The living members of our squad `id` hold, in total, less than `frac` of
+    /// their combined max health. False for a squad with no living members —
+    /// a squad that is gone cannot be "hurt", and firing a rescue at a corpse
+    /// pile is worse than firing nothing.
+    SquadBelow { id: u8, frac: f32 },
+    /// We can SEE at least `count` enemy units right now, optionally of one
+    /// `class` (`TargetClass`, the same words `priority` takes).
+    ///
+    /// **Fog-honest by construction**: it counts against this team's own
+    /// `FogGrid::sees`, so a trigger can never react to something its owner
+    /// could not have been told about. Remembered buildings do NOT count —
+    /// "sighted" means eyes on it now.
+    EnemySighted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
+        /// Defaults to 1.
+        #[serde(default = "one_u32")]
+        count: u32,
+    },
+    /// At least one neutral bounty cache is on the map AND visible to us. Also
+    /// fog-honest — the snapshot's `bounties` array is filtered the same way,
+    /// so the trigger sees exactly the caches its owner is shown.
+    BountySpawned,
+    /// A gold mine within `MINE_HOME_RADIUS` of one of our completed halls has
+    /// run dry (`remaining == 0`). This is what "our mine" means in a game
+    /// where mines are neutral: the one your hall was placed to work.
+    MineDry,
+    /// Our tech tier has reached `tier` (1, 2 or 3).
+    TierReached { tier: u8 },
+    /// We field at least `count` living units of `kind`.
+    UnitCount { kind: String, count: u32 },
+    /// The match clock has passed `at` game-seconds. The one predicate about
+    /// nothing in the world — it is here because "expand at 6 minutes" is a
+    /// plan every commander already writes, and writing it as a trigger is how
+    /// it stops depending on remembering.
+    GameTime { at: f32 },
+}
+
+fn one_u32() -> u32 {
+    1
+}
+
+/// Seconds after a hit that `base_under_attack` still counts as "under attack".
+///
+/// Generous enough to survive the evaluator's own 250ms cadence plus a lull
+/// between two volleys, short enough that a raid repelled a minute ago stops
+/// arming the rule.
+pub const BASE_ATTACK_WINDOW_S: f32 = 8.0;
+
+/// How close a gold mine must be to one of our completed halls to be "ours"
+/// for `mine_dry`. Mines are neutral and unowned; a hall is placed to work one,
+/// so proximity to your own hall is the only honest definition of the mine you
+/// are losing.
+pub const MINE_HOME_RADIUS: f32 = 40.0;
+
+impl TriggerWhen {
+    /// The predicate as an English clause, for `Intent::sentence()` and the
+    /// event feed. Reads after the word "when".
+    pub fn phrase(&self) -> String {
+        fn pct(frac: f32) -> String {
+            format!("{}%", (frac * 100.0).round() as i32)
+        }
+        match self {
+            TriggerWhen::BaseUnderAttack => "the base is attacked".to_string(),
+            TriggerWhen::HeroBelow { frac } => {
+                format!("a hero drops below {} health", pct(*frac))
+            }
+            TriggerWhen::SquadBelow { id, frac } => {
+                format!("squad {id} drops below {} health", pct(*frac))
+            }
+            TriggerWhen::EnemySighted { class, count } => {
+                let what = match class {
+                    Some(class) => format!("enemy {class}"),
+                    None => "enemies".to_string(),
+                };
+                if *count <= 1 {
+                    format!("any {what} are sighted")
+                } else {
+                    format!("{count} or more {what} are sighted")
+                }
+            }
+            TriggerWhen::BountySpawned => "a bounty cache is sighted".to_string(),
+            TriggerWhen::MineDry => "a mine at our base runs dry".to_string(),
+            TriggerWhen::TierReached { tier } => format!("we reach tier {tier}"),
+            TriggerWhen::UnitCount { kind, count } => {
+                format!("we field {count} or more {kind}")
+            }
+            TriggerWhen::GameTime { at } => format!("the clock passes {at:.0}s"),
+        }
+    }
+}
+
+/// One armed trigger, as the engine holds it.
+///
+/// `armed` and `last_fired` are the *runtime* half; everything above them is
+/// what the commander said. A once-trigger disarms on firing and stays in the
+/// list, spent — deleting it would make "did my rule ever fire?" unanswerable
+/// from the snapshot, which is the first question anybody asks.
+#[derive(Clone, Debug)]
+pub struct TriggerRule {
+    pub name: TriggerName,
+    pub when: TriggerWhen,
+    pub then: Intent,
+    /// `None` ⇒ fires **once** and disarms. `Some(secs)` ⇒ **repeating**, with
+    /// that many game-seconds of cooldown between fires.
+    pub repeat: Option<f32>,
+    /// The seat that armed it. Preserved so a fired intent is attributed to the
+    /// player who authored it, never to the engine — the engine is the
+    /// executor, not the author.
+    pub source: IntentSource,
+    /// False once a `once` trigger has spent itself.
+    pub armed: bool,
+    /// Game time of the last fire, `None` if it never has.
+    pub last_fired: Option<f32>,
+}
+
+impl TriggerRule {
+    /// May this trigger fire at `now`? Pure, so the once/cooldown rule is
+    /// testable without a world.
+    pub fn ready(&self, now: f32) -> bool {
+        if !self.armed {
+            return false;
+        }
+        match (self.repeat, self.last_fired) {
+            // A once-trigger is disarmed on firing, so `armed` already said no;
+            // this arm only matters if something re-armed it.
+            (None, _) => true,
+            (Some(_), None) => true,
+            (Some(cooldown), Some(last)) => now - last >= cooldown,
+        }
+    }
+
+    /// What the snapshot and the HUD call this trigger's state.
+    pub fn status(&self, now: f32) -> &'static str {
+        if !self.armed {
+            return "spent";
+        }
+        if self.ready(now) {
+            "armed"
+        } else {
+            "cooling"
+        }
+    }
+}
+
+/// Every team's armed triggers, in the order they were set.
+///
+/// A `Vec` rather than a map, and that is a determinism decision of the same
+/// family as `SquadOrders`' `BTreeMap`: the evaluator walks this list every
+/// tick and two triggers can fire on the same tick, so the order they are
+/// submitted in has to be the order the commander wrote them in, identically on
+/// every run. `trigger_set` replaces **in place** by name for the same reason.
+#[derive(Resource, Default)]
+pub struct Triggers {
+    human: Vec<TriggerRule>,
+    claude: Vec<TriggerRule>,
+}
+
+impl Triggers {
+    pub fn get(&self, team: Team) -> &Vec<TriggerRule> {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+
+    pub fn get_mut(&mut self, team: Team) -> &mut Vec<TriggerRule> {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+
+    /// Create or replace by name. `Err` names why it was refused; the cap is
+    /// the only way this fails once the compiler has validated the pieces.
+    pub fn set(&mut self, team: Team, trigger: TriggerRule) -> Result<(), String> {
+        let list = self.get_mut(team);
+        if let Some(slot) = list.iter_mut().find(|t| t.name == trigger.name) {
+            // Replace in place: same slot, same order, fresh runtime state.
+            // Re-stating a rule re-arms it, which is what "set" means and is
+            // also how a commander revives a spent once-trigger.
+            *slot = trigger;
+            return Ok(());
+        }
+        if list.len() >= MAX_TRIGGERS_PER_TEAM {
+            return Err(format!(
+                "you already have {MAX_TRIGGERS_PER_TEAM} triggers ({}) — \
+                 clear one first, or re-use its name to replace it",
+                list.iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        list.push(trigger);
+        Ok(())
+    }
+
+    /// Remove one by name; `true` if anything was there.
+    pub fn clear(&mut self, team: Team, name: &str) -> bool {
+        let list = self.get_mut(team);
+        let before = list.len();
+        list.retain(|t| t.name.as_str() != name);
+        list.len() != before
+    }
+
+    /// Remove every trigger of a team. Returns how many went.
+    pub fn clear_all(&mut self, team: Team) -> usize {
+        let list = self.get_mut(team);
+        let n = list.len();
+        list.clear();
+        n
+    }
+}
+
 /// Everything a player can mean.
 ///
 /// Grouped by what it is for: unit orders, production, the doctrine layer that
@@ -4355,6 +4674,41 @@ pub enum Intent {
         autocast: Option<u32>,
     },
 
+    // --- triggers: contingent standing policy ---
+    /// **Arm a trigger.** Create it, or replace an existing one of the same
+    /// name in place.
+    ///
+    /// `then` is any other intent, and that is the whole design: a trigger adds
+    /// no second vocabulary, it defers the one that already exists. When the
+    /// predicate holds, the engine submits `then` through this same compiler,
+    /// attributed to the seat that armed it, exempt from the command link
+    /// (docs/TEMPO.md) because it is engine-executed standing policy — the same
+    /// row `posture` and `retreat` are on, and for the same reason.
+    ///
+    /// `repeat` omitted or null ⇒ fires ONCE and disarms. A number ⇒ repeating,
+    /// with that many game-seconds of cooldown between fires.
+    ///
+    /// A trigger may not arm another trigger: `then` must not itself be
+    /// `trigger_set` or `trigger_clear`. That refusal is what keeps this
+    /// doctrine rather than a programming language, and it is what makes
+    /// `MAX_TRIGGERS_PER_TEAM` an actual bound.
+    #[serde(rename = "trigger_set")]
+    TriggerSet {
+        name: String,
+        when: TriggerWhen,
+        then: Box<Intent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repeat: Option<f32>,
+    },
+    /// **Disarm a trigger.** `name` omitted clears every trigger this team has
+    /// — the whole-slate form the human's one-key gesture needs, and cheap to
+    /// undo since re-arming is one sentence.
+    #[serde(rename = "trigger_clear")]
+    TriggerClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+
     // --- match level ---
     /// Hand this faction to the scripted AI (or take it back).
     Autopilot {
@@ -4410,6 +4764,8 @@ impl Intent {
             Intent::Squad { .. } => "squad",
             Intent::Posture { .. } => "posture",
             Intent::Template { .. } => "template",
+            Intent::TriggerSet { .. } => "trigger_set",
+            Intent::TriggerClear { .. } => "trigger_clear",
             Intent::Autopilot { .. } => "autopilot",
             Intent::Surrender => "surrender",
         }
@@ -4624,6 +4980,32 @@ impl Intent {
                     )
                 }
             }
+            // A trigger's sentence carries BOTH halves — the condition and the
+            // action it defers — because the whole thing is one statement and a
+            // log line naming only the condition would leave the reader unable
+            // to tell what is about to happen to their army. The action half is
+            // `then.sentence()` verbatim, so the line a trigger writes when it
+            // is armed and the line it writes when it fires are the same words.
+            Intent::TriggerSet {
+                name,
+                when,
+                then,
+                repeat,
+            } => {
+                let cadence = match repeat {
+                    Some(secs) => format!(", repeating every {secs:.0}s"),
+                    None => String::new(),
+                };
+                format!(
+                    "when {}: {} (trigger: {name}{cadence})",
+                    when.phrase(),
+                    then.sentence()
+                )
+            }
+            Intent::TriggerClear { name } => match name {
+                Some(name) => format!("clear trigger {name}"),
+                None => "clear every trigger".to_string(),
+            },
             Intent::Autopilot { on } => {
                 if *on {
                     "hand the faction to the scripted AI".to_string()
@@ -4716,6 +5098,17 @@ pub enum Cause {
         verb: &'static str,
         source: IntentSource,
     },
+    /// A **trigger** the player armed in advance fired, and the engine
+    /// submitted its intent. Its own rung rather than `Order`'s, because the
+    /// two answer different questions: `order:move by bridge` means somebody
+    /// decided to move this unit *just now*, and that is exactly what did not
+    /// happen here. The seat is still named — a trigger has an author, and the
+    /// engine is only its executor.
+    Trigger {
+        name: TriggerName,
+        verb: &'static str,
+        source: IntentSource,
+    },
     /// The unit's squad has a standing posture and the engine is executing it.
     Posture { squad: u8, posture: &'static str },
     /// A standing policy fired: a retreat threshold, a leash snapping back.
@@ -4751,6 +5144,7 @@ impl Provenance {
     ///
     /// ```text
     /// order:move by bridge t=123     a player said so, and when
+    /// trigger:home-guard move by ui t=41   a rule they armed earlier fired
     /// posture:push sq1               squad 1's standing posture
     /// policy:retreat t=210           a retreat threshold fired
     /// template:Barracks#4294968163   stamped at spawn by that building
@@ -4763,6 +5157,15 @@ impl Provenance {
             Cause::Order { verb, source } => {
                 format!("order:{verb} by {} t={:.0}", source.name(), self.at)
             }
+            Cause::Trigger {
+                name,
+                verb,
+                source,
+            } => format!(
+                "trigger:{name} {verb} by {} t={:.0}",
+                source.name(),
+                self.at
+            ),
             Cause::Posture { squad, posture } => format!("posture:{posture} sq{squad}"),
             Cause::Policy { policy } => format!("policy:{policy} t={:.0}", self.at),
             Cause::Stamp {
@@ -4820,18 +5223,27 @@ pub const NO_PROVENANCE: &str = "idle";
 pub struct IntentMark {
     pub source: IntentSource,
     pub at: f32,
+    /// Set when a **trigger** submitted this intent rather than a player
+    /// speaking it now. Carried here rather than checked at each of the eight
+    /// order arms so that the rung a unit ends up on is decided in one place.
+    pub trigger: Option<TriggerName>,
 }
 
 impl IntentMark {
     /// The provenance a direct order of `verb` stamps on its targets.
     pub fn order(&self, verb: &'static str) -> Provenance {
-        Provenance::new(
-            Cause::Order {
+        let cause = match self.trigger {
+            Some(name) => Cause::Trigger {
+                name,
                 verb,
                 source: self.source,
             },
-            self.at,
-        )
+            None => Cause::Order {
+                verb,
+                source: self.source,
+            },
+        };
+        Provenance::new(cause, self.at)
     }
 }
 
@@ -4849,6 +5261,15 @@ pub struct SubmitIntent {
     /// strings byte-identical.
     pub tag: String,
     pub intent: Intent,
+    /// Set when a **trigger** fired this intent. Three things read it, and each
+    /// would otherwise have to guess:
+    ///
+    /// * the link (docs/TEMPO.md) — trigger-fired intents are engine-executed
+    ///   standing policy and pay nothing, exactly like a posture;
+    /// * [`Provenance`] — the unit answers `trigger:<name>`, not `order:`;
+    /// * the human's refusal notice, which names the rule that failed rather
+    ///   than a gesture the player never made.
+    pub trigger: Option<TriggerName>,
 }
 
 impl SubmitIntent {
@@ -4859,6 +5280,23 @@ impl SubmitIntent {
             source: IntentSource::Ui,
             tag: "ui".to_string(),
             intent,
+            trigger: None,
+        }
+    }
+
+    /// An intent a **trigger** fired, on behalf of the seat that armed it.
+    ///
+    /// The tag is the trigger's own name, so every channel that already
+    /// prefixes by tag — the wire's `errors`, the replay log, the human's
+    /// alert stack — says which rule spoke without any of them learning a new
+    /// concept.
+    pub fn fired(team: Team, source: IntentSource, name: TriggerName, intent: Intent) -> Self {
+        SubmitIntent {
+            team,
+            source,
+            tag: format!("trigger:{name}"),
+            intent,
+            trigger: Some(name),
         }
     }
 }
@@ -5270,7 +5708,8 @@ pub enum SimSet {
     CoCommand,
     /// The scripted commander's macro decisions.
     AiThink,
-    /// Standing orders: postures, retreats, leashes, auto-cast.
+    /// Standing orders: postures, retreats, leashes, auto-cast — and the
+    /// trigger evaluator, which is the contingent member of the same family.
     Think,
     /// `apply_intents` — the one path from a stated intent to game state.
     Intent,
@@ -7206,7 +7645,7 @@ mod tests {
     fn the_log_tag_and_the_units_answer_are_the_same_string() {
         let intent: Intent =
             serde_json::from_str(r#"{"type":"move","units":[1,2],"x":40.0,"z":40.0}"#).unwrap();
-        let mark = IntentMark { source: IntentSource::Bridge, at: 21.5 };
+        let mark = IntentMark { source: IntentSource::Bridge, at: 21.5, trigger: None };
         let logged = mark.order(intent.provenance_verb().unwrap()).why();
         let on_the_unit = Provenance::new(
             Cause::Order { verb: "move", source: IntentSource::Bridge },

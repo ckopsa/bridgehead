@@ -565,6 +565,19 @@ struct StateOut {
     /// reading it. Absent entirely when `WC3_COMMAND_LATENCY` is off.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     command_nodes: Vec<CommandNodeOut>,
+    /// **Your armed triggers** (`trigger_set`), in the order you set them —
+    /// which is the order they fire in when two come true on the same tick.
+    ///
+    /// Own team only, and for a stronger reason than the usual one: a trigger
+    /// is a *plan*, and reading your opponent's contingency plans is the single
+    /// most valuable thing a snapshot could leak. Nothing here is derived from
+    /// the other faction's state.
+    ///
+    /// Absent when you have none, on the same rule as `command_nodes` — a
+    /// snapshot from a seat that has never spoken the word is byte-shape
+    /// identical to a v1 one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    triggers: Vec<TriggerOut>,
 
     // --- co-command (copilot seats only) ---------------------------------
     //
@@ -1001,6 +1014,36 @@ struct SquadOut {
     members: usize,
 }
 
+/// One armed trigger, as its owner reads it back.
+///
+/// `when` and `then` are the **same JSON you sent**, round-tripped through the
+/// `Intent` type rather than re-described — so a commander can read a trigger
+/// out of the snapshot, edit one number, and send it back as a `trigger_set`
+/// under the same name. A prose summary would have been a second spelling of
+/// the language, which is the thing docs/INTENT.md exists to prevent.
+#[derive(Serialize)]
+struct TriggerOut {
+    name: String,
+    when: TriggerWhen,
+    then: Intent,
+    /// Cooldown in game seconds for a repeating trigger; absent for a
+    /// once-trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat: Option<f32>,
+    /// `"armed"` (will fire when the predicate holds), `"cooling"` (repeating,
+    /// inside its cooldown) or `"spent"` (a once-trigger that has fired).
+    status: &'static str,
+    /// Game time of the last fire; absent if it never has. Spent triggers are
+    /// KEPT in this list precisely so this field can answer "did my rule ever
+    /// go off?" — an absence cannot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_fired: Option<f32>,
+    /// The English of the whole statement, identical to the line the replay log
+    /// wrote when it was armed and the line the event feed writes when it
+    /// fires.
+    sentence: String,
+}
+
 #[derive(Serialize)]
 struct HeroOut {
     level: u32,
@@ -1235,6 +1278,18 @@ struct SeatVerdicts<'w> {
     applied: Res<'w, IntentApplied>,
 }
 
+/// The standing policy a team has set and the engine executes for it: squad
+/// postures (continuous) and armed triggers (contingent). Bundled for the same
+/// reason `TeamTech` is — `write_snapshot` sits exactly on Bevy's 16-parameter
+/// ceiling — and the pairing is not arbitrary: both are written only by the
+/// intent compiler, read only here and in the HUD, and answer the one question
+/// "what has this commander told the engine to do without them".
+#[derive(SystemParam)]
+struct StandingOrders<'w> {
+    squads: Res<'w, SquadOrders>,
+    triggers: Res<'w, Triggers>,
+}
+
 /// The co-command side-channel: the pending proposal queue and the team's
 /// recent intent history. Bundled for the same reason `TeamTech` is — this
 /// system sits on Bevy's 16-parameter ceiling, and these two answer the one
@@ -1253,7 +1308,7 @@ fn write_snapshot(
     economies: Res<Economies>,
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
-    squad_orders: Res<SquadOrders>,
+    standing: StandingOrders,
     tech: TeamTech,
     feed: Res<GameEvents>,
     fog: Res<FogGrids>,
@@ -1303,7 +1358,8 @@ fn write_snapshot(
             &economies,
             &records,
             &game_over,
-            &squad_orders,
+            &standing.squads,
+            standing.triggers.get(seat.team),
             *tech.tiers,
             *tech.research,
             &feed,
@@ -1330,6 +1386,10 @@ fn write_seat_snapshot(
     records: &HeroRecords,
     game_over: &GameOver,
     squad_orders: &SquadOrders,
+    // This seat's own armed triggers. Passed pre-sliced by team rather than as
+    // the whole resource, so this function cannot read the opponent's plans
+    // even by accident.
+    my_triggers: &[TriggerRule],
     tiers: TechTiers,
     team_research: TeamResearch,
     feed: &GameEvents,
@@ -1583,6 +1643,29 @@ fn write_seat_snapshot(
         })
         .collect();
 
+    // Armed triggers, in the order they were set — which is the order they fire
+    // in, so it is the order they must be read in. NOT sorted, unlike every
+    // other list here: sorting would hide the one thing about the list that is
+    // load-bearing.
+    let triggers: Vec<TriggerOut> = my_triggers
+        .iter()
+        .map(|t| TriggerOut {
+            name: t.name.as_str().to_string(),
+            when: t.when.clone(),
+            then: t.then.clone(),
+            repeat: t.repeat,
+            status: t.status(now),
+            last_fired: t.last_fired.map(r1),
+            sentence: Intent::TriggerSet {
+                name: t.name.as_str().to_string(),
+                when: t.when.clone(),
+                then: Box::new(t.then.clone()),
+                repeat: t.repeat,
+            }
+            .sentence(),
+        })
+        .collect();
+
     // Bounty caches this seat can see, sorted by id so a seat serializes the
     // same order every tick. The two seats' lists now legitimately differ.
     let mut bounty_snaps: Vec<BountySnap> = bounties
@@ -1782,6 +1865,7 @@ fn write_seat_snapshot(
         bounties: bounties_out,
         events,
         command_nodes,
+        triggers,
         copilot: copilot_out,
         proposals: proposals_out,
         recent_resolutions: resolutions_out,
@@ -2062,6 +2146,9 @@ fn poll_commands(
                             source: IntentSource::Bridge,
                             tag,
                             intent,
+                            // A seat speaks for itself. Only trigger.rs sets
+                            // this, and only for a rule it is firing.
+                            trigger: None,
                         });
                     }
                     Err(err) => intent_errors
