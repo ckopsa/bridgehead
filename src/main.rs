@@ -22,6 +22,30 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `WC3_WINDOW=800x600` opens the game at a given logical size.
+///
+/// It exists because the HUD has a *narrow* failure mode and no way to
+/// reproduce it: a tiling WM hands the game whatever the tile is, and "does
+/// the console still fit at 800 wide?" was previously a question you could
+/// only answer by resizing a window with a mouse. Unset keeps Bevy's default.
+fn window_resolution() -> bevy::window::WindowResolution {
+    use bevy::window::WindowResolution;
+    let default = WindowResolution::default();
+    let Ok(raw) = std::env::var("WC3_WINDOW") else {
+        return default;
+    };
+    let parsed = raw.trim().split_once(['x', 'X']).and_then(|(w, h)| {
+        Some((w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?))
+    });
+    match parsed {
+        Some((w, h)) if w >= 320.0 && h >= 240.0 => WindowResolution::new(w, h),
+        _ => {
+            eprintln!("WC3_WINDOW=\"{raw}\" is not a WxH of at least 320x240 — ignoring");
+            default
+        }
+    }
+}
+
 fn main() {
     // WC3_HEADLESS=1: full-fidelity simulation with no window, no renderer,
     // no GPU — for agents, CI, and balance testing. Combine with WC3_SPEED,
@@ -51,11 +75,20 @@ fn main() {
         app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "WC3 Clone — Human vs Claude".into(),
+                resolution: window_resolution(),
                 ..default()
             }),
             ..default()
         }))
         .add_plugins(ui::UiPlugin);
+        // A windowed run normally ends when the player closes it. Setting the
+        // cap opts a windowed run into the same self-termination headless has,
+        // which is what lets an unattended session open a window, photograph
+        // itself (`WC3_SHOT_AT`) and get out of the way. Registered only when
+        // the variable is set, so an ordinary game is untouched.
+        if std::env::var("WC3_MAX_GAME_SECS").is_ok() {
+            app.add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));
+        }
     }
 
     // WC3_FIXED_DT=0.05: every frame advances the clock by exactly 50ms rather

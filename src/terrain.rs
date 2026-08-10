@@ -375,16 +375,30 @@ fn setup_ground(
 
     // Decorative rocks / dirt mounds. Not in the nav grid, kept away from the
     // bases and the marching corridor so they never look like obstacles.
-    let rock_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.42, 0.42, 0.45),
-        perceptual_roughness: 0.9,
-        ..default()
-    });
-    let mound_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.36, 0.31, 0.22),
-        perceptual_roughness: 1.0,
-        ..default()
-    });
+    // Fog-shaded, and these two are the reason the mechanism exists at all: a
+    // rock is a solid sphere sitting above `FOG_PLANE_Y`, so the ground quad
+    // blacks out the earth around it and the rock goes on catching the sun.
+    // docs/FOG.md called this out as a known limitation ("small ground doodads
+    // still poke through; they carry no information and are left alone") —
+    // true about the information, wrong about the impression, because a field
+    // of lit pebbles floating on unexplored black is the single most obvious
+    // way the fog looks broken.
+    let rock_shades = fog_shaded(
+        &mut materials,
+        StandardMaterial {
+            base_color: Color::srgb(0.42, 0.42, 0.45),
+            perceptual_roughness: 0.9,
+            ..default()
+        },
+    );
+    let mound_shades = fog_shaded(
+        &mut materials,
+        StandardMaterial {
+            base_color: Color::srgb(0.36, 0.31, 0.22),
+            perceptual_roughness: 1.0,
+            ..default()
+        },
+    );
     for _ in 0..40 {
         let p = Vec3::new(
             rng.gen_range(-(MAP_HALF - 4.0)..(MAP_HALF - 4.0)),
@@ -409,7 +423,8 @@ fn setup_ground(
             let r = rng.gen_range(0.5f32..1.4);
             commands.spawn((
                 Mesh3d(meshes.add(Sphere::new(r))),
-                MeshMaterial3d(rock_mat.clone()),
+                MeshMaterial3d(rock_shades.at(CellVis::Unexplored).clone()),
+                rock_shades.clone(),
                 Transform::from_xyz(p.x, r * 0.35, p.z)
                     .with_scale(Vec3::new(1.0, rng.gen_range(0.5f32..0.9), 1.0)),
             ));
@@ -417,7 +432,8 @@ fn setup_ground(
             let r = rng.gen_range(1.5f32..4.0);
             commands.spawn((
                 Mesh3d(meshes.add(Sphere::new(r))),
-                MeshMaterial3d(mound_mat.clone()),
+                MeshMaterial3d(mound_shades.at(CellVis::Unexplored).clone()),
+                mound_shades.clone(),
                 Transform::from_xyz(p.x, -r * 0.75, p.z)
                     .with_scale(Vec3::new(1.0, rng.gen_range(0.25f32..0.5), 1.0)),
             ));
@@ -662,12 +678,20 @@ fn setup_resource_nodes(
     });
     let blob_mesh = meshes.add(Sphere::new(1.7));
 
-    let bark_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.30, 0.21, 0.13),
-        perceptual_roughness: 1.0,
-        ..default()
-    });
-    let leaf_mats: Vec<Handle<StandardMaterial>> = [
+    // Trees are the tall case. A canopy sits 3-4 units up, six times the fog
+    // quad's height, so before the tint an EXPLORED forest — remembered ground,
+    // 44% black on the floor — stood over it in full daylight. The player's eye
+    // reads a lit forest as a place currently being watched, which is precisely
+    // the thing `Explored` means it is not.
+    let bark_shades = fog_shaded(
+        &mut materials,
+        StandardMaterial {
+            base_color: Color::srgb(0.30, 0.21, 0.13),
+            perceptual_roughness: 1.0,
+            ..default()
+        },
+    );
+    let leaf_shades: Vec<FogTinted> = [
         Color::srgb(0.11, 0.34, 0.14),
         Color::srgb(0.15, 0.42, 0.18),
         Color::srgb(0.09, 0.28, 0.13),
@@ -675,12 +699,15 @@ fn setup_resource_nodes(
     ]
     .into_iter()
     .map(|c| {
-        materials.add(StandardMaterial {
-            base_color: c,
-            perceptual_roughness: 0.95,
-            reflectance: 0.02,
-            ..default()
-        })
+        fog_shaded(
+            &mut materials,
+            StandardMaterial {
+                base_color: c,
+                perceptual_roughness: 0.95,
+                reflectance: 0.02,
+                ..default()
+            },
+        )
     })
     .collect();
 
@@ -694,7 +721,7 @@ fn setup_resource_nodes(
 
         let scale = rng.gen_range(0.8f32..1.25);
         let lean = Quat::from_rotation_y(rng.gen_range(0.0f32..std::f32::consts::TAU));
-        let leaf = leaf_mats[rng.gen_range(0..leaf_mats.len())].clone();
+        let leaf = leaf_shades[rng.gen_range(0..leaf_shades.len())].clone();
         let pine = rng.gen_bool(0.6);
 
         commands
@@ -709,37 +736,82 @@ fn setup_resource_nodes(
                 Visibility::default(),
             ))
             .with_children(|parent| {
+                // Every piece carries its own `FogTinted`: the tinter reads
+                // `GlobalTransform`, so a canopy 4 units up is still shaded by
+                // the cell its trunk stands in, and a child never has to know
+                // it is a child.
                 parent.spawn((
                     Mesh3d(trunk_mesh.clone()),
-                    MeshMaterial3d(bark_mat.clone()),
+                    MeshMaterial3d(bark_shades.at(CellVis::Unexplored).clone()),
+                    bark_shades.clone(),
                     Transform::from_xyz(0.0, 1.2, 0.0),
                 ));
+                let mut foliage = |mesh: Handle<Mesh>, tf: Transform| {
+                    parent.spawn((
+                        Mesh3d(mesh),
+                        MeshMaterial3d(leaf.at(CellVis::Unexplored).clone()),
+                        leaf.clone(),
+                        tf,
+                    ));
+                };
                 if pine {
-                    parent.spawn((
-                        Mesh3d(cone_mesh.clone()),
-                        MeshMaterial3d(leaf.clone()),
-                        Transform::from_xyz(0.0, 4.0, 0.0),
-                    ));
-                    parent.spawn((
-                        Mesh3d(cone_mesh.clone()),
-                        MeshMaterial3d(leaf),
+                    foliage(cone_mesh.clone(), Transform::from_xyz(0.0, 4.0, 0.0));
+                    foliage(
+                        cone_mesh.clone(),
                         Transform::from_xyz(0.0, 2.5, 0.0).with_scale(Vec3::splat(0.8)),
-                    ));
+                    );
                 } else {
-                    parent.spawn((
-                        Mesh3d(blob_mesh.clone()),
-                        MeshMaterial3d(leaf.clone()),
-                        Transform::from_xyz(0.0, 3.4, 0.0)
-                            .with_scale(Vec3::new(1.0, 1.15, 1.0)),
-                    ));
-                    parent.spawn((
-                        Mesh3d(blob_mesh.clone()),
-                        MeshMaterial3d(leaf),
+                    foliage(
+                        blob_mesh.clone(),
+                        Transform::from_xyz(0.0, 3.4, 0.0).with_scale(Vec3::new(1.0, 1.15, 1.0)),
+                    );
+                    foliage(
+                        blob_mesh.clone(),
                         Transform::from_xyz(0.55, 2.7, -0.3).with_scale(Vec3::splat(0.65)),
-                    ));
+                    );
                 }
             });
     }
+}
+
+/// Register one look three times — lit, remembered, unknown — so a doodad can
+/// wear its cell's fog state instead of standing brightly on top of it.
+///
+/// Only the *colour* channels are shaded. Roughness, reflectance and the rest
+/// describe the surface, not the light on it, so cloning the template and
+/// scaling `base_color` keeps the three shades recognisably one material.
+/// `emissive` is scaled too, for the same reason a torch in the dark should
+/// still be a dark torch: nothing on the map may light its own way out of the
+/// fog.
+fn fog_shaded(
+    materials: &mut Assets<StandardMaterial>,
+    template: StandardMaterial,
+) -> FogTinted {
+    let shades = [
+        CellVis::Unexplored,
+        CellVis::Explored,
+        CellVis::Visible,
+    ]
+    .map(|cell| {
+        let k = fog_shade(cell);
+        let mut mat = template.clone();
+        let c = mat.base_color.to_linear();
+        mat.base_color = Color::LinearRgba(LinearRgba {
+            red: c.red * k,
+            green: c.green * k,
+            blue: c.blue * k,
+            alpha: c.alpha,
+        });
+        let e = mat.emissive;
+        mat.emissive = LinearRgba {
+            red: e.red * k,
+            green: e.green * k,
+            blue: e.blue * k,
+            alpha: e.alpha,
+        };
+        materials.add(mat)
+    });
+    FogTinted { shades }
 }
 
 /// Distance from `p` to the segment `a`-`b`, in the XZ plane.

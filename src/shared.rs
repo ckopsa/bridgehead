@@ -2769,15 +2769,54 @@ pub struct TeleportRequest {
     pub army_only: bool,
 }
 
+/// Resources bought per 5 XP: one XP "nickel" per 20 gold-equivalent spent.
+///
+/// Picked to reproduce the three hand-written rows this rule replaced —
+/// Worker 75→15, Footman 135→30, Archer 120→30 — so the anchor points a match
+/// was balanced around are the formula's own output rather than exceptions to
+/// it. Everything else follows.
+const XP_PER_STEP: f32 = 5.0;
+const XP_COST_PER_STEP: u32 = 20;
+
 /// XP granted to nearby enemy heroes when this thing dies.
+///
+/// **One rule: XP is a quarter of what the thing cost, in 5-XP steps.**
+/// `5 * floor(cost / 20)`, where `cost` is gold + lumber weighted equally —
+/// the same "material worth" `asset_score` uses, so the two places the game
+/// puts a number on a corpse agree about what a corpse is worth.
+///
+/// This exists as a formula rather than a table because a table was the bug.
+/// Six of the eleven unit kinds (Raider, Catapult, Spearman, Sorcerer, Knight,
+/// Gryphon Rider) fell through the old `match` and granted **zero** XP: every
+/// kind added after the hero system shipped was invisible to it, so the
+/// tier-2/3 army a hero actually fights through was worth nothing to level on,
+/// and killing a Worker paid better than killing a Knight. A formula cannot
+/// have that gap — a new `UnitKind` is priced the day it is priced.
+///
+/// Buildings go through `building_value`, not `building_stats`, so a hall
+/// counts everything paid to raise it. That matters twice: it stops the ladder
+/// going *backwards* (a Keep's own row costs less than the TownHall it
+/// replaces, so the rung would have been worth less than the thing it was an
+/// upgrade of), and it is the same accounting `asset_score` already does.
+/// It also ends the other half of the old bug's absurdity, where a 35-resource
+/// Wall and a 590-resource TownHall were both flat 60 — wall spam was a hero
+/// XP faucet.
+///
+/// The scalars stay in code (tables-move-scalars-stay): the *inputs* are the
+/// data tables, and this is the one line of arithmetic over them.
 pub fn xp_for_kill(unit: Option<UnitKind>, building: Option<BuildingKind>) -> f32 {
-    match (unit, building) {
-        (Some(UnitKind::Worker), _) => 15.0,
-        (Some(UnitKind::Footman), _) | (Some(UnitKind::Archer), _) => 30.0,
-        (Some(UnitKind::Hero), _) => 120.0,
-        (_, Some(_)) => 60.0,
-        _ => 0.0,
-    }
+    let cost = match (unit, building) {
+        (Some(kind), _) => {
+            let s = unit_stats(kind);
+            s.cost_gold + s.cost_lumber
+        }
+        (_, Some(kind)) => {
+            let (gold, lumber) = building_value(kind);
+            gold + lumber
+        }
+        _ => return 0.0,
+    };
+    XP_PER_STEP * (cost / XP_COST_PER_STEP) as f32
 }
 
 /// ONE hero's progression, kept up to date while it lives and preserved when
@@ -3349,6 +3388,68 @@ impl CellVis {
     /// remember it".
     pub fn known(self) -> bool {
         !matches!(self, CellVis::Unexplored)
+    }
+    /// Dense index, for anything keyed by state — `FogTinted::shades` is the
+    /// one caller. Spelled out rather than `as usize` so a reordering of the
+    /// variants cannot silently reshuffle a lookup table.
+    pub fn index(self) -> usize {
+        match self {
+            CellVis::Unexplored => 0,
+            CellVis::Explored => 1,
+            CellVis::Visible => 2,
+        }
+    }
+}
+
+/// **How much of a thing's own colour survives at each fog state.**
+///
+/// The one shading rule, and it is deliberately here rather than in a
+/// renderer, because as of the scenery fix there are *two* renderers of it and
+/// docs/FOG.md's whole promise is that two renderings of one rule cannot drift:
+///
+/// | renderer | how it uses this |
+/// |---|---|
+/// | the ground quad (`ui::fog_alpha`) | lays `1.0 - shade` of black over the ground |
+/// | scenery tint (`FogTinted`) | multiplies a doodad's own base colour by it |
+///
+/// Those are the same darkening arrived at from opposite directions, which is
+/// exactly what makes a tree standing in remembered ground read as the *same*
+/// remembered as the ground under it. Before this, the quad dimmed the floor
+/// and the forest above it stayed at full brightness — a lit canopy hanging
+/// over dark earth, because a flat quad at `y = 0.16` cannot dim anything
+/// taller than 0.16.
+///
+/// The three numbers are 100% / 56% / 12%, which is 0.0 / 0.44 / 0.88 of black
+/// — the exact alphas the overlay already used, so the legibility this was
+/// tuned for is preserved by construction rather than re-tuned.
+pub fn fog_shade(cell: CellVis) -> f32 {
+    match cell {
+        CellVis::Visible => 1.0,
+        CellVis::Explored => 0.56,
+        CellVis::Unexplored => 0.12,
+    }
+}
+
+/// A doodad that wears its cell's fog state, as one pre-built material per
+/// state (indexed by `CellVis::index`).
+///
+/// Three materials rather than one material repainted per frame, and that
+/// choice is the direct lesson of the bug documented in `ui::update_fog_overlay`:
+/// a `StandardMaterial`'s bind group is built once and rebuilt only when the
+/// *material asset* changes, so anything that repaints in place has to
+/// republish or it silently goes on rendering last-time's data. Swapping which
+/// **handle** an entity wears has no such failure mode — the material assets
+/// are written once at setup and never touched again, and `MeshMaterial3d`
+/// pointing somewhere new is the whole update. The trap is designed out rather
+/// than defended against.
+#[derive(Component, Clone, Debug)]
+pub struct FogTinted {
+    pub shades: [Handle<StandardMaterial>; 3],
+}
+
+impl FogTinted {
+    pub fn at(&self, cell: CellVis) -> &Handle<StandardMaterial> {
+        &self.shades[cell.index()]
     }
 }
 
@@ -8848,6 +8949,67 @@ mod tests {
             HeroSlotVerdict::Ok,
             "a Keep team may field both ultimates at once",
         );
+    }
+
+    /// The bug this test exists for: six of eleven unit kinds fell through the
+    /// old hand-written `match` and were worth **zero** XP, so a hero could
+    /// grind an entire tier-3 army and never level. Every kind must pay, and
+    /// no kind may out-pay a kind that costs more than it.
+    #[test]
+    fn every_unit_kind_grants_xp_scaled_by_what_it_cost() {
+        for kind in ALL_UNIT_KINDS {
+            let xp = xp_for_kill(Some(kind), None);
+            assert!(xp > 0.0, "{kind:?} grants no XP at all");
+            // 5-XP steps, so the numbers stay readable in a combat log.
+            assert_eq!(xp % 5.0, 0.0, "{kind:?} grants a ragged {xp} XP");
+        }
+        // Monotone in cost: pricier is always worth at least as much.
+        let mut rows: Vec<(UnitKind, u32, f32)> = ALL_UNIT_KINDS
+            .iter()
+            .map(|&k| {
+                let s = unit_stats(k);
+                (k, s.cost_gold + s.cost_lumber, xp_for_kill(Some(k), None))
+            })
+            .collect();
+        rows.sort_by_key(|r| r.1);
+        for pair in rows.windows(2) {
+            assert!(
+                pair[0].2 <= pair[1].2,
+                "{:?} costs less than {:?} but grants more XP",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+
+        // The three rows the formula had to reproduce, spelled out: these are
+        // the values the hero curve was tuned against before the rule existed.
+        assert_eq!(xp_for_kill(Some(UnitKind::Worker), None), 15.0);
+        assert_eq!(xp_for_kill(Some(UnitKind::Footman), None), 30.0);
+        assert_eq!(xp_for_kill(Some(UnitKind::Archer), None), 30.0);
+        // And the kinds that used to pay nothing now pay by their price tag.
+        assert_eq!(xp_for_kill(Some(UnitKind::Spearman), None), 20.0);
+        assert_eq!(xp_for_kill(Some(UnitKind::Raider), None), 50.0);
+        assert_eq!(xp_for_kill(Some(UnitKind::Knight), None), 80.0);
+        assert_eq!(xp_for_kill(Some(UnitKind::GryphonRider), None), 100.0);
+    }
+
+    /// Structures pay too, and the hall ladder never pays *less* for a taller
+    /// rung — the reason buildings price off `building_value` (cumulative)
+    /// rather than their own row (an upgrade delta).
+    #[test]
+    fn every_building_kind_grants_xp_and_the_hall_ladder_never_shrinks() {
+        for kind in ALL_BUILDING_KINDS {
+            let xp = xp_for_kill(None, Some(kind));
+            assert!(xp > 0.0, "{kind:?} grants no XP at all");
+            assert_eq!(xp % 5.0, 0.0, "{kind:?} grants a ragged {xp} XP");
+        }
+        let hall = xp_for_kill(None, Some(BuildingKind::TownHall));
+        let keep = xp_for_kill(None, Some(BuildingKind::Keep));
+        let castle = xp_for_kill(None, Some(BuildingKind::Castle));
+        assert!(hall < keep && keep < castle, "{hall} {keep} {castle}");
+        // A 35-resource Wall and a 590-resource TownHall used to be worth the
+        // same flat 60. Wall spam is no longer an XP faucet.
+        assert!(xp_for_kill(None, Some(BuildingKind::Wall)) < hall / 10.0);
     }
 
     /// Records are per CLASS now, and so is the price: a team fielding a
