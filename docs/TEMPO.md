@@ -863,3 +863,283 @@ and this bead routes them through `OrderIssuer`; the composition is
 layer rather than around it and survives the deferred dispatch. All eleven sites
 compose, and no direct `Order` write remains in either the compiler or the
 script.
+
+---
+
+## 8. Phase 2 as built (issues 5–8)
+
+The four follow-ups that turn the latency core into a mechanic a player can
+*see*, an LLM can *read*, and a maintainer can *tune*. Issue 8's other half —
+the human-vs-Claude rematch — is not here and cannot be, for reasons §8.4 states
+plainly.
+
+### 8.1 The doctrine audit (issue 5, completed)
+
+Phase 1 added `Without<PendingOrder>` to `run_squad_postures` and
+`enforce_leash` and noted a knock-on it did not resolve: in-transit members no
+longer contributed to a squad's cohesion centroid. Walking every doctrine
+consumer in turn produced one real fix and five deliberate non-fixes, and the
+non-fixes are the more interesting half — each is now a comment at the system
+that answers "why is there no guard here?" before someone adds one.
+
+**The fix: an in-transit member is still a body in the formation.** The guard
+had shipped as a query *filter*, so it applied to two different questions at
+once. "Who may I re-task?" wants it. "Where is this squad standing?" does not: a
+unit awaiting a delayed order has not moved an inch, it is standing in the blob
+and in range of whatever the blob is in range of. Filtering it out made a
+squad's centre of mass lurch the moment a player spoke to half of it, and the
+other half would then regroup on a point that ignored the squadmates standing
+right beside them. The filter became `Option<&PendingOrder>` plus one `continue`
+in the member loop: counted for cohesion, skipped for re-tasking.
+
+Retreaters stay filtered out of the centroid entirely, and the asymmetry is the
+rationale. A retreater is deliberately *leaving* the formation under a policy
+the commander set, so the squad must not gather around a unit running for home.
+An in-transit unit is going nowhere yet.
+
+The five decisions not to guard:
+
+| System | Verdict | Why |
+|---|---|---|
+| `trigger_retreat` | no guard | A unit bleeding out is not "busy waiting", and a retreat threshold is the commander's own standing order — the fast path. It never cancels what is in transit, so nothing is swallowed. |
+| `rearm_retreat` | no guard (already) | Un-latches at *dispatch*, as §4 predicted. Now asserted rather than assumed. |
+| `idle_instinct` | no guard | A unit whose last order finished while a new one travels genuinely is idle, and "idle" is the true answer. Suppressing it would make the unit claim to be obeying an order it had already completed, to hide a latency window. |
+| `default_squad_autonomy` | no guard | Enrolment writes a `SquadId`, never an `Order`. It decides who may re-task the unit *later*; the posture executor then declines to while the order travels. The two compose. |
+| `recover_retreaters` | no guard | Only removes a marker, handing the unit back to an executor that will decline to touch it. |
+| `auto_cast_abilities` | no guard | The tempting one, and backwards: it would let a player *suppress* the fast path by reaching for the slow one. Left alone, the standing policy fires now and the hand-fired copy arrives to find the ability on cooldown and fizzles — the honest-fizzle rule `PendingCast` was built around. |
+
+`trigger_retreat`'s non-guard has a consequence worth naming, because it is C4
+in miniature and it is now a test. A player orders a unit forward; the unit
+breaks before the order arrives; the order lands and un-latches the retreat; the
+unit is still under its threshold, so the policy fires again a quarter of a
+second later. **An order bought at range loses the argument with a policy set in
+advance, and loses it within 250ms.**
+
+Outside doctrine, the audit cleared two more consumers. `economy.rs`'s
+depletion auto-rebalance writes `HarvestJob`/`MoveTo`, not commands, and never
+touches a `PendingOrder`. `ai.rs`'s `rebalance_mines` *does* pay the link, and is
+protected from the stale-state loop it would otherwise have — it re-derives crew
+counts from positions that do not change until the order lands, so its re-picks
+are byte-identical orders and the "saying the same thing again does not restart
+the journey" rule absorbs them.
+
+### 8.2 The acknowledgement (issue 6, completed)
+
+Phase 1 shipped `command_nodes`, `link` and `pending` and left the
+`applied: [{cmd, delay}]` acknowledgement open. It is in, and it cost less than
+expected because both halves already existed: `OrderIssuer.max_delay` is the
+realised worst link for one sentence, and `SubmitIntent.tag` is already the
+string `"cmd 3"` that the error channel prefixes its messages with.
+
+So `applied` is the positive half of a verdict the wire already carried:
+
+```json
+"errors":  ["cmd 5: unit 4294968182 is not yours"],
+"applied": [{"cmd": "cmd 3", "delay": 1.8}]
+```
+
+Same batch, same identity scheme, no second correlation mechanism. `IntentApplied`
+is shaped like `IntentErrors` down to the per-team split and the "cleared when a
+batch is accepted, appended by the compiler, copied into the next snapshot"
+lifecycle.
+
+Two decisions worth recording. **Bridge-sourced only**: a UI gesture's seat is a
+person looking at the selection panel, and echoing their every right-click into
+the other seat's snapshot would be noise for a reader who is not there.
+**Silence means instant**: only commands that actually paid are listed, on the
+same reasoning the intent log omits its `link` field when nothing was delayed.
+Together those keep the channel — and its wire key — permanently empty with the
+feature off, so `tools/verify_intent_bridge.py`'s both-directions key-set
+assertion still passes untouched.
+
+`tools/COMMANDER_BRIEF.md` gained a **chain of command** section: what
+`command_nodes` / `link` / `pending` / `applied` mean, and the three rules a
+commander would otherwise learn the hard way — repeating an order is free,
+`pending: true` with `why: "idle"` is not a lost order, and doctrine is strictly
+faster than micro at range.
+
+### 8.3 The HUD (issue 7, completed)
+
+§4 named this the issue that decides whether the mechanic "reads as a game rule
+rather than a bug", and it is why the default stays off. Three readouts:
+
+- **A closing ring at the destination.** Every selected unit with an order in
+  transit gets a marker where the order is going, in the rally flag's gold
+  because the player already reads that colour as "somewhere I told something to
+  go". Its radius *is* the countdown: full when the order is spoken, tight as it
+  lands. This is the piece that matters — a player who clicks and sees nothing
+  concludes the game dropped the click, while a player who sees a marker appear
+  and tighten concludes the order is on its way, which is both true and the
+  information they need to decide whether to wait.
+- **A link line in the selection panel**, under `Why` and for the same reason it
+  sits there: a unit's reason and the cost of changing it are one thought.
+  Tallied like `why_line` but sorted **worst first** — a player deciding whether
+  to reach for a strung-out selection is asking about its slowest unit, not its
+  typical one. In-transit orders are reported by the link they are paying, not
+  the time remaining; the countdown belongs to the ring on the ground.
+- **Hairline coverage rings and a top-bar count.** Each own command node draws
+  its free radius, and the bar reads `Chain: 3 nodes · 8/12 in reach`. Own team
+  only, symmetric with the snapshot, because the enemy's chain of command is
+  something you learn by razing it. The rings needed a second, thinner torus
+  mesh: the existing ring's band is 16% of its radius, which at a hall's 30
+  world units is a five-unit-wide donut over the base rather than a circle.
+
+**Flag off is pixel-identical, and mostly by construction rather than by check.**
+No `PendingOrder` can exist with the feature off, so the transit-marker query is
+empty and not one marker entity is ever spawned; both text lines collapse to the
+empty string, which occupies nothing in a left-packed bar or a text column. Only
+the node rings ask `latency.on`, because they are the one readout that could
+otherwise draw a stale circle from a cache nobody is refreshing.
+
+One structural cost: `update_hud` was already on Bevy's 16-parameter ceiling, so
+the three things this needed (the curve, the selection's positions, the whole
+army's positions) arrive as one `SelectionReasons` bundle that absorbed the
+existing `sel_why` query — net zero parameters. The UI's `Update` chain crossed
+Bevy's 20-element tuple limit and is now two chained groups, split where it reads
+best: everything that takes input, then everything that draws the result.
+
+### 8.4 Calibration (issue 8, first half — the sweep)
+
+`tools/link_sweep.py` runs the grid headless and classifies what it finds.
+Thirty-nine runs on `open`: a flag-off baseline plus twelve curves — hall radius
+{30, 45, 60} × step {0.3, 0.6} × ramp {0.01, 0.02}, cap fixed at 3.0s, hero
+radius fixed at 18 — three replicates each, `WC3_HEADLESS=1 WC3_AI_BOTH=1
+WC3_SPEED=16`, 1800s game cap.
+
+| arm | n | decisive | median length (game s) | mean link | worst link | mean in transit | caps (classified) |
+|---|---|---|---|---|---|---|---|
+| baseline (flag off) | 3 | 3/3 | 405 | — | — | — | — |
+| hall 30 / step 0.3 / ramp 0.01 | 3 | 3/3 | 449 | 1.18 | 1.70 | 2.4 | — |
+| hall 30 / step 0.3 / ramp 0.02 | 3 | 3/3 | 403 | 1.71 | 2.15 | 2.5 | — |
+| hall 30 / step 0.6 / ramp 0.01 | 3 | 3/3 | 424 | 1.55 | 2.07 | 2.9 | — |
+| hall 30 / step 0.6 / ramp 0.02 *(today's default)* | 3 | 3/3 | 424 | 2.21 | 3.00 | 2.9 | — |
+| hall 45 / step 0.3 / ramp 0.01 | 3 | 3/3 | 414 | 1.18 | 1.56 | 2.2 | — |
+| hall 45 / step 0.3 / ramp 0.02 | 3 | 3/3 | 416 | 1.87 | 3.00 | 2.0 | — |
+| hall 45 / step 0.6 / ramp 0.01 | 3 | 2/3 | 645 | 1.31 | 1.85 | 2.2 | 1 (cap-economy) |
+| hall 45 / step 0.6 / ramp 0.02 | 3 | 2/3 | 795 | 1.85 | 3.00 | 2.9 | 1 (cap-economy) |
+| hall 60 / step 0.3 / ramp 0.01 | 3 | 3/3 | 490 | 1.30 | 1.33 | 1.0 | — |
+| hall 60 / step 0.3 / ramp 0.02 | 3 | 3/3 | 484 | 1.58 | 2.46 | 3.9 | — |
+| hall 60 / step 0.6 / ramp 0.01 | 3 | 3/3 | 429 | 1.32 | 1.69 | 2.4 | — |
+| hall 60 / step 0.6 / ramp 0.02 | 3 | 3/3 | 490 | 1.84 | 3.00 | 2.0 | — |
+
+Plus `crossings`, as an off-grid check that the finding is not one map's
+accident: baseline 3/3 decisive at a 499s median, and the recommended curve
+below 3/3 decisive at a 494s median.
+
+**37 of 39 decisive, and neither cap is a tempo finding.** Both landed in
+hall-45 arms with an empty in-transit queue through the late game — the
+mine-exhaustion signature §7 warned the sweep would have to learn to recognise,
+and which the script classifies as `cap-economy` rather than counting. That the
+two fell in adjacent arms is n=3 noise; nothing about hall 45 distinguishes it
+from 30 or 60 on any other column.
+
+**Latency does not lengthen matches.** Excluding the two economy stalemates,
+every arm's median sits between 403 and 490 game seconds against a baseline of
+405 — inside the run-to-run spread of the baseline itself. This confirms §7's
+own correction (which retracted an earlier "latency lengthens matches" reading
+as master's drift) with a proper grid behind it rather than seven runs a side.
+
+**The curve is binding without being punishing.** Mean link across arms runs
+1.18–2.21s, so orders are genuinely paying, and mean orders-in-transit sits
+around 2–3 — the armies are reaching past their chain of command constantly, and
+still resolving their games.
+
+A methodological note that the script enforces rather than assumes: match length
+is inferred as `wall_seconds × WC3_SPEED`, because the engine logs no game
+clock. The inference is self-checking, and checked — capped runs landed on the
+1800s cap with **0.0% error**.
+
+#### Recommended tuning
+
+**hall 30 · hero 18 · step 0.6 · ramp 0.01 · cap 3.0** — one change from
+today's defaults: halve the ramp.
+
+The reason is where the cap starts binding. At ramp 0.02 the curve reaches its
+3.0s ceiling at 120 world units of slack, which on this map is a little over
+half the distance between the two bases — so across much of the ground that is
+actually fought over, the curve has stopped discriminating and every distant
+order costs a flat 3.0s. That shows up in the table as today's default being the
+only arm whose mean link (2.21) sits near the top of §C1's 1.5–3s band with its
+worst pinned at the ceiling. At ramp 0.01 the ceiling is not reached until 240
+units, past the base-to-base distance, so distance means something everywhere on
+the map and the cap goes back to meaning the thing it was designed to mean: the
+severed arm, the penalty for owning no command nodes at all.
+
+The resulting arm measures mean link 1.55s, worst 2.07s, median 424s, 3/3
+decisive on `open` and 3/3 on `crossings` — mid-band, never pinned,
+indistinguishable from baseline on match length.
+
+Hall radius barely mattered across 30/45/60, which is itself worth recording:
+the free bubble's *size* is not the lever, the ramp is. That leaves hall radius
+free to be chosen for legibility ("your base") rather than for balance, and it
+is the parameter the phase-3 forward Outpost will want to reuse.
+
+#### What this sweep does NOT establish, and who has to decide
+
+**The default stays OFF.** Nothing above is grounds to flip it, and the reason
+is that this sweep cannot answer the question the mechanism exists to answer.
+
+Every one of these 45 runs is the scripted `ai.rs` against itself. That AI does
+not micro heroes at the point of contact, does not time attacks against a human's
+decision cadence, and is not slow in the way an LLM commander is slow — so what
+the grid measures is whether command latency *breaks* the game, not whether it
+*equalises* the thing docs/TEMPO.md was written about. It does not break it, on
+either map, at any point of this grid. That is a necessary result and not a
+sufficient one.
+
+The sufficient one is thesis principle 4, and §4's migration path already named
+it: **flip `WC3_COMMAND_LATENCY` on by default only once command nodes appear in
+a winning player's after-action report.** That means a human-vs-Claude rematch,
+played with the flag on and the HUD from §8.3 in front of the human, whose AAR
+talks about where the halls and the hero were — not about input lag.
+
+**That acceptance step needs the project owner.** It is not automatable and this
+bead did not attempt it: an agent cannot sit in the human seat of a
+human-vs-Claude match and report honestly on whether the mechanic felt like a
+game rule. The sweep, the tuning recommendation and the HUD are the preparation
+for that match. The verdict is the owner's.
+
+Other honest limits of the numbers above: n=3 per arm, one map for the grid;
+`report_link_load` only emits when something is in transit, so each arm's mean
+link rests on 1–5 samples per match; and the engine has no seed control, so
+replicates differ only by bounty-placement RNG and frame timing rather than by a
+controlled seed. Widening any of these is a flag away —
+`tools/link_sweep.py --help` documents the axes.
+
+### Reconciled against master (bead/hre, co-command)
+
+Co-command landed while this bead was in flight, and the interesting part is
+that the two beads collided in exactly the same three places — twice by
+converging on the same answer independently, which is usually a sign the answer
+was forced by the shape of the problem rather than chosen.
+
+**Both hit Bevy's 16-parameter ceiling on `write_snapshot`, and both solved it
+the same way.** This bead bundled the compiler's two verdict channels as
+`SeatVerdicts`; hre bundled the copilot queue and the intent journal as
+`CoCommand`, with a comment giving `TeamTech` as its precedent — the same
+precedent this one had cited. Merged, the two bundles sit side by side and the
+system is back to fifteen parameters, with headroom neither bead had alone.
+
+**Both hit Bevy's 20-element tuple limit on the UI's `Update` chain.** hre added
+`update_posture_marker` (the doctrine page's click-to-place point finally got a
+ground visual) and grouped it with `update_ghost` as an unordered pair, on the
+honest grounds that two armed-gesture previews cannot observe each other. This
+bead added two Chain of Command systems and split the chain into two internally
+chained groups. Both were needed: the pair alone is 20 elements and this bead's
+two would have made 22. The merged chain keeps hre's pair *inside* this bead's
+second group.
+
+**`IntentApplied` and `IntentJournal` turned out to be siblings.** Both are
+per-team, both are written only by the compiler, both are read only by
+bridge.rs, and both were registered in `IntentPlugin` next to `IntentErrors`
+with near-identical reasoning in the comment. They now sit together, and the
+comment says "all three" rather than "both".
+
+Nothing about the mechanism itself needed revisiting. The one thing worth
+re-checking was the flag-off wire, because a copilot seat now adds keys of its
+own: `tools/verify_intent_bridge.py` still passes on a plain seat with the
+latency flag off, which is the assertion that a v1 snapshot is still exactly its
+historical sixteen keys. Re-run after the merge, the acceptance sims hold too —
+`open` 2/2 decisive in both arms, `crossings` 5/6 flag-off (the one cap a
+baseline stalemate, in the arm where the classifier has no link telemetry to
+read) and 6/6 flag-on.

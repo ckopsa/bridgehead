@@ -498,6 +498,17 @@ struct StateOut {
     my_team: &'static str,
     seq_applied: u64,
     errors: Vec<String>,
+    /// docs/TEMPO.md §3/§4 — **what your last batch cost to deliver.** One
+    /// entry per command that had to travel, naming it with the same `cmd N`
+    /// identity the `errors` above use, and the seconds the slowest unit it
+    /// spoke to took to receive it.
+    ///
+    /// The positive half of the acknowledgement: `errors` says what was
+    /// refused, this says what the rest cost. Commands that landed in the frame
+    /// they were spoken are simply absent — silence means instant — so this key
+    /// does not exist at all when `WC3_COMMAND_LATENCY` is off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applied: Vec<AppliedOut>,
     game_over: Option<&'static str>,
     me: MeOut,
     /// The ground both seats are fighting over: which layout is loaded and
@@ -651,6 +662,17 @@ struct JournalOut {
     sentence: String,
     /// False when the compiler refused some or all of it.
     ok: bool,
+}
+
+/// One delivered command and its realised link cost, in seconds.
+#[derive(Serialize)]
+struct AppliedOut {
+    /// `"cmd 3"` — the same handle the matching error string is prefixed with.
+    cmd: String,
+    /// Worst link any unit this command named actually paid. A group order
+    /// spread across the map reports its slowest member, which is when the
+    /// whole order is in effect.
+    delay: f32,
 }
 
 /// One command node, as the commander sees it.
@@ -1177,6 +1199,17 @@ struct TeamTech<'w> {
     research: Res<'w, TeamResearch>,
 }
 
+/// What the compiler had to say about the last batch a seat sent: what it
+/// **refused**, and what the rest **cost to deliver**. One acknowledgement in
+/// two halves, so they travel as one parameter — which is also what keeps
+/// `write_snapshot` off Bevy's 16-parameter ceiling now that Chain of Command
+/// has taken two of the slots.
+#[derive(SystemParam)]
+struct SeatVerdicts<'w> {
+    errors: Res<'w, IntentErrors>,
+    applied: Res<'w, IntentApplied>,
+}
+
 /// The co-command side-channel: the pending proposal queue and the team's
 /// recent intent history. Bundled for the same reason `TeamTech` is — this
 /// system sits on Bevy's 16-parameter ceiling, and these two answer the one
@@ -1199,7 +1232,7 @@ fn write_snapshot(
     tech: TeamTech,
     feed: Res<GameEvents>,
     fog: Res<FogGrids>,
-    intent_errors: Res<IntentErrors>,
+    verdicts: SeatVerdicts,
     co: CoCommand,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
@@ -1250,7 +1283,8 @@ fn write_snapshot(
             *tech.research,
             &feed,
             (fog.enabled(), seat_fog),
-            intent_errors.get(seat.team),
+            verdicts.errors.get(seat.team),
+            verdicts.applied.get(seat.team),
             co_out,
             &units,
             &buildings,
@@ -1284,6 +1318,9 @@ fn write_seat_snapshot(
     // your click just bounced off a stale ghost is a partner who can stop
     // proposing around it.
     intent_errors: &[String],
+    // What the rest of that batch cost to deliver — see `StateOut::applied`.
+    // Empty whenever nothing was charged, which is always with the feature off.
+    intent_applied: &[AppliedCommand],
     // `Some` for a copilot seat: its etiquette, its pending queue, what became
     // of the ones it already asked, and its team's recent sentences. `None`
     // for every other seat, which is what keeps their wire format unchanged.
@@ -1608,6 +1645,16 @@ fn write_seat_snapshot(
             .chain(intent_errors.iter())
             .cloned()
             .collect(),
+        // Rounded to the tenth the same way `link` and the intent log's own
+        // `link` field are, so a commander comparing the estimate it read
+        // against the cost it paid is comparing like with like.
+        applied: intent_applied
+            .iter()
+            .map(|a| AppliedOut {
+                cmd: a.cmd.clone(),
+                delay: r1(a.delay),
+            })
+            .collect(),
         game_over: game_over.0.map(team_name),
         me: MeOut {
             gold: eco.gold,
@@ -1908,6 +1955,7 @@ fn poll_commands(
     mut bridge: ResMut<Bridge>,
     game_over: Res<GameOver>,
     mut intent_errors: ResMut<IntentErrors>,
+    mut intent_applied: ResMut<IntentApplied>,
     mut submissions: EventWriter<SubmitIntent>,
     mut copilot_wire: EventWriter<CopilotWire>,
 ) {
@@ -1956,6 +2004,9 @@ fn poll_commands(
         // for this team both start empty.
         seat.errors.clear();
         intent_errors.get_mut(seat.team).clear();
+        // ...and so does the other half of the verdict: `applied` describes the
+        // batch being acknowledged, never the one before it.
+        intent_applied.get_mut(seat.team).clear();
 
         if game_over.0.is_some() {
             seat.errors

@@ -38,6 +38,7 @@ use bevy::window::{PrimaryWindow, SystemCursorIcon};
 use bevy::winit::cursor::CursorIcon;
 use std::collections::{HashMap, VecDeque};
 
+use crate::command::{CommandLink, PendingOrder};
 use crate::copilot::{Copilot, CopilotSet, ProposalVerdict, VetoReason, PROPOSAL_TTL};
 use crate::intent::IntentApply;
 use crate::shared::*;
@@ -297,39 +298,58 @@ impl Plugin for UiPlugin {
             .add_systems(Startup, (setup_ui, setup_hover, setup_fog).chain())
             .add_systems(
                 Update,
+                // Two groups, each internally chained and the pair chained to
+                // each other — one flat tuple would be 22 systems and Bevy's
+                // tuple impls stop at 20. The split is where it reads best:
+                // everything that *takes input* first, everything that *draws
+                // the result* second.
                 (
-                    minimap_static_markers,
-                    // Fog first, so everything downstream in this chain — the
-                    // pickers, the minimap, the hover ring — reads the same
-                    // visibility the player is looking at.
-                    apply_fog_visibility,
-                    update_fog_overlay,
-                    sync_building_ghosts,
-                    surrender_hotkey,
-                    command_input,
-                    panel_clicks,
-                    // Before `minimap_input`: both write `CameraFocus` and
-                    // terrain.rs honours the last one, so a live minimap drag
-                    // outranks a Space press from earlier in the frame.
-                    notification_input,
-                    control_groups,
-                    minimap_input,
-                    left_mouse,
-                    right_mouse,
-                    // Grouped, not listed: a Bevy system tuple tops out at 20
-                    // elements and this chain had reached it. The two armed-
-                    // gesture previews read the cursor and write nothing else
-                    // anybody here reads, so their order relative to each other
-                    // is genuinely free — which is exactly what a nested tuple
-                    // says, while keeping the group's place in the chain.
-                    (update_ghost, update_posture_marker),
-                    update_rally_flag,
-                    hover_feedback,
-                    sync_selection_rings,
-                    update_minimap,
-                    update_minimap_bounties,
-                    update_notifications,
-                    update_hud,
+                    (
+                        minimap_static_markers,
+                        // Fog first, so everything downstream in this chain —
+                        // the pickers, the minimap, the hover ring — reads the
+                        // same visibility the player is looking at.
+                        apply_fog_visibility,
+                        update_fog_overlay,
+                        sync_building_ghosts,
+                        surrender_hotkey,
+                        command_input,
+                        panel_clicks,
+                        // Before `minimap_input`: both write `CameraFocus` and
+                        // terrain.rs honours the last one, so a live minimap
+                        // drag outranks a Space press from earlier in the frame.
+                        notification_input,
+                        control_groups,
+                        minimap_input,
+                        left_mouse,
+                        right_mouse,
+                    )
+                        .chain(),
+                    (
+                        // Grouped, not listed: the two armed-gesture previews
+                        // read the cursor and write nothing else anybody here
+                        // reads, so their order relative to each other is
+                        // genuinely free — which is exactly what a nested tuple
+                        // says, while keeping the group's place in the chain.
+                        (update_ghost, update_posture_marker),
+                        update_rally_flag,
+                        // Chain of Command feedback. Like every system here it
+                        // runs before the compiler, so a click gets its marker
+                        // on the next frame rather than this one — 16ms, which
+                        // is the difference between "acknowledged instantly"
+                        // and "acknowledged instantly" as far as a player is
+                        // concerned, and is what keeps the whole UI one ordered
+                        // chain instead of two.
+                        update_link_rings,
+                        update_transit_markers,
+                        hover_feedback,
+                        sync_selection_rings,
+                        update_minimap,
+                        update_minimap_bounties,
+                        update_notifications,
+                        update_hud,
+                    )
+                        .chain(),
                 )
                     // Every gesture system here submits intents; the compiler
                     // runs after all of them, so a click is compiled in the
@@ -415,9 +435,18 @@ struct UiState {
 #[derive(Resource)]
 struct UiAssets {
     ring_mesh: Handle<Mesh>,
+    /// A *thin* ring, for circles drawn at map scale. `ring_mesh`'s band is
+    /// 16% of its radius, which reads as a donut once the radius is a command
+    /// node's 30 world units rather than a unit's 1.1.
+    hairline_mesh: Handle<Mesh>,
     ring_mat: Handle<StandardMaterial>,
     ghost_ok: Handle<StandardMaterial>,
     ghost_bad: Handle<StandardMaterial>,
+    /// docs/TEMPO.md §4 — the circle inside which your orders are free.
+    node_ring_mat: Handle<StandardMaterial>,
+    /// An order still travelling, in the rally flag's gold: both mean "this is
+    /// where a thing you said is going to happen".
+    transit_mat: Handle<StandardMaterial>,
 }
 
 #[derive(Resource)]
@@ -510,6 +539,19 @@ struct HoverRing;
 #[derive(Component)]
 struct RallyFlag;
 
+/// One pooled ring showing the free radius of an own command node
+/// (docs/TEMPO.md §3). Drawn only while `WC3_COMMAND_LATENCY` is on, so with
+/// the feature off not one of these entities is ever spawned.
+#[derive(Component)]
+struct LinkRing;
+
+/// One pooled marker at the destination of a selected unit's in-transit order,
+/// closing as the order arrives. This is the countdown: the ring's radius is
+/// `ready_at - now` made visible, so an order in flight looks like an order in
+/// flight rather than like the game ignoring the click.
+#[derive(Component)]
+struct TransitRing;
+
 /// Container of the minimap; all markers are absolute children of it.
 #[derive(Component)]
 struct MinimapRoot;
@@ -572,6 +614,13 @@ enum Slot {
     /// The selection's answer to "why are you doing that?" — verbatim the same
     /// string the bridge reads from the snapshot's `units[].why`.
     Why,
+    /// What reaching the selection costs, and what is already on its way —
+    /// the HUD's half of the snapshot's `units[].link` / `units[].pending`
+    /// (docs/TEMPO.md §4). Empty string whenever the mechanic is off.
+    Link,
+    /// Top bar: how much of this army is inside its own chain of command.
+    /// Empty string whenever the mechanic is off.
+    Coverage,
     Overflow,
     CardLetter(usize),
     /// Squad badge in the corner of a selection tile — the digit `Ctrl+N` and
@@ -1043,6 +1092,68 @@ fn sorted_doctrine(mut list: Vec<(u32, UnitDoctrine)>) -> Vec<UnitDoctrine> {
 /// A live `SquadPosture`, in the panel's compact shorthand. The point is
 /// spelled out because a posture *is* its point — "defend" alone tells the
 /// player nothing about which ground they told the squad to hold.
+/// **What reaching this selection costs**, for the info panel — the HUD's half
+/// of the snapshot's `units[].link` and `units[].pending` (docs/TEMPO.md §4,
+/// follow-up 7). Without a readout like this the mechanic is indistinguishable
+/// from input lag, which is exactly why the feature ships default-off.
+///
+/// Tallied like [`why_line`] and for the same reason, but sorted **worst
+/// first**: the number that decides whether to reach for a unit at all is the
+/// slowest one in the selection, not the typical one.
+///
+/// `in_transit` carries the link each already-travelling order is paying. The
+/// panel reports that, not the time remaining — the countdown belongs to the
+/// closing ring on the ground ([`update_transit_markers`]), and a number that
+/// ticks in the corner of the screen is a worse answer to "is my order lost?"
+/// than a marker at the place the order is going.
+fn link_line(mut links: Vec<f32>, in_transit: Vec<f32>) -> String {
+    if links.is_empty() {
+        return String::new();
+    }
+    links.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let mut tally: Vec<(String, usize)> = Vec::new();
+    for l in links {
+        let key = format!("{l:.1}s");
+        match tally.last_mut() {
+            Some((seen, n)) if *seen == key => *n += 1,
+            _ => tally.push((key, 1)),
+        }
+    }
+    let shown: Vec<String> = tally
+        .iter()
+        .take(2)
+        .map(|(k, n)| if *n > 1 { format!("{k} x{n}") } else { k.clone() })
+        .collect();
+    let more = if tally.len() > 2 {
+        format!("  (+{} more)", tally.len() - 2)
+    } else {
+        String::new()
+    };
+    let mut out = format!("Link: {}{more}", shown.join("   "));
+    if !in_transit.is_empty() {
+        let worst = in_transit.iter().copied().fold(0.0_f32, f32::max);
+        out.push_str(&format!(
+            "   ·   {} in transit ({worst:.1}s)",
+            in_transit.len()
+        ));
+    }
+    out
+}
+
+/// **How much of this army is inside its own chain of command**, for the top
+/// bar. A standing fact rather than an alert, and the one number that tells a
+/// player whether their next click will be answered at once.
+///
+/// Empty — and so invisible — whenever the mechanic is off, which is what makes
+/// a flag-off match pixel-identical to v1.
+fn coverage_line(on: bool, nodes: usize, covered: usize, total: usize) -> String {
+    if !on {
+        return String::new();
+    }
+    let plural = if nodes == 1 { "" } else { "s" };
+    format!("Chain: {nodes} node{plural} · {covered}/{total} in reach")
+}
+
 /// The selection's answer to "why are you doing that?", for the info panel.
 ///
 /// Every string here is byte-identical to what the same unit reports in the
@@ -2459,6 +2570,28 @@ fn setup_ui(
 ) {
     // --- 3D helper assets -------------------------------------------------
     let ring_mesh = meshes.add(Torus::new(0.84, 1.0));
+    // Same unit circle, drawn as a hairline: at a command node's radius the
+    // 16%-of-radius band above would be a 5-unit-wide donut over the base.
+    let hairline_mesh = meshes.add(Torus::new(0.985, 1.0));
+    let node_ring_mat = materials.add(StandardMaterial {
+        // Deliberately quiet: this is a standing fact about the map, not an
+        // alert. It is on screen for the whole match, so it has to be
+        // ignorable — docs/TEMPO.md §4 asks for feedback, not for decoration.
+        base_color: Color::srgba(0.42, 0.72, 1.0, 0.30),
+        emissive: LinearRgba::new(0.06, 0.16, 0.30, 1.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    let transit_mat = materials.add(StandardMaterial {
+        // The rally flag's gold, on purpose: the player already reads that
+        // colour as "somewhere I told something to go".
+        base_color: Color::srgba(1.0, 0.84, 0.20, 0.55),
+        emissive: LinearRgba::new(0.55, 0.42, 0.05, 1.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
     let ring_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.25, 1.0, 0.35),
         emissive: LinearRgba::new(0.1, 0.6, 0.15, 1.0),
@@ -2537,9 +2670,12 @@ fn setup_ui(
 
     commands.insert_resource(UiAssets {
         ring_mesh,
+        hairline_mesh,
         ring_mat,
         ghost_ok,
         ghost_bad,
+        node_ring_mat,
+        transit_mat,
     });
 
     // --- Top resource bar --------------------------------------------------
@@ -2570,6 +2706,14 @@ fn setup_ui(
                 18.0,
                 Color::WHITE,
                 Slot::Supply,
+            ));
+            // Node coverage. Empty — and therefore invisible, the bar being
+            // left-packed — for every match played with the feature off.
+            p.spawn(text_bundle(
+                "",
+                16.0,
+                Color::srgb(0.55, 0.78, 1.0),
+                Slot::Coverage,
             ));
         });
 
@@ -3150,6 +3294,14 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                 12.0,
                 Color::srgb(0.70, 0.70, 0.78),
                 Slot::Why,
+            ));
+            // Directly under `Why`, and for the same reason it sits there: a
+            // unit's reason and the cost of changing it are one thought.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(0.55, 0.78, 1.0),
+                Slot::Link,
             ));
             c.spawn(text_bundle(
                 "Left-click / drag to select.",
@@ -5156,6 +5308,147 @@ fn update_rally_flag(
 }
 
 // ---------------------------------------------------------------------------
+// Chain of Command feedback (docs/TEMPO.md §4, follow-up 7)
+//
+// Three readouts, one rule: with `WC3_COMMAND_LATENCY` off the HUD is
+// pixel-identical to v1. Two of the three get that for free rather than by a
+// check — no `PendingOrder` can exist with the feature off, and the node cache
+// is never built — and the third asks `latency.on` once.
+// ---------------------------------------------------------------------------
+
+/// Height of the node-coverage rings. Above `FOG_PLANE_Y` so a ring is not
+/// dimmed by the fog quad: these circles describe your own halls and your own
+/// hero, and there is nothing about them you have to scout.
+const LINK_RING_Y: f32 = 0.2;
+/// The in-transit marker's ring at the moment the order is spoken...
+const TRANSIT_RING_MAX: f32 = 5.0;
+/// ...and at the moment it lands. It never reaches zero: the last frame before
+/// arrival should still be a visible mark on the ground.
+const TRANSIT_RING_MIN: f32 = 1.2;
+
+/// Where an order is sending the unit, if it names a place at all.
+///
+/// `Idle` and `ReturnResources` name none — a returning worker picks its
+/// drop-off on arrival, so there is no one point to draw — and neither can be
+/// the subject of a delayed direct order anyway (`stop` compiles to a Move to
+/// the unit's own feet, precisely so that it *is* one).
+fn order_destination(order: &Order, at: impl Fn(Entity) -> Option<Vec3>) -> Option<Vec3> {
+    match order {
+        Order::Move(p) | Order::AttackMove(p) => Some(*p),
+        Order::Build { pos, .. } => Some(*pos),
+        Order::Attack(e) | Order::Harvest(e) | Order::Follow(e) => at(*e),
+        Order::Idle | Order::ReturnResources => None,
+    }
+}
+
+/// Draw the free radius of each of the player's own command nodes.
+///
+/// Own team only, exactly as the snapshot reports it to a commander
+/// (docs/TEMPO.md §4: "symmetric with what the HUD shows the human"). The
+/// enemy's chain of command is something you learn by razing it.
+fn update_link_rings(
+    mut commands: Commands,
+    assets: Res<UiAssets>,
+    link: CommandLink,
+    mut rings: Query<(&mut Transform, &mut Visibility), With<LinkRing>>,
+) {
+    // With the feature off the cache is never refreshed, but ask the flag
+    // rather than lean on that: this is the one of the three readouts that
+    // could otherwise draw a stale circle.
+    let wanted: Vec<(Vec3, f32)> = if link.latency.on {
+        link.nodes.own(Team::Human).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Pool: reuse, hide the surplus, spawn the shortfall — the same shape as
+    // `update_minimap_bounties`, because halls are built and razed and a hero
+    // dies and respawns.
+    let mut used = 0usize;
+    for (mut tf, mut vis) in &mut rings {
+        match wanted.get(used) {
+            Some((pos, radius)) => {
+                tf.translation = Vec3::new(pos.x, LINK_RING_Y, pos.z);
+                tf.scale = Vec3::new(*radius, 0.12, *radius);
+                *vis = Visibility::Visible;
+            }
+            None => *vis = Visibility::Hidden,
+        }
+        used += 1;
+    }
+    for (pos, radius) in wanted.iter().skip(used) {
+        commands.spawn((
+            Mesh3d(assets.hairline_mesh.clone()),
+            MeshMaterial3d(assets.node_ring_mat.clone()),
+            Transform::from_xyz(pos.x, LINK_RING_Y, pos.z)
+                .with_scale(Vec3::new(*radius, 0.12, *radius)),
+            LinkRing,
+        ));
+    }
+}
+
+/// **The countdown.** A ring at the destination of every selected unit's
+/// in-transit order, closing as the order arrives.
+///
+/// This is the piece that decides whether the mechanic reads as a game rule or
+/// as a broken mouse. A player who clicks and sees nothing happen concludes the
+/// game dropped the click; a player who clicks and sees a marker appear where
+/// they clicked, and tighten, concludes the order is on its way — which is the
+/// truth, and is also the information they need to decide whether to wait.
+///
+/// No flag check and none needed: `PendingOrder` cannot exist with the feature
+/// off, so the query is empty, no marker is ever spawned, and the flag-off HUD
+/// is untouched by construction rather than by promise.
+#[allow(clippy::type_complexity)]
+fn update_transit_markers(
+    mut commands: Commands,
+    time: Res<Time>,
+    assets: Res<UiAssets>,
+    travelling: Query<(&Team, &PendingOrder), (With<Selected>, With<Unit>)>,
+    targets: Query<&Transform, Without<TransitRing>>,
+    mut markers: Query<(&mut Transform, &mut Visibility), With<TransitRing>>,
+) {
+    let now = time.elapsed_secs();
+    let at = |e: Entity| targets.get(e).ok().map(|tf| tf.translation);
+
+    let wanted: Vec<(Vec3, f32)> = travelling
+        .iter()
+        .filter(|(team, _)| **team == Team::Human)
+        .filter_map(|(_, pending)| {
+            let dest = order_destination(&pending.order, at)?;
+            // How much of the journey is left, 1 at the moment it was spoken
+            // and 0 as it lands. `link()` is never zero here — a zero-delay
+            // order is applied instantly and never becomes a `PendingOrder`.
+            let remaining = ((pending.ready_at - now) / pending.link()).clamp(0.0, 1.0);
+            Some((dest, remaining))
+        })
+        .collect();
+
+    let mut used = 0usize;
+    for (mut tf, mut vis) in &mut markers {
+        match wanted.get(used) {
+            Some((dest, remaining)) => {
+                let r = TRANSIT_RING_MIN + (TRANSIT_RING_MAX - TRANSIT_RING_MIN) * remaining;
+                tf.translation = Vec3::new(dest.x, LINK_RING_Y, dest.z);
+                tf.scale = Vec3::new(r, 0.12, r);
+                *vis = Visibility::Visible;
+            }
+            None => *vis = Visibility::Hidden,
+        }
+        used += 1;
+    }
+    for (dest, _) in wanted.iter().skip(used) {
+        commands.spawn((
+            Mesh3d(assets.ring_mesh.clone()),
+            MeshMaterial3d(assets.transit_mat.clone()),
+            Transform::from_xyz(dest.x, LINK_RING_Y, dest.z)
+                .with_scale(Vec3::new(TRANSIT_RING_MAX, 0.12, TRANSIT_RING_MAX)),
+            TransitRing,
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Selection rings
 // ---------------------------------------------------------------------------
 
@@ -5801,6 +6094,31 @@ struct CardView {
     squad: Option<u8>,
 }
 
+/// Everything the panel needs to answer **"why is this selection doing that,
+/// and what would it cost me to change its mind?"** — one `SystemParam` because
+/// they are one question, and because `update_hud` sits on Bevy's
+/// 16-parameter ceiling and Chain of Command would otherwise have needed three
+/// of the slots on its own.
+#[allow(clippy::type_complexity)]
+#[derive(SystemParam)]
+struct SelectionReasons<'w, 's> {
+    /// The selection's `Provenance`, verbatim what the snapshot reports.
+    why: Query<'w, 's, (&'static Team, Option<&'static Provenance>), (With<Selected>, With<Unit>)>,
+    /// The curve and the node cache — `link.delay(team, pos)` is the estimate
+    /// the panel prints and the snapshot's `units[].link` reports.
+    link: CommandLink<'w>,
+    /// The selection's positions and anything already travelling to it.
+    selected: Query<
+        'w,
+        's,
+        (&'static Team, &'static Transform, Option<&'static PendingOrder>),
+        (With<Selected>, With<Unit>),
+    >,
+    /// Every unit on the map — the coverage indicator is about the whole army,
+    /// not the part of it that happens to be selected.
+    all: Query<'w, 's, (&'static Team, &'static Transform), With<Unit>>,
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_hud(
     mut ui: ResMut<UiState>,
@@ -5847,10 +6165,10 @@ fn update_hud(
         ),
         With<Selected>,
     >,
-    // Kept as its own read-only query rather than a 14th column on
-    // `sel_units`: provenance is orthogonal to everything that panel shows,
-    // and widening that tuple means editing five positional destructures.
-    sel_why: Query<(&Team, Option<&Provenance>), (With<Selected>, With<Unit>)>,
+    // Kept out of `sel_units` rather than added as a 14th column: provenance
+    // is orthogonal to everything that panel shows, and widening that tuple
+    // means editing five positional destructures.
+    reasons: SelectionReasons,
     sel_buildings: Query<
         (
             Entity,
@@ -6174,12 +6492,50 @@ fn update_hud(
     // Own units only — reading an opponent's chain of command would be reading
     // their plan, which is exactly what the snapshot refuses the other seat.
     let why_text = why_line(
-        sel_why
+        reasons
+            .why
             .iter()
             .filter(|(team, _)| **team == Team::Human)
             .map(|(_, why)| why.map_or_else(|| NO_PROVENANCE.to_string(), Provenance::why))
             .collect(),
     );
+
+    // What reaching this selection costs, and what is already on its way.
+    // `link.delay` with the feature off is a constant zero by construction
+    // (`CommandLatency::delay_for_slack` returns early), so this is a
+    // meaningless-but-harmless "Link: 0.0s" — which is why the panel line is
+    // suppressed outright below rather than allowed to print it.
+    let latency_on = reasons.link.latency.on;
+    let (link_text, coverage_text) = if latency_on {
+        let mut links = Vec::new();
+        let mut in_transit = Vec::new();
+        for (team, tf, pending) in &reasons.selected {
+            if *team != Team::Human {
+                continue;
+            }
+            links.push(reasons.link.delay(Team::Human, tf.translation));
+            if let Some(p) = pending {
+                in_transit.push(p.link());
+            }
+        }
+        let (mut covered, mut total) = (0usize, 0usize);
+        for (team, tf) in &reasons.all {
+            if *team != Team::Human {
+                continue;
+            }
+            total += 1;
+            if reasons.link.delay(Team::Human, tf.translation) <= 0.0 {
+                covered += 1;
+            }
+        }
+        let nodes = reasons.link.nodes.own(Team::Human).count();
+        (
+            link_line(links, in_transit),
+            coverage_line(true, nodes, covered, total),
+        )
+    } else {
+        (String::new(), String::new())
+    };
 
     // Hero commands: the ability of a selected caster, one train/revive button
     // per hero class the team's slots have room for, the building's own
@@ -6397,6 +6753,8 @@ fn update_hud(
             Slot::Items => text.0 = items_text.clone(),
             Slot::Doctrine => text.0 = doctrine_line.clone(),
             Slot::Why => text.0 = why_text.clone(),
+            Slot::Link => text.0 = link_text.clone(),
+            Slot::Coverage => text.0 = coverage_text.clone(),
             Slot::Overflow => text.0 = overflow_text.clone(),
             Slot::CardLetter(i) => {
                 text.0 = cards.get(i).map(|c| c.letter.clone()).unwrap_or_default();
@@ -8267,6 +8625,88 @@ mod tests {
     }
 
     /// The same invariant, carried onto the cards the test above never
+    /// **The HUD's answer to "is my order lost?"** (docs/TEMPO.md follow-up 7).
+    ///
+    /// Without a readout the mechanic is indistinguishable from input lag —
+    /// which is the stated reason `WC3_COMMAND_LATENCY` still defaults off — so
+    /// what these two lines say is part of the feature, not decoration on it.
+    ///
+    /// Worst-first is the load-bearing choice: a player deciding whether to
+    /// reach for a strung-out selection is asking about its slowest unit, not
+    /// its typical one, and a line that led with "0.0s" because most of the
+    /// group is at home would answer the wrong question.
+    #[test]
+    fn the_link_readout_leads_with_the_slowest_unit_in_the_selection() {
+        // One line when the selection is coherent.
+        assert_eq!(link_line(vec![1.2, 1.2, 1.2], vec![]), "Link: 1.2s x3");
+        // Worst first when it is not, whatever order the query yielded.
+        assert_eq!(
+            link_line(vec![0.0, 2.4, 0.0, 0.0], vec![]),
+            "Link: 2.4s   0.0s x3"
+        );
+        // More than two distinct costs: the two that matter, then a count.
+        let spread = link_line(vec![0.0, 1.0, 2.0, 3.0], vec![]);
+        assert!(
+            spread.starts_with("Link: 3.0s   2.0s") && spread.ends_with("(+2 more)"),
+            "a strung-out selection should still lead with its worst: {spread}"
+        );
+        // Orders already travelling are counted, and reported by the link they
+        // are paying — the time REMAINING is the closing ring's job.
+        assert_eq!(
+            link_line(vec![1.8, 1.8], vec![1.8, 0.9]),
+            "Link: 1.8s x2   ·   2 in transit (1.8s)"
+        );
+        // Nothing selected, nothing to say.
+        assert_eq!(link_line(vec![], vec![]), "");
+    }
+
+    /// **Flag off, HUD unchanged.** The promise the whole feature ships on: a
+    /// match played without `WC3_COMMAND_LATENCY` must look exactly like v1.
+    /// Both readouts collapse to the empty string, and an empty `Text` in a
+    /// left-packed bar and a column of panel lines occupies nothing.
+    ///
+    /// The two world-space markers get the same guarantee structurally rather
+    /// than by a check — `update_link_rings` asks `latency.on` before it
+    /// collects anything, and `update_transit_markers` queries `PendingOrder`,
+    /// which cannot exist with the feature off — so this test covers the half
+    /// that is a decision rather than a consequence.
+    #[test]
+    fn the_hud_says_nothing_at_all_when_the_chain_of_command_is_off() {
+        assert_eq!(coverage_line(false, 3, 8, 12), "");
+        // ...and says something useful when it is on.
+        assert_eq!(coverage_line(true, 3, 8, 12), "Chain: 3 nodes · 8/12 in reach");
+        assert_eq!(coverage_line(true, 1, 0, 4), "Chain: 1 node · 0/4 in reach");
+    }
+
+    /// An in-transit order has to point somewhere for the countdown ring to be
+    /// drawn there. Every verb that can be delayed names a place — either
+    /// directly or through the entity it targets — and the two that do not are
+    /// two that can never be delayed: `stop` compiles to a Move onto the unit's
+    /// own feet rather than to `Idle`, precisely so that it has a destination.
+    #[test]
+    fn every_delayable_order_names_a_place_to_draw_its_marker() {
+        let target = Vec3::new(12.0, 0.0, -4.0);
+        let somewhere = Vec3::new(30.0, 0.0, 30.0);
+        let at = |_| Some(target);
+
+        assert_eq!(order_destination(&Order::Move(somewhere), at), Some(somewhere));
+        assert_eq!(
+            order_destination(&Order::AttackMove(somewhere), at),
+            Some(somewhere)
+        );
+        // Entity-targeted orders resolve through the target's transform, so the
+        // ring sits on the thing being attacked rather than on stale ground.
+        let victim = Entity::from_raw(7);
+        assert_eq!(order_destination(&Order::Attack(victim), at), Some(target));
+        assert_eq!(order_destination(&Order::Harvest(victim), at), Some(target));
+        assert_eq!(order_destination(&Order::Follow(victim), at), Some(target));
+        // ...and gracefully give up when the target died while the order flew.
+        assert_eq!(order_destination(&Order::Attack(victim), |_| None), None);
+
+        assert_eq!(order_destination(&Order::Idle, at), None);
+        assert_eq!(order_destination(&Order::ReturnResources, at), None);
+    }
+
     /// reaches: a PRODUCTION building's. A worker card is builds and toggles;
     /// a building card is train slots plus that building's abilities, its
     /// tier-up and the page toggle, and those letters are chosen from a
