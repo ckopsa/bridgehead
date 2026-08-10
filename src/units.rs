@@ -136,6 +136,14 @@ struct UnitAssets {
     priestess_hood: Handle<Mesh>,
     priestess_staff: Handle<Mesh>,
     priestess_tip: Handle<Mesh>,
+    knight_mount: Handle<Mesh>,
+    knight_leg: Handle<Mesh>,
+    knight_rider: Handle<Mesh>,
+    knight_lance: Handle<Mesh>,
+    gryphon_body: Handle<Mesh>,
+    gryphon_wing: Handle<Mesh>,
+    gryphon_tail: Handle<Mesh>,
+    gryphon_rider: Handle<Mesh>,
     head: Handle<Mesh>,
     human_mat: Handle<StandardMaterial>,
     claude_mat: Handle<StandardMaterial>,
@@ -230,6 +238,23 @@ fn setup_unit_assets(
         priestess_hood: meshes.add(Sphere::new(0.26)),
         priestess_staff: meshes.add(Cuboid::new(0.07, 1.30, 0.07)),
         priestess_tip: meshes.add(Sphere::new(0.11)),
+        // Knight: the Raider's silhouette rebuilt in steel and scaled up — a
+        // heavier barded mount, thicker legs, an armoured rider, and a lance
+        // couched forward past the horse's head. The read from the RTS camera
+        // is "the same shape as a Raider, but bigger and metal", which is
+        // exactly what it is: cavalry, so the spear line still answers it.
+        knight_mount: meshes.add(Capsule3d::new(0.36, 0.92)),
+        // 0.42 tall so the legs meet the ground from their centre at -0.62.
+        knight_leg: meshes.add(Cylinder::new(0.11, 0.42)),
+        knight_rider: meshes.add(Capsule3d::new(0.23, 0.40)),
+        knight_lance: meshes.add(Cylinder::new(0.055, 2.10)),
+        // Gryphon Rider: a wide horizontal wingspan is the whole silhouette.
+        // Nothing else on the field is broader than it is tall, so at altitude
+        // the shape alone says "you cannot reach this".
+        gryphon_body: meshes.add(Capsule3d::new(0.30, 0.86)),
+        gryphon_wing: meshes.add(Cuboid::new(1.55, 0.07, 0.62)),
+        gryphon_tail: meshes.add(Cone::new(0.16, 0.70)),
+        gryphon_rider: meshes.add(Capsule3d::new(0.20, 0.34)),
         head: meshes.add(Sphere::new(0.20)),
         human_mat: solid(Team::Human.color()),
         claude_mat: solid(Team::Claude.color()),
@@ -258,6 +283,12 @@ fn unit_height(kind: UnitKind) -> f32 {
         // Taller than a Footman and much narrower — before the spear is even
         // drawn, the silhouette says "reach, not shoulders".
         UnitKind::Spearman => 1.56,
+        // Taller and heavier than the Raider's 1.50 — armoured horse, armoured
+        // man. The extra 0.2 is the whole visual claim of a tier-3 unit.
+        UnitKind::Knight => 1.70,
+        // Measured through the body, not the wings: what makes the Gryphon
+        // unmistakable is width and altitude, not height.
+        UnitKind::GryphonRider => 1.40,
     }
 }
 
@@ -330,6 +361,11 @@ fn spawn_units(
             UnitKind::Raider => assets.raider_rider.clone(),
             UnitKind::Priestess => assets.priestess_body.clone(),
             UnitKind::Spearman => assets.spearman_body.clone(),
+            // Both mounted kinds put the RIDER at the root for the same reason
+            // the Raider does: the root wears the team colour and faces where
+            // the unit faces, and the beast underneath is a child.
+            UnitKind::Knight => assets.knight_rider.clone(),
+            UnitKind::GryphonRider => assets.gryphon_rider.clone(),
         };
         // Everyone wears their team's colour; the catapult is a wooden machine
         // that merely carries a painted panel (spawned as a child below).
@@ -362,6 +398,10 @@ fn spawn_units(
         // (much taller) mounted silhouette.
         let head_y = match ev.kind {
             UnitKind::Raider => 0.45,
+            // Same reason as the Raider: the head belongs on the rider capsule,
+            // not on top of the whole mounted (or airborne) silhouette.
+            UnitKind::Knight => 0.50,
+            UnitKind::GryphonRider => 0.42,
             _ => unit_height(ev.kind) * 0.5 - 0.05,
         };
 
@@ -416,6 +456,8 @@ fn spawn_units(
                 UnitKind::Raider => "Raider",
                 UnitKind::Priestess => "Priestess",
                 UnitKind::Spearman => "Spearman",
+                UnitKind::Knight => "Knight",
+                UnitKind::GryphonRider => "Gryphon Rider",
             }),
         ));
 
@@ -569,6 +611,68 @@ fn spawn_units(
                         Mesh3d(assets.spearman_head.clone()),
                         MeshMaterial3d(assets.metal_mat.clone()),
                         Transform::from_xyz(0.30, 1.52, -0.04),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Knight => {
+                    // The barded warhorse: a steel-grey capsule laid along Z,
+                    // slung under the rider exactly like the Raider's mount but
+                    // heavier and metal rather than beast-dark.
+                    parent.spawn((
+                        Mesh3d(assets.knight_mount.clone()),
+                        MeshMaterial3d(assets.metal_mat.clone()),
+                        Transform::from_xyz(0.0, -0.18, 0.0)
+                            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                    // Four heavy legs under the barrel.
+                    for (x, z) in [(-0.23, -0.40), (0.23, -0.40), (-0.23, 0.40), (0.23, 0.40)] {
+                        parent.spawn((
+                            Mesh3d(assets.knight_leg.clone()),
+                            MeshMaterial3d(assets.dark_mat.clone()),
+                            Transform::from_xyz(x, -0.62, z),
+                            UnitAccent,
+                        ));
+                    }
+                    // The lance, couched under the right arm and levelled along
+                    // -Z (the facing direction), reaching well past the horse's
+                    // head. This is the line-breaker's whole story in one prop.
+                    parent.spawn((
+                        Mesh3d(assets.knight_lance.clone()),
+                        MeshMaterial3d(assets.wood_mat.clone()),
+                        Transform::from_xyz(0.34, 0.02, -0.55)
+                            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::GryphonRider => {
+                    // The beast: a capsule laid along Z under the rider.
+                    parent.spawn((
+                        Mesh3d(assets.gryphon_body.clone()),
+                        MeshMaterial3d(assets.wood_mat.clone()),
+                        Transform::from_xyz(0.0, -0.20, 0.05)
+                            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                    // Wings: two broad slabs swept out and up from the
+                    // shoulders. Nearly 3.5 units across at unit scale, which
+                    // is wider than any ground unit is tall — the silhouette IS
+                    // the unit's rules, readable from the camera at altitude.
+                    for (x, roll) in [(-0.85_f32, 0.30_f32), (0.85, -0.30)] {
+                        parent.spawn((
+                            Mesh3d(assets.gryphon_wing.clone()),
+                            MeshMaterial3d(assets.robe_mat.clone()),
+                            Transform::from_xyz(x, -0.02, 0.05)
+                                .with_rotation(Quat::from_rotation_z(roll)),
+                            UnitAccent,
+                        ));
+                    }
+                    // Tail streaming behind (+Z is "back" for look_to facing).
+                    parent.spawn((
+                        Mesh3d(assets.gryphon_tail.clone()),
+                        MeshMaterial3d(assets.wood_mat.clone()),
+                        Transform::from_xyz(0.0, -0.20, 0.72)
+                            .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
                         UnitAccent,
                     ));
                 }

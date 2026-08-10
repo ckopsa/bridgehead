@@ -1088,14 +1088,23 @@ fn build_cards() -> Vec<(u8, BuildingKind, KeyCode, &'static str)> {
     cards
 }
 
-/// Production hotkeys, by index into `trainable()`: Q, W, E, R. A Shop trains
+/// Production hotkeys, by index into `trainable()`: Q, W, E, R, T. A Shop trains
 /// nothing, so its buy buttons reuse the same letters without colliding, and
 /// the hero's [R] lives on a unit selection, never a building one.
-const TRAIN_KEYS: [(KeyCode, &str); 4] = [
+///
+/// [T] joined when the Castle-gated Knight took the Barracks' fifth slot. It is
+/// the next key along the same keyboard row, which keeps the row unbroken, and
+/// the only other [T] in the game is the hero's Auto-Slam toggle — a toggle
+/// that only exists on a UNIT selection, where no train button is ever drawn.
+/// Same reasoning as the Shop's buy buttons: production hotkeys collide with
+/// nothing because a building selection and a unit selection are disjoint
+/// cards.
+const TRAIN_KEYS: [(KeyCode, &str); 5] = [
     (KeyCode::KeyQ, "Q"),
     (KeyCode::KeyW, "W"),
     (KeyCode::KeyE, "E"),
     (KeyCode::KeyR, "R"),
+    (KeyCode::KeyT, "T"),
 ];
 
 /// Inventory-slot hotkeys, by slot index.
@@ -1198,8 +1207,8 @@ fn ability_slots(
 ///   fighters             A S | G V P | I                    (6)
 ///   hero                 A S R | Z X (carried items) | G V P T | I  (<=12)
 ///   town hall            Q(Worker) W/E(hero class) C(CallToArms) U | I
-///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman) | I  (5)
-///   workshop             Q(Catapult) | I                     (2)
+///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman) T(Knight) | I  (6)
+///   workshop             Q(Catapult) W(Gryphon Rider) | I     (3)
 ///   shop                 Q W E R I — the shelf, five rungs (see `SHOP_KEYS`)
 ///   blacksmith           Q(Attack) W(Armor)                  (2)
 ///
@@ -1674,6 +1683,8 @@ fn unit_name(kind: UnitKind) -> &'static str {
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
         UnitKind::Spearman => "Spearman",
+        UnitKind::Knight => "Knight",
+        UnitKind::GryphonRider => "Gryphon",
     }
 }
 
@@ -6321,5 +6332,88 @@ mod tests {
         let before = keys.len();
         keys.dedup();
         assert_eq!(before, keys.len(), "no two buttons share a hotkey");
+    }
+
+    /// The same invariant, carried onto the cards the test above never
+    /// reaches: a PRODUCTION building's. A worker card is builds and toggles;
+    /// a building card is train slots plus that building's abilities, its
+    /// tier-up and the page toggle, and those letters are chosen from a
+    /// different pool. The Barracks is the pressing case — it now offers five
+    /// units, so `TRAIN_KEYS` had to grow a fifth letter, and [T] is only safe
+    /// because the other [T] in the game (Auto-Slam) lives on a unit
+    /// selection and [T Stand Down] on the doctrine page, both disjoint from
+    /// this card.
+    #[test]
+    fn every_production_card_keeps_its_hotkeys_unique() {
+        // Tier 3 in hand, so nothing is hidden behind a tech gate and every
+        // train slot a building can ever show is on the card at once.
+        let completed = [
+            BuildingKind::TownHall,
+            BuildingKind::Castle,
+            BuildingKind::Barracks,
+            BuildingKind::Workshop,
+            BuildingKind::Blacksmith,
+            BuildingKind::Shop,
+        ];
+        for kind in ALL_BUILDING_KINDS {
+            let entries = command_entries(
+                CardPage::Orders,
+                0,
+                false,
+                Some((kind, true)),
+                HeroCmds::default(),
+                DoctrineCard::default(),
+                &completed,
+            );
+            assert!(
+                entries.len() <= CMD_SLOTS,
+                "{kind:?}'s card overflows: {} entries",
+                entries.len(),
+            );
+            let mut keys: Vec<KeyCode> = entries.iter().map(|e| e.key).collect();
+            keys.sort_by_key(|k| format!("{k:?}"));
+            let before = keys.len();
+            keys.dedup();
+            assert_eq!(
+                before,
+                keys.len(),
+                "two buttons share a hotkey on the {kind:?} card",
+            );
+        }
+
+        // ...and the two tier-3 slots really are on those cards, which is what
+        // makes the check above worth running: a unit with no button has no
+        // route in for a player at the keyboard.
+        let barracks = command_entries(
+            CardPage::Orders,
+            0,
+            false,
+            Some((BuildingKind::Barracks, true)),
+            HeroCmds::default(),
+            DoctrineCard::default(),
+            &completed,
+        );
+        let knight = barracks
+            .iter()
+            .find(|e| e.action == CmdAction::Train(UnitKind::Knight))
+            .expect("the Barracks must offer the Knight at T3");
+        assert_eq!(knight.key, KeyCode::KeyT, "the Knight sits on [T]");
+        assert!(knight.enabled, "and a Castle standing must enable it");
+
+        let workshop = command_entries(
+            CardPage::Orders,
+            0,
+            false,
+            Some((BuildingKind::Workshop, true)),
+            HeroCmds::default(),
+            DoctrineCard::default(),
+            &completed,
+        );
+        let gryphon = workshop
+            .iter()
+            .find(|e| e.action == CmdAction::Train(UnitKind::GryphonRider))
+            .expect("the Workshop must offer the Gryphon Rider at T3");
+        assert_eq!(gryphon.key, KeyCode::KeyW, "the Gryphon sits on [W]");
+        assert!(gryphon.enabled);
     }
 }

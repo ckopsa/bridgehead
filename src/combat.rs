@@ -1722,13 +1722,27 @@ mod tests {
     /// each attacker round-robins onto a living enemy rather than focus-firing
     /// — the game has no focus-fire order either, and perfect focus fire would
     /// hand every fight to whichever side merely brought more bodies.
+    ///
+    /// The attack ENVELOPE is honoured too, through the same `unit_can_hit` the
+    /// real acquisition path uses: a side that cannot reach the plane its enemy
+    /// is on simply deals nothing. That is what lets a flyer be checked here at
+    /// all — "a Footman block cannot hurt a Gryphon" is not a small multiplier,
+    /// it is a zero, and a harness that assumed everyone can hit everyone would
+    /// have quietly reported the opposite result.
     fn engage(a_kind: UnitKind, a_n: usize, b_kind: UnitKind, b_n: usize) -> Outcome {
         const DT: f32 = 0.02;
         const TIMEOUT: f32 = 120.0;
 
         let (a_stats, b_stats) = (unit_stats(a_kind), unit_stats(b_kind));
-        let a_hit = a_stats.damage * type_damage_mult(&a_stats, Some(b_kind), false);
-        let b_hit = b_stats.damage * type_damage_mult(&b_stats, Some(a_kind), false);
+        let hit = |from: UnitKind, stats: &UnitStats, to: UnitKind| {
+            if unit_can_hit(from, is_flying_kind(to)) {
+                stats.damage * type_damage_mult(stats, Some(to), false)
+            } else {
+                0.0
+            }
+        };
+        let a_hit = hit(a_kind, &a_stats, b_kind);
+        let b_hit = hit(b_kind, &b_stats, a_kind);
 
         let mut a: Vec<Fighter> = (0..a_n)
             .map(|_| Fighter { hp: a_stats.hp, cooldown: 0.0 })
@@ -1844,6 +1858,219 @@ mod tests {
             out.a_hp_fraction(UnitKind::Footman, 1) > 0.5,
             "and without dropping below half"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier 3: the Knight, and the claim that a tech advantage is not immunity
+    // -----------------------------------------------------------------------
+
+    /// The Knight is cavalry, and that is the whole design. A tier-3 unit
+    /// costing three times a Spearman still takes the spear's 5x, because the
+    /// multiplier is keyed on `TargetClass` and the Knight rides in under the
+    /// same class as the Raider.
+    #[test]
+    fn the_knight_is_cavalry_and_wears_the_spear_multiplier() {
+        assert_eq!(
+            TargetClass::of(Some(UnitKind::Knight), false),
+            Some(TargetClass::Cavalry),
+            "a tier-3 horse is still a horse",
+        );
+        let spear = unit_stats(UnitKind::Spearman);
+        assert_eq!(
+            type_damage_mult(&spear, Some(UnitKind::Knight), false),
+            5.0,
+            "the 90g counter must reach the 270g unit",
+        );
+        // ...and the Knight itself has no type bonus at all: its edge is raw
+        // stats and speed, never a matchup. Anti-siege stays the Raider's job.
+        let knight = unit_stats(UnitKind::Knight);
+        assert_eq!(type_damage_mult(&knight, Some(UnitKind::Catapult), false), 1.0);
+        assert_eq!(type_damage_mult(&knight, Some(UnitKind::Raider), false), 1.0);
+        assert_eq!(type_damage_mult(&knight, None, true), 1.0);
+    }
+
+    /// The triangle's tier-3 leg: 270 gold of Spearmen beats 270 gold of
+    /// Knight. The Knight even gets the better of the accounting — the same
+    /// gold, and its 60 lumber ignored — and still loses.
+    #[test]
+    fn equal_gold_spearmen_beat_the_knight() {
+        assert_eq!(unit_stats(UnitKind::Knight).cost_gold, 270);
+        assert_eq!(unit_stats(UnitKind::Spearman).cost_gold * 3, 270);
+        let out = engage(UnitKind::Spearman, 3, UnitKind::Knight, 1);
+        assert_eq!(out.b_alive(), 0, "the Knight should die to the spear line");
+        // But the counter is not free at this tier the way it is against a
+        // Raider (which dies without taking anyone): a Knight takes a Spearman
+        // with it. Measured: 2 of 3 left, on 60% of the block's hit points.
+        // Tech buys you a body, not the fight.
+        assert_eq!(
+            out.a_alive(),
+            2,
+            "the Knight should trade one spearman on its way down",
+        );
+        // 1v1 the Knight still wins, and comfortably (measured: 74% left). The
+        // counter is a spear LINE bought with equal gold, not one body walked
+        // at a unit that costs three times as much.
+        let solo = engage(UnitKind::Knight, 1, UnitKind::Spearman, 1);
+        assert_eq!(solo.b_alive(), 0, "one spearman is not a counter");
+    }
+
+    /// ...and pointed at what it IS for, the same gold is a rout: a Knight
+    /// walks through the equal-gold footman line it was built to break.
+    #[test]
+    fn equal_gold_knight_breaks_a_footman_line() {
+        assert_eq!(unit_stats(UnitKind::Footman).cost_gold * 2, 270);
+        let out = engage(UnitKind::Knight, 1, UnitKind::Footman, 2);
+        assert_eq!(out.b_alive(), 0, "both Footmen should die");
+        let left = out.a_hp_fraction(UnitKind::Knight, 1);
+        assert!(
+            // Measured: 0.55 of its 350 hp.
+            left > 0.40,
+            "the Knight should finish the line with plenty left, had {left:.3}",
+        );
+    }
+
+    /// The same against archers, who are the other thing a shock unit exists to
+    /// reach. This harness gives the archers their full dps from t=0 — in the
+    /// real game a 9.5-speed Knight closes 14 range in under two seconds — so
+    /// the true margin is wider than the number here.
+    #[test]
+    fn equal_gold_knight_breaks_an_archer_line() {
+        assert_eq!(unit_stats(UnitKind::Archer).cost_gold * 3, 270);
+        let out = engage(UnitKind::Knight, 1, UnitKind::Archer, 3);
+        assert_eq!(out.b_alive(), 0, "all three Archers should die");
+        assert!(
+            // Measured: 0.48 of its 350 hp.
+            out.a_hp_fraction(UnitKind::Knight, 1) > 0.35,
+            "and the Knight should walk away from it",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier 3: the Gryphon Rider, and the promise that altitude is a rule
+    // -----------------------------------------------------------------------
+
+    /// The systems layer's promise, stated as data: exactly the kinds that
+    /// throw something can answer a flyer. Melee — including the game's most
+    /// expensive melee unit — and the Catapult cannot, at any price.
+    #[test]
+    fn only_things_that_shoot_can_answer_the_gryphon() {
+        assert!(is_flying_kind(UnitKind::GryphonRider));
+        assert_eq!(
+            TargetClass::of(Some(UnitKind::GryphonRider), false),
+            Some(TargetClass::Air),
+            "derived from `flying`, so 'prioritise Air' finds it with no edit",
+        );
+
+        for helpless in [
+            UnitKind::Footman,
+            UnitKind::Spearman,
+            UnitKind::Raider,
+            UnitKind::Knight,
+            UnitKind::Worker,
+            UnitKind::Hero,
+            // The deliberate exception to "projectile == anti-air": siege is a
+            // ground bombardment weapon, which is what makes air the counter to
+            // a siege push.
+            UnitKind::Catapult,
+        ] {
+            assert!(
+                !unit_can_hit(helpless, true),
+                "{} must not be able to reach a flyer",
+                kind_name(helpless),
+            );
+        }
+        for answer in [
+            UnitKind::Archer,
+            UnitKind::Priestess,
+            UnitKind::GryphonRider,
+        ] {
+            assert!(
+                unit_can_hit(answer, true),
+                "{} is one of the answers to air",
+                kind_name(answer),
+            );
+        }
+        // Static defense is the one thing a flyer cannot walk around, so a base
+        // that bought towers is never helpless.
+        assert!(
+            building_stats(BuildingKind::Tower)
+                .attack
+                .is_some_and(|a| a.can_hit_air),
+            "towers shoot air",
+        );
+        // ...and the Gryphon answers both planes itself: air superiority plus a
+        // ground attack is what it is paying 280g/120l for.
+        assert!(unit_can_hit(UnitKind::GryphonRider, false));
+    }
+
+    /// The balance claim that keeps flying honest: massed ranged is the answer.
+    /// 270 gold of Archers — LESS gold than the 280g Gryphon, and ignoring its
+    /// 120 lumber entirely — kills it.
+    #[test]
+    fn equal_gold_archers_beat_the_gryphon() {
+        assert_eq!(unit_stats(UnitKind::GryphonRider).cost_gold, 280);
+        assert_eq!(unit_stats(UnitKind::Archer).cost_gold * 3, 270);
+        let out = engage(UnitKind::GryphonRider, 1, UnitKind::Archer, 3);
+        assert_eq!(out.a_alive(), 0, "the Gryphon should die to massed archers");
+        // Not a free answer, though — it costs a body. Measured: 2 of the 3
+        // Archers survive, so 90g of archer dies to kill 280g/120l of Gryphon.
+        // A losing trade for the flyer in a straight fight, which is the point:
+        // a Gryphon that meets an archer line has already been played wrong.
+        // Its money is made everywhere the archers are not.
+        assert!(
+            out.b_alive() >= 1,
+            "at least one Archer should be left to tell it",
+        );
+        assert!(
+            out.b_alive() < 3,
+            "and the Gryphon should not die for nothing",
+        );
+    }
+
+    /// The other half: against an army that brought no missiles, the same
+    /// Gryphon is not merely favoured, it is untouchable — it finishes an
+    /// equal-gold melee line without losing a single hit point. This is the
+    /// flyer systems layer's whole promise expressed as a number.
+    #[test]
+    fn the_gryphon_is_untouchable_by_a_melee_line() {
+        for melee in [UnitKind::Footman, UnitKind::Knight] {
+            let out = engage(UnitKind::GryphonRider, 1, melee, 2);
+            assert_eq!(
+                out.b_alive(),
+                0,
+                "{} should be ground down by something it cannot reach",
+                kind_name(melee),
+            );
+            assert_eq!(
+                out.a_hp_fraction(UnitKind::GryphonRider, 1),
+                1.0,
+                "and must not scratch the Gryphon doing it",
+            );
+        }
+    }
+
+    /// Both tier-3 kinds are gated on the Castle, and gated by TIER rather than
+    /// by kind — so the hall ladder is what pays for them, and a fourth rung
+    /// added later would satisfy the gate for free.
+    #[test]
+    fn the_tier_three_pair_is_castle_gated() {
+        for kind in [UnitKind::Knight, UnitKind::GryphonRider] {
+            assert_eq!(unit_requires(kind), &[BuildingKind::Castle]);
+            assert!(
+                !requirements_met(unit_requires(kind), [BuildingKind::Keep].into_iter()),
+                "{} must not be available at T2",
+                kind_name(kind),
+            );
+            assert!(
+                requirements_met(unit_requires(kind), [BuildingKind::Castle].into_iter()),
+                "{} unlocks at T3",
+                kind_name(kind),
+            );
+        }
+        // Trainers: the Knight joins the line at the Barracks, the Gryphon
+        // shares the Workshop with the Catapult rather than needing an Aviary.
+        assert!(trainable(BuildingKind::Barracks).contains(&UnitKind::Knight));
+        assert!(trainable(BuildingKind::Workshop).contains(&UnitKind::GryphonRider));
     }
 
     /// The same gold pointed at what it counters: 270g of Spearmen erases the

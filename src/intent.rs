@@ -1623,14 +1623,6 @@ mod tests {
         );
     }
 
-    /// The claim the whole module exists to make: a human gesture and a bridge
-    /// command are not *translated* into each other, they are the same value.
-    ///
-    /// The left-hand side of each pair is built the way ui.rs builds it from a
-    /// gesture; the right-hand side is the JSON a commander writes by hand.
-    /// They must be indistinguishable — same serialized form, same sentence —
-    /// because a replay must not be able to tell who was playing.
-    #[test]
     /// The research verb, from both ends. The Blacksmith card's [Q] and a
     /// commander's JSON are the same intent and the same log sentence — the
     /// claim docs/INTENT.md exists to keep checkable, applied to the newest
@@ -1683,6 +1675,14 @@ mod tests {
         assert_eq!(parse_research_kind(""), None);
     }
 
+    /// The claim the whole module exists to make: a human gesture and a bridge
+    /// command are not *translated* into each other, they are the same value.
+    ///
+    /// The left-hand side of each pair is built the way ui.rs builds it from a
+    /// gesture; the right-hand side is the JSON a commander writes by hand.
+    /// They must be indistinguishable — same serialized form, same sentence —
+    /// because a replay must not be able to tell who was playing.
+    #[test]
     fn a_gesture_and_a_command_are_the_same_intent() {
         // [G] Guard on two selected units standing around (12.0, -8.0), which
         // ui.rs compiles to an anchor + the card's fixed 18-unit radius.
