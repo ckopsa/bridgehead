@@ -168,6 +168,7 @@
 //! order — turns into an error string carried in the next snapshot's `errors`
 //! array instead of a panic.
 
+use crate::command::{CommandLink, PendingOrder};
 use crate::intent::{set_autopilot, IntentApply};
 use crate::shared::*;
 use bevy::ecs::system::SystemParam;
@@ -430,6 +431,22 @@ struct StateOut {
     bounties: Vec<BountyOut>,
     /// `[[game_time, message], ...]`, oldest first — see `diff_events`.
     events: Vec<(f32, String)>,
+    /// docs/TEMPO.md §3 — your own command nodes: the finished halls and the
+    /// living hero your orders radiate from. Orders to units inside one of
+    /// these circles arrive instantly; everything else pays for the distance.
+    /// Own team only, symmetric with what the HUD shows the human — and the
+    /// enemy's chain of command is something you learn by razing it, not by
+    /// reading it. Absent entirely when `WC3_COMMAND_LATENCY` is off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    command_nodes: Vec<CommandNodeOut>,
+}
+
+/// One command node, as the commander sees it.
+#[derive(Serialize)]
+struct CommandNodeOut {
+    pos: [f32; 2],
+    /// Orders to a unit within this many world units of `pos` are free.
+    radius: f32,
 }
 
 /// The map, as neutral public information — identical in both seats'
@@ -574,6 +591,19 @@ struct UnitOut {
     /// no abilities and for the opponent's army.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     abilities: Vec<AbilityOut>,
+    /// docs/TEMPO.md §3 — Chain of Command. Own units only: seconds a direct
+    /// order to THIS unit would take to arrive, given where it is standing
+    /// relative to your nearest hall or your hero. `0.0` means it is inside a
+    /// command node's radius and your hands reach it instantly. Absent
+    /// entirely when `WC3_COMMAND_LATENCY` is off, which is also when it is
+    /// meaningless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<f32>,
+    /// An order you already gave this unit is still in transit. Absent
+    /// (rather than `false`) the rest of the time. Re-ordering a unit that is
+    /// `pending` replaces what was travelling — it does not queue behind it.
+    #[serde(skip_serializing_if = "is_false")]
+    pending: bool,
 }
 
 /// One ability slot of one caster, as the commander sees it. The catalog says
@@ -846,6 +876,9 @@ type SnapshotUnits<'w, 's> = Query<
             Option<&'static Inventory>,
             Has<Militia>,
             Option<&'static AbilityCooldowns>,
+            // docs/TEMPO.md §3: an order this unit has been given that has not
+            // reached it yet. Always `None` with WC3_COMMAND_LATENCY off.
+            Option<&'static PendingOrder>,
         ),
     ),
 >;
@@ -874,6 +907,15 @@ type SnapshotNodes<'w, 's> =
 type SnapshotBounties<'w, 's> =
     Query<'w, 's, (Entity, &'static Bounty, &'static Transform)>;
 
+/// The neutral furniture of the map: resource nodes and bounty caches. Bundled
+/// for the same reason `TeamTech` is — `write_snapshot` sits exactly on Bevy's
+/// 16-parameter ceiling, and Chain of Command needed one of those slots.
+#[derive(SystemParam)]
+struct SnapshotNeutrals<'w, 's> {
+    nodes: SnapshotNodes<'w, 's>,
+    bounties: SnapshotBounties<'w, 's>,
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Per-team tech state the snapshot reports: how far up the hall ladder a team
 /// has climbed and how far up its two research ladders. Bundled because
@@ -900,8 +942,12 @@ fn write_snapshot(
     intent_errors: Res<IntentErrors>,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
-    nodes: SnapshotNodes,
-    bounties: SnapshotBounties,
+    neutrals: SnapshotNeutrals,
+    // docs/TEMPO.md §3/§4: the seat's own command nodes, and the curve that
+    // says what an order to a given unit would cost. An information right —
+    // reported to a commander for exactly the same reason the HUD draws it for
+    // the human, and never for the opponent's team.
+    link: CommandLink,
 ) {
     let now = r1(time.elapsed_secs());
     let delta = real.delta();
@@ -927,8 +973,9 @@ fn write_snapshot(
             intent_errors.get(seat.team),
             &units,
             &buildings,
-            &nodes,
-            &bounties,
+            &neutrals.nodes,
+            &neutrals.bounties,
+            &link,
         );
     }
 }
@@ -954,6 +1001,7 @@ fn write_seat_snapshot(
     buildings: &SnapshotBuildings,
     nodes: &SnapshotNodes,
     bounties: &SnapshotBounties,
+    link: &CommandLink,
 ) {
     let me = seat.team;
     let (fog_enabled, fog) = fog;
@@ -967,7 +1015,7 @@ fn write_seat_snapshot(
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(|(e, unit, team, tf, health, order, move_to, carrying, hero, doctrine, kit)| {
             let (squad, prio, retreat, leash, autocast) = doctrine;
-            let (inventory, militia, cooldowns) = kit;
+            let (inventory, militia, cooldowns, in_transit) = kit;
             let mine = *team == me;
             let has_policy =
                 prio.is_some() || retreat.is_some() || leash.is_some() || autocast.is_some();
@@ -1005,6 +1053,11 @@ fn write_seat_snapshot(
                     leash: leash.map(|l| [r1(l.anchor.x), r1(l.anchor.z), r1(l.radius)]),
                     autocast: autocast.and_then(|a| a.primary()),
                 }),
+                // What the chain of command costs to reach this unit, and
+                // whether something is already on its way to it.
+                link: (mine && link.latency.on)
+                    .then(|| r1(link.delay(*team, tf.translation))),
+                pending: mine && in_transit.is_some(),
                 // Our own casters only: abilities we can actually order.
                 abilities: if mine {
                     abilities_out(
@@ -1210,6 +1263,18 @@ fn write_seat_snapshot(
     let (hero_gold, hero_lumber, hero_time) = hero_train_cost(records, me);
 
     let map = crate::terrain::active_map();
+    let command_nodes: Vec<CommandNodeOut> = if link.latency.on {
+        link.nodes
+            .own(me)
+            .map(|(pos, radius)| CommandNodeOut {
+                pos: [r1(pos.x), r1(pos.z)],
+                radius: r1(radius),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let state = StateOut {
         t: now,
         my_team: team_name(me),
@@ -1304,6 +1369,7 @@ fn write_seat_snapshot(
         trees_near,
         bounties: bounties_out,
         events,
+        command_nodes,
     };
 
     let json = match serde_json::to_string(&state) {

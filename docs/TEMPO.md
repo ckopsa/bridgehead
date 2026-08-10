@@ -596,3 +596,106 @@ writes any float; squad ids from a gesture are 1–3 where the wire takes any
 `u8`; `posture escort` targets the team's hero where the wire names any own
 unit; and per-ability `autocast` rules are still one rule on slot 0. Each is a
 UI affordance, not a missing verb — the intent submitted is the same value.
+
+---
+
+## 7. Phase 1 as built (issue 4, shipped)
+
+The latency core landed behind `WC3_COMMAND_LATENCY`, default off. What differs
+from §4's sketch is mostly *cheaper than planned*, plus one thing the sketch
+could not have known because only a sim could find it.
+
+**There was no 23-site refactor.** §4 budgeted 23 player-command `Order` writes
+across three files and proposed a `shared::issue_order` helper to route them
+through. The intent compiler (docs/INTENT.md) landed in between and collapsed
+`ui.rs` and `bridge.rs` into one choke point, so latency for those two seats is
+a substitution inside `compile_intent`'s order arms and nothing else. The
+"integration hazard" §4 flagged survived intact and was worth every word.
+
+**The verb table.** §4 asked the implementer to decide the exact set. It is in
+`command.rs`'s module docs, in full, with a reason per row. In summary:
+
+| Verb | Latency |
+|---|---|
+| `move`, `attackmove`, `attack`, `harvest`, `return`, `follow`, `stop` | **pays** |
+| `build` | exempt — §4's open question, answered as recommended |
+| `train`, `upgrade`, `cancel`, `research`, `rally` | exempt — addressed to a building, which stands at a node |
+| `cast`, `use_item`, `buy` | exempt — see below |
+| `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt — doctrine IS the fast path |
+| `autopilot`, `surrender` | exempt — match level |
+
+The `cast` row is not a carve-out, it is an identity: every caster in the game
+either *is* a command node (a hero) or *sits on* one (`abilities_of_building` is
+`is_hall`-only), so a computed link would be zero for all of them. §C5's claim
+that CallToArms and TownPortal "survive by construction" is therefore literally
+true rather than a design intention, and
+`command::tests::every_caster_is_a_command_node` fails the build if anyone adds
+a caster that breaks it.
+
+**The curve** is the recommended step plus ramp, with per-node radii so the
+phase-3 Outpost is one arm of `building_node_radius`:
+
+```
+slack   = distance to nearest own node - that node's radius   (0 if inside)
+latency = 0                                   when slack <= 0
+        = min(max, step + per_unit * slack)    otherwise
+        = max                                  when the team has NO nodes
+```
+
+Defaults, all env-overridable for the sweep: hall radius 30, hero radius 18,
+step 0.6s, ramp 0.02s per world unit, cap 3.0s. That puts a midfield engagement
+(~100 units from home, which on this map is the centre) at ~2.0s and the far
+corners at the cap — the 1.5–3s §C1 asked for. The hero's radius is deliberately
+smaller than a hall's: the mobile node is the one you buy fast hands with, and
+it should cost something to place.
+
+**All three seats pay.** `ai.rs` does not speak through the intent compiler, so
+it calls the same `OrderIssuer` directly at its nine unit-order sites. Its
+`build` is exempt on the same row as everybody else's. Two tests pin it, in both
+flag states — if autopilot ever stops paying, the suite says so.
+
+**The doctrine guards** (§4's integration hazard, and issue 5's subject) are in:
+`run_squad_postures` and `enforce_leash` both gained `Without<PendingOrder>`,
+because a unit awaiting a delayed order is indistinguishable from an idle one
+and would otherwise be re-tasked out from under its own orders. `rearm_retreat`
+now un-latches `Retreating` at *dispatch* rather than issue time, which is the
+behaviour §4 predicted and asked to have asserted deliberately. One knock-on
+worth naming: `run_squad_postures` computes its cohesion point from the
+`members` query, so in-transit members no longer contribute to the squad's
+centre of mass for the second or two they are travelling.
+
+**What a sim found that review did not.** With latency on, a `crossings` run hit
+the time cap with two workers frozen and the telemetry reading "2 orders in
+transit, mean link 3.00s" for twenty minutes of game time. The team had lost
+every hall and its hero, so it paid the cap on every order — and `ai.rs`
+re-issues its standing decision once a second, so each repeat replaced the last
+and restarted the clock. Nothing ever landed.
+
+The fix is a rule that is better design than the bug was a bug: **saying the
+same thing again does not restart the journey.** An order that matches the one
+already in transit is a no-op; a genuinely different one supersedes it and pays.
+Latency is the cost of *changing your mind* at range, not a tax per click — which
+also means a human holding down right-click cannot accidentally paralyse their
+own army, and neither can a commander re-sending an unchanged batch. Six sims
+across both maps after the fix: all decisive, no caps, no frozen units.
+
+**The snapshot** gained `command_nodes` (own team only) on `StateOut` and
+`link` / `pending` on `UnitOut`, all omitted when the feature is off — a
+flag-off snapshot is the same 16 keys it always was, verified live. What issue 6
+still owns is the `applied: [{cmd, delay}]` acknowledgement, which needs the
+compiler to report per-command realised delay back to the seat that sent it.
+
+**Evidence and observability.** The intent log annotates delayed sentences —
+`move unit 4294968182 to (0.0, 0.0) (+0.7s link)` — plus a structured `link`
+field, both absent when nothing was delayed, so a flag-off replay is
+character-for-character a v1 replay. `ai.rs` is not a player and writes no
+intent log, so an AI-vs-AI sweep would otherwise produce no evidence at all;
+`command::report_link_load` covers that with a periodic line giving orders in
+transit, mean link and worst link. That series is what issue 8's calibration
+should read: near-zero mean means the curve is not binding, a mean pinned at the
+cap means the armies have marched off the end of their own chain of command.
+
+**Not built here, by design:** the HUD feedback (issue 7) — without it the
+mechanic reads as input lag, which is exactly why the default stays off — and
+the forward Outpost (phase 3), which is one table entry in
+`building_node_radius` when its bead comes up.
