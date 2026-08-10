@@ -601,14 +601,200 @@ Two implementation notes worth keeping:
 
 ---
 
+---
+
+## Co-command: one faction, two authors
+
+*`wc3clone-hre`. The bead THESIS.md was written for — "co-command, where a
+human and an AI run one faction and negotiate strategy in a language both speak
+natively". Implemented in `copilot.rs`.*
+
+`WC3_BRIDGE=copilot` opens **one** seat on `Team::Human` — beside the player at
+the keyboard, not opposite them. Its directory is `bridge/copilot/`, its
+snapshot is a `Team::Human` snapshot (same fog, same knowability, same
+everything), and `tools/bridge_send.py --seat bridge/copilot` drives it with no
+changes, because there is nothing new about the transport.
+
+The prediction the previous section made held: two authors on one team really
+was "two `SubmitIntent` producers with different `IntentSource`s". `IntentSource`
+gained its third variant, `Copilot`, and **every order the second author mints
+is attributed with zero new plumbing** — `Cause::Order { source }` was already
+stamped at the mint site, `units[].why` already rendered it, the selection panel
+already printed the same string, and `ui.rs::why_line` already tallied mixed
+answers across a selection. That tally *is* the "did my partner re-task my
+push?" readout; it needed no code at all.
+
+The rung is a **seat**, not `Cause::Script`. A co-commander pays the same
+latency, obeys the same fog and speaks the same 25 verbs; the scripted `ai.rs`
+does none of those things, and collapsing the two would have made "who moved
+this unit" unanswerable in exactly the case it is asked.
+
+### The real design question was conflict policy
+
+At the engine, conflict policy is unchanged and deliberately so: `Order` is a
+component, so **last writer wins**. It has always been overwrite-tolerant —
+that is how a human's right-click overrides doctrine's push a second later. A
+priority field that made one author's orders outrank the other's would break
+the rule that keeps the seats equitable: *source is descriptive, never
+authoritative.*
+
+So the deliverable is not arbitration. It is **consent before the fact and
+visibility after it**.
+
+#### Consent: proposals, not silent actions
+
+A co-commander's wire carries one shape an ordinary seat's does not:
+
+```json
+{"type":"propose","note":"their scout is gone — take the mid mine","commands":[
+  {"type":"attackmove","units":[…],"x":0,"z":0},
+  {"type":"move","units":[…],"x":10,"z":10}]}
+```
+
+It lands in a pending queue (max 4), appears on the human's HUD with the note
+and the **compiled sentences** — `Intent::sentence()`, free from this layer, so
+the human reads character-for-character what the replay log will write — and
+waits 20 game-seconds for a verdict. `[Enter]` approves the oldest, `[Backspace]`
+vetoes it, per-card buttons name one exactly, and silence lapses it. All three
+outcomes are announced on `GameEvents`, which means the human sees them in the
+alert stack *and* the co-commander sees them in its own `events` — one
+producer, two renderers, the same rule the event feed has followed since it
+existed.
+
+`propose` is **not** an `Intent` variant, and that is a deliberate line: a
+proposal is not something a player can *mean*, it is something one author says
+to another *about* a batch of meanings. As a verb it would have handed the
+human's interface something with nothing to compile and the compiler a case
+that changes no game state.
+
+On approval the batch goes through the ordinary compiler, **at approval time,
+against the world as it is then** — so a proposal whose units have since died
+is refused exactly as any stale command is, with the same strings, into the
+same `errors` array. There is no second execution path and therefore no second
+set of rules to drift.
+
+#### The direct/propose split, and why it is where it is
+
+| | verbs | why |
+|---|---|---|
+| **direct** | `squad` `posture` `template` `priority` `retreat` `leash` `autocast` | doctrine is *advice-shaped already* |
+| **propose** | every unit order, all production, all spending, `autopilot`, `surrender` | irreversible, or spends what is not the proposer's |
+
+The line sits where **the cost of being wrong** is. Vetoing a posture is
+trivial — you set another and the squad re-tasks within a second, because a
+standing order is a *disposition* the engine re-reads continuously. Vetoing a
+spent 400 gold is impossible. So the co-commander may keep the army fighting,
+holding fords, falling back at 35% and focusing siege — precisely the
+machine-speed work THESIS.md's tempo argument assigns to the engine — while it
+may not empty the treasury unasked.
+
+That split is what makes it a partner rather than a nag (propose everything and
+it cannot help during a fight) or a stranger with your wallet (do everything and
+"co-command" means "handed over"). It is also not a coincidence that the direct
+half is exactly the group this document already calls "Doctrine": that grouping
+already encoded the property the trust policy needed.
+
+A refused direct command teaches rather than scolds, because the reader is a
+model mid-match:
+
+```
+cmd 0: 'train' needs the human's approval — it spends or commits what your
+partner owns. Wrap it: {"type":"propose","commands":[…],"note":"why"}
+```
+
+`WC3_COPILOT_TRUST` moves the line for experiments: `full` (everything direct)
+or `strict` (everything proposed, doctrine included). The seat reads its own
+etiquette out of the snapshot rather than out of the environment — `copilot:
+{trust, direct:[…], propose_ttl, max_pending}` — the same principle that makes
+the catalog the tech tree.
+
+#### Visibility: what a proposal says it would disturb
+
+Every proposal is tagged with what it would step on, in the human's terms:
+
+```
+ ! re-tasks squad 1 (defend)
+ ! changes squad 2: push -> defend
+ ! overrides your move on 4 unit(s), 6s ago
+```
+
+Provenance is what makes this nearly free. Every unit already carries who gave
+it its current reason and when (`Cause::Order { source: Ui, at }`), and every
+squad already carries its standing posture, so "would this disturb something my
+partner set?" is a lookup rather than a new bookkeeping system. The tags are
+computed once, when the proposal arrives — they describe the board the
+co-commander was looking at when it wrote the note, which is the thing the note
+is arguing about.
+
+A partner who re-tasks your push is a partner. A partner who re-tasks your push
+*invisibly* is a bug you spend the next minute misdiagnosing.
+
+#### Legibility runs both ways: `partner_log`
+
+The human sees the co-commander's directives — they arrive as proposals with a
+stated reason. Without something more, the co-commander could not see the
+human's, and would be commanding next to someone it cannot hear.
+
+`shared::IntentJournal` keeps the last 40 intents per team in memory — the tail
+of `intent_log.jsonl`, not a second record with its own vocabulary — and a
+copilot seat serializes its team's as `partner_log`:
+
+```
+  [   4.3s] copilot  5 units join squad 1
+  [   4.3s] copilot  squad 1 defends (-70.0, -70.0) within 22
+  [  17.0s] copilot  attack-move 5 units to (0.0, 0.0)
+  [  29.6s] ui       surrender the match
+```
+
+Same sentences, same `source` tags `units[].why` carries. Rejected intents are
+kept: a partner learning that your last four clicks bounced is a partner that
+stops proposing around a plan you never actually issued.
+
+#### What co-command deliberately does *not* change
+
+- **`ExternallyCommanded` stays false for the human's team.** That flag tells
+  doctrine.rs "a machine drives this team, so pool its idle units into squad 0
+  and seed them a posture" — an autonomy floor that exists to compensate for a
+  slow commander. There is no slow commander here; there is a human with a
+  mouse who keeps full authority over where their idle units stand. Setting it
+  would have the engine quietly start enrolling the player's army the moment a
+  partner connected, which is the opposite of asking permission.
+- **Autopilot is not touched.** If the player has handed their faction to the
+  scripted AI, a co-commander connecting is no reason to take it back for them.
+- **`IntentErrors` stays keyed by team**, so a copilot's `errors` array also
+  carries the human's refused gestures (`ui: …`). Kept rather than filtered: a
+  partner who can see that your click bounced off a stale ghost is a partner
+  who can stop proposing around it.
+- **Ordinary seats' wire format is byte-shape identical.** `copilot`,
+  `proposals` and `partner_log` are `Option` and skipped when absent; `red` and
+  `blue` snapshots keep exactly the keys they had.
+
+### Follow-ups co-command leaves open
+
+- **A proposal's conflict tags can go stale.** They are computed at arrival and
+  describe a board up to 20 seconds old. The sentences cannot go stale (they
+  are the batch), and approval re-validates everything against the live world,
+  so the cost is a tag that over- or under-states — never an order that lands
+  differently than it read. Recomputing per frame is the fix if it ever bites.
+- **The queue is not prioritised.** Four pending proposals answer oldest-first,
+  which is right when they are about the same fight and wrong when one is
+  urgent. A `severity` on the wrapper is the obvious next rung.
+- **A veto tells the partner nothing but "no".** The human has no way to reply
+  *why*, so a co-commander can only guess whether to re-propose. A one-key
+  "not now" vs "never" distinction, or a canned reason list, is the smallest
+  thing that would make the negotiation two-sided in both directions.
+- **Headless has no approver.** `WC3_BRIDGE=copilot` under `WC3_HEADLESS=1`
+  queues proposals nobody can answer, so they all lapse. That is *correct* —
+  approval is a human act and headless has no human — but it means an
+  AI-vs-(AI+AI) sim needs either full-trust mode or a scripted approver seat.
+
+---
+
 ## What this unlocks
 
-- **`wc3clone-hre` (co-command).** Two authors submitting into one team is now
-  a matter of two `SubmitIntent` producers with different `IntentSource`s —
-  the compiler already tags, logs and attributes every intent, and already
-  treats source as descriptive rather than authoritative. `IntentSource` will
-  want a third variant, and conflict policy (last-writer-wins vs. veto) is the
-  real design question, not plumbing.
+- ~~**`wc3clone-hre` (co-command).**~~ **Done** — see above. The prediction was
+  right: it was two producers and one `IntentSource` variant, and the design
+  work was all in the conflict policy.
 - ~~**Closing the ghost-attack gap.**~~ **Done** — the picker reads
   `FogGrid::ghosts()` and produces the same `Intent::Attack` against the same
   id (see "The residual asymmetry" above). There is no longer a place where the

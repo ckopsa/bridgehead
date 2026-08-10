@@ -4,13 +4,20 @@
 //! building placement ghost, command hotkeys/buttons, control groups, and the
 //! bevy_ui HUD: a top resource bar plus a classic WC3-style bottom console
 //! (minimap | selection panel | command card), the drag rectangle, the
-//! game-over banner, and the top-right alert stack.
+//! game-over banner, the top-right alert stack, and the top-left co-command
+//! proposal panel.
 //!
 //! The alert stack renders `shared::GameEvents` — the very buffer bridge.rs
 //! serializes for an external commander, filtered to `Team::Human` the same way
 //! the bridge filters to its seat. One producer, two renderers: whatever the
 //! machine is told about the match, the player is told too. Space (or a click
 //! on a row) sends the camera to where the news came from.
+//!
+//! The proposal panel is the human's half of co-command (copilot.rs): a
+//! co-commander's pending directives, with the reason it gave and the compiled
+//! English of every command, answered with `[Enter]` / `[Backspace]` or the
+//! per-card buttons. Left, not right, and on its own clock — see the comment
+//! above `PROP_SLOTS`.
 //!
 //! All world picking is analytic: the cursor is projected onto the Y=0 plane
 //! with `shared::cursor_to_ground` and distance-tested in XZ against entity
@@ -31,6 +38,7 @@ use bevy::window::{PrimaryWindow, SystemCursorIcon};
 use bevy::winit::cursor::CursorIcon;
 use std::collections::{HashMap, VecDeque};
 
+use crate::copilot::{Copilot, CopilotSet, ProposalVerdict, PROPOSAL_TTL};
 use crate::intent::IntentApply;
 use crate::shared::*;
 
@@ -148,6 +156,48 @@ const NOTIF_ROW_HIT_H: f32 = NOTIF_ROW_H + NOTIF_FONT + NOTIF_GAP;
 /// Space is free: letters are command hotkeys, arrows pan, `.` cycles workers.
 const NOTIF_FOCUS_KEY: KeyCode = KeyCode::Space;
 
+// --- Co-command: the proposal panel ----------------------------------------
+//
+// Where it sits is a design decision, not a layout accident. The alert stack
+// owns the top-right and is built for news: six rows that fade after nine
+// seconds. A proposal is not news, it is an OPEN QUESTION with a twenty-second
+// clock, and putting it in a stack that expires on a different timer would
+// mean the thing you must answer scrolls away under the thing you need not.
+//
+// So: top-left, the last large area the HUD does not own (the minimap is
+// bottom-left, the console bottom, the resource bar a thin strip above). The
+// ARRIVAL is still announced in the alert stack, which is where the player's
+// eye already goes — transient notice on the right, standing decision on the
+// left. The visual vocabulary is the alert stack's, because it should read as
+// the same HUD: `PANEL_BG`, a coloured spine down the left edge, and amber for
+// "something of yours is affected", which is what amber already means here.
+
+/// One card per possible pending proposal; `copilot::MAX_PENDING` is the cap
+/// that makes the pool exact rather than a guess.
+const PROP_SLOTS: usize = crate::copilot::MAX_PENDING;
+const PROP_W: f32 = 360.0;
+/// Same narrow-window guard as the alert stack.
+const PROP_MAX_FRAC: f32 = 0.44;
+const PROP_FONT: f32 = 13.0;
+const PROP_HEAD_FONT: f32 = 12.0;
+const PROP_GAP: f32 = 6.0;
+/// Most sentences printed per card before the rest are summarised. Bounds the
+/// card's height, which is what makes `prop_rect` able to hit-test it.
+const PROP_MAX_SENTENCES: usize = 4;
+/// Height budgeted per card when hit-testing. Generous for the same reason
+/// `NOTIF_ROW_HIT_H` is: a card's real height depends on how much of the note
+/// wraps, no analytic guess can know, and swallowing a click just under the
+/// panel is far better than leaking one through as a stray order.
+const PROP_CARD_HIT_H: f32 = 132.0;
+/// Approve / veto the OLDEST pending proposal — the one closest to lapsing,
+/// and the top card. Both keys are free: every letter is a command hotkey,
+/// Space focuses alerts, `.` cycles workers.
+const PROP_APPROVE_KEY: KeyCode = KeyCode::Enter;
+const PROP_VETO_KEY: KeyCode = KeyCode::Backspace;
+/// The co-commander's colour. Deliberately NOT one of the three severity
+/// colours: "my partner said this" must never read as "the game says this".
+const PROP_ACCENT: Color = Color::srgb(0.68, 0.63, 1.0);
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -197,6 +247,21 @@ impl Plugin for UiPlugin {
                     .chain()
                     .before(IntentApply)
                     .after(FogSet),
+            )
+            // Co-command's two systems sit OUTSIDE the input chain above,
+            // which is at Bevy's 20-system tuple ceiling — and they want
+            // different ordering anyway. `proposal_input` only has to beat
+            // `CopilotSet`, so a verdict given this frame is resolved this
+            // frame and its orders compile with the rest of the frame's
+            // intents. `update_proposals` is the one HUD system that must run
+            // AFTER the frame's decisions: a proposal the player just answered
+            // should leave the screen immediately, not flicker one more time.
+            .add_systems(
+                Update,
+                (
+                    proposal_input.before(CopilotSet),
+                    update_proposals.after(CopilotSet),
+                ),
             );
     }
 }
@@ -242,6 +307,10 @@ struct UiState {
     /// `cursor_over_hud` can tell a click on a notification from a world click
     /// without walking the UI tree.
     notif_rows: usize,
+    /// Number of visible co-command proposal cards (refreshed by
+    /// `update_proposals`), for the same reason `notif_rows` exists: a click
+    /// on "Approve" must not also be a move order on the ground behind it.
+    prop_cards: usize,
     /// The hero the player most recently had selected — the Shop's customer.
     ///
     /// A Shop's buy card is drawn for a BUILDING selection, so at the moment of
@@ -300,6 +369,38 @@ struct NotifText(usize);
 struct NotifHint;
 
 /// The single world-space ring shown under whatever the cursor would pick.
+/// One pooled proposal card, by queue index (0 = oldest = the hotkeys' target).
+#[derive(Component)]
+struct PropCard(usize);
+
+/// Which line of which card a text node is. One marker component with a part
+/// tag rather than three marker types, because three `&mut Text` queries in one
+/// system would need three mutually-exclusive `Without` filters to satisfy
+/// Bevy B0001 — and one query with a discriminant is the same information
+/// without the aliasing puzzle.
+#[derive(Component, Clone, Copy)]
+struct PropText {
+    card: usize,
+    part: PropPart,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PropPart {
+    /// `#3   copilot   14s   [Enter] approve  [Bksp] veto`
+    Head,
+    /// The co-commander's stated reason.
+    Note,
+    /// The compiled sentences, then any conflict tags.
+    Body,
+}
+
+/// One of a card's two buttons. `approve` false is the veto.
+#[derive(Component, Clone, Copy)]
+struct PropBtn {
+    card: usize,
+    approve: bool,
+}
+
 #[derive(Component)]
 struct HoverRing;
 
@@ -1915,6 +2016,25 @@ fn cursor_over_hud(cursor: Vec2, window: &Window, ui: &UiState) -> bool {
         return true;
     }
     notif_rect(window, ui.notif_rows).is_some_and(|r| r.contains(cursor))
+        || prop_rect(window, ui.prop_cards).is_some_and(|r| r.contains(cursor))
+}
+
+/// Screen-space rectangle of the proposal panel, or `None` when nothing is
+/// pending. Analytic like `notif_rect`, and generous for the same reason — see
+/// `PROP_CARD_HIT_H`. Top-LEFT, so it never overlaps the alert stack's rect and
+/// the two hit tests stay independent.
+fn prop_rect(window: &Window, cards: usize) -> Option<Rect> {
+    if cards == 0 {
+        return None;
+    }
+    let width = PROP_W.min(window.width() * PROP_MAX_FRAC);
+    let top = TOP_BAR_H + PAD;
+    Some(Rect::new(
+        PAD,
+        top,
+        PAD + width,
+        top + cards as f32 * (PROP_CARD_HIT_H + PROP_GAP),
+    ))
 }
 
 /// Screen-space rectangle of the alert stack, or `None` when it is empty.
@@ -2279,6 +2399,126 @@ fn setup_ui(
         });
 
     spawn_notifications(&mut commands);
+    spawn_proposals(&mut commands);
+}
+
+/// The co-commander's pending directives: a fixed pool of cards in the
+/// top-left, hidden until a partner asks for something. Pooled and mutated in
+/// place like every other refreshed node in this file.
+fn spawn_proposals(commands: &mut Commands) {
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(PAD),
+            top: Val::Px(TOP_BAR_H + PAD),
+            width: Val::Px(PROP_W),
+            max_width: Val::Percent(PROP_MAX_FRAC * 100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(PROP_GAP),
+            ..default()
+        })
+        .with_children(|panel| {
+            for i in 0..PROP_SLOTS {
+                panel
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(3.0),
+                            padding: UiRect::axes(Val::Px(9.0), Val::Px(6.0)),
+                            // The same severity spine the alert stack uses,
+                            // in the co-commander's own colour.
+                            border: UiRect::left(Val::Px(3.0)),
+                            display: Display::None,
+                            ..default()
+                        },
+                        BackgroundColor(PANEL_BG),
+                        BorderColor(PROP_ACCENT),
+                        PropCard(i),
+                    ))
+                    .with_children(|card| {
+                        card.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: PROP_HEAD_FONT,
+                                ..default()
+                            },
+                            TextColor(PROP_ACCENT),
+                            PropText {
+                                card: i,
+                                part: PropPart::Head,
+                            },
+                        ));
+                        card.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: PROP_FONT,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                            PropText {
+                                card: i,
+                                part: PropPart::Note,
+                            },
+                        ));
+                        card.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: PROP_FONT,
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.72, 0.76, 0.86)),
+                            PropText {
+                                card: i,
+                                part: PropPart::Body,
+                            },
+                        ));
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(6.0),
+                            margin: UiRect::top(Val::Px(3.0)),
+                            ..default()
+                        })
+                        .with_children(|btns| {
+                            for approve in [true, false] {
+                                btns.spawn((
+                                    Button,
+                                    Node {
+                                        padding: UiRect::axes(Val::Px(9.0), Val::Px(3.0)),
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(SLOT_BG),
+                                    BorderColor(if approve {
+                                        PROP_ACCENT
+                                    } else {
+                                        EDGE
+                                    }),
+                                    PropBtn { card: i, approve },
+                                ))
+                                .with_children(|b| {
+                                    b.spawn((
+                                        Text::new(if approve {
+                                            "Approve"
+                                        } else {
+                                            "Veto"
+                                        }),
+                                        TextFont {
+                                            font_size: PROP_HEAD_FONT,
+                                            ..default()
+                                        },
+                                        TextColor(if approve {
+                                            PROP_ACCENT
+                                        } else {
+                                            Color::srgb(0.72, 0.74, 0.80)
+                                        }),
+                                    ));
+                                });
+                            }
+                        });
+                    });
+            }
+        });
 }
 
 /// The alert stack: a fixed pool of rows in the top-right corner, hidden until
@@ -6279,6 +6519,163 @@ fn update_notifications(
 }
 
 // ---------------------------------------------------------------------------
+// Co-command: answering the partner
+// ---------------------------------------------------------------------------
+//
+// The human's whole half of the negotiation is two keys and two buttons. That
+// is on purpose: an approval that costs a menu is an approval that gets given
+// on reflex, and the point of the loop is that the player actually reads the
+// note before their gold is spent.
+//
+// `[Enter]` and `[Backspace]` act on the OLDEST pending proposal — the top
+// card, the one whose clock is shortest. A player mid-fight can answer without
+// aiming a mouse; a player with a moment can click the card they mean.
+
+/// Turn the two keys and the per-card buttons into `ProposalVerdict`s.
+/// copilot.rs is the only thing that acts on them — this system knows nothing
+/// about what a proposal contains, which is what keeps the rendering side out
+/// of the trust policy.
+fn proposal_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    game_over: Res<GameOver>,
+    copilot: Res<Copilot>,
+    mut verdicts: EventWriter<ProposalVerdict>,
+    pressed: Query<(&Interaction, &PropBtn), Changed<Interaction>>,
+) {
+    if game_over.0.is_some() || copilot.seat.is_none() {
+        return;
+    }
+    // A click names its proposal exactly.
+    for (interaction, btn) in &pressed {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if let Some(proposal) = copilot.pending.get(btn.card) {
+            verdicts.write(ProposalVerdict {
+                id: proposal.id,
+                approve: btn.approve,
+            });
+        }
+    }
+    // The keys always mean the top card.
+    let Some(top) = copilot.pending.first() else {
+        return;
+    };
+    if keys.just_pressed(PROP_APPROVE_KEY) {
+        verdicts.write(ProposalVerdict {
+            id: top.id,
+            approve: true,
+        });
+    } else if keys.just_pressed(PROP_VETO_KEY) {
+        verdicts.write(ProposalVerdict {
+            id: top.id,
+            approve: false,
+        });
+    }
+}
+
+/// Paint the pending queue. Runs `.after(CopilotSet)`, so a proposal answered
+/// this frame is off the screen this frame rather than blinking once more.
+fn update_proposals(
+    time: Res<Time>,
+    copilot: Res<Copilot>,
+    mut ui: ResMut<UiState>,
+    mut cards: Query<(&PropCard, &mut Node, &mut BackgroundColor)>,
+    mut texts: Query<(&PropText, &mut Text)>,
+    mut buttons: Query<(&PropBtn, &mut Node), Without<PropCard>>,
+) {
+    let now = time.elapsed_secs();
+    let pending = &copilot.pending;
+    // Hand the count to `cursor_over_hud` so a click on a card is not also a
+    // click on the battlefield behind it.
+    ui.prop_cards = pending.len();
+
+    for (card, mut node, mut bg) in &mut cards {
+        let Some(proposal) = pending.get(card.0) else {
+            node.display = Display::None;
+            continue;
+        };
+        node.display = Display::Flex;
+        // The top card — the one the keys answer — reads slightly brighter, so
+        // "which one will Enter take?" is answerable without counting.
+        bg.0 = if card.0 == 0 {
+            lighten(PANEL_BG, 0.10).with_alpha(PANEL_BG.alpha())
+        } else {
+            PANEL_BG
+        };
+        let _ = proposal;
+    }
+
+    for (btn, mut node) in &mut buttons {
+        node.display = if btn.card < pending.len() {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+
+    for (slot, mut text) in &mut texts {
+        let wanted = match pending.get(slot.card) {
+            None => String::new(),
+            Some(proposal) => match slot.part {
+                PropPart::Head => {
+                    let left = proposal.expires_in(now);
+                    // The age is the honest way to show a clock in a game with
+                    // `WC3_SPEED`: game seconds, the same unit the co-commander
+                    // read off its snapshot when it wrote this.
+                    let keys = if slot.card == 0 {
+                        "   [Enter] approve   [Bksp] veto"
+                    } else {
+                        ""
+                    };
+                    // ASCII only, here and in `proposal_body`. Bevy's default
+                    // font has no glyph for `·`, and a HUD that renders its
+                    // own bullet points as tofu boxes is a HUD nobody reads
+                    // twice — caught by looking at the screenshot, which is
+                    // the only way this class of bug is ever caught.
+                    format!(
+                        "#{}  copilot   {left:.0}s left   ({}/{}){keys}",
+                        proposal.id,
+                        (now - proposal.proposed_at).min(PROPOSAL_TTL).round(),
+                        PROPOSAL_TTL.round(),
+                    )
+                }
+                PropPart::Note => proposal.note.clone(),
+                PropPart::Body => proposal_body(proposal),
+            },
+        };
+        if text.0 != wanted {
+            text.0 = wanted;
+        }
+    }
+}
+
+/// The card's lower half: what would happen, then what it would disturb.
+///
+/// The sentences are `Intent::sentence()` — the identical English the replay
+/// log writes and a bridge commander's own compile prints back. Nothing here
+/// renders a proposal into words; the intent layer already did, which is why
+/// the human is reading exactly what the co-commander asked for rather than a
+/// summary of it.
+fn proposal_body(proposal: &crate::copilot::Proposal) -> String {
+    let mut lines: Vec<String> = proposal
+        .sentences
+        .iter()
+        .take(PROP_MAX_SENTENCES)
+        .map(|s| format!("  - {s}"))
+        .collect();
+    if let Some(rest) = proposal.sentences.len().checked_sub(PROP_MAX_SENTENCES) {
+        if rest > 0 {
+            lines.push(format!("  - (+{rest} more)"));
+        }
+    }
+    for conflict in &proposal.conflicts {
+        lines.push(format!("  ! {conflict}"));
+    }
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // Tests — the human half of docs/TEMPO.md's doctrine parity
 // ---------------------------------------------------------------------------
 
@@ -6401,6 +6798,137 @@ mod tests {
         // drained by `seq`, and a rejection is news exactly once.
         app.update();
         assert_eq!(app.world().resource::<Notifications>().live.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Co-command: the human's half of the negotiation
+    // -----------------------------------------------------------------
+
+    fn a_proposal(id: u32, note: &str, sentences: &[&str], conflicts: &[&str]) -> crate::copilot::Proposal {
+        crate::copilot::Proposal {
+            id,
+            note: note.to_string(),
+            intents: vec![Intent::Stop { units: vec![1] }],
+            sentences: sentences.iter().map(|s| s.to_string()).collect(),
+            conflicts: conflicts.iter().map(|s| s.to_string()).collect(),
+            proposed_at: 0.0,
+            expires_at: PROPOSAL_TTL,
+            pos: None,
+        }
+    }
+
+    /// The panel and its two keys, with no window and no renderer — the same
+    /// headless-App discipline the doctrine-card gesture tests use. Every
+    /// keystroke below goes through the production system.
+    fn proposal_app(pending: Vec<crate::copilot::Proposal>) -> App {
+        let mut app = App::new();
+        app.init_resource::<UiState>()
+            .init_resource::<Time>()
+            .init_resource::<GameOver>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(Copilot::seated_with(Team::Human, pending))
+            .add_event::<ProposalVerdict>()
+            .add_systems(Startup, |mut commands: Commands| {
+                spawn_proposals(&mut commands)
+            })
+            .add_systems(Update, (proposal_input, update_proposals).chain());
+        app
+    }
+
+    fn verdicts(app: &mut App) -> Vec<ProposalVerdict> {
+        let events = app.world().resource::<Events<ProposalVerdict>>();
+        events.get_cursor().read(events).copied().collect()
+    }
+
+    /// The approve path, through the real hotkey.
+    ///
+    /// This is the human side of `copilot::a_proposal_waits_then_lands_stamped_by_the_copilot`:
+    /// that test proves an approved batch reaches the compiler stamped by the
+    /// partner, this one proves a keystroke is what approves it. Between them
+    /// the loop has no hand-waved step.
+    #[test]
+    fn enter_approves_the_top_proposal_and_backspace_vetoes_it() {
+        let mut app = proposal_app(vec![
+            a_proposal(7, "take the ford", &["3 units attack-move to (0.0, 0.0)"], &[]),
+            a_proposal(8, "and build a tower", &["worker 41 builds Tower at (1.0, 2.0)"], &[]),
+        ]);
+
+        press(&mut app, &[PROP_APPROVE_KEY]);
+        let said = verdicts(&mut app);
+        assert_eq!(said.len(), 1, "one key, one verdict");
+        // The OLDEST — the top card, the one whose clock is shortest. Not the
+        // newest, which is what a stack would have given.
+        assert_eq!(said[0].id, 7);
+        assert!(said[0].approve);
+
+        let mut app = proposal_app(vec![a_proposal(7, "spend it all", &["x"], &[])]);
+        press(&mut app, &[PROP_VETO_KEY]);
+        let said = verdicts(&mut app);
+        assert_eq!(said.len(), 1);
+        assert_eq!((said[0].id, said[0].approve), (7, false));
+    }
+
+    /// Nothing pending, nothing to answer — a stray Enter must not become a
+    /// verdict for a proposal that lapsed a second ago.
+    #[test]
+    fn the_keys_are_inert_with_an_empty_queue() {
+        let mut app = proposal_app(Vec::new());
+        press(&mut app, &[PROP_APPROVE_KEY]);
+        assert!(verdicts(&mut app).is_empty());
+        assert_eq!(app.world().resource::<UiState>().prop_cards, 0);
+    }
+
+    /// What the card actually says. The note is the co-commander's argument,
+    /// the sentences are `Intent::sentence()` — the same English the replay
+    /// log writes — and the conflict tags are the part that makes approval an
+    /// informed act rather than a reflex.
+    #[test]
+    fn a_card_shows_the_note_the_sentences_and_the_conflicts() {
+        let mut app = proposal_app(vec![a_proposal(
+            3,
+            "their push is committed — counter now",
+            &["squad 1 pushes to (40.0, 40.0)", "4 units focus Siege"],
+            &["re-tasks squad 1 (defend)"],
+        )]);
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query::<(&PropText, &Text)>();
+        let mut head = String::new();
+        let mut note = String::new();
+        let mut body = String::new();
+        for (slot, text) in q.iter(world) {
+            if slot.card != 0 {
+                // Unused cards are blanked, not left showing the last match's
+                // directive.
+                assert!(text.0.is_empty(), "card {} should be blank", slot.card);
+                continue;
+            }
+            match slot.part {
+                PropPart::Head => head = text.0.clone(),
+                PropPart::Note => note = text.0.clone(),
+                PropPart::Body => body = text.0.clone(),
+            }
+        }
+
+        assert!(head.starts_with("#3  copilot"), "got {head:?}");
+        assert!(head.contains("[Enter] approve"), "the top card names its keys");
+        assert_eq!(note, "their push is committed — counter now");
+        assert!(body.contains("- squad 1 pushes to (40.0, 40.0)"));
+        assert!(body.contains("- 4 units focus Siege"));
+        // The conflict is marked differently from the sentences: one says what
+        // would happen, the other says what it would cost you.
+        assert!(body.contains("! re-tasks squad 1 (defend)"), "got {body:?}");
+        // Everything the panel draws must be renderable by the default font —
+        // Bevy's has no `·`, and the first screenshot of this panel was full
+        // of tofu boxes where the bullets should have been.
+        assert!(
+            head.is_ascii() && body.is_ascii(),
+            "panel chrome must be ASCII: {head:?} / {body:?}"
+        );
+        // And the panel now occupies screen, so a click on "Approve" is not
+        // also a move order on the ground behind it.
+        assert_eq!(app.world().resource::<UiState>().prop_cards, 1);
     }
 
     fn json(intent: &Intent) -> serde_json::Value {

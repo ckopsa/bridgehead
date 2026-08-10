@@ -65,6 +65,19 @@ compiling to the same doctrine the AI writes, every unit able to answer *"why ar
 doing that?"* with its chain of command — and ultimately co-command, where a human and an
 AI run one faction and negotiate strategy in a language both speak natively.
 
+Co-command is now real (`WC3_BRIDGE=copilot`), and the shape it took is the best
+evidence the layers below it were built right. A second author on one faction turned out
+to be *one enum variant* — because there was already one vocabulary, one compiler, one
+fog rule, and a provenance stamp on every order, so "which of us moved this unit" was
+already a question the game could answer. What actually needed designing was the
+etiquette: the AI's standing orders execute directly, because a posture is advice you can
+overwrite in a second, while anything that spends the shared treasury or commits the army
+arrives as a **proposal** — the reason it gave, plus the compiled English of every
+command, plus a note of whose plan it would disturb — that the human approves, vetoes, or
+lets lapse. Legibility runs both ways: the human's own sentences ride in the AI's
+snapshot in the same schema. Neither partner can act invisibly on the other, which is the
+minimum condition for the word "together".
+
 ## Principles we learned by playing
 
 These were not designed in advance. They were forced by evidence — most of it written by
@@ -106,4 +119,6 @@ scoreboard. An RTS whose deciding layer is judgment — with a vocabulary both k
 minds speak natively — is our bet on what that future looks like.
 
 *Status: v1 playable (one race, three eras in progress — see the issue tracker); the
-shared-language v2 program is specified and sequenced. The arena is open.*
+shared-language v2 program is built — one intent vocabulary and compiler, English as a
+third spelling of it, provenance on every order, and co-command. The arena is open, and
+it now seats two on a side.*
