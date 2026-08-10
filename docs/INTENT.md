@@ -801,12 +801,20 @@ the Sorcerer, a caster but not a hero, is deliberately outside the word.
 
 It refuses rather than guesses. An unresolvable place, an unknown noun, a
 locked shop rung and a target class the engine does not have are all reported
-errors, never a silently different order. The one structural refusal is
-**conditionals**: "strike when their hero falls" has no verb, because the
-engine has no trigger system. The tool compiles the action, marks it deferred,
-and prints the command to run when the commander sees the condition in
-`events` — which is the honest shape of that request, not a limitation to
-paper over.
+errors, never a silently different order. **Conditionals** compile to
+`trigger_set` — "strike when their hero falls" arms a rule the engine watches
+at 4 Hz, which it could not do for as long as nothing in the game had an honest
+reading of an enemy hero. The sightings ledger is that reading: whether you
+*watched it die* is a fact a human plainly has.
+
+What still defers is a condition outside the predicate vocabulary, and the
+neighbouring sentence is the standing example — "strike when their hero is
+below 30%". No human can select an enemy hero, so no number about one has ever
+been on a screen, and a tool that reached for the nearest predicate would arm a
+rule about *our* hero and carry out the opposite order silently. The tool
+compiles the action, marks it deferred, and prints the command to run when the
+commander sees the condition in `events`. The line between the two sentences is
+not "is this about the enemy" but "could a human have seen it".
 
 The confirmation loop is `sentence()`. Compile, send, and the log reads back
 what the game understood in English. If the sentence is wrong, the compile was
@@ -1289,14 +1297,36 @@ what fired it.
 | `unit_count {kind, count}` | You field at least `count` living units of `kind`. |
 | `game_time {at}` | The match clock has passed `at` seconds. The one predicate about nothing in the world — it is here because "expand at six minutes" is a plan every commander already writes, and as a trigger it stops depending on remembering. |
 
-**What is deliberately missing** is anything about the *enemy's* internals — their
-gold, their tech, their hero's health. Not an oversight and not a fog problem
-you could scout your way around: those are facts the snapshot does not carry for
-either seat, so a predicate over them would be an information right the human
-does not have. `tools/intent_compile.py` therefore still **defers** "strike when
-their hero falls" — with `trigger_set` sitting right there — because the nearest
-predicate that exists reads *your own* hero and arming that would mean the
-opposite of what was asked.
+| `enemy_army_seen {size, within_s?}` | Your **intel ledger** holds at least `size` enemy troops that were observed as one concurrent force (`FogGrid::army_groups`). Reads MEMORY, unlike `enemy_sighted` — which is the point: an army does not stop existing because your scout died, and a rule that disarmed itself at that moment would disarm itself exactly when the enemy wanted. `within_s` bounds how stale the observation may be. Workers never count toward a force. Carries no region: regions are a different vocabulary, and a predicate that grew its own notion of "where" would be the second implementation this project keeps refusing to write. |
+| `enemy_hero_down {class?}` | An enemy hero class is **currently believed dead** — you watched one die and have not seen it alive since. A *level* predicate over a belief, not an edge over an event; see below. |
+
+**What is deliberately missing** is anything about the *enemy's* internals —
+their gold, their tech, their hero's **health**. Not an oversight and not a fog
+problem you could scout your way around: those are facts no observation
+produces, so a predicate over them would be an information right the human does
+not have. A human cannot even select an enemy hero — ui.rs's pickers skip
+anything that is not theirs — so no number about one has ever been on a screen.
+`tools/intent_compile.py` accordingly still **defers** "strike when their hero
+is below 30%".
+
+What it no longer defers is **"strike when their hero falls"**, and the
+distinction is the whole of what the intel bead bought. Whether their hero
+*died in front of you* is not an internal fact; it is the most public thing that
+can happen on a battlefield, and the sightings ledger records it the same way it
+records everything else — because one of your units was looking. So the honest
+predicate was never "their hero is hurt" but "their hero is believed dead", and
+once that was writable the sentence compiled. The line between the two requests
+is not *is this about the enemy* but *could a human have seen it*.
+
+`enemy_hero_down` is a **level** predicate, and the wording matters. Armed
+`once` — the normal case — it fires on the first sweep after the death is
+witnessed and disarms, which is the edge behaviour "when their hero falls"
+means, obtained without the engine keeping an edge-detection latch nobody can
+inspect. Armed with a `repeat` it re-fires while the belief stands, which reads
+as "keep pressing while they have no hero" and is a coherent second order. The
+belief is revocable: heroes revive through `HeroRecords`, so seeing the hero
+alive again returns the status to `alive` and a re-armed rule fires on the next
+death actually witnessed.
 
 ### once / repeating / spent
 

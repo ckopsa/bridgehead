@@ -1837,6 +1837,35 @@ fn validate_predicate(when: &TriggerWhen) -> Result<(), String> {
                 Err(format!("game_time must not be negative, got {at}"))
             }
         }
+        TriggerWhen::EnemyArmySeen { size, within_s } => {
+            if *size == 0 {
+                return Err("enemy_army_seen size must be at least 1".to_string());
+            }
+            if within_s.is_some_and(|w| w <= 0.0) {
+                return Err("enemy_army_seen within_s must be positive".to_string());
+            }
+            Ok(())
+        }
+        TriggerWhen::EnemyHeroDown { class } => match class {
+            // Refused at ARM time rather than silently never firing. A
+            // predicate naming "Footman" as a hero class is a typo, and the
+            // seat that typed it is owed the word — a rule that is armed,
+            // listed, and structurally incapable of coming true is the worst
+            // available outcome.
+            Some(name) => match parse_unit_kind(name) {
+                Some(kind) if is_hero_kind(kind) => Ok(()),
+                Some(_) => Err(format!(
+                    "'{name}' is not a hero class (one of {})",
+                    HERO_CLASSES
+                        .iter()
+                        .map(|k| kind_name(*k))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                None => Err(format!("unknown unit kind '{name}'")),
+            },
+            None => Ok(()),
+        },
         TriggerWhen::BaseUnderAttack | TriggerWhen::BountySpawned | TriggerWhen::MineDry => Ok(()),
     }
 }

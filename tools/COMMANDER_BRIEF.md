@@ -132,7 +132,7 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 
     trigger home-guard fired: squad 1 defends (-70.0, -70.0) within 26
 
-### The nine predicates
+### The eleven predicates
 
 | `when` | means |
 |---|---|
@@ -140,14 +140,32 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 | `{"type":"hero_below","frac":0.35}` | any of your living heroes under that fraction |
 | `{"type":"squad_below","id":1,"frac":0.5}` | squad 1's POOLED health under that (false if the squad is empty) |
 | `{"type":"enemy_sighted","class":"Siege","count":3}` | you can SEE that many enemies now (`class` optional; fog-honest) |
+| `{"type":"enemy_army_seen","size":6}` | your **intel ledger** holds 6+ enemy troops seen as one force. Optional `"within_s":30` demands a fresh sighting rather than a remembered one. Workers never count |
+| `{"type":"enemy_hero_down"}` | an enemy hero you **watched die** and have not seen alive since. Optional `"class":"Hero"` / `"Priestess"` for just one |
 | `{"type":"bounty_spawned"}` | a cache you can see is on the map |
 | `{"type":"mine_dry"}` | a dry gold mine within 40 of one of your finished halls |
 | `{"type":"tier_reached","tier":2}` | your tech tier |
 | `{"type":"unit_count","kind":"Footman","count":8}` | your living count of one unit kind |
 | `{"type":"game_time","at":360}` | the match clock, in seconds |
 
-There is nothing here about the enemy's gold, tech or hero health — the snapshot
-does not carry those for either seat, so no predicate can.
+`enemy_army_seen` vs `enemy_sighted` is the difference between memory and
+sight. `enemy_sighted` is true only while you have eyes on them, so it goes
+false the moment your scout dies — which is what the scout was killed for.
+`enemy_army_seen` reads the ledger and stays true.
+
+`enemy_hero_down` is a **level** predicate, not an edge: it means "as far as I
+know, their hero is down". Arm it `once` (no `repeat`) and it fires on the
+first sweep after you witness the death and then disarms, which is what "when
+their hero falls" means. Give it a `repeat` and it re-fires for as long as the
+belief stands — "keep pressing while they have no hero" — which is a different
+and equally legitimate order. If you see the hero alive again after a revive
+the belief flips back and a re-armed rule can fire on the next death you watch.
+
+There is still nothing here about the enemy's gold, their tech, or their hero's
+**health**. Those are facts no human can obtain — you cannot select an enemy
+hero, so no number about one has ever been on anybody's screen — so no
+predicate can read them. That their hero *died in front of you* is a different
+matter, and that one you may have.
 
 ### Three recipes worth arming in your first batch
 
@@ -179,6 +197,31 @@ only need telling the first time.
 {"type":"trigger_set","name":"expand",
  "when":{"type":"mine_dry"},
  "then":{"type":"build","worker":<worker id>,"kind":"TownHall","x":0.0,"z":-60.0}}
+```
+
+**4. The counter-punch** — the sentence this whole layer was named after. Their
+hero is the most expensive thing on their side of the map; the window after it
+dies is the one moment their army is worth less than yours. Once, because you
+only get to spend that window once.
+
+```json
+{"type":"trigger_set","name":"their-hero-down",
+ "when":{"type":"enemy_hero_down"},
+ "then":{"type":"posture","id":1,
+         "posture":{"type":"push","x":-70.0,"z":-70.0}}}
+```
+
+`tools/intent_compile.py` writes exactly that from `strike when their hero
+falls` — arm the squad first (`squad 1 is the army`) or let the tool mint one.
+
+**5. The doorbell** — react to a force you scouted, not to one you can still
+see. Repeating, because an army that is answered comes back.
+
+```json
+{"type":"trigger_set","name":"army-6","repeat":45,
+ "when":{"type":"enemy_army_seen","size":6,"within_s":30},
+ "then":{"type":"posture","id":1,
+         "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}
 ```
 
 A caution that applies to all three: `then` is frozen when you arm it, so ids in
@@ -239,9 +282,11 @@ omitted, exactly as before. The Sorcerer is a caster but **not** a hero, so
 - Anything it does not know, write by hand. It is a convenience over the schema
   above, never a gate in front of it, and it never guesses: an unresolvable
   place or an unknown noun is a reported error, not a silent whole-army move.
-- Conditionals ("strike when their hero falls") have no verb in this game —
-  there is no trigger system. The tool defers them and prints the command to
-  run when you see the condition in `events`.
+- Conditionals compile to `trigger_set`: "strike when their hero falls" arms a
+  rule the engine watches at 4 Hz. Only a condition outside the eleven
+  predicates defers, and then the tool says which condition and prints the
+  command to run when you see it in `events`. Enemy hero *health* is the
+  standing example — that one is genuinely unknowable, and it still defers.
 
 **Check the round trip.** Every intent, from either seat, is logged as one
 English sentence in `bridge/intent_log.jsonl`. If the sentence is not what you
@@ -487,8 +532,9 @@ first), `unlocked` for ACTING.
   - **An empty `units` list means "I have no information", not "there are no enemies."**
     Check the top-level `fog` object (`enabled`, `explored`, `visible`) before drawing any
     conclusion from silence. `explored: 0.1` means you have looked at a tenth of the map.
-  - Enemy **units** appear only while you can see them, and are never remembered. An army
-    that leaves your sight is simply gone from the snapshot — it has NOT died.
+  - Enemy **units** appear in `units` only while you can see them. An army that leaves
+    your sight is gone from `units` — it has NOT died. But it is not forgotten: see
+    **INTEL** below, which is where the memory of it lives.
   - Enemy **buildings** you have scouted stay in `buildings` as remembered ghosts carrying
     `last_seen` (game time of the sighting). A ghost may be stale: the building may have
     been destroyed, or upgraded to a higher tier, since. `last_seen` present == memory;
@@ -501,6 +547,42 @@ first), `unlocked` for ACTING.
   - **Scout deliberately.** Vision radius is per-kind in `catalog.json` (`vision`).
     Raiders see 24 and are the cheapest eyes on the map; Catapults see 14 but shoot 20, so
     unescorted siege is firing blind. Halls see furthest of all and grow with the tier.
+- **INTEL — what you REMEMBER of them (`intel`).** Fog decides what you can see; this is
+  what you learned from having seen it. Always present. Nothing in it was inferred,
+  deduced, or handed to you: every entry is something one of your units was looking at.
+  - `intel.sightings[]` — every enemy unit you have seen and not yet forgotten:
+    `{id, kind, pos, hp_frac, heading?, t_seen, age}`. **Every record carries its age**,
+    which is the whole reason this is a separate array from `units` — a memory reported
+    in the same shape as a sighting is a decoy. `heading` is a coarse compass point
+    (`"NE"`) and is absent when the unit was standing still or when you only glimpsed it
+    once: a heading is a difference between two looks.
+  - Entries **expire**. A sighting is dropped `intel.ttl_s` (90s) after its last refresh,
+    because a ninety-second-old unit position is not a stale fact but a wrong one. It is
+    also dropped the instant you **watch the unit die**. It is NOT dropped merely because
+    you walked back and found the spot empty — the record only ever claimed the unit was
+    there *at `t_seen`*, and it still was.
+  - So: an empty `sightings` means "nothing seen recently", never "nothing exists". Read
+    `age` before you act. A 5s-old sighting is a target; a 70s-old one is a rumour that
+    tells you where they *were going*, not where they are.
+  - `intel.groups[]` — the same sightings clustered into forces:
+    `{size, composition, pos, t_seen, age, place}`, e.g. `~8 (5 Footman, 3 Archer)` near
+    the center ford. Units cluster only if they were seen close together **in space and
+    in time**, so a group is a picture that existed at some instant. Workers are excluded:
+    a mining crew is not an army. `place` is the public name of the ground.
+  - `intel.heroes` — one entry per enemy hero class, always all of them:
+    `status` is `"unknown"` (never met), `"alive"` (seen alive, nothing since says
+    otherwise) or `"seen-dying"` (you watched it die), plus where and when.
+    **Read `"alive"` as *alive as far as you know*** — a hero that died out of your sight
+    goes on reporting `"alive"` for as long as nobody looks. `"unknown"` is not `"they
+    have no hero"`.
+  - There is **no level, xp, mana, inventory or squad** on any of this, ever. A human
+    cannot select an enemy unit, so none of those has been on anybody's screen. What you
+    get is what a player watching the same fight would have: existence, kind, place,
+    health bar, which way it was walking, and when.
+  - The human at the keyboard sees the identical ledger — faded markers where units were
+    last seen, on the map and the minimap, and a "Their heroes:" line. Same knowability,
+    both renderers.
+  - Two predicates read it: `enemy_army_seen` and `enemy_hero_down`. See Triggers above.
 - Map ±100. Your base corner and the enemy's are opposite. **Read `map` in your snapshot**:
   it names the layout, summarises what the ground does to a plan, and lists every `chokes`
   entry — the only gaps through impassable terrain. On a map with chokes, walls/towers at a

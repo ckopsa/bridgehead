@@ -23,6 +23,11 @@ EXPECTED_TOP_KEYS = {
     "t", "my_team", "seq_applied", "errors", "game_over", "me", "map",
     "unlocked", "units", "buildings", "squads", "bounties", "mines",
     "trees_near", "events", "fog",
+    # `intel` is ALWAYS present, on the same reasoning as `fog` and unlike the
+    # optional keys below: an absent block and an empty one are different
+    # claims ("this build has no ledger" vs "you have seen nothing"), and a
+    # commander that cannot tell them apart will read silence as safety.
+    "intel",
 }
 
 # Keys that appear only in states this check does not run in, so the assertion
