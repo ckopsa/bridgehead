@@ -550,3 +550,49 @@ asserted deliberately, not discovered.
    human-vs-Claude rematch. Acceptance per thesis principle 4: flip
    `WC3_COMMAND_LATENCY` on by default only once command nodes appear in a winning
    player's after-action report.
+
+---
+
+## 6. Phase 0 as built (issues 1–3, shipped)
+
+Doctrine parity shipped as its own release, as §3 required. What landed differs
+from the sketch in three places, and the differences are the interesting part.
+
+**The executor gate.** `run_squad_postures`'s `!machine_driven(...)` early-return
+is gone. The opt-in test turned out to be simpler than "does this unit have a
+`SquadId` whose `(team, id)` has a posture entry": that test is already the loop
+the executor runs — it iterates `SquadOrders`, and a unit with no squad is never
+in it. So the whole gate reduces to *one* carve-out:
+
+```rust
+if squad == DEFAULT_SQUAD && !machine_driven(&ai, &external, team) { continue; }
+```
+
+`DEFAULT_SQUAD` is not something a player said — it is the anti-idle floor
+`default_squad_autonomy` seeds to compensate for a slow machine commander, and
+that function keeps its machine-only gate exactly as it was (so a human's idle
+units still never self-organise). The carve-out is therefore also the F9
+handback rule: take a team back from the autopilot and you inherit its squads,
+not its autopilot. Four tests in `doctrine.rs` pin all four cases.
+
+**The page key is `[I]`, not `[U]`.** §4 proposed `[U]`; the upgrade bead
+claimed it in the meantime. `[I]` is also *both* a button and a raw hotkey: a
+worker selection spends all nine card slots on the classic build layout, so the
+button yields — and a route to doctrine that one stray worker in the drag box
+can close is not a route.
+
+**Squads are minted by the gesture.** A posture button pressed on a selection
+that is not already one squad submits `squad` first and `posture` second — two
+sentences, the same way a mixed right-click already compiles to two. So `[I][W]`
+works without a `Ctrl+N` first, and the log reads identically to a commander who
+sent both commands by hand.
+
+**Scoreboard against §2.0's 8-vs-4.** The human now has all seven doctrine verbs
+(`priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template`),
+parameterised rather than as toggles, with the coarse `[G]/[V]/[P]/[T]` presets
+kept on page one. What remains bridge-only is *range*, not vocabulary: the card
+steps retreat through 25/35/50% and leash through 10/18/30 where a commander
+writes any float; squad ids from a gesture are 1–3 where the wire takes any
+`u8`; `posture escort` targets the team's hero where the wire names any own
+unit; and per-ability `autocast` rules are still one rule on slot 0. Each is a
+UI affordance, not a missing verb — the intent submitted is the same value.

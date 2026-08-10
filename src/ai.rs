@@ -167,7 +167,83 @@ impl Plugin for AiPlugin {
             .add_systems(Startup, ai_apply_env)
             // `ai_think` after `FogSet`: the scripted commander plans from
             // this frame's visibility, exactly like the bridge seats.
-            .add_systems(Update, (ai_toggle_hotkey, ai_think.after(FogSet)));
+            .add_systems(
+                Update,
+                (ai_toggle_hotkey, seed_machine_autocast, ai_think.after(FogSet)),
+            );
+    }
+}
+
+/// Own heroes and whatever auto-cast doctrine they already carry.
+type HeroPolicyQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Unit,
+        &'static Team,
+        &'static Health,
+        Option<&'static AutoCastPolicy>,
+    ),
+    With<Hero>,
+>;
+
+/// Standing ultimate doctrine for the heroes of teams THIS module is driving.
+///
+/// The scripted commander casts Slam by hand (it knows what a clump of enemies
+/// on the Champion is worth). Ultimates are a different kind of decision —
+/// long cooldown, situational, worthless when spent early — so instead of
+/// scripting them, the AI writes an `AutoCastPolicy` and lets doctrine.rs's
+/// auto-caster decide, under exactly the gate a player's button obeys:
+///
+///   * Warcry — 4+ own units AND 4+ enemies inside radius 8 (doctrine.rs asks
+///     the offensive-buff question twice, so it never fires at a worker line);
+///   * Sanctuary — 3+ own units below 60% HP inside radius 7.
+///
+/// Rules are named, not numbered (`machine_autocast_rules`), and installed
+/// only while the team is machine-driven: flip F9 or take a seat on the bridge
+/// and the rules stop being re-applied, so a human or an LLM commander keeps
+/// its ultimates in its own hands. Idempotent — once the rules match, nothing
+/// is written.
+fn seed_machine_autocast(
+    ai_controlled: Res<AiControlled>,
+    mut commands: Commands,
+    heroes: HeroPolicyQuery,
+) {
+    for (entity, unit, team, health, policy) in &heroes {
+        let driving = match team {
+            Team::Human => ai_controlled.human,
+            Team::Claude => ai_controlled.claude,
+        };
+        if !driving || health.current <= 0.0 {
+            continue;
+        }
+        let wanted = machine_autocast_rules(unit.kind);
+        if wanted
+            .iter()
+            .all(|(index, min)| policy.and_then(|p| p.min_enemies_for(*index)) == Some(*min))
+        {
+            continue;
+        }
+        let mut next = policy.cloned().unwrap_or_default();
+        for (index, min) in &wanted {
+            next.set(*index, *min);
+        }
+        // One line per hero (so, per revive): the standing doctrine a
+        // machine-driven team just acquired, by ability name rather than slot.
+        let list = abilities_of_unit(unit.kind);
+        info!(
+            "{team:?}: ultimate auto-cast doctrine installed — {}",
+            wanted
+                .iter()
+                .map(|(index, min)| format!(
+                    "{} at {min}+ targets",
+                    list.get(*index).map_or("?", |d| d.name)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        commands.entity(entity).try_insert(next);
     }
 }
 

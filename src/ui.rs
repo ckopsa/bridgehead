@@ -56,6 +56,31 @@ const FALLBACK_FRAC: f32 = 0.35;
 /// Enemies inside the slam radius before [T Auto-Slam] fires.
 const AUTOCAST_MIN_ENEMIES: u32 = 3;
 
+/// Retreat thresholds the doctrine card's [F] steps through, in order. The
+/// coarse [V] toggle writes `FALLBACK_FRAC` and nothing else; this is the
+/// parameterised form, and closing exactly this gap (an on/off switch where
+/// the bridge gets a number) is what docs/TEMPO.md §2.0 asked for.
+const FALLBACK_STEPS: [f32; 3] = [0.25, 0.35, 0.50];
+/// Leash radii the doctrine card's [G] steps through. `GUARD_RADIUS` is the
+/// middle rung, so the quick preset and the parameterised control agree.
+const LEASH_STEPS: [f32; 3] = [10.0, 18.0, 30.0];
+/// Radius written by the doctrine card's Defend posture.
+const DEFEND_RADIUS: f32 = 22.0;
+/// Highest squad id a human gesture will ever mint. Matches the three control
+/// groups; a bridge commander may use any id it likes.
+const MAX_UI_SQUAD: u8 = 3;
+
+/// Step a value through `steps` and back to "off": `None -> steps[0] -> … ->
+/// steps[n-1] -> None`. `eq` decides which rung the current value is on, so a
+/// value a bridge commander wrote (37.5) lands on the next rung above it
+/// rather than resetting the cycle.
+fn cycle_step(current: Option<f32>, steps: &[f32]) -> Option<f32> {
+    let Some(current) = current else {
+        return steps.first().copied();
+    };
+    steps.iter().copied().find(|s| *s > current + 1e-3)
+}
+
 const TOP_BAR_H: f32 = 34.0;
 /// Height of the bottom console; also the "not a world click" strip.
 const CONSOLE_H: f32 = 200.0;
@@ -195,8 +220,14 @@ struct UiState {
     /// round-robin over the selected workers instead of piled on the nearest
     /// one. Cleared whenever placement mode is entered or cancelled.
     wall_chain: Vec<Entity>,
-    /// Control groups 1..3.
+    /// Control groups 1..3 — and, since `control_groups` submits the `squad`
+    /// verb, the same sets doctrine.rs executes postures for.
     groups: HashMap<u8, Vec<Entity>>,
+    /// Which page of the command card is showing ([I] toggles).
+    page: CardPage,
+    /// A posture waiting for the player to click its point on the ground.
+    /// Same shape as `placement`: an armed mode the next left-click consumes.
+    posture_place: Option<PostureArm>,
     /// Round-robin cursor for the idle-worker hotkey.
     idle_cursor: usize,
     /// Left button went down inside the minimap and is still held.
@@ -347,6 +378,57 @@ enum Slot {
 // the duplication the intent layer exists to remove, and dropping it also
 // bought `command_input` three parameters of headroom against Bevy's ceiling.
 
+/// The command card has two pages. Page one is the classic RTS card — build,
+/// train, cast, the four coarse doctrine toggles. Page two is doctrine proper:
+/// squad postures, parameterised retreat/leash, and the production template.
+///
+/// A page rather than more keys, because the 3x3 card was already full and the
+/// hotkey landscape already crowded; and a page rather than a separate screen,
+/// because a posture has to be issued in the middle of a fight, next to the
+/// selection it is about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum CardPage {
+    #[default]
+    Orders,
+    Doctrine,
+}
+
+/// The four postures, as the card offers them. `SquadPosture` carries a point
+/// (or a unit) that the player has not chosen yet when the button is pressed,
+/// so the button names only the kind and the click supplies the rest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PostureKind {
+    Defend,
+    Push,
+    Forage,
+    /// Screen the team's hero. Needs no click — the target is a unit.
+    Escort,
+}
+
+impl PostureKind {
+    fn label(self) -> &'static str {
+        match self {
+            PostureKind::Defend => "Defend",
+            PostureKind::Push => "Push",
+            PostureKind::Forage => "Forage",
+            PostureKind::Escort => "Escort Hero",
+        }
+    }
+    /// True when the gesture is "press, then click the ground".
+    fn needs_point(self) -> bool {
+        !matches!(self, PostureKind::Escort)
+    }
+}
+
+/// A posture button waiting for its ground click. The squad is resolved at
+/// press time (not at click time) so the sentence the player is composing
+/// cannot change under them if the selection does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PostureArm {
+    squad: u8,
+    kind: PostureKind,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CmdAction {
     AttackMove,
@@ -378,6 +460,31 @@ enum CmdAction {
     CyclePriority,
     /// Doctrine: toggle `AutoCastPolicy` on every selected own hero.
     ToggleAutoCast,
+
+    // --- page two: the doctrine card -------------------------------------
+    /// Flip between the orders card and the doctrine card.
+    TogglePage,
+    /// Set the selection's squad posture. Ground-pointed kinds arm a click.
+    SetPosture(PostureKind),
+    /// Clear the selection's squad posture (membership survives).
+    ClearPosture,
+    /// Step the retreat threshold: off -> 25% -> 35% -> 50% -> off. The
+    /// parameterised form of [V], and the reason it exists: the bridge sends a
+    /// number, so the human must be able to choose one too.
+    CycleFallback,
+    /// Step the leash radius: off -> 10 -> 18 -> 30 -> off.
+    CycleLeash,
+    /// Step the selected building's template squad: none -> 1 -> 2 -> 3 -> none.
+    TemplateSquad,
+    /// Step the selected building's template retreat threshold.
+    TemplateFallback,
+    /// Step the selected building's template focus-fire preset.
+    TemplatePriority,
+    /// Toggle auto-cast in the selected building's template (heroes only, but
+    /// a hall is exactly where a hero is trained).
+    TemplateAutoCast,
+    /// Remove the selected building's template entirely.
+    TemplateClear,
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +589,9 @@ struct UnitDoctrine {
     prio: PrioPreset,
     autocast: bool,
     hero: bool,
+    /// Squad membership — the same handle `Ctrl+N` and the bridge's `squad`
+    /// verb write, and the thing a posture is about.
+    squad: Option<u8>,
 }
 
 impl UnitDoctrine {
@@ -491,6 +601,7 @@ impl UnitDoctrine {
         prio: Option<&TargetPriority>,
         autocast: Option<&AutoCastPolicy>,
         hero: bool,
+        squad: Option<&SquadId>,
     ) -> Self {
         UnitDoctrine {
             leash: leash.map(|l| l.radius),
@@ -498,6 +609,7 @@ impl UnitDoctrine {
             prio: PrioPreset::of(prio.and_then(|p| p.0.first().copied())),
             autocast: autocast.is_some(),
             hero,
+            squad: squad.map(|s| s.0),
         }
     }
 }
@@ -516,19 +628,29 @@ struct DoctrineState {
     autocast: usize,
     /// Preset of the FIRST selected unit (lowest entity index).
     prio: PrioPreset,
+    /// Squad of the FIRST selected unit — the squad a posture gesture is about.
+    squad: Option<u8>,
+    /// How many of the selection are in that squad (the rest are elsewhere or
+    /// nowhere, which is what makes a posture gesture also submit `squad`).
+    in_squad: usize,
 }
 
 impl DoctrineState {
     /// `sorted` must be ordered by entity index — that fixes "the first unit".
     fn of(sorted: &[UnitDoctrine]) -> Self {
+        let first_squad = sorted.iter().find_map(|u| u.squad);
         let mut s = DoctrineState {
             units: sorted.len(),
             prio: sorted.first().map(|u| u.prio).unwrap_or_default(),
+            squad: first_squad,
             ..default()
         };
         for u in sorted {
             if u.hero {
                 s.heroes += 1;
+            }
+            if u.squad.is_some() && u.squad == first_squad {
+                s.in_squad += 1;
             }
             if let Some(r) = u.leash {
                 if s.leashed == 0 {
@@ -561,9 +683,20 @@ impl DoctrineState {
     fn autocast_active(&self) -> bool {
         Self::most(self.autocast, self.heroes)
     }
+    /// Radius the current selection is leashed at, for the [G] cycle. `None`
+    /// means "no leash", which is the first rung.
+    fn leash_value(&self) -> Option<f32> {
+        (self.leashed > 0).then_some(self.leash_radius)
+    }
+    /// Threshold the current selection falls back at, for the [F] cycle.
+    fn fallback_value(&self) -> Option<f32> {
+        (self.fallback > 0).then_some(self.fallback_frac)
+    }
     /// Compact panel line; empty when the selection carries no policy at all.
     /// A trailing `xN` marks a policy only part of the selection has.
-    fn line(&self) -> String {
+    /// `posture` is the live `SquadOrders` entry for `self.squad`, rendered by
+    /// the caller (which is the only place with the resource).
+    fn line(&self, posture: Option<&str>) -> String {
         let tally = |count: usize, total: usize| {
             if count < total {
                 format!(" x{}", count)
@@ -572,6 +705,18 @@ impl DoctrineState {
             }
         };
         let mut parts: Vec<String> = Vec::new();
+        // Squad first: it is the handle everything else on the doctrine card
+        // hangs off, and the one thing the human could not name at all before.
+        if let Some(squad) = self.squad {
+            parts.push(format!(
+                "squad {}{}",
+                squad,
+                tally(self.in_squad, self.units)
+            ));
+            if let Some(posture) = posture {
+                parts.push(posture.to_string());
+            }
+        }
         if self.leashed > 0 {
             parts.push(format!(
                 "guard({:.0}){}",
@@ -605,6 +750,86 @@ impl DoctrineState {
 fn sorted_doctrine(mut list: Vec<(u32, UnitDoctrine)>) -> Vec<UnitDoctrine> {
     list.sort_by_key(|(i, _)| *i);
     list.into_iter().map(|(_, d)| d).collect()
+}
+
+/// A live `SquadPosture`, in the panel's compact shorthand. The point is
+/// spelled out because a posture *is* its point — "defend" alone tells the
+/// player nothing about which ground they told the squad to hold.
+fn posture_tag(posture: &SquadPosture) -> String {
+    match posture {
+        SquadPosture::Defend { pos, radius } => {
+            format!("defend({:.0},{:.0} r{:.0})", pos.x, pos.z, radius)
+        }
+        SquadPosture::Push { pos } => format!("push({:.0},{:.0})", pos.x, pos.z),
+        SquadPosture::Escort { .. } => "escort".to_string(),
+        SquadPosture::Forage { muster } => {
+            format!("forage(muster {:.0},{:.0})", muster.x, muster.z)
+        }
+    }
+}
+
+/// Which button on the doctrine card a live posture corresponds to, so the
+/// card can show what the squad is currently doing.
+fn posture_kind(posture: &SquadPosture) -> PostureKind {
+    match posture {
+        SquadPosture::Defend { .. } => PostureKind::Defend,
+        SquadPosture::Push { .. } => PostureKind::Push,
+        SquadPosture::Escort { .. } => PostureKind::Escort,
+        SquadPosture::Forage { .. } => PostureKind::Forage,
+    }
+}
+
+/// The `DoctrineTemplate` of the one selected building, read out of
+/// the ECS. `capable` is false when the selection is not a single own finished
+/// building with a training queue — i.e. when intent.rs would reject a
+/// `template` for it, so the card refuses to offer one.
+#[derive(Clone, Copy, Default)]
+struct TemplateView {
+    capable: bool,
+    squad: Option<u8>,
+    retreat: Option<f32>,
+    prio: PrioPreset,
+    autocast: bool,
+}
+
+impl TemplateView {
+    fn read(capable: bool, template: Option<&DoctrineTemplate>) -> Self {
+        let t = template.cloned().unwrap_or_default();
+        TemplateView {
+            capable,
+            squad: t.squad,
+            retreat: t.retreat.map(|r| r.below_frac),
+            prio: PrioPreset::of(t.priority.as_ref().and_then(|p| p.first().copied())),
+            autocast: t.autocast.is_some_and(|n| n > 0),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.squad.is_none()
+            && self.retreat.is_none()
+            && self.prio == PrioPreset::None
+            && !self.autocast
+    }
+    /// Panel line for a selected building — the building-side twin of
+    /// `DoctrineState::line`.
+    fn line(&self) -> String {
+        if !self.capable || self.is_empty() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(squad) = self.squad {
+            parts.push(format!("squad {squad}"));
+        }
+        if let Some(frac) = self.retreat {
+            parts.push(format!("fallback({:.0}%)", frac * 100.0));
+        }
+        if self.prio != PrioPreset::None {
+            parts.push(format!("prio:{}", self.prio.tag()));
+        }
+        if self.autocast {
+            parts.push("autocast".to_string());
+        }
+        format!("Trains with: {}", parts.join("   "))
+    }
 }
 
 struct CmdEntry {
@@ -788,6 +1013,10 @@ struct ShopState {
     hero: bool,
     /// That hero has a free inventory slot.
     room: bool,
+    /// The team's tech tier — the shelf is tiered, so a Shop built at T1 shows
+    /// the T2 banner and the T3 scroll as locked rather than hiding them. A
+    /// player has to be able to see what climbing the ladder buys.
+    tier: TechTier,
 }
 
 /// Where a building sits on the worker's build card: `(slot, key, caption)`,
@@ -795,12 +1024,26 @@ struct ShopState {
 /// match is the ONLY thing a new `BuildingKind` has to declare here — cost,
 /// name and tech gating all come from the shared tables via `build_cards`.
 ///
-/// Free letters only: every other command key in this file is
-/// A S R C B F H O L K N Q W E G V P T Z X U, plus the second/third ability
-/// slots Y D (hero) and J M (building), plus Esc / '.' / Ctrl+1-3;
-/// shared.rs owns F1-F4, ai.rs F9, the surrender hotkey F12, and terrain.rs
-/// the arrow keys. K (workshop) and N (shop) were picked against that whole
-/// list — I is the only remaining unclaimed letter.
+/// Free letters only — but "free" is a question about THIS CARD, not about the
+/// file. Every letter A-Z is now spoken for somewhere in ui.rs, so the test a
+/// new build card has to pass is narrower and more useful: no collision with
+/// anything that can appear on a card that also has build buttons.
+///
+/// A build card is only ever drawn for a selection containing a WORKER, and
+/// such a selection can also carry a hero. So the occupied set here is:
+///   A S (orders) · B F H O L K N (the other builds) · G V P (doctrine quick
+///   toggles) · I (the doctrine page toggle) · R Y D (hero abilities) ·
+///   Z X (carried items) · T (auto-cast)
+/// plus Esc / '.' / Ctrl+1-3; shared.rs owns F1-F4, ai.rs F9, the surrender
+/// hotkey F12, and terrain.rs the arrow keys.
+///
+/// What that leaves is C E J M Q U W — every one of them a letter that only
+/// ever appears on a card for a selection of exactly ONE BUILDING (production
+/// hotkeys Q W E, building abilities C J M, the tier-up U). A worker selection
+/// and a single-building selection are mutually exclusive by construction, so
+/// reusing one costs nothing. `SHOP_KEYS` already relies on the same disjointness
+/// in the other direction — it puts the production letters on a Shop, which
+/// trains nothing.
 fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
     match kind {
         BuildingKind::Barracks => Some((0, KeyCode::KeyB, "B")),
@@ -810,12 +1053,21 @@ fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
         BuildingKind::Wall => Some((4, KeyCode::KeyL, "L")),
         BuildingKind::Workshop => Some((5, KeyCode::KeyK, "K")),
         BuildingKind::Shop => Some((6, KeyCode::KeyN, "N")),
-        // I, the last free letter in the census above. Slot 7 is what pushed
-        // the command card from 3x3 to 4x3 (see `CMD_SLOTS`): with eight
-        // placeable kinds, `[A] [S]` plus eight build cards is ten entries, and
-        // at nine slots the truncation at the end of `command_entries` would
-        // have silently eaten this one.
-        BuildingKind::Blacksmith => Some((7, KeyCode::KeyI, "I")),
+        // [C], for bla(C)ksmith — a building-ability letter, and building
+        // abilities never share a card with build buttons (see above).
+        //
+        // It was [I] until the doctrine-page bead claimed that letter for the
+        // page toggle, which IS on a worker card. Two things wanting [I] on the
+        // same selection is the one collision this table exists to prevent, and
+        // the page toggle wins it: a build card has seven siblings the player
+        // can learn the pattern from, while [I] is the only route to postures
+        // and templates at all.
+        //
+        // Slot 7 is separately what pushed the command card from 3x3 to 4x3
+        // (see `CMD_SLOTS`): eight placeable kinds plus `[A] [S]` is ten
+        // entries before doctrine gets a look in, and at nine slots the
+        // truncation at the end of `command_entries` ate the last build card.
+        BuildingKind::Blacksmith => Some((7, KeyCode::KeyC, "C")),
         // Reached by upgrading a hall, never by placing one — no build card,
         // and `build_cards` filters on `building_placeable` besides.
         BuildingKind::Keep | BuildingKind::Castle => None,
@@ -849,6 +1101,17 @@ const TRAIN_KEYS: [(KeyCode, &str); 4] = [
 /// Inventory-slot hotkeys, by slot index.
 const ITEM_KEYS: [(KeyCode, &str); 2] = [(KeyCode::KeyZ, "Z"), (KeyCode::KeyX, "X")];
 
+/// Shop-shelf hotkeys, by index into `ALL_ITEMS`. Q W E R are the production
+/// letters (a Shop trains nothing, so they never collide), and [I] — the one
+/// letter `build_card_slot`'s roster left unclaimed — takes the fifth rung.
+const SHOP_KEYS: [(KeyCode, &str); 5] = [
+    (KeyCode::KeyQ, "Q"),
+    (KeyCode::KeyW, "W"),
+    (KeyCode::KeyE, "E"),
+    (KeyCode::KeyR, "R"),
+    (KeyCode::KeyI, "I"),
+];
+
 /// Hero ability hotkeys, by ability slot. [R] is where the one hero ability
 /// has always lived, so a Champion or Priestess with a single spell is
 /// unchanged; a second and third spell get [Y] and [U].
@@ -880,22 +1143,23 @@ fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
     }
 }
 
-/// What the command card READS to decide whether an ability is castable: the
-/// team's tech tier (the `TeamTier` unlock predicate) and each caster's
-/// per-ability cooldowns, looked up by entity so the big selection queries keep
-/// their shape. The matching WRITES live in `CardActions` — two bundles because
-/// `command_input` is near Bevy's 16-parameter ceiling and these five params
-/// would otherwise blow through it.
-/// It now also carries what the RESEARCH buttons read — the team's completed
-/// levels and which forges are mid-job. Same justification: these are reads the
-/// card needs in two systems (`command_input` builds the entries, `update_hud`
-/// rebuilds them to draw), and bundling them keeps both under Bevy's
-/// 16-parameter ceiling. `update_hud` takes the whole bundle rather than
-/// `TechTiers` and `AbilityCooldowns` loose, which is a parameter cheaper than
-/// it used to be and removes a second spelling of the same two reads.
+/// The read-only side of the command card, bundled so `command_input` keeps
+/// headroom against Bevy's parameter ceiling (the same reason `CardActions`
+/// existed before intent.rs took the writers). `squads` is here because the
+/// doctrine page has to show what a squad is *currently* doing before it can
+/// offer to change it, and `research`/`researching` because a forge's buttons
+/// have to show what the TEAM has already bought before offering the next rung.
+///
+/// `update_hud` takes the whole bundle too, rather than `TechTiers`,
+/// `SquadOrders` and `AbilityCooldowns` loose. That is two parameters cheaper
+/// than spelling them out — which is what buys the room for the research reads
+/// — and it removes a second, drifting copy of the same lookups: the card the
+/// player SEES and the card the keyboard DISPATCHES against are now computed
+/// from one set of facts.
 #[derive(SystemParam)]
 struct CastLookup<'w, 's> {
     tiers: Res<'w, TechTiers>,
+    squads: Res<'w, SquadOrders>,
     cooldowns: Query<'w, 's, &'static AbilityCooldowns>,
     /// The team's completed research levels — what a research button reads to
     /// decide whether it is buyable, in progress, or already at the cap.
@@ -928,40 +1192,55 @@ fn ability_slots(
 /// the command card drive off this list, so a click and a key press run the
 /// exact same code path.
 ///
-/// Slot budget (the card is 3x3 = `CMD_SLOTS`). Layout per selection type:
-///   worker(s)            A S | B F H O L K N               (9, all toggles dropped)
-///   worker(s) + hero     A S | B F H O L K N               (9, [R Z X] dropped too)
-///   fighters             A S | G V P                       (5)
-///   hero                 A S R | Z X (carried items) | G V P T   (<=9)
-///   town hall            Q(Worker) W/E(hero class) C(CallToArms)
-///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman)  (4)
-///   workshop             Q(Catapult)                       (1)
-///   shop                 Q(Potion) W(Portal)               (2)
+/// Slot budget (the card is 4x3 = `CMD_SLOTS`). Layout per selection type:
+///   worker(s)            A S | B F H O L K N C | (1 toggle) I   (12)
+///   worker(s) + hero     A S | B F H O L K N C | (1 toggle) I   (12, [R Z X] dropped)
+///   fighters             A S | G V P | I                    (6)
+///   hero                 A S R | Z X (carried items) | G V P T | I  (<=12)
+///   town hall            Q(Worker) W/E(hero class) C(CallToArms) U | I
+///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman) | I  (5)
+///   workshop             Q(Catapult) | I                     (2)
+///   shop                 Q W E R I — the shelf, five rungs (see `SHOP_KEYS`)
+///   blacksmith           Q(Attack) W(Armor)                  (2)
+///
+/// The card was 3x3 until the Blacksmith became the EIGHTH placeable kind.
+/// `[A] [S]` plus eight build cards is ten entries before doctrine is even
+/// considered, so at nine slots the `truncate` below silently ate the last
+/// build card — which is the worst possible way for a building to become
+/// unbuildable. It grew a fourth COLUMN rather than a fourth row because the
+/// console is height-bound (`CONSOLE_H` 200px against three 52px rows plus gaps
+/// and margins), while the selection panel next to it is `flex_grow` and has
+/// 52px of width to give.
 ///
 /// Build commands never yield — a greyed [K Workshop] is how the player learns
 /// what unlocks it, and it is the only route to a building at all. The doctrine
 /// toggles give way first, in the order [P Priority] (a preference),
 /// [V Fallback], [G Guard]; [T Auto-Slam] is kept longest because it is the
-/// only hero-specific toggle with no other route in. With seven buildable kinds
-/// a worker card spends its whole budget on the classic layout, so a worker
-/// selection loses the toggles outright — and a worker+hero selection loses the
-/// hero's [R] and item buttons as well. Both are one deselect away; a building
-/// the player cannot even see on the card is not.
+/// only hero-specific toggle with no other route in. One slot is always held
+/// back for [I], the page toggle, since postures and templates have no other
+/// route in either. At twelve slots a worker card now keeps the classic build
+/// layout, one quick toggle AND the page toggle; a worker+hero selection still
+/// loses the hero's [R] and item buttons, one deselect away.
 ///
 /// Abilities and items are generic: the hero button reads `ability_of_unit`, so
 /// a Champion shows [R Slam 40mp] and a Priestess [R Heal 45mp] with no code
 /// here naming either; the building button reads `ability_of_building`, which
 /// only the TownHall answers today ([C CallToArms]).
 fn command_entries(
+    page: CardPage,
     own_units: usize,
     has_worker: bool,
     // (kind, completed) of the only selected building, when it is the whole selection.
     single_building: Option<(BuildingKind, bool)>,
     hero: HeroCmds,
-    doc: DoctrineState,
+    card: DoctrineCard,
     // Completed buildings the player owns — the tech gate for build entries.
     completed: &[BuildingKind],
 ) -> Vec<CmdEntry> {
+    let doc = card.doc;
+    if page == CardPage::Doctrine {
+        return doctrine_entries(own_units, card);
+    }
     let mut out: Vec<CmdEntry> = Vec::new();
 
     if own_units > 0 {
@@ -1143,14 +1422,22 @@ fn command_entries(
             // full inventory, or with an empty purse.
             if let Some(shop) = hero.shop {
                 for (i, item) in ALL_ITEMS.iter().enumerate() {
-                    let Some((key, hotkey)) = TRAIN_KEYS.get(i).copied() else {
+                    let Some((key, hotkey)) = SHOP_KEYS.get(i).copied() else {
                         continue;
                     };
                     let def = item_def(*item);
-                    let mut entry =
-                        CmdEntry::plain(CmdAction::Buy(*item), key, hotkey, item_name(*item))
-                            .priced(def.cost_gold, 0);
-                    entry.enabled = shop.hero && shop.room;
+                    let unlocked = item_unlocked(*item, shop.tier);
+                    // A locked rung says WHAT IT COSTS in tech, not just that
+                    // it is dark: "Banner T2" is a build order, "Banner"
+                    // greyed out is a mystery.
+                    let caption = if unlocked {
+                        item_name(*item).to_string()
+                    } else {
+                        format!("{} {}", item_name(*item), def.tier.name())
+                    };
+                    let mut entry = CmdEntry::plain(CmdAction::Buy(*item), key, hotkey, &caption)
+                        .priced(def.cost_gold, 0);
+                    entry.enabled = shop.hero && shop.room && unlocked;
                     out.push(entry);
                 }
             }
@@ -1186,7 +1473,10 @@ fn command_entries(
             CmdAction::ToggleFallback,
             CmdAction::ToggleGuard,
         ];
-        let room = CMD_SLOTS.saturating_sub(out.len());
+        // One slot is held back for [I]: it is the only route to postures,
+        // templates and the parameterised controls, so it outranks every
+        // quick preset that has a page-two equivalent anyway.
+        let room = CMD_SLOTS.saturating_sub(out.len()).saturating_sub(1);
         for dropped in YIELD_ORDER {
             if doctrine.len() <= room {
                 break;
@@ -1199,7 +1489,167 @@ fn command_entries(
         out.extend(doctrine);
     }
 
+    // The page toggle, last on the card and last to yield. A worker selection
+    // spends all nine slots on the classic build layout and therefore loses it
+    // — one deselect away, exactly like the toggles it sits with.
+    if (own_units > 0 || card.tmpl.capable) && out.len() < CMD_SLOTS {
+        out.push(CmdEntry::plain(
+            CmdAction::TogglePage,
+            KeyCode::KeyI,
+            "I",
+            "Doctrine",
+        ));
+    }
+
     out.truncate(CMD_SLOTS);
+    out
+}
+
+/// Everything page two draws itself from. Bundled so `command_entries` keeps
+/// one argument for "the doctrine situation" instead of five.
+#[derive(Clone, Copy, Default)]
+struct DoctrineCard {
+    doc: DoctrineState,
+    /// Live posture of `doc.squad`, when that squad has an entry in
+    /// `SquadOrders` — i.e. when doctrine.rs is actually executing something.
+    posture: Option<PostureKind>,
+    tmpl: TemplateView,
+    /// The team has a living hero somewhere, so Escort has a target.
+    hero_alive: bool,
+}
+
+/// Page two: the doctrine card. This is the half of docs/TEMPO.md §2.0 that
+/// the bridge had and the human did not — squads with postures, a retreat
+/// threshold and a leash radius the player chooses rather than accepts, and a
+/// production template. Every button submits an intent that a commander could
+/// have typed, and the log cannot tell which happened.
+///
+///   units selected      Q Defend  W Push  E Forage | R Escort  T Stand Down
+///                       F Fall back%  G Guard r  P Priority | I Orders   (9)
+///   production building Q Squad  W Fall back%  E Priority  R Auto-cast
+///                       T Clear | I Orders                              (6)
+///
+/// The ground-pointed postures (Defend/Push/Forage) arm a click, exactly like
+/// building placement; Escort needs no point because its target is the hero.
+fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
+    let doc = card.doc;
+    let mut out: Vec<CmdEntry> = Vec::new();
+
+    if own_units > 0 {
+        for (kind, key, hotkey) in [
+            (PostureKind::Defend, KeyCode::KeyQ, "Q"),
+            (PostureKind::Push, KeyCode::KeyW, "W"),
+            (PostureKind::Forage, KeyCode::KeyE, "E"),
+            (PostureKind::Escort, KeyCode::KeyR, "R"),
+        ] {
+            let mut entry = CmdEntry::plain(CmdAction::SetPosture(kind), key, hotkey, kind.label())
+                .active(card.posture == Some(kind));
+            if kind.needs_point() {
+                entry.cost = "click ground".to_string();
+            } else {
+                entry.enabled = card.hero_alive;
+            }
+            out.push(entry);
+        }
+        let mut stand_down =
+            CmdEntry::plain(CmdAction::ClearPosture, KeyCode::KeyT, "T", "Stand Down");
+        stand_down.enabled = card.posture.is_some();
+        out.push(stand_down);
+
+        // The parameterised pair. Captions name the CURRENT value, like [P]
+        // does, so the card always reads as state rather than as a verb.
+        let fallback = doc.fallback_value();
+        out.push(
+            CmdEntry::plain(
+                CmdAction::CycleFallback,
+                KeyCode::KeyF,
+                "F",
+                &match fallback {
+                    Some(frac) => format!("Fall back {:.0}%", frac * 100.0),
+                    None => "Fall back".to_string(),
+                },
+            )
+            .active(fallback.is_some()),
+        );
+        let leash = doc.leash_value();
+        out.push(
+            CmdEntry::plain(
+                CmdAction::CycleLeash,
+                KeyCode::KeyG,
+                "G",
+                &match leash {
+                    Some(r) => format!("Guard r{:.0}", r),
+                    None => "Guard".to_string(),
+                },
+            )
+            .active(leash.is_some()),
+        );
+        out.push(
+            CmdEntry::plain(
+                CmdAction::CyclePriority,
+                KeyCode::KeyP,
+                "P",
+                doc.prio.label(),
+            )
+            .active(doc.prio != PrioPreset::None),
+        );
+    } else if card.tmpl.capable {
+        let t = card.tmpl;
+        out.push(
+            CmdEntry::plain(
+                CmdAction::TemplateSquad,
+                KeyCode::KeyQ,
+                "Q",
+                &match t.squad {
+                    Some(id) => format!("Squad {id}"),
+                    None => "Squad".to_string(),
+                },
+            )
+            .active(t.squad.is_some()),
+        );
+        out.push(
+            CmdEntry::plain(
+                CmdAction::TemplateFallback,
+                KeyCode::KeyW,
+                "W",
+                &match t.retreat {
+                    Some(frac) => format!("Fall back {:.0}%", frac * 100.0),
+                    None => "Fall back".to_string(),
+                },
+            )
+            .active(t.retreat.is_some()),
+        );
+        out.push(
+            CmdEntry::plain(
+                CmdAction::TemplatePriority,
+                KeyCode::KeyE,
+                "E",
+                t.prio.label(),
+            )
+            .active(t.prio != PrioPreset::None),
+        );
+        out.push(
+            CmdEntry::plain(
+                CmdAction::TemplateAutoCast,
+                KeyCode::KeyR,
+                "R",
+                "Auto-cast",
+            )
+            .active(t.autocast),
+        );
+        let mut clear =
+            CmdEntry::plain(CmdAction::TemplateClear, KeyCode::KeyT, "T", "Clear Doctrine");
+        clear.enabled = !t.is_empty();
+        out.push(clear);
+    }
+
+    out.truncate(CMD_SLOTS.saturating_sub(1));
+    out.push(CmdEntry::plain(
+        CmdAction::TogglePage,
+        KeyCode::KeyI,
+        "I",
+        "Orders",
+    ));
     out
 }
 
@@ -1233,6 +1683,9 @@ fn item_name(id: ItemId) -> &'static str {
     match id {
         ItemId::HealingPotion => "Potion",
         ItemId::TownPortal => "Portal",
+        ItemId::BootsOfSpeed => "Boots",
+        ItemId::BannerOfCommand => "Banner",
+        ItemId::ScrollOfMassTeleport => "MassTP",
     }
 }
 
@@ -1460,6 +1913,31 @@ fn ground_intent(
             Intent::Move { units, x, z }
         },
     );
+}
+
+/// The second half of a posture gesture: an armed button plus the point the
+/// player clicked becomes one `posture` sentence. A pure function so the click
+/// handler and the tests take the same path, and so "what does clicking here
+/// mean" is answerable without a window.
+///
+/// `None` for Escort, which names a unit and is therefore issued outright at
+/// press time rather than arming a click.
+fn posture_intent(arm: PostureArm, ground: Vec3) -> Option<Intent> {
+    let p = clamp_to_map(ground);
+    let posture = match arm.kind {
+        PostureKind::Defend => PostureIntent::Defend {
+            x: p.x,
+            z: p.z,
+            radius: DEFEND_RADIUS,
+        },
+        PostureKind::Push => PostureIntent::Push { x: p.x, z: p.z },
+        PostureKind::Forage => PostureIntent::Forage { x: p.x, z: p.z },
+        PostureKind::Escort => return None,
+    };
+    Some(Intent::Posture {
+        id: arm.squad,
+        posture: Some(posture),
+    })
 }
 
 /// Pull the entities out of a `(Entity, UnitKind, carrying)` selection slice.
@@ -2104,6 +2582,7 @@ fn command_input(
             Option<&TargetPriority>,
             Option<&AutoCastPolicy>,
             Option<&Inventory>,
+            Option<&SquadId>,
         ),
         With<Selected>,
     >,
@@ -2118,11 +2597,22 @@ fn command_input(
             // Per-ability cooldowns are read through `CastLookup` by entity, so
             // this query stays free of them.
             Option<&Upgrading>,
+            Option<&DoctrineTemplate>,
         ),
         With<Selected>,
     >,
-    // Read-only: the team's hero (anywhere on the map) is the Shop's customer.
-    all_units: Query<(Entity, &Unit, &Team, &Order, &Transform, Option<&Inventory>)>,
+    // Read-only: the team's hero (anywhere on the map) is the Shop's customer,
+    // Escort's target, and — with `SquadId` — the census that tells a posture
+    // gesture which squad ids are already spoken for.
+    all_units: Query<(
+        Entity,
+        &Unit,
+        &Team,
+        &Order,
+        &Transform,
+        Option<&Inventory>,
+        Option<&SquadId>,
+    )>,
     // Read-only: the fallback rally looks for the nearest own town hall.
     all_buildings: Query<(&Building, &Team, &Transform, Has<UnderConstruction>)>,
 ) {
@@ -2130,13 +2620,18 @@ fn command_input(
         return;
     }
 
-    // Escape cancels every transient mode.
+    // Escape cancels every transient mode, innermost first, and finally backs
+    // out of the doctrine page — so Escape always means "one step out".
     if keys.just_pressed(KeyCode::Escape) {
         if ui.placement.is_some() {
             ui.placement = None;
             ui.wall_chain.clear();
+        } else if ui.posture_place.is_some() {
+            ui.posture_place = None;
         } else if ui.attack_move_armed {
             ui.attack_move_armed = false;
+        } else {
+            ui.page = CardPage::Orders;
         }
         ui.dragging = false;
         ui.drag_start = None;
@@ -2149,10 +2644,10 @@ fn command_input(
     if !ctrl && keys.just_pressed(KeyCode::Period) {
         let idle: Vec<(Entity, Vec3)> = all_units
             .iter()
-            .filter(|(_, u, t, o, _, _)| {
+            .filter(|(_, u, t, o, _, _, _)| {
                 **t == Team::Human && u.kind == UnitKind::Worker && matches!(o, Order::Idle)
             })
-            .map(|(e, _, _, _, tf, _)| (e, tf.translation))
+            .map(|(e, _, _, _, tf, _, _)| (e, tf.translation))
             .collect();
         if !idle.is_empty() {
             let (pick, pos) = idle[ui.idle_cursor % idle.len()];
@@ -2166,20 +2661,20 @@ fn command_input(
     // --- what can this selection do? --------------------------------------
     let own_units: Vec<(Entity, Vec3)> = sel_units
         .iter()
-        .filter(|(_, _, t, _, _, _, _, _, _, _)| **t == Team::Human)
-        .map(|(e, _, _, tf, _, _, _, _, _, _)| (e, tf.translation))
+        .filter(|(_, _, t, _, _, _, _, _, _, _, _)| **t == Team::Human)
+        .map(|(e, _, _, tf, _, _, _, _, _, _, _)| (e, tf.translation))
         .collect();
     // The same selection, named the way the shared language names units.
     let own_ids = || -> Vec<IntentId> { own_units.iter().map(|(e, _)| intent_id(*e)).collect() };
     let has_worker = sel_units
         .iter()
-        .any(|(_, u, t, _, _, _, _, _, _, _)| *t == Team::Human && u.kind == UnitKind::Worker);
+        .any(|(_, u, t, _, _, _, _, _, _, _, _)| *t == Team::Human && u.kind == UnitKind::Worker);
     // Every selected own hero (there is only ever one, but iterate anyway).
     // Keyed off the `Hero` component, so both classes qualify.
     let own_heroes: Vec<(Entity, UnitKind, Hero, Inventory)> = sel_units
         .iter()
-        .filter(|(_, _, t, _, h, _, _, _, _, _)| **t == Team::Human && h.is_some())
-        .map(|(e, u, _, _, h, _, _, _, _, inv)| {
+        .filter(|(_, _, t, _, h, _, _, _, _, _, _)| **t == Team::Human && h.is_some())
+        .map(|(e, u, _, _, h, _, _, _, _, inv, _)| {
             (e, u.kind, *h.unwrap(), inv.copied().unwrap_or_default())
         })
         .collect();
@@ -2187,11 +2682,11 @@ fn command_input(
     let doc = DoctrineState::of(&sorted_doctrine(
         sel_units
             .iter()
-            .filter(|(_, _, t, _, _, _, _, _, _, _)| **t == Team::Human)
-            .map(|(e, _, _, _, hero, leash, retreat, prio, autocast, _)| {
+            .filter(|(_, _, t, _, _, _, _, _, _, _, _)| **t == Team::Human)
+            .map(|(e, _, _, _, hero, leash, retreat, prio, autocast, _, squad)| {
                 (
                     e.index(),
-                    UnitDoctrine::read(leash, retreat, prio, autocast, hero.is_some()),
+                    UnitDoctrine::read(leash, retreat, prio, autocast, hero.is_some(), squad),
                 )
             })
             .collect(),
@@ -2201,28 +2696,43 @@ fn command_input(
     // The one selected own building: its kind, whether it is finished, its
     // entity (buy/cast target) and its ability cooldown, if it has one.
     let single = match (b_iter.next(), b_iter.next()) {
-        (Some((e, b, t, _, uc, up)), None) if *t == Team::Human => {
+        (Some((e, b, t, _, uc, up, _)), None) if *t == Team::Human => {
             Some((e, b.kind, uc.is_none(), up.is_some()))
         }
         _ => None,
     };
     let single_building = single.map(|(_, kind, done, _)| (kind, done));
+    // The template side of the doctrine card. intent.rs accepts a `template`
+    // only for an own, finished, unit-producing building, so the card offers
+    // one under exactly that condition and never logs a rejected intent.
+    let mut t_iter = sel_buildings.iter();
+    let single_template = match (t_iter.next(), t_iter.next()) {
+        (Some((_, b, t, queue, uc, _, tmpl)), None) => TemplateView::read(
+            *t == Team::Human
+                && uc.is_none()
+                && queue.is_some()
+                && !trainable(b.kind).is_empty(),
+            tmpl,
+        ),
+        _ => TemplateView::default(),
+    };
 
     // Hero training is offered only while the team has neither a living
     // hero (of either class) nor one already queued in this building.
     let team_has_hero = all_units
         .iter()
-        .any(|(_, u, t, _, _, _)| *t == Team::Human && is_hero_kind(u.kind));
-    let hero_in_queue = sel_buildings.iter().any(|(_, _, t, q, _, _)| {
+        .any(|(_, u, t, _, _, _, _)| *t == Team::Human && is_hero_kind(u.kind));
+    let hero_in_queue = sel_buildings.iter().any(|(_, _, t, q, _, _, _)| {
         *t == Team::Human
             && q.map(|q| q.queue.iter().any(|k| is_hero_kind(*k)))
                 .unwrap_or(false)
     });
-    // The team's hero wherever it stands — the Shop's only customer.
+    // The team's hero wherever it stands — the Shop's only customer, and the
+    // Escort posture's target.
     let team_hero: Option<(Entity, Inventory)> = all_units
         .iter()
-        .find(|(_, u, t, _, _, _)| **t == Team::Human && is_hero_kind(u.kind))
-        .map(|(e, _, _, _, _, inv)| (e, inv.copied().unwrap_or_default()));
+        .find(|(_, u, t, _, _, _, _)| **t == Team::Human && is_hero_kind(u.kind))
+        .map(|(e, _, _, _, _, inv, _)| (e, inv.copied().unwrap_or_default()));
     let hero_cmds = HeroCmds {
         train: (!team_has_hero && !hero_in_queue).then(|| {
             let (gold, lumber, _) = hero_train_cost(&records, Team::Human);
@@ -2258,6 +2768,7 @@ fn command_input(
             (done && kind == BuildingKind::Shop).then(|| ShopState {
                 hero: team_hero.is_some(),
                 room: team_hero.is_some_and(|(_, inv)| inv.0.iter().any(|s| s.is_none())),
+                tier: cast.tiers.get(Team::Human),
             })
         }),
         upgrade: single.and_then(|(_, kind, done, upgrading)| {
@@ -2286,12 +2797,23 @@ fn command_input(
         .map(|(b, _, _, _)| b.kind)
         .collect();
 
+    // Which squad the doctrine page is about, and what it is already doing.
+    let card = DoctrineCard {
+        doc,
+        posture: doc
+            .squad
+            .and_then(|s| cast.squads.0.get(&(Team::Human, s)))
+            .map(posture_kind),
+        tmpl: single_template,
+        hero_alive: team_hero.is_some(),
+    };
     let entries = command_entries(
+        ui.page,
         own_units.len(),
         has_worker,
         single_building,
         hero_cmds,
-        doc,
+        card,
         &completed,
     );
 
@@ -2307,6 +2829,18 @@ fn command_input(
             }
         }
     }
+    // [I] is a raw hotkey as well as a button. A worker selection spends all
+    // nine slots on the classic build layout, so the button is not always on
+    // the card — but the doctrine page is the only route to postures and
+    // templates, and a route that a stray worker in the drag box can close is
+    // not a route. The button stays for discoverability; the key always works.
+    if !ctrl
+        && keys.just_pressed(KeyCode::KeyI)
+        && !actions.contains(&CmdAction::TogglePage)
+        && (!own_units.is_empty() || single_template.capable)
+    {
+        actions.push(CmdAction::TogglePage);
+    }
     for (interaction, el) in &pressed_buttons {
         if *interaction != Interaction::Pressed {
             continue;
@@ -2321,6 +2855,67 @@ fn command_input(
             }
         }
     }
+
+    // Centre of mass of the group being told to hold / fall back.
+    let centroid = || {
+        own_units.iter().fold(Vec3::ZERO, |acc, (_, p)| acc + *p) / own_units.len().max(1) as f32
+    };
+    // Where a fallback sends the wounded: the nearest own completed hall (any
+    // rung of the ladder is a place to run to), else the start base.
+    let nearest_hall = |from: Vec3| -> Vec3 {
+        all_buildings
+            .iter()
+            .filter(|(b, t, _, under)| **t == Team::Human && is_hall(b.kind) && !under)
+            .map(|(_, _, tf, _)| tf.translation)
+            .min_by(|a, b| {
+                dist_xz(*a, from)
+                    .partial_cmp(&dist_xz(*b, from))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(HUMAN_BASE)
+    };
+    // Which squad a doctrine-page gesture is about, submitting the `squad`
+    // verb first when the selection is not already one squad. A compound
+    // gesture becomes two sentences rather than a special case — the same rule
+    // a mixed right-click follows — so the log reads
+    // "3 units join squad 2" / "squad 2 pushes to (…)", which is exactly what
+    // a bridge commander would have had to send.
+    let resolve_squad = |submissions: &mut EventWriter<SubmitIntent>| -> Option<u8> {
+        if own_units.is_empty() {
+            return None;
+        }
+        if let Some(squad) = doc.squad {
+            if doc.in_squad < doc.units {
+                say(
+                    submissions,
+                    Intent::Squad {
+                        units: own_ids(),
+                        id: Some(squad),
+                    },
+                );
+            }
+            return Some(squad);
+        }
+        // Nobody selected is in a squad: mint the lowest control-group id that
+        // is free, so [I][W] works without a Ctrl+N first and still lines up
+        // with the digit that recalls it.
+        let taken: Vec<u8> = all_units
+            .iter()
+            .filter(|(_, _, t, _, _, _, _)| **t == Team::Human)
+            .filter_map(|(_, _, _, _, _, _, s)| s.map(|s| s.0))
+            .collect();
+        let squad = (1..=MAX_UI_SQUAD)
+            .find(|id| !taken.contains(id))
+            .unwrap_or(1);
+        say(
+            submissions,
+            Intent::Squad {
+                units: own_ids(),
+                id: Some(squad),
+            },
+        );
+        Some(squad)
+    };
 
     // --- execute -----------------------------------------------------------
     for action in actions {
@@ -2436,11 +3031,7 @@ fn command_input(
                 if doc.leashed == 0 {
                     // Anchor on the centre of mass of the group being told to
                     // hold: "guard where you stand".
-                    let centroid = own_units
-                        .iter()
-                        .fold(Vec3::ZERO, |acc, (_, p)| acc + *p)
-                        / own_units.len().max(1) as f32;
-                    let anchor = clamp_to_map(centroid);
+                    let anchor = clamp_to_map(centroid());
                     say(
                         &mut submissions,
                         Intent::Leash {
@@ -2469,25 +3060,8 @@ fn command_input(
                     continue;
                 }
                 if doc.fallback == 0 {
-                    let centroid = own_units
-                        .iter()
-                        .fold(Vec3::ZERO, |acc, (_, p)| acc + *p)
-                        / own_units.len().max(1) as f32;
                     // Nearest own completed town hall, else the start base.
-                    let rally = all_buildings
-                        .iter()
-                        .filter(|(b, t, _, under)| {
-                            // Any rung of the hall ladder is a place to fall
-                            // back to.
-                            **t == Team::Human && is_hall(b.kind) && !under
-                        })
-                        .map(|(_, _, tf, _)| tf.translation)
-                        .min_by(|a, b| {
-                            dist_xz(*a, centroid)
-                                .partial_cmp(&dist_xz(*b, centroid))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .unwrap_or(HUMAN_BASE);
+                    let rally = nearest_hall(centroid());
                     say(
                         &mut submissions,
                         Intent::Retreat {
@@ -2553,6 +3127,165 @@ fn command_input(
                     },
                 );
             }
+            // --- page two: the doctrine card -------------------------------
+            CmdAction::TogglePage => {
+                ui.page = match ui.page {
+                    CardPage::Orders => CardPage::Doctrine,
+                    CardPage::Doctrine => CardPage::Orders,
+                };
+                // Flipping the card cancels whatever the other page armed.
+                ui.attack_move_armed = false;
+                ui.placement = None;
+                ui.wall_chain.clear();
+                ui.posture_place = None;
+            }
+            CmdAction::SetPosture(kind) => {
+                let Some(squad) = resolve_squad(&mut submissions) else {
+                    continue;
+                };
+                match kind {
+                    // Escort names a unit, not a point, so it needs no click.
+                    PostureKind::Escort => {
+                        let Some((hero, _)) = team_hero else { continue };
+                        say(
+                            &mut submissions,
+                            Intent::Posture {
+                                id: squad,
+                                posture: Some(PostureIntent::Escort {
+                                    unit: intent_id(hero),
+                                }),
+                            },
+                        );
+                    }
+                    // The rest are "press, then click the ground" — the same
+                    // two-step building placement already teaches.
+                    _ => {
+                        ui.posture_place = Some(PostureArm { squad, kind });
+                        ui.attack_move_armed = false;
+                        ui.placement = None;
+                        ui.wall_chain.clear();
+                    }
+                }
+            }
+            CmdAction::ClearPosture => {
+                // Clearing a posture leaves membership intact: the squad stops
+                // being re-tasked but stays a squad, exactly as the bridge's
+                // `{"type":"posture","id":N}` does.
+                let Some(squad) = doc.squad else { continue };
+                say(
+                    &mut submissions,
+                    Intent::Posture {
+                        id: squad,
+                        posture: None,
+                    },
+                );
+            }
+            CmdAction::CycleFallback => {
+                if own_units.is_empty() {
+                    continue;
+                }
+                match cycle_step(doc.fallback_value(), &FALLBACK_STEPS) {
+                    Some(below) => {
+                        let rally = nearest_hall(centroid());
+                        say(
+                            &mut submissions,
+                            Intent::Retreat {
+                                units: own_ids(),
+                                below: Some(below),
+                                x: Some(rally.x),
+                                z: Some(rally.z),
+                            },
+                        );
+                    }
+                    None => say(
+                        &mut submissions,
+                        Intent::Retreat {
+                            units: own_ids(),
+                            below: Some(0.0),
+                            x: None,
+                            z: None,
+                        },
+                    ),
+                }
+            }
+            CmdAction::CycleLeash => {
+                if own_units.is_empty() {
+                    continue;
+                }
+                match cycle_step(doc.leash_value(), &LEASH_STEPS) {
+                    Some(radius) => {
+                        let anchor = clamp_to_map(centroid());
+                        say(
+                            &mut submissions,
+                            Intent::Leash {
+                                units: own_ids(),
+                                x: Some(anchor.x),
+                                z: Some(anchor.z),
+                                radius: Some(radius),
+                            },
+                        );
+                    }
+                    None => say(
+                        &mut submissions,
+                        Intent::Leash {
+                            units: own_ids(),
+                            x: None,
+                            z: None,
+                            radius: Some(0.0),
+                        },
+                    ),
+                }
+            }
+            // The production template. Every piece is absolute, so each button
+            // re-sends the WHOLE template with one field stepped — which is
+            // also how a commander has to spell an edit.
+            CmdAction::TemplateSquad
+            | CmdAction::TemplateFallback
+            | CmdAction::TemplatePriority
+            | CmdAction::TemplateAutoCast
+            | CmdAction::TemplateClear => {
+                if !own_units.is_empty() || !single_template.capable {
+                    continue;
+                }
+                let Some((entity, _, true, _)) = single else {
+                    continue;
+                };
+                let mut next = single_template;
+                match action {
+                    CmdAction::TemplateSquad => {
+                        next.squad = match next.squad {
+                            None => Some(1),
+                            Some(id) if id < MAX_UI_SQUAD => Some(id + 1),
+                            Some(_) => None,
+                        };
+                    }
+                    CmdAction::TemplateFallback => {
+                        next.retreat = cycle_step(next.retreat, &FALLBACK_STEPS);
+                    }
+                    CmdAction::TemplatePriority => next.prio = next.prio.next(),
+                    CmdAction::TemplateAutoCast => next.autocast = !next.autocast,
+                    _ => next = TemplateView { capable: true, ..default() },
+                }
+                // A template rally cannot be the group's centroid (there is no
+                // group yet — these units do not exist), so it is the hall
+                // nearest the base: where a fresh recruit runs home to.
+                let rally = nearest_hall(HUMAN_BASE);
+                say(
+                    &mut submissions,
+                    Intent::Template {
+                        building: intent_id(entity),
+                        squad: next.squad,
+                        retreat: next.retreat.map(|below| RetreatIntent {
+                            below,
+                            x: rally.x,
+                            z: rally.z,
+                        }),
+                        priority: priority_component(next.prio)
+                            .map(|p| p.0.iter().map(|c| c.name().to_string()).collect()),
+                        autocast: next.autocast.then_some(AUTOCAST_MIN_ENEMIES),
+                    },
+                );
+            }
             CmdAction::Train(kind) => {
                 // One hero per team — never let a second one be queued, and
                 // never a class the team's record doesn't name.
@@ -2569,7 +3302,7 @@ fn command_input(
                 if second.is_some() {
                     continue;
                 }
-                let Some((entity, building, team, Some(queue), uc, upgrading)) = first else {
+                let Some((entity, building, team, Some(queue), uc, upgrading, _)) = first else {
                     continue;
                 };
                 if *team != Team::Human || uc.is_some() || !trainable(building.kind).contains(&kind)
@@ -2662,30 +3395,129 @@ fn panel_clicks(
 }
 
 // ---------------------------------------------------------------------------
-// Control groups (Ctrl+1..3 assign, 1..3 recall)
+// Control groups ARE squads (Ctrl+1..3 assign, Shift+1..3 add, 1..3 recall)
 // ---------------------------------------------------------------------------
 
+/// The control-group slots, which are also the squad ids they write. Three,
+/// matching `UiState::groups` and the hint line; `DEFAULT_SQUAD` (0) is
+/// deliberately not among them — that id is doctrine.rs's machine-only
+/// anti-idle floor, not a group a player can claim.
+const GROUP_DIGITS: [(KeyCode, u8); 3] = [
+    (KeyCode::Digit1, 1),
+    (KeyCode::Digit2, 2),
+    (KeyCode::Digit3, 3),
+];
+
+/// Control groups, and the highest-leverage line in docs/TEMPO.md: `Ctrl+N`
+/// does not just remember a selection, it submits the `squad` verb — the same
+/// object a bridge commander creates with
+/// `{"type":"squad","units":[...],"id":1}`. The human's existing muscle memory
+/// becomes the shared strategic vocabulary, and `[I] Doctrine`'s postures then
+/// have something to act on.
+///
+/// The three gestures:
+///   * `Ctrl+N` — the selection *becomes* squad N. Anyone who was in squad N
+///     and is not in the new selection leaves it, so the group the player sees
+///     and the squad the engine executes never drift apart. That eviction is
+///     its own sentence (`squad … id: null`), exactly as a commander would
+///     have to spell it.
+///   * `Shift+N` — add the selection to squad N, evicting nobody.
+///   * `N` — recall. Pure selection: ui-local, no intent, nothing to say.
+///
+/// Buildings may sit in a control group (they always could) but never in a
+/// squad — `SquadId` is a unit component, so a hall caught in the box is
+/// remembered for recall and left out of the sentence.
 fn control_groups(
     mut commands: Commands,
     mut ui: ResMut<UiState>,
     keys: Res<ButtonInput<KeyCode>>,
+    game_over: Res<GameOver>,
+    mut submissions: EventWriter<SubmitIntent>,
     selected: Query<Entity, With<Selected>>,
     alive: Query<&Team>,
+    // Every own unit and the squad it is in — the source for "who is leaving
+    // squad N", which the UI must work out because the language has no
+    // "replace the membership of squad N" verb (and should not: `squad` names
+    // units, so a swap is two sentences).
+    squad_members: Query<(Entity, &Team, Option<&SquadId>), With<Unit>>,
 ) {
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-    const DIGITS: [(KeyCode, u8); 3] = [
-        (KeyCode::Digit1, 1),
-        (KeyCode::Digit2, 2),
-        (KeyCode::Digit3, 3),
-    ];
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    const DIGITS: [(KeyCode, u8); 3] = GROUP_DIGITS;
 
     for (key, slot) in DIGITS {
         if !keys.just_pressed(key) {
             continue;
         }
-        if ctrl {
+        if ctrl || shift {
             let members: Vec<Entity> = selected.iter().collect();
+            // Only own units can join a squad; the rest of the selection is
+            // still remembered for recall.
+            let joining: Vec<Entity> = members
+                .iter()
+                .copied()
+                .filter(|e| {
+                    squad_members
+                        .get(*e)
+                        .is_ok_and(|(_, team, _)| *team == Team::Human)
+                })
+                .collect();
+
+            if shift && !ctrl {
+                // Add: union with what the group already held, minus the dead.
+                let existing = ui.groups.get(&slot).cloned().unwrap_or_default();
+                let mut merged = existing;
+                merged.retain(|e| alive.get(*e).is_ok());
+                for e in &members {
+                    if !merged.contains(e) {
+                        merged.push(*e);
+                    }
+                }
+                ui.groups.insert(slot, merged);
+                if !joining.is_empty() && game_over.0.is_none() {
+                    say(
+                        &mut submissions,
+                        Intent::Squad {
+                            units: ids(&joining),
+                            id: Some(slot),
+                        },
+                    );
+                }
+                continue;
+            }
+
+            // Replace. Anyone left behind in squad N is released first, so the
+            // squad and the control group stay the same set of units.
+            let leavers: Vec<Entity> = squad_members
+                .iter()
+                .filter(|(e, team, squad)| {
+                    **team == Team::Human
+                        && squad.is_some_and(|s| s.0 == slot)
+                        && !joining.contains(e)
+                })
+                .map(|(e, _, _)| e)
+                .collect();
             ui.groups.insert(slot, members);
+            if game_over.0.is_none() {
+                if !leavers.is_empty() {
+                    say(
+                        &mut submissions,
+                        Intent::Squad {
+                            units: ids(&leavers),
+                            id: None,
+                        },
+                    );
+                }
+                if !joining.is_empty() {
+                    say(
+                        &mut submissions,
+                        Intent::Squad {
+                            units: ids(&joining),
+                            id: Some(slot),
+                        },
+                    );
+                }
+            }
         } else {
             let members: Vec<Entity> = ui
                 .groups
@@ -2864,6 +3696,18 @@ fn left_mouse(
                             }
                         }
                     }
+                    return;
+                }
+
+                // Posture point. The doctrine card armed a squad posture; this
+                // click supplies the ground it is about, and the pair becomes
+                // one `posture` sentence — the same object a commander sends
+                // as {"type":"posture","id":1,"posture":{...}}.
+                if let Some(arm) = ui.posture_place {
+                    if let Some(intent) = ground.and_then(|g| posture_intent(arm, g)) {
+                        say(&mut submissions, intent);
+                    }
+                    ui.posture_place = None;
                     return;
                 }
 
@@ -3052,10 +3896,11 @@ fn right_mouse(
     }
 
     // Right-click on the world always cancels transient modes first.
-    if ui.placement.is_some() || ui.attack_move_armed {
+    if ui.placement.is_some() || ui.attack_move_armed || ui.posture_place.is_some() {
         ui.placement = None;
         ui.wall_chain.clear();
         ui.attack_move_armed = false;
+        ui.posture_place = None;
         return;
     }
 
@@ -4017,9 +4862,10 @@ fn update_hud(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     ai_controlled: Res<AiControlled>,
-    // The same reads `command_input` builds its entries from, so the card the
-    // player sees and the card the keyboard dispatches against are computed
-    // from one set of facts.
+    // The same reads `command_input` builds its entries from — tech tier, the
+    // squad postures doctrine.rs is currently executing, ability cooldowns and
+    // team research — so the card the player sees and the card the keyboard
+    // dispatches against are computed from one set of facts.
     cast: CastLookup,
     // Latched the frame the match ends: was this an AI-vs-AI spectate?
     mut spectated: Local<Option<bool>>,
@@ -4045,6 +4891,7 @@ fn update_hud(
             Option<&AutoCastPolicy>,
             Option<&Inventory>,
             Has<Militia>,
+            Option<&SquadId>,
         ),
         With<Selected>,
     >,
@@ -4057,6 +4904,7 @@ fn update_hud(
             Option<&TrainingQueue>,
             Option<&UnderConstruction>,
             Option<&Upgrading>,
+            Option<&DoctrineTemplate>,
         ),
         With<Selected>,
     >,
@@ -4088,7 +4936,7 @@ fn update_hud(
     let mut items_text = String::new();
 
     if total == 1 && unit_count == 1 {
-        if let Some((_, unit, health, team, carrying, hero, _, _, _, _, inventory, militia)) =
+        if let Some((_, unit, health, team, carrying, hero, _, _, _, _, inventory, militia, _)) =
             sel_units.iter().next()
         {
             show_single = true;
@@ -4152,7 +5000,7 @@ fn update_hud(
             }
         }
     } else if total == 1 && building_count == 1 {
-        if let Some((sel_entity, building, health, team, queue, under, upgrading)) =
+        if let Some((sel_entity, building, health, team, queue, under, upgrading, _)) =
             sel_buildings.iter().next()
         {
             // Looked up by entity rather than added to `sel_buildings`, so the
@@ -4274,7 +5122,7 @@ fn update_hud(
         }
     } else if total > 1 {
         show_multi = true;
-        for (e, unit, health, team, _, hero, _, _, _, _, _, _) in &sel_units {
+        for (e, unit, health, team, _, hero, _, _, _, _, _, _, _) in &sel_units {
             cards.push(CardView {
                 entity: e,
                 // Heroes show "H<level>" instead of a plain initial.
@@ -4286,7 +5134,7 @@ fn update_hud(
                 color: team.color(),
             });
         }
-        for (e, building, health, team, _, _, _) in &sel_buildings {
+        for (e, building, health, team, _, _, _, _) in &sel_buildings {
             cards.push(CardView {
                 entity: e,
                 letter: initial(building_name(building.kind)),
@@ -4304,51 +5152,72 @@ fn update_hud(
     // --- command card ------------------------------------------------------
     let own_units = sel_units
         .iter()
-        .filter(|(_, _, _, t, _, _, _, _, _, _, _, _)| **t == Team::Human)
+        .filter(|(_, _, _, t, _, _, _, _, _, _, _, _, _)| **t == Team::Human)
         .count();
-    let has_worker = sel_units
-        .iter()
-        .any(|(_, u, _, t, _, _, _, _, _, _, _, _)| *t == Team::Human && u.kind == UnitKind::Worker);
+    let has_worker = sel_units.iter().any(|(_, u, _, t, _, _, _, _, _, _, _, _, _)| {
+        *t == Team::Human && u.kind == UnitKind::Worker
+    });
     // Same aggregate the input system builds, so caption/highlight and the
     // toggle that a click executes can never disagree.
     let doc = DoctrineState::of(&sorted_doctrine(
         sel_units
             .iter()
-            .filter(|(_, _, _, t, _, _, _, _, _, _, _, _)| **t == Team::Human)
-            .map(|(e, _, _, _, _, hero, leash, retreat, prio, autocast, _, _)| {
+            .filter(|(_, _, _, t, _, _, _, _, _, _, _, _, _)| **t == Team::Human)
+            .map(|(e, _, _, _, _, hero, leash, retreat, prio, autocast, _, _, squad)| {
                 (
                     e.index(),
-                    UnitDoctrine::read(leash, retreat, prio, autocast, hero.is_some()),
+                    UnitDoctrine::read(leash, retreat, prio, autocast, hero.is_some(), squad),
                 )
             })
             .collect(),
     ));
-    let doctrine_line = doc.line();
+    // What doctrine.rs is executing for that squad right now. Since the
+    // executor was ungated this is a live readout of the engine acting on the
+    // player's behalf, not a stored preference — so it belongs on screen.
+    let live_posture = doc
+        .squad
+        .and_then(|s| cast.squads.0.get(&(Team::Human, s)));
     // The one selected own building: kind, finished, ability cooldown.
     let single = if building_count == 1 && unit_count == 0 {
         sel_buildings
             .iter()
             .next()
-            .filter(|(_, _, _, t, _, _, _)| **t == Team::Human)
-            .map(|(e, b, _, _, _, uc, up)| (e, b.kind, uc.is_none(), up.is_some()))
+            .filter(|(_, _, _, t, _, _, _, _)| **t == Team::Human)
+            .map(|(e, b, _, _, _, uc, up, _)| (e, b.kind, uc.is_none(), up.is_some()))
     } else {
         None
     };
     let single_building = single.map(|(_, kind, done, _)| (kind, done));
+    // Same template view the input system builds, from the same conditions.
+    let mut t_iter = sel_buildings.iter();
+    let single_template = match (t_iter.next(), t_iter.next()) {
+        (Some((_, b, _, t, queue, uc, _, tmpl)), None) => TemplateView::read(
+            *t == Team::Human && uc.is_none() && queue.is_some() && !trainable(b.kind).is_empty(),
+            tmpl,
+        ),
+        _ => TemplateView::default(),
+    };
+    // Units line, else the building's template line — the panel always answers
+    // "what standing orders is this selection under?".
+    let doctrine_line = if own_units > 0 {
+        doc.line(live_posture.map(posture_tag).as_deref())
+    } else {
+        single_template.line()
+    };
 
     // Hero commands: the ability of a selected hero (whichever class), the
     // train/revive button on a town hall while the team is hero-less, the
     // building's own ability, and the Shop's wares.
     let team_hero = heroes.iter().find(|(t, _)| **t == Team::Human);
     let team_has_hero = team_hero.is_some();
-    let hero_in_queue = sel_buildings.iter().any(|(_, _, _, t, q, _, _)| {
+    let hero_in_queue = sel_buildings.iter().any(|(_, _, _, t, q, _, _, _)| {
         *t == Team::Human
             && q.map(|q| q.queue.iter().any(|k| is_hero_kind(*k)))
                 .unwrap_or(false)
     });
     let selected_hero = sel_units
         .iter()
-        .find(|(_, _, _, t, _, h, _, _, _, _, _, _)| **t == Team::Human && h.is_some());
+        .find(|(_, _, _, t, _, h, _, _, _, _, _, _, _)| **t == Team::Human && h.is_some());
     let hero_cmds = HeroCmds {
         train: (!team_has_hero && !hero_in_queue).then(|| {
             let (gold, lumber, _) = hero_train_cost(&records, Team::Human);
@@ -4359,7 +5228,7 @@ fn update_hud(
             }
         }),
         abilities: selected_hero
-            .and_then(|(e, u, _, _, _, h, _, _, _, _, _, _)| {
+            .and_then(|(e, u, _, _, _, h, _, _, _, _, _, _, _)| {
                 let hero = h?;
                 Some(ability_slots(
                     abilities_of_unit(u.kind),
@@ -4392,10 +5261,11 @@ fn update_hud(
                 room: team_hero
                     .and_then(|(_, inv)| inv)
                     .is_some_and(|inv| inv.0.iter().any(|s| s.is_none())),
+                tier: cast.tiers.get(Team::Human),
             })
         }),
         items: selected_hero
-            .and_then(|(_, _, _, _, _, _, _, _, _, _, inv, _)| inv.copied())
+            .and_then(|(_, _, _, _, _, _, _, _, _, _, inv, _, _)| inv.copied())
             .unwrap_or_default()
             .0,
         research: single
@@ -4415,11 +5285,17 @@ fn update_hud(
         .map(|(b, _, _)| b.kind)
         .collect();
     let entries = command_entries(
+        ui.page,
         own_units,
         has_worker,
         single_building,
         hero_cmds,
-        doc,
+        DoctrineCard {
+            doc,
+            posture: live_posture.map(posture_kind),
+            tmpl: single_template,
+            hero_alive: team_has_hero,
+        },
         &completed,
     );
 
@@ -4429,7 +5305,7 @@ fn update_hud(
         && building_count > 0
         && sel_buildings
             .iter()
-            .all(|(_, b, _, t, _, _, _)| *t == Team::Human && !trainable(b.kind).is_empty());
+            .all(|(_, b, _, t, _, _, _, _)| *t == Team::Human && !trainable(b.kind).is_empty());
 
     // Publish the click targets for the input systems (they run earlier next
     // frame and read exactly what the player is looking at now).
@@ -4452,10 +5328,28 @@ fn update_hud(
             s.cost_lumber,
             tail
         )
+    } else if let Some(arm) = ui.posture_place {
+        format!(
+            "Squad {} - {} posture armed: left-click the ground it is about (Right-click / Esc cancels)",
+            arm.squad,
+            arm.kind.label()
+        )
     } else if ui.attack_move_armed {
         "Attack-move armed - left-click a destination (Esc cancels)".to_string()
+    } else if ui.page == CardPage::Doctrine {
+        match doc.squad {
+            Some(squad) => format!(
+                "Doctrine card - squad {squad}. Postures run at machine speed for whoever set them.   [I] / Esc: back to orders."
+            ),
+            None if own_units > 0 => {
+                "Doctrine card - this selection has no squad yet; a posture will enrol it in one.   [I] / Esc: back to orders."
+                    .to_string()
+            }
+            None => "Doctrine card - standing orders stamped on everything this building trains.   [I] / Esc: back to orders."
+                .to_string(),
+        }
     } else if total == 0 {
-        "Left-click / drag to select.   Ctrl+1-3 set group, 1-3 recall.   '.' idle worker   F9: AI plays Blue   F12 x2: surrender   Minimap: left-click to look, right-click to order"
+        "Left-click / drag to select.   Ctrl+1-3 set squad, Shift+1-3 add, 1-3 recall.   [I] doctrine   '.' idle worker   F9: AI plays Blue   F12 x2: surrender"
             .to_string()
     } else if rally_capable {
         "Right-click: set rally (ground, resource node or own unit).   Shift-click adds to selection."
@@ -4641,6 +5535,11 @@ fn update_hud(
                     || match entry.action {
                         CmdAction::AttackMove => ui.attack_move_armed,
                         CmdAction::Place(k) => ui.placement == Some(k),
+                        // A posture waiting for its ground click is armed in
+                        // exactly the sense the other two are.
+                        CmdAction::SetPosture(k) => {
+                            ui.posture_place.is_some_and(|arm| arm.kind == k)
+                        }
                         _ => false,
                     };
                 let base = if !entry.enabled {
@@ -5071,5 +5970,356 @@ fn update_notifications(
         if text.0 != wanted {
             text.0 = wanted.to_string();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the human half of docs/TEMPO.md's doctrine parity
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every intent the interface submitted, in order. Standing in for
+    /// `bridge/intent_log.jsonl`, which is fed from exactly this event.
+    #[derive(Resource, Default)]
+    struct Said(Vec<Intent>);
+
+    fn record(mut said: ResMut<Said>, mut events: EventReader<SubmitIntent>) {
+        for e in events.read() {
+            // The source is recorded, never consulted: the compiler cannot
+            // tell a gesture from a command, and neither can this test.
+            assert_eq!(e.source, IntentSource::Ui);
+            assert_eq!(e.team, Team::Human);
+            said.0.push(e.intent.clone());
+        }
+    }
+
+    /// A world with the real input systems and nothing else — no window, no
+    /// camera, no renderer. Every gesture below is the production code path.
+    fn ui_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<UiState>()
+            .init_resource::<Said>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Economies>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<GameOver>()
+            .init_resource::<TechTiers>()
+            .init_resource::<SquadOrders>()
+            // `CastLookup` reads it, so the card cannot be built without it.
+            .init_resource::<TeamResearch>()
+            .add_event::<CameraFocus>()
+            .add_event::<SubmitIntent>()
+            .add_systems(Update, (control_groups, command_input, record).chain());
+        app
+    }
+
+    /// One frame with `keys` held. `ButtonInput::just_pressed` is cleared by
+    /// bevy's input plugin, which is not running here, so the test clears it.
+    fn press(app: &mut App, keys: &[KeyCode]) {
+        {
+            let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            input.clear();
+            input.release_all();
+            for key in keys {
+                input.press(*key);
+            }
+        }
+        app.update();
+    }
+
+    fn spawn_selected_footman(app: &mut App, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(at),
+                Health::new(100.0),
+                Order::Idle,
+                Selected,
+            ))
+            .id()
+    }
+
+    fn said(app: &App) -> &[Intent] {
+        &app.world().resource::<Said>().0
+    }
+
+    fn json(intent: &Intent) -> serde_json::Value {
+        serde_json::to_value(intent).unwrap()
+    }
+
+    /// docs/TEMPO.md's highest-leverage item: `Ctrl+1` is not a UI bookmark
+    /// any more, it is the `squad` verb. The muscle memory every RTS player
+    /// already has becomes the shared strategic vocabulary.
+    #[test]
+    fn ctrl_digit_is_the_squad_verb() {
+        let mut app = ui_app();
+        let a = spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        let b = spawn_selected_footman(&mut app, Vec3::new(-8.0, 0.0, -10.0));
+
+        press(&mut app, &[KeyCode::ControlLeft, KeyCode::Digit1]);
+
+        assert_eq!(said(&app).len(), 1, "expected exactly one sentence");
+        let gesture = &said(&app)[0];
+        assert_eq!(gesture.sentence(), "2 units join squad 1");
+        // Indistinguishable from what a commander sends.
+        let typed: Intent = serde_json::from_str(&format!(
+            r#"{{"type":"squad","units":[{},{}],"id":1}}"#,
+            intent_id(a),
+            intent_id(b)
+        ))
+        .unwrap();
+        assert_eq!(json(gesture), json(&typed));
+    }
+
+    /// Re-assigning a control group must not leave a ghost membership behind,
+    /// or the group the player sees and the squad doctrine.rs executes drift
+    /// apart. The eviction is its own sentence, as the language requires.
+    #[test]
+    fn reassigning_a_group_releases_whoever_left_it() {
+        let mut app = ui_app();
+        let a = spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        let b = spawn_selected_footman(&mut app, Vec3::new(-8.0, 0.0, -10.0));
+        // `a` is already in squad 1; only `b` is selected now.
+        app.world_mut().entity_mut(a).insert(SquadId(1));
+        app.world_mut().entity_mut(a).remove::<Selected>();
+
+        press(&mut app, &[KeyCode::ControlLeft, KeyCode::Digit1]);
+
+        let sentences: Vec<String> = said(&app).iter().map(|i| i.sentence()).collect();
+        assert_eq!(
+            sentences,
+            vec![
+                format!("unit {} leave their squad", intent_id(a)),
+                format!("unit {} join squad 1", intent_id(b)),
+            ]
+        );
+    }
+
+    /// The doctrine page, end to end: [I] opens it, [W] arms Push, the ground
+    /// click supplies the point. An unsquadded selection is enrolled first, so
+    /// the gesture becomes the same two sentences a commander would have to
+    /// send — and the log cannot tell which of them happened.
+    #[test]
+    fn the_doctrine_page_composes_squad_then_posture() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        spawn_selected_footman(&mut app, Vec3::new(-8.0, 0.0, -10.0));
+
+        press(&mut app, &[KeyCode::KeyI]);
+        assert_eq!(app.world().resource::<UiState>().page, CardPage::Doctrine);
+        assert!(said(&app).is_empty(), "opening a page says nothing");
+
+        press(&mut app, &[KeyCode::KeyW]);
+        let arm = app
+            .world()
+            .resource::<UiState>()
+            .posture_place
+            .expect("Push should arm a ground click");
+        assert_eq!(arm.kind, PostureKind::Push);
+
+        // The click. Same function `left_mouse` calls.
+        let click = posture_intent(arm, Vec3::new(40.0, 0.0, 40.0)).unwrap();
+
+        let mut sentences: Vec<String> = said(&app).iter().map(|i| i.sentence()).collect();
+        sentences.push(click.sentence());
+        assert_eq!(
+            sentences,
+            vec![
+                "2 units join squad 1".to_string(),
+                "squad 1 pushes to (40.0, 40.0)".to_string(),
+            ]
+        );
+        let typed: Intent = serde_json::from_str(
+            r#"{"type":"posture","id":1,"posture":{"type":"push","x":40.0,"z":40.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(json(&click), json(&typed));
+    }
+
+    /// The parameterised half of the gap: the coarse [V] writes one fixed
+    /// threshold, [F] on the doctrine page walks the ladder — an actual number,
+    /// chosen by the human, exactly as the bridge's `below` field is.
+    #[test]
+    fn the_doctrine_page_parameterises_retreat_and_leash() {
+        let mut app = ui_app();
+        let unit = spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyF]);
+        press(&mut app, &[KeyCode::KeyG]);
+
+        let sentences: Vec<String> = said(&app).iter().map(|i| i.sentence()).collect();
+        assert_eq!(
+            sentences,
+            vec![
+                // No town hall in this world, so the rally is the start base.
+                format!(
+                    "unit {} fall back to (-70.0, -70.0) below 25% health",
+                    intent_id(unit)
+                ),
+                format!("unit {} hold within 10 of (-10.0, -10.0)", intent_id(unit)),
+            ]
+        );
+        // The steps are a ladder, not a toggle: the same key again moves up.
+        assert_eq!(cycle_step(Some(0.25), &FALLBACK_STEPS), Some(0.35));
+        assert_eq!(cycle_step(Some(0.50), &FALLBACK_STEPS), None);
+        assert_eq!(cycle_step(None, &LEASH_STEPS), Some(10.0));
+        assert_eq!(cycle_step(Some(30.0), &LEASH_STEPS), None);
+    }
+
+    /// A production building carries standing doctrine for everything it will
+    /// ever train. This was bridge-only; it is now a button.
+    #[test]
+    fn a_building_can_be_stamped_with_a_doctrine_template() {
+        let mut app = ui_app();
+        let barracks = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Human,
+                Transform::from_translation(Vec3::new(-60.0, 0.0, -60.0)),
+                Health::new(700.0),
+                TrainingQueue::default(),
+                Selected,
+            ))
+            .id();
+
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyQ]); // squad piece: none -> 1
+        assert_eq!(said(&app).len(), 1);
+        let gesture = &said(&app)[0];
+        assert_eq!(
+            gesture.sentence(),
+            "building 4294967296 stamps every unit it trains with squad 1"
+                .replace("4294967296", &intent_id(barracks).to_string())
+        );
+        let typed: Intent = serde_json::from_str(&format!(
+            r#"{{"type":"template","building":{},"squad":1}}"#,
+            intent_id(barracks)
+        ))
+        .unwrap();
+        assert_eq!(json(gesture), json(&typed));
+    }
+
+    /// The card is a projection of state, not a second opinion about it: the
+    /// page the input system reads actions from is the page the HUD draws.
+    #[test]
+    fn the_doctrine_page_offers_a_way_back() {
+        let card = DoctrineCard::default();
+        let orders = command_entries(CardPage::Orders, 2, false, None, HeroCmds::default(), card, &[]);
+        assert!(
+            orders.iter().any(|e| e.action == CmdAction::TogglePage),
+            "a unit selection must be able to reach the doctrine page"
+        );
+        let doctrine =
+            command_entries(CardPage::Doctrine, 2, false, None, HeroCmds::default(), card, &[]);
+        assert!(doctrine.len() <= CMD_SLOTS);
+        assert_eq!(
+            doctrine.last().map(|e| e.action),
+            Some(CmdAction::TogglePage),
+            "the doctrine page must always end with the way out"
+        );
+        assert!(doctrine
+            .iter()
+            .any(|e| e.action == CmdAction::SetPosture(PostureKind::Defend)));
+    }
+
+    /// A card too full for the [I] BUTTON must still take the [I] KEY, or one
+    /// stray worker in the drag box takes doctrine away from the player.
+    ///
+    /// The scenario used to be a plain worker selection: at 3x3 the seven build
+    /// cards plus [A] [S] spent all nine slots. The Blacksmith bead grew the
+    /// card to 4x3 (see `CMD_SLOTS`), and a worker card now has room for the
+    /// build layout, a quick toggle AND the page button — which is the point of
+    /// having grown it, and is asserted separately below. So the overflow case
+    /// moved up to worker + hero, where the hero's spells and carried items
+    /// push past twelve. The property under test is unchanged.
+    #[test]
+    fn the_doctrine_page_is_reachable_even_when_its_button_is_not() {
+        // The Champion's real first spell, so the fixture cannot drift from
+        // whatever the ability tables actually say.
+        let def = abilities_of_unit(UnitKind::Hero)[0];
+        let slot = |index: usize| AbilitySlot {
+            index,
+            def,
+            ready: true,
+            cooldown: 0.0,
+        };
+        let crowded = HeroCmds {
+            abilities: vec![slot(0), slot(1), slot(2)],
+            items: [Some(ItemId::HealingPotion), Some(ItemId::TownPortal)],
+            ..HeroCmds::default()
+        };
+        let entries = command_entries(
+            CardPage::Orders,
+            3,
+            true,
+            None,
+            crowded,
+            DoctrineCard::default(),
+            &[],
+        );
+        assert_eq!(entries.len(), CMD_SLOTS, "a worker+hero card is full");
+        assert!(
+            !entries.iter().any(|e| e.action == CmdAction::TogglePage),
+            "the page button is expected to yield here — that is the premise"
+        );
+
+        let mut app = ui_app();
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Worker },
+            Team::Human,
+            Transform::from_translation(Vec3::new(-60.0, 0.0, -60.0)),
+            Health::new(100.0),
+            Order::Idle,
+            Selected,
+        ));
+        press(&mut app, &[KeyCode::KeyI]);
+        assert_eq!(app.world().resource::<UiState>().page, CardPage::Doctrine);
+    }
+
+    /// What growing the card to 4x3 actually bought: a plain worker selection
+    /// now keeps every build button INCLUDING the eighth (the Blacksmith), and
+    /// still has room for the page toggle. At 3x3 the eighth build card was
+    /// silently eaten by the truncate at the end of `command_entries`.
+    #[test]
+    fn a_worker_card_holds_every_build_button_and_the_page_toggle() {
+        let entries = command_entries(
+            CardPage::Orders,
+            3,
+            true,
+            None,
+            HeroCmds::default(),
+            DoctrineCard::default(),
+            &[],
+        );
+        assert!(entries.len() <= CMD_SLOTS, "the card never overflows");
+        for (_, kind, _, _) in build_cards() {
+            assert!(
+                entries.iter().any(|e| e.action == CmdAction::Place(kind)),
+                "{kind:?} must have a button — a building the player cannot see \
+                 on the card has no other route in"
+            );
+        }
+        assert!(
+            entries.iter().any(|e| e.action == CmdAction::Place(BuildingKind::Blacksmith)),
+            "the eighth build card is the one 3x3 used to drop"
+        );
+        assert!(
+            entries.iter().any(|e| e.action == CmdAction::TogglePage),
+            "and there is still room for the way to page two"
+        );
+        // Every hotkey on one card must be unique, which is the invariant the
+        // Blacksmith's [C] had to be chosen against once [I] became the page
+        // toggle.
+        let mut keys: Vec<KeyCode> = entries.iter().map(|e| e.key).collect();
+        keys.sort_by_key(|k| format!("{k:?}"));
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "no two buttons share a hotkey");
     }
 }

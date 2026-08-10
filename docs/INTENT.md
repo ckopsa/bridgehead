@@ -108,6 +108,18 @@ the schema.
 | `buy` | `{shop:id, item:"HealingPotion"}` — buyer implied by team |
 | `use_item` | `{slot:0}` |
 
+The shop shelf is TIERED. `catalog.items[].tier` gives each item's required
+tech tier (1/2/3), and every own finished Shop reports the shelf with this
+team's tier already applied as `buildings[].sells[] = {id, cost_gold, tier,
+locked}`. Buying a locked rung is refused by the compiler with
+`cmd N: BannerOfCommand requires tier T2 (you are T1)`, and economy.rs
+re-checks on the frame it pays — so losing the Keep closes the rung again.
+
+Hero ultimates are ordinary second ability slots gated on
+`AbilityUnlock::HeroLevel(5)`: `{"type":"cast","hero":<id>,"ability":"Warcry"}`
+(Champion) or `"Sanctuary"` (Priestess). `units[].abilities[]` reports each
+slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
+
 ### Doctrine — standing policy the engine executes at machine speed
 | Verb | Shape | Clears when |
 |---|---|---|
@@ -166,6 +178,22 @@ a_gesture_and_a_command_are_the_same_intent` asserts exactly this.
 Compound gestures become *two sentences* rather than a special case: a
 right-click on a gold mine with a mixed selection submits a `harvest` for the
 workers and a `move` for everyone else, which is what it always meant.
+
+The doctrine card (`[I]`, added by docs/TEMPO.md's phase 0) is the same trick at
+the strategic layer. `Ctrl+1` is a `squad`; `[I][W]` then a ground click is a
+`posture`; `[I][F]` steps a retreat *threshold* rather than toggling one. A
+posture pressed on a selection that is not already one squad submits `squad`
+first and `posture` second — two sentences again — so the log reads:
+
+```
+  [ 91.6s] Human/ui: 3 units join squad 1
+  [100.2s] Human/ui: squad 1 pushes to (-59.4, -27.1)
+  [103.2s] Human/ui: 3 units fall back to (-70.0, -70.0) below 25% health
+  [104.1s] Human/ui: 3 units hold within 10 of (-61.0, -40.0)
+  [106.9s] Human/ui: squad 1 stands down (posture cleared)
+```
+
+Every one of those is a sentence only a bridge commander could produce before.
 
 ---
 

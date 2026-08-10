@@ -1783,6 +1783,7 @@ fn training_queues(
 fn buy_items(
     mut events: EventReader<BuyItem>,
     mut economies: ResMut<Economies>,
+    tiers: Res<TechTiers>,
     shops: Query<(&Building, &Team, Option<&UnderConstruction>)>,
     // Gated on `Inventory`, which units.rs only puts on heroes.
     mut heroes: Query<(&Team, &Health, &mut Inventory)>,
@@ -1819,6 +1820,20 @@ fn buy_items(
         };
 
         let def = item_def(ev.item);
+        // The shelf is tiered. This is the authoritative check — the command
+        // card greys the button and the bridge validator explains the refusal,
+        // but a team that has just LOST its Castle stops being able to buy the
+        // scroll here, on the same frame, without anyone telling it.
+        if !item_unlocked(ev.item, tiers.get(*hero_team)) {
+            debug!(
+                "BuyItem: {:?} is {} but {} needs {}",
+                hero_team,
+                tiers.get(*hero_team).name(),
+                def.name,
+                def.tier.name()
+            );
+            continue;
+        }
         if !economies.get_mut(*hero_team).pay(def.cost_gold, 0) {
             debug!(
                 "BuyItem: {:?} cannot afford {} ({} gold)",

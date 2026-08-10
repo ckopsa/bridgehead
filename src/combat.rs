@@ -1039,7 +1039,7 @@ fn cast_abilities(
         let ResolvedCast { def, team, center, power } = resolved;
 
         // --- apply the effect ----------------------------------------------
-        for (entity, other_team, gt, mut health, unit, status) in &mut affected {
+        for (entity, other_team, gt, mut health, unit, mut status) in &mut affected {
             if health.current <= 0.0 || xz_dist(center, gt.translation()) > def.radius {
                 continue;
             }
@@ -1075,7 +1075,8 @@ fn cast_abilities(
                 // The whole point of (A) meeting (B): a status ability is a
                 // table row. `power` is the magnitude, `duration` the seconds,
                 // `targets` says who — and shared.rs expires it.
-                AbilityEffect::ApplyStatus { status: kind, targets } => {
+                AbilityEffect::ApplyStatus { status: kind, targets, also } => {
+                    // (`status` is the target's component, rebound mutable.)
                     let matches = match targets {
                         AbilityTargets::Enemies => other_team != &team && unit.is_some(),
                         AbilityTargets::Allies => other_team == &team && unit.is_some(),
@@ -1086,15 +1087,34 @@ fn cast_abilities(
                     if !matches {
                         continue;
                     }
-                    let effect =
-                        StatusEffect::new(kind, def.power, now, def.duration, StatusSource::Ability);
-                    match status {
-                        Some(mut existing) => existing.apply(effect),
-                        None => {
-                            let mut fresh = StatusEffects::new();
-                            fresh.apply(effect);
-                            commands.entity(entity).try_insert(fresh);
-                        }
+                    // One cast, one or two statuses. `also` shares this cast's
+                    // duration and targets and brings only its own magnitude —
+                    // Sanctuary's heal-over-time and its armour arrive
+                    // together, expire together, and are still two ordinary
+                    // instances the moment they land.
+                    let mut fresh = StatusEffects::new();
+                    let sink: &mut StatusEffects = match status {
+                        Some(ref mut existing) => &mut *existing,
+                        None => &mut fresh,
+                    };
+                    sink.apply(StatusEffect::new(
+                        kind,
+                        def.power,
+                        now,
+                        def.duration,
+                        StatusSource::Ability,
+                    ));
+                    if let Some((extra, magnitude)) = also {
+                        sink.apply(StatusEffect::new(
+                            extra,
+                            magnitude,
+                            now,
+                            def.duration,
+                            StatusSource::Ability,
+                        ));
+                    }
+                    if status.is_none() {
+                        commands.entity(entity).try_insert(fresh);
                     }
                 }
             }
@@ -1156,53 +1176,170 @@ fn update_shockwaves(
 /// (combat owns `Health`); Town Portals delegate to units.rs, which owns
 /// Transforms, via a `TeleportRequest`.
 fn use_items(
+    mut commands: Commands,
+    time: Res<Time>,
     mut events: EventReader<UseItem>,
     mut teleports: EventWriter<TeleportRequest>,
-    mut heroes: Query<(&Team, &Transform, &mut Inventory, &mut Health)>,
+    // Health lives on the SHARED `buffed` query, not here: a hero is one of
+    // the units an item can buff, and two queries cannot both hold `&mut
+    // Health` (B0001). So the potion heals through the same handle the banner
+    // buffs through.
+    mut heroes: Query<(&Team, &Transform, &mut Inventory)>,
     halls: Query<(&Building, &Team, &Transform), Without<UnderConstruction>>,
+    mut buffed: StatusTargets,
 ) {
+    let now = time.elapsed_secs();
+
     for ev in events.read() {
-        let Ok((team, tf, mut inventory, mut health)) = heroes.get_mut(ev.hero) else {
+        let Ok((team, tf, mut inventory)) = heroes.get_mut(ev.hero) else {
             continue;
         };
-        if health.current <= 0.0 {
+        if !buffed.get(ev.hero).is_ok_and(|(_, _, _, hp, _)| hp.current > 0.0) {
             continue;
         }
         let Some(Some(item)) = inventory.0.get(ev.slot).copied() else {
             continue;
         };
+        let team = *team;
+        let hero_pos = tf.translation;
+        // Every item below is consumed. Doing it once, up front, is also the
+        // rule: a scroll that finds no hall still burns — no free retries.
+        inventory.0[ev.slot] = None;
+
+        // The nearest rung of our own hall ladder. Both teleport items home in
+        // on the same spot, so the search is written once.
+        let nearest_hall = || {
+            halls
+                .iter()
+                .filter(|(building, hall_team, _)| is_hall(building.kind) && **hall_team == team)
+                .map(|(_, _, hall_tf)| hall_tf.translation)
+                .min_by(|a, b| {
+                    xz_dist_sq(hero_pos, *a)
+                        .partial_cmp(&xz_dist_sq(hero_pos, *b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        };
 
         match item {
             ItemId::HealingPotion => {
-                inventory.0[ev.slot] = None;
-                health.current = (health.current + POTION_HEAL).min(health.max);
-            }
-            ItemId::TownPortal => {
-                let hero_pos = tf.translation;
-                let hall = halls
-                    .iter()
-                    .filter(|(building, hall_team, _)| {
-                        // Any rung of the hall ladder is home.
-                        is_hall(building.kind) && *hall_team == team
-                    })
-                    .map(|(_, _, hall_tf)| hall_tf.translation)
-                    .min_by(|a, b| {
-                        xz_dist_sq(hero_pos, *a)
-                            .partial_cmp(&xz_dist_sq(hero_pos, *b))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                // The scroll burns either way — no free retries.
-                inventory.0[ev.slot] = None;
-                match hall {
-                    Some(dest) => {
-                        teleports.write(TeleportRequest {
-                            center: ev.hero,
-                            radius: PORTAL_RADIUS,
-                            dest,
-                        });
-                    }
-                    None => warn!("TownPortal used with no completed TownHall to return to"),
+                if let Ok((_, _, _, mut health, _)) = buffed.get_mut(ev.hero) {
+                    health.current = (health.current + POTION_HEAL).min(health.max);
                 }
+            }
+            // Two shop items are now nothing but a status application. They go
+            // through the SAME `StatusEffects::apply` an ability uses, tagged
+            // `StatusSource::Item` so a future dispel can tell them apart, and
+            // shared.rs expires them — no item ever grows an expiry system.
+            ItemId::BootsOfSpeed => {
+                apply_status_around(
+                    &mut commands,
+                    &mut buffed,
+                    now,
+                    hero_pos,
+                    team,
+                    0.0,
+                    Some(ev.hero),
+                    StatusKind::Haste,
+                    BOOTS_HASTE,
+                    BOOTS_DURATION,
+                );
+            }
+            ItemId::BannerOfCommand => {
+                apply_status_around(
+                    &mut commands,
+                    &mut buffed,
+                    now,
+                    hero_pos,
+                    team,
+                    BANNER_RADIUS,
+                    None,
+                    StatusKind::ArmorBuff,
+                    BANNER_ARMOR,
+                    BANNER_DURATION,
+                );
+            }
+            ItemId::TownPortal => match nearest_hall() {
+                Some(dest) => {
+                    teleports.write(TeleportRequest {
+                        center: ev.hero,
+                        radius: PORTAL_RADIUS,
+                        dest,
+                        army_only: false,
+                    });
+                }
+                None => warn!("TownPortal used with no completed TownHall to return to"),
+            },
+            // The late-game map-control item. THE RULE: hero + every own
+            // non-worker unit anywhere on the map, to the hall nearest the
+            // HERO (not nearest each unit — one destination, so an army
+            // arrives together). Workers stay on the gold. Expressed entirely
+            // as a `TeleportRequest` with a map-spanning radius, so units.rs
+            // needed one new flag and no new code path.
+            ItemId::ScrollOfMassTeleport => match nearest_hall() {
+                Some(dest) => {
+                    teleports.write(TeleportRequest {
+                        center: ev.hero,
+                        radius: MASS_TELEPORT_RADIUS,
+                        dest,
+                        army_only: true,
+                    });
+                }
+                None => warn!("ScrollOfMassTeleport used with no completed hall to return to"),
+            },
+        }
+    }
+}
+
+/// Every unit an item may buff: the status framework's write side, as a query.
+type StatusTargets<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Team,
+        &'static GlobalTransform,
+        &'static mut Health,
+        Option<&'static mut StatusEffects>,
+    ),
+    With<Unit>,
+>;
+
+/// Lay `kind` at `magnitude` for `duration` on own living units — either one
+/// named entity (`only`), or everything within `radius` of `center`.
+///
+/// This is `cast_abilities`'s ApplyStatus arm, minus the ability: items are the
+/// second producer of statuses, and they must land the same way abilities do
+/// (same `apply`, same stacking policy, same central expiry) or the two would
+/// drift. Buildings are never targets — a banner steadies soldiers, not walls.
+#[allow(clippy::too_many_arguments)]
+fn apply_status_around(
+    commands: &mut Commands,
+    targets: &mut StatusTargets,
+    now: f32,
+    center: Vec3,
+    team: Team,
+    radius: f32,
+    only: Option<Entity>,
+    kind: StatusKind,
+    magnitude: f32,
+    duration: f32,
+) {
+    for (entity, other_team, gt, health, status) in targets.iter_mut() {
+        if health.current <= 0.0 || *other_team != team {
+            continue;
+        }
+        match only {
+            Some(wanted) if wanted != entity => continue,
+            None if xz_dist(center, gt.translation()) > radius => continue,
+            _ => {}
+        }
+        let effect = StatusEffect::new(kind, magnitude, now, duration, StatusSource::Item);
+        match status {
+            Some(mut existing) => existing.apply(effect),
+            None => {
+                let mut fresh = StatusEffects::new();
+                fresh.apply(effect);
+                commands.entity(entity).try_insert(fresh);
             }
         }
     }

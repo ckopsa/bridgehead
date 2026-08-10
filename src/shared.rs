@@ -1212,6 +1212,10 @@ pub struct CatalogAbility {
     pub effect: &'static str,
     /// Status kind applied, for `effect == "status"`.
     pub status: Option<&'static str>,
+    /// A second status the same cast lays down, with its own magnitude —
+    /// `[kind, magnitude]`. Only Sanctuary has one today. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status2: Option<(&'static str, f32)>,
     pub mana_cost: f32,
     pub cooldown: f32,
     pub radius: f32,
@@ -1281,6 +1285,10 @@ pub struct CatalogItem {
     pub id: &'static str,
     pub cost_gold: u32,
     pub sold_at: &'static str,
+    /// Team tech tier needed to buy it: 1, 2 or 3. A Shop stocks the whole
+    /// shelf from the moment it is built; this is what decides which rungs a
+    /// given team may actually take off it.
+    pub tier: u32,
     pub description: &'static str,
 }
 
@@ -1377,6 +1385,7 @@ pub fn game_catalog() -> Catalog {
                 index,
                 effect: a.effect.name(),
                 status: a.effect.status().map(|s| s.name()),
+                status2: a.effect.extra_status().map(|(k, m)| (k.name(), m)),
                 mana_cost: a.mana_cost,
                 cooldown: a.cooldown,
                 radius: a.radius,
@@ -1429,6 +1438,7 @@ pub fn game_catalog() -> Catalog {
                     id: d.name,
                     cost_gold: d.cost_gold,
                     sold_at: building_name(BuildingKind::Shop),
+                    tier: d.tier.level(),
                     description: d.description,
                 }
             })
@@ -2076,7 +2086,9 @@ pub enum AbilityTargets {
     OwnWorkers,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// `Eq` is out: `ApplyStatus::also` carries a magnitude, and a magnitude is an
+// f32. Nothing compares ability effects for hashing or set membership.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AbilityEffect {
     /// AoE damage around the caster (scaled by hero level).
     Damage,
@@ -2091,6 +2103,15 @@ pub enum AbilityEffect {
     ApplyStatus {
         status: StatusKind,
         targets: AbilityTargets,
+        /// A SECOND status laid down by the same cast, with its own magnitude.
+        /// Everything else — radius, targets, duration — is shared with the
+        /// primary status, because it is one cast.
+        ///
+        /// This is the framework's only concession to the Priestess ultimate:
+        /// Sanctuary both heals over time AND hardens, and "two abilities on
+        /// one button" or "an ability that casts another ability" would both
+        /// have cost more than one optional pair. `None` for every other row.
+        also: Option<(StatusKind, f32)>,
     },
 }
 
@@ -2110,6 +2131,21 @@ impl AbilityEffect {
             AbilityEffect::ApplyStatus { status, .. } => Some(status),
             _ => None,
         }
+    }
+    /// The optional second status and its magnitude — see `ApplyStatus::also`.
+    pub fn extra_status(self) -> Option<(StatusKind, f32)> {
+        match self {
+            AbilityEffect::ApplyStatus { also, .. } => also,
+            _ => None,
+        }
+    }
+    /// Does this effect restore HP (instantly or over time)? Auto-cast asks,
+    /// so that a healing ability waits for someone who is actually hurt
+    /// instead of firing at a column of full-health allies.
+    pub fn heals(self) -> bool {
+        matches!(self, AbilityEffect::Heal)
+            || self.status() == Some(StatusKind::HealOverTime)
+            || self.extra_status().map(|(k, _)| k) == Some(StatusKind::HealOverTime)
     }
 }
 
@@ -2192,6 +2228,58 @@ const CALL_TO_ARMS: AbilityDef = AbilityDef {
     description: "Own workers near the TownHall become fighters for 40s.",
 };
 
+// --- hero ultimates: the second ability of each class, at hero level 5 ------
+//
+// Both are pure table rows: `ApplyStatus` at `Allies`, an `AbilityUnlock::
+// HeroLevel(5)` predicate, their own cooldown slot. Nothing in combat.rs,
+// ui.rs, doctrine.rs or bridge.rs knows their names.
+//
+// They are also the reason a leveled hero is worth a war of its own. A team
+// that keeps its Champion alive to level 5 gets a 45s army-wide damage spike;
+// a team that kills it takes that away for the whole revive-and-relevel arc.
+
+/// Champion ultimate. Radius and duration are tuned so it is an ENGAGEMENT
+/// button, not a permanent aura: 8s of +30% inside 8 units, once every 45s.
+const WARCRY: AbilityDef = AbilityDef {
+    name: "Warcry",
+    effect: AbilityEffect::ApplyStatus {
+        status: StatusKind::DamageBuff,
+        targets: AbilityTargets::Allies,
+        also: None,
+    },
+    mana_cost: 75.0,
+    cooldown: 45.0,
+    radius: 8.0,
+    power: 0.30,
+    duration: 8.0,
+    // A shout carries. Unlike the Slam this is not a ground shockwave, so the
+    // team's air units are inside the buff like everyone else.
+    hits_air: true,
+    unlock: AbilityUnlock::HeroLevel(5),
+    description: "Ultimate: allies around the Champion deal +30% damage for 8s. Hero level 5.",
+};
+
+/// Priestess ultimate: the two-status row. 15 HP/s is roughly a Footman's
+/// health bar over the full 6s, and the 25% reduction is what makes the heal
+/// out-race incoming fire instead of merely trailing it.
+const SANCTUARY: AbilityDef = AbilityDef {
+    name: "Sanctuary",
+    effect: AbilityEffect::ApplyStatus {
+        status: StatusKind::HealOverTime,
+        targets: AbilityTargets::Allies,
+        also: Some((StatusKind::ArmorBuff, 0.25)),
+    },
+    mana_cost: 90.0,
+    cooldown: 60.0,
+    radius: 7.0,
+    power: 15.0,
+    duration: 6.0,
+    hits_air: true,
+    unlock: AbilityUnlock::HeroLevel(5),
+    description: "Ultimate: allies around the Priestess regain 15 HP/s and take 25% less damage \
+                  for 6s. Hero level 5.",
+};
+
 /// Dev-only second Champion ability, present only under `WC3_STATUS_PROBE=1`.
 /// It exists so a real match can exercise the v2 path end to end — a second
 /// ability on a caster, a level-gated unlock, its own cooldown slot, an
@@ -2202,6 +2290,7 @@ const PROBE_CHILL: AbilityDef = AbilityDef {
     effect: AbilityEffect::ApplyStatus {
         status: StatusKind::Slow,
         targets: AbilityTargets::Enemies,
+        also: None,
     },
     mana_cost: 10.0,
     cooldown: 8.0,
@@ -2217,9 +2306,9 @@ const PROBE_CHILL: AbilityDef = AbilityDef {
 };
 
 const NO_ABILITIES: [AbilityDef; 0] = [];
-const HERO_ABILITIES: [AbilityDef; 1] = [SLAM];
-const HERO_ABILITIES_PROBE: [AbilityDef; 2] = [SLAM, PROBE_CHILL];
-const PRIESTESS_ABILITIES: [AbilityDef; 1] = [HEAL];
+const HERO_ABILITIES: [AbilityDef; 2] = [SLAM, WARCRY];
+const HERO_ABILITIES_PROBE: [AbilityDef; 3] = [SLAM, WARCRY, PROBE_CHILL];
+const PRIESTESS_ABILITIES: [AbilityDef; 2] = [HEAL, SANCTUARY];
 const TOWNHALL_ABILITIES: [AbilityDef; 1] = [CALL_TO_ARMS];
 
 /// `WC3_STATUS_PROBE=1`: dev instrumentation for the status + ability-v2
@@ -2300,6 +2389,37 @@ pub fn first_unlocked_ability(list: &[AbilityDef], ctx: UnlockCtx) -> Option<usi
 /// Slot of the ability with this id (case-insensitive), unlocked or not.
 pub fn ability_index_by_id(list: &[AbilityDef], id: &str) -> Option<usize> {
     list.iter().position(|def| def.name.eq_ignore_ascii_case(id))
+}
+
+/// Enemies inside Warcry's radius (and allies to buff) before the scripted
+/// commander thinks the shout is worth its 45s.
+pub const WARCRY_MIN_TARGETS: u32 = 4;
+/// Hurt allies inside Sanctuary's radius before it is worth its 60s.
+pub const SANCTUARY_MIN_TARGETS: u32 = 3;
+
+/// Standing auto-cast doctrine a MACHINE-DRIVEN team gets for free, per hero
+/// class: the ultimate slots and their trigger counts.
+///
+/// Ultimates are the one part of the kit a scripted commander cannot be
+/// trusted to spend by hand — they are long-cooldown, situational, and worth
+/// nothing cast early. So they are doctrine, not script: ai.rs installs these
+/// rules on the heroes of any team it is actually driving, and doctrine.rs's
+/// auto-caster fires them under the same unlock/cooldown/mana gate a player's
+/// button obeys. A human or bridge-driven team gets nothing here and keeps
+/// full manual control.
+///
+/// Slots are resolved BY NAME, so a row inserted ahead of an ultimate moves
+/// the rule with it. Slot 0 (Slam / Heal) is deliberately absent: that is the
+/// player's `T` toggle and the scripted AI's own explicit cast.
+pub fn machine_autocast_rules(kind: UnitKind) -> Vec<(usize, u32)> {
+    let list = abilities_of_unit(kind);
+    [
+        ("Warcry", WARCRY_MIN_TARGETS),
+        ("Sanctuary", SANCTUARY_MIN_TARGETS),
+    ]
+    .iter()
+    .filter_map(|(id, min)| ability_index_by_id(list, id).map(|index| (index, *min)))
+    .collect()
 }
 
 /// Which ability of `list` a cast request means. `None` selector = the first
@@ -2405,13 +2525,30 @@ pub const MILITIA_DAMAGE: f32 = 16.0;
 pub enum ItemId {
     HealingPotion,
     TownPortal,
+    BootsOfSpeed,
+    BannerOfCommand,
+    ScrollOfMassTeleport,
 }
 
-pub const ALL_ITEMS: [ItemId; 2] = [ItemId::HealingPotion, ItemId::TownPortal];
+/// The shop shelf, in shelf order: tier 1 first, then the gated rungs. The
+/// command card, the catalog and the bridge all walk this array, so the order
+/// here IS the order a player and a commander see.
+pub const ALL_ITEMS: [ItemId; 5] = [
+    ItemId::HealingPotion,
+    ItemId::TownPortal,
+    ItemId::BootsOfSpeed,
+    ItemId::BannerOfCommand,
+    ItemId::ScrollOfMassTeleport,
+];
 
 pub struct ItemDef {
     pub name: &'static str,
     pub cost_gold: u32,
+    /// Team tech tier required to BUY this. The shelf is tiered for the same
+    /// reason the ability list is: a Shop built in the first two minutes must
+    /// not sell the late-game map-control scroll. `item_unlocked` is the one
+    /// place the comparison happens.
+    pub tier: TechTier,
     pub description: &'static str,
 }
 
@@ -2420,18 +2557,64 @@ pub fn item_def(id: ItemId) -> ItemDef {
         ItemId::HealingPotion => ItemDef {
             name: "HealingPotion",
             cost_gold: 100,
+            tier: TechTier::T1,
             description: "Instantly restores 150 HP to the hero.",
         },
         ItemId::TownPortal => ItemDef {
             name: "TownPortal",
             cost_gold: 150,
+            tier: TechTier::T1,
             description: "Teleports the hero and nearby own units to the nearest own TownHall.",
+        },
+        ItemId::BootsOfSpeed => ItemDef {
+            name: "BootsOfSpeed",
+            cost_gold: 50,
+            tier: TechTier::T1,
+            description: "Hastes the hero: +40% move speed for 15s.",
+        },
+        ItemId::BannerOfCommand => ItemDef {
+            name: "BannerOfCommand",
+            cost_gold: 125,
+            tier: TechTier::T2,
+            description: "Plants a banner: own units within 8 take 30% less damage for 10s.",
+        },
+        ItemId::ScrollOfMassTeleport => ItemDef {
+            name: "ScrollOfMassTeleport",
+            cost_gold: 250,
+            tier: TechTier::T3,
+            description: "Recalls the hero and EVERY own non-worker unit on the map to the \
+                          hall nearest the hero.",
         },
     }
 }
 
+/// May a team at `tier` buy `id`? Asked by economy.rs (which pays), by the
+/// command card (which greys the button), by the bridge validator (which
+/// explains the refusal) and by the snapshot (which reports `locked`), so the
+/// four can never disagree about what is on the shelf.
+pub fn item_unlocked(id: ItemId, tier: TechTier) -> bool {
+    tier >= item_def(id).tier
+}
+
 pub const POTION_HEAL: f32 = 150.0;
 pub const PORTAL_RADIUS: f32 = 8.0;
+
+/// Boots of Speed: a Haste status on the hero alone, through the ordinary
+/// status framework — so it stacks with, and expires like, every other buff.
+pub const BOOTS_HASTE: f32 = 0.40;
+pub const BOOTS_DURATION: f32 = 15.0;
+
+/// Banner of Command: an ArmorBuff on own units around the hero. Shorter than
+/// it is wide — it is a "hold this fight" button, not a march buff.
+pub const BANNER_ARMOR: f32 = 0.30;
+pub const BANNER_DURATION: f32 = 10.0;
+pub const BANNER_RADIUS: f32 = 8.0;
+
+/// Scroll of Mass Teleport's radius. Deliberately larger than the map's
+/// diagonal (`MAP_HALF * 2 * sqrt(2)`), so the single radius test in units.rs
+/// includes every own unit wherever it stands: "map-wide" is expressed as a
+/// number in the existing mechanism, not as a second code path.
+pub const MASS_TELEPORT_RADIUS: f32 = MAP_HALF * 4.0;
 
 /// Two consumable slots, heroes only. units.rs inserts it empty at hero spawn.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -2461,6 +2644,11 @@ pub struct TeleportRequest {
     pub center: Entity,
     pub radius: f32,
     pub dest: Vec3,
+    /// Leave workers where they stand. A Town Portal at radius 8 sweeps up
+    /// whatever is beside the hero and that is fine; a MAP-WIDE recall that
+    /// also emptied every gold mine would be an economy wipe disguised as a
+    /// map-control item. `center` itself always rides, worker or not.
+    pub army_only: bool,
 }
 
 /// XP granted to nearby enemy heroes when this thing dies.
@@ -4642,7 +4830,7 @@ fn status_probe(
         );
     }
 
-    // Keep asking the Champion for its SECOND ability by explicit index. The
+    // Keep asking the Champion for its probe ability by explicit slot. The
     // executor refuses while it is locked, on cooldown, or short of mana; every
     // cast that does land slows whatever is standing around it.
     if now >= *next_cast {
@@ -4652,10 +4840,12 @@ fn status_probe(
                 continue;
             }
             let list = abilities_of_unit(unit.kind);
-            if list.len() > 1 {
+            // By NAME, not by slot: the ultimates bead put Warcry in slot 1,
+            // and the probe still means the probe.
+            if let Some(index) = ability_index_by_id(list, "ProbeChill") {
                 let ctx = UnlockCtx::new(hero.level, tiers.get(*team));
-                if ability_unlocked(&list[1], ctx) {
-                    casts.write(CastAbility::index(entity, 1));
+                if ability_unlocked(&list[index], ctx) {
+                    casts.write(CastAbility::index(entity, index));
                 }
             }
         }
@@ -5656,6 +5846,7 @@ mod tests {
                 effect: AbilityEffect::ApplyStatus {
                     status: StatusKind::DamageBuff,
                     targets: AbilityTargets::Allies,
+                    also: None,
                 },
                 mana_cost: 50.0,
                 cooldown: 30.0,
@@ -5787,6 +5978,231 @@ mod tests {
         assert_eq!(policy.primary(), Some(5));
         policy.clear_ability(1);
         assert!(policy.is_empty());
+    }
+
+    // --- hero ultimates (T3 content) -----------------------------------------
+
+    #[test]
+    fn each_hero_class_has_an_ultimate_in_slot_one_at_level_five() {
+        for (kind, id) in [(UnitKind::Hero, "Warcry"), (UnitKind::Priestess, "Sanctuary")] {
+            let list = abilities_of_unit(kind);
+            assert_eq!(list[1].name, id, "{id} must be the second slot");
+            assert_eq!(list[1].unlock, AbilityUnlock::HeroLevel(5));
+            // The unlock is a CLIFF at 5, and the tier ladder has no say in it:
+            // a T3 team with a level-4 hero still has no ultimate.
+            for level in 0..5 {
+                assert!(
+                    !ability_unlocked(&list[1], UnlockCtx::new(level, TechTier::T3)),
+                    "{id} must stay locked at hero level {level}"
+                );
+            }
+            assert!(ability_unlocked(&list[1], UnlockCtx::new(5, TechTier::T1)));
+            // Slot 0 is untouched — an ultimate never displaces the basic kit.
+            assert!(ability_unlocked(&list[0], UnlockCtx::new(1, TechTier::T1)));
+            // `None` selector still means "the first ability I can use", so a
+            // level-5 hero's old one-button call sites did not silently move.
+            assert_eq!(first_unlocked_ability(list, UnlockCtx::new(5, TechTier::T3)), Some(0));
+            // The ultimate is reachable by id, which is what the bridge sends.
+            assert_eq!(
+                resolve_ability(list, Some(&AbilitySelector::Id(id.to_lowercase())), UnlockCtx::new(5, TechTier::T1)),
+                Some(1)
+            );
+            assert_eq!(
+                resolve_ability(list, Some(&AbilitySelector::Id(id.to_string())), UnlockCtx::new(4, TechTier::T3)),
+                None,
+                "{id} must be unreachable below level 5"
+            );
+            // Its own cooldown slot: firing the ultimate never blocks Slam/Heal.
+            let mut cds = AbilityCooldowns::default();
+            cds.start(1, list[1].cooldown);
+            assert!(!ability_ready(&list[1], None, Some(&cds), 1));
+            assert!(ability_ready(&list[0], None, Some(&cds), 0));
+        }
+    }
+
+    #[test]
+    fn sanctuary_is_one_cast_carrying_two_statuses() {
+        let sanctuary = abilities_of_unit(UnitKind::Priestess)[1];
+        assert_eq!(sanctuary.effect.status(), Some(StatusKind::HealOverTime));
+        assert_eq!(
+            sanctuary.effect.extra_status(),
+            Some((StatusKind::ArmorBuff, 0.25))
+        );
+        assert!(sanctuary.effect.heals());
+        // Warcry is the single-status shape, and is NOT a heal — the auto-cast
+        // trigger keys off exactly this.
+        let warcry = abilities_of_unit(UnitKind::Hero)[1];
+        assert_eq!(warcry.effect.extra_status(), None);
+        assert!(!warcry.effect.heals());
+        assert!(SLAM.effect.extra_status().is_none() && !SLAM.effect.heals());
+        assert!(HEAL.effect.heals());
+    }
+
+    #[test]
+    fn ultimate_and_item_magnitudes_arrive_through_effective_stats() {
+        let footman = BaseStats::of_unit(UnitKind::Footman);
+        let base = unit_stats(UnitKind::Footman);
+
+        // Warcry: +30% outgoing damage for 8s.
+        let warcry = abilities_of_unit(UnitKind::Hero)[1];
+        let mut buffed = StatusEffects::new();
+        buffed.apply(StatusEffect::new(
+            warcry.effect.status().unwrap(),
+            warcry.power,
+            0.0,
+            warcry.duration,
+            StatusSource::Ability,
+        ));
+        assert!((effective_stats(footman, Some(&buffed)).damage_mult - 1.30).abs() < 1e-6);
+
+        // Sanctuary: both statuses, one cast, one duration.
+        let sanctuary = abilities_of_unit(UnitKind::Priestess)[1];
+        let (extra, magnitude) = sanctuary.effect.extra_status().unwrap();
+        let mut warded = StatusEffects::new();
+        warded.apply(StatusEffect::new(
+            sanctuary.effect.status().unwrap(),
+            sanctuary.power,
+            0.0,
+            sanctuary.duration,
+            StatusSource::Ability,
+        ));
+        warded.apply(StatusEffect::new(
+            extra,
+            magnitude,
+            0.0,
+            sanctuary.duration,
+            StatusSource::Ability,
+        ));
+        let eff = effective_stats(footman, Some(&warded));
+        assert!((eff.heal_per_second - 15.0).abs() < 1e-6);
+        assert!((eff.damage_taken_mult - 0.75).abs() < 1e-6);
+        // Both instances die on the same tick — one cast, one expiry.
+        assert!(warded.expire(sanctuary.duration + 0.01));
+        assert!(warded.is_empty());
+
+        // Boots of Speed: +40% legs, and legs only.
+        let mut hasted = StatusEffects::new();
+        hasted.apply(StatusEffect::new(
+            StatusKind::Haste,
+            BOOTS_HASTE,
+            0.0,
+            BOOTS_DURATION,
+            StatusSource::Item,
+        ));
+        let eff = effective_stats(footman, Some(&hasted));
+        assert!((eff.speed - base.speed * 1.40).abs() < 1e-4);
+        assert!((eff.attack_cooldown - base.attack_cooldown).abs() < 1e-6);
+
+        // Banner of Command: 30% off incoming damage.
+        let mut shielded = StatusEffects::new();
+        shielded.apply(StatusEffect::new(
+            StatusKind::ArmorBuff,
+            BANNER_ARMOR,
+            0.0,
+            BANNER_DURATION,
+            StatusSource::Item,
+        ));
+        assert!((effective_stats(footman, Some(&shielded)).damage_taken_mult - 0.70).abs() < 1e-6);
+    }
+
+    #[test]
+    fn machine_autocast_covers_the_ultimates_and_nothing_else() {
+        let champion = machine_autocast_rules(UnitKind::Hero);
+        assert_eq!(champion, vec![(1, WARCRY_MIN_TARGETS)]);
+        let priestess = machine_autocast_rules(UnitKind::Priestess);
+        assert_eq!(priestess, vec![(1, SANCTUARY_MIN_TARGETS)]);
+        // Slot 0 stays the player's `T` toggle / the script's own cast.
+        assert!(champion.iter().all(|(index, _)| *index != 0));
+        assert!(machine_autocast_rules(UnitKind::Footman).is_empty());
+        // Installing them leaves any hand-set slot-0 rule alone.
+        let mut policy = AutoCastPolicy::first(3);
+        for (index, min) in machine_autocast_rules(UnitKind::Hero) {
+            policy.set(index, min);
+        }
+        assert_eq!(policy.min_enemies_for(0), Some(3));
+        assert_eq!(policy.min_enemies_for(1), Some(WARCRY_MIN_TARGETS));
+    }
+
+    // --- the tiered shop shelf -----------------------------------------------
+
+    #[test]
+    fn the_shop_shelf_is_tiered_and_gating_is_one_rule() {
+        // The shelf, as designed: two starter consumables and the boots at T1,
+        // the banner at the Keep, the mass-teleport scroll at the Castle.
+        let expected = [
+            (ItemId::HealingPotion, 100, TechTier::T1),
+            (ItemId::TownPortal, 150, TechTier::T1),
+            (ItemId::BootsOfSpeed, 50, TechTier::T1),
+            (ItemId::BannerOfCommand, 125, TechTier::T2),
+            (ItemId::ScrollOfMassTeleport, 250, TechTier::T3),
+        ];
+        assert_eq!(ALL_ITEMS.len(), expected.len());
+        for (id, cost, tier) in expected {
+            let def = item_def(id);
+            assert_eq!(def.cost_gold, cost, "{} price", def.name);
+            assert_eq!(def.tier, tier, "{} tier", def.name);
+            // Gating is `tier >= required`, and nothing else: a team at or
+            // above the rung may buy, a team below may not, at every rung.
+            for team_tier in [TechTier::T1, TechTier::T2, TechTier::T3] {
+                assert_eq!(
+                    item_unlocked(id, team_tier),
+                    team_tier >= tier,
+                    "{} at {}",
+                    def.name,
+                    team_tier.name()
+                );
+            }
+        }
+        // The rungs a fresh team can reach are exactly the T1 ones — the
+        // regression this bead exists to prevent is a Shop built at minute two
+        // selling the late-game scroll.
+        let at_start: Vec<&str> = ALL_ITEMS
+            .iter()
+            .filter(|id| item_unlocked(**id, TechTier::T1))
+            .map(|id| item_def(*id).name)
+            .collect();
+        assert_eq!(at_start, ["HealingPotion", "TownPortal", "BootsOfSpeed"]);
+        // Tier is a property of what is STANDING: the same team that could buy
+        // the scroll with a Castle up cannot once it is rubble.
+        let with_castle = tech_tier_for([BuildingKind::TownHall, BuildingKind::Castle].into_iter());
+        let after_loss = tech_tier_for([BuildingKind::TownHall].into_iter());
+        assert!(item_unlocked(ItemId::ScrollOfMassTeleport, with_castle));
+        assert!(!item_unlocked(ItemId::ScrollOfMassTeleport, after_loss));
+        assert!(item_unlocked(ItemId::HealingPotion, after_loss));
+    }
+
+    #[test]
+    fn mass_teleport_spans_the_map_and_the_catalog_carries_the_shelf() {
+        // "Map-wide" is a radius, not a special case: the scroll's radius has
+        // to beat the longest possible distance between two units.
+        let diagonal = (MAP_HALF * 2.0) * std::f32::consts::SQRT_2;
+        assert!(MASS_TELEPORT_RADIUS > diagonal);
+        assert!(PORTAL_RADIUS < diagonal, "the Town Portal stays local");
+
+        let catalog = game_catalog();
+        assert_eq!(catalog.items.len(), ALL_ITEMS.len());
+        for id in ALL_ITEMS {
+            let def = item_def(id);
+            let row = catalog
+                .items
+                .iter()
+                .find(|i| i.id == def.name)
+                .unwrap_or_else(|| panic!("{} missing from the catalog", def.name));
+            assert_eq!(row.tier, def.tier.level());
+            assert_eq!(row.cost_gold, def.cost_gold);
+            assert_eq!(row.sold_at, building_name(BuildingKind::Shop));
+        }
+        // The ultimates and their second status reach the catalog too, so a
+        // commander reading catalog.json alone knows Sanctuary does two things.
+        for id in ["Warcry", "Sanctuary"] {
+            let row = catalog.abilities.iter().find(|a| a.id == id).expect(id);
+            assert_eq!(row.index, 1);
+            assert_eq!(row.unlock, "hero level 5");
+            assert_eq!(row.effect, "status");
+        }
+        let sanctuary = catalog.abilities.iter().find(|a| a.id == "Sanctuary").unwrap();
+        assert_eq!(sanctuary.status, Some("HealOverTime"));
+        assert_eq!(sanctuary.status2, Some(("ArmorBuff", 0.25)));
     }
 
     #[test]
