@@ -103,7 +103,19 @@ const SPEARMAN_EVERY_NTH_BOTH: u32 = 3;
 /// cap. So the count is capped by construction, not by budget:
 /// `tower_quota` can never return more than `MAX_TOWERS`, and the build branch
 /// re-checks the same cap against what is actually standing.
-const BASELINE_TOWERS: usize = 2;
+//
+// ONE, not two, and this number was measured rather than chosen. Against the
+// pre-bead baseline the `open` map converges in 7.1 / 7.1 / 7.2 / 8.4 minutes —
+// four runs, all decisive, remarkably tight. With two base towers a side it
+// went 6.7 / 10.3 / 23.3 / 25.0-and-timed-out: a 550 HP emplacement that shoots
+// 16 at range 16 does not merely cost 110 gold, it makes a 6-14 unit wave
+// bounce, and when BOTH scripted sides own that, neither can ever close and the
+// match runs to the cap with two intact economies staring at each other. That
+// is precisely the turtle failure this file is not allowed to have. Notably the
+// `crossings` runs stayed decisive (5.5-12.4) with the same code, because there
+// the towers go to a ford instead of the front door — which is the clearest
+// possible evidence that the problem was base defense, not the spending.
+const BASELINE_TOWERS: usize = 1;
 /// Hard ceiling on towers the script will ever own, baseline plus reactive.
 /// Four is one more than the rules below can currently ask for (2 baseline + 1
 /// on air contact): the slack is deliberate, so a future reactive rule has room
@@ -112,7 +124,10 @@ const MAX_TOWERS: usize = 4;
 /// Gold in hand before the AI spends 110g/80l on a baseline Tower. A reactive
 /// (air-contact) Tower ignores this: by the time a Gryphon is overhead, "we
 /// cannot afford to answer it" is not a position, it is a loss.
-const TOWER_GOLD: u32 = 240;
+// 240 -> 350, alongside the second-hall gate below. Both exist to push the
+// baseline tower late and make it come out of genuine surplus, for the pacing
+// reason recorded on BASELINE_TOWERS.
+const TOWER_GOLD: u32 = 350;
 
 /// ---- Fortifying a crossing ----------------------------------------------
 ///
@@ -1149,11 +1164,16 @@ fn think(
             // above it its benefit travels with the army instead of guarding
             // one patch of dirt. Same argument, same side of the towers.
             Some(BuildingKind::Shop)
-        } else if tower_wanted && gold > TOWER_GOLD {
-            // The baseline pair, at the bottom of the chain. Everything above
+        } else if tower_wanted && halls >= 2 && gold > TOWER_GOLD {
+            // The baseline tower, at the bottom of the chain. Everything above
             // either earns money, makes soldiers, or makes soldiers better; a
             // Tower does none of the three, and the scripted AI is judged on
             // whether it attacks.
+            //
+            // `halls >= 2` — fortify only what a second income is paying for.
+            // A base that has not expanded yet cannot spare the gold OR the
+            // tempo, and buying static defense out of a single mine is how the
+            // scripted matchup stops converging (see BASELINE_TOWERS).
             Some(BuildingKind::Tower)
         } else if wall_wanted {
             Some(BuildingKind::Wall)
