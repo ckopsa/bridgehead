@@ -284,7 +284,7 @@ fn enforce_leash(
 fn auto_cast_abilities(
     mut casts: EventWriter<CastAbility>,
     heroes: Query<(Entity, &AutoCastPolicy, &Hero, &Unit, &Team, &Transform)>,
-    others: Query<(&Team, &Transform, &Health), With<Unit>>,
+    others: Query<(&Team, &Transform, &Health, &Unit)>,
 ) {
     /// A hurt ally is one below this fraction of max HP.
     const HEAL_FRAC: f32 = 0.7;
@@ -299,9 +299,15 @@ fn auto_cast_abilities(
         }
         let count = others
             .iter()
-            .filter(|(other_team, other_tf, health)| {
+            .filter(|(other_team, other_tf, health, other_unit)| {
                 if health.current <= 0.0 || xz_dist(tf.translation, other_tf.translation) > def.radius
                 {
+                    return false;
+                }
+                // Only count what the ability can actually affect. Three
+                // flyers overhead must not trip a Champion's auto-slam: the
+                // shockwave would miss and the mana would be gone.
+                if !def.hits_air && is_flying_kind(other_unit.kind) {
                     return false;
                 }
                 match def.effect {

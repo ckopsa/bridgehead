@@ -460,6 +460,13 @@ struct UnitOut {
     /// the time, which is almost always.
     #[serde(skip_serializing_if = "is_false")]
     militia: bool,
+    /// Airborne. `pos` is the ground cell it is over (altitude is not a
+    /// tactical variable — every range check in the game is ground-plane), but
+    /// WHETHER it is airborne decides who can shoot it, so it has to be
+    /// visible in the snapshot and not merely inferable from `kind` via the
+    /// catalog. Omitted for the overwhelmingly common ground unit.
+    #[serde(skip_serializing_if = "is_false")]
+    flying: bool,
     /// Own units only (`null` when unassigned); absent entirely for enemies —
     /// we can see their army, not their command structure.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -700,6 +707,7 @@ fn write_seat_snapshot(
                         .collect()
                 }),
                 militia,
+                flying: is_flying_kind(unit.kind),
                 squad: mine.then(|| squad.map(|s| s.0)),
                 policies: (mine && has_policy).then(|| PoliciesOut {
                     prio: prio.map(|p| p.0.iter().map(|c| target_class_name(*c)).collect()),

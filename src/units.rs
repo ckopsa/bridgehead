@@ -257,8 +257,15 @@ fn unit_root_scale(kind: UnitKind) -> f32 {
 }
 
 /// Constant Y the unit's origin is kept at (mesh centre = half height).
+/// Flying kinds ride `FLYER_ALTITUDE` above that — the one place altitude is
+/// decided, so every mover and teleport lands a flyer at the same height.
 fn unit_y(kind: UnitKind) -> f32 {
-    unit_height(kind) * 0.5 * unit_root_scale(kind)
+    let ground = unit_height(kind) * 0.5 * unit_root_scale(kind);
+    if is_flying_kind(kind) {
+        ground + FLYER_ALTITUDE
+    } else {
+        ground
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -282,11 +289,13 @@ fn spawn_units(
     for ev in events.read() {
         let stats = unit_stats(ev.kind);
 
-        // Nudge out of blocked / out-of-bounds cells.
+        // Nudge out of blocked / out-of-bounds cells. Flyers skip the nudge:
+        // an occupied cell is not occupied airspace, so a Gryphon may perfectly
+        // well be born hovering over the tree its barracks backs onto.
         let mut pos = ev.pos;
         pos.x = pos.x.clamp(-MAP_HALF + 1.0, MAP_HALF - 1.0);
         pos.z = pos.z.clamp(-MAP_HALF + 1.0, MAP_HALF - 1.0);
-        if nav.is_blocked_world(pos) {
+        if !stats.flying && nav.is_blocked_world(pos) {
             if let Some(cell) = NavGrid::world_to_cell(pos) {
                 if let Some(free) = nearest_free_cell(&nav, cell) {
                     pos = NavGrid::cell_to_world(free.0, free.1);
@@ -601,8 +610,13 @@ fn handle_teleports(
             let mut spot = Vec3::new(dest.x + offset.x, 0.0, dest.z + offset.z);
             spot.x = spot.x.clamp(-MAP_HALF + 1.0, MAP_HALF - 1.0);
             spot.z = spot.z.clamp(-MAP_HALF + 1.0, MAP_HALF - 1.0);
-            // Never materialise inside a building or a tree.
-            if nav.is_blocked_world(spot) {
+            // Never materialise inside a building or a tree — unless you fly
+            // over both anyway.
+            let flying = units
+                .get(entity)
+                .map(|(_, unit, ..)| is_flying_kind(unit.kind))
+                .unwrap_or(false);
+            if !flying && nav.is_blocked_world(spot) {
                 if let Some(cell) = NavGrid::world_to_cell(spot) {
                     if let Some(free) = nearest_free_cell(&nav, cell) {
                         spot = NavGrid::cell_to_world(free.0, free.1);
@@ -761,15 +775,26 @@ fn compute_paths(
     nav: Res<NavGrid>,
     mut scratch: ResMut<PathScratch>,
     query: Query<
-        (Entity, &Transform, &MoveTo, Option<&PathFollow>),
+        (Entity, &Unit, &Transform, &MoveTo, Option<&PathFollow>),
         Or<(Changed<MoveTo>, Without<PathFollow>)>,
     >,
 ) {
-    for (entity, transform, move_to, existing) in &query {
+    for (entity, unit, transform, move_to, existing) in &query {
         let repaths = existing.map(|p| p.repaths).unwrap_or(0);
         let from = transform.translation;
 
-        match plan_path(&nav, &mut scratch, from, move_to.target) {
+        // Flying: no grid, no search, no unreachable. One waypoint — the
+        // destination — and the steering below flies the straight line to it,
+        // over walls, forests, mines and the enemy's whole tower net. This is
+        // the entire "bypass" in one branch; everything else about a flyer is
+        // an ordinary unit.
+        let plan = if is_flying_kind(unit.kind) {
+            Some(vec![clamp_to_map_xz(move_to.target)])
+        } else {
+            plan_path(&nav, &mut scratch, from, move_to.target)
+        };
+
+        match plan {
             Some(waypoints) if !waypoints.is_empty() => {
                 commands.entity(entity).try_insert(PathFollow {
                     waypoints,
@@ -789,6 +814,16 @@ fn compute_paths(
             }
         }
     }
+}
+
+/// Flatten to the ground plane and keep inside the map bounds. Flying paths
+/// use this in place of the whole A* pipeline.
+fn clamp_to_map_xz(p: Vec3) -> Vec3 {
+    Vec3::new(
+        p.x.clamp(-MAP_HALF + 0.5, MAP_HALF - 0.5),
+        0.0,
+        p.z.clamp(-MAP_HALF + 0.5, MAP_HALF - 0.5),
+    )
 }
 
 /// Full plan: resolve start/goal cells, run A*, convert to world waypoints and
@@ -1120,7 +1155,9 @@ fn steer_units(
         };
 
         // --- repath if the way ahead became blocked ---------------------
-        if nav.is_blocked_world(waypoint) {
+        // Airspace is never blocked, so a flyer never repaths for terrain —
+        // and a wall thrown up across its route is simply not its problem.
+        if !stats.flying && nav.is_blocked_world(waypoint) {
             move_to.set_changed();
             continue;
         }
@@ -1183,7 +1220,8 @@ fn steer_units(
 
 #[derive(Default)]
 struct SepScratch {
-    entries: Vec<(Entity, Team, Vec3)>,
+    /// (entity, team, position, flying)
+    entries: Vec<(Entity, Team, Vec3, bool)>,
     pushes: Vec<Vec3>,
     buckets: HashMap<(i32, i32), Vec<usize>>,
 }
@@ -1210,22 +1248,24 @@ fn separate_units(
         bucket.clear();
     }
 
-    for (entity, team, _, transform) in &query {
-        scratch.entries.push((entity, *team, transform.translation));
+    for (entity, team, unit, transform) in &query {
+        scratch
+            .entries
+            .push((entity, *team, transform.translation, is_flying_kind(unit.kind)));
     }
     if scratch.entries.len() < 2 {
         return;
     }
     scratch.pushes.resize(scratch.entries.len(), Vec3::ZERO);
 
-    for (i, (_, _, pos)) in scratch.entries.iter().enumerate() {
+    for (i, (_, _, pos, _)) in scratch.entries.iter().enumerate() {
         scratch.buckets.entry(bucket_of(*pos)).or_default().push(i);
     }
 
     let max_push = SEPARATION_SPEED * dt;
 
     for i in 0..scratch.entries.len() {
-        let (_, team_i, pos_i) = scratch.entries[i];
+        let (_, team_i, pos_i, flying_i) = scratch.entries[i];
         let (bx, bz) = bucket_of(pos_i);
         let mut push = Vec3::ZERO;
 
@@ -1238,7 +1278,14 @@ fn separate_units(
                     if j == i {
                         continue;
                     }
-                    let (_, team_j, pos_j) = scratch.entries[j];
+                    let (_, team_j, pos_j, flying_j) = scratch.entries[j];
+                    // Two different traffic layers: a flyer and a ground unit
+                    // sharing an XZ cell are stacked, not collided, so they
+                    // never push each other. Flyers jostle flyers, walkers
+                    // jostle walkers.
+                    if flying_i != flying_j {
+                        continue;
+                    }
                     let mut delta = Vec3::new(pos_i.x - pos_j.x, 0.0, pos_i.z - pos_j.z);
                     let dist = delta.length();
                     if dist >= SEPARATION_DIST {
@@ -1271,7 +1318,7 @@ fn separate_units(
         if push.length_squared() < 1e-8 {
             continue;
         }
-        let (entity, _, _) = scratch.entries[i];
+        let (entity, _, _, flying) = scratch.entries[i];
         let Ok((_, _, _, mut transform)) = query.get_mut(entity) else {
             continue;
         };
@@ -1279,7 +1326,8 @@ fn separate_units(
         let mut candidate = Vec3::new(old.x + push.x, old.y, old.z + push.z);
 
         // Never shove a unit into a blocked cell — retry one axis at a time.
-        if nav.is_blocked_world(candidate) {
+        // Flyers have no such cells to be shoved into.
+        if !flying && nav.is_blocked_world(candidate) {
             let x_only = Vec3::new(old.x + push.x, old.y, old.z);
             let z_only = Vec3::new(old.x, old.y, old.z + push.z);
             if !nav.is_blocked_world(x_only) {

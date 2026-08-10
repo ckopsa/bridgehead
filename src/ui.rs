@@ -292,16 +292,22 @@ enum PrioPreset {
     HuntHero,
     KillArchers,
     Siege,
+    /// Shoot the air first. The bridge can already write `prio: ["Air", ..]`
+    /// by hand; without this the human has no way to say the same thing, and
+    /// "the AI cannot act in ways the human cannot" has to run both
+    /// directions.
+    AntiAir,
 }
 
 impl PrioPreset {
-    /// None -> Hunt Hero -> Kill Archers -> Siege -> None.
+    /// None -> Hunt Hero -> Kill Archers -> Siege -> Anti-Air -> None.
     fn next(self) -> Self {
         match self {
             PrioPreset::None => PrioPreset::HuntHero,
             PrioPreset::HuntHero => PrioPreset::KillArchers,
             PrioPreset::KillArchers => PrioPreset::Siege,
-            PrioPreset::Siege => PrioPreset::None,
+            PrioPreset::Siege => PrioPreset::AntiAir,
+            PrioPreset::AntiAir => PrioPreset::None,
         }
     }
     /// Button caption; the empty state just names the button.
@@ -311,6 +317,7 @@ impl PrioPreset {
             PrioPreset::HuntHero => "Hunt Hero",
             PrioPreset::KillArchers => "Kill Archers",
             PrioPreset::Siege => "Siege",
+            PrioPreset::AntiAir => "Anti-Air",
         }
     }
     /// Compact tag for the selection-panel doctrine line.
@@ -320,6 +327,7 @@ impl PrioPreset {
             PrioPreset::HuntHero => "HuntHero",
             PrioPreset::KillArchers => "KillArchers",
             PrioPreset::Siege => "Siege",
+            PrioPreset::AntiAir => "AntiAir",
         }
     }
     /// The class list written to `TargetPriority` (empty = remove it).
@@ -341,6 +349,13 @@ impl PrioPreset {
                 TargetClass::Building,
             ],
             PrioPreset::Siege => &[TargetClass::Building],
+            PrioPreset::AntiAir => &[
+                TargetClass::Air,
+                TargetClass::Archer,
+                TargetClass::Hero,
+                TargetClass::Footman,
+                TargetClass::Worker,
+            ],
         }
     }
     /// Which preset a live `TargetPriority` reads as (its first class decides,
@@ -350,6 +365,7 @@ impl PrioPreset {
             Some(TargetClass::Hero) => PrioPreset::HuntHero,
             Some(TargetClass::Archer) => PrioPreset::KillArchers,
             Some(TargetClass::Building) => PrioPreset::Siege,
+            Some(TargetClass::Air) => PrioPreset::AntiAir,
             _ => PrioPreset::None,
         }
     }
@@ -930,6 +946,20 @@ fn resource_name(kind: ResourceKind) -> &'static str {
 
 fn dist_xz(a: Vec3, b: Vec3) -> f32 {
     Vec2::new(a.x - b.x, a.z - b.z).length()
+}
+
+/// Where the cursor sits on the horizontal plane a given unit occupies.
+///
+/// The camera looks down at a fixed pitch, so the y=0 point under the cursor
+/// and the point at the unit's own height are offset by `height / tan(pitch)`
+/// — over 4 world units for a flyer, against a pick radius of ~1.4. Testing an
+/// airborne unit against the ground projection would make it impossible to
+/// click, select, right-click or hover: a unit a bridge commander could order
+/// and a human could not. Everything picks against its own plane instead,
+/// which also quietly sharpens picking for ordinary ground units (whose body
+/// centres are ~1.4 up, not at zero).
+fn pick_point_for(ray: Option<Ray3d>, ground: Vec3, target_y: f32) -> Vec3 {
+    ray.and_then(|r| ray_at_height(r, target_y)).unwrap_or(ground)
 }
 
 fn clamp_to_map(p: Vec3) -> Vec3 {
@@ -2333,13 +2363,17 @@ fn left_mouse(
         let Some(ground) = cursor_to_ground(camera, cam_tf, cursor) else {
             return;
         };
+        let ray = cursor_ray(camera, cam_tf, cursor);
 
         let mut best: Option<(Entity, f32)> = None;
         for (e, tf, _, team, _) in &units {
             if *team != Team::Human {
                 continue;
             }
-            let d = dist_xz(tf.translation, ground);
+            let d = dist_xz(
+                tf.translation,
+                pick_point_for(ray, ground, tf.translation.y),
+            );
             if d <= UNIT_PICK_RADIUS && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((e, d));
             }
@@ -2429,10 +2463,14 @@ fn right_mouse(
     selected_units.sort_by_key(|(e, _, _)| e.index());
 
     // --- pick whatever the cursor is over (once, shared by every branch) --
+    let ray = cursor_ray(camera, cam_tf, cursor);
     let mut enemy: Option<(Entity, f32)> = None;
     let mut own_unit: Option<(Entity, f32)> = None;
     for (e, tf, _, team, _, _) in &units {
-        let d = dist_xz(tf.translation, ground);
+        let d = dist_xz(
+            tf.translation,
+            pick_point_for(ray, ground, tf.translation.y),
+        );
         if d > UNIT_PICK_RADIUS {
             continue;
         }
@@ -2701,16 +2739,21 @@ fn sync_selection_rings(
     mut commands: Commands,
     assets: Res<UiAssets>,
     newly_selected: Query<
-        (Entity, &Transform, Option<&Building>),
+        (Entity, &Transform, Option<&Building>, Option<&Unit>),
         (With<Selected>, Without<HasRing>),
     >,
     deselected: Query<(Entity, &HasRing), Without<Selected>>,
 ) {
-    for (entity, tf, building) in &newly_selected {
+    for (entity, tf, building, unit) in &newly_selected {
         let radius = match building {
             Some(b) => building_stats(b.kind).size * 0.62,
             None => 1.1,
         };
+        // A flyer's ring rides with it. Cancelling its height like a ground
+        // unit's would leave the ring on the dirt six units below the model,
+        // where it reads as a selection of something else entirely.
+        let flying = unit.is_some_and(|u| is_flying_kind(u.kind));
+        let ring_world_y = if flying { tf.translation.y - 1.2 } else { 0.08 };
         let ring = commands
             .spawn((
                 Mesh3d(assets.ring_mesh.clone()),
@@ -2722,7 +2765,7 @@ fn sync_selection_rings(
                 // ring lands at world y ~0.08 regardless.
                 Transform::from_xyz(
                     0.0,
-                    (0.08 - tf.translation.y) / tf.scale.y.max(0.001),
+                    (ring_world_y - tf.translation.y) / tf.scale.y.max(0.001),
                     0.0,
                 )
                     .with_scale(Vec3::new(radius, 0.12, radius)),
@@ -3584,9 +3627,13 @@ fn hover_feedback(
                 if let Some(ground) = cursor_to_ground(cam, cam_tf, cursor) {
                     // Closest unit first (units win ties against buildings),
                     // then buildings, then resource nodes.
+                    let ray = cursor_ray(cam, cam_tf, cursor);
                     let mut best_unit: Option<(f32, Vec3, Team)> = None;
                     for (tf, team) in &units {
-                        let d = dist_xz(tf.translation, ground);
+                        let d = dist_xz(
+                            tf.translation,
+                            pick_point_for(ray, ground, tf.translation.y),
+                        );
                         if d <= UNIT_PICK_RADIUS && best_unit.is_none_or(|(bd, _, _)| d < bd) {
                             best_unit = Some((d, tf.translation, *team));
                         }
@@ -3643,7 +3690,11 @@ fn hover_feedback(
 
     match hit {
         Some((pos, radius, mat)) => {
-            ring_tf.translation = Vec3::new(pos.x, 0.1, pos.z);
+            // Hover ring sits just under whatever is hovered — on the ground
+            // for ground things, at altitude for a flyer, so the highlight is
+            // always attached to the thing the cursor actually picked.
+            let ring_y = if pos.y > FLYER_ALTITUDE * 0.5 { pos.y - 1.2 } else { 0.1 };
+            ring_tf.translation = Vec3::new(pos.x, ring_y, pos.z);
             ring_tf.scale = Vec3::new(radius, 0.12, radius);
             if ring_mat.0 != mat {
                 ring_mat.0 = mat;

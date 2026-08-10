@@ -835,7 +835,10 @@ fn harvest_loop(
     // orders from the commander still go wherever they're told.
     let combat_presence: Vec<(Vec3, Team)> = hostiles
         .iter()
-        .filter(|(_, _, u)| u.kind != UnitKind::Worker)
+        // "Dangerous to a worker" means it can actually shoot one. Flyers that
+        // strafe the ground count and will chase a crew off a mine like
+        // anything else; a hypothetical air-only interceptor would not.
+        .filter(|(_, _, u)| u.kind != UnitKind::Worker && unit_stats(u.kind).can_hit_ground)
         .map(|(tf, t, _)| (tf.translation, *t))
         .collect();
 
@@ -1186,7 +1189,7 @@ fn training_queues(
             commands.entity(entity).try_insert(PaidFront(false));
 
             let size = building_stats(building.kind).size;
-            let pos = free_spawn_spot(&nav, flat(tf.translation), size);
+            let pos = free_spawn_spot(&nav, flat(tf.translation), size, is_flying_kind(front));
             spawn_events.write(SpawnUnitEvent {
                 kind: front,
                 team: *team,
@@ -1266,7 +1269,10 @@ fn buy_items(
 }
 
 /// A free-ish rally spot just outside the footprint, biased toward map center.
-fn free_spawn_spot(nav: &NavGrid, center: Vec3, size: f32) -> Vec3 {
+/// `flying` units skip the walkability search entirely — every spot is free
+/// airspace, so a packed base can never stall an air factory the way it can
+/// stall a barracks.
+fn free_spawn_spot(nav: &NavGrid, center: Vec3, size: f32, flying: bool) -> Vec3 {
     let toward_center = {
         let d = flat(-center);
         if d.length_squared() > 0.0001 {
@@ -1281,6 +1287,9 @@ fn free_spawn_spot(nav: &NavGrid, center: Vec3, size: f32) -> Vec3 {
         0.0,
         fallback.z.clamp(-MAP_HALF + 2.0, MAP_HALF - 2.0),
     );
+    if flying {
+        return fallback;
+    }
 
     for ring in 0..3 {
         let radius = size * 0.5 + 2.0 + ring as f32 * 2.0;
