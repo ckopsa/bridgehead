@@ -601,6 +601,9 @@ fn engagement(
     // GlobalTransform (not Transform) so this never conflicts with the mutable
     // attacker query — attackers can themselves be targets.
     targets: Query<(&GlobalTransform, &Team, &Health, Option<&Building>, Option<&Unit>)>,
+    // The attacker's team research. Read here and handed to the stat law, so
+    // no arm below ever reaches for a research level on its own.
+    research: Res<TeamResearch>,
 ) {
     let dt = time.delta_secs();
 
@@ -655,7 +658,9 @@ fn engagement(
         // Everything a buff or debuff can touch comes from the ONE modifier
         // function — never off `stats` directly. `stats.range`,
         // `vs_building_mult` and friends are unmodifiable, so they stay raw.
-        let effective = effective_unit_stats(unit.kind, status);
+        // Attack research rides in through the same door as a damage buff:
+        // one call, one struct, and the flat term lands in `bonus_damage`.
+        let effective = effective_unit_stats_with(unit.kind, status, research.get(*team).bonus());
         let target_pos = target_gt.translation();
         let my_pos = tf.translation;
         let reach = stats.range + target_radius(target_building);
@@ -736,7 +741,11 @@ fn engagement(
             * hero.map_or(1.0, |h| Hero::damage_mult(h.level))
             * type_mult
             // Outgoing damage buffs (Warcry and friends) land here.
-            * effective.damage_mult;
+            * effective.damage_mult
+            // ...and attack research lands HERE, outside every multiplier, so
+            // +3 is +3 whether the swinger is a level-10 hero or a militia
+            // worker, and whether the thing being hit is a man or a wall.
+            + effective.bonus_damage;
 
         if stats.projectile {
             let origin = my_pos + Vec3::Y * 1.3;
@@ -1403,20 +1412,35 @@ fn apply_damage(
         Option<&Militia>,
     )>,
     attackers: Query<(&Team, Option<&Unit>), Or<(With<Unit>, With<Building>)>>,
+    research: Res<TeamResearch>,
 ) {
     for event in events.read() {
+        // Everything the victim brings to the hit, resolved before the
+        // subtraction. `victims` requires `Unit`, so a successful get is also
+        // the test for "is this a unit?" — which is exactly the question armor
+        // research asks. A building falls through with `ResearchBonus::NONE`
+        // and takes the hit unreduced: research equips the army, and masonry
+        // is what a Keep upgrade buys.
+        let victim = victims.get(event.victim).ok();
+        let bonus = victim
+            .map(|(_, team, ..)| research.get(*team).bonus())
+            .unwrap_or(ResearchBonus::NONE);
         // Incoming damage goes through the same law as outgoing damage:
         // whatever armour buffs the victim is carrying are applied HERE, once,
         // at the single point where health is subtracted.
-        let taken = effective_stats(BaseStats::STATIC, shields.get(event.victim).ok())
-            .damage_taken_mult;
+        let effective =
+            effective_stats_with(BaseStats::STATIC, shields.get(event.victim).ok(), bonus);
         let Ok(mut health) = healths.get_mut(event.victim) else {
             continue;
         };
         if health.current <= 0.0 {
             continue;
         }
-        health.current -= event.amount * taken;
+        health.current -= damage_after_armor(
+            event.amount,
+            effective.damage_taken_mult,
+            effective.flat_armor,
+        );
         // Everything that takes a hit — unit, hero, building — is stamped, so
         // shared.rs's out-of-combat regen restarts its clock from here.
         commands
@@ -1424,7 +1448,9 @@ fn apply_damage(
             .try_insert(LastDamaged { at: time.elapsed_secs() });
 
         // --- retaliation (buildings never fight back) ---
-        let Ok((unit, team, tf, order, current_target, militia)) = victims.get(event.victim) else {
+        // Already resolved above for the armor lookup; `None` here means the
+        // victim was a building, which is the same reason it does not retaliate.
+        let Some((unit, team, tf, order, current_target, militia)) = victim else {
             continue;
         };
         if current_target.is_some() || !matches!(order, Order::Idle) {

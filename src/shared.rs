@@ -166,6 +166,11 @@ pub enum BuildingKind {
     Workshop,
     /// Item vendor: heroes buy consumables here.
     Shop,
+    /// Tier 2 forge: researches the team-wide attack and armor ladders
+    /// (`ResearchKind`). Requires a Keep. Trains nothing — it converts a bank
+    /// balance into a permanent multiplier on every soldier the team will ever
+    /// field, which is the one thing an economic lead could not previously buy.
+    Blacksmith,
     /// Tier 2 of the town hall ladder. Never placed — a TownHall upgrades into
     /// one in place (see `building_upgrades_to`). Trains everything the hall
     /// trained, and is the tech gate future tier-2 content names.
@@ -184,7 +189,7 @@ pub const ALL_UNIT_KINDS: [UnitKind; 8] = [
     UnitKind::Priestess,
     UnitKind::Spearman,
 ];
-pub const ALL_BUILDING_KINDS: [BuildingKind; 9] = [
+pub const ALL_BUILDING_KINDS: [BuildingKind; 10] = [
     BuildingKind::TownHall,
     BuildingKind::Barracks,
     BuildingKind::Farm,
@@ -192,6 +197,7 @@ pub const ALL_BUILDING_KINDS: [BuildingKind; 9] = [
     BuildingKind::Wall,
     BuildingKind::Workshop,
     BuildingKind::Shop,
+    BuildingKind::Blacksmith,
     BuildingKind::Keep,
     BuildingKind::Castle,
 ];
@@ -446,6 +452,16 @@ pub fn building_stats(kind: BuildingKind) -> BuildingStats {
             cost_gold: 75, cost_lumber: 60, hp: 400.0, build_time: 15.0,
             supply_provided: 0, size: 4.0, attack: None, vision: 14.0,
         },
+        // Vision 14: a forge is a workplace, not a watchtower. Deliberately at
+        // the bottom of the table alongside the Shop — per docs/FOG.md, sight
+        // is what a structure is FOR, and this one is for hammering. A team
+        // that wants eyes buys a Tower; a Blacksmith planted forward buys its
+        // owner almost nothing, which is exactly right for a building whose
+        // whole value is a number that follows the army wherever it goes.
+        BuildingKind::Blacksmith => BuildingStats {
+            cost_gold: 140, cost_lumber: 80, hp: 600.0, build_time: 24.0,
+            supply_provided: 0, size: 5.0, attack: None, vision: 14.0,
+        },
         // Tier 2/3 halls. `cost_*` and `build_time` are the price and duration
         // of the UPGRADE STEP that produces them, not of a placement — these
         // kinds are unplaceable (`building_placeable`), so there is no other
@@ -601,12 +617,32 @@ pub struct UpgradeBuilding {
     pub building: Entity,
 }
 
+/// Ask a forge to begin the next rung of a research ladder. Written by
+/// intent.rs (for both player seats) and ai.rs; economy.rs validates, pays and
+/// inserts `Researching` — the same division of labour as `UpgradeBuilding`,
+/// and the reason "all money in the game is spent in economy.rs" stays true.
+///
+/// The LEVEL is not on the event: it is always the team's current level plus
+/// one, resolved by economy.rs at the instant it takes the money. Carrying a
+/// level would let two events queued in one frame both claim to produce
+/// level 2.
+#[derive(Event, Debug)]
+pub struct StartResearch {
+    pub building: Entity,
+    pub kind: ResearchKind,
+}
+
 /// Tech requirements: completed buildings a team must own before this
 /// building may be PLACED. economy.rs enforces at placement; ui.rs greys the
 /// button; bridge.rs reports and validates.
 pub fn building_requires(kind: BuildingKind) -> &'static [BuildingKind] {
     match kind {
         BuildingKind::Tower | BuildingKind::Workshop => &[BuildingKind::Barracks],
+        // Tier 2. Research is the reward for teching, not an opening build:
+        // gating it behind the Keep means the 100g/50l first level is a choice
+        // made *after* the 320g/160l hall upgrade, so nobody buys +1 attack
+        // instead of their second barracks in the first four minutes.
+        BuildingKind::Blacksmith => &[BuildingKind::Keep],
         _ => &[],
     }
 }
@@ -725,6 +761,255 @@ impl TechTiers {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Research: the bank-to-power conversion
+// ---------------------------------------------------------------------------
+//
+// Everything else a team can buy is a THING — a unit that can die, a building
+// that can be razed, an item that gets consumed. Research is the one purchase
+// that buys a *property of the faction*: it is retroactive to every soldier
+// already standing, applies to every soldier trained afterwards, cannot be
+// killed, and survives the Blacksmith that produced it. That is deliberate and
+// it is the whole point of the mechanic. Every AAR in this repo that read
+// "Human ended with 2,400 banked gold and lost anyway" was describing a game
+// with no sink that converts money into fighting strength faster than a
+// production queue can. This is that sink.
+//
+// The shape of the design, and why:
+//
+//   * **Flat, not percentage.** +1 damage per swing and −1 damage per hit
+//     taken. A percentage would scale with whatever the biggest number on the
+//     field is (a Catapult's 6x siege multiplier, a level-10 hero) and turn
+//     research into a rich-get-richer multiplier on an existing lead. Flat
+//     bonuses are worth proportionally MORE to cheap line infantry — +3 on a
+//     Footman's 12 is +25%, on a Hero's 24 it is +12.5% — so the ladder
+//     rewards the player who has an army over the player who has a deathball.
+//   * **Applied after the multipliers, never through them.** See
+//     `EffectiveStats::bonus_damage`.
+//   * **Units only, never structures.** Attack research does not arm Towers and
+//     armor research does not thicken walls. Research equips the army; masonry
+//     is what a Keep upgrade is for. Without this rule a turtle could buy 3
+//     levels of armor and make every building in the base 25% harder to raze,
+//     which is a fortification upgrade wearing a research label.
+//   * **A floor of `MIN_DAMAGE_PER_HIT`.** Three levels of armor against a
+//     Spearman's 6 damage is a 50% reduction; against a Worker's 5 it is 60%.
+//     Neither can ever reach zero, so no amount of research makes a team immune
+//     to anything, and chip damage always chips.
+
+/// The two team-wide ladders a Blacksmith researches. Ids here are what the
+/// `research` intent's `upgrade` field accepts and what the catalog exports.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ResearchKind {
+    /// +1 flat damage per level on every attack a UNIT makes.
+    Attack,
+    /// −1 flat damage per level on every hit a UNIT takes.
+    Armor,
+}
+
+pub const ALL_RESEARCH_KINDS: [ResearchKind; 2] = [ResearchKind::Attack, ResearchKind::Armor];
+
+/// Top of both ladders. The bonus at max is +3/−3.
+pub const RESEARCH_MAX_LEVEL: u32 = 3;
+
+/// No hit, however armoured the victim, ever lands for less than this. The
+/// floor that keeps armor a discount rather than an immunity.
+pub const MIN_DAMAGE_PER_HIT: f32 = 1.0;
+
+impl ResearchKind {
+    /// Wire id: the `upgrade` field of a `research` intent, and the catalog id.
+    pub fn id(self) -> &'static str {
+        match self {
+            ResearchKind::Attack => "attack",
+            ResearchKind::Armor => "armor",
+        }
+    }
+    /// What a HUD button and a log line call it.
+    pub fn label(self) -> &'static str {
+        match self {
+            ResearchKind::Attack => "Weapon Smithing",
+            ResearchKind::Armor => "Armor Plating",
+        }
+    }
+    /// Stable slot in `ResearchState`, and the order the command card lays the
+    /// buttons out in.
+    pub fn index(self) -> usize {
+        match self {
+            ResearchKind::Attack => 0,
+            ResearchKind::Armor => 1,
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            ResearchKind::Attack => {
+                "+1 damage per level on every attack made by one of your UNITS. Flat and \
+                 applied last, so it is never multiplied by a Catapult's siege bonus or a \
+                 hero's level. Does not arm Towers — research equips the army."
+            }
+            ResearchKind::Armor => {
+                "-1 damage per level from every hit taken by one of your UNITS, floored at \
+                 1 damage per hit. Does not protect buildings — a Keep upgrade is what \
+                 thickens masonry."
+            }
+        }
+    }
+}
+
+/// One rung of a research ladder: what it costs and how long the forge is busy.
+#[derive(Clone, Copy, Debug)]
+pub struct ResearchStep {
+    /// The level this step produces (1..=`RESEARCH_MAX_LEVEL`).
+    pub level: u32,
+    pub cost_gold: u32,
+    pub cost_lumber: u32,
+    /// Seconds of forge time, timed exactly like a training queue item.
+    pub research_time: f32,
+}
+
+/// Cost and duration of advancing a ladder TO `level`. `None` above the cap or
+/// at level 0 — the one table, so catalog, UI, intent validation, economy and
+/// the AI all quote the same numbers.
+///
+/// The escalation is deliberately steeper in lumber than in gold (2x, 2x)
+/// because gold is the resource a winning economy floods with; a team that
+/// wants all three rungs has to have kept workers on trees, not just on the
+/// mine it is out-expanding you at.
+pub fn research_step(kind: ResearchKind, level: u32) -> Option<ResearchStep> {
+    if level == 0 || level > RESEARCH_MAX_LEVEL {
+        return None;
+    }
+    // Both ladders share a price list: a game where armor is cheaper than
+    // attack is a game where everybody buys armor first, and the interesting
+    // decision (do I want to kill faster or die slower?) disappears into
+    // arithmetic.
+    let (cost_gold, cost_lumber, research_time) = match level {
+        1 => (100, 50, 40.0),
+        2 => (175, 100, 55.0),
+        _ => (250, 150, 70.0),
+    };
+    let _ = kind;
+    Some(ResearchStep {
+        level,
+        cost_gold,
+        cost_lumber,
+        research_time,
+    })
+}
+
+/// The flat bonus a ladder at `level` confers. Linear on purpose: a commander
+/// reading "attack 2" should be able to add 2 to a damage number in their head
+/// without consulting a table.
+pub fn research_bonus(kind: ResearchKind, level: u32) -> f32 {
+    let _ = kind;
+    level.min(RESEARCH_MAX_LEVEL) as f32
+}
+
+/// Which building kind researches a ladder. One function so a second forge (or
+/// moving a ladder to another building) is a data change.
+pub fn research_building(kind: ResearchKind) -> BuildingKind {
+    let _ = kind;
+    BuildingKind::Blacksmith
+}
+
+/// Can this building kind run research at all? What the command card asks
+/// before drawing research buttons and what the compiler asks before accepting
+/// a `research` intent.
+pub fn building_researches(kind: BuildingKind) -> &'static [ResearchKind] {
+    match kind {
+        BuildingKind::Blacksmith => &ALL_RESEARCH_KINDS,
+        _ => &[],
+    }
+}
+
+/// One team's completed research. Levels only ever go up: unlike `TechTier`,
+/// which is recounted from standing buildings every frame, research is a LATCH.
+/// Razing the forge does not unlearn the metallurgy, and that asymmetry is the
+/// reason research is worth its price — a Keep upgrade you can be denied by
+/// losing the hall, a completed upgrade nobody can take back.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ResearchState {
+    levels: [u32; ALL_RESEARCH_KINDS.len()],
+}
+
+impl ResearchState {
+    pub fn level(&self, kind: ResearchKind) -> u32 {
+        self.levels[kind.index()]
+    }
+    /// Advance a ladder by one rung, saturating at the cap. Returns the new
+    /// level, or `None` if it was already maxed.
+    pub fn advance(&mut self, kind: ResearchKind) -> Option<u32> {
+        let slot = &mut self.levels[kind.index()];
+        if *slot >= RESEARCH_MAX_LEVEL {
+            return None;
+        }
+        *slot += 1;
+        Some(*slot)
+    }
+    /// The step that would come next, or `None` at the cap.
+    pub fn next_step(&self, kind: ResearchKind) -> Option<ResearchStep> {
+        research_step(kind, self.level(kind) + 1)
+    }
+    /// Flat damage this team adds to every unit attack.
+    pub fn attack_bonus(&self) -> f32 {
+        research_bonus(ResearchKind::Attack, self.level(ResearchKind::Attack))
+    }
+    /// Flat damage this team subtracts from every hit one of its units takes.
+    pub fn armor_bonus(&self) -> f32 {
+        research_bonus(ResearchKind::Armor, self.level(ResearchKind::Armor))
+    }
+    /// Both numbers in the shape the stat law wants them.
+    pub fn bonus(&self) -> ResearchBonus {
+        ResearchBonus {
+            bonus_damage: self.attack_bonus(),
+            flat_armor: self.armor_bonus(),
+        }
+    }
+}
+
+/// Per-team research levels. Written in exactly one place (economy.rs, when a
+/// `Researching` timer runs out) and read by combat.rs through the stat law,
+/// by the UI, by the snapshot and by the AI.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct TeamResearch {
+    pub human: ResearchState,
+    pub claude: ResearchState,
+}
+
+impl TeamResearch {
+    pub fn get(&self, team: Team) -> ResearchState {
+        match team {
+            Team::Human => self.human,
+            Team::Claude => self.claude,
+        }
+    }
+    pub fn get_mut(&mut self, team: Team) -> &mut ResearchState {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+}
+
+/// A forge working. `intent.rs` inserts it (after economy.rs has taken the
+/// money), economy.rs ticks it and applies the level on completion — the same
+/// division of labour as `Upgrading` and `Order::Build`.
+///
+/// **One at a time, and concurrent requests are REJECTED, not queued.** A
+/// queue here would let a team pre-commit its whole research plan in one click
+/// and then walk away, which turns the interesting part (spending 250 gold now
+/// versus three more Footmen now) into a single early decision. Rejecting
+/// makes every rung its own choice, and the answer to "I want both ladders at
+/// once" is the same answer an RTS gives to "I want two units at once": build
+/// a second building.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Researching {
+    pub kind: ResearchKind,
+    /// The level this will produce when it finishes.
+    pub to_level: u32,
+    pub remaining: f32,
+    /// Full duration, so a renderer can show a fraction.
+    pub total: f32,
+}
+
 /// What each building can train.
 pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
     match kind {
@@ -744,7 +1029,17 @@ pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
             UnitKind::Spearman,
         ],
         BuildingKind::Workshop => &[UnitKind::Catapult],
-        BuildingKind::Farm | BuildingKind::Tower | BuildingKind::Wall | BuildingKind::Shop => &[],
+        // The Blacksmith trains nothing on purpose. It is the first building in
+        // the game whose entire output is a number, which also means it does
+        // NOT count as a production building for the win condition
+        // (`check_game_over` asks `!trainable(kind).is_empty()`) — a team down
+        // to one forge has already lost, and a Blacksmith should not be able to
+        // keep a dead match alive.
+        BuildingKind::Farm
+        | BuildingKind::Tower
+        | BuildingKind::Wall
+        | BuildingKind::Shop
+        | BuildingKind::Blacksmith => &[],
     }
 }
 
@@ -779,6 +1074,7 @@ pub fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Wall",
         BuildingKind::Workshop => "Workshop",
         BuildingKind::Shop => "Shop",
+        BuildingKind::Blacksmith => "Blacksmith",
         BuildingKind::Keep => "Keep",
         BuildingKind::Castle => "Castle",
     }
@@ -815,6 +1111,14 @@ pub fn building_description(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Cheap blocking segment. No function except HP in the way.",
         BuildingKind::Workshop => "Siege works: trains Catapults. The answer to tower turtles.",
         BuildingKind::Shop => "Item vendor: heroes buy consumables here (see catalog items).",
+        BuildingKind::Blacksmith => {
+            "Tier 2 forge (requires a Keep). Researches the two team-wide ladders in \
+             catalog.research: Attack (+1/+2/+3 flat damage on every UNIT attack) and \
+             Armor (+1/+2/+3 flat damage reduction on every UNIT hit taken, never below \
+             1 damage per hit). Bonuses are permanent, retroactive to units already \
+             alive, and survive the Blacksmith's death. One research at a time per \
+             forge; build a second Blacksmith to run both ladders at once."
+        }
     }
 }
 
@@ -944,6 +1248,38 @@ pub struct CatalogStatus {
     pub description: &'static str,
 }
 
+/// One rung of a research ladder, as the catalog exports it.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogResearchLevel {
+    /// The level this step produces (1-based).
+    pub level: u32,
+    pub cost_gold: u32,
+    pub cost_lumber: u32,
+    /// Seconds the forge is busy. Timed exactly like a training queue item.
+    pub research_time: f32,
+    /// The flat bonus the team holds ONCE this level is complete (cumulative,
+    /// not incremental — level 2 reads 2.0, not another 1.0).
+    pub bonus: f32,
+}
+
+/// A team-wide passive upgrade ladder. The CURRENT level is deliberately not
+/// here: the catalog is static content written once at startup, and a level is
+/// match state. Read it from the snapshot (`me.research`) instead.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogResearch {
+    /// Wire id — what the `research` command's `upgrade` field accepts.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Catalog id of the building that researches it.
+    pub researched_at: &'static str,
+    pub max_level: u32,
+    /// What the bonus applies to, in one phrase — the answer to "do my towers
+    /// get this?" without reading the source. See `description` for why.
+    pub applies_to: &'static str,
+    pub levels: Vec<CatalogResearchLevel>,
+    pub description: &'static str,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct CatalogItem {
     pub id: &'static str,
@@ -961,6 +1297,9 @@ pub struct Catalog {
     pub units: Vec<CatalogUnit>,
     pub buildings: Vec<CatalogBuilding>,
     pub abilities: Vec<CatalogAbility>,
+    /// The team-wide passive ladders a Blacksmith buys. Costs and durations
+    /// only — current levels are match state and live in the snapshot.
+    pub research: Vec<CatalogResearch>,
     pub items: Vec<CatalogItem>,
     /// The status-effect vocabulary: what a buff/debuff means and how it
     /// stacks, so a commander can reason about them without reading the source.
@@ -1069,6 +1408,28 @@ pub fn game_catalog() -> Catalog {
             }
             out
         },
+        research: ALL_RESEARCH_KINDS
+            .iter()
+            .map(|&k| CatalogResearch {
+                id: k.id(),
+                name: k.label(),
+                researched_at: building_name(research_building(k)),
+                max_level: RESEARCH_MAX_LEVEL,
+                applies_to: "units only (not buildings or towers)",
+                levels: (1..=RESEARCH_MAX_LEVEL)
+                    .filter_map(|level| {
+                        research_step(k, level).map(|s| CatalogResearchLevel {
+                            level: s.level,
+                            cost_gold: s.cost_gold,
+                            cost_lumber: s.cost_lumber,
+                            research_time: s.research_time,
+                            bonus: research_bonus(k, level),
+                        })
+                    })
+                    .collect(),
+                description: k.description(),
+            })
+            .collect(),
         items: ALL_ITEMS
             .iter()
             .map(|&id| {
@@ -1478,6 +1839,26 @@ impl BaseStats {
     }
 }
 
+/// The team-wide half of the stat law's input: what this entity's OWNER has
+/// researched. Zeroes for anything research does not touch (buildings, towers),
+/// which is how "research equips the army, not the masonry" is spelled at the
+/// call site rather than buried in a branch inside the law.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResearchBonus {
+    /// Flat damage added to each attack this entity makes.
+    pub bonus_damage: f32,
+    /// Flat damage subtracted from each hit this entity takes.
+    pub flat_armor: f32,
+}
+
+impl ResearchBonus {
+    /// Nothing researched, or research does not apply here.
+    pub const NONE: ResearchBonus = ResearchBonus {
+        bonus_damage: 0.0,
+        flat_armor: 0.0,
+    };
+}
+
 /// What the simulation must actually use.
 #[derive(Clone, Copy, Debug)]
 pub struct EffectiveStats {
@@ -1491,6 +1872,19 @@ pub struct EffectiveStats {
     pub damage_taken_mult: f32,
     /// HP per second this entity regains from HealOverTime.
     pub heal_per_second: f32,
+    /// Flat damage ADDED to each attack, from attack research. Added AFTER
+    /// every multiplier — `damage_mult`, a hero's level bonus, a Catapult's
+    /// 6x vs buildings — precisely so that none of them can amplify it. +3
+    /// attack is +3 damage on every swing in the game, whoever swings it and
+    /// whatever they swing at. Multiplying it instead would make the upgrade
+    /// worth +18 to a Catapult hitting a wall and +3 to a Footman hitting a
+    /// man, which is a siege upgrade wearing an army upgrade's label.
+    pub bonus_damage: f32,
+    /// Flat damage SUBTRACTED from each incoming hit, from armor research.
+    /// Applied after `damage_taken_mult`, at the single point health is
+    /// subtracted, and floored at `MIN_DAMAGE_PER_HIT` so no stack of armour
+    /// ever makes a unit immune.
+    pub flat_armor: f32,
 }
 
 /// **THE modifier function.** One law, one place. `units.rs` asks it for move
@@ -1503,13 +1897,37 @@ pub struct EffectiveStats {
 /// reciprocal of attack speed, so it is divided, not multiplied — that is the
 /// whole reason this arithmetic lives in one function instead of five call
 /// sites). Haste is legs only.
+/// Statuses only — for everything research does not touch (buildings taking a
+/// hit, tower weapons). Exactly `effective_stats_with(base, status,
+/// ResearchBonus::NONE)`, named so that "no research applies here" is a
+/// deliberate statement at the call site rather than a forgotten argument.
 pub fn effective_stats(base: BaseStats, status: Option<&StatusEffects>) -> EffectiveStats {
+    effective_stats_with(base, status, ResearchBonus::NONE)
+}
+
+/// **THE modifier function**, in full: the one place a base stat, a status
+/// effect and a team's research meet. Everything downstream — move speed,
+/// attack cooldown, damage dealt, damage taken — is read off the struct this
+/// returns, never off `unit_stats(kind)` and never off `TeamResearch` directly.
+///
+/// The two inputs are deliberately different shapes because they are different
+/// kinds of fact: a `StatusEffects` is a component ON the entity, `ResearchBonus`
+/// is a property of the team that OWNS it. Multiplicative modifiers compose in
+/// the multipliers; research composes as the two flat terms, which is what
+/// keeps a percentage buff from ever scaling a flat upgrade.
+pub fn effective_stats_with(
+    base: BaseStats,
+    status: Option<&StatusEffects>,
+    research: ResearchBonus,
+) -> EffectiveStats {
     let mut out = EffectiveStats {
         speed: base.speed,
         attack_cooldown: base.attack_cooldown,
         damage_mult: 1.0,
         damage_taken_mult: 1.0,
         heal_per_second: 0.0,
+        bonus_damage: research.bonus_damage,
+        flat_armor: research.flat_armor,
     };
     let Some(status) = status else {
         return out;
@@ -1532,6 +1950,36 @@ pub fn effective_stats(base: BaseStats, status: Option<&StatusEffects>) -> Effec
 /// Convenience wrapper for the common "a unit of kind K with these effects".
 pub fn effective_unit_stats(kind: UnitKind, status: Option<&StatusEffects>) -> EffectiveStats {
     effective_stats(BaseStats::of_unit(kind), status)
+}
+
+/// The same, for a unit whose owning team has researched something. This is
+/// what combat.rs uses for every unit swing; the research-free wrapper above
+/// remains for callers that only want speed (units.rs) or that are asking on
+/// behalf of a structure.
+pub fn effective_unit_stats_with(
+    kind: UnitKind,
+    status: Option<&StatusEffects>,
+    research: ResearchBonus,
+) -> EffectiveStats {
+    effective_stats_with(BaseStats::of_unit(kind), status, research)
+}
+
+/// Damage actually subtracted from a victim's health, given the raw amount,
+/// the victim's incoming-damage multiplier and its team's armor research.
+///
+/// One function because the floor is easy to forget and expensive to get wrong:
+/// without it three levels of armor would take a Worker's 5-damage swing to 2
+/// and a Spearman's 6 to 3, and a fourth level (or a stacking armor buff on top)
+/// would reach zero and make the victim literally unkillable by that attacker.
+/// The floor is `MIN_DAMAGE_PER_HIT` *or the unarmoured amount, whichever is
+/// smaller* — armor must never round a hit UP. A 0.5-damage tick stays 0.5
+/// against three levels of plate; only a hit that started above the floor can
+/// be pushed down to it. That subtlety is why this is a function and not an
+/// expression at the call site.
+pub fn damage_after_armor(raw: f32, damage_taken_mult: f32, flat_armor: f32) -> f32 {
+    let full = raw * damage_taken_mult;
+    let floor = MIN_DAMAGE_PER_HIT.min(full.max(0.0));
+    (full - flat_armor).max(floor)
 }
 
 /// Units (heroes included) heal this fraction of max HP per second once out
@@ -3448,6 +3896,22 @@ pub enum Intent {
         building: IntentId,
         index: usize,
     },
+    /// Start the next rung of a team-wide research ladder at one of our own
+    /// finished Blacksmiths (`catalog.research`). `upgrade` is a ladder id —
+    /// `"attack"` or `"armor"`, parsed like every other name in the protocol
+    /// (case, spaces, dashes and underscores are noise).
+    ///
+    /// Paid in full the moment it is accepted, exactly like `upgrade`. The
+    /// level it produces is always *current + 1*: a commander cannot name a
+    /// level, because skipping rungs is not a thing the game can do and
+    /// accepting a number that has only one legal value is a way to spell it
+    /// wrong. Refused if the forge is already researching something — one job
+    /// per Blacksmith, and requests are rejected rather than queued (see
+    /// `Researching`).
+    Research {
+        building: IntentId,
+        upgrade: String,
+    },
     /// Where units this building trains should go. `x`/`z` for ground, or
     /// `target` for a resource node (new workers harvest it) or an own unit
     /// (new units follow it).
@@ -3598,6 +4062,7 @@ impl Intent {
             Intent::Train { .. } => "train",
             Intent::Upgrade { .. } => "upgrade",
             Intent::Cancel { .. } => "cancel",
+            Intent::Research { .. } => "research",
             Intent::Rally { .. } => "rally",
             Intent::Cast { .. } => "cast",
             Intent::Buy { .. } => "buy",
@@ -3671,6 +4136,9 @@ impl Intent {
             }
             Intent::Cancel { building, index } => {
                 format!("building {building} cancels queue slot {index}")
+            }
+            Intent::Research { building, upgrade } => {
+                format!("building {building} researches {upgrade}")
             }
             Intent::Rally {
                 building,
@@ -4054,6 +4522,7 @@ impl Plugin for CorePlugin {
             .init_resource::<ExternallyCommanded>()
             .init_resource::<SquadOrders>()
             .init_resource::<TechTiers>()
+            .init_resource::<TeamResearch>()
             .init_resource::<GameEvents>()
             .init_resource::<FogGrids>()
             .add_event::<SpawnUnitEvent>()
@@ -4067,6 +4536,7 @@ impl Plugin for CorePlugin {
             .add_event::<UseItem>()
             .add_event::<TeleportRequest>()
             .add_event::<UpgradeBuilding>()
+            .add_event::<StartResearch>()
             .add_systems(Startup, (initial_spawns, apply_env_speed, log_fog_mode))
             .add_systems(
                 Update,
@@ -5880,5 +6350,228 @@ mod tests {
         }
         assert_eq!(walked, vec!["TownHall", "Keep", "Castle"]);
         assert_eq!(paid, (320 + 480, 160 + 240));
+    }
+
+    // -----------------------------------------------------------------------
+    // Research
+    // -----------------------------------------------------------------------
+
+    /// Costs and durations climb strictly with the rung, on every ladder. A
+    /// flat or non-monotonic price list would make level 3 the obvious opening
+    /// purchase and the whole escalation decorative.
+    #[test]
+    fn research_costs_escalate_strictly_on_every_ladder() {
+        for kind in ALL_RESEARCH_KINDS {
+            let steps: Vec<ResearchStep> = (1..=RESEARCH_MAX_LEVEL)
+                .map(|l| research_step(kind, l).expect("every rung up to the cap exists"))
+                .collect();
+            assert_eq!(steps.len() as u32, RESEARCH_MAX_LEVEL);
+            for pair in steps.windows(2) {
+                let (lo, hi) = (&pair[0], &pair[1]);
+                assert_eq!(hi.level, lo.level + 1, "{} rungs are contiguous", kind.id());
+                assert!(hi.cost_gold > lo.cost_gold, "{} gold escalates", kind.id());
+                assert!(hi.cost_lumber > lo.cost_lumber, "{} lumber escalates", kind.id());
+                assert!(
+                    hi.research_time > lo.research_time,
+                    "{} takes longer each rung",
+                    kind.id()
+                );
+            }
+            // Every rung costs both resources: research is deliberately not
+            // purchasable out of a pure gold economy.
+            assert!(steps.iter().all(|s| s.cost_gold > 0 && s.cost_lumber > 0));
+        }
+    }
+
+    /// The cap holds from both directions: `research_step` refuses to quote a
+    /// price above it, and `advance` refuses to climb past it however many
+    /// times it is called.
+    #[test]
+    fn research_levels_stop_at_the_cap() {
+        for kind in ALL_RESEARCH_KINDS {
+            assert!(research_step(kind, 0).is_none(), "level 0 is not a rung");
+            assert!(
+                research_step(kind, RESEARCH_MAX_LEVEL + 1).is_none(),
+                "{} has nothing above the cap",
+                kind.id()
+            );
+
+            let mut state = ResearchState::default();
+            assert_eq!(state.level(kind), 0);
+            for expected in 1..=RESEARCH_MAX_LEVEL {
+                assert!(state.next_step(kind).is_some(), "a rung remains below the cap");
+                assert_eq!(state.advance(kind), Some(expected));
+                assert_eq!(state.level(kind), expected);
+            }
+            // Saturated: further advances are refused and change nothing.
+            assert!(state.next_step(kind).is_none(), "nothing left to buy");
+            assert_eq!(state.advance(kind), None);
+            assert_eq!(state.level(kind), RESEARCH_MAX_LEVEL);
+            assert_eq!(
+                research_bonus(kind, state.level(kind)),
+                RESEARCH_MAX_LEVEL as f32
+            );
+        }
+    }
+
+    /// The two ladders are independent: buying attack does not move armor.
+    #[test]
+    fn research_ladders_advance_independently() {
+        let mut state = ResearchState::default();
+        state.advance(ResearchKind::Attack);
+        state.advance(ResearchKind::Attack);
+        assert_eq!(state.attack_bonus(), 2.0);
+        assert_eq!(state.armor_bonus(), 0.0);
+        assert_eq!(state.bonus().bonus_damage, 2.0);
+        assert_eq!(state.bonus().flat_armor, 0.0);
+    }
+
+    /// The whole point of the mechanic, measured end to end through the stat
+    /// law: a Footman with attack research swings for exactly +N, and a Footman
+    /// with armor research takes exactly -N. Flat, not scaled.
+    #[test]
+    fn research_shifts_effective_damage_by_exactly_the_flat_bonus() {
+        let kind = UnitKind::Footman;
+        let base = unit_stats(kind).damage;
+
+        let mut attacker = ResearchState::default();
+        let mut victim = ResearchState::default();
+        for level in 1..=RESEARCH_MAX_LEVEL {
+            attacker.advance(ResearchKind::Attack);
+            victim.advance(ResearchKind::Armor);
+            let bonus = level as f32;
+
+            // Outgoing: the swing is base + N.
+            let out = effective_unit_stats_with(kind, None, attacker.bonus());
+            assert_eq!(out.bonus_damage, bonus);
+            assert_eq!(base * out.damage_mult + out.bonus_damage, base + bonus);
+
+            // Incoming: the hit lands for base - N.
+            let inc = effective_unit_stats_with(kind, None, victim.bonus());
+            assert_eq!(inc.flat_armor, bonus);
+            assert_eq!(
+                damage_after_armor(base, inc.damage_taken_mult, inc.flat_armor),
+                base - bonus
+            );
+        }
+
+        // Both at once: +3 attack against +3 armor is a wash, exactly.
+        let out = effective_unit_stats_with(kind, None, attacker.bonus());
+        let inc = effective_unit_stats_with(kind, None, victim.bonus());
+        let swing = base * out.damage_mult + out.bonus_damage;
+        assert_eq!(
+            damage_after_armor(swing, inc.damage_taken_mult, inc.flat_armor),
+            base
+        );
+    }
+
+    /// A flat bonus must never be caught by a multiplier. A Catapult's 6x vs
+    /// buildings would turn +3 into +18 if the term were added before the
+    /// multiply — this pins the order of operations combat.rs uses.
+    #[test]
+    fn attack_research_is_never_multiplied_by_a_type_bonus() {
+        let mut state = ResearchState::default();
+        for _ in 0..RESEARCH_MAX_LEVEL {
+            state.advance(ResearchKind::Attack);
+        }
+        let stats = unit_stats(UnitKind::Catapult);
+        let eff = effective_unit_stats_with(UnitKind::Catapult, None, state.bonus());
+        // The arithmetic combat.rs performs, verbatim in shape.
+        let vs_building =
+            stats.damage * stats.vs_building_mult * eff.damage_mult + eff.bonus_damage;
+        assert_eq!(vs_building, stats.damage * 6.0 + 3.0);
+        assert_ne!(vs_building, (stats.damage + 3.0) * 6.0);
+    }
+
+    /// Armor is a discount, never an immunity: the floor holds even when the
+    /// research would otherwise erase a weak attack, and it never rounds a hit
+    /// UP.
+    #[test]
+    fn armor_floors_damage_without_ever_raising_it() {
+        let mut state = ResearchState::default();
+        for _ in 0..RESEARCH_MAX_LEVEL {
+            state.advance(ResearchKind::Armor);
+        }
+        let armor = state.armor_bonus();
+
+        // A Worker's 5-damage swing is heavily reduced but still lands.
+        let worker = unit_stats(UnitKind::Worker).damage;
+        assert_eq!(damage_after_armor(worker, 1.0, armor), worker - armor);
+        // An attack weaker than the armour is floored, not zeroed or negated.
+        assert_eq!(damage_after_armor(2.0, 1.0, armor), MIN_DAMAGE_PER_HIT);
+        assert_eq!(damage_after_armor(0.5, 1.0, armor), 0.5, "never rounded up");
+        // Unresearched teams are completely unaffected by the new pipeline.
+        assert_eq!(damage_after_armor(12.0, 1.0, 0.0), 12.0);
+    }
+
+    /// The forge sits at tier 2, is placeable, trains nothing, and therefore
+    /// cannot keep a losing team alive under the win condition.
+    #[test]
+    fn the_blacksmith_is_a_tier_two_support_building() {
+        let kind = BuildingKind::Blacksmith;
+        assert!(building_placeable(kind), "workers place it");
+        assert_eq!(building_requires(kind), &[BuildingKind::Keep]);
+        assert!(trainable(kind).is_empty(), "not a production building");
+        assert_eq!(building_researches(kind), &ALL_RESEARCH_KINDS);
+        assert!(building_stats(kind).vision > 0.0, "every building sees");
+
+        // A Keep satisfies it, a TownHall does not, and a Castle does — the
+        // tier comparison, not kind equality.
+        assert!(!requirements_met(
+            building_requires(kind),
+            [BuildingKind::TownHall].into_iter()
+        ));
+        assert!(requirements_met(
+            building_requires(kind),
+            [BuildingKind::Keep].into_iter()
+        ));
+        assert!(requirements_met(
+            building_requires(kind),
+            [BuildingKind::Castle].into_iter()
+        ));
+
+        // Nothing else researches, so a `research` command naming any other
+        // building is refused by the same table the card draws from.
+        for other in ALL_BUILDING_KINDS.into_iter().filter(|k| *k != kind) {
+            assert!(
+                building_researches(other).is_empty(),
+                "{other:?} is not a forge"
+            );
+        }
+    }
+
+    /// The catalog carries enough to plan a research investment without
+    /// reading the source, and deliberately does NOT carry a current level.
+    #[test]
+    fn the_catalog_exports_every_research_rung() {
+        let catalog = game_catalog();
+        assert_eq!(catalog.research.len(), ALL_RESEARCH_KINDS.len());
+        for entry in &catalog.research {
+            let kind = ALL_RESEARCH_KINDS
+                .into_iter()
+                .find(|k| k.id() == entry.id)
+                .expect("catalog ids are ladder ids");
+            assert_eq!(entry.researched_at, building_name(BuildingKind::Blacksmith));
+            assert_eq!(entry.max_level, RESEARCH_MAX_LEVEL);
+            assert_eq!(entry.levels.len() as u32, RESEARCH_MAX_LEVEL);
+            for (i, level) in entry.levels.iter().enumerate() {
+                let step = research_step(kind, i as u32 + 1).expect("a rung per level");
+                assert_eq!(level.level, step.level);
+                assert_eq!(level.cost_gold, step.cost_gold);
+                assert_eq!(level.cost_lumber, step.cost_lumber);
+                assert_eq!(level.research_time, step.research_time);
+                // Cumulative, not incremental: level 2 reads 2.
+                assert_eq!(level.bonus, level.level as f32);
+            }
+        }
+        // The forge itself appears in the building catalog, gated on the Keep.
+        let forge = catalog
+            .buildings
+            .iter()
+            .find(|b| b.id == "Blacksmith")
+            .expect("the forge is catalog content");
+        assert_eq!(forge.requires, vec!["Keep"]);
+        assert!(forge.trains.is_empty());
+        assert!(forge.placeable);
     }
 }

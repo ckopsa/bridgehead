@@ -170,6 +170,7 @@
 
 use crate::intent::{set_autopilot, IntentApply};
 use crate::shared::*;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -470,6 +471,53 @@ struct MeOut {
     tier: u32,
     hero_record: Option<HeroRecordOut>,
     hero_cost: CostOut,
+    /// Team-wide research: one entry per ladder in `catalog.research`, always
+    /// present and always both ladders, so a commander can read a level off a
+    /// fixed shape rather than testing whether a key exists. Levels are yours
+    /// alone — the opponent's research is never reported, and the only way to
+    /// learn it is to notice your units dying faster.
+    research: Vec<ResearchOut>,
+}
+
+/// One research ladder's state for the seat that owns it.
+#[derive(Serialize)]
+struct ResearchOut {
+    /// Ladder id — the `upgrade` field of a `research` command.
+    id: &'static str,
+    name: &'static str,
+    /// Levels completed, 0..=`max_level`.
+    level: u32,
+    max_level: u32,
+    /// The flat bonus currently in force. Attack adds it to every unit attack;
+    /// armor subtracts it from every hit a unit takes.
+    bonus: f32,
+    /// Cost and duration of the next rung, or null at the cap. Absent is the
+    /// honest way to say "there is nothing left to buy here".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<ResearchStepOut>,
+    /// Present while one of your forges is working on this ladder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    in_progress: Option<ResearchProgressOut>,
+}
+
+#[derive(Serialize)]
+struct ResearchStepOut {
+    level: u32,
+    cost_gold: u32,
+    cost_lumber: u32,
+    research_time: f32,
+}
+
+/// A research job running, as it appears in a snapshot.
+#[derive(Serialize)]
+struct ResearchProgressOut {
+    /// The level this will produce when it finishes.
+    level: u32,
+    /// Seconds left.
+    remaining: f32,
+    /// Which of your Blacksmiths is doing the work — the same id the
+    /// `research` command names, so a commander can tell two forges apart.
+    building: u64,
 }
 
 #[derive(Serialize)]
@@ -683,6 +731,13 @@ struct BuildingOut {
     /// invented intelligence rather than preserved intelligence.
     #[serde(skip_serializing_if = "Option::is_none")]
     upgrading: Option<UpgradeOut>,
+    /// Present only on YOUR OWN forge while it is working. Never on an enemy
+    /// building you can see, for the same reason `queue` is not: what a rival
+    /// is spending its lumber on is exactly the intelligence that scouting is
+    /// supposed to be unable to give you. You learn their attack upgrade
+    /// landed by losing a fight, not by looking at their base.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    researching: Option<ResearchJobOut>,
     /// Present ONLY on remembered enemy structures: the game time at which
     /// this seat last actually saw it. Everything else in the record is the
     /// state observed at that moment and may since have changed — including
@@ -690,6 +745,17 @@ struct BuildingOut {
     /// Absent means "observed right now".
     #[serde(skip_serializing_if = "Option::is_none")]
     last_seen: Option<f32>,
+}
+
+/// A research job on one of your own forges.
+#[derive(Serialize)]
+struct ResearchJobOut {
+    /// Ladder id — what a `research` command would name.
+    upgrade: &'static str,
+    /// The level this will produce.
+    level: u32,
+    /// Seconds left.
+    remaining: f32,
 }
 
 /// An in-place upgrade in progress, as it appears in a snapshot.
@@ -798,6 +864,7 @@ type SnapshotBuildings<'w, 's> = Query<
         Option<&'static DoctrineTemplate>,
         Option<&'static AbilityCooldowns>,
         Option<&'static Upgrading>,
+        Option<&'static Researching>,
     ),
 >;
 
@@ -808,6 +875,17 @@ type SnapshotBounties<'w, 's> =
     Query<'w, 's, (Entity, &'static Bounty, &'static Transform)>;
 
 #[allow(clippy::too_many_arguments)]
+/// Per-team tech state the snapshot reports: how far up the hall ladder a team
+/// has climbed and how far up its two research ladders. Bundled because
+/// `write_snapshot` sits exactly on Bevy's 16-parameter ceiling and these two
+/// resources answer the same question from different tables. Both are `Copy`,
+/// so `write_seat_snapshot` takes them by value and needs no bundle of its own.
+#[derive(SystemParam)]
+struct TeamTech<'w> {
+    tiers: Res<'w, TechTiers>,
+    research: Res<'w, TeamResearch>,
+}
+
 fn write_snapshot(
     time: Res<Time>,
     real: Res<Time<Real>>,
@@ -816,7 +894,7 @@ fn write_snapshot(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     squad_orders: Res<SquadOrders>,
-    tiers: Res<TechTiers>,
+    tech: TeamTech,
     feed: Res<GameEvents>,
     fog: Res<FogGrids>,
     intent_errors: Res<IntentErrors>,
@@ -842,7 +920,8 @@ fn write_snapshot(
             &records,
             &game_over,
             &squad_orders,
-            &tiers,
+            *tech.tiers,
+            *tech.research,
             &feed,
             (fog.enabled(), seat_fog),
             intent_errors.get(seat.team),
@@ -864,7 +943,8 @@ fn write_seat_snapshot(
     records: &HeroRecords,
     game_over: &GameOver,
     squad_orders: &SquadOrders,
-    tiers: &TechTiers,
+    tiers: TechTiers,
+    team_research: TeamResearch,
     feed: &GameEvents,
     fog: (bool, &FogGrid),
     // Per-command validation errors this team's intents produced, from the
@@ -948,7 +1028,7 @@ fn write_seat_snapshot(
         .iter()
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(
-            |(e, building, team, tf, health, under, queue, template, cooldown, upgrading)| BuildingOut {
+            |(e, building, team, tf, health, under, queue, template, cooldown, upgrading, researching)| BuildingOut {
             id: e.to_bits(),
             team: team_name(*team),
             kind: building_name(building.kind),
@@ -987,6 +1067,12 @@ fn write_seat_snapshot(
                 to: building_name(u.to),
                 remaining: r1(u.remaining),
             }),
+            // Ours only — see the field's doc.
+            researching: researching.filter(|_| *team == me).map(|r| ResearchJobOut {
+                upgrade: r.kind.id(),
+                level: r.to_level,
+                remaining: r1(r.remaining),
+            }),
             // Observed this instant.
             last_seen: None,
             },
@@ -1019,8 +1105,10 @@ fn write_seat_snapshot(
             // upgraded behind our back still reports the old rung — the memory
             // is stale in exactly the way the scouting report was.
             tier: building_tier(ghost.kind),
-            // Never on a ghost: see the field's doc.
+            // Never on a ghost: see each field's doc. A remembered forge is a
+            // building, not a work order.
             upgrading: None,
+            researching: None,
             last_seen: Some(ghost.last_seen),
         });
     }
@@ -1029,7 +1117,7 @@ fn write_seat_snapshot(
     // Tech state, for this seat only: what its completed buildings unlock.
     let completed: Vec<BuildingKind> = buildings
         .iter()
-        .filter(|(_, _, team, _, _, under, _, _, _, _)| **team == me && under.is_none())
+        .filter(|(_, _, team, _, _, under, _, _, _, _, _)| **team == me && under.is_none())
         .map(|(_, building, ..)| building.kind)
         .collect();
     let unlocked = unlocked_map(&completed);
@@ -1155,6 +1243,38 @@ fn write_seat_snapshot(
                 gold: hero_gold,
                 lumber: hero_lumber,
                 time: hero_time,
+            },
+            research: {
+                let levels = team_research.get(me);
+                ALL_RESEARCH_KINDS
+                    .iter()
+                    .map(|&k| ResearchOut {
+                        id: k.id(),
+                        name: k.label(),
+                        level: levels.level(k),
+                        max_level: RESEARCH_MAX_LEVEL,
+                        bonus: research_bonus(k, levels.level(k)),
+                        next: levels.next_step(k).map(|s| ResearchStepOut {
+                            level: s.level,
+                            cost_gold: s.cost_gold,
+                            cost_lumber: s.cost_lumber,
+                            research_time: s.research_time,
+                        }),
+                        // Our own forges only. `buildings` also holds enemy
+                        // structures we can see, so the team filter is what
+                        // keeps this from reporting theirs.
+                        in_progress: buildings
+                            .iter()
+                            .filter(|(_, _, team, ..)| **team == me)
+                            .find_map(|(e, _, _, _, _, _, _, _, _, _, job)| {
+                                job.filter(|j| j.kind == k).map(|j| ResearchProgressOut {
+                                    level: j.to_level,
+                                    remaining: r1(j.remaining),
+                                    building: e.to_bits(),
+                                })
+                            }),
+                    })
+                    .collect()
             },
         },
         map: MapOut {
