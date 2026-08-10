@@ -140,9 +140,16 @@ slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
 ### The ability selector
 
 `cast` and `autocast` take an optional `ability`, and it is **untagged** on the
-wire: a bare `2` is a slot index, a bare `"Slam"` is an ability id
-(case-insensitive). Omit it and you get the caster's first unlocked ability —
-so `{"type":"cast","hero":123}` means exactly what it always meant.
+wire: a bare `2` is a slot index, a bare `"Slam"` is an ability id. Omit it and
+you get the caster's first unlocked ability — so `{"type":"cast","hero":123}`
+means exactly what it always meant.
+
+Ability ids are matched by `shared::normalize_name`, the same function every
+other name on the wire goes through: case, spaces, dashes and underscores are
+all noise, so `"CallToArms"`, `"calltoarms"` and `"Call to Arms"` are one
+ability. (This was the last name in the language matched by
+`eq_ignore_ascii_case` instead — which accepted the first two spellings and
+rejected the third, the one a person actually types.)
 
 There is one type for all three jobs: `shared::AbilitySelector` is the intent
 field, the `CastAbility` event payload and the wire form. A slot cannot be
@@ -210,29 +217,79 @@ seat. It now binds whoever is speaking, which is the only version of the rule
 worth having: a snapshot that will not show you an enemy must not accept orders
 against it either, or the filtering is decoration.
 
-Mechanically this mostly *formalises* what was already true — the human's
-right-click picker skips fogged enemies, so a human could not click one anyway.
-The value is that it is now enforced in one place for both seats instead of
-being a property of two independent pieces of code that happened to agree.
-
 `attack` is the only verb that consults fog, matching master's behaviour
 exactly. `harvest`, `follow`, `rally` and `posture escort` name neutral nodes
 or the issuer's own units, which need no visibility test.
 
-### The one residual asymmetry
+### The residual asymmetry, and how it was closed
 
 The compiler's rule is `knows_entity` (visible **or** remembered structure).
-The human's right-click picker uses `sees` (visible only). So a *remembered but
-currently unseen* enemy building is a legal target for a bridge commander and
-un-clickable for the human. The compiler would accept the human's intent
-happily — the UI simply has no gesture that produces it.
+The human's right-click picker used `sees` (visible only). So a *remembered but
+currently unseen* enemy building was a legal target for a bridge commander and
+un-clickable for the human: the compiler would have accepted the human's intent
+happily, and the UI simply had no gesture that produced it. A real capability
+gap in the direction THESIS.md cares about, visible only because there was one
+rule to compare the two gestures against.
 
-That is a real capability gap in the direction THESIS.md cares about (the AI
-can express something the human cannot), and it is now visible precisely
-because there is one rule to compare the gestures against. Closing it is a UI
-job — let a right-click on a building ghost produce an `Intent::Attack` — and
-it is filed as follow-up rather than fixed here, because this bead is a
-refactor and that would be new behaviour.
+`ui.rs::right_mouse` now picks against **`FogGrid::ghosts()`** — the same
+iterator `sync_building_ghosts` builds the translucent boxes on screen from.
+What is clickable is therefore what is drawn, by construction rather than by
+two pieces of code agreeing. `ghosts()` never yields a record whose cell is
+currently visible, so the ghost set and the live-building set are disjoint and
+nothing can be picked twice; enemy units still win ties, exactly as live
+buildings lose to them.
+
+The mechanism turns on one field: `RememberedBuilding.id` is the real entity's
+`to_bits()` — the same number the bridge names in
+`{"type":"attack","target":N}`, and the same key `knows_entity` looks up. So
+the gesture produces the **same `Intent::Attack` against the same id**, not an
+attack-move to the remembered position. That distinction is the whole point: an
+attack-move is a different verb with different behaviour, and "the human has a
+gesture that is nearly it" is precisely what the gap already was.
+
+The hover ring follows, and is deliberately driven off the ghost *record*
+rather than the live entity: a ring that appeared only for buildings that are
+still standing would answer "is it still there?" for free, and walking back
+over the rubble is the only thing allowed to answer that. A ghost whose
+building has since been razed resolves to a dead entity and the compiler
+answers `target N not found` — which is exactly what the bridge already gets
+for the same id, and, now that rejections reach the alert stack (below), is how
+the player learns their intel was stale.
+
+Covered by `intent::tests::a_remembered_building_is_attackable_by_id`.
+
+### Both seats are told when they are refused
+
+The compiler reaches one verdict, but the two seats read it down different
+channels, and for a while only one channel existed. A bridge commander has
+always received its errors in the next snapshot's `errors` array. The human at
+the keyboard got the identical string written to `IntentErrors`, where only
+bridge.rs reads, and then overwritten — same compiler, same verdict, one seat
+told and one not. That is the fairness claim failing in the *reverse* direction
+from the usual worry, and it made the ghost-attack gesture above nearly
+unusable: a stale ghost would simply do nothing.
+
+A `ui`-source rejection is now also pushed onto that team's `GameEvents` feed
+as a `Warning`, which the alert stack already renders and `[Space]` already
+focuses. Rendering is where the two seats are allowed to differ — a file reader
+gets forty lines of history and all the time in the world, a human gets six
+rows that fade — but *being told* is not.
+
+The text after the channel tag is byte-identical. The bridge is told
+`cmd 3: target 41 not found` because a commander needs to know which command in
+its batch bounced; the human is told `order refused: target 41 not found`,
+because a gesture is always the one just made. `IntentSource` decides which
+renderer hears, and that is the only thing it decides — never whether an intent
+was legal.
+
+Because a held mouse button can re-fail at frame rate (where a bridge batch is
+a discrete document whose errors arrive once), the channel is rate-limited: the
+last dozen distinct messages stay quiet for four game-seconds, and at most two
+notices are raised per frame, shared across every gesture in it. One stuck
+right-click must never evict "hostiles near base" from a six-row stack.
+Covered by `a_refused_gesture_reaches_the_humans_alert_stack`,
+`a_held_click_cannot_flood_the_alert_stack` and
+`a_bridge_rejection_does_not_touch_the_event_feed`.
 
 ### Where `research` is actually enforced
 
@@ -346,7 +403,10 @@ the bridge always did.
 `IntentErrors` holds per-team validation errors. `bridge.rs` clears its seat's
 list when it accepts a new batch and concatenates it onto the seat's own
 file-level errors when it writes a snapshot, so the wire format
-(`errors: ["cmd 3: …"]`) and the `cmd <i>:` prefix are unchanged.
+(`errors: ["cmd 3: …"]`) and the `cmd <i>:` prefix are unchanged. Errors from
+`ui`-source intents additionally go to that team's `GameEvents` feed for the
+alert stack — one verdict, delivered down whichever channel the seat is
+actually reading (see "Both seats are told when they are refused").
 
 **One cosmetic difference:** errors now arrive grouped — commands that failed
 to *parse* are listed before commands that failed to *validate* — where they
@@ -391,15 +451,14 @@ behaviour** — it changed how many places can cause it.
   treats source as descriptive rather than authoritative. `IntentSource` will
   want a third variant, and conflict policy (last-writer-wins vs. veto) is the
   real design question, not plumbing.
-- **Closing the ghost-attack gap.** Give the human a gesture for attacking a
-  remembered enemy building, so the picker matches the compiler's `knows_entity`
-  rule (see above). Small, and it removes the one place the AI can currently
-  express something the human cannot.
-- **Ability ids parse inconsistently.** Unit, building and item names go
-  through `normalize_name` (case, spaces, dashes and underscores are all
-  noise), but ability ids use plain `eq_ignore_ascii_case` — so `"CallToArms"`
-  and `"calltoarms"` work while `"Call to Arms"` does not. Pre-existing, and
-  now more visible for sitting next to the other parsers in one file.
+- ~~**Closing the ghost-attack gap.**~~ **Done** — the picker reads
+  `FogGrid::ghosts()` and produces the same `Intent::Attack` against the same
+  id (see "The residual asymmetry" above). There is no longer a place where the
+  AI can express something the human cannot.
+- ~~**Ability ids parse inconsistently.**~~ **Done** — `normalize_name` moved
+  to shared.rs, next to the catalog whose names it folds, and now backs
+  `ability_index_by_id` and `parse_target_class` as well. There is one name
+  matcher, and `"Call to Arms"` works.
 - **Chain of Command (docs/TEMPO.md).** The spike asked for "a single choke
   point where player commands become engine orders" and budgeted 23 call sites
   across three files. There is now one function. `PendingOrder` latency becomes

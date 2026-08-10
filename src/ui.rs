@@ -3985,6 +3985,50 @@ fn right_mouse(
         }
     }
 
+    // --- a remembered enemy structure under the cursor? -------------------
+    //
+    // This closes docs/INTENT.md's "one residual asymmetry". The compiler's
+    // rule is `knows_entity` — visible now OR a structure this team remembers
+    // — but the loop above only offers what `fog_sees` allows, so a scouted
+    // barracks the player is currently looking at a GHOST of was a legal
+    // target for a bridge commander and un-clickable for the human. The AI
+    // could say something the human could not, which is the one thing
+    // THESIS.md's fairness claim does not survive.
+    //
+    // The picker reads `FogGrid::ghosts()` — the same iterator
+    // `sync_building_ghosts` builds the boxes on screen from, so what is
+    // clickable is exactly what is drawn, by construction rather than by
+    // agreement. The record's `id` is the real entity's `to_bits()`: the same
+    // number the bridge names in `{"type":"attack","target":N}`, the same key
+    // `knows_entity` looks up. So this produces the *same* `Intent::Attack`
+    // against the *same* id, not an attack-move to the remembered position —
+    // an attack-move would be a different verb with different behaviour, and
+    // "the human has a gesture that is nearly it" is what the gap already was.
+    //
+    // `ghosts()` never yields a record whose cell is currently visible, so
+    // this set and the live-building set above are disjoint and nothing can
+    // be picked twice. Enemy units still win, exactly as live buildings lose
+    // to them.
+    //
+    // A ghost whose building has since been razed resolves to a dead entity
+    // and the compiler answers `target N not found` — which is precisely what
+    // the bridge already gets for the same id, and, now that rejections reach
+    // the alert stack, is how the player learns their intel was stale.
+    if !hit_enemy_unit {
+        for ghost in fog.get(Team::Human).ghosts() {
+            let d = dist_xz(ghost.pos, ground);
+            if d > building_stats(ghost.kind).size * 0.5 {
+                continue;
+            }
+            let Ok(entity) = Entity::try_from_bits(ghost.id) else {
+                continue;
+            };
+            if enemy.is_none_or(|(_, bd)| d < bd) {
+                enemy = Some((entity, d));
+            }
+        }
+    }
+
     // --- resource node under the cursor? ---------------------------------
     let mut node: Option<(Entity, f32)> = None;
     for (e, tf, res) in &nodes {
@@ -5697,6 +5741,24 @@ fn hover_feedback(
                                 best_bld = Some((d, tf.translation, *team, r));
                             }
                         }
+                        // A remembered structure the player can right-click is
+                        // a structure the crosshair has to acknowledge, or the
+                        // gesture is undiscoverable. Driving this off the
+                        // ghost RECORD rather than the live entity is what
+                        // keeps it honest: the ring appears for a razed
+                        // building's ghost exactly as it does for a standing
+                        // one, so hovering can never answer "is it still
+                        // there?" — the question only walking back over the
+                        // rubble is allowed to answer.
+                        if best_bld.is_none() {
+                            for ghost in fog.get(Team::Human).ghosts() {
+                                let r = building_stats(ghost.kind).size * 0.5;
+                                let d = dist_xz(ghost.pos, ground);
+                                if d <= r && best_bld.is_none_or(|(bd, _, _, _)| d < bd) {
+                                    best_bld = Some((d, ghost.pos, Team::Claude, r));
+                                }
+                            }
+                        }
                         if let Some((_, pos, team, r)) = best_bld {
                             let (mat, ic) = match team {
                                 Team::Human => (assets.friendly.clone(), SystemCursorIcon::Pointer),
@@ -6056,6 +6118,57 @@ mod tests {
 
     fn said(app: &App) -> &[Intent] {
         &app.world().resource::<Said>().0
+    }
+
+    /// The renderer half of the equitable-error-visibility change.
+    ///
+    /// `intent.rs` raises a refused `ui` gesture on the team's `GameEvents`
+    /// feed; this asserts the alert stack actually picks such a notice up,
+    /// colours it as a warning, and counts it for `cursor_over_hud` — the
+    /// three things a screenshot of the corner of the screen would show. The
+    /// compiler-side half (that the notice is raised at all, with the bridge's
+    /// exact string, once per distinct problem) lives in `intent::tests`.
+    #[test]
+    fn a_refused_gesture_shows_up_in_the_alert_stack() {
+        let mut app = App::new();
+        app.init_resource::<UiState>()
+            .init_resource::<Time<Real>>()
+            .init_resource::<GameEvents>()
+            .init_resource::<Notifications>()
+            .add_systems(Update, update_notifications);
+
+        // Exactly what `UiNotices::raise` pushes.
+        let message = "order refused: target 41 not found".to_string();
+        app.world_mut().resource_mut::<GameEvents>().push(
+            Team::Human,
+            12.5,
+            message.clone(),
+            EventSeverity::Warning,
+            None,
+        );
+        app.update();
+
+        let notes = app.world().resource::<Notifications>();
+        assert_eq!(notes.live.len(), 1, "the refusal reached the stack");
+        assert_eq!(notes.live[0].message, message);
+        assert_eq!(notes.live[0].severity, EventSeverity::Warning);
+        // Amber, the HUD's existing "something of yours went wrong" colour —
+        // not the red reserved for a hero down or a building lost.
+        assert_eq!(
+            severity_color(notes.live[0].severity),
+            Color::srgb(1.0, 0.86, 0.35)
+        );
+        // A placeless alert must not be a camera-jump target: `[Space]` skips
+        // it rather than sending the view somewhere nothing happened.
+        assert_eq!(notes.live[0].pos, None);
+        // And the stack now occupies rows, so a click on it is not also a
+        // click on the battlefield behind it.
+        assert_eq!(app.world().resource::<UiState>().notif_rows, 1);
+
+        // Re-running with nothing new must not duplicate it — the feed is
+        // drained by `seq`, and a rejection is news exactly once.
+        app.update();
+        assert_eq!(app.world().resource::<Notifications>().live.len(), 1);
     }
 
     fn json(intent: &Intent) -> serde_json::Value {
