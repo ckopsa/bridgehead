@@ -30,7 +30,10 @@ EXPECTED_TOP_KEYS = {
 #   * game_over_reason ("razed"/"surrender") exists only once a match has ended
 #     — see docs/INTENT.md, "Which win was it": `game_over` itself keeps its
 #     historical string-or-null shape precisely so this tooling never breaks.
-OPTIONAL_TOP_KEYS = {"applied", "game_over_reason"}
+#   * triggers is present only once this seat has armed one (`trigger_set`).
+#     Like `command_nodes` and `applied` it is `skip_serializing_if` empty, so
+#     a seat that never speaks the word sends exactly the historical key set.
+OPTIONAL_TOP_KEYS = {"applied", "game_over_reason", "triggers"}
 
 
 def upgrade_price(st):

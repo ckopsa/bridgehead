@@ -202,7 +202,11 @@ def test_the_headline_directive():
     """THESIS.md's example, end to end.
 
     Two clauses compile; the conditional one is deferred with the exact
-    follow-up command, because the engine has no trigger verb to compile it to.
+    follow-up command — and it is still deferred now that `trigger_set` EXISTS,
+    which is the interesting half. "their hero falls" is not deferred because
+    the language lacks a `when`; it is deferred because the predicate
+    vocabulary has no reading of an ENEMY hero's health, and answering it with
+    your own would be a different order carried out silently.
     """
     result = compile_one("hold the west, forage mid with cavalry, "
                          "strike when their hero falls")
@@ -503,6 +507,146 @@ def test_surrender_and_autopilot():
 
 
 # ---------------------------------------------------------------------------
+# Triggers — "when X, Y"
+# ---------------------------------------------------------------------------
+
+
+def test_the_leading_conditional_survives_its_own_comma():
+    """The headline shape, and the one that used to be impossible to parse.
+
+    `split_clauses` splits on commas, so "when my base is attacked, squad 1
+    defends our base" would have become a dangling "when ..." fragment and an
+    order that ran IMMEDIATELY — the worst available failure, because the
+    commander believes they armed a rule and instead moved their army.
+    """
+    result = compile_one("when my base is attacked, squad 1 defends our base")
+    trigger = only(result, "trigger_set")
+    assert trigger["name"] == "base-attacked"
+    assert trigger["when"] == {"type": "base_under_attack"}
+    assert trigger["then"]["type"] == "posture"
+    assert trigger["then"]["id"] == 1
+    assert trigger["then"]["posture"]["type"] == "defend"
+    # A once-trigger says nothing about repeating, matching the wire's
+    # skip-when-absent shape.
+    assert "repeat" not in trigger
+    assert not result.errors and not result.deferred
+
+
+def test_the_trailing_conditional_still_works():
+    result = compile_one("squad 1 defends our base when my base is attacked")
+    assert only(result, "trigger_set")["when"] == {"type": "base_under_attack"}
+
+
+def test_whenever_repeats_and_when_does_not():
+    once = only(compile_one("when a bounty appears, squad 1 forages mid"),
+                "trigger_set")
+    assert "repeat" not in once
+    repeating = only(compile_one("whenever a bounty appears, squad 1 forages mid"),
+                     "trigger_set")
+    assert repeating["repeat"] == ic.DEFAULT_REPEAT_S
+
+
+def test_an_explicit_name_and_cooldown_are_honoured():
+    t = only(compile_one("when my base is attacked, squad 1 defends our base "
+                         "as home-guard every 2 minutes"), "trigger_set")
+    assert t["name"] == "home-guard"
+    assert t["repeat"] == 120.0
+
+
+def test_auto_names_are_stable_so_re_issuing_replaces_rather_than_spends():
+    """The engine caps a team at eight triggers and replaces by name. A tool
+    that named the same rule differently on every cycle would burn the cap in
+    four turns, which is exactly the failure the cap exists to prevent."""
+    phrasings = ["when my base is attacked, squad 1 defends our base",
+                 "when the base is under attack, squad 1 defends our base",
+                 "squad 1 defends our base if my base is attacked"]
+    names = {only(compile_one(p), "trigger_set")["name"] for p in phrasings}
+    assert names == {"base-attacked"}
+
+
+def test_every_predicate_has_a_phrase_that_reaches_it():
+    """One sentence per `TriggerWhen` arm. A predicate the tool cannot spell is
+    a predicate that does not exist for anybody reading --explain."""
+    cases = {
+        "when my base is attacked, squad 1 defends our base":
+            {"type": "base_under_attack"},
+        "when my hero drops below 30%, squad 1 defends our base":
+            {"type": "hero_below", "frac": 0.3},
+        "when squad 2 drops below 40%, squad 2 defends our base":
+            {"type": "squad_below", "id": 2, "frac": 0.4},
+        "when I see 3 or more siege, squad 1 defends our base":
+            {"type": "enemy_sighted", "class": "Siege", "count": 3},
+        "when a bounty appears, squad 1 forages mid":
+            {"type": "bounty_spawned"},
+        "when my mine runs dry, squad 1 defends our base":
+            {"type": "mine_dry"},
+        "when we reach tier 2, squad 1 defends our base":
+            {"type": "tier_reached", "tier": 2},
+        "when we have 8 footmen, squad 1 pushes their base":
+            {"type": "unit_count", "kind": "Footman", "count": 8},
+        "when the clock passes 6 minutes, squad 1 pushes their base":
+            {"type": "game_time", "at": 360.0},
+    }
+    for directive, want in cases.items():
+        got = only(compile_one(directive), "trigger_set")["when"]
+        assert got == want, f"{directive!r} -> {got}, wanted {want}"
+
+
+def test_a_bare_enemy_sighting_defaults_to_one():
+    t = only(compile_one("when I see cavalry, squad 1 defends our base"),
+             "trigger_set")
+    assert t["when"] == {"type": "enemy_sighted", "class": "Cavalry", "count": 1}
+
+
+def test_an_unreadable_condition_defers_instead_of_guessing():
+    """The refusal that matters most. Nothing in `TriggerWhen` reads an ENEMY
+    hero's health, and the nearest predicate that exists reads YOUR OWN — so a
+    tool that reached for it would arm a rule meaning the opposite."""
+    result = compile_one("strike when their hero falls")
+    assert not result.intents
+    assert len(result.deferred) == 1
+    _, condition, suggestion = result.deferred[0]
+    assert condition == "their hero falls"
+    assert suggestion == "strike"
+
+
+def test_a_multi_intent_action_sends_the_setup_and_defers_the_purpose():
+    """"forage mid with the cavalry" is membership AND purpose. Who is in the
+    squad is a fact you establish today; what the squad does when treasure
+    appears is the part that waits."""
+    result = compile_one("whenever a bounty appears, forage mid with the cavalry")
+    assert verbs(result) == ["squad", "trigger_set"]
+    assert set(result.intents[0]["units"]) == {4294968130, 4294968131, 4294968132}
+    assert result.intents[1]["then"]["posture"]["type"] == "forage"
+
+
+def test_a_trigger_never_arms_a_trigger():
+    """The engine refuses it; the tool must not emit it and then be told so.
+    Nesting is the line between doctrine and a scripting language, and it is
+    also what makes the cap of eight an actual bound."""
+    for directive in ("when my base is attacked, clear all triggers",
+                      "when my base is attacked, disarm trigger home-guard"):
+        result = compile_one(directive)
+        emitted = [i for i in result.intents if i["type"] == "trigger_set"]
+        assert not emitted, f"{directive!r} emitted a nested trigger"
+
+
+def test_clearing_is_one_verb_with_two_forms():
+    assert only(compile_one("clear all triggers"), "trigger_clear") == \
+        {"type": "trigger_clear"}
+    assert only(compile_one("disarm trigger home-guard"), "trigger_clear") == \
+        {"type": "trigger_clear", "name": "home-guard"}
+
+
+def test_a_named_squad_posture_emits_exactly_one_intent():
+    """The rule that makes a squad-scoped trigger action possible: naming a
+    squad you already built must not re-enrol anybody into it."""
+    result = compile_one("squad 3 defends our base")
+    assert verbs(result) == ["posture"]
+    assert result.intents[0]["id"] == 3
+
+
+# ---------------------------------------------------------------------------
 # Shape of the output — it must be Intent VALUES the game already parses
 # ---------------------------------------------------------------------------
 
@@ -512,6 +656,7 @@ KNOWN_VERBS = {
     "build", "train", "upgrade", "cancel", "research", "rally",
     "cast", "buy", "use_item",
     "priority", "retreat", "leash", "autocast", "squad", "posture", "template",
+    "trigger_set", "trigger_clear",
     "autopilot", "surrender",
 }
 POSTURE_TYPES = {"defend", "push", "escort", "forage"}
@@ -579,7 +724,16 @@ def test_explain_lists_the_whole_vocabulary():
                    "retreat at", "focus", "leash", "autocast", "template",
                    "harvest", "build", "train", "tier up", "research", "buy",
                    "scout", "surrender", "rally", "bridge_send.py", "docs/INTENT.md",
-                   "units[].why", "intent_log.jsonl"):
+                   "units[].why", "intent_log.jsonl",
+                   # The trigger layer: the connectors, the cap and the whole
+                   # predicate list, because a model that cannot see a
+                   # predicate cannot arm it.
+                   "when X, Y", "trigger_set", "trigger_clear", "as <name>",
+                   "every 90s", "whenever", "my base is attacked",
+                   "my hero drops below", "squad 2 drops below",
+                   "I see 3 or more siege", "a bounty appears",
+                   "my mine runs dry", "we reach tier 2", "we have 8 footmen",
+                   "the clock passes 6 minutes", "Max 8 armed triggers"):
         assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
 
 

@@ -168,6 +168,10 @@ pub enum Action {
     CycleLeash,
     CyclePriority,
     AutoCastSlot(usize),
+    /// Arm (or disarm) the `home-guard` trigger: when the base is attacked,
+    /// this squad falls back and defends it. A preset, not an authoring UI —
+    /// see docs/INTENT.md on the asymmetry this leaves open.
+    HomeGuard,
 
     // ---- doctrine page, production building ----
     TemplateSquad,
@@ -456,6 +460,7 @@ pub const REGISTRY: &[Binding] = &[
     b(Action::AutoCastSlot(0), KeyCode::KeyZ, Ctx::DoctrinePage),
     b(Action::AutoCastSlot(1), KeyCode::KeyX, Ctx::DoctrinePage),
     b(Action::AutoCastSlot(2), KeyCode::KeyC, Ctx::DoctrinePage),
+    b(Action::HomeGuard, KeyCode::KeyH, Ctx::DoctrinePage),
     // ---- doctrine page, production building ------------------------------
     b(Action::TemplateSquad, KeyCode::KeyQ, Ctx::DoctrineTemplate),
     b(Action::TemplateFallback, KeyCode::KeyW, Ctx::DoctrineTemplate),

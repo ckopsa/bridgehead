@@ -261,7 +261,7 @@ Deaths → Fog → Input → CoCommand → AiThink → Think → Intent
 | `Input` | ui.rs gesture chain, `bridge::poll_commands`, command.rs dispatchers, hotkeys, `status_probe` |
 | `CoCommand` | copilot.rs `CopilotSet` |
 | `AiThink` | `ai::ai_think`, `seed_machine_autocast` |
-| `Think` | doctrine.rs — postures, retreat, leash, auto-cast |
+| `Think` | doctrine.rs — postures, retreat, leash, auto-cast; trigger.rs — the trigger evaluator, the contingent member of the same family |
 | `Intent` | `intent::apply_intents` (wraps `IntentApply`) |
 | `Movement` | units.rs — spawn, path, steer, separate |
 | `Combat` | combat.rs — acquire, engage, projectiles, abilities, damage |

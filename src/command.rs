@@ -48,6 +48,8 @@
 //! | `autocast` | exempt | Doctrine — and this is the row that makes the Sorcerer interesting rather than annoying. Turning the debuff into standing policy costs nothing and runs at machine speed; hand-firing it at range costs the link. C4 ("doctrine strictly better than micro at range") landing on a new unit for free, by construction. |
 //! | `use_item`, `buy` | exempt | Items live in a hero's inventory and a hero is a node; `buy` is a transaction with a shop, not a unit order. Both verbs now take an optional `hero`, and every hero a team can field is a node, so the link is zero however the field is spelled. `use_item`'s `destination` does not disturb this either: choosing WHICH hall a scroll arrives at does not move the speaker, the bag or the place the item is spent from, so there is no new distance to price. Pinned by `intent::tests::choosing_a_destination_does_not_start_charging_for_the_item`. |
 //! | `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt | Doctrine. Standing orders ARE the fast path — that is the mechanism, not an exception to it. |
+//! | `trigger_set`, `trigger_clear` | exempt | Arming a rule is doctrine. |
+//! | **anything a trigger fires** | exempt | Whatever verb it carries. A trigger is standing policy whose condition came true, so its author paid the reach when they ARMED it and charging the link again would price one reach twice. Selected by `SubmitIntent::trigger` through [`CommandLink::exempt_issuer`], which is a named constructor rather than a boolean precisely so this row has somewhere to point. It extends C4 one rung: pre-arming a rule is strictly better than hand-answering an alarm at range. |
 //! | `autopilot`, `surrender` | exempt | Match level, not a unit order. |
 //!
 //! ## The curve
@@ -379,7 +381,46 @@ impl CommandLink<'_> {
             max_delay: 0.0,
         }
     }
+
+    /// An issuer that charges **nothing**, whatever the curve says.
+    ///
+    /// For orders minted by ENGINE-EXECUTED STANDING POLICY that happen to run
+    /// through the intent compiler rather than around it — today, exactly one
+    /// caller: an intent a `trigger_set` rule fired (trigger.rs).
+    ///
+    /// It is not a bypass, it is the verb table's own rule reached from the
+    /// other side. Every doctrine verb is exempt because *standing orders are
+    /// local; direct orders travel* — the unit already has its orders and does
+    /// not need to ask anyone. A trigger is standing policy whose condition
+    /// came true: its author paid the reach when they armed it, and charging it
+    /// again on firing would price one reach twice. doctrine.rs gets the same
+    /// exemption for free by never touching this module at all.
+    ///
+    /// Spelled as its own constructor rather than as a `bool` on `issuer` so
+    /// the exemption is a named decision with this comment attached to it,
+    /// which is what a future reader auditing "who is allowed to skip the link"
+    /// needs to find.
+    pub fn exempt_issuer(&self, now: f32) -> OrderIssuer<'_> {
+        OrderIssuer {
+            nodes: &self.nodes,
+            latency: &LATENCY_EXEMPT,
+            now,
+            max_delay: 0.0,
+        }
+    }
 }
+
+/// The curve with the master switch off, as a `'static` so `exempt_issuer` can
+/// hand out a borrow of it. Every field but `on` is unreachable —
+/// `delay_for_slack` returns 0.0 before it reads any of them.
+static LATENCY_EXEMPT: CommandLatency = CommandLatency {
+    on: false,
+    hall_radius: 0.0,
+    hero_radius: 0.0,
+    step: 0.0,
+    per_world_unit: 0.0,
+    max: 0.0,
+};
 
 /// Issues direct orders, delaying them by the link latency of the unit they are
 /// addressed to. Borrowed for the duration of one system's work; `max_delay`
@@ -796,7 +837,7 @@ mod tests {
     /// A reason for an order to carry, minted at speech time — the shape the
     /// compiler hands the issuer (docs/INTENT.md's `why` layer).
     fn test_why() -> Provenance {
-        IntentMark { source: IntentSource::Ui, at: 0.0 }.order("move")
+        IntentMark { source: IntentSource::Ui, at: 0.0, trigger: None }.order("move")
     }
 
     /// The curve, as a curve: free inside the radius, a step the moment you
@@ -1118,6 +1159,7 @@ mod tests {
                     provenance: IntentMark {
                         source: IntentSource::Bridge,
                         at: spoken_at,
+                        trigger: None,
                     }
                     .order("attackmove"),
                     ready_at: spoken_at + link,
@@ -1159,6 +1201,7 @@ mod tests {
         let expected = IntentMark {
             source: IntentSource::Bridge,
             at: spoken_at + link,
+            trigger: None,
         }
         .order("attackmove")
         .why();

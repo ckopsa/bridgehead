@@ -80,7 +80,7 @@ player expressing anything, so it stays where it is.
 
 ## The vocabulary
 
-25 verbs, grouped by what they are for. The serde shape **is** the bridge's
+27 verbs, grouped by what they are for. The serde shape **is** the bridge's
 historical wire format — tag is `type`, entity ids are `Entity::to_bits`,
 positions are flat `x`/`z` — so `commands.json` parses straight into `Intent`
 with no translation layer. Backward compatibility is not an adapter here; it is
@@ -136,6 +136,15 @@ slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
 | `squad` | `{units:[id], id:1}` | `id` absent |
 | `posture` | `{id:1, posture:{type:"defend"\|"push"\|"escort"\|"forage", …}}` | `posture` absent |
 | `template` | `{building:id, squad, retreat, priority, autocast}` | all pieces absent |
+
+### Triggers — contingent standing policy (v3)
+| Verb | Shape | Clears when |
+|---|---|---|
+| `trigger_set` | `{name, when:{…}, then:{<any intent>}, repeat?:secs}` | — |
+| `trigger_clear` | `{name}` or `{}` for every trigger | — |
+
+Full treatment below (§ Triggers). One line here: doctrine is what the engine
+does *continuously*; a trigger is what it does *when something happens*.
 
 ### Match level
 | Verb | Shape |
@@ -583,7 +592,7 @@ Verified end-to-end against a live `WC3_BRIDGE=1` seat driven by
   — the diff against master touches none of them.
 - Every historical command shape still parses, including the `caster` alias on
   `cast`, the `use_item` rename and the untagged ability selector
-  (`intent::tests::legacy_wire_commands_parse` covers all 25 verbs and their
+  (`intent::tests::legacy_wire_commands_parse` covers all 27 verbs and their
   optional-field forms).
 - `seq` gating, `last_seq`, the 4 Hz poll and the 1 Hz snapshot are untouched.
 - `tools/bridge_send.py`, `tools/bridge_view.py`, `tools/bridge_wait.py` and
@@ -754,7 +763,7 @@ with a `sentence()` renderer.*
 `tools/intent_compile.py` compiles a natural-language directive plus a snapshot
 into a batch of `Intent` objects. It is a **tool, not an engine feature**, and
 that placement is the design: the game gains no NLP, no new verb, and no new
-mutation path. What it gains is a shorter way to write the same 25 verbs.
+mutation path. What it gains is a shorter way to write the same 27 verbs.
 
 ```
 "hold the northwest ford, forage mid with the cavalry, retreat at 35%"
@@ -898,7 +907,7 @@ answers across a selection. That tally *is* the "did my partner re-task my
 push?" readout; it needed no code at all.
 
 The rung is a **seat**, not `Cause::Script`. A co-commander pays the same
-latency, obeys the same fog and speaks the same 25 verbs; the scripted `ai.rs`
+latency, obeys the same fog and speaks the same 27 verbs; the scripted `ai.rs`
 does none of those things, and collapsing the two would have made "who moved
 this unit" unanswerable in exactly the case it is asked.
 
@@ -1222,6 +1231,280 @@ both go through the one place an order becomes real.
   arbitration), but a *tag* on the proposal — "you were told never about this
   once already" — would keep it etiquette while making the lapse visible to
   both authors.
+
+---
+
+## Triggers: `when` as a first-class word
+
+*`wc3clone-pec`. Two verbs, nine predicates, one new file (`trigger.rs`), and
+no new way to change the game.*
+
+Doctrine relocated **continuous** fast work into the engine: retreat below 35%,
+hold this ring, focus the siege, forage that cache. Eight rounds of AARs say it
+worked. What it never covered was **reaction**, and the gap had a shape:
+
+> A commander who wanted to answer a base raid had to read `events`, notice the
+> line, decide, and speak. For a language model that loop costs ten to fifteen
+> seconds *every time*. A human at a keyboard pays 200ms for the same answer.
+
+That difference is not judgment. It is polling latency, and THESIS.md's own
+principle 3 says what to do about it: the engine does what is fast. A trigger is
+a condition the engine watches at 4 Hz and an intent it submits the instant the
+condition holds — **for whichever player armed it**. Doctrine is the engine
+doing something continuously; a trigger is the engine doing something *when*.
+
+### The action is any intent, and that is the whole design
+
+`then` is an `Intent`. Not a small private list of "things a trigger may do" —
+that would be a second vocabulary, and this document exists because two
+implementations of one language is two languages. A fired trigger goes through
+`apply_intents` like anything else: same ownership checks, same fog rule, same
+tech gates, same `errors` array, same `intent_log.jsonl` line. `trigger.rs` has
+exactly one power, which is to write `SubmitIntent`.
+
+The consequences are all free. A trigger that names a dead unit is refused with
+the string that verb always produces. A trigger that attacks something the fog
+no longer shows is refused by the same `knows_entity` call. A trigger that
+spends money it does not have is refused by economy.rs on the frame it tries to
+pay. Nothing about triggers needed to learn any of that.
+
+### The predicates, exactly
+
+Nine, and the constraint that produced the list is worth stating: **every one is
+answerable from state the frame already has, for the arming team, with no new
+bookkeeping.** No event subscriptions, no history, no memo. A predicate that
+needed its own record-keeping would be a predicate whose truth could drift from
+the world, and the whole value of firing at machine speed is that the world is
+what fired it.
+
+| `when` | True when |
+|---|---|
+| `base_under_attack` | Any of **your buildings** has a `LastDamaged` inside `BASE_ATTACK_WINDOW_S` (8s). Buildings only — a skirmish in midfield is not the base being attacked. Half-built ones count: losing an expansion under construction is exactly this raid. |
+| `hero_below {frac}` | **Any** of your living heroes is under `frac` of max health. Any, not "the" — hero slots climb the hall ladder, and the useful reading of "save my hero" is "whichever one is dying". |
+| `squad_below {id, frac}` | Squad `id`'s living members hold, **pooled**, less than `frac` of their combined max HP. Pooled because a squad is a formation: one wounded footman in a healthy line is not a squad in trouble. **False for a squad with no living members** — a squad that is gone cannot be hurt, and firing a rescue at a corpse pile is worse than firing nothing. |
+| `enemy_sighted {class?, count}` | You can **see** at least `count` enemy units right now, optionally of one `TargetClass`. Fog-honest: counted against your own `FogGrid::sees`. Remembered buildings do **not** count — remembering where a barracks stood is not the news that an army came out of it. |
+| `bounty_spawned` | A neutral cache exists **and you can see it**. The same `fog.sees` filter the snapshot's `bounties` array uses, so the rule sees exactly the caches its owner is shown. |
+| `mine_dry` | A gold node with `remaining == 0` lies within `MINE_HOME_RADIUS` (40) of one of your **completed** halls. Mines are neutral and unowned, so "our mine" is defined by geometry: the one your hall was placed to work. |
+| `tier_reached {tier}` | `TechTiers::get(you).level() >= tier`. |
+| `unit_count {kind, count}` | You field at least `count` living units of `kind`. |
+| `game_time {at}` | The match clock has passed `at` seconds. The one predicate about nothing in the world — it is here because "expand at six minutes" is a plan every commander already writes, and as a trigger it stops depending on remembering. |
+
+**What is deliberately missing** is anything about the *enemy's* internals — their
+gold, their tech, their hero's health. Not an oversight and not a fog problem
+you could scout your way around: those are facts the snapshot does not carry for
+either seat, so a predicate over them would be an information right the human
+does not have. `tools/intent_compile.py` therefore still **defers** "strike when
+their hero falls" — with `trigger_set` sitting right there — because the nearest
+predicate that exists reads *your own* hero and arming that would mean the
+opposite of what was asked.
+
+### once / repeating / spent
+
+`repeat` absent ⇒ the rule fires **once** and disarms. `repeat: 60` ⇒ it fires,
+stamps `last_fired`, and goes quiet for sixty game-seconds.
+
+A spent once-trigger **stays in the list**, marked `spent`. Deleting it would
+make "did my rule ever fire?" unanswerable from the snapshot, and that is the
+first question anybody asks. Re-sending a `trigger_set` under the same name
+re-arms it, which is also how a commander revives one.
+
+### The cap is eight, and it is doctrine rather than programming
+
+`MAX_TRIGGERS_PER_TEAM = 8`. The reasoning is the whole point of the number:
+every trigger is a rule that fires while nobody is watching, and a player who
+cannot recite their own rules has stopped commanding and started debugging. The
+losing AAR would blame the engine. Eight also happens to fit everywhere it has
+to — one HUD line, one snapshot array a model re-reads each poll, one 4 Hz sweep
+nobody has to think about the cost of.
+
+Two things keep the bound real:
+
+- **The cap counts distinct names.** `trigger_set` replaces by name *in place*,
+  so tuning one number never costs a slot — and the tool's auto-derived names
+  are stable across phrasings for exactly this reason.
+- **A trigger may not arm or clear a trigger.** Refused at compile time. Without
+  it, one rule could re-arm seven others forever and eight would be a starting
+  balance rather than a limit. It is also the line between doctrine and a
+  scripting language, which is the line this whole feature is standing on.
+
+### The frame slot, reasoned out
+
+`SimSet::Think`, `.after(FogSet)`, on a 250ms timer — the same heartbeat as
+`doctrine::trigger_retreat`, which is the closest analogue (the other thing in
+`Think` watching for a threshold to be crossed).
+
+Against `SIM_ORDER` (`Deaths → Fog → Input → CoCommand → AiThink → Think →
+Intent → …`):
+
+- **After `Deaths`** — a predicate must not count a corpse.
+- **After `Fog`** — `enemy_sighted` and `bounty_spawned` read the grid the
+  snapshot and the HUD are about to be built from. Any earlier and a rule reacts
+  to last frame's knowability.
+- **Before `Intent`** — this is what makes a trigger *fast* rather than merely
+  automatic: the intent it submits is compiled in the **same frame**, so the
+  whole distance from "the hall took damage" to "the squad is moving" is one
+  tick plus the cadence.
+- **`Think`, not `Input`** — `Think` is where standing policy lives. It also
+  gives the right precedence: doctrine.rs writes `Order`s *inside* `Think` and
+  the compiler runs *after* it, so a fired trigger overrules the posture
+  executor for that tick. Correct — a rule written for this exact situation
+  should beat the continuous policy it was written to interrupt.
+
+One honest consequence, stated rather than discovered: an intent submitted in
+`Think` is read by the compiler *after* the ones ui.rs and bridge.rs submitted
+in `Input` this frame. On the rare tick where a player clicks in the same 250ms
+window their own rule fires, the rule lands last. `Order` is a component and
+last writer wins everywhere here (*source is descriptive, never authoritative*),
+so this is the existing rule rather than a new one, and speaking again is a
+quarter of a second away.
+
+### Latency: a trigger pays nothing, and that is the point
+
+docs/TEMPO.md's verb table exempts every doctrine verb on one rule — *standing
+orders are local; direct orders travel* — because a unit under standing policy
+already has its orders and does not need to ask. A trigger is standing policy
+whose condition came true: **its author paid the reach when they armed it**, and
+charging the link again on firing would price one reach twice.
+
+It also restores the mechanism's own incentive one rung further out. C4 says
+doctrine must be strictly better than micro at range; with triggers exempt,
+*pre-arming a rule is strictly better than hand-answering an alarm at range*,
+which is the same argument applied to contingent work. The exemption is spelled
+as its own constructor (`CommandLink::exempt_issuer`) rather than a boolean, so
+"who is allowed to skip the link" is a question with a findable answer.
+
+### Provenance: a new rung, because it is a different answer
+
+A trigger-fired order answering `order:move by bridge` would be claiming that
+somebody decided to move this unit *just now* — exactly what did not happen. So
+`Cause` gained a rung:
+
+```text
+order:move by bridge t=123            a player said so, and when
+trigger:home-guard move by ui t=41    a rule they armed earlier fired
+```
+
+The seat is still named. A trigger has an author and the engine is only its
+executor, so `source` stays descriptive in the way every other rung is. The
+name is a `TriggerName` — bounded ASCII in a `Copy` scalar — because `Cause` is
+an allocation-free `Copy` enum by design and a `String` there would have cost
+every unit in the game a heap pointer to answer a question about one of them.
+
+The join with the replay log still holds character-for-character: the log
+renders its `why` at `t + link` through the same `IntentMark`, so
+`why.at == t + link` remains true for a trigger the same way it is for a click.
+
+### Both renderers hear it fire
+
+Every fire pushes one `GameEvents` line on the **owner's** feed:
+
+```
+trigger home-guard fired: squad 1 defends (-70.0, -70.0) within 26
+```
+
+`Info`, not `Warning` — whatever the rule reacted to has already raised its own
+line at its own severity, and this is the calmer follow-up saying what was done
+about it. One producer, two renderers: the human reads it in the alert stack and
+the commander reads the identical string in its snapshot's `events`. A trigger
+would otherwise be the one thing in the game that changes the board without
+saying so.
+
+A refusal is routed the same way every refusal is, with one word changed: a
+`Ui`-armed rule that bounces raises `trigger home-guard refused: …` rather than
+`order refused: …`, because the player made no gesture and sending them to look
+for a click they never made is a worse answer than none.
+
+### The seats, honestly
+
+| seat | authoring surface |
+|---|---|
+| bridge / copilot | full — nine predicates × 27 verbs, as JSON |
+| `tools/intent_compile.py` | full-ish — "when X, Y" over the same nine, in English |
+| human at the keyboard | **one preset**: `[I][H] Home guard`, plus a readout of every armed rule |
+
+**This is a real asymmetry and it is the first one this document has had to
+report in that direction since docs/TEMPO.md §2.0.** The human's `[I][H]` is a
+toggle that arms `base_under_attack → posture defend` on the selection's squad
+at the nearest hall, repeating every 30s, and presses again to clear it. The
+selection panel lists every rule the team has armed with its state
+(`armed` / `cooling` / `spent`), including ones a co-commander set. That is the
+whole surface.
+
+What the preset is *not* is a capability gap in the sense that matters: every
+intent it produces is one a commander could have typed, byte-identical, and the
+test that proves it is `the_home_guard_preset_is_a_trigger_a_commander_could_have_typed`.
+What the human lacks is the *authoring* — nine predicates and a free choice of
+action — and a full custom authoring UI (predicate picker, action picker,
+click-to-place) is v3-later work, deliberately not attempted here.
+
+Two things make the gap narrower than the table looks. The English compiler is
+not a bridge-only tool — it emits `Intent` values against a snapshot, and a
+human running it against their own seat writes the same rules a commander does.
+And the *reading* half is symmetric already: the HUD line and the snapshot's
+`triggers` array are built from the same resource and say the same things.
+
+The gap that would actually matter is the reverse one — the human unable to see
+or stop a rule their partner armed — and that one is closed: the readout is
+team-wide, and `trigger_clear` with no name is one keystroke away from being
+bound if it is ever wanted.
+
+### Co-command: `trigger_set` needs the human's approval
+
+The direct/propose split (below) puts doctrine on the direct side because a
+posture is *advice you can overwrite in a second*. Triggers sit on the
+**propose** side, and the reason is the action rather than the rule: a trigger
+whose `then` is `train` or `attack` is an irreversible act that has merely been
+postponed, and it is *harder* to veto than the immediate version because it
+happens when nobody is looking. The line stays where the cost of being wrong is,
+which is where it always was. `DOCTRINE_VERBS` is untouched.
+
+### The snapshot
+
+```json
+"triggers": [
+  {"name":"home-guard",
+   "when":{"type":"base_under_attack"},
+   "then":{"type":"posture","id":1,"posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}},
+   "repeat":30.0, "status":"armed", "last_fired":112.4,
+   "sentence":"when the base is attacked: squad 1 defends (-70.0, -70.0) within 26 (trigger: home-guard, repeating every 30s)"}
+]
+```
+
+Own team only, and for a stronger reason than the usual one: **a trigger is a
+plan**, and an opponent's contingency plans are the single most valuable thing a
+snapshot could leak. In the engine the resource is split by team and
+`write_seat_snapshot` is handed a pre-sliced `&[TriggerRule]`, so it cannot read
+the other faction's even by accident.
+
+`when` and `then` are the **same JSON you sent**, round-tripped through `Intent`
+rather than re-described in prose — so a commander reads a rule out of the
+snapshot, edits one number, and sends it back under the same name. A prose
+summary would have been a second spelling of the language.
+
+Not sorted, unlike every other list in the snapshot: the order is the order they
+were set, which is the order they fire in when two come true on the same tick.
+Sorting would hide the one thing about the list that is load-bearing.
+
+`skip_serializing_if` empty, like `command_nodes` — a seat that has never spoken
+the word sends exactly the historical sixteen keys.
+
+### What this leaves open
+
+- **A full authoring UI for the human.** Named above; the honest gap.
+- **No predicate composition.** No `and`, no `or`, no `not`. One condition per
+  rule, deliberately: a boolean algebra is the point where this stops being
+  doctrine. Two rules with the same action is the workaround and it costs two
+  of the eight slots, which is the right price.
+- **No "when it stops being true".** Every predicate is level-triggered, so a
+  repeating rule re-fires on its cooldown while the condition holds rather than
+  once per crossing. For `base_under_attack` (an 8s window) that is what you
+  want; for a long-lived condition like `tier_reached` a repeating rule is
+  almost certainly a mistake, and nothing stops you making it.
+- **A trigger cannot name a unit that does not exist yet.** `then` is frozen at
+  arm time, so "when I have 8 footmen, attack-move them" has to say a squad
+  rather than a list of ids. Squads are the right answer and the reason
+  `squad_below` and the `squad N defends X` NL rule are here — but it is a real
+  edge and the plans bead will meet it again.
 
 ---
 

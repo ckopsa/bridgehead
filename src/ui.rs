@@ -154,6 +154,52 @@ fn trim_num(v: f32) -> String {
 
 /// Radius written by the doctrine card's Defend posture.
 const DEFEND_RADIUS: f32 = 22.0;
+
+/// The name the human's one trigger preset is armed under. A fixed name rather
+/// than a generated one is what makes the tile a TOGGLE: pressing it twice
+/// clears the rule it just set instead of arming a second copy, and re-pressing
+/// it after moving the army replaces the rule in place without spending another
+/// of the team's eight slots.
+const HOME_GUARD: &str = "home-guard";
+/// Radius of the Defend posture the home guard falls back to. Wider than
+/// `DEFEND_RADIUS` because it has to cover a base rather than a chokepoint.
+const HOME_GUARD_RADIUS: f32 = 26.0;
+/// Cooldown between home-guard fires. A base is raided more than once a match,
+/// and the rule must survive the first harassing Raider.
+const HOME_GUARD_COOLDOWN: f32 = 30.0;
+
+/// Is `name` armed for the human right now?
+///
+/// Spent once-triggers do not count: the tile is a toggle and its lit state has
+/// to mean "this rule will fire", not "this rule exists".
+fn has_trigger(triggers: &Triggers, name: &str) -> bool {
+    triggers
+        .get(Team::Human)
+        .iter()
+        .any(|t| t.name.as_str() == name && t.armed)
+}
+
+/// The selection panel's one-line trigger readout: every rule this team has
+/// armed, with its state. The human's whole "list" view, and deliberately one
+/// line — eight short names fit, and a panel that grew a scrolling list would
+/// be building the authoring UI this bead explicitly deferred.
+///
+/// Empty string when there are none, which is how every other optional line in
+/// this panel disappears.
+fn trigger_line(triggers: &Triggers, now: f32) -> String {
+    let armed = triggers.get(Team::Human);
+    if armed.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = armed
+        .iter()
+        .map(|t| match t.status(now) {
+            "armed" => t.name.as_str().to_string(),
+            other => format!("{} ({other})", t.name),
+        })
+        .collect();
+    format!("Triggers: {}", parts.join("  "))
+}
 /// Highest squad id a human gesture will ever mint. Matches the three control
 /// groups; a bridge commander may use any id it likes.
 const MAX_UI_SQUAD: u8 = 3;
@@ -664,6 +710,9 @@ enum Slot {
     /// the HUD's half of the snapshot's `units[].link` / `units[].pending`
     /// (docs/TEMPO.md §4). Empty string whenever the mechanic is off.
     Link,
+    /// Every trigger this team has armed, and its state. Empty until the
+    /// player (or their co-commander) arms one.
+    Triggers,
     /// Top bar: how much of this army is inside its own chain of command.
     /// Empty string whenever the mechanic is off.
     Coverage,
@@ -884,6 +933,8 @@ enum CmdAction {
     TemplateAutoCast,
     /// Remove the selected building's template entirely.
     TemplateClear,
+    /// Arm or clear the `home-guard` trigger for the selection's squad.
+    ToggleHomeGuard,
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,6 +1714,15 @@ fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
 struct CastLookup<'w, 's> {
     tiers: Res<'w, TechTiers>,
     squads: Res<'w, SquadOrders>,
+    /// The team's armed triggers. Here rather than as its own parameter
+    /// because `command_input` and `update_hud` both sit on Bevy's
+    /// 16-parameter ceiling and both already share this bundle — and because
+    /// squads and triggers are the same kind of thing (standing policy the
+    /// engine executes), read by the same two systems for the same reason.
+    triggers: Res<'w, Triggers>,
+    /// Rides along with `triggers` because it is only ever read to answer a
+    /// question about them: is this repeating rule still inside its cooldown?
+    clock: Res<'w, Time>,
     cooldowns: Query<'w, 's, &'static AbilityCooldowns>,
     /// The team's completed research levels — what a research button reads to
     /// decide whether it is buyable, in progress, or already at the cap.
@@ -2119,6 +2179,9 @@ struct DoctrineCard {
     /// `SquadOrders` — i.e. when doctrine.rs is actually executing something.
     posture: Option<PostureKind>,
     tmpl: TemplateView,
+    /// Is the `home-guard` trigger armed right now? The tile is a toggle, so
+    /// this is what decides whether pressing it arms or clears.
+    home_guard: bool,
 }
 
 /// Page two: the doctrine card. This is the half of docs/TEMPO.md §2.0 that
@@ -2230,6 +2293,28 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
                 out.push(entry);
             }
         }
+
+        // **The trigger preset.** One tile, and it is a toggle for the same
+        // reason [G] Guard is one: the human's fast path is a switch, and the
+        // parameterised form of the same statement lives on the wire and in
+        // tools/intent_compile.py. Pressed, it arms `home-guard` — when any of
+        // our buildings takes damage, this squad falls back and defends the
+        // nearest hall. Pressed again, it clears it.
+        //
+        // This is a PRESET, not an authoring surface, and the asymmetry is
+        // real and documented (docs/INTENT.md § Triggers): a commander can
+        // write any of nine predicates against any of the 27 verbs, and the
+        // human at the keyboard gets one canned rule plus a readout. What
+        // closes most of the gap is that the English compiler speaks the same
+        // sentences to the same wire.
+        let mut guard = CmdEntry::plain(
+            CmdAction::ToggleHomeGuard,
+            bind(Hk::HomeGuard),
+            "Home guard",
+        )
+        .active(card.home_guard);
+        guard.cost = if card.home_guard { "armed".into() } else { "trigger".into() };
+        out.push(guard);
     } else if card.tmpl.capable {
         let t = card.tmpl;
         out.push(
@@ -3381,6 +3466,16 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                 Color::srgb(0.55, 0.78, 1.0),
                 Slot::Link,
             ));
+            // The team's armed rules. Below the selection's own lines because
+            // it is the one entry in this panel that is not about the
+            // selection: a trigger belongs to the faction, and it stays on
+            // screen when nothing at all is selected.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(0.85, 0.72, 0.40),
+                Slot::Triggers,
+            ));
             c.spawn(text_bundle(
                 "Left-click / drag to select.",
                 13.0,
@@ -3768,6 +3863,7 @@ fn command_input(
             .and_then(|s| cast.squads.0.get(&(Team::Human, s)))
             .map(posture_kind),
         tmpl: single_template,
+        home_guard: has_trigger(&cast.triggers, HOME_GUARD),
     };
     let entries = command_entries(
         ui.page,
@@ -4256,6 +4352,53 @@ fn command_input(
                 ui.posture_place = None;
                 ui.cast_place = None;
                 ui.teleport_place = None;
+            }
+            // The one trigger gesture the human has. A toggle, like [G] Guard:
+            // armed, it clears; unarmed, it arms. Both halves submit an intent
+            // a commander could have typed, and the replay log cannot tell
+            // which of us pressed it.
+            CmdAction::ToggleHomeGuard => {
+                if has_trigger(&cast.triggers, HOME_GUARD) {
+                    say(
+                        &mut submissions,
+                        Intent::TriggerClear {
+                            name: Some(HOME_GUARD.to_string()),
+                        },
+                    );
+                    continue;
+                }
+                if own_units.is_empty() {
+                    continue;
+                }
+                // The squad is resolved AT PRESS TIME, exactly as an armed
+                // posture resolves it: the rule names a squad, and which units
+                // are in it must not change under the player between the press
+                // and the day it fires.
+                let Some(squad) = resolve_squad(&mut submissions) else {
+                    continue;
+                };
+                let home = nearest_hall(centroid());
+                say(
+                    &mut submissions,
+                    Intent::TriggerSet {
+                        name: HOME_GUARD.to_string(),
+                        when: TriggerWhen::BaseUnderAttack,
+                        then: Box::new(Intent::Posture {
+                            id: squad,
+                            posture: Some(PostureIntent::Defend {
+                                x: home.x,
+                                z: home.z,
+                                radius: HOME_GUARD_RADIUS,
+                            }),
+                        }),
+                        // Repeating, and this is the only interesting choice in
+                        // the preset. A base is raided more than once a match,
+                        // and a home guard that spent itself on the first
+                        // harassing Raider would be a rule that is armed
+                        // exactly when it is not needed.
+                        repeat: Some(HOME_GUARD_COOLDOWN),
+                    },
+                );
             }
             CmdAction::SetPosture(kind) => {
                 let Some(squad) = resolve_squad(&mut submissions) else {
@@ -6944,6 +7087,9 @@ fn update_hud(
     } else {
         (String::new(), String::new())
     };
+    // The team's armed rules — nothing to do with the selection or the link,
+    // and drawn whether or not either exists.
+    let triggers_text = trigger_line(&cast.triggers, cast.clock.elapsed_secs());
 
     // Hero commands: the ability of a selected caster, one train/revive button
     // per hero class the team's slots have room for, the building's own
@@ -7040,6 +7186,7 @@ fn update_hud(
             doc,
             posture: live_posture.map(posture_kind),
             tmpl: single_template,
+            home_guard: has_trigger(&cast.triggers, HOME_GUARD),
         },
         &completed,
     );
@@ -7241,6 +7388,7 @@ fn update_hud(
             Slot::Doctrine => text.0 = doctrine_line.clone(),
             Slot::Why => text.0 = why_text.clone(),
             Slot::Link => text.0 = link_text.clone(),
+            Slot::Triggers => text.0 = triggers_text.clone(),
             Slot::Coverage => text.0 = coverage_text.clone(),
             Slot::Overflow => text.0 = overflow_text.clone(),
             Slot::CardLetter(i) => {
@@ -8169,8 +8317,12 @@ mod tests {
             .init_resource::<GameOver>()
             .init_resource::<TechTiers>()
             .init_resource::<SquadOrders>()
-            // `CastLookup` reads it, so the card cannot be built without it.
+            // `CastLookup` reads them, so the card cannot be built without
+            // them: research for the forge buttons, triggers and the clock for
+            // the home-guard toggle's lit state.
             .init_resource::<TeamResearch>()
+            .init_resource::<Triggers>()
+            .init_resource::<Time>()
             .add_event::<CameraFocus>()
             .add_event::<SubmitIntent>()
             .add_systems(Update, (control_groups, command_input, record).chain());
@@ -8763,6 +8915,107 @@ mod tests {
         assert_eq!(json(&click), json(&typed));
     }
 
+    /// **The human's trigger gesture is a sentence a commander could type.**
+    ///
+    /// `[I][H]` on a selection compiles to `squad` + `trigger_set`, and the
+    /// second of those is byte-identical to the JSON in COMMANDER_BRIEF.md's
+    /// home-guard recipe. This is the fairness invariant applied to the newest
+    /// verb in the language: the human's surface is *narrower* (one preset
+    /// against nine predicates and 27 verbs), but nothing it produces is
+    /// outside what the wire can say, and nothing the wire says is outside what
+    /// the engine will do for the human.
+    #[test]
+    fn the_home_guard_preset_is_a_trigger_a_commander_could_have_typed() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        spawn_selected_footman(&mut app, Vec3::new(-8.0, 0.0, -10.0));
+
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyH]);
+
+        let out = said(&app);
+        let sentences: Vec<String> = out.iter().map(|i| i.sentence()).collect();
+        assert_eq!(
+            sentences,
+            vec![
+                "2 units join squad 1".to_string(),
+                "when the base is attacked: squad 1 defends (-70.0, -70.0) within 26 \
+                 (trigger: home-guard, repeating every 30s)"
+                    .to_string(),
+            ]
+        );
+        let typed: Intent = serde_json::from_str(
+            r#"{"type":"trigger_set","name":"home-guard",
+                "when":{"type":"base_under_attack"},
+                "then":{"type":"posture","id":1,
+                        "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}},
+                "repeat":30.0}"#,
+        )
+        .unwrap();
+        assert_eq!(json(&out[1]), json(&typed));
+    }
+
+    /// The tile is a TOGGLE, like `[G] Guard`: pressed while armed it clears
+    /// the rule rather than arming a second copy. Without this the one key the
+    /// human has would be a one-way door.
+    #[test]
+    fn pressing_home_guard_again_clears_it() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+
+        // Arm it for real, through the resource the card reads.
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .set(
+                Team::Human,
+                TriggerRule {
+                    name: TriggerName::new(HOME_GUARD).unwrap(),
+                    when: TriggerWhen::BaseUnderAttack,
+                    then: Intent::Stop { units: vec![] },
+                    repeat: Some(HOME_GUARD_COOLDOWN),
+                    source: IntentSource::Ui,
+                    armed: true,
+                    last_fired: None,
+                },
+            )
+            .unwrap();
+
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyH]);
+        let sentences: Vec<String> = said(&app).iter().map(|i| i.sentence()).collect();
+        assert_eq!(sentences, vec!["clear trigger home-guard".to_string()]);
+    }
+
+    /// The human's whole "list" view. One line, because eight short names fit
+    /// on one and a scrolling panel would be the authoring UI this deliberately
+    /// defers.
+    #[test]
+    fn the_trigger_readout_names_every_rule_and_its_state() {
+        let mut triggers = Triggers::default();
+        let rule = |name: &str, repeat, armed, last| TriggerRule {
+            name: TriggerName::new(name).unwrap(),
+            when: TriggerWhen::BaseUnderAttack,
+            then: Intent::Stop { units: vec![] },
+            repeat,
+            source: IntentSource::Bridge,
+            armed,
+            last_fired: last,
+        };
+        assert_eq!(trigger_line(&triggers, 0.0), "", "silent until there is one");
+
+        triggers.set(Team::Human, rule("home-guard", Some(30.0), true, None)).unwrap();
+        triggers.set(Team::Human, rule("hero-save", None, false, Some(12.0))).unwrap();
+        triggers.set(Team::Human, rule("alarm", Some(60.0), true, Some(90.0))).unwrap();
+        assert_eq!(
+            trigger_line(&triggers, 100.0),
+            "Triggers: home-guard  hero-save (spent)  alarm (cooling)"
+        );
+
+        // The opponent's rules are their plans, and the panel never sees them.
+        triggers.set(Team::Claude, rule("theirs", None, true, None)).unwrap();
+        assert!(!trigger_line(&triggers, 100.0).contains("theirs"));
+    }
+
     /// The parameterised half of the gap: the coarse [V] writes one fixed
     /// threshold, [F] on the doctrine page walks the ladder — an actual number,
     /// chosen by the human, exactly as the bridge's `below` field is.
@@ -8990,6 +9243,15 @@ mod tests {
             ),
         ] {
             let entries = doctrine_entries(units, card);
+            // BUDGET NOTE: a page holds `CMD_SLOTS - 1` = 11 content tiles
+            // (the mode toggle is pinned). A two-ability caster's doctrine card
+            // is now exactly 11 — 4 postures, Stand Down, Fall back, Guard,
+            // Priority, two auto-casts, Home guard. It is FULL. The next tile
+            // that wants to live here spills the card to a [Tab] page and trips
+            // this assertion, which is the intended tripwire: overflow paging
+            // works and every hotkey stays live across it, but a doctrine
+            // vocabulary that no longer fits on one screen is a design decision
+            // rather than an accident, and it should be made deliberately.
             assert_eq!(
                 paginate(&entries, 0).pages,
                 1,

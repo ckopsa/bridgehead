@@ -13,6 +13,7 @@ mod hotkeys;
 mod intent;
 mod shared;
 mod terrain;
+mod trigger;
 mod ui;
 mod units;
 
@@ -106,6 +107,10 @@ fn main() {
         // the compiler. Inert unless `WC3_BRIDGE=copilot` seats one.
         copilot::CopilotPlugin,
         doctrine::DoctrinePlugin,
+        // Triggers: the CONTINGENT half of doctrine — a condition the engine
+        // watches and an intent it submits the moment it holds. Beside
+        // DoctrinePlugin because it shares its frame slot and its argument.
+        trigger::TriggerPlugin,
         bounty::BountyPlugin,
     ))
     .run();
@@ -147,6 +152,7 @@ mod tests {
             bridge::BridgePlugin,
             copilot::CopilotPlugin,
             doctrine::DoctrinePlugin,
+            trigger::TriggerPlugin,
             bounty::BountyPlugin,
         ))
         .add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));

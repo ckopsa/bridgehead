@@ -5,7 +5,7 @@
 
 WHAT THIS IS
 ------------
-The game speaks exactly one language: `shared::Intent`, 25 verbs, documented in
+The game speaks exactly one language: `shared::Intent`, 27 verbs, documented in
 docs/INTENT.md. A human's mouse compiles to it; a bridge commander's JSON *is*
 it. This tool adds a third spelling of the same language — English — and it is
 a TOOL, not an engine feature. Nothing here is natural-language processing.
@@ -38,16 +38,33 @@ TWO LAYERS, AND WHY
 Deterministic first. An idiom that earns its place here stops needing a model at
 all, which is the direction this should keep moving.
 
-WHAT IT DELIBERATELY WILL NOT DO
---------------------------------
-Conditionals. "strike when their hero falls" has no verb in the language,
-because the engine has no trigger system — doctrine is the only thing that acts
-on its own, and it reacts to health, range and treasure, not to arbitrary
-events. Rather than invent a trigger or silently drop the condition, the tool
-compiles the ACTION, reports it as deferred, and hands back the exact command
-to run when the commander sees the condition in the event feed. Refusing to
-guess is a feature: the alternative is an army that attacks at the wrong moment
-and a log that says the commander ordered it.
+CONDITIONALS ARE REAL NOW
+-------------------------
+"when my base is attacked, squad 1 defends our base" used to be the one thing
+this tool structurally could not compile: the engine had no trigger system, so
+the honest answer was to compile the ACTION, mark it deferred, and print the
+command to run once the commander spotted the condition in `events`.
+
+The engine has `trigger_set` now, so that whole paragraph is obsolete and the
+clause compiles. A conditional becomes one trigger the engine watches at 4 Hz
+and fires for you — which is the point, because the old advice priced every
+reaction at one poll cycle, and a poll cycle for a language model is ten to
+fifteen seconds.
+
+    "when my base is attacked, squad 1 defends our base"
+      -> {"type":"trigger_set","name":"base-attacked",
+          "when":{"type":"base_under_attack"},
+          "then":{"type":"posture","id":1,"posture":{...}}}
+
+`when`/`if`/`once`/`after`/`as soon as` arm a ONCE trigger; `whenever` and
+`every time` arm a REPEATING one with a cooldown. Name it yourself with a
+trailing `as <name>`, or let the tool derive a stable one from the condition.
+
+What it still will not do is guess at a condition it does not recognise: an
+unparseable `when` clause is an error naming the predicates that exist, never
+a plain order that quietly runs right now. An order that fires at the wrong
+moment is the failure this tool exists to prevent, and it is worse when the
+commander believes they armed a rule.
 """
 
 import argparse
@@ -694,6 +711,57 @@ def rule(name, pattern):
     return wrap
 
 
+@rule("squad-posture",
+      r"^squad\s*(?P<sid>\d+)\s+(?P<verb>defends?|holds?|guards?|pushes|push|"
+      r"attacks?|strikes?|forages?|hunts?)\s+(?P<place>.+?)"
+      r"(?:\s+(?:at|within)\s+(?:radius\s+)?(?P<radius>\d+))?$")
+def _squad_posture(m, ctx, clause):
+    """"squad 1 defends our base" — a posture on a squad NAMED by the commander.
+
+    Above `hold`/`push` in the table because it is the specific form: those
+    rules allocate a squad and enrol units into it, which is what you want when
+    you say "hold the ford with the cavalry" and exactly what you do NOT want
+    when you have already built squad 1 and are talking about it.
+
+    It emits ONE intent, which is also what makes it the natural action half of
+    a trigger: "when my base is attacked, squad 1 defends our base" defers a
+    single posture rather than a membership change the commander never asked to
+    postpone.
+    """
+    word = {"defend": "defend", "defends": "defend",
+            "hold": "defend", "holds": "defend",
+            "guard": "defend", "guards": "defend",
+            "push": "push", "pushes": "push",
+            "attack": "push", "attacks": "push",
+            "strike": "push", "strikes": "push",
+            "forage": "forage", "forages": "forage",
+            "hunt": "forage", "hunts": "forage"}[m.group("verb").lower()]
+    pos = resolve_place(m.group("place"), ctx.snap)
+    if pos is None:
+        ctx.result.fail(clause, f"cannot resolve place {m.group('place')!r}")
+        return []
+    sid = int(m.group("sid"))
+    posture = {"type": word, "x": round(pos[0], 1), "z": round(pos[1], 1)}
+    if word == "defend":
+        radius = m.group("radius")
+        posture["radius"] = float(radius) if radius else float(DEFAULT_DEFEND_RADIUS)
+    ctx.result.ok(clause, f"squad {sid} {word}s ({pos[0]:.1f}, {pos[1]:.1f})")
+    return [{"type": "posture", "id": sid, "posture": posture}]
+
+
+@rule("trigger-clear",
+      r"^(?:clear|disarm|cancel|drop|remove|forget)\s+(?:the\s+)?"
+      r"(?:trigger\s+(?P<name>[A-Za-z0-9][A-Za-z0-9_-]*)|"
+      r"(?P<all>all\s+triggers|every\s+trigger|triggers|my\s+triggers))$")
+def _trigger_clear(m, ctx, clause):
+    """Disarm one rule, or the whole slate."""
+    if m.group("name"):
+        ctx.result.ok(clause, f"clear trigger {m.group('name')!r}")
+        return [{"type": "trigger_clear", "name": m.group("name")}]
+    ctx.result.ok(clause, "clear every trigger")
+    return [{"type": "trigger_clear"}]
+
+
 @rule("hold", r"^(?:hold|defend|guard|garrison|sit\s+on)\s+(?P<place>.+?)"
               + WITH + r"(?:\s+(?:at|within)\s+(?:radius\s+)?(?P<radius>\d+))?$")
 def _hold(m, ctx, clause):
@@ -1124,11 +1192,282 @@ def _autopilot(m, ctx, clause):
 
 
 # ---------------------------------------------------------------------------
+# Triggers: the `when` half of the language
+# ---------------------------------------------------------------------------
+#
+# A conditional compiles to ONE `trigger_set`: the engine watches the predicate
+# at 4 Hz and submits the action itself. That is the whole reason this section
+# exists — the old advice ("watch `events`, then send the command") priced every
+# reaction at a poll cycle, and a poll cycle for a model is ten to fifteen
+# seconds.
+#
+# Predicates are `shared::TriggerWhen`, and the list is short on purpose: each
+# one is answerable from state the engine already keeps. A condition outside it
+# is DEFERRED with the old advice rather than guessed at — see `parse_when`.
+
+# Connectors that introduce a condition, and whether they mean "keep watching".
+# `whenever` / `every time` are the English for a repeating rule, and treating
+# them as synonyms of `when` would silently disarm a rule the commander expects
+# to keep working.
+ONCE_WORDS = ("when", "if", "once", "after", "as soon as")
+REPEAT_WORDS = ("whenever", "every time", "each time", "any time")
+CONNECTORS = "|".join(w.replace(" ", r"\s+") for w in REPEAT_WORDS + ONCE_WORDS)
+
+# Default cooldown for a repeating trigger, in game seconds. Long enough that a
+# rule cannot re-fire inside one engagement, short enough to answer the next
+# one. Override with a trailing "every 90s".
+DEFAULT_REPEAT_S = 45.0
+
+# "<action> when <cond>" — the trailing form, matched per clause.
+CONDITIONAL = re.compile(rf"^(?P<action>.+?)\s+(?P<conn>{CONNECTORS})\s+"
+                         r"(?P<cond>.+?)$", re.I)
+# "when <cond>, <action>" — the LEADING form, matched against the whole
+# directive BEFORE clause splitting, because the comma in it is the joint of one
+# sentence rather than a separator between two.
+LEADING_CONDITIONAL = re.compile(rf"^(?P<conn>{CONNECTORS})\s+(?P<cond>.+?)\s*,\s*"
+                                 r"(?P<action>.+)$", re.I)
+# An explicit name: "... as home-guard" / "... call it home-guard".
+NAMED = re.compile(r"^(?P<rest>.+?)\s+(?:as|named|call\s+it|calling\s+it)\s+"
+                   r"(?P<name>[A-Za-z0-9][A-Za-z0-9_-]{0,23})$", re.I)
+# An explicit cooldown: "... every 90s" / "... every 2 minutes".
+EVERY = re.compile(r"^(?P<rest>.+?)\s+every\s+(?P<n>\d+(?:\.\d+)?)\s*"
+                   r"(?P<unit>s|sec|secs|seconds|m|min|mins|minutes)?$", re.I)
+
+
+def _seconds(n, unit):
+    """A duration a commander typed. Bare numbers are seconds, like every other
+    time in this game (`Bounty.expires_at`, `GameEvent.t`)."""
+    n = float(n)
+    return n * 60.0 if unit and unit.lower().startswith("m") else n
+
+
+def parse_when(text):
+    """A condition phrase -> a `TriggerWhen` dict, or None if it is outside the
+    predicate vocabulary.
+
+    None is not an error: the caller DEFERS instead, because a commander whose
+    condition this cannot express is better served by the old watch-the-feed
+    advice than by a rule that fires on something else. The predicates are
+    deliberately few — every one of them is answerable from state the engine
+    already keeps, which is what keeps them cheap enough to evaluate at 4 Hz.
+    """
+    t = " ".join(text.strip().lower().rstrip(".").split())
+    theirs = bool(re.search(r"\b(their|enemy|enemies|hostile|his|her|its)\b", t))
+
+    # --- the base is being hit -------------------------------------------
+    if (not theirs and re.search(r"\b(base|town|hall|home|expansion)\b", t)
+            and re.search(r"\b(attack|attacked|attacking|raid|raided|hit|damaged|"
+                          r"burning|threatened)\b", t)):
+        return {"type": "base_under_attack"}
+
+    # --- a hero is dying --------------------------------------------------
+    # `their hero falls` is deliberately NOT this: the predicate vocabulary has
+    # no reading of an enemy hero's health, and answering it with your own would
+    # be the silent wrong order this whole tool exists to avoid.
+    if not theirs:
+        m = re.search(r"\bhero(?:es)?\b.*?(?:below|under|at)\s*(?P<pct>\d+)\s*%", t)
+        if m:
+            return {"type": "hero_below",
+                    "frac": round(int(m.group("pct")) / 100.0, 3)}
+        if re.search(r"\bhero(?:es)?\b.*\b(falls?|dying|dies|in\s+trouble|"
+                     r"nearly\s+dead|low|hurt|wounded)\b", t):
+            # A named default rather than a refusal: 35% is the threshold the
+            # human's own [V] Fall back preset uses, so "my hero is in trouble"
+            # means the same number in both interfaces.
+            return {"type": "hero_below", "frac": 0.35}
+
+    # --- a squad is breaking ---------------------------------------------
+    m = re.search(r"\bsquad\s*(?P<sid>\d+)\b.*?(?:below|under|at)\s*(?P<pct>\d+)\s*%", t)
+    if m:
+        return {"type": "squad_below", "id": int(m.group("sid")),
+                "frac": round(int(m.group("pct")) / 100.0, 3)}
+
+    # --- treasure ---------------------------------------------------------
+    # Above the sighting branch, not below it: "a bounty APPEARS" shares its
+    # verb with "cavalry appears", and the noun is the unambiguous half.
+    if re.search(r"\b(bounty|bounties|cache|caches|treasure|chest)\b", t):
+        return {"type": "bounty_spawned"}
+
+    # --- eyes on the enemy ------------------------------------------------
+    rest = None
+    m = re.search(r"\b(?:i|we)\s+(?:see|sight|spot|find)\s+(?P<rest>.+)$", t)
+    if m:
+        rest = m.group("rest")
+    elif re.search(r"\b(sighted|spotted|seen|appears?|arrives?|shows?\s+up)\b", t):
+        m = re.match(r"^(?P<rest>.+?)\s+(?:is|are)?\s*(?:sighted|spotted|seen|"
+                     r"appears?|arrives?|shows?\s+up)\b", t)
+        if m:
+            rest = m.group("rest")
+    if rest is not None:
+        rest = rest.strip()
+        count = 1
+        cm = re.match(r"^(?P<n>\d+)\s*(?:or\s+more\s+)?(?P<what>.*)$", rest)
+        if cm:
+            count, rest = int(cm.group("n")), cm.group("what").strip()
+        what = re.sub(r"^(?:their|the|a|an|any|some|enemy|hostile)\s+", "", rest).strip()
+        what = re.sub(r"^(?:their|enemy|hostile)\s+", "", what).strip()
+        if what in ("", "units", "unit", "them", "anything", "enemies", "enemy",
+                    "troops", "army", "something"):
+            return {"type": "enemy_sighted", "count": count}
+        cls = CLASS_WORDS.get(what) or CLASS_WORDS.get(what.rstrip("s"))
+        if cls:
+            return {"type": "enemy_sighted", "class": cls, "count": count}
+        return None
+
+    # --- the gold runs out ------------------------------------------------
+    if re.search(r"\bmines?\b", t) and re.search(
+            r"\b(dry|dries|empty|empties|exhausted|depleted|out)\b", t):
+        return {"type": "mine_dry"}
+
+    # --- teching up -------------------------------------------------------
+    reached = re.search(r"\b(reach|reached|reaches|hit|hits|get|got|gets|have|has|"
+                        r"finish|finished|am|are|is)\b", t)
+    m = re.search(r"\b(?:tier|t)\s*(?P<t>[123])\b", t)
+    if m and reached:
+        return {"type": "tier_reached", "tier": int(m.group("t"))}
+    if reached and re.search(r"\bkeep\b", t):
+        return {"type": "tier_reached", "tier": 2}
+    if reached and re.search(r"\bcastle\b", t):
+        return {"type": "tier_reached", "tier": 3}
+
+    # --- army size --------------------------------------------------------
+    m = re.search(r"\b(?:i|we)\s+(?:have|has|field|fields|reach|reaches|get|gets)\s+"
+                  r"(?P<n>\d+)\s+(?P<kind>[a-z ]+)$", t)
+    if m:
+        word = m.group("kind").strip()
+        kind = UNIT_WORDS.get(word) or UNIT_WORDS.get(word.rstrip("s"))
+        if kind:
+            return {"type": "unit_count", "kind": kind, "count": int(m.group("n"))}
+        return None
+
+    # --- the clock --------------------------------------------------------
+    if re.search(r"\b(clock|game\s+time|minutes?|seconds?|secs?)\b", t):
+        m = re.search(r"(?P<n>\d+(?:\.\d+)?)\s*(?P<unit>s|sec|secs|seconds|m|min|"
+                      r"mins|minutes)?\b", t)
+        if m:
+            unit = m.group("unit")
+            if not unit and re.search(r"\bminutes?\b", t):
+                unit = "m"
+            return {"type": "game_time",
+                    "at": round(_seconds(m.group("n"), unit), 1)}
+
+    return None
+
+
+def name_for(when):
+    """The auto-derived trigger name.
+
+    Deterministic and short (the engine caps a name at 24 bytes), so re-issuing
+    the same directive next cycle REPLACES the rule in place instead of spending
+    another of the eight slots. A commander that wants its own label says
+    `... as home-guard`.
+    """
+    kind = when["type"]
+    if kind == "base_under_attack":
+        return "base-attacked"
+    if kind == "hero_below":
+        return f"hero-{int(round(when['frac'] * 100))}"
+    if kind == "squad_below":
+        return f"sq{when['id']}-{int(round(when['frac'] * 100))}"
+    if kind == "enemy_sighted":
+        what = when.get("class", "enemy").lower()
+        n = when.get("count", 1)
+        return f"{what}-seen" if n <= 1 else f"{n}-{what}-seen"
+    if kind == "bounty_spawned":
+        return "bounty-up"
+    if kind == "mine_dry":
+        return "mine-dry"
+    if kind == "tier_reached":
+        return f"tier{when['tier']}"
+    if kind == "unit_count":
+        return f"{when['kind'].lower()}-{when['count']}"
+    if kind == "game_time":
+        return f"t{int(when['at'])}"
+    return "trigger"
+
+
+def compile_conditional(conn, cond_text, action_text, clause, ctx):
+    """One conditional -> the intents it means.
+
+    The action is compiled by the ORDINARY rules against the ordinary snapshot,
+    so a trigger can say anything the language can say. When the action compiles
+    to several intents — "hold the ford with the cavalry" is membership *and*
+    purpose — the leading ones are emitted NOW and the LAST becomes the deferred
+    action. That split is the honest reading of the sentence: who is in the
+    squad is a fact you establish today; what the squad does when the base burns
+    is the part that waits.
+    """
+    conn_norm = " ".join(conn.lower().split())
+    repeat = DEFAULT_REPEAT_S if conn_norm in REPEAT_WORDS else None
+
+    # Cooldown first, then the name: both are trailing modifiers, and "... as
+    # home-guard every 2 minutes" puts them in that order because it is the
+    # order a person says them in.
+    name = None
+    m = EVERY.match(action_text)
+    if m:
+        action_text = m.group("rest").strip()
+        repeat = _seconds(m.group("n"), m.group("unit"))
+    m = NAMED.match(action_text)
+    if m:
+        action_text, name = m.group("rest").strip(), m.group("name").strip()
+
+    when = parse_when(cond_text)
+
+    # Compile the action against a throwaway context first: if the condition
+    # turns out to be inexpressible we must not have spent a squad id or a build
+    # site on a batch we are not going to send.
+    probe = Result()
+    probe_ctx = Ctx(ctx.snap, probe)
+    probe_ctx.used_squads = set(ctx.used_squads)
+    probe_ctx.assigned = dict(ctx.assigned)
+    probe_ctx.claimed_sites = list(ctx.claimed_sites)
+    probe_ctx.busy_workers = set(ctx.busy_workers)
+    trial = compile_clause(action_text, probe_ctx)
+
+    if when is None:
+        # The condition is outside the predicate vocabulary. The old advice is
+        # still the right advice for exactly this case, so it survives here
+        # rather than being deleted along with the rest of it.
+        ctx.result.deferred.append((clause, cond_text.strip(),
+                                    action_text if trial else None))
+        return []
+    if not trial:
+        reason = probe.errors[0][1] if probe.errors else "no pattern matched"
+        ctx.result.fail(clause, f"the condition is fine, but the action "
+                                f"{action_text!r} did not compile ({reason})")
+        return []
+    # A trigger may not arm or disarm a trigger — the engine refuses it, and
+    # emitting it anyway would mean learning that from an error channel a turn
+    # later. It is the line between doctrine and a scripting language, and it
+    # is what makes the cap of eight an actual bound rather than a starting
+    # balance.
+    if any(i["type"] in ("trigger_set", "trigger_clear") for i in trial):
+        ctx.result.fail(clause, "a trigger cannot arm or clear another trigger "
+                                "— triggers are doctrine, not a scripting language")
+        return []
+
+    # The action really is being compiled now, so its claims are real claims.
+    ctx.used_squads = probe_ctx.used_squads
+    ctx.assigned = probe_ctx.assigned
+    ctx.claimed_sites = probe_ctx.claimed_sites
+    ctx.busy_workers = probe_ctx.busy_workers
+
+    setup, action = trial[:-1], trial[-1]
+    name = name or name_for(when)
+    trigger = {"type": "trigger_set", "name": name, "when": when, "then": action}
+    if repeat is not None:
+        trigger["repeat"] = repeat
+    cadence = f"repeating every {repeat:g}s" if repeat is not None else "once"
+    ctx.result.ok(clause,
+                  f"trigger {name!r} ({cadence}): when {when['type']} -> {action['type']}"
+                  + (f", plus {len(setup)} intent(s) sent now" if setup else ""))
+    return setup + [trigger]
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
-
-CONDITIONAL = re.compile(r"^(?P<action>.+?)\s+(?:when|if|once|after|as\s+soon\s+as)\s+"
-                         r"(?P<cond>.+?)$", re.I)
 
 
 def split_clauses(text):
@@ -1186,18 +1525,23 @@ def compile_directives(directives, snap):
     result = Result()
     ctx = Ctx(snap, result)
     for directive in directives:
+        # The LEADING conditional is matched against the whole directive, before
+        # `split_clauses` ever sees it. "when my base is attacked, squad 1
+        # defends our base" has exactly one comma and it is the joint of one
+        # sentence — splitting there produced a dangling "when ..." fragment and
+        # an order that ran immediately, which is the worst of both.
+        lead = LEADING_CONDITIONAL.match(directive.strip().rstrip("."))
+        if lead:
+            result.intents.extend(compile_conditional(
+                lead.group("conn"), lead.group("cond"), lead.group("action").strip(),
+                directive.strip(), ctx))
+            continue
         for clause in split_clauses(directive):
-            cond = CONDITIONAL.match(clause)
+            cond = CONDITIONAL.match(clause.strip().rstrip("."))
             if cond:
-                # The action may be perfectly compilable; the trigger is not
-                # expressible. Say so, and hand back the command to run later.
-                action = cond.group("action").strip()
-                probe = Result()
-                probe_ctx = Ctx(snap, probe)
-                probe_ctx.used_squads = set(ctx.used_squads)
-                trial = compile_clause(action, probe_ctx)
-                suggestion = action if trial else None
-                result.deferred.append((clause, cond.group("cond").strip(), suggestion))
+                result.intents.extend(compile_conditional(
+                    cond.group("conn"), cond.group("cond"),
+                    cond.group("action").strip(), clause, ctx))
                 continue
             out = compile_clause(clause, ctx)
             if out is None:
@@ -1268,12 +1612,40 @@ WHAT THE PATTERN LAYER UNDERSTANDS
 
   Clauses split on commas, semicolons and newlines — not on "and".
 
-WHAT IT WILL NOT DO, AND WHAT TO DO INSTEAD
-  Conditionals ("strike when their hero falls") have no verb in this language:
-  the engine has no trigger system, and doctrine reacts only to health, range
-  and treasure. The tool compiles the action, marks it deferred, and prints the
-  command to run when you see the condition in the event feed. Watch `events`
-  (bridge_wait.py wakes you on them), then run the printed command.
+TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
+  A conditional compiles to one `trigger_set`. The engine evaluates the
+  predicate every 250ms and submits the action itself, so a reaction costs you
+  nothing per poll. Max 8 armed triggers; re-using a name replaces that rule.
+    "when my base is attacked, squad 1 defends our base"
+    "pull back when my hero drops below 30%"
+    "whenever a bounty appears, forage mid with the cavalry"   (repeating)
+    "when we reach tier 2, build a workshop as tech-up"        (your own name)
+    "when the clock passes 6 minutes, push their base every 90s"
+    "clear all triggers" / "disarm trigger home-guard"     -> trigger_clear
+  when / if / once / after / as soon as   -> fires ONCE, then disarms
+  whenever / every time / each time       -> REPEATS (45s cooldown by default)
+  "... as <name>"   names it;   "... every 90s"   sets the cooldown.
+
+  THE NINE PREDICATES (this is the whole list — `shared::TriggerWhen`):
+    my base is attacked                 any of your buildings damaged (last 8s)
+    my hero drops below 40%             any living hero of yours under that
+    squad 2 drops below 50%             that squad's POOLED health under that
+    I see 3 or more siege               enemy units you can SEE right now
+    a bounty appears                    a cache you can see is on the map
+    my mine runs dry                    a dry gold mine near one of your halls
+    we reach tier 2                     your tech tier (1/2/3)
+    we have 8 footmen                   your living count of one unit kind
+    the clock passes 6 minutes          game time
+
+  If your condition is not one of these the tool says so and falls back to the
+  old advice — watch `events` (bridge_wait.py wakes you on them) and send the
+  action yourself. It will not silently pick a predicate that is nearly right:
+  "strike when their hero falls" defers, because nothing here reads an ENEMY
+  hero's health and answering it with your own is a different order.
+
+  A trigger's action is any intent, but exactly ONE. When your phrasing needs
+  two ("hold the ford with the cavalry" is membership AND purpose), the
+  membership is sent now and the purpose is what waits.
 
 IF A PHRASE IS NOT HERE (the escape hatch)
   You are a language model with the snapshot in front of you. Write the intents
@@ -1312,8 +1684,12 @@ def report(result, stream):
     for clause, summary in result.notes:
         print(f"  ok       {clause!r:<44} -> {summary}", file=stream)
     for clause, cond, suggestion in result.deferred:
-        print(f"  deferred {clause!r:<44} -> no trigger verb exists; watch for "
-              f"{cond!r} in `events`, then run:", file=stream)
+        # `deferred` now means one specific thing: the ACTION compiles but the
+        # CONDITION is outside `TriggerWhen`. The old watch-the-feed advice is
+        # exactly right for that case and nothing else, so it lives here.
+        print(f"  deferred {clause!r:<44} -> no predicate matches {cond!r} "
+              f"(see --explain for the nine); watch `events` for it, then run:",
+              file=stream)
         print(f"           intent_compile.py --seat <SEAT> --send "
               f"{suggestion!r}" if suggestion else
               "           (and write the intents by hand — see --explain)",
