@@ -64,7 +64,17 @@ Production:
   Priestess. Name the hero and the item lands in that hero's bag; name one that is not a living
   hero of yours and the command is REJECTED rather than redirected, so a typo can never hand
   your potion to the wrong character.
-  TownPortal teleports that hero + nearby own units to your nearest TownHall — the expansion-saver.
+  TownPortal teleports that hero + nearby own units to one of your halls; ScrollOfMassTeleport
+  (T3) takes the hero + EVERY own non-worker on the map (workers keep mining).
+  **YOU CHOOSE THE HALL.** `{"type":"use_item","slot":0,"hero":id,"destination":<building id>}`
+  — `destination` is one of YOUR OWN FINISHED HALLS, read straight off `buildings[]`. Omit it and
+  you get the hall nearest the hero, which is the old behaviour and is WRONG in the case the
+  scroll exists for: with the army at the expansion and the main dying, "nearest" ports you to
+  the expansion you are already standing on. Name the far hall. A destination that is not your
+  own standing hall is REJECTED (`destination 123 is not your standing hall`) and the item is
+  NOT spent, so a typo costs you a cycle, never a 250-gold scroll. The catalog flags both items
+  `"destination": "choosable"`. On arrival your EVT feed says which hall you landed at by name:
+  `hero ports the army to the Keep at (-70.0, -70.0)`.
 Doctrine (standing orders, executed continuously — USE THESE, they fight for you between your turns):
 - `{"type":"priority","units":[ids],"classes":[...]}` — focus-fire order ([] clears). Valid classes:
   Hero (both hero types), Archer (also Sorcerers — the fragile ranged back rank), Footman,
@@ -465,3 +475,12 @@ first), `unlocked` for ACTING.
 4. Buildings are worth 60 hero XP: razing an undefended expansion levels your hero safely.
 5. Keep training workers (target 12-14) even during fights; economy wins long games.
 6. Watch the EVT feed: "hostiles near base" means respond NOW, not next cycle.
+7. **Army split is instantly fatal and the game gives no warning** (r10). Escorting an expansion
+   and defending a main are 130 units apart; between the decision and the counterattack landing
+   there is no signal, and the march home IS the game. Doctrine offers nothing between the two —
+   a `defend` posture does not react to a base outside its radius.
+   **The answer to defending two places is a scroll aimed at the OTHER one.** Keep a
+   ScrollOfMassTeleport on the hero the moment you take a second base, and when the main is hit,
+   fire it with `destination` set to the MAIN — not to wherever the army happens to be standing.
+   That is the difference between a 14-second march and an instant one, and it is the only tool
+   in the game that lets one army hold two places.

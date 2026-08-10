@@ -177,6 +177,13 @@ const PAD: f32 = 8.0;
 /// Minimap is a square of this many logical pixels.
 const MINIMAP_PX: f32 = 184.0;
 
+/// How close to a minimap click an own hall must stand to be the hall that
+/// click NAMED, in world units. A hall's footprint is about seven minimap
+/// pixels, which is a hard thing to hit under pressure; halls stand far enough
+/// apart that this radius still cannot mean two of them at once, and the
+/// nearest wins if it ever does.
+const MINIMAP_HALL_PICK: f32 = 10.0;
+
 /// Selection cards: 2 rows of 6.
 const MAX_CARDS: usize = 12;
 const CARD_PX: f32 = 44.0;
@@ -438,6 +445,10 @@ struct UiState {
     /// taught and postures borrowed. A `Caster`-geometry ability never arms
     /// anything and fires on the key press exactly as it always did.
     cast_place: Option<CastArm>,
+    /// A teleport item waiting for the player to click WHICH hall it goes to.
+    /// Armed only when there are two or more to choose between; see
+    /// [`TeleportArm`].
+    teleport_place: Option<TeleportArm>,
     /// Round-robin cursor for the idle-worker hotkey.
     idle_cursor: usize,
     /// Left button went down inside the minimap and is still held.
@@ -783,6 +794,29 @@ struct CastArm {
     name: &'static str,
     /// True for `AbilityTarget::Unit`: the click names a unit, not ground.
     wants_unit: bool,
+}
+
+/// A teleport item waiting for the player to say WHICH hall.
+///
+/// The fourth user of the press-then-click vocabulary building placement
+/// taught, and the first whose click names a *building* rather than a point or
+/// a unit. Like [`CastArm`], the hero and the slot are resolved at PRESS time:
+/// the bag the player is spending from must not change under them between the
+/// key and the click.
+///
+/// It only ever exists with **two or more** standing halls. With one hall
+/// there is no choice to make, so the key fires the scroll outright with no
+/// destination at all — a ceremony that always has exactly one answer is a
+/// tax, not a decision, and the nearest-hall default already says it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TeleportArm {
+    /// Whose bag, named explicitly for the reason `UseSlot` always named it:
+    /// reading "the team's hero" at click time would show the Priestess's
+    /// scroll and burn the Champion's.
+    hero: Entity,
+    slot: usize,
+    /// Item name, for the hint line the player reads while choosing.
+    name: &'static str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3509,7 +3543,12 @@ fn command_input(
     // Escape cancels every transient mode, innermost first, and finally backs
     // out of the doctrine page — so Escape always means "one step out".
     if keys.just_pressed(hotkeys::CANCEL) {
-        if ui.cast_place.is_some() {
+        // Innermost first, and a hall-pick is the innermost thing there is: it
+        // is armed from a card that is itself only reachable with a hero
+        // selected, and backing out of it must not also drop the hero.
+        if ui.teleport_place.is_some() {
+            ui.teleport_place = None;
+        } else if ui.cast_place.is_some() {
             ui.cast_place = None;
         } else if ui.placement.is_some() {
             ui.placement = None;
@@ -3877,6 +3916,7 @@ fn command_input(
             CmdAction::AttackMove => {
                 ui.attack_move_armed = true;
                 ui.placement = None;
+                ui.teleport_place = None;
             }
             CmdAction::Stop => {
                 if !own_units.is_empty() {
@@ -3893,6 +3933,7 @@ fn command_input(
                 ui.placement = Some(kind);
                 ui.wall_chain.clear();
                 ui.attack_move_armed = false;
+                ui.teleport_place = None;
             }
             // Abilities: combat.rs owns the unlock/mana/cooldown verdict,
             // exactly as it does for the AI and the bridge. The hotkey IS the
@@ -3936,6 +3977,7 @@ fn command_input(
                     ui.attack_move_armed = false;
                     ui.placement = None;
                     ui.posture_place = None;
+                    ui.teleport_place = None;
                     continue;
                 }
                 for (hero, _, _, _) in &own_casters {
@@ -3957,6 +3999,7 @@ fn command_input(
                         ui.attack_move_armed = false;
                         ui.placement = None;
                         ui.posture_place = None;
+                        ui.teleport_place = None;
                         continue;
                     }
                     say(&mut submissions, cast_here(entity, index, None));
@@ -4017,15 +4060,52 @@ fn command_input(
                 // (`hero_cmds.items`), so the intent has to name it. Reading
                 // "the team's hero" here would show the Priestess's potion and
                 // drink the Champion's.
-                if let Some((entity, ..)) = own_casters.first() {
-                    say(
-                        &mut submissions,
-                        Intent::UseItem {
+                let Some((entity, _, _, inventory)) = own_casters.first() else {
+                    continue;
+                };
+                // A teleport item is the one consumable whose press is a
+                // QUESTION, not an act: with a second hall standing, "use the
+                // scroll" no longer names an outcome. So the key arms a
+                // hall-pick, exactly as a targeted ability's key arms an aim —
+                // and, exactly as a `Caster`-geometry ability fires on the
+                // press, a team with one hall gets no ceremony at all,
+                // because there is nothing to be asked.
+                let teleport = inventory
+                    .0
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .filter(|id| item_chooses_destination(*id));
+                if let Some(item) = teleport {
+                    let halls = all_buildings
+                        .iter()
+                        .filter(|(b, team, _, under, _)| {
+                            **team == Team::Human && !under && is_hall(b.kind)
+                        })
+                        .count();
+                    if halls > 1 {
+                        ui.teleport_place = Some(TeleportArm {
+                            hero: *entity,
                             slot,
-                            hero: Some(intent_id(*entity)),
-                        },
-                    );
+                            name: item_name(item),
+                        });
+                        ui.attack_move_armed = false;
+                        ui.placement = None;
+                        ui.posture_place = None;
+                        ui.cast_place = None;
+                        continue;
+                    }
                 }
+                say(
+                    &mut submissions,
+                    Intent::UseItem {
+                        slot,
+                        hero: Some(intent_id(*entity)),
+                        // One hall, or an item that does not teleport: the
+                        // nearest-hall default is the only answer there is.
+                        destination: None,
+                    },
+                );
             }
             // --- doctrine toggles ------------------------------------------
             // These are the clearest case of a gesture *compiling*: the card
@@ -4175,6 +4255,7 @@ fn command_input(
                 ui.wall_chain.clear();
                 ui.posture_place = None;
                 ui.cast_place = None;
+                ui.teleport_place = None;
             }
             CmdAction::SetPosture(kind) => {
                 let Some(squad) = resolve_squad(&mut submissions) else {
@@ -4189,6 +4270,7 @@ fn command_input(
                 ui.placement = None;
                 ui.wall_chain.clear();
                 ui.cast_place = None;
+                ui.teleport_place = None;
             }
             CmdAction::ClearPosture => {
                 // Clearing a posture leaves membership intact: the squad stops
@@ -4636,6 +4718,11 @@ fn minimap_input(
     mut focus: EventWriter<CameraFocus>,
     mut submissions: EventWriter<SubmitIntent>,
     sel_units: Query<(Entity, &Team), (With<Selected>, With<Unit>)>,
+    // The hall pick's second home. Cheap because the plumbing was already
+    // here: this system converts a minimap click to a world point for the
+    // camera and for right-click orders, so naming a hall from it is that
+    // point plus one nearest-own-hall search.
+    halls: Query<(Entity, &Building, &Team, &Transform), Without<UnderConstruction>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -4647,6 +4734,46 @@ fn minimap_input(
     let rect = minimap_rect(window);
     let cursor = window.cursor_position();
     let inside = cursor.map_or(false, |c| rect.contains(c));
+
+    // --- left click while a teleport is armed: name the hall ---------------
+    //
+    // The minimap is where the OTHER base is. A hall-pick that could only be
+    // made in the world view would ask the player to scroll the camera to the
+    // main they are trying to save, which is a second or two of exactly the
+    // moment the scroll exists to buy back. Tolerance is generous
+    // (`MINIMAP_HALL_PICK` world units, ~11 minimap pixels) because a hall is
+    // only about seven pixels wide down here; halls stand far enough apart
+    // that a forgiving radius still cannot mean two of them at once, and if
+    // it did, the nearest wins. A miss leaves the gesture armed and falls
+    // through to the ordinary camera drag, so a mis-click still just looks.
+    if buttons.just_pressed(MouseButton::Left) && inside && ui.teleport_place.is_some() {
+        if let (Some(arm), Some(c)) = (ui.teleport_place, cursor) {
+            let uv = Vec2::new(c.x - rect.min.x, c.y - rect.min.y);
+            let ground = clamp_to_map(minimap_to_world(uv));
+            let mut best: Option<(Entity, f32)> = None;
+            for (e, b, team, tf) in &halls {
+                if *team != Team::Human || !is_hall(b.kind) {
+                    continue;
+                }
+                let d = dist_xz(tf.translation, ground);
+                if d <= MINIMAP_HALL_PICK && best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((e, d));
+                }
+            }
+            if let Some((hall, _)) = best {
+                say(
+                    &mut submissions,
+                    Intent::UseItem {
+                        slot: arm.slot,
+                        hero: Some(intent_id(arm.hero)),
+                        destination: Some(intent_id(hall)),
+                    },
+                );
+                ui.teleport_place = None;
+                return;
+            }
+        }
+    }
 
     // --- left click / drag: move the camera --------------------------------
     if buttons.just_pressed(MouseButton::Left) && inside {
@@ -4705,7 +4832,17 @@ fn left_mouse(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     units: Query<(Entity, &Transform, &Unit, &Team, Has<Selected>)>,
-    buildings: Query<(Entity, &Transform, &Building, &Team, Has<Selected>)>,
+    // `UnderConstruction` rides along for the hall pick: a hall still going up
+    // is not a place a scroll can land, and offering it would compose a
+    // gesture the compiler is about to refuse.
+    buildings: Query<(
+        Entity,
+        &Transform,
+        &Building,
+        &Team,
+        Has<Selected>,
+        Has<UnderConstruction>,
+    )>,
     selected: Query<Entity, With<Selected>>,
     mut drag_node: Query<&mut Node, With<DragRect>>,
 ) {
@@ -4889,6 +5026,48 @@ fn left_mouse(
                     return;
                 }
 
+                // Hall pick. The item card armed a teleport; this click names
+                // WHICH of your halls it arrives at, and the pair becomes the
+                // same sentence a commander sends as
+                // {"type":"use_item","slot":0,"hero":7,"destination":34}.
+                //
+                // The picker is the SELECTION picker's building rule verbatim
+                // (own, within half a footprint of the ground point), so "the
+                // hall you can click to select" and "the hall you can click to
+                // port to" are the same hall. A miss leaves it armed, for the
+                // reason Escort and a targeted cast do: this gesture is
+                // usually made with an enemy army on top of the thing you are
+                // aiming at, and disarming on a near-miss would make the hall
+                // you most need the one you keep failing to name.
+                if let Some(arm) = ui.teleport_place {
+                    if let Some(ground) = ground {
+                        let mut best: Option<(Entity, f32)> = None;
+                        for (e, tf, b, team, _, under) in &buildings {
+                            if *team != Team::Human || under || !is_hall(b.kind) {
+                                continue;
+                            }
+                            let d = dist_xz(tf.translation, ground);
+                            if d <= building_stats(b.kind).size * 0.5
+                                && best.is_none_or(|(_, bd)| d < bd)
+                            {
+                                best = Some((e, d));
+                            }
+                        }
+                        if let Some((hall, _)) = best {
+                            say(
+                                &mut submissions,
+                                Intent::UseItem {
+                                    slot: arm.slot,
+                                    hero: Some(intent_id(arm.hero)),
+                                    destination: Some(intent_id(hall)),
+                                },
+                            );
+                            ui.teleport_place = None;
+                        }
+                    }
+                    return;
+                }
+
                 // Attack-move click.
                 if ui.attack_move_armed {
                     if let Some(ground) = ground {
@@ -4968,7 +5147,7 @@ fn left_mouse(
             }
             // Only buildings caught by the box.
             let mut picked_buildings = Vec::new();
-            for (e, tf, _, team, _) in &buildings {
+            for (e, tf, _, team, _, _) in &buildings {
                 if *team != Team::Human {
                     continue;
                 }
@@ -5009,7 +5188,7 @@ fn left_mouse(
             }
         }
         if best.is_none() {
-            for (e, tf, b, team, _) in &buildings {
+            for (e, tf, b, team, _, _) in &buildings {
                 if *team != Team::Human {
                     continue;
                 }
@@ -5078,12 +5257,14 @@ fn right_mouse(
         || ui.attack_move_armed
         || ui.posture_place.is_some()
         || ui.cast_place.is_some()
+        || ui.teleport_place.is_some()
     {
         ui.placement = None;
         ui.wall_chain.clear();
         ui.attack_move_armed = false;
         ui.posture_place = None;
         ui.cast_place = None;
+        ui.teleport_place = None;
         return;
     }
 
@@ -6363,9 +6544,14 @@ fn update_hud(
     heroes: Query<(&Team, &Unit, Option<&Inventory>), With<Hero>>,
     // Read-only: which buildings the player has FINISHED (the tech gate), and
     // what is in their queues (heroes in flight spend a slot).
+    // `Transform` and `Health` ride along for ONE reader: the hall-pick hint,
+    // which names the hall that is bleeding. See the hint block below for why
+    // the answer is a sentence rather than a highlight.
     all_buildings: Query<(
         &Building,
         &Team,
+        &Transform,
+        &Health,
         Has<UnderConstruction>,
         Option<&TrainingQueue>,
     )>,
@@ -6768,7 +6954,7 @@ fn update_hud(
         .filter(|(t, _, _)| **t == Team::Human)
         .map(|(_, u, _)| u.kind)
         .collect();
-    for (_, team, _, queue) in all_buildings.iter() {
+    for (_, team, _, _, _, queue) in all_buildings.iter() {
         if *team != Team::Human {
             continue;
         }
@@ -6841,8 +7027,8 @@ fn update_hud(
     };
     let completed: Vec<BuildingKind> = all_buildings
         .iter()
-        .filter(|(_, t, under, _)| **t == Team::Human && !under)
-        .map(|(b, _, _, _)| b.kind)
+        .filter(|(_, t, _, _, under, _)| **t == Team::Human && !under)
+        .map(|(b, ..)| b.kind)
         .collect();
     let all_entries = command_entries(
         ui.page,
@@ -6880,7 +7066,60 @@ fn update_hud(
     ui.queue_len = queue_letters.len();
 
     // --- hints -------------------------------------------------------------
-    let hints = if let Some(kind) = ui.placement {
+    let hints = if let Some(arm) = ui.teleport_place {
+        // SHOULD A HALL UNDER ATTACK BE HIGHLIGHTED? Yes — as a sentence, not
+        // as a highlight. The decision, and why:
+        //
+        // The reason to arm this gesture at all is almost always that one of
+        // your halls is being hit, and a pick UI that made the player read the
+        // alert stack to find out WHICH would be asking them to do the lookup
+        // twice, with a modal gesture held open. So the hint names it.
+        //
+        // It is a sentence because a highlight is not cheap: the world view
+        // has no per-building marker to borrow (rings are parented on
+        // selection), and the minimap draws buildings as flat dots with no
+        // per-entity state, so either would mean new render plumbing for one
+        // transient mode. The hint line is already recomputed every frame from
+        // this exact query.
+        //
+        // The predicate is the building's own health fraction against
+        // `BUILDING_HURT_FRAC` — the SAME threshold `shared::…` uses to decide
+        // a building is "under attack" for the alert stack and the bridge
+        // event feed. Not a re-derivation: the hint and the alert agree by
+        // construction, so the line the player reads here cannot contradict
+        // the line they just read there. (`GameEvents`' structured threat
+        // state was the other candidate and is the wrong shape — it is one
+        // hostile COUNT for the whole base, not a per-hall verdict, so it
+        // could not name a hall even though it is what raises the alarm.)
+        let hurt: Vec<String> = all_buildings
+            .iter()
+            .filter(|(b, team, _, hp, under, _)| {
+                **team == Team::Human
+                    && !under
+                    && is_hall(b.kind)
+                    && hp.max > 0.0
+                    && hp.current / hp.max < BUILDING_HURT_FRAC
+            })
+            .map(|(b, _, tf, _, _, _)| {
+                format!(
+                    "{} at ({:.0},{:.0})",
+                    building_name(b.kind),
+                    tf.translation.x,
+                    tf.translation.z
+                )
+            })
+            .collect();
+        let tail = if hurt.is_empty() {
+            "the far hall is the one that saves it".to_string()
+        } else {
+            format!("UNDER ATTACK: {}", hurt.join(", "))
+        };
+        format!(
+            "{} armed: left-click the HALL to arrive at, on the map or the minimap \
+             (Right-click / Esc cancels) - {tail}",
+            arm.name
+        )
+    } else if let Some(kind) = ui.placement {
         let s = building_stats(kind);
         let tail = if kind == BuildingKind::Wall {
             "Left-click each segment (placement stays armed), Right-click / Esc to stop"
@@ -9669,5 +9908,172 @@ mod tests {
         // that literally would write PNGs into the process's own directory.
         assert_eq!(shot_dir_from(Some("")), PathBuf::from(DEFAULT_SHOT_DIR));
         assert_eq!(shot_dir_from(Some("   ")), PathBuf::from(DEFAULT_SHOT_DIR));
+    }
+
+    // -----------------------------------------------------------------------
+    // The hall pick: when the item key is a question and when it is an act
+    // -----------------------------------------------------------------------
+
+    /// A selected hero carrying `item` in slot 0.
+    fn spawn_selected_hero_with(app: &mut App, item: ItemId) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Transform::from_translation(Vec3::new(20.0, 0.0, 20.0)),
+                Health::new(600.0),
+                Order::Idle,
+                Hero { level: 3, xp: 0.0, mana: 200.0 },
+                Inventory([Some(item), None]),
+                Selected,
+            ))
+            .id()
+    }
+
+    fn spawn_hall(app: &mut App, kind: BuildingKind, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Building { kind },
+                Team::Human,
+                Transform::from_translation(at),
+                Health::new(building_stats(kind).hp),
+            ))
+            .id()
+    }
+
+    /// **Two halls make the key a question.** Pressing it must not spend the
+    /// scroll — it arms the pick and says nothing, because with a choice
+    /// available "use the scroll" no longer names an outcome.
+    #[test]
+    fn a_second_hall_turns_the_teleport_key_into_a_hall_pick() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::ScrollOfMassTeleport);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        spawn_hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+
+        assert!(
+            said(&app).is_empty(),
+            "arming is not using: {:?}",
+            said(&app)
+        );
+        let armed = app.world().resource::<UiState>().teleport_place;
+        assert!(armed.is_some(), "the key armed a hall pick");
+        assert_eq!(armed.unwrap().slot, 0, "and it remembers which slot it is spending");
+        // The card's own short label, so the hint names the button the player
+        // just pressed rather than a second name for the same thing.
+        assert_eq!(armed.unwrap().name, item_name(ItemId::ScrollOfMassTeleport));
+    }
+
+    /// **One hall is no choice at all, so there is no ceremony.** The key
+    /// fires the scroll outright, with no destination — which is exactly the
+    /// pre-existing behaviour, and the nearest-hall default is the only answer
+    /// there is anyway.
+    #[test]
+    fn with_one_hall_the_teleport_key_still_just_fires() {
+        let mut app = ui_app();
+        let hero = spawn_selected_hero_with(&mut app, ItemId::ScrollOfMassTeleport);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+
+        assert!(
+            app.world().resource::<UiState>().teleport_place.is_none(),
+            "nothing to ask, so nothing is armed"
+        );
+        assert!(
+            matches!(
+                said(&app),
+                [Intent::UseItem { slot: 0, hero: Some(h), destination: None }] if *h == hero.to_bits()
+            ),
+            "the item fires on the press, unaimed: {:?}",
+            said(&app)
+        );
+    }
+
+    /// A hall still going up is not a place a scroll can land, so it does not
+    /// count toward "is there a choice". Two buildings, one finished hall, no
+    /// question.
+    #[test]
+    fn a_hall_under_construction_is_not_a_choice() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::TownPortal);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        let going_up = spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(-70.0, 0.0, -70.0));
+        app.world_mut()
+            .entity_mut(going_up)
+            .insert(UnderConstruction { remaining: 20.0 });
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+
+        assert!(
+            app.world().resource::<UiState>().teleport_place.is_none(),
+            "an unfinished hall is not a destination, so there is still only one"
+        );
+        assert_eq!(said(&app).len(), 1, "and the portal fires: {:?}", said(&app));
+    }
+
+    /// Only the teleport items ask. A potion with two halls standing is still
+    /// just a potion — the arming rule is a property of the ITEM, read from
+    /// the one function that answers it.
+    #[test]
+    fn a_potion_never_asks_which_hall() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::HealingPotion);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        spawn_hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+
+        assert!(
+            app.world().resource::<UiState>().teleport_place.is_none(),
+            "a potion has nowhere to go"
+        );
+        assert_eq!(said(&app).len(), 1, "it is drunk on the press: {:?}", said(&app));
+    }
+
+    /// Escape means "one step out", and the hall pick is the innermost step.
+    /// Backing out of it must spend nothing and must not also leave the
+    /// command card.
+    #[test]
+    fn escape_cancels_the_hall_pick_and_spends_nothing() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::ScrollOfMassTeleport);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        spawn_hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+        assert!(app.world().resource::<UiState>().teleport_place.is_some());
+
+        press(&mut app, &[hotkeys::CANCEL]);
+
+        let ui = app.world().resource::<UiState>();
+        assert!(ui.teleport_place.is_none(), "one step out cancels the pick");
+        assert_eq!(ui.page, CardPage::Orders, "and it does not also flip the card");
+        assert!(said(&app).is_empty(), "a cancelled gesture spends nothing: {:?}", said(&app));
+    }
+
+    /// Arming something else disarms the hall pick. The armed modes are
+    /// mutually exclusive, and this one is checked FIRST by the click handler,
+    /// so a stale one would swallow the click meant for the new mode.
+    #[test]
+    fn arming_another_mode_drops_a_pending_hall_pick() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::ScrollOfMassTeleport);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        spawn_hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+        assert!(app.world().resource::<UiState>().teleport_place.is_some());
+
+        press(&mut app, &[hotkeys::key(Hk::AttackMove).unwrap()]);
+
+        let ui = app.world().resource::<UiState>();
+        assert!(ui.attack_move_armed, "the new mode is armed");
+        assert!(
+            ui.teleport_place.is_none(),
+            "and the old one is gone — two armed clicks cannot both want the next press"
+        );
     }
 }

@@ -1311,6 +1311,15 @@ pub struct CatalogItem {
     /// shelf from the moment it is built; this is what decides which rungs a
     /// given team may actually take off it.
     pub tier: u32,
+    /// `"choosable"` on the two teleport items and absent on everything else:
+    /// `use_item` takes an optional `destination` (a building id of one of
+    /// your own standing halls), and omitting it sends the scroll to the hall
+    /// nearest the hero. A field rather than a sentence buried in
+    /// `description` because this is the one item property a commander has to
+    /// ACT on — the scroll that saves a main from an army standing at the
+    /// expansion is the scroll aimed away from where the hero is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<&'static str>,
     pub description: &'static str,
 }
 
@@ -1488,6 +1497,7 @@ pub fn game_catalog() -> Catalog {
                     cost_gold: d.cost_gold,
                     sold_at: building_name(BuildingKind::Shop),
                     tier: d.tier.level(),
+                    destination: item_chooses_destination(id).then_some("choosable"),
                     description: d.description,
                 }
             })
@@ -2753,6 +2763,21 @@ pub struct BuyItem {
 pub struct UseItem {
     pub hero: Entity,
     pub slot: usize,
+    /// For the two teleport items: WHICH own standing hall to arrive at.
+    /// `None` means the hall nearest the hero — the original behaviour, and
+    /// what every non-teleport item ignores entirely. Already validated by
+    /// intent.rs (own, finished, a hall) at the moment the order was given;
+    /// combat.rs re-checks on the frame it fires, because a hall can fall
+    /// between the two.
+    pub destination: Option<Entity>,
+}
+
+/// Does this item let its user choose where the teleport lands? The one place
+/// the question is answered: the UI asks it to decide whether a keypress arms
+/// a hall-pick or fires immediately, and the catalog asks it to tell a
+/// commander the `destination` field is worth sending.
+pub fn item_chooses_destination(id: ItemId) -> bool {
+    matches!(id, ItemId::TownPortal | ItemId::ScrollOfMassTeleport)
 }
 
 /// Move `center` and own units within `radius` of it to `dest` instantly.
@@ -4280,11 +4305,21 @@ pub enum Intent {
     },
     /// Consume the item in one of a hero's inventory slots. `hero` picks which
     /// hero's bag, with the same default as `Buy`.
+    ///
+    /// `destination` is for the two teleport items and names WHICH of your own
+    /// standing halls to arrive at. Omit it and both scrolls fall back to the
+    /// hall nearest the hero, which is what they always did — so every
+    /// `use_item` written before this field means exactly what it used to.
+    /// Naming a building that is not your own finished hall is an error, not a
+    /// quiet fall-back: "the scroll went somewhere else" is the whole bug the
+    /// field exists to prevent.
     #[serde(rename = "use_item")]
     UseItem {
         slot: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hero: Option<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<IntentId>,
     },
 
     // --- doctrine: standing policy, executed by the engine at machine speed ---
@@ -4527,10 +4562,25 @@ impl Intent {
                 Some(hero) => format!("hero {hero} buys {item} at shop {shop}"),
                 None => format!("buy {item} at shop {shop}"),
             },
-            Intent::UseItem { slot, hero } => match hero {
-                Some(hero) => format!("hero {hero} uses item in slot {slot}"),
-                None => format!("hero uses item in slot {slot}"),
-            },
+            // The DESTINATION is part of the sentence for the same reason a
+            // cast's aim is: with two halls standing, "used the scroll" and
+            // "used the scroll at the hall that is not the one being hit" are
+            // different decisions, and a log that spelled them identically
+            // would hide the only one the commander made.
+            Intent::UseItem {
+                slot,
+                hero,
+                destination,
+            } => {
+                let to = match destination {
+                    Some(d) => format!(", bound for hall {d}"),
+                    None => String::new(),
+                };
+                match hero {
+                    Some(hero) => format!("hero {hero} uses item in slot {slot}{to}"),
+                    None => format!("hero uses item in slot {slot}{to}"),
+                }
+            }
             Intent::Priority { units, classes } => {
                 if classes.is_empty() {
                     format!("{} clear focus-fire priority", group(units))
@@ -6268,7 +6318,7 @@ const THREAT_RADIUS: f32 = 45.0;
 /// Hero HP fraction whose downward crossing raises a "hero low" event.
 const HERO_LOW_FRAC: f32 = 0.35;
 /// Building HP fraction whose downward crossing raises an "under attack" event.
-const BUILDING_HURT_FRAC: f32 = 0.5;
+pub const BUILDING_HURT_FRAC: f32 = 0.5;
 /// A tick that loses this many units of one kind is reported as one line.
 const LOSS_AGGREGATE: usize = 3;
 /// Sudden growth in the base-threat count that re-raises the event.

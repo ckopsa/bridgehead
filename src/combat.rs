@@ -1319,7 +1319,12 @@ fn use_items(
     // Health` (B0001). So the potion heals through the same handle the banner
     // buffs through.
     mut heroes: Query<(&Team, &Transform, &mut Inventory)>,
-    halls: Query<(&Building, &Team, &Transform), Without<UnderConstruction>>,
+    halls: Query<(Entity, &Building, &Team, &Transform), Without<UnderConstruction>>,
+    // A teleport that moved an army across the map used to leave no trace in
+    // the one channel both seats read. With the destination now a DECISION,
+    // the arrival has to be reportable — "the army left the expansion" is the
+    // event, and it names the hall it arrived at.
+    mut feed: ResMut<GameEvents>,
     mut buffed: StatusTargets,
 ) {
     let now = time.elapsed_secs();
@@ -1340,18 +1345,39 @@ fn use_items(
         // rule: a scroll that finds no hall still burns — no free retries.
         inventory.0[ev.slot] = None;
 
-        // The nearest rung of our own hall ladder. Both teleport items home in
-        // on the same spot, so the search is written once.
-        let nearest_hall = || {
-            halls
-                .iter()
-                .filter(|(building, hall_team, _)| is_hall(building.kind) && **hall_team == team)
-                .map(|(_, _, hall_tf)| hall_tf.translation)
-                .min_by(|a, b| {
-                    xz_dist_sq(hero_pos, *a)
-                        .partial_cmp(&xz_dist_sq(hero_pos, *b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+        // WHERE the scroll lands: the hall the caller named, or — with no
+        // name, or with a named hall that has fallen since the order was
+        // given — the nearest rung of our own hall ladder. Both teleport items
+        // ask the same question, so the search is written once, and it yields
+        // the hall's KIND as well as its spot so the arrival can be announced
+        // by name ("the Keep") rather than by coordinates alone.
+        //
+        // The fall-back on a destroyed destination is deliberate: the item is
+        // already consumed by the time we get here (see above), so refusing to
+        // move would burn a 250-gold scroll for nothing. intent.rs is the
+        // layer that says no; this layer's job is to always do *something*
+        // sane. It is the same rule the no-destination case has always used.
+        let chosen_hall = |dest: Option<Entity>| {
+            let mine = || {
+                halls
+                    .iter()
+                    .filter(|(_, building, hall_team, _)| {
+                        is_hall(building.kind) && **hall_team == team
+                    })
+            };
+            dest.and_then(|wanted| {
+                mine().find(|(entity, ..)| *entity == wanted)
+                    .map(|(_, building, _, tf)| (building.kind, tf.translation))
+            })
+            .or_else(|| {
+                mine()
+                    .map(|(_, building, _, tf)| (building.kind, tf.translation))
+                    .min_by(|a, b| {
+                        xz_dist_sq(hero_pos, a.1)
+                            .partial_cmp(&xz_dist_sq(hero_pos, b.1))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
         };
 
         match item {
@@ -1392,14 +1418,26 @@ fn use_items(
                     BANNER_DURATION,
                 );
             }
-            ItemId::TownPortal => match nearest_hall() {
-                Some(dest) => {
+            ItemId::TownPortal => match chosen_hall(ev.destination) {
+                Some((kind, dest)) => {
                     teleports.write(TeleportRequest {
                         center: ev.hero,
                         radius: PORTAL_RADIUS,
                         dest,
                         army_only: false,
                     });
+                    feed.push(
+                        team,
+                        now,
+                        format!(
+                            "hero ports to the {} at ({:.1}, {:.1})",
+                            building_name(kind),
+                            dest.x,
+                            dest.z
+                        ),
+                        EventSeverity::Info,
+                        Some(dest),
+                    );
                 }
                 None => warn!("TownPortal used with no completed TownHall to return to"),
             },
@@ -1409,14 +1447,26 @@ fn use_items(
             // arrives together). Workers stay on the gold. Expressed entirely
             // as a `TeleportRequest` with a map-spanning radius, so units.rs
             // needed one new flag and no new code path.
-            ItemId::ScrollOfMassTeleport => match nearest_hall() {
-                Some(dest) => {
+            ItemId::ScrollOfMassTeleport => match chosen_hall(ev.destination) {
+                Some((kind, dest)) => {
                     teleports.write(TeleportRequest {
                         center: ev.hero,
                         radius: MASS_TELEPORT_RADIUS,
                         dest,
                         army_only: true,
                     });
+                    feed.push(
+                        team,
+                        now,
+                        format!(
+                            "hero ports the army to the {} at ({:.1}, {:.1})",
+                            building_name(kind),
+                            dest.x,
+                            dest.z
+                        ),
+                        EventSeverity::Info,
+                        Some(dest),
+                    );
                 }
                 None => warn!("ScrollOfMassTeleport used with no completed hall to return to"),
             },
@@ -2753,6 +2803,281 @@ mod tests {
             app.world().entity(away).get::<Health>().unwrap().current,
             hp_away,
             "Slam is centred on the Champion whatever the event carries"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Teleport destination
+    // -----------------------------------------------------------------------
+
+    /// The two systems a teleport item actually needs, and nothing else:
+    /// combat.rs picks the hall, units.rs moves the bodies. Chained in one
+    /// `Update` so a `TeleportRequest` written by the first is consumed by the
+    /// second in the same tick, which is how the real schedule runs them.
+    fn teleport_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<NavGrid>()
+            .init_resource::<GameEvents>()
+            .add_event::<UseItem>()
+            .add_event::<TeleportRequest>()
+            .add_plugins(bevy::transform::TransformPlugin)
+            .add_systems(Update, (use_items, crate::units::handle_teleports).chain());
+        app
+    }
+
+    /// A hall on the board: completed (no `UnderConstruction`), so the item's
+    /// search will see it.
+    fn spawn_hall(app: &mut App, kind: BuildingKind, team: Team, pos: Vec3) -> Entity {
+        let tf = Transform::from_translation(pos);
+        app.world_mut()
+            .spawn((
+                Building { kind },
+                team,
+                tf,
+                GlobalTransform::from(tf),
+                Health::new(building_stats(kind).hp),
+            ))
+            .id()
+    }
+
+    /// A unit on the board with its `GlobalTransform` seeded — the same
+    /// contract units.rs's spawner honours, and the reason a teleported unit
+    /// is not read as standing at the origin for the rest of the frame.
+    fn spawn_body(app: &mut App, kind: UnitKind, team: Team, pos: Vec3) -> Entity {
+        let tf = Transform::from_translation(pos);
+        app.world_mut()
+            .spawn((
+                Unit { kind },
+                team,
+                tf,
+                GlobalTransform::from(tf),
+                Health::new(unit_stats(kind).hp),
+                Order::Idle,
+            ))
+            .id()
+    }
+
+    fn pos_of(app: &App, e: Entity) -> Vec3 {
+        app.world().entity(e).get::<Transform>().unwrap().translation
+    }
+
+    const NEAR_HALL: Vec3 = Vec3::new(60.0, 0.0, 60.0);
+    const FAR_HALL: Vec3 = Vec3::new(-70.0, 0.0, -70.0);
+    /// A teleport scatters its passengers inside `SPREAD` (3.0) of the
+    /// destination, so "landed here" is a small ball, not a point.
+    const LANDED: f32 = 4.0;
+
+    /// **The scenario that decided round 10.** The army is at the expansion,
+    /// the main is dying 130 units away, and the scroll's old rule — "the hall
+    /// nearest the hero" — sent everyone to the hall they were already
+    /// standing at. Naming the OTHER hall is the whole feature, so the probe
+    /// is the whole feature: two halls, the army far from both, and the scroll
+    /// aimed at the one that is NOT nearest.
+    #[test]
+    fn mass_teleport_lands_the_army_on_the_hall_it_was_aimed_at() {
+        let mut app = teleport_app();
+        let near = spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        let far = spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::ScrollOfMassTeleport), None]));
+        // The army, spread out the way an army holding an expansion is —
+        // every one of them nearer the hall it must NOT be sent to.
+        let army: Vec<Entity> = [
+            Vec3::new(30.0, 0.0, 25.0),
+            Vec3::new(12.0, 0.0, 34.0),
+            Vec3::new(45.0, 0.0, 10.0),
+        ]
+        .into_iter()
+        .map(|p| spawn_body(&mut app, UnitKind::Footman, Team::Human, p))
+        .collect();
+        // Workers stay on the gold: `army_only` is untouched by this feature
+        // and the probe says so out loud.
+        let worker = spawn_body(&mut app, UnitKind::Worker, Team::Human, Vec3::new(58.0, 0.0, 58.0));
+        let enemy = spawn_body(&mut app, UnitKind::Footman, Team::Claude, Vec3::new(25.0, 0.0, 25.0));
+
+        // The probe is only worth anything if `near` really is the nearest.
+        let hero_pos = pos_of(&app, hero);
+        assert!(
+            xz_dist(hero_pos, NEAR_HALL) < xz_dist(hero_pos, FAR_HALL),
+            "setup: the aimed-at hall must be the FAR one"
+        );
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: Some(far),
+        });
+        app.update();
+
+        // Everyone who rode is at the FAR hall — 184 units from the hall the
+        // old rule would have picked, so no rounding error can pass this.
+        assert!(
+            xz_dist(pos_of(&app, hero), FAR_HALL) <= LANDED,
+            "the hero rides its own scroll to the hall it named ({:.1} away)",
+            xz_dist(pos_of(&app, hero), FAR_HALL)
+        );
+        for (i, e) in army.iter().enumerate() {
+            assert!(
+                xz_dist(pos_of(&app, *e), FAR_HALL) <= LANDED,
+                "army member {i} lands at the NAMED hall, not the nearest one ({:.1} away)",
+                xz_dist(pos_of(&app, *e), FAR_HALL)
+            );
+        }
+        assert!(
+            xz_dist(pos_of(&app, worker), Vec3::new(58.0, 0.0, 58.0)) < 0.01,
+            "army_only is unchanged: the worker keeps mining"
+        );
+        assert!(
+            xz_dist(pos_of(&app, enemy), Vec3::new(25.0, 0.0, 25.0)) < 0.01,
+            "the enemy does not ride our scroll"
+        );
+        assert!(
+            app.world().entity(hero).get::<Inventory>().unwrap().0[0].is_none(),
+            "the scroll is consumed"
+        );
+        assert_ne!(near, far, "two distinct halls were on the board");
+    }
+
+    /// The same board, the same scroll, no `destination` — the pre-existing
+    /// rule, unchanged. The back-compatibility claim as an experiment:
+    /// omitting the field is not a new default, it is the old behaviour.
+    #[test]
+    fn mass_teleport_with_no_destination_still_goes_to_the_nearest_hall() {
+        let mut app = teleport_app();
+        spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::ScrollOfMassTeleport), None]));
+        let soldier = spawn_body(&mut app, UnitKind::Footman, Team::Human, Vec3::new(30.0, 0.0, 25.0));
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: None,
+        });
+        app.update();
+
+        assert!(
+            xz_dist(pos_of(&app, hero), NEAR_HALL) <= LANDED,
+            "no destination means the nearest hall, exactly as before"
+        );
+        assert!(
+            xz_dist(pos_of(&app, soldier), NEAR_HALL) <= LANDED,
+            "and the army follows the hero to it"
+        );
+    }
+
+    /// A Town Portal is the same choice at a smaller radius: the hero and
+    /// whoever is standing beside it, to the hall the player named.
+    #[test]
+    fn town_portal_honours_a_named_hall_too() {
+        let mut app = teleport_app();
+        spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        let far = spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::TownPortal), None]));
+        // Inside PORTAL_RADIUS of the hero, and well outside it.
+        let beside = spawn_body(&mut app, UnitKind::Footman, Team::Human, Vec3::new(23.0, 0.0, 21.0));
+        let away = spawn_body(&mut app, UnitKind::Footman, Team::Human, Vec3::new(45.0, 0.0, 45.0));
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: Some(far),
+        });
+        app.update();
+
+        assert!(
+            xz_dist(pos_of(&app, hero), FAR_HALL) <= LANDED,
+            "the hero ports where it aimed"
+        );
+        assert!(
+            xz_dist(pos_of(&app, beside), FAR_HALL) <= LANDED,
+            "so does the ally standing next to it"
+        );
+        assert!(
+            xz_dist(pos_of(&app, away), Vec3::new(45.0, 0.0, 45.0)) < 0.01,
+            "PORTAL_RADIUS is unchanged: the distant ally is left behind"
+        );
+    }
+
+    /// The scroll is consumed up front, so a destination that has FALLEN
+    /// between the order and the frame it fires must still move the army:
+    /// burning 250 gold for nothing is the worse of the two failures. It falls
+    /// back to the rule that has always applied when nobody chose. (intent.rs
+    /// is the layer that says no; this layer's job is to do something sane.)
+    #[test]
+    fn a_destination_that_no_longer_exists_falls_back_to_the_nearest_hall() {
+        let mut app = teleport_app();
+        spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        let doomed = spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::ScrollOfMassTeleport), None]));
+        app.world_mut().entity_mut(doomed).despawn();
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: Some(doomed),
+        });
+        app.update();
+
+        assert!(
+            xz_dist(pos_of(&app, hero), NEAR_HALL) <= LANDED,
+            "a razed destination is not a wasted scroll — it lands at the hall that is left"
+        );
+    }
+
+    /// The arrival announces itself, and the announcement NAMES the hall.
+    /// Coordinates alone would not tell a commander whether the scroll did
+    /// what it was aimed at; "the Keep at (-70.0, -70.0)" does.
+    #[test]
+    fn the_teleport_event_names_the_hall_it_arrived_at() {
+        let mut app = teleport_app();
+        spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        let far = spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::ScrollOfMassTeleport), None]));
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: Some(far),
+        });
+        app.update();
+
+        let feed = app.world().resource::<GameEvents>();
+        let messages: Vec<String> = feed
+            .feed(Team::Human)
+            .iter()
+            .map(|e| e.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "hero ports the army to the Keep at (-70.0, -70.0)"),
+            "the arrival names the hall: {messages:?}"
+        );
+        // And it goes to the acting team ONLY — the enemy does not learn that
+        // an army just left the map's other corner.
+        assert!(
+            feed.feed(Team::Claude).is_empty(),
+            "a teleport is not announced to the other seat"
         );
     }
 }

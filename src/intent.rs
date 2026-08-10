@@ -1322,7 +1322,11 @@ fn compile_intent(
                 item,
             });
         }
-        Intent::UseItem { slot, hero } => {
+        Intent::UseItem {
+            slot,
+            hero,
+            destination,
+        } => {
             if slot >= INVENTORY_SLOTS {
                 errors.push(format!(
                     "{tag}: item slot {slot} out of range (0..{})",
@@ -1337,8 +1341,38 @@ fn compile_intent(
                 }
                 return;
             };
+            // WHERE the scroll lands, when the caller cared. Validated here
+            // and not in combat.rs because this is the layer that can still
+            // say NO out loud: a destination that is not one of your standing
+            // halls is refused with a sentence, rather than silently becoming
+            // "nearest" — which is precisely the outcome the field exists to
+            // stop. One message for every way of getting it wrong (unknown
+            // id, enemy building, a Farm, a hall still going up), because
+            // "your standing hall" already names all four conditions and a
+            // finer-grained answer would leak the enemy's building ids.
+            let destination = match destination {
+                None => None,
+                Some(id) => {
+                    let hall = intent_entity(id)
+                        .and_then(|e| buildings.get(e).ok().map(|b| (e, b)))
+                        .filter(|(_, (b, team, under, _, _))| {
+                            **team == me && under.is_none() && is_hall(b.kind)
+                        })
+                        .map(|(e, _)| e);
+                    if hall.is_none() {
+                        errors
+                            .push(format!("{tag}: destination {id} is not your standing hall"));
+                        return;
+                    }
+                    hall
+                }
+            };
             // combat.rs checks the slot is actually filled.
-            events.item_uses.write(UseItem { hero, slot });
+            events.item_uses.write(UseItem {
+                hero,
+                slot,
+                destination,
+            });
         }
         Intent::Autopilot { on } => {
             // Only ever this seat's own faction.
@@ -3366,14 +3400,22 @@ mod tests {
         let back: Intent = serde_json::from_str(&json).unwrap();
         assert_eq!(back.sentence(), "hero 42 buys HealingPotion at shop 1");
 
-        let use_addressed = Intent::UseItem { slot: 0, hero: Some(42) };
+        let use_addressed = Intent::UseItem {
+            slot: 0,
+            hero: Some(42),
+            destination: None,
+        };
         let back: Intent =
             serde_json::from_str(&serde_json::to_string(&use_addressed).unwrap()).unwrap();
         assert_eq!(back.sentence(), "hero 42 uses item in slot 0");
 
         // Omitting it must not serialize a null — the wire shape is unchanged
         // for every command that does not care.
-        let plain = Intent::UseItem { slot: 0, hero: None };
+        let plain = Intent::UseItem {
+            slot: 0,
+            hero: None,
+            destination: None,
+        };
         assert_eq!(
             serde_json::to_string(&plain).unwrap(),
             r#"{"type":"use_item","slot":0}"#,
@@ -3572,5 +3614,252 @@ mod tests {
         assert_eq!(parse_item("town portal"), Some(ItemId::TownPortal));
         assert_eq!(parse_target_class("siege"), Some(TargetClass::Siege));
         assert!(parse_building_kind("nonsense").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // use_item: WHICH hall
+    // -----------------------------------------------------------------------
+
+    fn item_uses_of(app: &mut App) -> Vec<UseItem> {
+        app.world_mut()
+            .resource_mut::<Events<UseItem>>()
+            .drain()
+            .collect()
+    }
+
+    fn spawn_hero(app: &mut App, team: Team, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                team,
+                Transform::from_translation(at),
+                Order::Idle,
+                Health::new(600.0),
+                Inventory([Some(ItemId::ScrollOfMassTeleport), None]),
+            ))
+            .id()
+    }
+
+    /// A hall, finished unless `under` says otherwise.
+    fn spawn_hall_at(app: &mut App, kind: BuildingKind, team: Team, at: Vec3, under: bool) -> Entity {
+        let mut e = app.world_mut().spawn((
+            Building { kind },
+            team,
+            Transform::from_translation(at),
+            Health::new(building_stats(kind).hp),
+        ));
+        if under {
+            e.insert(UnderConstruction { remaining: 5.0 });
+        }
+        e.id()
+    }
+
+    /// **The happy path, and the reason the field exists.** A named hall that
+    /// IS one of your standing halls survives the compiler and arrives on the
+    /// event combat.rs reads — with the entity, not a coordinate, so the
+    /// executor re-checks it against a world that may have moved on.
+    #[test]
+    fn a_named_hall_reaches_the_executor() {
+        let mut app = compiler_app();
+        let hero = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        spawn_hall_at(&mut app, BuildingKind::TownHall, Team::Human, Vec3::new(60.0, 0.0, 60.0), false);
+        let far = spawn_hall_at(&mut app, BuildingKind::Keep, Team::Human, Vec3::new(-70.0, 0.0, -70.0), false);
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::UseItem {
+                slot: 0,
+                hero: Some(hero.to_bits()),
+                destination: Some(far.to_bits()),
+            },
+        ));
+        app.update();
+
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "naming your own standing hall is legal: {:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+        let uses = item_uses_of(&mut app);
+        assert_eq!(uses.len(), 1, "one use_item event: {uses:?}");
+        assert_eq!(uses[0].destination, Some(far), "the chosen hall, not the near one");
+    }
+
+    /// **Omitted is the old behaviour, spelled as `None`.** The compiler does
+    /// not substitute a hall of its own choosing — it passes the absence
+    /// through, and combat.rs's nearest-hall rule (which predates this field)
+    /// is what answers. Back-compatible by construction, not by coincidence.
+    #[test]
+    fn an_omitted_destination_stays_omitted_all_the_way_to_the_executor() {
+        let mut app = compiler_app();
+        let hero = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        spawn_hall_at(&mut app, BuildingKind::TownHall, Team::Human, Vec3::new(60.0, 0.0, 60.0), false);
+        spawn_hall_at(&mut app, BuildingKind::Keep, Team::Human, Vec3::new(-70.0, 0.0, -70.0), false);
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::UseItem { slot: 0, hero: None, destination: None },
+        ));
+        app.update();
+
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "the historic call shape is still legal"
+        );
+        let uses = item_uses_of(&mut app);
+        assert_eq!(uses.len(), 1, "one use_item event: {uses:?}");
+        assert_eq!(uses[0].hero, hero, "and it still finds the team's only hero");
+        assert_eq!(uses[0].destination, None, "no hall was chosen, so none is invented");
+    }
+
+    /// **Every way of getting it wrong, and the one sentence that teaches all
+    /// four.** A destination that is not your own standing hall is REFUSED,
+    /// never quietly downgraded to "nearest" — a scroll that silently went
+    /// somewhere else is exactly the failure the field exists to prevent, and
+    /// a fall-back would reintroduce it while looking like it worked.
+    ///
+    /// One message for all four because "your standing hall" already names
+    /// every condition, and a finer-grained answer ("that is the enemy's
+    /// Keep") would hand a seat a building id it could not otherwise have.
+    #[test]
+    fn a_destination_that_is_not_your_standing_hall_is_refused() {
+        let mine = Vec3::new(60.0, 0.0, 60.0);
+        let cases: Vec<(&str, Box<dyn Fn(&mut App) -> u64>)> = vec![
+            (
+                "an enemy hall",
+                Box::new(|app: &mut App| {
+                    spawn_hall_at(app, BuildingKind::TownHall, Team::Claude, Vec3::new(-70.0, 0.0, -70.0), false)
+                        .to_bits()
+                }),
+            ),
+            (
+                "a hall still going up",
+                Box::new(|app: &mut App| {
+                    spawn_hall_at(app, BuildingKind::TownHall, Team::Human, Vec3::new(-70.0, 0.0, -70.0), true)
+                        .to_bits()
+                }),
+            ),
+            (
+                "a building of ours that is not a hall",
+                Box::new(|app: &mut App| {
+                    spawn_hall_at(app, BuildingKind::Barracks, Team::Human, Vec3::new(-70.0, 0.0, -70.0), false)
+                        .to_bits()
+                }),
+            ),
+            // A bare number nobody ever minted.
+            ("an id that names nothing", Box::new(|_: &mut App| 987_654_321_u64)),
+        ];
+
+        for (what, make) in cases {
+            let mut app = compiler_app();
+            let hero = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+            spawn_hall_at(&mut app, BuildingKind::TownHall, Team::Human, mine, false);
+            let bad = make(&mut app);
+
+            // Sent as a commander would send it, so the assertion below is on
+            // the exact string that rides back in the snapshot's `errors`.
+            app.world_mut().send_event(SubmitIntent {
+                team: Team::Human,
+                source: IntentSource::Bridge,
+                tag: "cmd 0".to_string(),
+                intent: Intent::UseItem {
+                    slot: 0,
+                    hero: Some(hero.to_bits()),
+                    destination: Some(bad),
+                },
+            });
+            app.update();
+
+            let errors = app.world().resource::<IntentErrors>().get(Team::Human).to_vec();
+            assert_eq!(errors.len(), 1, "{what}: expected one rejection, got {errors:?}");
+            assert_eq!(
+                errors[0],
+                format!("cmd 0: destination {bad} is not your standing hall"),
+                "{what}: the message has to teach the rule"
+            );
+            assert!(
+                item_uses_of(&mut app).is_empty(),
+                "{what}: a refused destination must not fire the item at all — \
+                 falling back to the nearest hall IS the bug"
+            );
+        }
+    }
+
+    /// The sentence carries the choice. Two `use_item` commands that differ
+    /// only in where the army lands must not read identically in the log a
+    /// person reviews the match from.
+    #[test]
+    fn the_sentence_names_the_hall_that_was_chosen() {
+        let aimed = Intent::UseItem { slot: 0, hero: Some(7), destination: Some(34) };
+        assert_eq!(aimed.sentence(), "hero 7 uses item in slot 0, bound for hall 34");
+        let plain = Intent::UseItem { slot: 0, hero: Some(7), destination: None };
+        assert_eq!(plain.sentence(), "hero 7 uses item in slot 0");
+        assert_ne!(aimed.sentence(), plain.sentence(), "the choice is visible in the log");
+    }
+
+    /// The wire, both directions. The new field round-trips under its own
+    /// name, and omitting it serializes to the byte-identical historic shape —
+    /// so a commander written before this bead keeps working unchanged.
+    #[test]
+    fn the_destination_rides_the_wire_without_disturbing_the_old_shape() {
+        let aimed: Intent =
+            serde_json::from_str(r#"{"type":"use_item","slot":1,"hero":7,"destination":34}"#).unwrap();
+        assert!(
+            matches!(aimed, Intent::UseItem { slot: 1, hero: Some(7), destination: Some(34) }),
+            "the field parses under its own name"
+        );
+        assert_eq!(
+            serde_json::to_string(&aimed).unwrap(),
+            r#"{"type":"use_item","slot":1,"hero":7,"destination":34}"#
+        );
+        // The historic form still parses, and still means "nearest".
+        let old: Intent = serde_json::from_str(r#"{"type":"use_item","slot":0}"#).unwrap();
+        assert!(
+            matches!(old, Intent::UseItem { slot: 0, hero: None, destination: None }),
+            "a command written before this bead means what it always meant"
+        );
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"type":"use_item","slot":0}"#,
+            "an unused field must not appear on the wire"
+        );
+    }
+
+    /// **The latency row is unchanged** (docs/TEMPO.md §4). `use_item` is
+    /// exempt because a hero is a command node, and choosing a destination
+    /// does not move the hero — the item is still spent from the same bag, at
+    /// the same place, by the same speaker. A destination that started
+    /// charging for the privilege would be a silent tax on the one verb this
+    /// bead exists to make more expressive.
+    #[test]
+    fn choosing_a_destination_does_not_start_charging_for_the_item() {
+        let mut app = compiler_app();
+        // Latency ON and no command nodes at all — the severed-arm case, where
+        // anything that pays pays visibly.
+        app.insert_resource(CommandLatency { on: true, ..Default::default() })
+            .insert_resource(CommandNodes { nodes: Vec::new(), ready: true });
+        let hero = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        let far = spawn_hall_at(&mut app, BuildingKind::Keep, Team::Human, Vec3::new(-70.0, 0.0, -70.0), false);
+
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: Intent::UseItem {
+                slot: 0,
+                hero: Some(hero.to_bits()),
+                destination: Some(far.to_bits()),
+            },
+        });
+        app.update();
+
+        // Fired this frame, not queued for later — the exemption in one
+        // observation.
+        let uses = item_uses_of(&mut app);
+        assert_eq!(uses.len(), 1, "the item fires on the frame it was asked for: {uses:?}");
+        assert!(
+            app.world().resource::<IntentApplied>().get(Team::Human).is_empty(),
+            "an exempt verb reports no cost, however its destination is spelled"
+        );
     }
 }
