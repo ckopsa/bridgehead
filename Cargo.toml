@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = "0.16"
+# `wav` is the one non-default Bevy feature this project turns on, and it buys
+# a decoder rather than any content: the alert cues in ui.rs are three tones
+# synthesized into an in-memory RIFF buffer at startup, so the game ships no
+# audio files and `assets/` stays a directory of stat tables. Vorbis (which IS
+# default) would have meant either an encoder dependency or a binary blob in
+# the repo, for a sound that lasts a fifth of a second.
+bevy = { version = "0.16", features = ["wav"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

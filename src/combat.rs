@@ -169,14 +169,22 @@ impl CombatAssets {
             Team::Claude => &self.proj_claude,
         }
     }
-    fn shock_mat(&self, effect: AbilityEffect) -> &Handle<StandardMaterial> {
-        match effect {
-            AbilityEffect::Damage => &self.shock_mat,
-            AbilityEffect::Heal => &self.shock_heal_mat,
-            AbilityEffect::Militia => &self.shock_militia_mat,
+    /// Ring colour for a cast — chosen by its AIM atom, the same atom that
+    /// chose where the cast points. A two-atom ability shows one ring because
+    /// it is one cast; a damage-then-slow row rings in the damage red its
+    /// first clause earns, and the slow announces itself on the bodies.
+    fn shock_mat(&self, atom: EffectAtom) -> &Handle<StandardMaterial> {
+        match atom {
+            EffectAtom::Damage { .. } => &self.shock_mat,
+            EffectAtom::Heal { .. } => &self.shock_heal_mat,
+            EffectAtom::Militia { .. } => &self.shock_militia_mat,
             // A status ability paints its ring in the colour its effect wears
             // on the affected units — one legend for the cast and the buff.
-            AbilityEffect::ApplyStatus { status, .. } => self.status_mat(status),
+            EffectAtom::ApplyStatus { status, .. } => self.status_mat(status),
+            // A summon and a recall are movements of bodies, not a wave of
+            // force; they borrow the militia ring, which is the one that
+            // already means "someone new is standing here".
+            EffectAtom::Summon { .. } | EffectAtom::Teleport { .. } => &self.shock_militia_mat,
         }
     }
     /// Ring material for a status kind (also used for the persistent ring under
@@ -217,6 +225,10 @@ impl Plugin for CombatPlugin {
                     tower_fire,
                     update_projectiles,
                     cast_abilities,
+                    // After the casts that create them and before the damage
+                    // pass that resolves them, so an over-time tick is
+                    // indistinguishable from an instant cast in the same frame.
+                    tick_scheduled_effects,
                     use_items,
                     apply_damage,
                 )
@@ -1006,11 +1018,17 @@ fn cast_center(
             // is about where the wound is, and a heal centred on the healthiest
             // half of a healthy army is a heal aimed at nothing. (Whether it is
             // worth casting at all stays doctrine's `min_targets` question.)
-            let wounded_only = def.effect.heals();
+            let wounded_only = def.heals();
+            // **Atom 0 aims the cast.** A spell has one centre; the ability's
+            // first clause is what it is *about*, so it is what the auto-pick
+            // looks for. A damage-then-slow row therefore aims at the biggest
+            // clump of enemies its damage would catch — and the slow rides
+            // along, because it wants the same clump.
+            let aim = def.aim();
             let candidates: Vec<Vec3> = affected
                 .iter()
                 .filter(|(_, other_team, gt, health, unit, _)| {
-                    effect_hits(def, team, **other_team, *unit, health)
+                    effect_hits(aim, def.hits_air, team, **other_team, *unit, health)
                         && (!wounded_only || health.current < health.max)
                         // A `Unit`-targeted ability must be aimed at a unit,
                         // never at a building that merely happens to be hit —
@@ -1029,16 +1047,21 @@ fn cast_center(
     }
 }
 
-/// **Would this cast affect that entity?** — the team/kind half of the filter,
+/// **Would this ATOM affect that entity?** — the team/kind half of the filter,
 /// split out of the effect loop so the AUTO-PICK can ask the same question
 /// before choosing where to aim. An aimer that used a different predicate from
 /// the applier would confidently centre a heal on the enemy.
+///
+/// v3 asks it per ATOM rather than per ability, which is what lets one cast
+/// damage enemies and heal allies from the same centre. The aimer asks it of
+/// atom 0 (see `AbilityDef::aim`); the applier asks it of each atom in turn.
 ///
 /// The distance test is deliberately NOT here: the applier measures from the
 /// centre, the aimer measures candidacy from the caster, and folding both into
 /// one function would have needed two distances and a flag.
 fn effect_hits(
-    def: &AbilityDef,
+    atom: EffectAtom,
+    hits_air: bool,
     team: Team,
     other_team: Team,
     unit: Option<&Unit>,
@@ -1050,23 +1073,209 @@ fn effect_hits(
     // Ground AoE stops at the ground: the Champion's Slam passes harmlessly
     // under a flyer, while the Priestess's Heal reaches up to one. Both are
     // `hits_air` in the ability table, not code here.
-    if !def.hits_air && is_air(unit) {
+    if !hits_air && is_air(unit) {
         return false;
     }
-    match def.effect {
-        // Damage is the one effect that counts BUILDINGS as victims.
-        AbilityEffect::Damage => other_team != team,
-        AbilityEffect::Heal => other_team == team && unit.is_some(),
-        AbilityEffect::Militia => {
+    // An atom that fires once at the centre (Summon, Teleport) affects nobody
+    // in particular, so it never answers yes to "does this hit that body".
+    let Some(targets) = atom.targets() else {
+        return false;
+    };
+    // **Damage is the one atom that counts BUILDINGS as victims.** A shockwave
+    // cracks a wall; a hex does not confuse one and a banner does not steady
+    // one. That has been true since v1 and it is a property of the ATOM, not
+    // of the ability, so it lives here rather than in a per-row flag.
+    let structures_too = matches!(atom, EffectAtom::Damage { .. });
+    match targets {
+        AbilityTargets::Enemies => other_team != team && (structures_too || unit.is_some()),
+        AbilityTargets::Allies => other_team == team && unit.is_some(),
+        AbilityTargets::OwnWorkers => {
             other_team == team && unit.map(|u| u.kind) == Some(UnitKind::Worker)
         }
-        AbilityEffect::ApplyStatus { targets, .. } => match targets {
-            AbilityTargets::Enemies => other_team != team && unit.is_some(),
-            AbilityTargets::Allies => other_team == team && unit.is_some(),
-            AbilityTargets::OwnWorkers => {
-                other_team == team && unit.map(|u| u.kind) == Some(UnitKind::Worker)
+    }
+}
+
+/// Everything an atom needs to know about the cast that produced it, so that
+/// the INSTANT path and the OVER-TIME path apply atoms through one function
+/// rather than two that drift.
+#[derive(Clone, Copy, Debug)]
+struct AtomCtx {
+    center: Vec3,
+    radius: f32,
+    hits_air: bool,
+    team: Team,
+    caster: Entity,
+    /// Hero level multiplier, captured at the cast. A heal-over-time cast by a
+    /// level 6 hero keeps ticking at level 6 strength even if the hero levels
+    /// (or dies) mid-effect: the spell was paid for once.
+    power_mult: f32,
+    now: f32,
+}
+
+/// **Apply one atom, once.** The single applier: `cast_abilities` calls it for
+/// every `Instant` atom, and `tick_scheduled_effects` calls it for every tick
+/// of an `OverTime` one, so a lingering blizzard and a plain nuke land through
+/// exactly the same arithmetic.
+///
+/// `Teleport` is the one atom NOT handled here: a recall needs the hall table,
+/// which is a query only `cast_abilities` holds, and the validator refuses to
+/// schedule one. It is applied in the cast loop instead.
+fn apply_atom(
+    atom: EffectAtom,
+    ctx: AtomCtx,
+    commands: &mut Commands,
+    damage: &mut EventWriter<DamageEvent>,
+    spawns: &mut EventWriter<SpawnUnitEvent>,
+    affected: &mut AffectedQuery,
+) {
+    // Atoms that happen once, at the centre, to nobody in particular.
+    if !atom.per_target() {
+        match atom {
+            EffectAtom::Summon { unit_kind, count, lifetime } => {
+                // A ring of bodies around the centre rather than a stack on
+                // it — units.rs nudges each out of blocked cells from there.
+                for i in 0..count {
+                    let angle = std::f32::consts::TAU * (i as f32) / (count.max(1) as f32);
+                    let pos = ctx.center + Vec3::new(angle.cos(), 0.0, angle.sin()) * 2.0;
+                    spawns.write(SpawnUnitEvent {
+                        kind: unit_kind,
+                        team: ctx.team,
+                        pos,
+                        rally: None,
+                        source: None,
+                        summoned: Some(Summoned { until: lifetime.map(|l| ctx.now + l) }),
+                    });
+                }
             }
-        },
+            // Handled by the caller: a recall needs the hall table.
+            EffectAtom::Teleport { .. } => {}
+            _ => {}
+        }
+        return;
+    }
+
+    // Damage and healing are quantities of force, and a hero's level multiplies
+    // them. A duration, a magnitude and a body count are not, and it does not.
+    let scale = if atom.scales_with_level() { ctx.power_mult } else { 1.0 };
+
+    for (entity, other_team, gt, mut health, unit, mut status) in affected.iter_mut() {
+        if xz_dist(ctx.center, gt.translation()) > ctx.radius
+            || !effect_hits(atom, ctx.hits_air, ctx.team, *other_team, unit, &health)
+        {
+            continue;
+        }
+        match atom {
+            EffectAtom::Damage { amount, .. } => {
+                // Health is only ever subtracted in `apply_damage`.
+                damage.write(DamageEvent {
+                    victim: entity,
+                    attacker: ctx.caster,
+                    amount: amount * scale,
+                });
+            }
+            EffectAtom::Heal { amount, .. } => {
+                health.current = (health.current + amount * scale).min(health.max);
+            }
+            EffectAtom::Militia { duration, .. } => {
+                // A duration is not a damage number: never level-scaled.
+                commands
+                    .entity(entity)
+                    .try_insert(Militia { until: ctx.now + duration });
+            }
+            // The whole point of (A) meeting (B): a status ability is a table
+            // row. Two of these atoms in one row is Sanctuary — heal-over-time
+            // and armour arrive together, expire together, and are still two
+            // ordinary instances the moment they land.
+            EffectAtom::ApplyStatus { status: kind, magnitude, duration, .. } => {
+                // (`status` is the target's component, rebound mutable.)
+                let instance =
+                    StatusEffect::new(kind, magnitude, ctx.now, duration, StatusSource::Ability);
+                match status {
+                    // Already carrying statuses: straight through the one
+                    // public door, `StatusEffects::apply`.
+                    Some(ref mut existing) => existing.apply(instance),
+                    // **Nothing yet — and this is the subtle one.** A queued
+                    // `insert` is not visible to the next atom, which still
+                    // sees an entity with no `StatusEffects` and would queue an
+                    // insert of its own that OVERWRITES the first. Sanctuary is
+                    // exactly that shape (two status atoms, one cast), and a
+                    // fresh ally would have kept only the armour.
+                    //
+                    // So the component is created by a command that MERGES at
+                    // flush time, when it can see what earlier commands did.
+                    // That also closes the same hole between two casts landing
+                    // on one fresh body in a single frame.
+                    None => {
+                        commands.entity(entity).queue(
+                            move |mut target: bevy::ecs::world::EntityWorldMut| {
+                                match target.get_mut::<StatusEffects>() {
+                                    Some(mut existing) => existing.apply(instance),
+                                    None => {
+                                        let mut fresh = StatusEffects::new();
+                                        fresh.apply(instance);
+                                        target.insert(fresh);
+                                    }
+                                }
+                            },
+                        );
+                    }
+                }
+            }
+            // Returned above: `per_target()` is false for both.
+            EffectAtom::Summon { .. } | EffectAtom::Teleport { .. } => {}
+        }
+    }
+}
+
+/// **A cast that is not finished happening.** One entity per scheduled atom,
+/// spawned by `cast_abilities` and retired by `tick_scheduled_effects`.
+///
+/// It records the CENTRE rather than a list of victims: an over-time effect is
+/// a place, so a unit that walks out of a blizzard stops taking it and one that
+/// walks in starts. (A future `OnHit`/`OnDeath` schedule would record a
+/// subject instead; that is exactly the seam those variants are waiting for.)
+///
+/// It is its own entity rather than a component on the caster so that a caster
+/// who dies mid-effect does not cancel a spell that has already been paid for,
+/// and so that two overlapping casts of the same ability are two fields rather
+/// than one that clobbers the other.
+#[derive(Component, Clone, Copy, Debug)]
+struct ScheduledEffect {
+    atom: EffectAtom,
+    ctx: AtomCtx,
+    /// Seconds between applications.
+    interval: f32,
+    /// When the next application is due.
+    next_at: f32,
+    /// How many are still owed. The first tick is paid at the cast, so this
+    /// starts at `ticks - 1`.
+    ticks_left: u32,
+}
+
+/// Pay out every scheduled atom that has come due, through the same
+/// `apply_atom` the instant path uses.
+fn tick_scheduled_effects(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut damage: EventWriter<DamageEvent>,
+    mut spawns: EventWriter<SpawnUnitEvent>,
+    mut scheduled: Query<(Entity, &mut ScheduledEffect)>,
+    mut affected: AffectedQuery,
+) {
+    let now = time.elapsed_secs();
+    for (entity, mut sched) in &mut scheduled {
+        // A long frame may owe more than one tick; pay them all rather than
+        // silently dropping the difference, or a paused/slow frame would make
+        // a heal-over-time cheaper than the row says it is.
+        while sched.ticks_left > 0 && now >= sched.next_at {
+            let ctx = AtomCtx { now, ..sched.ctx };
+            apply_atom(sched.atom, ctx, &mut commands, &mut damage, &mut spawns, &mut affected);
+            sched.ticks_left -= 1;
+            sched.next_at += sched.interval;
+        }
+        if sched.ticks_left == 0 {
+            commands.entity(entity).try_despawn();
+        }
     }
 }
 
@@ -1108,6 +1317,12 @@ fn cast_abilities(
     tiers: Res<TechTiers>,
     mut events: EventReader<CastAbility>,
     mut damage: EventWriter<DamageEvent>,
+    // The two atoms that reach outside combat.rs: `Summon` asks units.rs for
+    // bodies, `Teleport` asks it to move them. Both go through the events those
+    // mechanics already had, so neither atom is a new code path — which is
+    // precisely why they could be added as vocabulary rather than as systems.
+    mut spawns: EventWriter<SpawnUnitEvent>,
+    mut teleports: EventWriter<TeleportRequest>,
     // `Without<Building>` is load-bearing: heroes and ability buildings now
     // share the `AbilityCooldowns` component, so the two caster queries need an
     // explicit disjointness proof to both take it mutably (B0001).
@@ -1125,6 +1340,10 @@ fn cast_abilities(
         (&Building, &Team, &Transform, Option<&mut AbilityCooldowns>),
         Without<UnderConstruction>,
     >,
+    // Read-only, for `EffectAtom::Teleport`'s `NearestHall`. Disjoint from
+    // `building_casters` by ACCESS rather than by filter: both read Building,
+    // Team and Transform, and only one of them touches `AbilityCooldowns`.
+    halls: Query<(&Building, &Team, &Transform), Without<UnderConstruction>>,
     mut affected: AffectedQuery,
 ) {
     let now = time.elapsed_secs();
@@ -1177,7 +1396,7 @@ fn cast_abilities(
         };
 
         // --- 3. PAY --------------------------------------------------------
-        let power = if is_unit_caster {
+        let power_mult = if is_unit_caster {
             let Ok((_, mut hero, _, _, cooldowns)) = unit_casters.get_mut(ev.caster) else {
                 continue;
             };
@@ -1185,78 +1404,98 @@ fn cast_abilities(
                 hero.mana = (hero.mana - def.mana_cost).max(0.0);
             }
             start_cooldown(&mut commands, ev.caster, cooldowns, index, def.cooldown);
-            // Only a hero's power scales with a level it actually has.
-            def.power * if level > 0 { Hero::damage_mult(level) } else { 1.0 }
+            // Only a hero's power scales with a level it actually has, and only
+            // the atoms that are a QUANTITY OF FORCE scale at all — see
+            // `EffectAtom::scales_with_level`.
+            if level > 0 { Hero::damage_mult(level) } else { 1.0 }
         } else {
             let Ok((_, _, _, cooldowns)) = building_casters.get_mut(ev.caster) else {
                 continue;
             };
             start_cooldown(&mut commands, ev.caster, cooldowns, index, def.cooldown);
-            def.power
+            1.0
         };
 
-        // --- 4. apply the effect -------------------------------------------
-        for (entity, other_team, gt, mut health, unit, mut status) in &mut affected {
-            if xz_dist(center, gt.translation()) > def.radius
-                || !effect_hits(&def, team, *other_team, unit, &health)
-            {
+        // --- 4. apply the effects, atom by atom, in row order --------------
+        //
+        // Every atom shares this cast's centre, radius and air rule — it is one
+        // cast — and brings its own numbers, its own targets and its own
+        // schedule. Nothing here knows which ABILITY it is executing, which is
+        // the whole of the v3 promise: a new mechanic that is a new combination
+        // of these atoms is a row in abilities.ron and no Rust at all.
+        let ctx = AtomCtx {
+            center,
+            radius: def.radius,
+            hits_air: def.hits_air,
+            team,
+            caster: ev.caster,
+            power_mult,
+            now,
+        };
+        for effect in def.effects {
+            // A recall is the one atom the shared applier cannot do: it needs
+            // the hall table. `Teleport` is `Instant`-only and `Caster`-only by
+            // the validator, so this arm is the whole of its story.
+            if let EffectAtom::Teleport { destination, army_only } = effect.atom {
+                let dest = match destination {
+                    TeleportDestination::NearestHall => halls
+                        .iter()
+                        .filter(|(b, hall_team, _)| is_hall(b.kind) && **hall_team == team)
+                        .map(|(_, _, hall_tf)| hall_tf.translation)
+                        .min_by(|a, b| {
+                            xz_dist_sq(caster_pos, *a)
+                                .partial_cmp(&xz_dist_sq(caster_pos, *b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        }),
+                };
+                match dest {
+                    Some(dest) => {
+                        teleports.write(TeleportRequest {
+                            center: ev.caster,
+                            radius: def.radius,
+                            dest,
+                            army_only,
+                        });
+                    }
+                    None => warn!("{}: no completed hall to recall to", def.name),
+                }
                 continue;
             }
-            match def.effect {
-                AbilityEffect::Damage => {
-                    // Health is only ever subtracted in `apply_damage`.
-                    damage.write(DamageEvent { victim: entity, attacker: ev.caster, amount: power });
+
+            match effect.schedule {
+                EffectSchedule::Instant => {
+                    apply_atom(effect.atom, ctx, &mut commands, &mut damage, &mut spawns, &mut affected);
                 }
-                AbilityEffect::Heal => {
-                    health.current = (health.current + power).min(health.max);
-                }
-                AbilityEffect::Militia => {
-                    // `power` is a duration here, so it is never level-scaled.
-                    commands
-                        .entity(entity)
-                        .try_insert(Militia { until: now + def.power });
-                }
-                // The whole point of (A) meeting (B): a status ability is a
-                // table row. `power` is the magnitude, `duration` the seconds,
-                // `targets` says who — and shared.rs expires it.
-                AbilityEffect::ApplyStatus { status: kind, also, .. } => {
-                    // (`status` is the target's component, rebound mutable.)
-                    // One cast, one or two statuses. `also` shares this cast's
-                    // duration and targets and brings only its own magnitude —
-                    // Sanctuary's heal-over-time and its armour arrive
-                    // together, expire together, and are still two ordinary
-                    // instances the moment they land.
-                    let mut fresh = StatusEffects::new();
-                    let sink: &mut StatusEffects = match status {
-                        Some(ref mut existing) => &mut *existing,
-                        None => &mut fresh,
-                    };
-                    sink.apply(StatusEffect::new(
-                        kind,
-                        def.power,
-                        now,
-                        def.duration,
-                        StatusSource::Ability,
-                    ));
-                    if let Some((extra, magnitude)) = also {
-                        sink.apply(StatusEffect::new(
-                            extra,
-                            magnitude,
-                            now,
-                            def.duration,
-                            StatusSource::Ability,
-                        ));
+                // The FIRST tick lands now; the rest are owed. A 1-tick
+                // over-time effect is therefore exactly an instant one, which
+                // is what makes `interval`/`ticks` safe to tune down to
+                // nothing.
+                EffectSchedule::OverTime { interval, ticks } => {
+                    if ticks == 0 {
+                        continue;
                     }
-                    if status.is_none() {
-                        commands.entity(entity).try_insert(fresh);
+                    apply_atom(effect.atom, ctx, &mut commands, &mut damage, &mut spawns, &mut affected);
+                    if ticks > 1 {
+                        commands.spawn(ScheduledEffect {
+                            atom: effect.atom,
+                            ctx,
+                            interval,
+                            next_at: now + interval,
+                            ticks_left: ticks - 1,
+                        });
                     }
                 }
+                // Refused by the validator at startup, so a row carrying one
+                // never reaches a live match. Skipped rather than panicked on:
+                // this runs every frame and a data mistake is the loader's to
+                // report, by name, before the game begins.
+                EffectSchedule::OnHit { .. } | EffectSchedule::OnDeath => {}
             }
         }
 
         commands.spawn((
             Mesh3d(assets.ring_mesh.clone()),
-            MeshMaterial3d(assets.shock_mat(def.effect).clone()),
+            MeshMaterial3d(assets.shock_mat(def.aim()).clone()),
             Transform::from_xyz(center.x, 0.15, center.z)
                 .with_scale(Vec3::new(SHOCKWAVE_START, 0.5, SHOCKWAVE_START)),
             Shockwave { age: 0.0, radius: def.radius },
@@ -1319,7 +1558,12 @@ fn use_items(
     // Health` (B0001). So the potion heals through the same handle the banner
     // buffs through.
     mut heroes: Query<(&Team, &Transform, &mut Inventory)>,
-    halls: Query<(&Building, &Team, &Transform), Without<UnderConstruction>>,
+    halls: Query<(Entity, &Building, &Team, &Transform), Without<UnderConstruction>>,
+    // A teleport that moved an army across the map used to leave no trace in
+    // the one channel both seats read. With the destination now a DECISION,
+    // the arrival has to be reportable — "the army left the expansion" is the
+    // event, and it names the hall it arrived at.
+    mut feed: ResMut<GameEvents>,
     mut buffed: StatusTargets,
 ) {
     let now = time.elapsed_secs();
@@ -1340,18 +1584,39 @@ fn use_items(
         // rule: a scroll that finds no hall still burns — no free retries.
         inventory.0[ev.slot] = None;
 
-        // The nearest rung of our own hall ladder. Both teleport items home in
-        // on the same spot, so the search is written once.
-        let nearest_hall = || {
-            halls
-                .iter()
-                .filter(|(building, hall_team, _)| is_hall(building.kind) && **hall_team == team)
-                .map(|(_, _, hall_tf)| hall_tf.translation)
-                .min_by(|a, b| {
-                    xz_dist_sq(hero_pos, *a)
-                        .partial_cmp(&xz_dist_sq(hero_pos, *b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+        // WHERE the scroll lands: the hall the caller named, or — with no
+        // name, or with a named hall that has fallen since the order was
+        // given — the nearest rung of our own hall ladder. Both teleport items
+        // ask the same question, so the search is written once, and it yields
+        // the hall's KIND as well as its spot so the arrival can be announced
+        // by name ("the Keep") rather than by coordinates alone.
+        //
+        // The fall-back on a destroyed destination is deliberate: the item is
+        // already consumed by the time we get here (see above), so refusing to
+        // move would burn a 250-gold scroll for nothing. intent.rs is the
+        // layer that says no; this layer's job is to always do *something*
+        // sane. It is the same rule the no-destination case has always used.
+        let chosen_hall = |dest: Option<Entity>| {
+            let mine = || {
+                halls
+                    .iter()
+                    .filter(|(_, building, hall_team, _)| {
+                        is_hall(building.kind) && **hall_team == team
+                    })
+            };
+            dest.and_then(|wanted| {
+                mine().find(|(entity, ..)| *entity == wanted)
+                    .map(|(_, building, _, tf)| (building.kind, tf.translation))
+            })
+            .or_else(|| {
+                mine()
+                    .map(|(_, building, _, tf)| (building.kind, tf.translation))
+                    .min_by(|a, b| {
+                        xz_dist_sq(hero_pos, a.1)
+                            .partial_cmp(&xz_dist_sq(hero_pos, b.1))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
         };
 
         match item {
@@ -1392,14 +1657,26 @@ fn use_items(
                     BANNER_DURATION,
                 );
             }
-            ItemId::TownPortal => match nearest_hall() {
-                Some(dest) => {
+            ItemId::TownPortal => match chosen_hall(ev.destination) {
+                Some((kind, dest)) => {
                     teleports.write(TeleportRequest {
                         center: ev.hero,
                         radius: PORTAL_RADIUS,
                         dest,
                         army_only: false,
                     });
+                    feed.push(
+                        team,
+                        now,
+                        format!(
+                            "hero ports to the {} at ({:.1}, {:.1})",
+                            building_name(kind),
+                            dest.x,
+                            dest.z
+                        ),
+                        EventSeverity::Info,
+                        Some(dest),
+                    );
                 }
                 None => warn!("TownPortal used with no completed TownHall to return to"),
             },
@@ -1409,14 +1686,26 @@ fn use_items(
             // arrives together). Workers stay on the gold. Expressed entirely
             // as a `TeleportRequest` with a map-spanning radius, so units.rs
             // needed one new flag and no new code path.
-            ItemId::ScrollOfMassTeleport => match nearest_hall() {
-                Some(dest) => {
+            ItemId::ScrollOfMassTeleport => match chosen_hall(ev.destination) {
+                Some((kind, dest)) => {
                     teleports.write(TeleportRequest {
                         center: ev.hero,
                         radius: MASS_TELEPORT_RADIUS,
                         dest,
                         army_only: true,
                     });
+                    feed.push(
+                        team,
+                        now,
+                        format!(
+                            "hero ports the army to the {} at ({:.1}, {:.1})",
+                            building_name(kind),
+                            dest.x,
+                            dest.z
+                        ),
+                        EventSeverity::Info,
+                        Some(dest),
+                    );
                 }
                 None => warn!("ScrollOfMassTeleport used with no completed hall to return to"),
             },
@@ -2556,8 +2845,17 @@ mod tests {
             .add_event::<CastAbility>()
             .add_event::<XpDrop>()
             .add_event::<DamageEvent>()
+            // The two events the v3 atoms reach the rest of the game through:
+            // `Summon` asks units.rs for bodies, `Teleport` asks it to move
+            // them. Registered here (rather than mocked) so the executor under
+            // test is the executor that ships.
+            .add_event::<SpawnUnitEvent>()
+            .add_event::<TeleportRequest>()
             .insert_resource(CombatAssets::test_stub())
-            .add_systems(Update, (cast_abilities, apply_damage).chain());
+            .add_systems(
+                Update,
+                (cast_abilities, tick_scheduled_effects, apply_damage).chain(),
+            );
         app
     }
 
@@ -2755,4 +3053,613 @@ mod tests {
             "Slam is centred on the Champion whatever the event carries"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Teleport destination
+    // -----------------------------------------------------------------------
+
+    /// The two systems a teleport item actually needs, and nothing else:
+    /// combat.rs picks the hall, units.rs moves the bodies. Chained in one
+    /// `Update` so a `TeleportRequest` written by the first is consumed by the
+    /// second in the same tick, which is how the real schedule runs them.
+    fn teleport_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<NavGrid>()
+            .init_resource::<GameEvents>()
+            .add_event::<UseItem>()
+            .add_event::<TeleportRequest>()
+            .add_plugins(bevy::transform::TransformPlugin)
+            .add_systems(Update, (use_items, crate::units::handle_teleports).chain());
+        app
+    }
+
+    /// A hall on the board: completed (no `UnderConstruction`), so the item's
+    /// search will see it.
+    fn spawn_hall(app: &mut App, kind: BuildingKind, team: Team, pos: Vec3) -> Entity {
+        let tf = Transform::from_translation(pos);
+        app.world_mut()
+            .spawn((
+                Building { kind },
+                team,
+                tf,
+                GlobalTransform::from(tf),
+                Health::new(building_stats(kind).hp),
+            ))
+            .id()
+    }
+
+    /// A unit on the board with its `GlobalTransform` seeded — the same
+    /// contract units.rs's spawner honours, and the reason a teleported unit
+    /// is not read as standing at the origin for the rest of the frame.
+    fn spawn_body(app: &mut App, kind: UnitKind, team: Team, pos: Vec3) -> Entity {
+        let tf = Transform::from_translation(pos);
+        app.world_mut()
+            .spawn((
+                Unit { kind },
+                team,
+                tf,
+                GlobalTransform::from(tf),
+                Health::new(unit_stats(kind).hp),
+                Order::Idle,
+            ))
+            .id()
+    }
+
+    fn pos_of(app: &App, e: Entity) -> Vec3 {
+        app.world().entity(e).get::<Transform>().unwrap().translation
+    }
+
+    const NEAR_HALL: Vec3 = Vec3::new(60.0, 0.0, 60.0);
+    const FAR_HALL: Vec3 = Vec3::new(-70.0, 0.0, -70.0);
+    /// A teleport scatters its passengers inside `SPREAD` (3.0) of the
+    /// destination, so "landed here" is a small ball, not a point.
+    const LANDED: f32 = 4.0;
+
+    /// **The scenario that decided round 10.** The army is at the expansion,
+    /// the main is dying 130 units away, and the scroll's old rule — "the hall
+    /// nearest the hero" — sent everyone to the hall they were already
+    /// standing at. Naming the OTHER hall is the whole feature, so the probe
+    /// is the whole feature: two halls, the army far from both, and the scroll
+    /// aimed at the one that is NOT nearest.
+    #[test]
+    fn mass_teleport_lands_the_army_on_the_hall_it_was_aimed_at() {
+        let mut app = teleport_app();
+        let near = spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        let far = spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::ScrollOfMassTeleport), None]));
+        // The army, spread out the way an army holding an expansion is —
+        // every one of them nearer the hall it must NOT be sent to.
+        let army: Vec<Entity> = [
+            Vec3::new(30.0, 0.0, 25.0),
+            Vec3::new(12.0, 0.0, 34.0),
+            Vec3::new(45.0, 0.0, 10.0),
+        ]
+        .into_iter()
+        .map(|p| spawn_body(&mut app, UnitKind::Footman, Team::Human, p))
+        .collect();
+        // Workers stay on the gold: `army_only` is untouched by this feature
+        // and the probe says so out loud.
+        let worker = spawn_body(&mut app, UnitKind::Worker, Team::Human, Vec3::new(58.0, 0.0, 58.0));
+        let enemy = spawn_body(&mut app, UnitKind::Footman, Team::Claude, Vec3::new(25.0, 0.0, 25.0));
+
+        // The probe is only worth anything if `near` really is the nearest.
+        let hero_pos = pos_of(&app, hero);
+        assert!(
+            xz_dist(hero_pos, NEAR_HALL) < xz_dist(hero_pos, FAR_HALL),
+            "setup: the aimed-at hall must be the FAR one"
+        );
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: Some(far),
+        });
+        app.update();
+
+        // Everyone who rode is at the FAR hall — 184 units from the hall the
+        // old rule would have picked, so no rounding error can pass this.
+        assert!(
+            xz_dist(pos_of(&app, hero), FAR_HALL) <= LANDED,
+            "the hero rides its own scroll to the hall it named ({:.1} away)",
+            xz_dist(pos_of(&app, hero), FAR_HALL)
+        );
+        for (i, e) in army.iter().enumerate() {
+            assert!(
+                xz_dist(pos_of(&app, *e), FAR_HALL) <= LANDED,
+                "army member {i} lands at the NAMED hall, not the nearest one ({:.1} away)",
+                xz_dist(pos_of(&app, *e), FAR_HALL)
+            );
+        }
+        assert!(
+            xz_dist(pos_of(&app, worker), Vec3::new(58.0, 0.0, 58.0)) < 0.01,
+            "army_only is unchanged: the worker keeps mining"
+        );
+        assert!(
+            xz_dist(pos_of(&app, enemy), Vec3::new(25.0, 0.0, 25.0)) < 0.01,
+            "the enemy does not ride our scroll"
+        );
+        assert!(
+            app.world().entity(hero).get::<Inventory>().unwrap().0[0].is_none(),
+            "the scroll is consumed"
+        );
+        assert_ne!(near, far, "two distinct halls were on the board");
+    }
+
+    /// The same board, the same scroll, no `destination` — the pre-existing
+    /// rule, unchanged. The back-compatibility claim as an experiment:
+    /// omitting the field is not a new default, it is the old behaviour.
+    #[test]
+    fn mass_teleport_with_no_destination_still_goes_to_the_nearest_hall() {
+        let mut app = teleport_app();
+        spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::ScrollOfMassTeleport), None]));
+        let soldier = spawn_body(&mut app, UnitKind::Footman, Team::Human, Vec3::new(30.0, 0.0, 25.0));
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: None,
+        });
+        app.update();
+
+        assert!(
+            xz_dist(pos_of(&app, hero), NEAR_HALL) <= LANDED,
+            "no destination means the nearest hall, exactly as before"
+        );
+        assert!(
+            xz_dist(pos_of(&app, soldier), NEAR_HALL) <= LANDED,
+            "and the army follows the hero to it"
+        );
+    }
+
+    /// A Town Portal is the same choice at a smaller radius: the hero and
+    /// whoever is standing beside it, to the hall the player named.
+    #[test]
+    fn town_portal_honours_a_named_hall_too() {
+        let mut app = teleport_app();
+        spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        let far = spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::TownPortal), None]));
+        // Inside PORTAL_RADIUS of the hero, and well outside it.
+        let beside = spawn_body(&mut app, UnitKind::Footman, Team::Human, Vec3::new(23.0, 0.0, 21.0));
+        let away = spawn_body(&mut app, UnitKind::Footman, Team::Human, Vec3::new(45.0, 0.0, 45.0));
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: Some(far),
+        });
+        app.update();
+
+        assert!(
+            xz_dist(pos_of(&app, hero), FAR_HALL) <= LANDED,
+            "the hero ports where it aimed"
+        );
+        assert!(
+            xz_dist(pos_of(&app, beside), FAR_HALL) <= LANDED,
+            "so does the ally standing next to it"
+        );
+        assert!(
+            xz_dist(pos_of(&app, away), Vec3::new(45.0, 0.0, 45.0)) < 0.01,
+            "PORTAL_RADIUS is unchanged: the distant ally is left behind"
+        );
+    }
+
+    /// The scroll is consumed up front, so a destination that has FALLEN
+    /// between the order and the frame it fires must still move the army:
+    /// burning 250 gold for nothing is the worse of the two failures. It falls
+    /// back to the rule that has always applied when nobody chose. (intent.rs
+    /// is the layer that says no; this layer's job is to do something sane.)
+    #[test]
+    fn a_destination_that_no_longer_exists_falls_back_to_the_nearest_hall() {
+        let mut app = teleport_app();
+        spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        let doomed = spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::ScrollOfMassTeleport), None]));
+        app.world_mut().entity_mut(doomed).despawn();
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: Some(doomed),
+        });
+        app.update();
+
+        assert!(
+            xz_dist(pos_of(&app, hero), NEAR_HALL) <= LANDED,
+            "a razed destination is not a wasted scroll — it lands at the hall that is left"
+        );
+    }
+
+    /// The arrival announces itself, and the announcement NAMES the hall.
+    /// Coordinates alone would not tell a commander whether the scroll did
+    /// what it was aimed at; "the Keep at (-70.0, -70.0)" does.
+    #[test]
+    fn the_teleport_event_names_the_hall_it_arrived_at() {
+        let mut app = teleport_app();
+        spawn_hall(&mut app, BuildingKind::TownHall, Team::Human, NEAR_HALL);
+        let far = spawn_hall(&mut app, BuildingKind::Keep, Team::Human, FAR_HALL);
+        let hero = spawn_body(&mut app, UnitKind::Hero, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(Inventory([Some(ItemId::ScrollOfMassTeleport), None]));
+
+        app.world_mut().send_event(UseItem {
+            hero,
+            slot: 0,
+            destination: Some(far),
+        });
+        app.update();
+
+        let feed = app.world().resource::<GameEvents>();
+        let messages: Vec<String> = feed
+            .feed(Team::Human)
+            .iter()
+            .map(|e| e.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "hero ports the army to the Keep at (-70.0, -70.0)"),
+            "the arrival names the hall: {messages:?}"
+        );
+        // And it goes to the acting team ONLY — the enemy does not learn that
+        // an army just left the map's other corner.
+        assert!(
+            feed.feed(Team::Claude).is_empty(),
+            "a teleport is not announced to the other seat"
+        );
+    // -----------------------------------------------------------------------
+    // v3: the effect-atom vocabulary, through the real applier
+    // -----------------------------------------------------------------------
+
+    /// **The atom bench.** One atom, one centre, one application — through the
+    /// exact `apply_atom` the executor and the over-time scheduler both call.
+    ///
+    /// This exists because the interesting atoms (`Summon`, `OverTime` payouts)
+    /// have no shipping row to cast: their proof has to be about the applier
+    /// rather than about a particular ability. A system is the only way to
+    /// reach `apply_atom` honestly — it wants a `Commands`, two event writers
+    /// and the real `AffectedQuery` — so the bench is a system.
+    #[derive(Resource, Clone, Copy)]
+    struct Bench(EffectAtom, AtomCtx);
+
+    fn bench_system(
+        mut commands: Commands,
+        bench: Res<Bench>,
+        mut damage: EventWriter<DamageEvent>,
+        mut spawns: EventWriter<SpawnUnitEvent>,
+        mut affected: AffectedQuery,
+    ) {
+        apply_atom(bench.0, bench.1, &mut commands, &mut damage, &mut spawns, &mut affected);
+    }
+
+    fn bench_ctx(now: f32) -> AtomCtx {
+        AtomCtx {
+            center: Vec3::ZERO,
+            radius: 6.0,
+            hits_air: true,
+            team: Team::Human,
+            caster: Entity::PLACEHOLDER,
+            power_mult: 1.0,
+            now,
+        }
+    }
+
+    /// **A summon is a row, not a system.** The atom asks units.rs for bodies
+    /// through the same `SpawnUnitEvent` a barracks uses — and stamps each with
+    /// the mark that says when it goes home.
+    #[test]
+    fn a_summon_atom_calls_bodies_that_know_when_to_leave() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .add_event::<DamageEvent>()
+            .add_event::<SpawnUnitEvent>()
+            .insert_resource(Bench(
+                EffectAtom::Summon {
+                    unit_kind: UnitKind::Footman,
+                    count: 3,
+                    lifetime: Some(30.0),
+                },
+                bench_ctx(10.0),
+            ))
+            .add_systems(Update, bench_system);
+        app.update();
+
+        let events = app.world().resource::<Events<SpawnUnitEvent>>();
+        let mut cursor = events.get_cursor();
+        let spawned: Vec<&SpawnUnitEvent> = cursor.read(events).collect();
+        assert_eq!(spawned.len(), 3, "count: 3 means three bodies");
+        for ev in spawned {
+            assert_eq!(ev.kind, UnitKind::Footman);
+            assert_eq!(ev.team, Team::Human);
+            assert_eq!(
+                ev.summoned.map(|s| s.until),
+                Some(Some(40.0)),
+                "lifetime 30 cast at t=10 goes home at t=40"
+            );
+        }
+    }
+
+    /// A permanent summon is spelled by leaving `lifetime` out — and it still
+    /// carries the mark, because "called, not trained" is true whether or not
+    /// there is a timer on it.
+    #[test]
+    fn a_summon_with_no_lifetime_is_permanent() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .add_event::<DamageEvent>()
+            .add_event::<SpawnUnitEvent>()
+            .insert_resource(Bench(
+                EffectAtom::Summon { unit_kind: UnitKind::Spearman, count: 1, lifetime: None },
+                bench_ctx(5.0),
+            ))
+            .add_systems(Update, bench_system);
+        app.update();
+        let events = app.world().resource::<Events<SpawnUnitEvent>>();
+        let mut cursor = events.get_cursor();
+        let ev = cursor.read(events).next().expect("one body");
+        assert_eq!(ev.summoned.map(|s| s.until), Some(None));
+    }
+
+    /// **The targets predicate is per ATOM.** The same centre, the same radius,
+    /// two atoms, three different answers about who is in the blast — which is
+    /// the property that lets one cast hurt enemies and mend allies.
+    #[test]
+    fn each_atom_asks_its_own_question_about_who_is_hit() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .add_event::<DamageEvent>()
+            .add_event::<SpawnUnitEvent>()
+            .init_resource::<TeamResearch>()
+            .add_systems(Update, (bench_system, apply_damage).chain());
+        let enemy = spawn_at(&mut app, UnitKind::Footman, Team::Claude, Vec3::new(1.0, 0.0, 0.0));
+        let ally = spawn_at(&mut app, UnitKind::Footman, Team::Human, Vec3::new(2.0, 0.0, 0.0));
+        let worker = spawn_at(&mut app, UnitKind::Worker, Team::Human, Vec3::new(3.0, 0.0, 0.0));
+        // Hurt the ally so a heal has somewhere to go.
+        app.world_mut().entity_mut(ally).get_mut::<Health>().unwrap().current = 10.0;
+
+        let hp = |app: &App, e: Entity| app.world().entity(e).get::<Health>().unwrap().current;
+
+        // Damage at Enemies.
+        app.insert_resource(Bench(
+            EffectAtom::Damage { amount: 20.0, targets: AbilityTargets::Enemies },
+            bench_ctx(0.0),
+        ));
+        app.update();
+        assert!(hp(&app, enemy) < unit_stats(UnitKind::Footman).hp, "the enemy is hit");
+        assert_eq!(hp(&app, ally), 10.0, "the ally is not");
+
+        // Heal at Allies, same centre.
+        app.insert_resource(Bench(
+            EffectAtom::Heal { amount: 25.0, targets: AbilityTargets::Allies },
+            bench_ctx(0.0),
+        ));
+        app.update();
+        assert_eq!(hp(&app, ally), 35.0, "the ally is mended by the same cast's other clause");
+
+        // Militia at OwnWorkers: only the worker, never the Footman beside it.
+        app.insert_resource(Bench(
+            EffectAtom::Militia { duration: 40.0, targets: AbilityTargets::OwnWorkers },
+            bench_ctx(0.0),
+        ));
+        app.update();
+        assert!(app.world().entity(worker).get::<Militia>().is_some());
+        assert!(app.world().entity(ally).get::<Militia>().is_none());
+    }
+
+    /// **Over time is a place, tick by tick.** The schedule pays out through
+    /// the same applier as an instant cast — the first tick at the cast, the
+    /// rest on the clock — and retires itself when the last one is paid.
+    #[test]
+    fn an_over_time_schedule_pays_out_one_tick_at_a_time() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .add_event::<DamageEvent>()
+            .add_event::<SpawnUnitEvent>()
+            .init_resource::<TeamResearch>()
+            .add_systems(Update, (tick_scheduled_effects, apply_damage).chain());
+        let ally = spawn_at(&mut app, UnitKind::Footman, Team::Human, Vec3::new(1.0, 0.0, 0.0));
+        app.world_mut().entity_mut(ally).get_mut::<Health>().unwrap().current = 1.0;
+
+        // Three ticks still owed, one second apart, starting a second from now
+        // — exactly the state `cast_abilities` leaves behind after paying the
+        // first tick of a 4-tick effect.
+        app.world_mut().spawn(ScheduledEffect {
+            atom: EffectAtom::Heal { amount: 10.0, targets: AbilityTargets::Allies },
+            ctx: bench_ctx(0.0),
+            interval: 1.0,
+            next_at: 1.0,
+            ticks_left: 3,
+        });
+
+        let hp = |app: &App| app.world().entity(ally).get::<Health>().unwrap().current;
+        let scheduled = |app: &mut App| {
+            app.world_mut().query::<&ScheduledEffect>().iter(app.world()).count()
+        };
+
+        app.update();
+        assert_eq!(hp(&app), 1.0, "nothing is owed yet at t=0");
+
+        for expected in [11.0, 21.0, 31.0] {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs_f32(1.0));
+            app.update();
+            assert_eq!(hp(&app), expected);
+        }
+        assert_eq!(scheduled(&mut app), 0, "a spent schedule despawns itself");
+
+        // And a long frame pays everything it owes rather than dropping the
+        // difference: three seconds of arrears in one update.
+        app.world_mut().entity_mut(ally).get_mut::<Health>().unwrap().current = 1.0;
+        let now = app.world().resource::<Time>().elapsed_secs();
+        app.world_mut().spawn(ScheduledEffect {
+            atom: EffectAtom::Heal { amount: 10.0, targets: AbilityTargets::Allies },
+            ctx: bench_ctx(now),
+            interval: 1.0,
+            next_at: now + 1.0,
+            ticks_left: 3,
+        });
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(5.0));
+        app.update();
+        assert_eq!(hp(&app), 31.0, "a slow frame owes three ticks and pays three");
+        assert_eq!(scheduled(&mut app), 0);
+    }
+
+    /// **Sanctuary, the row `also` existed for, through the executor.** Two
+    /// atoms, one cast, one duration — and both statuses land on the ally in
+    /// the radius exactly as the single-field version did.
+    #[test]
+    fn sanctuary_lands_both_of_its_atoms_on_one_cast() {
+        let mut app = cast_world();
+        let tf = Transform::from_translation(Vec3::ZERO);
+        // The ultimate is `HeroLevel(5)`, so the Priestess has to have earned it.
+        let priestess = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Priestess },
+                Team::Human,
+                Hero { level: 5, xp: 0.0, mana: 500.0 },
+                Health::new(unit_stats(UnitKind::Priestess).hp),
+                Order::Idle,
+                tf,
+                GlobalTransform::from(tf),
+            ))
+            .id();
+        let ally = spawn_at(&mut app, UnitKind::Footman, Team::Human, Vec3::new(3.0, 0.0, 0.0));
+
+        // Slot 1 is Sanctuary (slot 0 is Heal).
+        app.world_mut().send_event(CastAbility::index(priestess, 1));
+        app.update();
+
+        let status = app.world().entity(ally).get::<StatusEffects>().expect("statuses landed");
+        assert!((status.magnitude(StatusKind::HealOverTime) - 15.0).abs() < 1e-4);
+        assert!((status.magnitude(StatusKind::ArmorBuff) - 0.25).abs() < 1e-4);
+        assert!(
+            (status.remaining(StatusKind::HealOverTime, 0.0) - 6.0).abs() < 1e-4
+                && (status.remaining(StatusKind::ArmorBuff, 0.0) - 6.0).abs() < 1e-4,
+            "one cast, one duration: both clauses expire together"
+        );
+    }
+
+    /// **THE PROOF: an ability with no Rust behind it, cast by the real
+    /// executor.**
+    ///
+    /// The demo row is a row in abilities.ron and nothing else — two atoms,
+    /// damage then slow, thrown at a point. Under v2 it was unbuildable
+    /// without a new `AbilityEffect` variant and four new match arms.
+    ///
+    /// Its NAME is deliberately absent from this file (and every other Rust
+    /// file): `data::tests::the_demo_ability_is_defined_purely_in_ron` greps
+    /// the whole crate for it, so the ability is spelled here the only way it
+    /// legitimately can be — assembled from halves at runtime.
+    ///
+    /// It lives in the Champion's `probe_abilities`, so it exists only under
+    /// `WC3_STATUS_PROBE=1` — and the ability tables read that flag ONCE, at
+    /// first touch, which no test running beside others can arrange. So this
+    /// test has two lives: the parent re-runs it as a child process with the
+    /// flag set, and the child does the work and prints a marker the parent
+    /// insists on seeing (so a filter that matched nothing cannot pass).
+    #[test]
+    fn frost_nova_a_pure_ron_ability_fires_through_the_real_executor() {
+        const MARKER: &str = "FROSTNOVA-PROBE-CAST-OK";
+        const TEST: &str =
+            "combat::tests::frost_nova_a_pure_ron_ability_fires_through_the_real_executor";
+
+        if std::env::var("WC3_STATUS_PROBE").is_err() {
+            let exe = std::env::current_exe().expect("this test binary");
+            let out = std::process::Command::new(exe)
+                .args([TEST, "--exact", "--nocapture"])
+                .env("WC3_STATUS_PROBE", "1")
+                .output()
+                .expect("re-run this test with the probe flag set");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "probe-mode run failed:\n{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(stdout.contains(MARKER), "probe-mode run did not run the test:\n{stdout}");
+            return;
+        }
+
+        // --- probe mode: the demo row is the Champion's last slot ---------
+        let list = abilities_of_unit(UnitKind::Hero);
+        let index = list
+            .iter()
+            .position(|d| d.name == concat!("Frost", "Nova"))
+            .expect("probe mode gives the Champion the demo ability");
+
+        let mut app = cast_world();
+        let tf = Transform::from_translation(Vec3::ZERO);
+        let champion = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Hero { level: 1, xp: 0.0, mana: 200.0 },
+                Health::new(unit_stats(UnitKind::Hero).hp),
+                Order::Idle,
+                tf,
+                GlobalTransform::from(tf),
+            ))
+            .id();
+        // Thrown 9 away, blooming 4: a victim at the aim point, a bystander
+        // just inside the bloom, and an enemy standing ON the caster who must
+        // feel nothing at all.
+        let aim = Vec3::new(9.0, 0.0, 0.0);
+        let victim = spawn_at(&mut app, UnitKind::Footman, Team::Claude, aim);
+        let edge = spawn_at(&mut app, UnitKind::Footman, Team::Claude, Vec3::new(12.5, 0.0, 0.0));
+        let neighbour = spawn_at(&mut app, UnitKind::Footman, Team::Claude, Vec3::new(1.0, 0.0, 0.0));
+
+        let full = unit_stats(UnitKind::Footman).hp;
+        app.world_mut()
+            .send_event(CastAbility::index(champion, index).at(CastTarget::Point(aim)));
+        app.update();
+
+        let hp = |app: &App, e: Entity| app.world().entity(e).get::<Health>().unwrap().current;
+        // Clause one: 60 damage, at level 1 (mult 1.0).
+        assert_eq!(hp(&app, victim), full - 60.0, "the damage clause landed");
+        assert_eq!(hp(&app, edge), full - 60.0, "and bloomed the full 4");
+        assert_eq!(hp(&app, neighbour), full, "the spell went where it was thrown");
+        // Clause two: 35% slow for 4s, on the same bodies and nobody else.
+        for (entity, want) in [(victim, true), (edge, true), (neighbour, false)] {
+            let slowed = app
+                .world()
+                .entity(entity)
+                .get::<StatusEffects>()
+                .is_some_and(|s| (s.magnitude(StatusKind::Slow) - 0.35).abs() < 1e-4);
+            assert_eq!(slowed, want, "the slow clause follows the damage clause");
+        }
+        // One cast, one bill.
+        assert!(spent(&app, champion));
+        assert_eq!(
+            app.world().entity(champion).get::<Hero>().unwrap().mana,
+            140.0,
+            "60 mana, once — two atoms are one cast"
+        );
+        println!("{MARKER}");
+    }
+}
 }

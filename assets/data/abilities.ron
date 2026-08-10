@@ -5,6 +5,39 @@
 //                          catalog key, the bridge selector, the button
 //                          caption. Field meanings are on `AbilityDef` in
 //                          src/shared.rs.
+//
+//                          `effects` is the ABILITY'S SENTENCE: a list of
+//                          clauses, each `(atom: …, schedule: …)`, applied in
+//                          order from one resolved centre. `schedule`
+//                          defaults to `Instant`, so a row that means "now"
+//                          says nothing at all.
+//
+//                            atoms     Damage(amount, targets?)
+//                                      Heal(amount, targets?)
+//                                      ApplyStatus(status, magnitude,
+//                                                  duration, targets)
+//                                      Militia(duration, targets?)
+//                                      Summon(unit_kind, count, lifetime?)
+//                                      Teleport(destination, army_only?)
+//                            schedules Instant
+//                                      OverTime(interval, ticks)  — first
+//                                        tick lands at the cast
+//
+//                          `targets` is per-atom (`Enemies` / `Allies` /
+//                          `OwnWorkers`) and defaults to the only side the
+//                          atom sensibly has, so one cast can damage enemies
+//                          and mend allies. The FIRST atom AIMS the cast: the
+//                          auto-pick and the auto-cast trigger both count
+//                          whoever atom 0 is looking for. Put the clause the
+//                          ability is ABOUT first.
+//
+//                          The loader refuses nonsense by name at startup —
+//                          an empty `effects`, a summoned hero, a thrown
+//                          recall, a repeating teleport, militia raised from
+//                          the enemy's workers, one status applied twice, a
+//                          schedule with no machinery behind it. Compose
+//                          freely; the validator is the safety net, and
+//                          `check_values` in src/data.rs is the full list.
 //                          `target` is OPTIONAL and defaults to `Caster` —
 //                          the effect centres on whoever cast it, which is
 //                          what every row meant before geometry existed. A
@@ -41,12 +74,12 @@
         // report to ai.rs; there is no second copy of them in code.
         (
             name: "Slam",
-            effect: Damage,
+            effects: [
+                (atom: Damage(amount: 45.0)),
+            ],
             mana_cost: 40.0,
             cooldown: 10.0,
             radius: 7.0,
-            power: 45.0,
-            duration: 0.0,
             hits_air: false,
             unlock: Always,
             description: "AoE damage around the Champion (ground only), scales with level.",
@@ -54,12 +87,12 @@
         // Healing light reaches up: air allies are still your allies.
         (
             name: "Heal",
-            effect: Heal,
+            effects: [
+                (atom: Heal(amount: 60.0)),
+            ],
             mana_cost: 45.0,
             cooldown: 12.0,
             radius: 8.0,
-            power: 60.0,
-            duration: 0.0,
             hits_air: true,
             unlock: Always,
             description: "Restores HP to all allies around the Priestess, air included, scales with level.",
@@ -67,19 +100,22 @@
         // Workers are ground units, so this never had an air question.
         (
             name: "CallToArms",
-            effect: Militia,
+            // The one atom that TRANSFORMS a body instead of creating,
+            // hurting, mending or moving one — see `EffectAtom::Militia` for
+            // why it is not a `Summon`.
+            effects: [
+                (atom: Militia(duration: 40.0)),
+            ],
             mana_cost: 0.0,
             cooldown: 90.0,
             radius: 16.0,
-            power: 40.0,
-            duration: 0.0,
             hits_air: false,
             unlock: Always,
             description: "Own workers near the TownHall become fighters for 40s.",
         ),
         // --- hero ultimates: the second ability of each class, at level 5 ---
         //
-        // Both are pure table rows: `ApplyStatus` at `Allies`, a `HeroLevel(5)`
+        // Both are pure table rows: an `ApplyStatus` atom at `Allies`, a `HeroLevel(5)`
         // predicate, their own cooldown slot. Nothing in combat.rs, ui.rs,
         // doctrine.rs or bridge.rs knows their names.
         //
@@ -95,12 +131,12 @@
         // everyone else.
         (
             name: "Warcry",
-            effect: ApplyStatus(status: DamageBuff, targets: Allies, also: None),
+            effects: [
+                (atom: ApplyStatus(status: DamageBuff, magnitude: 0.30, duration: 8.0, targets: Allies)),
+            ],
             mana_cost: 75.0,
             cooldown: 45.0,
             radius: 8.0,
-            power: 0.30,
-            duration: 8.0,
             hits_air: true,
             unlock: HeroLevel(5),
             description: "Ultimate: allies around the Champion deal +30% damage for 8s. Hero level 5.",
@@ -108,17 +144,22 @@
         // Priestess ultimate: the two-status row. 15 HP/s is roughly a
         // Footman's health bar over the full 6s, and the 25% reduction is what
         // makes the heal out-race incoming fire instead of merely trailing it.
-        // `also` is the framework's only concession to this ability: Sanctuary
-        // both heals over time AND hardens, and "two abilities on one button"
-        // would have cost more than one optional pair.
+        // Under v2 this row needed a bespoke `also` field, because "two
+        // statuses on one button" had nowhere else to live. Under v3 it is
+        // simply a two-atom row, and the field is gone.
         (
             name: "Sanctuary",
-            effect: ApplyStatus(status: HealOverTime, targets: Allies, also: Some((ArmorBuff, 0.25))),
+            // **The row `also` existed for, now written as what it always
+            // was: two clauses of one sentence.** Same centre, same radius,
+            // same 6 seconds, two statuses — and the schema is no longer
+            // holding a place for a third.
+            effects: [
+                (atom: ApplyStatus(status: HealOverTime, magnitude: 15.0, duration: 6.0, targets: Allies)),
+                (atom: ApplyStatus(status: ArmorBuff,    magnitude: 0.25, duration: 6.0, targets: Allies)),
+            ],
             mana_cost: 90.0,
             cooldown: 60.0,
             radius: 7.0,
-            power: 15.0,
-            duration: 6.0,
             hits_air: true,
             unlock: HeroLevel(5),
             description: "Ultimate: allies around the Priestess regain 15 HP/s and take 25% less damage for 6s. Hero level 5.",
@@ -163,16 +204,16 @@
         //     Keep), so gating the spell on `TeamTier` as well would be the
         //     same rule written twice, and would silently disarm every
         //     Sorcerer alive the moment a team's Keep fell.
-        //   * `also: None` — Slow is one debuff and nothing else.
+        //   * one atom — Slow is one debuff and nothing else.
         (
             name: "Slow",
-            effect: ApplyStatus(status: Slow, targets: Enemies, also: None),
+            effects: [
+                (atom: ApplyStatus(status: Slow, magnitude: 0.4, duration: 5.0, targets: Enemies)),
+            ],
             target: Point(range: 9.0),
             mana_cost: 0.0,
             cooldown: 9.0,
             radius: 4.5,
-            power: 0.4,
-            duration: 5.0,
             hits_air: true,
             unlock: Always,
             description: "Cast at a point up to 9 away: slows every enemy within 4.5 of it by 40% (move AND attack speed) for 5s. Refreshes rather than stacks; no mana, 9s cooldown. Omit the point and the Sorcerer aims at the biggest clump it can reach.",
@@ -190,15 +231,54 @@
         // finishes.
         (
             name: "ProbeChill",
-            effect: ApplyStatus(status: Slow, targets: Enemies, also: None),
+            effects: [
+                (atom: ApplyStatus(status: Slow, magnitude: 0.4, duration: 6.0, targets: Enemies)),
+            ],
             mana_cost: 10.0,
             cooldown: 8.0,
             radius: 9.0,
-            power: 0.4,
-            duration: 6.0,
             hits_air: false,
             unlock: TeamTier(T2),
             description: "Dev probe: slows enemies around the Champion by 40% for 6s. Requires tier 2.",
+        ),
+        // ------------------------------------------------------------------
+        // **THE v3 PROOF.** A mechanic this engine has never had — a thrown
+        // nuke that both hurts and chills — added as a ROW.
+        //
+        // Under v2 this ability was unbuildable without Rust: `AbilityEffect`
+        // was a closed enum with one variant per mechanic, so "damage AND
+        // slow" needed a new variant, a new arm in combat.rs's applier, a new
+        // arm in doctrine.rs's counter, and a new arm in the catalog. Under v3
+        // it is two atoms in a list, and the diff that added it is this
+        // comment and the eight lines below it. Nothing in src/ knows the word
+        // "FrostNova"; grep for it and the only hits are this file and the
+        // tests that assert exactly that.
+        //
+        // Order is load-bearing and is the reason `Damage` is written first:
+        // atom 0 AIMS the cast (see `AbilityDef::aim`), so this spell centres
+        // on the biggest clump of enemies its damage would catch, and the slow
+        // rides along to the same clump. Written the other way round it would
+        // aim identically here — both atoms want Enemies — but a row whose
+        // clauses disagree about who they are for should put the one it is
+        // ABOUT first.
+        //
+        // Dev-gated: listed only in the Champion's `probe_abilities`, so it
+        // exists under `WC3_STATUS_PROBE=1` and in no shipping match. The
+        // numbers below are therefore a demonstration, not a balance
+        // proposal — the content bead that ships a nuke will pick its own.
+        (
+            name: "FrostNova",
+            effects: [
+                (atom: Damage(amount: 60.0)),
+                (atom: ApplyStatus(status: Slow, magnitude: 0.35, duration: 4.0, targets: Enemies)),
+            ],
+            target: Point(range: 9.0),
+            mana_cost: 60.0,
+            cooldown: 12.0,
+            radius: 4.0,
+            hits_air: true,
+            unlock: Always,
+            description: "Dev demo: thrown up to 9 away, deals 60 damage and slows every enemy within 4 by 35% for 4s. Defined entirely in abilities.ron — no Rust knows its name.",
         ),
     ],
 
@@ -206,7 +286,7 @@
         // Heroes deliberately have NO default autocast: their mana is a
         // resource a player budgets, and a hero that spends it the instant one
         // enemy wanders past is a hero with none left for the fight.
-        (kind: Hero,      abilities: ["Slam", "Warcry"],   probe_abilities: ["ProbeChill"], autocast: None),
+        (kind: Hero,      abilities: ["Slam", "Warcry"],   probe_abilities: ["ProbeChill", "FrostNova"], autocast: None),
         (kind: Priestess, abilities: ["Heal", "Sanctuary"], probe_abilities: [],            autocast: None),
         // One enemy in the bubble is enough: the cooldown is the only cost,
         // and a Slow landed on a single Raider diving your workers is exactly

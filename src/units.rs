@@ -521,6 +521,14 @@ fn spawn_units(
             entity.insert((hero, Inventory::default()));
         }
 
+        // A body an `EffectAtom::Summon` called up: identical to a trained one
+        // in every way except that it knows when to leave (shared.rs expires
+        // it). Stamped here because this is where units are made, so a summon
+        // can never diverge from a trained unit by accident.
+        if let Some(summoned) = ev.summoned {
+            entity.insert(summoned);
+        }
+
         // Set when a `DoctrineTemplate` had an explicit opinion about
         // auto-cast, so the per-kind default below does not overrule it.
         let mut stamped_autocast = false;
@@ -808,7 +816,11 @@ fn spawn_units(
 /// keeps its own `unit_y` and its relative offset to the centre (clamped, so an
 /// arriving group lands as a loose blob instead of one stack), and everyone
 /// moved has `MoveTo` + path state cleared — they arrive standing still.
-fn handle_teleports(
+/// `pub(crate)` for one reason: a destination is now a DECISION, and the only
+/// test that can check the decision was honoured is one that runs the item and
+/// the move together — combat.rs picks the hall, this system is what actually
+/// puts the army on it. See the probe in combat.rs's test module.
+pub(crate) fn handle_teleports(
     mut commands: Commands,
     mut events: EventReader<TeleportRequest>,
     nav: Res<NavGrid>,

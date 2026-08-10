@@ -1967,13 +1967,19 @@ fn think(
                     if engaged { ", in a fight" } else { "" },
                     if marching { ", marching out" } else { "" },
                 );
-                // `hero` named explicitly rather than left to the compiler's
-                // lowest-living-id default: the script picked THIS hero's bag
-                // when it read the inventory, and a team with two heroes must
-                // not drink out of the other one's.
                 voice.say(Intent::UseItem {
                     slot,
+                    // `hero` named explicitly rather than left to the
+                    // compiler's lowest-living-id default: the script picked
+                    // THIS hero's bag when it read the inventory, and a team
+                    // with two heroes must not drink out of the other one's.
                     hero: Some(intent_id(hero.entity)),
+                    // The scripted AI does not pick a hall. `None` is the
+                    // nearest one, which is exactly what it got before the
+                    // field existed — the baseline this ladder measures
+                    // against must not move because a commander gained an
+                    // option the script never had.
+                    destination: None,
                 });
             }
             Some(ItemAction::Buy(id)) => {
@@ -3850,6 +3856,30 @@ mod tests {
             matches!(app.world().entity(soldier).get::<Order>(), Some(Order::Idle)),
             "an in-transit order must not change what the unit is doing yet"
         );
+    }
+
+    /// **The script does not ride the trigger exemption.**
+    ///
+    /// `wc3clone-pec` gave `apply_intents` a second issuer: anything carrying
+    /// `SubmitIntent::trigger` gets `CommandLink::exempt_issuer` and pays
+    /// nothing, because a rule's author paid the reach when they armed it.
+    /// That is a correct rule and a live hazard for this seat — a scripted
+    /// think tick submitting with `trigger: Some(..)` would be autopilot
+    /// commanding at zero latency, which is docs/TEMPO.md §3's cheat by
+    /// another door.
+    ///
+    /// Pinned at the field rather than at the timing, because the field is
+    /// what decides it and a timing assertion would pass for the wrong reason
+    /// on a unit that happened to be standing on a command node.
+    #[test]
+    fn the_script_never_claims_the_trigger_link_exemption() {
+        let spoken = SubmitIntent::script(Team::Claude, Intent::Return { units: vec![] });
+        assert!(
+            spoken.trigger.is_none(),
+            "a scripted decision is a commander deciding now, not a rule firing — \
+             it pays the link like the other two seats"
+        );
+        assert_eq!(spoken.source, IntentSource::Script);
     }
 
     /// The off-flag identity at the third seat: with `WC3_COMMAND_LATENCY`

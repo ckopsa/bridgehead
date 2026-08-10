@@ -173,6 +173,15 @@ def main():
     for sq in s.get("squads", []):
         print(f"SQUAD {sq['id']}: {sq['posture']} members={sq['members']}")
 
+    # --- triggers ---
+    # Absent until this seat has armed one, so a v1 snapshot prints nothing
+    # extra. Shown as the English sentence rather than the JSON: this readout is
+    # for deciding, and the JSON is one `state.json` away when you want to edit
+    # a rule and re-send it.
+    for t in s.get("triggers", []):
+        fired = f" last={t['last_fired']:.0f}s" if t.get("last_fired") is not None else ""
+        print(f"TRIGGER [{t['status']}]{fired} {t['sentence']}")
+
     # --- mines & trees ---
     print(
         "MINES: "

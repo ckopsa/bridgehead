@@ -154,6 +154,52 @@ fn trim_num(v: f32) -> String {
 
 /// Radius written by the doctrine card's Defend posture.
 const DEFEND_RADIUS: f32 = 22.0;
+
+/// The name the human's one trigger preset is armed under. A fixed name rather
+/// than a generated one is what makes the tile a TOGGLE: pressing it twice
+/// clears the rule it just set instead of arming a second copy, and re-pressing
+/// it after moving the army replaces the rule in place without spending another
+/// of the team's eight slots.
+const HOME_GUARD: &str = "home-guard";
+/// Radius of the Defend posture the home guard falls back to. Wider than
+/// `DEFEND_RADIUS` because it has to cover a base rather than a chokepoint.
+const HOME_GUARD_RADIUS: f32 = 26.0;
+/// Cooldown between home-guard fires. A base is raided more than once a match,
+/// and the rule must survive the first harassing Raider.
+const HOME_GUARD_COOLDOWN: f32 = 30.0;
+
+/// Is `name` armed for the human right now?
+///
+/// Spent once-triggers do not count: the tile is a toggle and its lit state has
+/// to mean "this rule will fire", not "this rule exists".
+fn has_trigger(triggers: &Triggers, name: &str) -> bool {
+    triggers
+        .get(Team::Human)
+        .iter()
+        .any(|t| t.name.as_str() == name && t.armed)
+}
+
+/// The selection panel's one-line trigger readout: every rule this team has
+/// armed, with its state. The human's whole "list" view, and deliberately one
+/// line — eight short names fit, and a panel that grew a scrolling list would
+/// be building the authoring UI this bead explicitly deferred.
+///
+/// Empty string when there are none, which is how every other optional line in
+/// this panel disappears.
+fn trigger_line(triggers: &Triggers, now: f32) -> String {
+    let armed = triggers.get(Team::Human);
+    if armed.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = armed
+        .iter()
+        .map(|t| match t.status(now) {
+            "armed" => t.name.as_str().to_string(),
+            other => format!("{} ({other})", t.name),
+        })
+        .collect();
+    format!("Triggers: {}", parts.join("  "))
+}
 /// Highest squad id a human gesture will ever mint. Matches the three control
 /// groups; a bridge commander may use any id it likes.
 const MAX_UI_SQUAD: u8 = 3;
@@ -170,12 +216,23 @@ fn cycle_step(current: Option<f32>, steps: &[f32]) -> Option<f32> {
 }
 
 const TOP_BAR_H: f32 = 34.0;
-/// Height of the bottom console; also the "not a world click" strip.
-const CONSOLE_H: f32 = 200.0;
 /// Uniform gap between console zones and the console edge.
 const PAD: f32 = 8.0;
-/// Minimap is a square of this many logical pixels.
+/// Minimap is a square of at most this many logical pixels — the size it wants
+/// and, on any window this HUD was designed for, the size it gets. What it
+/// actually measures is `HudLayout::minimap_px`; see `hud_layout`.
+///
+/// The bottom console no longer has a constant of its own. It used to be a
+/// flat 200px, which was two pixels short of the minimap it contained, and
+/// deriving its height from its contents is what fixed that.
 const MINIMAP_PX: f32 = 184.0;
+
+/// How close to a minimap click an own hall must stand to be the hall that
+/// click NAMED, in world units. A hall's footprint is about seven minimap
+/// pixels, which is a hard thing to hit under pressure; halls stand far enough
+/// apart that this radius still cannot mean two of them at once, and the
+/// nearest wins if it ever does.
+const MINIMAP_HALL_PICK: f32 = 10.0;
 
 /// Selection cards: 2 rows of 6.
 const MAX_CARDS: usize = 12;
@@ -191,7 +248,7 @@ const CARD_GAP: f32 = 5.0;
 /// way for a building to become unbuildable.
 ///
 /// It grew a COLUMN rather than a row because the console is height-bound
-/// (`CONSOLE_H` is 200px and three rows of 52 plus gaps and margins already
+/// (the console is ~202px and three rows of 52 plus gaps and margins already
 /// spend 184 of it); a fourth row would not fit, and a fourth column costs
 /// 52px of the selection panel's flex-grow width, which has it to spare.
 const CMD_SLOTS: usize = 12;
@@ -225,7 +282,16 @@ const NOTIF_FONT: f32 = 13.0;
 /// Cap on how much of a narrow window the stack may take. A tiling WM can hand
 /// the game a window slimmer than `NOTIF_W`, and a fixed-width stack pinned to
 /// the right edge then runs off the left one.
-const NOTIF_MAX_FRAC: f32 = 0.9;
+///
+/// 0.52, down from the 0.9 that only considered the stack on its own. The two
+/// floating panels live in opposite top corners and 0.9 + `PROP_MAX_FRAC`'s
+/// 0.44 is 134% of the window: below about 620px wide the alert stack grew
+/// left across the proposal panel and the player was reading two things
+/// printed on top of each other, with `notif_rect` and `prop_rect` both
+/// claiming the same clicks. 0.52 + 0.44 = 0.96 can never overlap, and at any
+/// width at or above 620 neither cap binds, so nothing about the sizes this
+/// HUD was designed at changes.
+const NOTIF_MAX_FRAC: f32 = 0.52;
 /// Height budgeted per row when hit-testing (see `notif_rect`). A row is one
 /// line of text most of the time, but a long message in a narrow window wraps,
 /// and no analytic guess can know which. Two lines' worth means the stack
@@ -307,9 +373,14 @@ impl Plugin for UiPlugin {
         }
         app.init_resource::<UiState>()
             .init_resource::<Notifications>()
+            .init_resource::<AlertPings>()
+            .init_resource::<HudLayout>()
             // `setup_fog` after `setup_ui`: it parents the minimap's fog layer
             // to the `MinimapRoot` that `setup_ui` spawns.
-            .add_systems(Startup, (setup_ui, setup_hover, setup_fog).chain())
+            .add_systems(
+                Startup,
+                (setup_ui, setup_hover, setup_fog, setup_alert_cues).chain(),
+            )
             .add_systems(
                 Update,
                 // Two groups, each internally chained and the pair chained to
@@ -319,15 +390,27 @@ impl Plugin for UiPlugin {
                 // the result* second.
                 (
                     (
+                        // First in the chain, ahead of every reader: the
+                        // minimap's pixel size is an input to hit-testing a
+                        // click on it, and a frame that hit-tested against last
+                        // frame's size would put a camera jump in the wrong
+                        // place on the frame a window is resized.
+                        apply_hud_layout,
                         minimap_static_markers,
                         // Fog first, so everything downstream in this chain —
                         // the pickers, the minimap, the hover ring — reads the
                         // same visibility the player is looking at.
                         apply_fog_visibility,
+                        // Immediately after the hider, because they are two
+                        // halves of one answer: `apply_fog_visibility` decides
+                        // what is on screen at all, `apply_fog_tint` decides
+                        // how brightly what remains is lit.
+                        apply_fog_tint,
                         update_fog_overlay,
                         sync_building_ghosts,
                         surrender_hotkey,
                         screenshot_hotkey,
+                        scheduled_screenshots,
                         command_input,
                         panel_clicks,
                         // Before `minimap_input`: both write `CameraFocus` and
@@ -362,6 +445,9 @@ impl Plugin for UiPlugin {
                         update_minimap,
                         update_minimap_bounties,
                         update_notifications,
+                        // After the drain that fills the ping list, so a ring
+                        // is on screen the same frame its alert row is.
+                        update_minimap_pings,
                         update_hud,
                     )
                         .chain(),
@@ -438,6 +524,10 @@ struct UiState {
     /// taught and postures borrowed. A `Caster`-geometry ability never arms
     /// anything and fires on the key press exactly as it always did.
     cast_place: Option<CastArm>,
+    /// A teleport item waiting for the player to click WHICH hall it goes to.
+    /// Armed only when there are two or more to choose between; see
+    /// [`TeleportArm`].
+    teleport_place: Option<TeleportArm>,
     /// Round-robin cursor for the idle-worker hotkey.
     idle_cursor: usize,
     /// Left button went down inside the minimap and is still held.
@@ -587,6 +677,10 @@ struct LinkRing;
 #[derive(Component)]
 struct TransitRing;
 
+/// The bottom console strip. `apply_hud_layout` owns its height.
+#[derive(Component)]
+struct ConsoleRoot;
+
 /// Container of the minimap; all markers are absolute children of it.
 #[derive(Component)]
 struct MinimapRoot;
@@ -653,6 +747,9 @@ enum Slot {
     /// the HUD's half of the snapshot's `units[].link` / `units[].pending`
     /// (docs/TEMPO.md §4). Empty string whenever the mechanic is off.
     Link,
+    /// Every trigger this team has armed, and its state. Empty until the
+    /// player (or their co-commander) arms one.
+    Triggers,
     /// Top bar: how much of this army is inside its own chain of command.
     /// Empty string whenever the mechanic is off.
     Coverage,
@@ -785,6 +882,29 @@ struct CastArm {
     wants_unit: bool,
 }
 
+/// A teleport item waiting for the player to say WHICH hall.
+///
+/// The fourth user of the press-then-click vocabulary building placement
+/// taught, and the first whose click names a *building* rather than a point or
+/// a unit. Like [`CastArm`], the hero and the slot are resolved at PRESS time:
+/// the bag the player is spending from must not change under them between the
+/// key and the click.
+///
+/// It only ever exists with **two or more** standing halls. With one hall
+/// there is no choice to make, so the key fires the scroll outright with no
+/// destination at all — a ceremony that always has exactly one answer is a
+/// tax, not a decision, and the nearest-hall default already says it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TeleportArm {
+    /// Whose bag, named explicitly for the reason `UseSlot` always named it:
+    /// reading "the team's hero" at click time would show the Priestess's
+    /// scroll and burn the Champion's.
+    hero: Entity,
+    slot: usize,
+    /// Item name, for the hint line the player reads while choosing.
+    name: &'static str,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CmdAction {
     AttackMove,
@@ -850,6 +970,8 @@ enum CmdAction {
     TemplateAutoCast,
     /// Remove the selected building's template entirely.
     TemplateClear,
+    /// Arm or clear the `home-guard` trigger for the selection's squad.
+    ToggleHomeGuard,
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,6 +1751,15 @@ fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
 struct CastLookup<'w, 's> {
     tiers: Res<'w, TechTiers>,
     squads: Res<'w, SquadOrders>,
+    /// The team's armed triggers. Here rather than as its own parameter
+    /// because `command_input` and `update_hud` both sit on Bevy's
+    /// 16-parameter ceiling and both already share this bundle — and because
+    /// squads and triggers are the same kind of thing (standing policy the
+    /// engine executes), read by the same two systems for the same reason.
+    triggers: Res<'w, Triggers>,
+    /// Rides along with `triggers` because it is only ever read to answer a
+    /// question about them: is this repeating rule still inside its cooldown?
+    clock: Res<'w, Time>,
     cooldowns: Query<'w, 's, &'static AbilityCooldowns>,
     /// The team's completed research levels — what a research button reads to
     /// decide whether it is buyable, in progress, or already at the cap.
@@ -2085,6 +2216,9 @@ struct DoctrineCard {
     /// `SquadOrders` — i.e. when doctrine.rs is actually executing something.
     posture: Option<PostureKind>,
     tmpl: TemplateView,
+    /// Is the `home-guard` trigger armed right now? The tile is a toggle, so
+    /// this is what decides whether pressing it arms or clears.
+    home_guard: bool,
 }
 
 /// Page two: the doctrine card. This is the half of docs/TEMPO.md §2.0 that
@@ -2196,6 +2330,28 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
                 out.push(entry);
             }
         }
+
+        // **The trigger preset.** One tile, and it is a toggle for the same
+        // reason [G] Guard is one: the human's fast path is a switch, and the
+        // parameterised form of the same statement lives on the wire and in
+        // tools/intent_compile.py. Pressed, it arms `home-guard` — when any of
+        // our buildings takes damage, this squad falls back and defends the
+        // nearest hall. Pressed again, it clears it.
+        //
+        // This is a PRESET, not an authoring surface, and the asymmetry is
+        // real and documented (docs/INTENT.md § Triggers): a commander can
+        // write any of nine predicates against any of the 27 verbs, and the
+        // human at the keyboard gets one canned rule plus a readout. What
+        // closes most of the gap is that the English compiler speaks the same
+        // sentences to the same wire.
+        let mut guard = CmdEntry::plain(
+            CmdAction::ToggleHomeGuard,
+            bind(Hk::HomeGuard),
+            "Home guard",
+        )
+        .active(card.home_guard);
+        guard.cost = if card.home_guard { "armed".into() } else { "trigger".into() };
+        out.push(guard);
     } else if card.tmpl.capable {
         let t = card.tmpl;
         out.push(
@@ -2369,12 +2525,121 @@ fn placement_valid(nav: &NavGrid, econ: &Economy, kind: BuildingKind, pos: Vec3)
 /// Cursor sitting on top of a HUD panel? Then it isn't a world click. The bar
 /// and the console are fixed strips; the alert stack floats, so it only counts
 /// while it actually has rows in it.
-fn cursor_over_hud(cursor: Vec2, window: &Window, ui: &UiState) -> bool {
-    if cursor.y < TOP_BAR_H || cursor.y > window.height() - CONSOLE_H {
+fn cursor_over_hud(cursor: Vec2, window: &Window, ui: &UiState, hud: &HudLayout) -> bool {
+    if cursor.y < TOP_BAR_H || cursor.y > window.height() - hud.console_h {
         return true;
     }
     notif_rect(window, ui.notif_rows).is_some_and(|r| r.contains(cursor))
         || prop_rect(window, ui.prop_cards).is_some_and(|r| r.contains(cursor))
+}
+
+// --- Responsive console ----------------------------------------------------
+//
+// The console used to be 200 fixed pixels holding a 184px minimap with an 8px
+// margin and a 1px border on each side. 184 + 16 + 2 is 202, so the minimap's
+// bottom edge was two pixels below the console it lives in and `overflow:
+// clip()` quietly ate them — the map's south edge and its border were missing
+// at EVERY window size, and nobody noticed because a missing 2px border looks
+// like a design choice.
+//
+// A tiling WM makes that worse rather than differently: it hands the game
+// whatever the tile is, and a 200px console is a third of a 600px-tall window.
+// So the console is no longer a number. It is **derived from what it has to
+// hold**, and the two numbers below are the things that have to hold.
+
+/// The minimap's chrome: `PAD` above and below, a 1px border each side. What
+/// the console needs *beyond* the map itself.
+const MINIMAP_CHROME: f32 = 2.0 * PAD + 2.0;
+/// Never shrink the map past the point where a dot is a dot.
+const MINIMAP_MIN_PX: f32 = 120.0;
+/// …and never let it eat a narrow window's console. At 800 wide this is 224,
+/// so it binds only well below the sizes this was tuned for.
+const MINIMAP_MAX_W_FRAC: f32 = 0.28;
+/// The height of the command card's own column: three rows of tiles, their
+/// gaps, the overflow-page line, and the margins. This is a **floor** on the
+/// console — the card's tiles are a fixed grid, so a console shorter than this
+/// clips buttons, which is the one failure that costs you the game rather than
+/// just looking wrong.
+const CMD_PAGE_LINE_H: f32 = 14.0;
+/// How much of a short window the console may claim before it starts giving
+/// height back. A third is already a lot of a 600px screen.
+const CONSOLE_MAX_H_FRAC: f32 = 0.34;
+
+/// What the console and minimap measure at this window size.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+struct HudLayout {
+    console_h: f32,
+    minimap_px: f32,
+}
+
+impl Default for HudLayout {
+    fn default() -> Self {
+        // The full-size answer, so anything constructed before the first
+        // `apply_hud_layout` (setup, a test app) is already consistent.
+        hud_layout(1280.0, 800.0)
+    }
+}
+
+/// The whole responsive rule, as one pure function of the window size — which
+/// is what makes it testable without a compositor. Three clauses, in priority
+/// order:
+///
+/// 1. The command card's grid never clips. It is a fixed number of fixed
+///    tiles, and a half-drawn build menu is a broken game rather than an ugly
+///    one, so its height is a hard floor on the console.
+/// 2. Below that floor the console takes at most `CONSOLE_MAX_H_FRAC` of the
+///    window, so a short tile keeps a battlefield.
+/// 3. The minimap is square, fits inside whatever height clauses 1-2 left, and
+///    is additionally capped by width and by a legibility minimum.
+fn hud_layout(window_w: f32, window_h: f32) -> HudLayout {
+    let card_h = 3.0 * CMD_PX + 2.0 * CMD_GAP + CMD_PAGE_LINE_H + 2.0 * PAD;
+    let want = MINIMAP_PX + MINIMAP_CHROME;
+    // `max(card_h)` twice over: once so a short window cannot squeeze below the
+    // floor, once so the fraction cannot either.
+    let console_h = want.min((window_h * CONSOLE_MAX_H_FRAC).max(card_h)).max(card_h);
+    let minimap_px = (console_h - MINIMAP_CHROME)
+        .min(window_w * MINIMAP_MAX_W_FRAC)
+        .clamp(MINIMAP_MIN_PX, MINIMAP_PX);
+    HudLayout {
+        console_h,
+        minimap_px,
+    }
+}
+
+/// Recompute on resize and push the two numbers into the nodes that wear them.
+///
+/// Written every frame rather than on a resize event on purpose: the nodes are
+/// only *touched* when a value actually changes (Bevy's change detection then
+/// does the rest), and a resize event that arrives while the window is being
+/// dragged between tiles is exactly the event most likely to be missed.
+fn apply_hud_layout(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut hud: ResMut<HudLayout>,
+    mut console: Query<&mut Node, (With<ConsoleRoot>, Without<MinimapRoot>, Without<MinimapFog>)>,
+    mut minimap: Query<&mut Node, (With<MinimapRoot>, Without<MinimapFog>)>,
+    mut minimap_fog: Query<&mut Node, With<MinimapFog>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let next = hud_layout(window.width(), window.height());
+    if *hud == next {
+        return;
+    }
+    *hud = next;
+    for mut node in &mut console {
+        node.height = Val::Px(next.console_h);
+    }
+    for mut node in &mut minimap {
+        node.width = Val::Px(next.minimap_px);
+        node.height = Val::Px(next.minimap_px);
+    }
+    // The fog layer is an absolutely-positioned child that must cover the map
+    // exactly; it does not inherit a size it was given in pixels.
+    for mut node in &mut minimap_fog {
+        node.width = Val::Px(next.minimap_px);
+        node.height = Val::Px(next.minimap_px);
+    }
 }
 
 /// Screen-space rectangle of the proposal panel, or `None` when nothing is
@@ -2422,29 +2687,31 @@ fn notif_width(window: &Window) -> f32 {
     NOTIF_W.min(window.width() * NOTIF_MAX_FRAC)
 }
 
-/// Screen-space rectangle of the minimap. The console is a fixed-height strip
-/// pinned to the bottom of the window and the minimap sits at its top-left with
-/// a `PAD` margin, so the rect is exact without touching layout internals.
-fn minimap_rect(window: &Window) -> Rect {
-    let top = window.height() - CONSOLE_H + PAD;
-    Rect::new(PAD, top, PAD + MINIMAP_PX, top + MINIMAP_PX)
+/// Screen-space rectangle of the minimap. The console is a strip pinned to the
+/// bottom of the window and the minimap sits at its top-left with a `PAD`
+/// margin, so the rect is exact without touching layout internals — given the
+/// same `HudLayout` the nodes were sized from.
+fn minimap_rect(window: &Window, hud: &HudLayout) -> Rect {
+    let top = window.height() - hud.console_h + PAD;
+    Rect::new(PAD, top, PAD + hud.minimap_px, top + hud.minimap_px)
 }
 
-/// World XZ -> minimap pixel offset. +X is right, +Z is up (matching the
-/// default camera view: the Human base ends up bottom-left).
-fn world_to_minimap(p: Vec3) -> Vec2 {
+/// World XZ -> minimap pixel offset, for a map `px` on a side. +X is right,
+/// +Z is up (matching the default camera view: the Human base ends up
+/// bottom-left).
+fn world_to_minimap(p: Vec3, px: f32) -> Vec2 {
     Vec2::new(
-        (p.x + MAP_HALF) / (2.0 * MAP_HALF) * MINIMAP_PX,
-        (MAP_HALF - p.z) / (2.0 * MAP_HALF) * MINIMAP_PX,
+        (p.x + MAP_HALF) / (2.0 * MAP_HALF) * px,
+        (MAP_HALF - p.z) / (2.0 * MAP_HALF) * px,
     )
 }
 
 /// Minimap pixel offset -> world XZ.
-fn minimap_to_world(uv: Vec2) -> Vec3 {
+fn minimap_to_world(uv: Vec2, px: f32) -> Vec3 {
     Vec3::new(
-        uv.x / MINIMAP_PX * 2.0 * MAP_HALF - MAP_HALF,
+        uv.x / px * 2.0 * MAP_HALF - MAP_HALF,
         0.0,
-        MAP_HALF - uv.y / MINIMAP_PX * 2.0 * MAP_HALF,
+        MAP_HALF - uv.y / px * 2.0 * MAP_HALF,
     )
 }
 
@@ -2769,7 +3036,9 @@ fn setup_ui(
                 left: Val::Px(0.0),
                 bottom: Val::Px(0.0),
                 width: Val::Percent(100.0),
-                height: Val::Px(CONSOLE_H),
+                // Resized by `apply_hud_layout`; this is the full-size answer
+                // so the first frame is already right.
+                height: Val::Px(HudLayout::default().console_h),
                 flex_direction: FlexDirection::Row,
                 align_items: AlignItems::Stretch,
                 border: UiRect::top(Val::Px(2.0)),
@@ -2777,6 +3046,7 @@ fn setup_ui(
             },
             BackgroundColor(CONSOLE_BG),
             BorderColor(EDGE),
+            ConsoleRoot,
         ))
         .with_children(|console| {
             spawn_minimap(console);
@@ -3023,8 +3293,8 @@ fn spawn_minimap(console: &mut ChildSpawnerCommands) {
     console
         .spawn((
             Node {
-                width: Val::Px(MINIMAP_PX),
-                height: Val::Px(MINIMAP_PX),
+                width: Val::Px(HudLayout::default().minimap_px),
+                height: Val::Px(HudLayout::default().minimap_px),
                 margin: UiRect::all(Val::Px(PAD)),
                 border: UiRect::all(Val::Px(1.0)),
                 overflow: Overflow::clip(),
@@ -3066,6 +3336,14 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
             flex_direction: FlexDirection::Column,
             margin: UiRect::all(Val::Px(PAD)),
             row_gap: Val::Px(4.0),
+            // This panel is the console's only *elastic* zone, so it is the
+            // only one whose contents can be forced past their box: squeeze the
+            // width and the idle hint wraps from two lines to nine, which at
+            // 560px runs out of the bottom of the window. `hud_layout` cannot
+            // help — the overflow is text reflow, not geometry — so the panel
+            // owns its own edge. Nothing is lost that was ever visible: the
+            // clip only bites once the line has already fallen off the screen.
+            overflow: Overflow::clip(),
             ..default()
         })
         .with_children(|c| {
@@ -3347,6 +3625,16 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                 Color::srgb(0.55, 0.78, 1.0),
                 Slot::Link,
             ));
+            // The team's armed rules. Below the selection's own lines because
+            // it is the one entry in this panel that is not about the
+            // selection: a trigger belongs to the faction, and it stays on
+            // screen when nothing at all is selected.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(0.85, 0.72, 0.40),
+                Slot::Triggers,
+            ));
             c.spawn(text_bundle(
                 "Left-click / drag to select.",
                 13.0,
@@ -3361,8 +3649,9 @@ fn spawn_command_card(console: &mut ChildSpawnerCommands) {
     // indicator is a text line rather than a thirteenth tile because a tile
     // would cost a slot on every card, including the eleven-in-twelve that never
     // page — and the whole reason paging exists is that slots are the scarce
-    // thing. Three 52px rows plus gaps and the two PAD margins spend 184 of
-    // `CONSOLE_H`'s 200px; an 11px line fits in what is left.
+    // thing. Three 52px rows plus gaps and the two PAD margins spend 184px, and
+    // an 11px line fits in the `CMD_PAGE_LINE_H` budgeted after it — which is
+    // exactly the sum `hud_layout` uses as the console's floor.
     console
         .spawn(Node {
             width: Val::Px(CMD_COLS * CMD_PX + (CMD_COLS - 1.0) * CMD_GAP),
@@ -3509,7 +3798,12 @@ fn command_input(
     // Escape cancels every transient mode, innermost first, and finally backs
     // out of the doctrine page — so Escape always means "one step out".
     if keys.just_pressed(hotkeys::CANCEL) {
-        if ui.cast_place.is_some() {
+        // Innermost first, and a hall-pick is the innermost thing there is: it
+        // is armed from a card that is itself only reachable with a hero
+        // selected, and backing out of it must not also drop the hero.
+        if ui.teleport_place.is_some() {
+            ui.teleport_place = None;
+        } else if ui.cast_place.is_some() {
             ui.cast_place = None;
         } else if ui.placement.is_some() {
             ui.placement = None;
@@ -3729,6 +4023,7 @@ fn command_input(
             .and_then(|s| cast.squads.0.get(&(Team::Human, s)))
             .map(posture_kind),
         tmpl: single_template,
+        home_guard: has_trigger(&cast.triggers, HOME_GUARD),
     };
     let entries = command_entries(
         ui.page,
@@ -3877,6 +4172,7 @@ fn command_input(
             CmdAction::AttackMove => {
                 ui.attack_move_armed = true;
                 ui.placement = None;
+                ui.teleport_place = None;
             }
             CmdAction::Stop => {
                 if !own_units.is_empty() {
@@ -3893,6 +4189,7 @@ fn command_input(
                 ui.placement = Some(kind);
                 ui.wall_chain.clear();
                 ui.attack_move_armed = false;
+                ui.teleport_place = None;
             }
             // Abilities: combat.rs owns the unlock/mana/cooldown verdict,
             // exactly as it does for the AI and the bridge. The hotkey IS the
@@ -3936,6 +4233,7 @@ fn command_input(
                     ui.attack_move_armed = false;
                     ui.placement = None;
                     ui.posture_place = None;
+                    ui.teleport_place = None;
                     continue;
                 }
                 for (hero, _, _, _) in &own_casters {
@@ -3957,6 +4255,7 @@ fn command_input(
                         ui.attack_move_armed = false;
                         ui.placement = None;
                         ui.posture_place = None;
+                        ui.teleport_place = None;
                         continue;
                     }
                     say(&mut submissions, cast_here(entity, index, None));
@@ -4017,15 +4316,52 @@ fn command_input(
                 // (`hero_cmds.items`), so the intent has to name it. Reading
                 // "the team's hero" here would show the Priestess's potion and
                 // drink the Champion's.
-                if let Some((entity, ..)) = own_casters.first() {
-                    say(
-                        &mut submissions,
-                        Intent::UseItem {
+                let Some((entity, _, _, inventory)) = own_casters.first() else {
+                    continue;
+                };
+                // A teleport item is the one consumable whose press is a
+                // QUESTION, not an act: with a second hall standing, "use the
+                // scroll" no longer names an outcome. So the key arms a
+                // hall-pick, exactly as a targeted ability's key arms an aim —
+                // and, exactly as a `Caster`-geometry ability fires on the
+                // press, a team with one hall gets no ceremony at all,
+                // because there is nothing to be asked.
+                let teleport = inventory
+                    .0
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .filter(|id| item_chooses_destination(*id));
+                if let Some(item) = teleport {
+                    let halls = all_buildings
+                        .iter()
+                        .filter(|(b, team, _, under, _)| {
+                            **team == Team::Human && !under && is_hall(b.kind)
+                        })
+                        .count();
+                    if halls > 1 {
+                        ui.teleport_place = Some(TeleportArm {
+                            hero: *entity,
                             slot,
-                            hero: Some(intent_id(*entity)),
-                        },
-                    );
+                            name: item_name(item),
+                        });
+                        ui.attack_move_armed = false;
+                        ui.placement = None;
+                        ui.posture_place = None;
+                        ui.cast_place = None;
+                        continue;
+                    }
                 }
+                say(
+                    &mut submissions,
+                    Intent::UseItem {
+                        slot,
+                        hero: Some(intent_id(*entity)),
+                        // One hall, or an item that does not teleport: the
+                        // nearest-hall default is the only answer there is.
+                        destination: None,
+                    },
+                );
             }
             // --- doctrine toggles ------------------------------------------
             // These are the clearest case of a gesture *compiling*: the card
@@ -4175,6 +4511,54 @@ fn command_input(
                 ui.wall_chain.clear();
                 ui.posture_place = None;
                 ui.cast_place = None;
+                ui.teleport_place = None;
+            }
+            // The one trigger gesture the human has. A toggle, like [G] Guard:
+            // armed, it clears; unarmed, it arms. Both halves submit an intent
+            // a commander could have typed, and the replay log cannot tell
+            // which of us pressed it.
+            CmdAction::ToggleHomeGuard => {
+                if has_trigger(&cast.triggers, HOME_GUARD) {
+                    say(
+                        &mut submissions,
+                        Intent::TriggerClear {
+                            name: Some(HOME_GUARD.to_string()),
+                        },
+                    );
+                    continue;
+                }
+                if own_units.is_empty() {
+                    continue;
+                }
+                // The squad is resolved AT PRESS TIME, exactly as an armed
+                // posture resolves it: the rule names a squad, and which units
+                // are in it must not change under the player between the press
+                // and the day it fires.
+                let Some(squad) = resolve_squad(&mut submissions) else {
+                    continue;
+                };
+                let home = nearest_hall(centroid());
+                say(
+                    &mut submissions,
+                    Intent::TriggerSet {
+                        name: HOME_GUARD.to_string(),
+                        when: TriggerWhen::BaseUnderAttack,
+                        then: Box::new(Intent::Posture {
+                            id: squad,
+                            posture: Some(PostureIntent::Defend {
+                                x: home.x,
+                                z: home.z,
+                                radius: HOME_GUARD_RADIUS,
+                            }),
+                        }),
+                        // Repeating, and this is the only interesting choice in
+                        // the preset. A base is raided more than once a match,
+                        // and a home guard that spent itself on the first
+                        // harassing Raider would be a rule that is armed
+                        // exactly when it is not needed.
+                        repeat: Some(HOME_GUARD_COOLDOWN),
+                    },
+                );
             }
             CmdAction::SetPosture(kind) => {
                 let Some(squad) = resolve_squad(&mut submissions) else {
@@ -4189,6 +4573,7 @@ fn command_input(
                 ui.placement = None;
                 ui.wall_chain.clear();
                 ui.cast_place = None;
+                ui.teleport_place = None;
             }
             CmdAction::ClearPosture => {
                 // Clearing a posture leaves membership intact: the squad stops
@@ -4629,6 +5014,7 @@ fn control_groups(
 // ---------------------------------------------------------------------------
 
 fn minimap_input(
+    hud: Res<HudLayout>,
     mut ui: ResMut<UiState>,
     buttons: Res<ButtonInput<MouseButton>>,
     game_over: Res<GameOver>,
@@ -4636,6 +5022,11 @@ fn minimap_input(
     mut focus: EventWriter<CameraFocus>,
     mut submissions: EventWriter<SubmitIntent>,
     sel_units: Query<(Entity, &Team), (With<Selected>, With<Unit>)>,
+    // The hall pick's second home. Cheap because the plumbing was already
+    // here: this system converts a minimap click to a world point for the
+    // camera and for right-click orders, so naming a hall from it is that
+    // point plus one nearest-own-hall search.
+    halls: Query<(Entity, &Building, &Team, &Transform), Without<UnderConstruction>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -4644,9 +5035,49 @@ fn minimap_input(
         ui.minimap_drag = false;
         return;
     }
-    let rect = minimap_rect(window);
+    let rect = minimap_rect(window, &hud);
     let cursor = window.cursor_position();
     let inside = cursor.map_or(false, |c| rect.contains(c));
+
+    // --- left click while a teleport is armed: name the hall ---------------
+    //
+    // The minimap is where the OTHER base is. A hall-pick that could only be
+    // made in the world view would ask the player to scroll the camera to the
+    // main they are trying to save, which is a second or two of exactly the
+    // moment the scroll exists to buy back. Tolerance is generous
+    // (`MINIMAP_HALL_PICK` world units, ~11 minimap pixels) because a hall is
+    // only about seven pixels wide down here; halls stand far enough apart
+    // that a forgiving radius still cannot mean two of them at once, and if
+    // it did, the nearest wins. A miss leaves the gesture armed and falls
+    // through to the ordinary camera drag, so a mis-click still just looks.
+    if buttons.just_pressed(MouseButton::Left) && inside && ui.teleport_place.is_some() {
+        if let (Some(arm), Some(c)) = (ui.teleport_place, cursor) {
+            let uv = Vec2::new(c.x - rect.min.x, c.y - rect.min.y);
+            let ground = clamp_to_map(minimap_to_world(uv, hud.minimap_px));
+            let mut best: Option<(Entity, f32)> = None;
+            for (e, b, team, tf) in &halls {
+                if *team != Team::Human || !is_hall(b.kind) {
+                    continue;
+                }
+                let d = dist_xz(tf.translation, ground);
+                if d <= MINIMAP_HALL_PICK && best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((e, d));
+                }
+            }
+            if let Some((hall, _)) = best {
+                say(
+                    &mut submissions,
+                    Intent::UseItem {
+                        slot: arm.slot,
+                        hero: Some(intent_id(arm.hero)),
+                        destination: Some(intent_id(hall)),
+                    },
+                );
+                ui.teleport_place = None;
+                return;
+            }
+        }
+    }
 
     // --- left click / drag: move the camera --------------------------------
     if buttons.just_pressed(MouseButton::Left) && inside {
@@ -4658,11 +5089,11 @@ fn minimap_input(
     if ui.minimap_drag {
         if let Some(c) = cursor {
             let uv = Vec2::new(
-                (c.x - rect.min.x).clamp(0.0, MINIMAP_PX),
-                (c.y - rect.min.y).clamp(0.0, MINIMAP_PX),
+                (c.x - rect.min.x).clamp(0.0, hud.minimap_px),
+                (c.y - rect.min.y).clamp(0.0, hud.minimap_px),
             );
             focus.write(CameraFocus {
-                pos: minimap_to_world(uv),
+                pos: minimap_to_world(uv, hud.minimap_px),
             });
         }
     }
@@ -4671,7 +5102,7 @@ fn minimap_input(
     if buttons.just_pressed(MouseButton::Right) && inside {
         let Some(c) = cursor else { return };
         let uv = Vec2::new(c.x - rect.min.x, c.y - rect.min.y);
-        let ground = clamp_to_map(minimap_to_world(uv));
+        let ground = clamp_to_map(minimap_to_world(uv, hud.minimap_px));
 
         let mut group: Vec<Entity> = sel_units
             .iter()
@@ -4694,6 +5125,7 @@ fn minimap_input(
 
 #[allow(clippy::too_many_arguments)]
 fn left_mouse(
+    hud: Res<HudLayout>,
     mut commands: Commands,
     mut ui: ResMut<UiState>,
     buttons: Res<ButtonInput<MouseButton>>,
@@ -4705,7 +5137,17 @@ fn left_mouse(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     units: Query<(Entity, &Transform, &Unit, &Team, Has<Selected>)>,
-    buildings: Query<(Entity, &Transform, &Building, &Team, Has<Selected>)>,
+    // `UnderConstruction` rides along for the hall pick: a hall still going up
+    // is not a place a scroll can land, and offering it would compose a
+    // gesture the compiler is about to refuse.
+    buildings: Query<(
+        Entity,
+        &Transform,
+        &Building,
+        &Team,
+        Has<Selected>,
+        Has<UnderConstruction>,
+    )>,
     selected: Query<Entity, With<Selected>>,
     mut drag_node: Query<&mut Node, With<DragRect>>,
 ) {
@@ -4728,7 +5170,7 @@ fn left_mouse(
     // ---- press ----------------------------------------------------------
     if buttons.just_pressed(MouseButton::Left) {
         if let Some(cursor) = cursor {
-            if !cursor_over_hud(cursor, window, &ui) {
+            if !cursor_over_hud(cursor, window, &ui, &hud) {
                 let ground = cursor_to_ground(camera, cam_tf, cursor);
 
                 // Placement confirm.
@@ -4889,6 +5331,48 @@ fn left_mouse(
                     return;
                 }
 
+                // Hall pick. The item card armed a teleport; this click names
+                // WHICH of your halls it arrives at, and the pair becomes the
+                // same sentence a commander sends as
+                // {"type":"use_item","slot":0,"hero":7,"destination":34}.
+                //
+                // The picker is the SELECTION picker's building rule verbatim
+                // (own, within half a footprint of the ground point), so "the
+                // hall you can click to select" and "the hall you can click to
+                // port to" are the same hall. A miss leaves it armed, for the
+                // reason Escort and a targeted cast do: this gesture is
+                // usually made with an enemy army on top of the thing you are
+                // aiming at, and disarming on a near-miss would make the hall
+                // you most need the one you keep failing to name.
+                if let Some(arm) = ui.teleport_place {
+                    if let Some(ground) = ground {
+                        let mut best: Option<(Entity, f32)> = None;
+                        for (e, tf, b, team, _, under) in &buildings {
+                            if *team != Team::Human || under || !is_hall(b.kind) {
+                                continue;
+                            }
+                            let d = dist_xz(tf.translation, ground);
+                            if d <= building_stats(b.kind).size * 0.5
+                                && best.is_none_or(|(_, bd)| d < bd)
+                            {
+                                best = Some((e, d));
+                            }
+                        }
+                        if let Some((hall, _)) = best {
+                            say(
+                                &mut submissions,
+                                Intent::UseItem {
+                                    slot: arm.slot,
+                                    hero: Some(intent_id(arm.hero)),
+                                    destination: Some(intent_id(hall)),
+                                },
+                            );
+                            ui.teleport_place = None;
+                        }
+                    }
+                    return;
+                }
+
                 // Attack-move click.
                 if ui.attack_move_armed {
                     if let Some(ground) = ground {
@@ -4968,7 +5452,7 @@ fn left_mouse(
             }
             // Only buildings caught by the box.
             let mut picked_buildings = Vec::new();
-            for (e, tf, _, team, _) in &buildings {
+            for (e, tf, _, team, _, _) in &buildings {
                 if *team != Team::Human {
                     continue;
                 }
@@ -4987,7 +5471,7 @@ fn left_mouse(
         }
 
         // Plain click: closest own unit, else own building, else clear.
-        if cursor_over_hud(cursor, window, &ui) {
+        if cursor_over_hud(cursor, window, &ui, &hud) {
             return;
         }
         let Some(ground) = cursor_to_ground(camera, cam_tf, cursor) else {
@@ -5009,7 +5493,7 @@ fn left_mouse(
             }
         }
         if best.is_none() {
-            for (e, tf, b, team, _) in &buildings {
+            for (e, tf, b, team, _, _) in &buildings {
                 if *team != Team::Human {
                     continue;
                 }
@@ -5037,6 +5521,7 @@ fn left_mouse(
 
 #[allow(clippy::type_complexity)]
 fn right_mouse(
+    hud: Res<HudLayout>,
     mut ui: ResMut<UiState>,
     buttons: Res<ButtonInput<MouseButton>>,
     game_over: Res<GameOver>,
@@ -5069,7 +5554,7 @@ fn right_mouse(
         return;
     };
     // Console clicks belong to the console (minimap_input handles them).
-    if cursor_over_hud(cursor, window, &ui) {
+    if cursor_over_hud(cursor, window, &ui, &hud) {
         return;
     }
 
@@ -5078,12 +5563,14 @@ fn right_mouse(
         || ui.attack_move_armed
         || ui.posture_place.is_some()
         || ui.cast_place.is_some()
+        || ui.teleport_place.is_some()
     {
         ui.placement = None;
         ui.wall_chain.clear();
         ui.attack_move_armed = false;
         ui.posture_place = None;
         ui.cast_place = None;
+        ui.teleport_place = None;
         return;
     }
 
@@ -5703,6 +6190,7 @@ fn sync_selection_rings(
 /// be able to see where the ground is closed without panning the camera along
 /// it.
 fn minimap_static_markers(
+    hud: Res<HudLayout>,
     mut commands: Commands,
     mut done: Local<bool>,
     root: Query<Entity, With<MinimapRoot>>,
@@ -5723,7 +6211,7 @@ fn minimap_static_markers(
             ResourceKind::Gold => (5.0, Color::srgb(1.0, 0.82, 0.25), 2),
             ResourceKind::Lumber => (2.0, Color::srgb(0.16, 0.42, 0.18), 0),
         };
-        let p = world_to_minimap(tf.translation);
+        let p = world_to_minimap(tf.translation, hud.minimap_px);
         commands.spawn((
             Node {
                 position_type: PositionType::Absolute,
@@ -5744,7 +6232,7 @@ fn minimap_static_markers(
     // nav cell so the barrier reads as one continuous wall.
     let rock = Color::srgb(0.26, 0.26, 0.30);
     for cell in crate::terrain::barrier_cells() {
-        let p = world_to_minimap(cell);
+        let p = world_to_minimap(cell, hud.minimap_px);
         commands.spawn((
             Node {
                 position_type: PositionType::Absolute,
@@ -5794,12 +6282,6 @@ fn minimap_static_markers(
 // takes enemy units and buildings out of the 3D scene entirely. Health bars are
 // children of their owner, so they inherit the hidden state for free.
 
-/// Opaque enough to read as "nothing known", not so opaque that the map's
-/// shape stops being legible under it.
-const FOG_UNEXPLORED_ALPHA: f32 = 0.88;
-/// Terrain remembered, contents not. Deliberately a long way from both
-/// neighbours so the three states are told apart at a glance.
-const FOG_EXPLORED_ALPHA: f32 = 0.44;
 /// Above the ground plane and its cosmetic patches (0.02-0.046) and above the
 /// selection/hover rings (0.08/0.1), below the placement ghost's box. Low
 /// enough that it reads as lying ON the ground rather than hanging over it.
@@ -5911,8 +6393,8 @@ fn setup_fog(
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
                 top: Val::Px(0.0),
-                width: Val::Px(MINIMAP_PX),
-                height: Val::Px(MINIMAP_PX),
+                width: Val::Px(HudLayout::default().minimap_px),
+                height: Val::Px(HudLayout::default().minimap_px),
                 ..default()
             },
             ImageNode {
@@ -5942,12 +6424,56 @@ fn setup_fog(
 /// The whole legibility of the fog is these three numbers: a spectator should
 /// be able to read a team's vision off the ground without hunting for the
 /// boundary, so they are spread deliberately wide rather than being a gentle
-/// ramp.
+/// ramp — 0.0 / 0.44 / 0.88.
+///
+/// It is now *derived* rather than declared, and that is the point.
+/// `shared::fog_shade` says how much of a thing's colour survives at each
+/// state; the quad's job is to remove the rest, and the scenery tint's job is
+/// to keep exactly that much. Two renderers, one rule, no way for them to
+/// disagree about what "remembered" looks like.
 fn fog_alpha(cell: CellVis) -> f32 {
-    match cell {
-        CellVis::Unexplored => FOG_UNEXPLORED_ALPHA,
-        CellVis::Explored => FOG_EXPLORED_ALPHA,
-        CellVis::Visible => 0.0,
+    1.0 - fog_shade(cell)
+}
+
+/// Dress every fog-tinted doodad in its cell's shade.
+///
+/// The flat-quad limitation, closed. The overlay lies on the ground at
+/// `FOG_PLANE_Y` (0.16) and can therefore only darken things shorter than
+/// 0.16 — which is nothing. A rock is a sphere half a unit across; a pine's
+/// canopy is four units up. Both stood in full sun over black earth, and
+/// docs/FOG.md named it as the known limitation a shader would fix.
+///
+/// This is that fix, done with materials rather than WGSL: every doodad owns
+/// three pre-built copies of its own look (`FogTinted`), and all this system
+/// does is decide which one it wears. No shader, no extended material, no
+/// per-frame texture upload — and, crucially, no repaint, so the bind-group
+/// staleness trap that `update_fog_overlay` has to defend against with a
+/// republish simply does not exist here. Swapping the handle *is* the update.
+///
+/// Trees are still hidden outright while `Unexplored` (`apply_fog_visibility`),
+/// and the reason has changed: it used to be a rendering workaround, and it is
+/// now an information rule. Where a forest stands is worth knowing — it is
+/// lumber, and it is cover — so a team that has never been there does not get
+/// to see its silhouette, however dark.
+fn apply_fog_tint(
+    fog: Res<FogGrids>,
+    mut tinted: Query<(
+        &FogTinted,
+        &GlobalTransform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
+) {
+    // `WC3_FOG=0` hands back a fully-lit grid, so this resolves to the
+    // `Visible` shade everywhere — the same "no branch at the call site"
+    // discipline the rest of the fog code keeps.
+    let grid = fog.get(Team::Human);
+    for (shades, gt, mut mat) in &mut tinted {
+        // `GlobalTransform`, so a leaf cluster is shaded by the ground its
+        // trunk stands on rather than by wherever its local offset points.
+        let want = shades.at(grid.at(gt.translation()));
+        if mat.0.id() != want.id() {
+            mat.0 = want.clone();
+        }
     }
 }
 
@@ -6121,6 +6647,7 @@ fn sync_building_ghosts(
 }
 
 fn update_minimap_bounties(
+    hud: Res<HudLayout>,
     mut commands: Commands,
     time: Res<Time>,
     root: Query<Entity, With<MinimapRoot>>,
@@ -6139,7 +6666,7 @@ fn update_minimap_bounties(
     let wanted: Vec<Vec2> = bounties
         .iter()
         .filter(|tf| grid.sees(tf.translation))
-        .map(|tf| world_to_minimap(tf.translation))
+        .map(|tf| world_to_minimap(tf.translation, hud.minimap_px))
         .collect();
 
     let mut used = 0usize;
@@ -6173,6 +6700,7 @@ fn update_minimap_bounties(
 }
 
 fn update_minimap(
+    hud: Res<HudLayout>,
     mut commands: Commands,
     root: Query<Entity, With<MinimapRoot>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -6208,14 +6736,14 @@ fn update_minimap(
         } else {
             (3.0, team.color())
         };
-        wanted.push((world_to_minimap(tf.translation), size, color));
+        wanted.push((world_to_minimap(tf.translation, hud.minimap_px), size, color));
     }
     for (tf, team) in &buildings {
         if !known(team, tf.translation) {
             continue;
         }
         wanted.push((
-            world_to_minimap(tf.translation),
+            world_to_minimap(tf.translation, hud.minimap_px),
             6.0,
             lighten(team.color(), 0.12),
         ));
@@ -6225,7 +6753,7 @@ fn update_minimap(
     // fainter than one being looked at.
     for ghost in grid.ghosts() {
         wanted.push((
-            world_to_minimap(ghost.pos),
+            world_to_minimap(ghost.pos, hud.minimap_px),
             6.0,
             lighten(ghost.team.color(), -0.35),
         ));
@@ -6292,8 +6820,8 @@ fn update_minimap(
         return;
     }
     // +Z maps to smaller Y on the minimap, so the corners swap.
-    let a = world_to_minimap(Vec3::new(min.x, 0.0, max.y));
-    let b = world_to_minimap(Vec3::new(max.x, 0.0, min.y));
+    let a = world_to_minimap(Vec3::new(min.x, 0.0, max.y), hud.minimap_px);
+    let b = world_to_minimap(Vec3::new(max.x, 0.0, min.y), hud.minimap_px);
     vp.display = Display::Flex;
     vp.left = Val::Px(a.x);
     vp.top = Val::Px(a.y);
@@ -6363,9 +6891,14 @@ fn update_hud(
     heroes: Query<(&Team, &Unit, Option<&Inventory>), With<Hero>>,
     // Read-only: which buildings the player has FINISHED (the tech gate), and
     // what is in their queues (heroes in flight spend a slot).
+    // `Transform` and `Health` ride along for ONE reader: the hall-pick hint,
+    // which names the hall that is bleeding. See the hint block below for why
+    // the answer is a sentence rather than a highlight.
     all_buildings: Query<(
         &Building,
         &Team,
+        &Transform,
+        &Health,
         Has<UnderConstruction>,
         Option<&TrainingQueue>,
     )>,
@@ -6758,6 +7291,9 @@ fn update_hud(
     } else {
         (String::new(), String::new())
     };
+    // The team's armed rules — nothing to do with the selection or the link,
+    // and drawn whether or not either exists.
+    let triggers_text = trigger_line(&cast.triggers, cast.clock.elapsed_secs());
 
     // Hero commands: the ability of a selected caster, one train/revive button
     // per hero class the team's slots have room for, the building's own
@@ -6768,7 +7304,7 @@ fn update_hud(
         .filter(|(t, _, _)| **t == Team::Human)
         .map(|(_, u, _)| u.kind)
         .collect();
-    for (_, team, _, queue) in all_buildings.iter() {
+    for (_, team, _, _, _, queue) in all_buildings.iter() {
         if *team != Team::Human {
             continue;
         }
@@ -6841,8 +7377,8 @@ fn update_hud(
     };
     let completed: Vec<BuildingKind> = all_buildings
         .iter()
-        .filter(|(_, t, under, _)| **t == Team::Human && !under)
-        .map(|(b, _, _, _)| b.kind)
+        .filter(|(_, t, _, _, under, _)| **t == Team::Human && !under)
+        .map(|(b, ..)| b.kind)
         .collect();
     let all_entries = command_entries(
         ui.page,
@@ -6854,6 +7390,7 @@ fn update_hud(
             doc,
             posture: live_posture.map(posture_kind),
             tmpl: single_template,
+            home_guard: has_trigger(&cast.triggers, HOME_GUARD),
         },
         &completed,
     );
@@ -6880,7 +7417,60 @@ fn update_hud(
     ui.queue_len = queue_letters.len();
 
     // --- hints -------------------------------------------------------------
-    let hints = if let Some(kind) = ui.placement {
+    let hints = if let Some(arm) = ui.teleport_place {
+        // SHOULD A HALL UNDER ATTACK BE HIGHLIGHTED? Yes — as a sentence, not
+        // as a highlight. The decision, and why:
+        //
+        // The reason to arm this gesture at all is almost always that one of
+        // your halls is being hit, and a pick UI that made the player read the
+        // alert stack to find out WHICH would be asking them to do the lookup
+        // twice, with a modal gesture held open. So the hint names it.
+        //
+        // It is a sentence because a highlight is not cheap: the world view
+        // has no per-building marker to borrow (rings are parented on
+        // selection), and the minimap draws buildings as flat dots with no
+        // per-entity state, so either would mean new render plumbing for one
+        // transient mode. The hint line is already recomputed every frame from
+        // this exact query.
+        //
+        // The predicate is the building's own health fraction against
+        // `BUILDING_HURT_FRAC` — the SAME threshold `shared::…` uses to decide
+        // a building is "under attack" for the alert stack and the bridge
+        // event feed. Not a re-derivation: the hint and the alert agree by
+        // construction, so the line the player reads here cannot contradict
+        // the line they just read there. (`GameEvents`' structured threat
+        // state was the other candidate and is the wrong shape — it is one
+        // hostile COUNT for the whole base, not a per-hall verdict, so it
+        // could not name a hall even though it is what raises the alarm.)
+        let hurt: Vec<String> = all_buildings
+            .iter()
+            .filter(|(b, team, _, hp, under, _)| {
+                **team == Team::Human
+                    && !under
+                    && is_hall(b.kind)
+                    && hp.max > 0.0
+                    && hp.current / hp.max < BUILDING_HURT_FRAC
+            })
+            .map(|(b, _, tf, _, _, _)| {
+                format!(
+                    "{} at ({:.0},{:.0})",
+                    building_name(b.kind),
+                    tf.translation.x,
+                    tf.translation.z
+                )
+            })
+            .collect();
+        let tail = if hurt.is_empty() {
+            "the far hall is the one that saves it".to_string()
+        } else {
+            format!("UNDER ATTACK: {}", hurt.join(", "))
+        };
+        format!(
+            "{} armed: left-click the HALL to arrive at, on the map or the minimap \
+             (Right-click / Esc cancels) - {tail}",
+            arm.name
+        )
+    } else if let Some(kind) = ui.placement {
         let s = building_stats(kind);
         let tail = if kind == BuildingKind::Wall {
             "Left-click each segment (placement stays armed), Right-click / Esc to stop"
@@ -7002,6 +7592,7 @@ fn update_hud(
             Slot::Doctrine => text.0 = doctrine_line.clone(),
             Slot::Why => text.0 = why_text.clone(),
             Slot::Link => text.0 = link_text.clone(),
+            Slot::Triggers => text.0 = triggers_text.clone(),
             Slot::Coverage => text.0 = coverage_text.clone(),
             Slot::Overflow => text.0 = overflow_text.clone(),
             Slot::CardLetter(i) => {
@@ -7207,6 +7798,7 @@ fn setup_hover(
 
 #[allow(clippy::too_many_arguments)]
 fn hover_feedback(
+    hud: Res<HudLayout>,
     mut commands: Commands,
     state: Res<UiState>,
     game_over: Res<GameOver>,
@@ -7248,7 +7840,7 @@ fn hover_feedback(
     let pickable = game_over.winner.is_none() && state.placement.is_none() && !state.dragging;
     if pickable {
         if let (Some(cursor), Ok((cam, cam_tf))) = (window.cursor_position(), camera.single()) {
-            if !cursor_over_hud(cursor, window, &state) {
+            if !cursor_over_hud(cursor, window, &state, &hud) {
                 if let Some(ground) = cursor_to_ground(cam, cam_tf, cursor) {
                     // Closest unit first (units win ties against buildings),
                     // then buildings, then resource nodes.
@@ -7443,15 +8035,35 @@ fn shot_name(stamp: u64, game_secs: f32, nth: u32) -> String {
     format!("wc3-{stamp}-t{:04}-{nth:02}.png", game_secs.max(0.0) as u32)
 }
 
-fn screenshot_hotkey(
-    keys: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    mut taken: Local<u32>,
-    mut commands: Commands,
-) {
-    if !keys.just_pressed(SCREENSHOT_KEY) {
-        return;
-    }
+/// Game-time seconds at which the engine photographs itself unattended, comma
+/// separated: `WC3_SHOT_AT=20,90,240`.
+///
+/// The same reasoning that produced F10, taken one step further. F10 solved
+/// "the capture tool photographs a stale frame"; it did not solve "an agent
+/// with no hands cannot press F10", and the workaround for *that* was reaching
+/// back for the external tools this whole section exists to avoid. So the
+/// engine keeps a list of moments and takes its own picture at each of them,
+/// through the identical code path — a scheduled shot and a pressed one are
+/// the same function, so evidence gathered without a human at the keyboard is
+/// the same evidence.
+const SHOT_AT_ENV: &str = "WC3_SHOT_AT";
+
+/// Parse the schedule, sorted and with the unparseable dropped. Split out so
+/// the policy is testable without touching the process environment.
+fn shot_schedule_from(raw: Option<&str>) -> Vec<f32> {
+    let mut out: Vec<f32> = raw
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f32>().ok())
+        .filter(|s| *s >= 0.0)
+        .collect();
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// The one place a picture is actually requested. `taken` numbers the shots of
+/// this run so two in the same game-second do not collide.
+fn take_shot(commands: &mut Commands, game_secs: f32, taken: &mut u32) {
     let dir = shot_dir();
     if let Err(err) = std::fs::create_dir_all(&dir) {
         warn!("screenshot: cannot create {} — {err}", dir.display());
@@ -7461,14 +8073,50 @@ fn screenshot_hotkey(
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let path = dir.join(shot_name(stamp, time.elapsed_secs(), *taken));
-    // Logged on the keypress rather than on success: `save_to_disk` reports its
-    // own failures, and a line that only appears when the write worked cannot
-    // tell you whether the key registered at all.
+    let path = dir.join(shot_name(stamp, game_secs, *taken));
+    // Logged on request rather than on success: `save_to_disk` reports its own
+    // failures, and a line that only appears when the write worked cannot tell
+    // you whether the request happened at all.
     info!("screenshot: {}", path.display());
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path));
+}
+
+fn screenshot_hotkey(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut taken: Local<u32>,
+    mut commands: Commands,
+) {
+    if !keys.just_pressed(SCREENSHOT_KEY) {
+        return;
+    }
+    take_shot(&mut commands, time.elapsed_secs(), &mut taken);
+}
+
+/// Fire the `WC3_SHOT_AT` schedule. Shares `taken` with nothing — the two
+/// counters are independent, and the wall-clock stamp in the file name is what
+/// keeps a scheduled shot and a pressed one from landing on the same path.
+fn scheduled_screenshots(
+    time: Res<Time>,
+    mut due: Local<Option<std::collections::VecDeque<f32>>>,
+    mut taken: Local<u32>,
+    mut commands: Commands,
+) {
+    let queue = due.get_or_insert_with(|| {
+        shot_schedule_from(std::env::var(SHOT_AT_ENV).ok().as_deref())
+            .into_iter()
+            .collect()
+    });
+    let now = time.elapsed_secs();
+    // A `while`, not an `if`: at `WC3_SPEED=8` one frame can step past several
+    // scheduled moments, and silently dropping the ones it skipped would make
+    // the evidence depend on the frame rate.
+    while queue.front().is_some_and(|t| *t <= now) {
+        queue.pop_front();
+        take_shot(&mut commands, now, &mut taken);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7513,6 +8161,299 @@ struct Notice {
     /// `Time<Real>` seconds. Real time on purpose: at `WC3_SPEED=8` a
     /// game-time lifetime would blink out before it could be read.
     born: f32,
+}
+
+// ---------------------------------------------------------------------------
+// Alert pings: the alert stack, on the minimap and in the ear
+// ---------------------------------------------------------------------------
+//
+// `GameEvent` has carried a `pos` since the feed was built, and until now the
+// only thing that used it was the Space key. That is a lot of information to
+// keep and never show: the stack tells you *what* happened, and it is a list
+// of sentences in the corner you look at least, so "hostiles near your base"
+// arrives as text while your eyes are on your build queue.
+//
+// Two cheap renderings of the same field close it:
+//
+//   * an expanding ring on the minimap, at the place, in the severity's own
+//     colour — the eye catches motion at the periphery far better than text;
+//   * a short tone, one per severity, which reaches a player who is not
+//     looking at the screen's corner at all.
+//
+// Neither carries information the alert row does not, which is the rule: this
+// is a second and third *rendering* of one event, not a new source of it. In
+// particular the ring is drawn only where an alert already told you something
+// happened, so it can never reveal a position the feed itself would not — the
+// feed's own fog audit (docs/FOG.md, "the event feed was audited category by
+// category") is what makes that safe, and it is doing the work here too.
+
+/// How long a ring lives, in real seconds. Long enough to catch an eye that
+/// was elsewhere, short enough that six alerts do not leave the minimap under
+/// a permanent light show.
+const PING_LIFETIME: f32 = 3.0;
+/// Ring diameter in minimap pixels, at birth and at death.
+const PING_MIN_PX: f32 = 5.0;
+const PING_MAX_PX: f32 = 34.0;
+/// Ring stroke. Two pixels reads as a ring rather than a dot at every size in
+/// the range above.
+const PING_STROKE: f32 = 2.0;
+/// Silences the alert cues. A game whose *sound* cannot be turned off without
+/// turning the game off is a game people mute at the OS, and then never hear
+/// again — including the parts they wanted.
+const MUTE_ENV: &str = "WC3_MUTE";
+
+/// Which severity wins when several arrive in one frame.
+fn severity_rank(severity: EventSeverity) -> u8 {
+    match severity {
+        EventSeverity::Info => 0,
+        EventSeverity::Warning => 1,
+        EventSeverity::Critical => 2,
+    }
+}
+
+/// One live ring.
+struct AlertPing {
+    pos: Vec3,
+    severity: EventSeverity,
+    /// `Time<Real>` seconds, like `Notice::born` and for the same reason: at
+    /// `WC3_SPEED=8` a game-time ring would be gone before it was seen.
+    born: f32,
+}
+
+#[derive(Resource, Default)]
+struct AlertPings {
+    live: Vec<AlertPing>,
+}
+
+/// Marker on a pooled ring node.
+#[derive(Component)]
+struct MinimapPing;
+
+/// Ring radius and opacity as a fraction of its life. Expanding and fading, so
+/// the eye reads "something happened HERE, just now" and then stops being
+/// bothered by it.
+fn ping_shape(age: f32) -> (f32, f32) {
+    let t = (age / PING_LIFETIME).clamp(0.0, 1.0);
+    // Ease out: fast at the start, so the motion that catches the eye happens
+    // in the first half-second rather than being spread evenly over three.
+    let eased = 1.0 - (1.0 - t) * (1.0 - t);
+    (
+        PING_MIN_PX + (PING_MAX_PX - PING_MIN_PX) * eased,
+        1.0 - t,
+    )
+}
+
+/// Paint the rings. Pooled and mutated in place, exactly like the minimap's
+/// unit dots and bounty markers.
+fn update_minimap_pings(
+    hud: Res<HudLayout>,
+    mut commands: Commands,
+    real: Res<Time<Real>>,
+    pings: Res<AlertPings>,
+    root: Query<Entity, With<MinimapRoot>>,
+    mut nodes: Query<(&mut Node, &mut BorderColor), With<MinimapPing>>,
+) {
+    let Ok(root) = root.single() else {
+        return;
+    };
+    let now = real.elapsed_secs();
+    let wanted: Vec<(Vec2, f32, Color)> = pings
+        .live
+        .iter()
+        .map(|p| {
+            let (size, alpha) = ping_shape(now - p.born);
+            (
+                world_to_minimap(p.pos, hud.minimap_px),
+                size,
+                severity_color(p.severity).with_alpha(alpha),
+            )
+        })
+        .collect();
+
+    let mut used = 0usize;
+    for (mut node, mut border) in &mut nodes {
+        match wanted.get(used) {
+            Some((at, size, color)) => {
+                node.display = Display::Flex;
+                node.left = Val::Px(at.x - size * 0.5);
+                node.top = Val::Px(at.y - size * 0.5);
+                node.width = Val::Px(*size);
+                node.height = Val::Px(*size);
+                border.0 = *color;
+            }
+            None => node.display = Display::None,
+        }
+        used += 1;
+    }
+    for _ in used..wanted.len() {
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                display: Display::None,
+                border: UiRect::all(Val::Px(PING_STROKE)),
+                ..default()
+            },
+            // A ring, not a disc: the fog, the dots and the mines underneath it
+            // all stay readable through the hole.
+            BorderRadius::MAX,
+            BorderColor(Color::NONE),
+            BackgroundColor(Color::NONE),
+            // Above the fog layer (1) — a ping is news about a place, and the
+            // whole point is that it shows up over unexplored black.
+            ZIndex(2),
+            MinimapPing,
+            ChildOf(root),
+        ));
+    }
+}
+
+// --- The cues -------------------------------------------------------------
+//
+// Three sounds, generated at startup into an in-memory WAV each. No files: a
+// game that ships stat tables as its only assets should not grow an `audio/`
+// directory for six hundred milliseconds of beep, and a synthesized cue can be
+// re-tuned by editing a number in this file rather than by opening a DAW.
+
+/// Sample rate of the synthesized cues. 44.1 kHz is taken by every backend
+/// without resampling, and a cue is far too short to be worth economising on.
+const CUE_RATE: u32 = 44_100;
+/// Attack ramp. Without it a tone starts at full amplitude mid-cycle and the
+/// speaker cone's step response is an audible click — which is the one thing
+/// worse than no sound at all.
+const CUE_ATTACK: f32 = 0.006;
+
+/// One note of a cue.
+struct Tone {
+    hz: f32,
+    secs: f32,
+    /// Peak amplitude, 0..1.
+    gain: f32,
+}
+
+/// Render a sequence of tones as a 16-bit mono WAV, header and all.
+///
+/// Hand-rolled rather than pulled from a crate because the format's header is
+/// 44 bytes of well-documented constants and the alternative is a dependency
+/// that exists to write those 44 bytes.
+fn synth_wav(tones: &[Tone]) -> Vec<u8> {
+    let mut samples: Vec<i16> = Vec::new();
+    for tone in tones {
+        let n = (tone.secs * CUE_RATE as f32) as usize;
+        for i in 0..n {
+            let t = i as f32 / CUE_RATE as f32;
+            // Attack ramp in, then a linear decay to silence over the rest of
+            // the note — so notes butt against each other without clicking and
+            // the cue reads as a struck sound rather than a held one.
+            let attack = (t / CUE_ATTACK).clamp(0.0, 1.0);
+            let decay = 1.0 - (i as f32 / n.max(1) as f32);
+            let phase = std::f32::consts::TAU * tone.hz * t;
+            // A little second harmonic: a pure sine sounds like a hearing test,
+            // and this is meant to sound like an instrument being tapped.
+            let wave = phase.sin() + 0.25 * (2.0 * phase).sin();
+            let v = wave * tone.gain * attack * decay * 0.8;
+            samples.push((v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+        }
+    }
+
+    let data_len = (samples.len() * 2) as u32;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    let byte_rate = CUE_RATE * 2; // mono, 2 bytes per sample
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&CUE_RATE.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// The notes of each cue.
+///
+/// The shape carries the meaning, not the pitch: **Info** is one light tick,
+/// **Warning** *rises* (look up), **Critical** *falls* and is lower and louder
+/// (something is wrong). A player learns those three in a match without being
+/// told, which is the only kind of audio vocabulary worth having.
+fn cue_tones(severity: EventSeverity) -> Vec<Tone> {
+    match severity {
+        EventSeverity::Info => vec![Tone { hz: 784.0, secs: 0.10, gain: 0.22 }],
+        EventSeverity::Warning => vec![
+            Tone { hz: 587.0, secs: 0.085, gain: 0.34 },
+            Tone { hz: 880.0, secs: 0.13, gain: 0.34 },
+        ],
+        EventSeverity::Critical => vec![
+            Tone { hz: 392.0, secs: 0.10, gain: 0.46 },
+            Tone { hz: 294.0, secs: 0.18, gain: 0.46 },
+        ],
+    }
+}
+
+#[derive(Resource)]
+struct AlertCues {
+    info: Handle<AudioSource>,
+    warning: Handle<AudioSource>,
+    critical: Handle<AudioSource>,
+    /// `WC3_MUTE`. Read once at setup so no system can observe a different
+    /// answer than another, the same discipline `WC3_FOG` is read with.
+    muted: bool,
+}
+
+impl AlertCues {
+    fn handle(&self, severity: EventSeverity) -> &Handle<AudioSource> {
+        match severity {
+            EventSeverity::Info => &self.info,
+            EventSeverity::Warning => &self.warning,
+            EventSeverity::Critical => &self.critical,
+        }
+    }
+
+    /// Spawn a one-shot player that removes itself when the note ends.
+    fn play(&self, commands: &mut Commands, severity: EventSeverity) {
+        if self.muted {
+            return;
+        }
+        commands.spawn((
+            AudioPlayer(self.handle(severity).clone()),
+            PlaybackSettings::DESPAWN,
+        ));
+    }
+}
+
+/// Synthesize the three cues once.
+///
+/// Registered by `UiPlugin`, which main.rs adds only when there is a window —
+/// so a headless run never synthesizes a tone, never asks for an audio device
+/// and never touches `Assets<AudioSource>`, which under `MinimalPlugins` does
+/// not exist. The same graceful absence F10 gets, for the same reason. Every
+/// system that plays a cue takes `Option<Res<AlertCues>>` besides, so even a
+/// hand-built test app that registers a renderer without this setup runs
+/// silently instead of panicking.
+fn setup_alert_cues(mut commands: Commands, mut sources: ResMut<Assets<AudioSource>>) {
+    let muted = std::env::var(MUTE_ENV)
+        .map(|v| !v.is_empty() && v.trim() != "0")
+        .unwrap_or(false);
+    if muted {
+        info!("alert cues: muted ({MUTE_ENV})");
+    }
+    let mut cue = |severity| {
+        sources.add(AudioSource {
+            bytes: synth_wav(&cue_tones(severity)).into(),
+        })
+    };
+    commands.insert_resource(AlertCues {
+        info: cue(EventSeverity::Info),
+        warning: cue(EventSeverity::Warning),
+        critical: cue(EventSeverity::Critical),
+        muted,
+    });
 }
 
 fn severity_color(severity: EventSeverity) -> Color {
@@ -7582,7 +8523,10 @@ fn update_notifications(
     real: Res<Time<Real>>,
     feed: Res<GameEvents>,
     mut notes: ResMut<Notifications>,
+    mut pings: ResMut<AlertPings>,
     mut ui: ResMut<UiState>,
+    mut commands: Commands,
+    cues: Option<Res<AlertCues>>,
     mut rows: Query<(
         &NotifRow,
         &mut Node,
@@ -7599,11 +8543,28 @@ fn update_notifications(
     // `Team::Human` is the whole filter, and it is the same one the bridge
     // applies to its seat: a renderer sees one team's feed and has no way to
     // ask for the other's.
+    //
+    // The same drain now feeds three senses' worth of the one event: the row
+    // you read, the ring on the minimap that says *where*, and the tone that
+    // says *how bad* without needing you to be looking at the HUD at all.
+    // One producer, three renderers — the rule this codebase keeps.
+    let mut loudest: Option<EventSeverity> = None;
     for event in feed.feed(Team::Human) {
         if event.seq <= notes.seen {
             continue;
         }
         notes.seen = event.seq;
+        if let Some(pos) = event.pos {
+            pings.live.push(AlertPing {
+                pos,
+                severity: event.severity,
+                born: now,
+            });
+        }
+        loudest = Some(match loudest {
+            Some(prev) if severity_rank(prev) >= severity_rank(event.severity) => prev,
+            _ => event.severity,
+        });
         notes.live.push_front(Notice {
             message: event.message.clone(),
             severity: event.severity,
@@ -7613,6 +8574,16 @@ fn update_notifications(
         notes.focus_cursor = 0;
     }
     notes.live.truncate(NOTIF_SLOTS);
+    // At most ONE cue per frame, and it is the worst thing that happened.
+    // A base under attack while two buildings finish should sound like a base
+    // under attack, not like three sounds at once — and a frame that drains
+    // forty backed-up events must not fire forty tones.
+    if let (Some(severity), Some(cues)) = (loudest, cues.as_deref()) {
+        cues.play(&mut commands, severity);
+    }
+    // Rings outlive nothing: a ping is a two-and-a-bit-second flourish, and
+    // the alert row it belongs to stays for nine.
+    pings.live.retain(|p| now - p.born < PING_LIFETIME);
 
     // Ordered newest-first and stamped in arrival order, so everything stale
     // is at the back and one pop per expiry suffices.
@@ -7930,8 +8901,12 @@ mod tests {
             .init_resource::<GameOver>()
             .init_resource::<TechTiers>()
             .init_resource::<SquadOrders>()
-            // `CastLookup` reads it, so the card cannot be built without it.
+            // `CastLookup` reads them, so the card cannot be built without
+            // them: research for the forge buttons, triggers and the clock for
+            // the home-guard toggle's lit state.
             .init_resource::<TeamResearch>()
+            .init_resource::<Triggers>()
+            .init_resource::<Time>()
             .add_event::<CameraFocus>()
             .add_event::<SubmitIntent>()
             .add_systems(Update, (control_groups, command_input, record).chain());
@@ -7984,6 +8959,10 @@ mod tests {
             .init_resource::<Time<Real>>()
             .init_resource::<GameEvents>()
             .init_resource::<Notifications>()
+            // The drain feeds the ping list too. No `AlertCues` here, though —
+            // that one is deliberately `Option<Res<_>>` so a renderer test
+            // never has to stand up an audio device to check a text row.
+            .init_resource::<AlertPings>()
             .add_systems(Update, update_notifications);
 
         // Exactly what `UiNotices::raise` pushes.
@@ -8524,6 +9503,107 @@ mod tests {
         assert_eq!(json(&click), json(&typed));
     }
 
+    /// **The human's trigger gesture is a sentence a commander could type.**
+    ///
+    /// `[I][H]` on a selection compiles to `squad` + `trigger_set`, and the
+    /// second of those is byte-identical to the JSON in COMMANDER_BRIEF.md's
+    /// home-guard recipe. This is the fairness invariant applied to the newest
+    /// verb in the language: the human's surface is *narrower* (one preset
+    /// against nine predicates and 27 verbs), but nothing it produces is
+    /// outside what the wire can say, and nothing the wire says is outside what
+    /// the engine will do for the human.
+    #[test]
+    fn the_home_guard_preset_is_a_trigger_a_commander_could_have_typed() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        spawn_selected_footman(&mut app, Vec3::new(-8.0, 0.0, -10.0));
+
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyH]);
+
+        let out = said(&app);
+        let sentences: Vec<String> = out.iter().map(|i| i.sentence()).collect();
+        assert_eq!(
+            sentences,
+            vec![
+                "2 units join squad 1".to_string(),
+                "when the base is attacked: squad 1 defends (-70.0, -70.0) within 26 \
+                 (trigger: home-guard, repeating every 30s)"
+                    .to_string(),
+            ]
+        );
+        let typed: Intent = serde_json::from_str(
+            r#"{"type":"trigger_set","name":"home-guard",
+                "when":{"type":"base_under_attack"},
+                "then":{"type":"posture","id":1,
+                        "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}},
+                "repeat":30.0}"#,
+        )
+        .unwrap();
+        assert_eq!(json(&out[1]), json(&typed));
+    }
+
+    /// The tile is a TOGGLE, like `[G] Guard`: pressed while armed it clears
+    /// the rule rather than arming a second copy. Without this the one key the
+    /// human has would be a one-way door.
+    #[test]
+    fn pressing_home_guard_again_clears_it() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+
+        // Arm it for real, through the resource the card reads.
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .set(
+                Team::Human,
+                TriggerRule {
+                    name: TriggerName::new(HOME_GUARD).unwrap(),
+                    when: TriggerWhen::BaseUnderAttack,
+                    then: Intent::Stop { units: vec![] },
+                    repeat: Some(HOME_GUARD_COOLDOWN),
+                    source: IntentSource::Ui,
+                    armed: true,
+                    last_fired: None,
+                },
+            )
+            .unwrap();
+
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyH]);
+        let sentences: Vec<String> = said(&app).iter().map(|i| i.sentence()).collect();
+        assert_eq!(sentences, vec!["clear trigger home-guard".to_string()]);
+    }
+
+    /// The human's whole "list" view. One line, because eight short names fit
+    /// on one and a scrolling panel would be the authoring UI this deliberately
+    /// defers.
+    #[test]
+    fn the_trigger_readout_names_every_rule_and_its_state() {
+        let mut triggers = Triggers::default();
+        let rule = |name: &str, repeat, armed, last| TriggerRule {
+            name: TriggerName::new(name).unwrap(),
+            when: TriggerWhen::BaseUnderAttack,
+            then: Intent::Stop { units: vec![] },
+            repeat,
+            source: IntentSource::Bridge,
+            armed,
+            last_fired: last,
+        };
+        assert_eq!(trigger_line(&triggers, 0.0), "", "silent until there is one");
+
+        triggers.set(Team::Human, rule("home-guard", Some(30.0), true, None)).unwrap();
+        triggers.set(Team::Human, rule("hero-save", None, false, Some(12.0))).unwrap();
+        triggers.set(Team::Human, rule("alarm", Some(60.0), true, Some(90.0))).unwrap();
+        assert_eq!(
+            trigger_line(&triggers, 100.0),
+            "Triggers: home-guard  hero-save (spent)  alarm (cooling)"
+        );
+
+        // The opponent's rules are their plans, and the panel never sees them.
+        triggers.set(Team::Claude, rule("theirs", None, true, None)).unwrap();
+        assert!(!trigger_line(&triggers, 100.0).contains("theirs"));
+    }
+
     /// The parameterised half of the gap: the coarse [V] writes one fixed
     /// threshold, [F] on the doctrine page walks the ladder — an actual number,
     /// chosen by the human, exactly as the bridge's `below` field is.
@@ -8751,6 +9831,15 @@ mod tests {
             ),
         ] {
             let entries = doctrine_entries(units, card);
+            // BUDGET NOTE: a page holds `CMD_SLOTS - 1` = 11 content tiles
+            // (the mode toggle is pinned). A two-ability caster's doctrine card
+            // is now exactly 11 — 4 postures, Stand Down, Fall back, Guard,
+            // Priority, two auto-casts, Home guard. It is FULL. The next tile
+            // that wants to live here spills the card to a [Tab] page and trips
+            // this assertion, which is the intended tripwire: overflow paging
+            // works and every hotkey stays live across it, but a doctrine
+            // vocabulary that no longer fits on one screen is a design decision
+            // rather than an accident, and it should be made deliberately.
             assert_eq!(
                 paginate(&entries, 0).pages,
                 1,
@@ -9526,6 +10615,244 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Alert pings and cues
+    // -----------------------------------------------------------------------
+
+    /// A ring is born small and opaque and dies large and invisible. Both ends
+    /// matter: a ring that started big is a flash rather than a ping, and one
+    /// that did not fade would leave the minimap permanently decorated.
+    #[test]
+    fn a_ping_expands_and_fades_over_its_life() {
+        let (born_px, born_a) = ping_shape(0.0);
+        let (mid_px, mid_a) = ping_shape(PING_LIFETIME * 0.5);
+        let (dead_px, dead_a) = ping_shape(PING_LIFETIME);
+
+        assert_eq!(born_px, PING_MIN_PX);
+        assert_eq!(born_a, 1.0);
+        assert_eq!(dead_px, PING_MAX_PX);
+        assert_eq!(dead_a, 0.0);
+        assert!(born_px < mid_px && mid_px < dead_px, "the ring must expand");
+        assert!(born_a > mid_a && mid_a > dead_a, "the ring must fade");
+        // Eased out, so most of the motion is in the first half — that is the
+        // half an eye at the edge of vision actually catches.
+        assert!(
+            mid_px > (PING_MIN_PX + PING_MAX_PX) * 0.5,
+            "the expansion is not front-loaded: {mid_px}"
+        );
+        // Past the end it clamps rather than running away.
+        assert_eq!(ping_shape(PING_LIFETIME * 10.0), (PING_MAX_PX, 0.0));
+    }
+
+    /// Several events in one frame make ONE sound, and it is the worst of them.
+    /// A frame that drains a backlog must not fire a chord.
+    #[test]
+    fn the_loudest_severity_wins_a_shared_frame() {
+        assert!(severity_rank(EventSeverity::Critical) > severity_rank(EventSeverity::Warning));
+        assert!(severity_rank(EventSeverity::Warning) > severity_rank(EventSeverity::Info));
+    }
+
+    /// Only events that know WHERE they happened get a ring — the ping's whole
+    /// content is the position, so a placeless alert has nothing to draw.
+    #[test]
+    fn only_a_located_alert_earns_a_ping() {
+        let mut app = App::new();
+        app.init_resource::<UiState>()
+            .init_resource::<Time<Real>>()
+            .init_resource::<GameEvents>()
+            .init_resource::<Notifications>()
+            .init_resource::<AlertPings>()
+            .add_systems(Update, update_notifications);
+
+        let at = Vec3::new(20.0, 0.0, -40.0);
+        {
+            let mut feed = app.world_mut().resource_mut::<GameEvents>();
+            feed.push(
+                Team::Human,
+                1.0,
+                "somewhere".into(),
+                EventSeverity::Critical,
+                Some(at),
+            );
+            feed.push(Team::Human, 1.0, "nowhere".into(), EventSeverity::Info, None);
+        }
+        app.update();
+
+        let pings = app.world().resource::<AlertPings>();
+        assert_eq!(pings.live.len(), 1, "one located alert, one ring");
+        assert_eq!(pings.live[0].pos, at);
+        assert_eq!(pings.live[0].severity, EventSeverity::Critical);
+
+        // Both alerts still reached the stack: the ping is a second rendering
+        // of the feed, not a filter on it.
+        assert_eq!(app.world().resource::<Notifications>().live.len(), 2);
+    }
+
+    /// The cues are synthesized, so the "asset" that has to be right is a byte
+    /// buffer this file writes. A malformed header would be a decoder panic at
+    /// the first alert of a match — the worst possible place to find out.
+    #[test]
+    fn a_synthesized_cue_is_a_wav_with_sound_in_it() {
+        for severity in [
+            EventSeverity::Info,
+            EventSeverity::Warning,
+            EventSeverity::Critical,
+        ] {
+            let wav = synth_wav(&cue_tones(severity));
+            assert_eq!(&wav[0..4], b"RIFF", "{severity:?}: not a RIFF file");
+            assert_eq!(&wav[8..12], b"WAVE", "{severity:?}: not a WAVE file");
+            assert_eq!(&wav[36..40], b"data", "{severity:?}: no data chunk");
+
+            // The header's two lengths must describe the buffer that follows,
+            // or a decoder reads off the end or stops early.
+            let data_len = u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize;
+            assert_eq!(data_len, wav.len() - 44, "{severity:?}: data length lies");
+            let riff_len = u32::from_le_bytes(wav[4..8].try_into().unwrap()) as usize;
+            assert_eq!(riff_len, wav.len() - 8, "{severity:?}: RIFF length lies");
+
+            // A cue you cannot hear is the same bug as no cue at all.
+            let peak = wav[44..]
+                .chunks_exact(2)
+                .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            assert!(peak > 2000, "{severity:?}: peak amplitude {peak} is silence");
+
+            // Short. A cue that outlasts the moment it reports is noise.
+            let secs = (data_len / 2) as f32 / CUE_RATE as f32;
+            assert!(
+                (0.05..0.5).contains(&secs),
+                "{severity:?}: {secs}s is not a cue"
+            );
+            // No click: the first sample must start from rest.
+            let first = i16::from_le_bytes([wav[44], wav[45]]).unsigned_abs();
+            assert!(first < 200, "{severity:?}: opens on a step of {first}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Responsive console
+    // -----------------------------------------------------------------------
+
+    /// Every window size this HUD might plausibly be handed, including the
+    /// tiling-WM sizes it was never tried at.
+    const SIZES: [(f32, f32); 8] = [
+        (2560.0, 1440.0),
+        (1920.0, 1080.0),
+        (1280.0, 800.0),
+        (1024.0, 768.0),
+        (900.0, 700.0),
+        (800.0, 600.0),
+        (700.0, 520.0),
+        (640.0, 480.0),
+    ];
+
+    /// **The bug this whole responsive pass exists for.** 184 + 8 + 8 + 1 + 1
+    /// is 202, and the console was 200, so the minimap's bottom border and the
+    /// map's southern edge were clipped away by `overflow: clip()` at every
+    /// size the game has ever run at. It looked like a design choice.
+    #[test]
+    fn the_minimap_always_fits_inside_the_console_it_lives_in() {
+        for (w, h) in SIZES {
+            let hud = hud_layout(w, h);
+            assert!(
+                hud.minimap_px + MINIMAP_CHROME <= hud.console_h + 1e-3,
+                "{w}x{h}: a {}px minimap plus {MINIMAP_CHROME}px of chrome does \
+                 not fit a {}px console",
+                hud.minimap_px,
+                hud.console_h
+            );
+        }
+    }
+
+    /// The command card is a fixed grid of fixed tiles. A console shorter than
+    /// the grid does not look cramped, it hides buttons — so the card's height
+    /// is a floor the responsive rule may never go under, however small the
+    /// window gets.
+    #[test]
+    fn the_command_card_grid_is_never_clipped_by_a_short_window() {
+        let card_h = 3.0 * CMD_PX + 2.0 * CMD_GAP + CMD_PAGE_LINE_H + 2.0 * PAD;
+        for (w, h) in SIZES {
+            let hud = hud_layout(w, h);
+            assert!(
+                hud.console_h >= card_h - 1e-3,
+                "{w}x{h}: console {} is shorter than the {card_h} the build \
+                 menu needs — tiles would be cut off",
+                hud.console_h
+            );
+        }
+        // …and it really does bind on a short window, or the test above is
+        // only asserting that 202 > 198.
+        assert!(
+            hud_layout(800.0, 400.0).console_h >= card_h - 1e-3,
+            "the floor must survive a window far shorter than the console"
+        );
+    }
+
+    /// The console must leave a battlefield. A third of the window is already
+    /// generous; more than that and a narrow tile is all HUD.
+    #[test]
+    fn the_console_never_eats_more_than_it_has_to() {
+        for (w, h) in SIZES {
+            let hud = hud_layout(w, h);
+            assert!(
+                hud.console_h <= MINIMAP_PX + MINIMAP_CHROME + 1e-3,
+                "{w}x{h}: console {} grew past full size",
+                hud.console_h
+            );
+            assert!(
+                hud.minimap_px >= MINIMAP_MIN_PX - 1e-3
+                    && hud.minimap_px <= MINIMAP_PX + 1e-3,
+                "{w}x{h}: minimap {} left its legibility range",
+                hud.minimap_px
+            );
+        }
+        // At the sizes this HUD was designed for, nothing is scaled at all.
+        assert_eq!(hud_layout(1920.0, 1080.0), hud_layout(1280.0, 800.0));
+    }
+
+    /// The minimap's own coordinate transform has to follow the size, both
+    /// ways, or a click on the map lands somewhere else on the map.
+    #[test]
+    fn minimap_coordinates_round_trip_at_every_size() {
+        for (w, h) in SIZES {
+            let px = hud_layout(w, h).minimap_px;
+            for p in [
+                Vec3::new(-MAP_HALF, 0.0, -MAP_HALF),
+                Vec3::new(MAP_HALF, 0.0, MAP_HALF),
+                Vec3::new(37.0, 0.0, -61.0),
+                Vec3::ZERO,
+            ] {
+                let back = minimap_to_world(world_to_minimap(p, px), px);
+                assert!(
+                    (back.x - p.x).abs() < 0.01 && (back.z - p.z).abs() < 0.01,
+                    "{w}x{h} ({px}px): {p:?} came back as {back:?}"
+                );
+            }
+        }
+    }
+
+    /// The two floating panels sit in opposite top corners and are hit-tested
+    /// by two independent rects. If their widths can ever sum past the window
+    /// they overlap — printed on top of each other, and both claiming the same
+    /// clicks.
+    #[test]
+    fn the_alert_stack_and_the_proposal_panel_cannot_collide() {
+        assert!(
+            NOTIF_MAX_FRAC + PROP_MAX_FRAC <= 1.0,
+            "the two top panels may together claim {}% of the window",
+            (NOTIF_MAX_FRAC + PROP_MAX_FRAC) * 100.0
+        );
+        for (w, _) in SIZES {
+            let notif = NOTIF_W.min(w * NOTIF_MAX_FRAC);
+            let prop = PROP_W.min(w * PROP_MAX_FRAC);
+            assert!(
+                notif + prop + 2.0 * PAD <= w,
+                "{w} wide: {notif} of alerts and {prop} of proposals do not fit"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Fog overlay
     // -----------------------------------------------------------------------
 
@@ -9630,13 +10957,129 @@ mod tests {
         assert_eq!(alpha_at(10, 10), 0, "a visible cell is not dimmed");
         assert_eq!(
             alpha_at(20, 20),
-            (FOG_EXPLORED_ALPHA * 255.0) as u8,
+            (fog_alpha(CellVis::Explored) * 255.0) as u8,
             "a remembered cell wears the middle shade"
         );
         assert_eq!(
             alpha_at(50, 50),
-            (FOG_UNEXPLORED_ALPHA * 255.0) as u8,
+            (fog_alpha(CellVis::Unexplored) * 255.0) as u8,
             "unvisited ground stays dark"
+        );
+    }
+
+    /// The scenery tint is the *same* darkening as the ground overlay, reached
+    /// from the other side. If these two ever stop summing to 1, a tree and the
+    /// earth under it are being told two different stories about how well the
+    /// player knows that spot — the exact class of bug docs/FOG.md exists to
+    /// forbid, just moved from the grid to the shading.
+    #[test]
+    fn the_scenery_tint_and_the_ground_overlay_are_one_darkness() {
+        for cell in [CellVis::Unexplored, CellVis::Explored, CellVis::Visible] {
+            assert!(
+                (fog_alpha(cell) + fog_shade(cell) - 1.0).abs() < 1e-6,
+                "{cell:?}: overlay {} + tint {} is not one darkness",
+                fog_alpha(cell),
+                fog_shade(cell)
+            );
+        }
+        // And the same legibility bar the overlay is held to, measured on the
+        // tint: 100% / 56% / 12%, a quarter of the range apart at minimum.
+        let (vis, expl, unexp) = (
+            fog_shade(CellVis::Visible),
+            fog_shade(CellVis::Explored),
+            fog_shade(CellVis::Unexplored),
+        );
+        assert_eq!(vis, 1.0, "what a team can see now keeps its own colour");
+        assert!(
+            vis - expl > 0.25 && expl - unexp > 0.25,
+            "neighbouring shades too close to distinguish: {vis} / {expl} / {unexp}"
+        );
+    }
+
+    /// The flat-quad limitation, closed and asserted: a doodad standing in a
+    /// cell wears that cell's shade, and changes shade when the cell does.
+    ///
+    /// The `GlobalTransform` half is the part that would silently rot — a
+    /// canopy is a *child* four units above its trunk, so a tinter reading the
+    /// local `Transform` would shade every leaf cluster in the game by the cell
+    /// at the map's origin and look almost right until someone walked there.
+    #[test]
+    fn a_doodad_wears_the_shade_of_the_cell_it_stands_in() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<StandardMaterial>()
+            .insert_resource(FogGrids::test_dark())
+            .add_systems(Update, apply_fog_tint);
+        // Bevy needs the transform propagation to give a child a global
+        // position; without it the assertion below would pass for the wrong
+        // reason.
+        app.add_plugins(bevy::transform::TransformPlugin);
+
+        let shades = {
+            let mut materials = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+            let mut add = |c: f32| {
+                materials.add(StandardMaterial {
+                    base_color: Color::srgb(c, c, c),
+                    ..default()
+                })
+            };
+            FogTinted { shades: [add(0.1), add(0.5), add(1.0)] }
+        };
+
+        // A trunk at a known cell, with its canopy parented four units up.
+        let ground = Vec3::new(30.0, 0.0, -30.0);
+        let (cx, cz) = NavGrid::world_to_cell(ground).expect("on the map");
+        let canopy = app
+            .world_mut()
+            .spawn((
+                shades.clone(),
+                MeshMaterial3d(shades.at(CellVis::Unexplored).clone()),
+                Transform::from_xyz(0.0, 4.0, 0.0),
+            ))
+            .id();
+        app.world_mut()
+            .spawn((
+                shades.clone(),
+                MeshMaterial3d(shades.at(CellVis::Unexplored).clone()),
+                Transform::from_translation(ground),
+            ))
+            .add_child(canopy);
+
+        let worn = |app: &App, e: Entity| {
+            app.world()
+                .entity(e)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .unwrap()
+                .0
+                .id()
+        };
+
+        app.update();
+        assert_eq!(
+            worn(&app, canopy),
+            shades.at(CellVis::Unexplored).id(),
+            "a canopy over never-visited ground is not lit"
+        );
+
+        app.world_mut()
+            .resource_mut::<FogGrids>()
+            .test_set_cell(Team::Human, cx, cz, CellVis::Explored);
+        app.update();
+        assert_eq!(
+            worn(&app, canopy),
+            shades.at(CellVis::Explored).id(),
+            "a canopy over remembered ground must be dimmed with it — this is \
+             the lit-forest-over-dark-earth bug"
+        );
+
+        app.world_mut()
+            .resource_mut::<FogGrids>()
+            .test_set_cell(Team::Human, cx, cz, CellVis::Visible);
+        app.update();
+        assert_eq!(
+            worn(&app, canopy),
+            shades.at(CellVis::Visible).id(),
+            "ground in sight gets its colour back"
         );
     }
 
@@ -9669,5 +11112,172 @@ mod tests {
         // that literally would write PNGs into the process's own directory.
         assert_eq!(shot_dir_from(Some("")), PathBuf::from(DEFAULT_SHOT_DIR));
         assert_eq!(shot_dir_from(Some("   ")), PathBuf::from(DEFAULT_SHOT_DIR));
+    }
+
+    // -----------------------------------------------------------------------
+    // The hall pick: when the item key is a question and when it is an act
+    // -----------------------------------------------------------------------
+
+    /// A selected hero carrying `item` in slot 0.
+    fn spawn_selected_hero_with(app: &mut App, item: ItemId) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Transform::from_translation(Vec3::new(20.0, 0.0, 20.0)),
+                Health::new(600.0),
+                Order::Idle,
+                Hero { level: 3, xp: 0.0, mana: 200.0 },
+                Inventory([Some(item), None]),
+                Selected,
+            ))
+            .id()
+    }
+
+    fn spawn_hall(app: &mut App, kind: BuildingKind, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Building { kind },
+                Team::Human,
+                Transform::from_translation(at),
+                Health::new(building_stats(kind).hp),
+            ))
+            .id()
+    }
+
+    /// **Two halls make the key a question.** Pressing it must not spend the
+    /// scroll — it arms the pick and says nothing, because with a choice
+    /// available "use the scroll" no longer names an outcome.
+    #[test]
+    fn a_second_hall_turns_the_teleport_key_into_a_hall_pick() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::ScrollOfMassTeleport);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        spawn_hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+
+        assert!(
+            said(&app).is_empty(),
+            "arming is not using: {:?}",
+            said(&app)
+        );
+        let armed = app.world().resource::<UiState>().teleport_place;
+        assert!(armed.is_some(), "the key armed a hall pick");
+        assert_eq!(armed.unwrap().slot, 0, "and it remembers which slot it is spending");
+        // The card's own short label, so the hint names the button the player
+        // just pressed rather than a second name for the same thing.
+        assert_eq!(armed.unwrap().name, item_name(ItemId::ScrollOfMassTeleport));
+    }
+
+    /// **One hall is no choice at all, so there is no ceremony.** The key
+    /// fires the scroll outright, with no destination — which is exactly the
+    /// pre-existing behaviour, and the nearest-hall default is the only answer
+    /// there is anyway.
+    #[test]
+    fn with_one_hall_the_teleport_key_still_just_fires() {
+        let mut app = ui_app();
+        let hero = spawn_selected_hero_with(&mut app, ItemId::ScrollOfMassTeleport);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+
+        assert!(
+            app.world().resource::<UiState>().teleport_place.is_none(),
+            "nothing to ask, so nothing is armed"
+        );
+        assert!(
+            matches!(
+                said(&app),
+                [Intent::UseItem { slot: 0, hero: Some(h), destination: None }] if *h == hero.to_bits()
+            ),
+            "the item fires on the press, unaimed: {:?}",
+            said(&app)
+        );
+    }
+
+    /// A hall still going up is not a place a scroll can land, so it does not
+    /// count toward "is there a choice". Two buildings, one finished hall, no
+    /// question.
+    #[test]
+    fn a_hall_under_construction_is_not_a_choice() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::TownPortal);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        let going_up = spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(-70.0, 0.0, -70.0));
+        app.world_mut()
+            .entity_mut(going_up)
+            .insert(UnderConstruction { remaining: 20.0 });
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+
+        assert!(
+            app.world().resource::<UiState>().teleport_place.is_none(),
+            "an unfinished hall is not a destination, so there is still only one"
+        );
+        assert_eq!(said(&app).len(), 1, "and the portal fires: {:?}", said(&app));
+    }
+
+    /// Only the teleport items ask. A potion with two halls standing is still
+    /// just a potion — the arming rule is a property of the ITEM, read from
+    /// the one function that answers it.
+    #[test]
+    fn a_potion_never_asks_which_hall() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::HealingPotion);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        spawn_hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+
+        assert!(
+            app.world().resource::<UiState>().teleport_place.is_none(),
+            "a potion has nowhere to go"
+        );
+        assert_eq!(said(&app).len(), 1, "it is drunk on the press: {:?}", said(&app));
+    }
+
+    /// Escape means "one step out", and the hall pick is the innermost step.
+    /// Backing out of it must spend nothing and must not also leave the
+    /// command card.
+    #[test]
+    fn escape_cancels_the_hall_pick_and_spends_nothing() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::ScrollOfMassTeleport);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        spawn_hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+        assert!(app.world().resource::<UiState>().teleport_place.is_some());
+
+        press(&mut app, &[hotkeys::CANCEL]);
+
+        let ui = app.world().resource::<UiState>();
+        assert!(ui.teleport_place.is_none(), "one step out cancels the pick");
+        assert_eq!(ui.page, CardPage::Orders, "and it does not also flip the card");
+        assert!(said(&app).is_empty(), "a cancelled gesture spends nothing: {:?}", said(&app));
+    }
+
+    /// Arming something else disarms the hall pick. The armed modes are
+    /// mutually exclusive, and this one is checked FIRST by the click handler,
+    /// so a stale one would swallow the click meant for the new mode.
+    #[test]
+    fn arming_another_mode_drops_a_pending_hall_pick() {
+        let mut app = ui_app();
+        spawn_selected_hero_with(&mut app, ItemId::ScrollOfMassTeleport);
+        spawn_hall(&mut app, BuildingKind::TownHall, Vec3::new(60.0, 0.0, 60.0));
+        spawn_hall(&mut app, BuildingKind::Keep, Vec3::new(-70.0, 0.0, -70.0));
+
+        press(&mut app, &[hotkeys::key(Hk::ItemSlot(0)).unwrap()]);
+        assert!(app.world().resource::<UiState>().teleport_place.is_some());
+
+        press(&mut app, &[hotkeys::key(Hk::AttackMove).unwrap()]);
+
+        let ui = app.world().resource::<UiState>();
+        assert!(ui.attack_move_armed, "the new mode is armed");
+        assert!(
+            ui.teleport_place.is_none(),
+            "and the old one is gone — two armed clicks cannot both want the next press"
+        );
     }
 }

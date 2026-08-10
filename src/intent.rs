@@ -141,6 +141,10 @@ impl Plugin for IntentPlugin {
             // the only thing that ever writes them.
             .init_resource::<IntentApplied>()
             .init_resource::<IntentJournal>()
+            // A fourth on the same reasoning, one layer up: `Triggers` is
+            // read by trigger.rs, bridge.rs and ui.rs, and written by exactly
+            // two verbs in this file. The writer owns the registration.
+            .init_resource::<Triggers>()
             .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
             // `IntentApply` lives INSIDE `SimSet::Intent`, declared once here
@@ -287,6 +291,9 @@ impl UiNotices {
         team: Team,
         now: f32,
         tag: &str,
+        // The channel label — `order refused` for a gesture, `trigger <name>
+        // refused` for a rule that fired and bounced.
+        prefix: &str,
         errors: &[String],
         budget: &mut usize,
     ) {
@@ -306,7 +313,7 @@ impl UiNotices {
             if self.recent.iter().any(|(seen, _)| *seen == body) {
                 continue;
             }
-            let message = format!("{UI_NOTICE_PREFIX}: {body}");
+            let message = format!("{prefix}: {body}");
             self.recent.push_back((body, now));
             while self.recent.len() > UI_NOTICE_MEMORY {
                 self.recent.pop_front();
@@ -335,6 +342,7 @@ fn apply_intents(
     time: Res<Time>,
     tables: IntentTables,
     mut squad_orders: ResMut<SquadOrders>,
+    mut triggers: ResMut<Triggers>,
     mut ai_controlled: ResMut<AiControlled>,
     mut error_log: ResMut<IntentErrors>,
     // The positive half of the same channel: what each command cost to deliver.
@@ -364,7 +372,23 @@ fn apply_intents(
         // One issuer per sentence, so `max_delay` reports what THIS intent
         // cost — a group order spread across the map is logged with the worst
         // link any of its units pays.
-        let mut issuer = link.issuer(now);
+        //
+        // **A trigger-fired intent is exempt from the link**, and that is the
+        // point of triggers rather than an exception to them. docs/TEMPO.md's
+        // verb table exempts every doctrine verb on one rule — *standing orders
+        // are local; direct orders travel* — because a unit under standing
+        // policy already has its orders and does not need to ask. A trigger is
+        // standing policy whose condition happened to come true just now: the
+        // commander reached the unit when they ARMED it, and charging the link
+        // again on firing would price the same reach twice. It also restores
+        // the mechanism's own incentive at the contingent layer: pre-arming a
+        // rule is strictly better than hand-answering an alarm at range, which
+        // is C4 ("doctrine strictly better than micro at range") landing one
+        // rung further out.
+        let mut issuer = match submission.trigger {
+            Some(_) => link.exempt_issuer(now),
+            None => link.issuer(now),
+        };
         compile_intent(
             submission.intent.clone(),
             submission.team,
@@ -374,6 +398,7 @@ fn apply_intents(
             IntentMark {
                 source: submission.source,
                 at: now,
+                trigger: submission.trigger,
             },
             &mut errors,
             &mut ai_controlled,
@@ -387,6 +412,7 @@ fn apply_intents(
             // order, and neither seat gets to borrow the other's eyes.
             tables.fog.get(submission.team),
             &mut squad_orders,
+            &mut triggers,
             &mut commands,
             &mut events,
             &mut world,
@@ -411,11 +437,21 @@ fn apply_intents(
         // is told, never whether the intent was legal — the verdict above was
         // reached without consulting it.
         if submission.source == IntentSource::Ui && !errors.is_empty() {
+            // A trigger's refusal names the RULE, not the gesture: the player
+            // made no gesture, and "order refused" would send them looking for
+            // a click they never made. Same verdict, same words after the
+            // colon — only the channel label differs, which is the one thing
+            // `IntentSource` and this tag are allowed to decide.
+            let prefix = match submission.trigger {
+                Some(name) => format!("trigger {name} refused"),
+                None => UI_NOTICE_PREFIX.to_string(),
+            };
             notices.raise(
                 &mut feed,
                 submission.team,
                 now,
                 &submission.tag,
+                &prefix,
                 &errors,
                 &mut notice_budget,
             );
@@ -497,6 +533,10 @@ fn compile_intent(
     team_research: &TeamResearch,
     fog: &FogGrid,
     squad_orders: &mut SquadOrders,
+    // The armed triggers of every team. Written by two verbs here and read by
+    // trigger.rs's evaluator, bridge.rs's snapshot and ui.rs's HUD — same
+    // shape, and the same one-writer rule, as `SquadOrders` above it.
+    triggers: &mut Triggers,
     commands: &mut Commands,
     events: &mut IntentEvents,
     world: &mut IntentWorld,
@@ -1342,7 +1382,11 @@ fn compile_intent(
                 item,
             });
         }
-        Intent::UseItem { slot, hero } => {
+        Intent::UseItem {
+            slot,
+            hero,
+            destination,
+        } => {
             if slot >= INVENTORY_SLOTS {
                 errors.push(format!(
                     "{tag}: item slot {slot} out of range (0..{})",
@@ -1357,8 +1401,38 @@ fn compile_intent(
                 }
                 return;
             };
+            // WHERE the scroll lands, when the caller cared. Validated here
+            // and not in combat.rs because this is the layer that can still
+            // say NO out loud: a destination that is not one of your standing
+            // halls is refused with a sentence, rather than silently becoming
+            // "nearest" — which is precisely the outcome the field exists to
+            // stop. One message for every way of getting it wrong (unknown
+            // id, enemy building, a Farm, a hall still going up), because
+            // "your standing hall" already names all four conditions and a
+            // finer-grained answer would leak the enemy's building ids.
+            let destination = match destination {
+                None => None,
+                Some(id) => {
+                    let hall = intent_entity(id)
+                        .and_then(|e| buildings.get(e).ok().map(|b| (e, b)))
+                        .filter(|(_, (b, team, under, _, _))| {
+                            **team == me && under.is_none() && is_hall(b.kind)
+                        })
+                        .map(|(e, _)| e);
+                    if hall.is_none() {
+                        errors
+                            .push(format!("{tag}: destination {id} is not your standing hall"));
+                        return;
+                    }
+                    hall
+                }
+            };
             // combat.rs checks the slot is actually filled.
-            events.item_uses.write(UseItem { hero, slot });
+            events.item_uses.write(UseItem {
+                hero,
+                slot,
+                destination,
+            });
         }
         Intent::Autopilot { on } => {
             // Only ever this seat's own faction.
@@ -1643,6 +1717,147 @@ fn compile_intent(
                 ec.try_insert(template);
             }
         }
+
+        // -------------------------------------------------------------------
+        // Triggers. See docs/INTENT.md § "Triggers" and trigger.rs.
+        // -------------------------------------------------------------------
+        Intent::TriggerSet {
+            name,
+            when,
+            then,
+            repeat,
+        } => {
+            let Some(name) = TriggerName::new(&name) else {
+                errors.push(format!(
+                    "{tag}: '{name}' is not a usable trigger name — 1..{TRIGGER_NAME_MAX} \
+                     printable ASCII characters"
+                ));
+                return;
+            };
+            // A trigger may not arm a trigger. This is the line between
+            // doctrine and programming, and it is also what makes
+            // MAX_TRIGGERS_PER_TEAM an actual bound rather than a starting
+            // balance.
+            if matches!(*then, Intent::TriggerSet { .. } | Intent::TriggerClear { .. }) {
+                errors.push(format!(
+                    "{tag}: a trigger cannot arm or clear another trigger — \
+                     triggers are doctrine, not a scripting language"
+                ));
+                return;
+            }
+            if let Some(secs) = repeat {
+                if !(secs > 0.0) {
+                    errors.push(format!(
+                        "{tag}: trigger {name} repeat cooldown must be > 0 seconds, got {secs} \
+                         (omit it entirely for a trigger that fires once)"
+                    ));
+                    return;
+                }
+            }
+            if let Err(err) = validate_predicate(&when) {
+                errors.push(format!("{tag}: trigger {name}: {err}"));
+                return;
+            }
+            // NOTE what is deliberately NOT checked here: the ACTION. A
+            // trigger's whole point is that the world at fire time is
+            // different from the world at arm time — the units it names may
+            // not be trained yet, the enemy it attacks may not be visible yet.
+            // Validating `then` now would refuse exactly the sentences worth
+            // arming. It is validated in full when it fires, by this same
+            // compiler, and the refusal reaches the arming seat's own error
+            // channel tagged `trigger:<name>`.
+            let trigger = TriggerRule {
+                name,
+                when,
+                then: *then,
+                repeat,
+                // The AUTHOR, not the executor. A trigger armed from the wire
+                // stays a bridge intent when it fires, and a preset the human
+                // pressed stays a `ui` one — which is what routes its refusals
+                // to the alert stack rather than into a file nobody is reading.
+                source: mark.source,
+                armed: true,
+                last_fired: None,
+            };
+            if let Err(err) = triggers.set(me, trigger) {
+                errors.push(format!("{tag}: {err}"));
+            }
+        }
+        Intent::TriggerClear { name } => match name {
+            Some(name) => {
+                if !triggers.clear(me, name.trim()) {
+                    // Named rather than silent: "I cleared it" and "there was
+                    // nothing by that name" call for opposite next moves, and
+                    // a commander that cannot tell them apart will spend a poll
+                    // wondering why its rule keeps firing.
+                    errors.push(format!("{tag}: you have no trigger named '{name}'"));
+                }
+            }
+            None => {
+                triggers.clear_all(me);
+            }
+        },
+    }
+}
+
+/// Is this predicate expressible? Checked at arm time, because a predicate is
+/// the one half of a trigger that CAN be judged before the world moves — every
+/// parameter in it is a constant the commander typed.
+fn validate_predicate(when: &TriggerWhen) -> Result<(), String> {
+    fn frac(label: &str, value: f32) -> Result<(), String> {
+        if value > 0.0 && value <= 1.0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{label} must be a health fraction in (0,1], got {value}"
+            ))
+        }
+    }
+    match when {
+        TriggerWhen::HeroBelow { frac: f } => frac("hero_below", *f),
+        TriggerWhen::SquadBelow { frac: f, .. } => frac("squad_below", *f),
+        TriggerWhen::EnemySighted { class, count } => {
+            if *count == 0 {
+                return Err("enemy_sighted count must be at least 1".to_string());
+            }
+            match class {
+                // The same words `priority` takes, matched by the same
+                // function — there is one name matcher in this language.
+                Some(name) if parse_target_class(name).is_none() => Err(format!(
+                    "unknown target class '{name}' (one of {})",
+                    ALL_TARGET_CLASSES
+                        .iter()
+                        .map(|c| c.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                _ => Ok(()),
+            }
+        }
+        TriggerWhen::TierReached { tier } => {
+            if (1..=3).contains(tier) {
+                Ok(())
+            } else {
+                Err(format!("tier must be 1, 2 or 3, got {tier}"))
+            }
+        }
+        TriggerWhen::UnitCount { kind, count } => {
+            if *count == 0 {
+                return Err("unit_count count must be at least 1".to_string());
+            }
+            if parse_unit_kind(kind).is_none() {
+                return Err(format!("unknown unit kind '{kind}'"));
+            }
+            Ok(())
+        }
+        TriggerWhen::GameTime { at } => {
+            if *at >= 0.0 {
+                Ok(())
+            } else {
+                Err(format!("game_time must not be negative, got {at}"))
+            }
+        }
+        TriggerWhen::BaseUnderAttack | TriggerWhen::BountySpawned | TriggerWhen::MineDry => Ok(()),
     }
 }
 
@@ -1771,6 +1986,11 @@ impl IntentLog {
                     // tenth.
                     at: now + raw_link,
                     source: submission.source,
+                    // So a trigger-fired order's log line and the unit's own
+                    // `why` are the same string: `trigger:home-guard move by
+                    // bridge t=41`. The join key has to match on both rungs or
+                    // it stops being a join.
+                    trigger: submission.trigger,
                 }
                 .order(verb)
                 .why()
@@ -2346,6 +2566,7 @@ mod tests {
             source: IntentSource::Bridge,
             tag: "cmd 3".to_string(),
             intent: Intent::Move { units: vec![commanded.to_bits()], x: 0.0, z: 0.0 },
+            trigger: None,
         });
         // The same sentence, from the seat with a screen.
         app.world_mut().send_event(SubmitIntent::ui(
@@ -2392,6 +2613,7 @@ mod tests {
             source: IntentSource::Bridge,
             tag: "cmd 0".to_string(),
             intent: Intent::Move { units: vec![inside.to_bits()], x: 61.0, z: 61.0 },
+            trigger: None,
         });
         app.update();
 
@@ -2447,6 +2669,7 @@ mod tests {
                 units: vec![soldier.to_bits()],
                 id: Some(1),
             },
+            trigger: None,
         });
         app.update();
 
@@ -2746,6 +2969,7 @@ mod tests {
                 units: vec![soldier.to_bits()],
                 target: 999_999,
             },
+            trigger: None,
         });
         app.update();
 
@@ -2812,6 +3036,19 @@ mod tests {
             r#"{"type":"posture","id":1}"#,
             r#"{"type":"template","building":1,"squad":1,"retreat":{"below":0.35,"x":1.0,"z":2.0},"priority":["Hero"],"autocast":3}"#,
             r#"{"type":"template","building":1}"#,
+            // v3 triggers. Every predicate, both cadences, both clear-forms.
+            r#"{"type":"trigger_set","name":"home-guard","when":{"type":"base_under_attack"},"then":{"type":"posture","id":1,"posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":22.0}}}"#,
+            r#"{"type":"trigger_set","name":"hero-save","when":{"type":"hero_below","frac":0.35},"then":{"type":"move","units":[1],"x":-70.0,"z":-70.0},"repeat":60.0}"#,
+            r#"{"type":"trigger_set","name":"sq","when":{"type":"squad_below","id":1,"frac":0.5},"then":{"type":"stop","units":[1]}}"#,
+            r#"{"type":"trigger_set","name":"eyes","when":{"type":"enemy_sighted"},"then":{"type":"stop","units":[1]}}"#,
+            r#"{"type":"trigger_set","name":"eyes2","when":{"type":"enemy_sighted","class":"Siege","count":3},"then":{"type":"stop","units":[1]}}"#,
+            r#"{"type":"trigger_set","name":"gold","when":{"type":"bounty_spawned"},"then":{"type":"stop","units":[1]}}"#,
+            r#"{"type":"trigger_set","name":"dry","when":{"type":"mine_dry"},"then":{"type":"stop","units":[1]}}"#,
+            r#"{"type":"trigger_set","name":"tech","when":{"type":"tier_reached","tier":2},"then":{"type":"stop","units":[1]}}"#,
+            r#"{"type":"trigger_set","name":"army","when":{"type":"unit_count","kind":"Footman","count":6},"then":{"type":"stop","units":[1]}}"#,
+            r#"{"type":"trigger_set","name":"clock","when":{"type":"game_time","at":360.0},"then":{"type":"stop","units":[1]}}"#,
+            r#"{"type":"trigger_clear","name":"home-guard"}"#,
+            r#"{"type":"trigger_clear"}"#,
         ];
         for case in cases {
             let parsed: Intent = serde_json::from_str(case)
@@ -2826,6 +3063,447 @@ mod tests {
                 "{case} re-serialized under a different tag"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Triggers (docs/INTENT.md § Triggers)
+    // -----------------------------------------------------------------------
+
+    fn arm(app: &mut App, team: Team, json: &str) {
+        app.world_mut().send_event(from_the_wire(team, json));
+        app.update();
+    }
+
+    fn trigger_names(app: &App, team: Team) -> Vec<String> {
+        app.world()
+            .resource::<Triggers>()
+            .get(team)
+            .iter()
+            .map(|t| t.name.as_str().to_string())
+            .collect()
+    }
+
+    /// **The cap is eight, and re-using a name is free.**
+    ///
+    /// The bound is what makes triggers doctrine rather than programming, so it
+    /// has to be a bound rather than a suggestion — and it has to be a bound on
+    /// *distinct rules*, or a commander tuning one number every cycle would
+    /// spend their whole allowance on a rule they already had.
+    #[test]
+    fn a_team_may_arm_eight_triggers_and_replacing_one_costs_nothing() {
+        let mut app = compiler_app();
+        for i in 0..MAX_TRIGGERS_PER_TEAM {
+            arm(
+                &mut app,
+                Team::Human,
+                &format!(
+                    r#"{{"type":"trigger_set","name":"rule-{i}",
+                        "when":{{"type":"game_time","at":{i}.0}},
+                        "then":{{"type":"stop","units":[]}}}}"#
+                ),
+            );
+        }
+        assert_eq!(trigger_names(&app, Team::Human).len(), MAX_TRIGGERS_PER_TEAM);
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "eight must fit"
+        );
+
+        // The ninth is refused, and the refusal names what is already there so
+        // the commander can pick one to drop without another round trip.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"one-too-many",
+                "when":{"type":"mine_dry"},"then":{"type":"stop","units":[]}}"#,
+        );
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("you already have 8 triggers"), "{}", errors[0]);
+        assert!(errors[0].contains("rule-0"), "the refusal lists them: {}", errors[0]);
+        assert_eq!(trigger_names(&app, Team::Human).len(), MAX_TRIGGERS_PER_TEAM);
+
+        // Re-stating rule-3 replaces it IN PLACE — same slot, same order, no
+        // cap spent. Order matters because it is firing order.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"rule-3",
+                "when":{"type":"mine_dry"},"then":{"type":"stop","units":[]}}"#,
+        );
+        let names = trigger_names(&app, Team::Human);
+        assert_eq!(names.len(), MAX_TRIGGERS_PER_TEAM);
+        assert_eq!(names[3], "rule-3", "replaced in place, not moved to the end");
+        assert_eq!(
+            app.world().resource::<Triggers>().get(Team::Human)[3].when,
+            TriggerWhen::MineDry,
+            "and it really is the new rule"
+        );
+    }
+
+    /// The cap is per team, like every other thing in this game that is per
+    /// team. A commander filling their own eight must not be able to starve
+    /// their opponent's.
+    #[test]
+    fn the_cap_is_per_team() {
+        let mut app = compiler_app();
+        for i in 0..MAX_TRIGGERS_PER_TEAM {
+            arm(
+                &mut app,
+                Team::Human,
+                &format!(
+                    r#"{{"type":"trigger_set","name":"h{i}",
+                        "when":{{"type":"mine_dry"}},"then":{{"type":"stop","units":[]}}}}"#
+                ),
+            );
+        }
+        arm(
+            &mut app,
+            Team::Claude,
+            r#"{"type":"trigger_set","name":"c0","when":{"type":"mine_dry"},
+                "then":{"type":"stop","units":[]}}"#,
+        );
+        assert_eq!(trigger_names(&app, Team::Claude), vec!["c0"]);
+        assert!(app.world().resource::<IntentErrors>().get(Team::Claude).is_empty());
+    }
+
+    /// **A trigger cannot arm a trigger.** The line between doctrine and a
+    /// scripting language, and also the thing that makes the cap an actual
+    /// bound: without it, one trigger could re-arm seven others forever.
+    #[test]
+    fn a_trigger_may_not_arm_or_clear_another_trigger() {
+        let mut app = compiler_app();
+        for nested in [
+            r#"{"type":"trigger_set","name":"outer","when":{"type":"mine_dry"},
+                "then":{"type":"trigger_set","name":"inner","when":{"type":"mine_dry"},
+                        "then":{"type":"stop","units":[]}}}"#,
+            r#"{"type":"trigger_set","name":"outer","when":{"type":"mine_dry"},
+                "then":{"type":"trigger_clear","name":"whatever"}}"#,
+        ] {
+            arm(&mut app, Team::Human, nested);
+            let errors = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+            assert!(
+                errors.iter().any(|e| e.contains("cannot arm or clear another trigger")),
+                "{errors:?}"
+            );
+            assert!(trigger_names(&app, Team::Human).is_empty(), "nothing was armed");
+            app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+        }
+    }
+
+    /// Bad predicate parameters are refused at ARM time, because a predicate is
+    /// the one half of a trigger whose every parameter is a constant the
+    /// commander typed. The action is deliberately not checked here — see the
+    /// note in `compile_intent`.
+    #[test]
+    fn a_predicate_is_validated_when_it_is_armed() {
+        let mut app = compiler_app();
+        for (json, expect) in [
+            (
+                r#"{"type":"trigger_set","name":"a","when":{"type":"hero_below","frac":1.5},
+                    "then":{"type":"stop","units":[]}}"#,
+                "health fraction in (0,1]",
+            ),
+            (
+                r#"{"type":"trigger_set","name":"a","when":{"type":"enemy_sighted","class":"Wizard"},
+                    "then":{"type":"stop","units":[]}}"#,
+                "unknown target class 'Wizard'",
+            ),
+            (
+                r#"{"type":"trigger_set","name":"a","when":{"type":"unit_count","kind":"Dragon","count":2},
+                    "then":{"type":"stop","units":[]}}"#,
+                "unknown unit kind 'Dragon'",
+            ),
+            (
+                r#"{"type":"trigger_set","name":"a","when":{"type":"tier_reached","tier":7},
+                    "then":{"type":"stop","units":[]}}"#,
+                "tier must be 1, 2 or 3",
+            ),
+            (
+                r#"{"type":"trigger_set","name":"a","when":{"type":"mine_dry"},
+                    "then":{"type":"stop","units":[]},"repeat":0.0}"#,
+                "cooldown must be > 0",
+            ),
+            (
+                r#"{"type":"trigger_set","name":"   ","when":{"type":"mine_dry"},
+                    "then":{"type":"stop","units":[]}}"#,
+                "is not a usable trigger name",
+            ),
+        ] {
+            arm(&mut app, Team::Human, json);
+            let errors = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+            assert!(
+                errors.iter().any(|e| e.contains(expect)),
+                "wanted {expect:?} in {errors:?}"
+            );
+            assert!(trigger_names(&app, Team::Human).is_empty());
+            app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+        }
+    }
+
+    /// Clearing: one by name, or the whole slate. A name that is not there is
+    /// an ERROR rather than a silent no-op — "I cleared it" and "there was
+    /// nothing by that name" call for opposite next moves.
+    #[test]
+    fn clearing_names_one_rule_or_all_of_them() {
+        let mut app = compiler_app();
+        for name in ["a", "b"] {
+            arm(
+                &mut app,
+                Team::Human,
+                &format!(
+                    r#"{{"type":"trigger_set","name":"{name}","when":{{"type":"mine_dry"}},
+                        "then":{{"type":"stop","units":[]}}}}"#
+                ),
+            );
+        }
+        arm(&mut app, Team::Human, r#"{"type":"trigger_clear","name":"a"}"#);
+        assert_eq!(trigger_names(&app, Team::Human), vec!["b"]);
+        assert!(app.world().resource::<IntentErrors>().get(Team::Human).is_empty());
+
+        arm(&mut app, Team::Human, r#"{"type":"trigger_clear","name":"a"}"#);
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+        assert!(
+            errors.iter().any(|e| e.contains("you have no trigger named 'a'")),
+            "{errors:?}"
+        );
+
+        arm(&mut app, Team::Human, r#"{"type":"trigger_clear"}"#);
+        assert!(trigger_names(&app, Team::Human).is_empty(), "the whole slate");
+    }
+
+    /// **The sentence**, which is what a person reads in `intent_log.jsonl` and
+    /// in the event feed. It carries BOTH halves — the condition and the action
+    /// it defers — because a line naming only the condition leaves the reader
+    /// unable to tell what is about to happen to their army.
+    #[test]
+    fn a_trigger_reads_as_one_english_sentence() {
+        let armed: Intent = serde_json::from_str(
+            r#"{"type":"trigger_set","name":"home-guard",
+                "when":{"type":"base_under_attack"},
+                "then":{"type":"posture","id":1,
+                        "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":22.0}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            armed.sentence(),
+            "when the base is attacked: squad 1 defends (-70.0, -70.0) within 22 \
+             (trigger: home-guard)"
+        );
+
+        let repeating: Intent = serde_json::from_str(
+            r#"{"type":"trigger_set","name":"hero-save",
+                "when":{"type":"hero_below","frac":0.35},
+                "then":{"type":"move","units":[41],"x":-70.0,"z":-70.0},
+                "repeat":60.0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            repeating.sentence(),
+            "when a hero drops below 35% health: move unit 41 to (-70.0, -70.0) \
+             (trigger: hero-save, repeating every 60s)"
+        );
+
+        assert_eq!(
+            Intent::TriggerClear { name: Some("home-guard".into()) }.sentence(),
+            "clear trigger home-guard"
+        );
+        assert_eq!(
+            Intent::TriggerClear { name: None }.sentence(),
+            "clear every trigger"
+        );
+    }
+
+    /// **A trigger-fired order is exempt from the command link, and says so.**
+    ///
+    /// docs/TEMPO.md exempts every doctrine verb on one rule — *standing orders
+    /// are local; direct orders travel*. A trigger is standing policy whose
+    /// condition came true, so its author paid the reach when they armed it.
+    /// The contrast is the contract: the identical `move`, from the identical
+    /// place, at the identical severed-arm latency, pays when a player speaks
+    /// it now and pays nothing when a rule fires it.
+    #[test]
+    fn a_trigger_fired_order_pays_no_link_where_a_spoken_one_would() {
+        let mut app = compiler_app();
+        app.insert_resource(CommandLatency { on: true, ..Default::default() })
+            .insert_resource(CommandNodes { nodes: Vec::new(), ready: true });
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Order::Idle,
+            ))
+            .id();
+        let go = Intent::Move {
+            units: vec![soldier.to_bits()],
+            x: 40.0,
+            z: 40.0,
+        };
+
+        // Spoken now: it travels.
+        app.world_mut().send_event(SubmitIntent::ui(Team::Human, go.clone()));
+        app.update();
+        assert!(
+            app.world().entity(soldier).get::<PendingOrder>().is_some(),
+            "a direct order from outside the chain of command must travel"
+        );
+        app.world_mut().entity_mut(soldier).remove::<PendingOrder>();
+        app.world_mut().entity_mut(soldier).insert(Order::Idle);
+
+        // Fired by a rule armed earlier: it lands now.
+        let name = TriggerName::new("home-guard").unwrap();
+        app.world_mut()
+            .send_event(SubmitIntent::fired(Team::Human, IntentSource::Bridge, name, go));
+        app.update();
+        assert!(
+            app.world().entity(soldier).get::<PendingOrder>().is_none(),
+            "engine-executed standing policy must not pay the link twice"
+        );
+        assert!(
+            matches!(app.world().entity(soldier).get::<Order>(), Some(Order::Move(_))),
+            "and the unit is actually moving"
+        );
+    }
+
+    /// **"Why are you doing that?" has a trigger rung.** A trigger-fired order
+    /// that answered `order:move by bridge` would be claiming somebody decided
+    /// to move this unit just now, which is exactly what did not happen. The
+    /// seat is still named, because a trigger has an author and the engine is
+    /// only its executor.
+    #[test]
+    fn a_trigger_fired_order_says_which_rule_moved_the_unit() {
+        let mut app = compiler_app();
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Order::Idle,
+            ))
+            .id();
+        let name = TriggerName::new("home-guard").unwrap();
+        app.world_mut().send_event(SubmitIntent::fired(
+            Team::Human,
+            IntentSource::Ui,
+            name,
+            Intent::Move {
+                units: vec![soldier.to_bits()],
+                x: 1.0,
+                z: 2.0,
+            },
+        ));
+        app.update();
+        let why = app
+            .world()
+            .entity(soldier)
+            .get::<Provenance>()
+            .expect("a fired order stamps its reason")
+            .why();
+        assert_eq!(why, "trigger:home-guard move by ui t=0");
+    }
+
+    /// **A trigger is in the match record twice**: once as the sentence that
+    /// armed it, once as the sentence it fired. `IntentJournal` is the
+    /// in-memory tail of `intent_log.jsonl` — same four fields — so asserting
+    /// on it is asserting on what the replay file says.
+    ///
+    /// The fired entry is attributed to the seat that ARMED the rule, not to
+    /// the engine, and the `tag` names which rule spoke. Both matter to a
+    /// reader: a co-commander's `partner_log` would otherwise show its partner
+    /// giving an order they were not at the keyboard for.
+    #[test]
+    fn arming_a_trigger_and_firing_it_both_reach_the_replay_record() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"home-guard","repeat":30.0,
+                "when":{"type":"base_under_attack"},
+                "then":{"type":"posture","id":1,
+                        "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}"#,
+        );
+        // Now the fire, exactly as trigger.rs submits it.
+        let name = TriggerName::new("home-guard").unwrap();
+        app.world_mut().send_event(SubmitIntent::fired(
+            Team::Human,
+            IntentSource::Bridge,
+            name,
+            Intent::Posture {
+                id: 1,
+                posture: Some(PostureIntent::Defend {
+                    x: -70.0,
+                    z: -70.0,
+                    radius: 26.0,
+                }),
+            },
+        ));
+        app.update();
+
+        let journal = app.world().resource::<IntentJournal>();
+        let lines: Vec<(&str, &str, bool)> = journal
+            .get(Team::Human)
+            .iter()
+            .map(|e| (e.verb, e.sentence.as_str(), e.ok))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "trigger_set",
+                    "when the base is attacked: squad 1 defends (-70.0, -70.0) within 26 \
+                     (trigger: home-guard, repeating every 30s)",
+                    true
+                ),
+                ("posture", "squad 1 defends (-70.0, -70.0) within 26", true),
+            ]
+        );
+        // The action's sentence is a SUBSTRING of the rule's, because the rule
+        // renders `then.sentence()` verbatim. That is what lets a reader join
+        // "what fired" to "what I armed" by eye.
+        assert!(lines[0].1.contains(lines[1].1));
+        assert!(
+            journal
+                .get(Team::Human)
+                .iter()
+                .all(|e| e.source == IntentSource::Bridge),
+            "the author, not the engine"
+        );
+    }
+
+    /// A rule armed from the keyboard that bounces must tell the human, and
+    /// must name the RULE rather than a gesture they never made.
+    #[test]
+    fn a_failing_trigger_tells_the_human_which_rule_failed() {
+        let mut app = compiler_app();
+        let name = TriggerName::new("home-guard").unwrap();
+        app.world_mut().send_event(SubmitIntent::fired(
+            Team::Human,
+            IntentSource::Ui,
+            name,
+            Intent::Move {
+                units: vec![999_999],
+                x: 1.0,
+                z: 2.0,
+            },
+        ));
+        app.update();
+        let feed = app.world().resource::<GameEvents>();
+        let notices: Vec<&str> = feed
+            .feed(Team::Human)
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect();
+        assert!(
+            notices.iter().any(|m| m.starts_with("trigger home-guard refused:")),
+            "{notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|m| m.starts_with("order refused")),
+            "the player made no gesture: {notices:?}"
+        );
     }
 
     /// **Every hall is a caster, not just the first one** — `wc3clone-d4y`,
@@ -2863,6 +3541,7 @@ mod tests {
                     hero: caster.to_bits(),
                     ability: Some(AbilitySelector::Id("CallToArms".to_string())),
                 },
+                trigger: None,
             });
             app.update();
             assert!(
@@ -2889,6 +3568,7 @@ mod tests {
                     x: None,
                     z: None,
                     target: None, hero: caster, ability: None },
+                trigger: None,
             });
             app.update();
             app.world()
@@ -2998,6 +3678,7 @@ mod tests {
                 x: mine.x,
                 z: mine.z,
             },
+            trigger: None,
         });
         app.update();
 
@@ -3038,6 +3719,7 @@ mod tests {
                 x: hx,
                 z: hz,
             },
+            trigger: None,
         });
         app.update();
         assert!(
@@ -3110,6 +3792,7 @@ mod tests {
             source: IntentSource::Bridge,
             tag: "cmd 1".to_string(),
             intent: serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}")),
+            trigger: None,
         }
     }
 
@@ -3386,14 +4069,22 @@ mod tests {
         let back: Intent = serde_json::from_str(&json).unwrap();
         assert_eq!(back.sentence(), "hero 42 buys HealingPotion at shop 1");
 
-        let use_addressed = Intent::UseItem { slot: 0, hero: Some(42) };
+        let use_addressed = Intent::UseItem {
+            slot: 0,
+            hero: Some(42),
+            destination: None,
+        };
         let back: Intent =
             serde_json::from_str(&serde_json::to_string(&use_addressed).unwrap()).unwrap();
         assert_eq!(back.sentence(), "hero 42 uses item in slot 0");
 
         // Omitting it must not serialize a null — the wire shape is unchanged
         // for every command that does not care.
-        let plain = Intent::UseItem { slot: 0, hero: None };
+        let plain = Intent::UseItem {
+            slot: 0,
+            hero: None,
+            destination: None,
+        };
         assert_eq!(
             serde_json::to_string(&plain).unwrap(),
             r#"{"type":"use_item","slot":0}"#,
@@ -3592,5 +4283,254 @@ mod tests {
         assert_eq!(parse_item("town portal"), Some(ItemId::TownPortal));
         assert_eq!(parse_target_class("siege"), Some(TargetClass::Siege));
         assert!(parse_building_kind("nonsense").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // use_item: WHICH hall
+    // -----------------------------------------------------------------------
+
+    fn item_uses_of(app: &mut App) -> Vec<UseItem> {
+        app.world_mut()
+            .resource_mut::<Events<UseItem>>()
+            .drain()
+            .collect()
+    }
+
+    fn spawn_hero(app: &mut App, team: Team, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                team,
+                Transform::from_translation(at),
+                Order::Idle,
+                Health::new(600.0),
+                Inventory([Some(ItemId::ScrollOfMassTeleport), None]),
+            ))
+            .id()
+    }
+
+    /// A hall, finished unless `under` says otherwise.
+    fn spawn_hall_at(app: &mut App, kind: BuildingKind, team: Team, at: Vec3, under: bool) -> Entity {
+        let mut e = app.world_mut().spawn((
+            Building { kind },
+            team,
+            Transform::from_translation(at),
+            Health::new(building_stats(kind).hp),
+        ));
+        if under {
+            e.insert(UnderConstruction { remaining: 5.0 });
+        }
+        e.id()
+    }
+
+    /// **The happy path, and the reason the field exists.** A named hall that
+    /// IS one of your standing halls survives the compiler and arrives on the
+    /// event combat.rs reads — with the entity, not a coordinate, so the
+    /// executor re-checks it against a world that may have moved on.
+    #[test]
+    fn a_named_hall_reaches_the_executor() {
+        let mut app = compiler_app();
+        let hero = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        spawn_hall_at(&mut app, BuildingKind::TownHall, Team::Human, Vec3::new(60.0, 0.0, 60.0), false);
+        let far = spawn_hall_at(&mut app, BuildingKind::Keep, Team::Human, Vec3::new(-70.0, 0.0, -70.0), false);
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::UseItem {
+                slot: 0,
+                hero: Some(hero.to_bits()),
+                destination: Some(far.to_bits()),
+            },
+        ));
+        app.update();
+
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "naming your own standing hall is legal: {:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+        let uses = item_uses_of(&mut app);
+        assert_eq!(uses.len(), 1, "one use_item event: {uses:?}");
+        assert_eq!(uses[0].destination, Some(far), "the chosen hall, not the near one");
+    }
+
+    /// **Omitted is the old behaviour, spelled as `None`.** The compiler does
+    /// not substitute a hall of its own choosing — it passes the absence
+    /// through, and combat.rs's nearest-hall rule (which predates this field)
+    /// is what answers. Back-compatible by construction, not by coincidence.
+    #[test]
+    fn an_omitted_destination_stays_omitted_all_the_way_to_the_executor() {
+        let mut app = compiler_app();
+        let hero = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        spawn_hall_at(&mut app, BuildingKind::TownHall, Team::Human, Vec3::new(60.0, 0.0, 60.0), false);
+        spawn_hall_at(&mut app, BuildingKind::Keep, Team::Human, Vec3::new(-70.0, 0.0, -70.0), false);
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::UseItem { slot: 0, hero: None, destination: None },
+        ));
+        app.update();
+
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "the historic call shape is still legal"
+        );
+        let uses = item_uses_of(&mut app);
+        assert_eq!(uses.len(), 1, "one use_item event: {uses:?}");
+        assert_eq!(uses[0].hero, hero, "and it still finds the team's only hero");
+        assert_eq!(uses[0].destination, None, "no hall was chosen, so none is invented");
+    }
+
+    /// **Every way of getting it wrong, and the one sentence that teaches all
+    /// four.** A destination that is not your own standing hall is REFUSED,
+    /// never quietly downgraded to "nearest" — a scroll that silently went
+    /// somewhere else is exactly the failure the field exists to prevent, and
+    /// a fall-back would reintroduce it while looking like it worked.
+    ///
+    /// One message for all four because "your standing hall" already names
+    /// every condition, and a finer-grained answer ("that is the enemy's
+    /// Keep") would hand a seat a building id it could not otherwise have.
+    #[test]
+    fn a_destination_that_is_not_your_standing_hall_is_refused() {
+        let mine = Vec3::new(60.0, 0.0, 60.0);
+        let cases: Vec<(&str, Box<dyn Fn(&mut App) -> u64>)> = vec![
+            (
+                "an enemy hall",
+                Box::new(|app: &mut App| {
+                    spawn_hall_at(app, BuildingKind::TownHall, Team::Claude, Vec3::new(-70.0, 0.0, -70.0), false)
+                        .to_bits()
+                }),
+            ),
+            (
+                "a hall still going up",
+                Box::new(|app: &mut App| {
+                    spawn_hall_at(app, BuildingKind::TownHall, Team::Human, Vec3::new(-70.0, 0.0, -70.0), true)
+                        .to_bits()
+                }),
+            ),
+            (
+                "a building of ours that is not a hall",
+                Box::new(|app: &mut App| {
+                    spawn_hall_at(app, BuildingKind::Barracks, Team::Human, Vec3::new(-70.0, 0.0, -70.0), false)
+                        .to_bits()
+                }),
+            ),
+            // A bare number nobody ever minted.
+            ("an id that names nothing", Box::new(|_: &mut App| 987_654_321_u64)),
+        ];
+
+        for (what, make) in cases {
+            let mut app = compiler_app();
+            let hero = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+            spawn_hall_at(&mut app, BuildingKind::TownHall, Team::Human, mine, false);
+            let bad = make(&mut app);
+
+            // Sent as a commander would send it, so the assertion below is on
+            // the exact string that rides back in the snapshot's `errors`.
+            app.world_mut().send_event(SubmitIntent {
+                team: Team::Human,
+                source: IntentSource::Bridge,
+                tag: "cmd 0".to_string(),
+                trigger: None,
+                intent: Intent::UseItem {
+                    slot: 0,
+                    hero: Some(hero.to_bits()),
+                    destination: Some(bad),
+                },
+            });
+            app.update();
+
+            let errors = app.world().resource::<IntentErrors>().get(Team::Human).to_vec();
+            assert_eq!(errors.len(), 1, "{what}: expected one rejection, got {errors:?}");
+            assert_eq!(
+                errors[0],
+                format!("cmd 0: destination {bad} is not your standing hall"),
+                "{what}: the message has to teach the rule"
+            );
+            assert!(
+                item_uses_of(&mut app).is_empty(),
+                "{what}: a refused destination must not fire the item at all — \
+                 falling back to the nearest hall IS the bug"
+            );
+        }
+    }
+
+    /// The sentence carries the choice. Two `use_item` commands that differ
+    /// only in where the army lands must not read identically in the log a
+    /// person reviews the match from.
+    #[test]
+    fn the_sentence_names_the_hall_that_was_chosen() {
+        let aimed = Intent::UseItem { slot: 0, hero: Some(7), destination: Some(34) };
+        assert_eq!(aimed.sentence(), "hero 7 uses item in slot 0, bound for hall 34");
+        let plain = Intent::UseItem { slot: 0, hero: Some(7), destination: None };
+        assert_eq!(plain.sentence(), "hero 7 uses item in slot 0");
+        assert_ne!(aimed.sentence(), plain.sentence(), "the choice is visible in the log");
+    }
+
+    /// The wire, both directions. The new field round-trips under its own
+    /// name, and omitting it serializes to the byte-identical historic shape —
+    /// so a commander written before this bead keeps working unchanged.
+    #[test]
+    fn the_destination_rides_the_wire_without_disturbing_the_old_shape() {
+        let aimed: Intent =
+            serde_json::from_str(r#"{"type":"use_item","slot":1,"hero":7,"destination":34}"#).unwrap();
+        assert!(
+            matches!(aimed, Intent::UseItem { slot: 1, hero: Some(7), destination: Some(34) }),
+            "the field parses under its own name"
+        );
+        assert_eq!(
+            serde_json::to_string(&aimed).unwrap(),
+            r#"{"type":"use_item","slot":1,"hero":7,"destination":34}"#
+        );
+        // The historic form still parses, and still means "nearest".
+        let old: Intent = serde_json::from_str(r#"{"type":"use_item","slot":0}"#).unwrap();
+        assert!(
+            matches!(old, Intent::UseItem { slot: 0, hero: None, destination: None }),
+            "a command written before this bead means what it always meant"
+        );
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"type":"use_item","slot":0}"#,
+            "an unused field must not appear on the wire"
+        );
+    }
+
+    /// **The latency row is unchanged** (docs/TEMPO.md §4). `use_item` is
+    /// exempt because a hero is a command node, and choosing a destination
+    /// does not move the hero — the item is still spent from the same bag, at
+    /// the same place, by the same speaker. A destination that started
+    /// charging for the privilege would be a silent tax on the one verb this
+    /// bead exists to make more expressive.
+    #[test]
+    fn choosing_a_destination_does_not_start_charging_for_the_item() {
+        let mut app = compiler_app();
+        // Latency ON and no command nodes at all — the severed-arm case, where
+        // anything that pays pays visibly.
+        app.insert_resource(CommandLatency { on: true, ..Default::default() })
+            .insert_resource(CommandNodes { nodes: Vec::new(), ready: true });
+        let hero = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        let far = spawn_hall_at(&mut app, BuildingKind::Keep, Team::Human, Vec3::new(-70.0, 0.0, -70.0), false);
+
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            trigger: None,
+            intent: Intent::UseItem {
+                slot: 0,
+                hero: Some(hero.to_bits()),
+                destination: Some(far.to_bits()),
+            },
+        });
+        app.update();
+
+        // Fired this frame, not queued for later — the exemption in one
+        // observation.
+        let uses = item_uses_of(&mut app);
+        assert_eq!(uses.len(), 1, "the item fires on the frame it was asked for: {uses:?}");
+        assert!(
+            app.world().resource::<IntentApplied>().get(Team::Human).is_empty(),
+            "an exempt verb reports no cost, however its destination is spelled"
+        );
     }
 }

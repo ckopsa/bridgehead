@@ -40,13 +40,29 @@ Win by destroying all enemy buildings.
     expires everything centrally (combat.rs draws the ground ring).
   * **Abilities v2** — `abilities_of_unit` / `abilities_of_building` return a
     LIST per caster; each `AbilityDef` carries an `AbilityUnlock` predicate
-    (always / hero level / `TechTier`) and an effect that may be
-    `ApplyStatus`. `CastAbility { caster, ability: Option<AbilitySelector> }`
+    (always / hero level / `TechTier`) and a composition of effects (v3, below).
+    `CastAbility { caster, ability: Option<AbilitySelector> }`
     picks a slot (`None` = first unlocked); cooldowns live per slot in
     `AbilityCooldowns` and auto-cast rules per slot in `AutoCastPolicy`.
     `tech_tier_for` derives the team's `TechTier` from the highest hall rung it
     has standing (`is_hall` + `building_tier`), so a completed Keep opens every
     `TeamTier(T2)` ability and losing it closes them again.
+  * **Composable effects (v3)** — an ability's `effects` is a `Vec<Effect>`,
+    each an `EffectAtom` plus an `EffectSchedule`. The atoms are `Damage`,
+    `Heal`, `ApplyStatus`, `Militia`, `Summon` and `Teleport`; the schedules
+    are `Instant` and `OverTime { interval, ticks }` (`OnHit` / `OnDeath` are
+    schema the loader refuses — the damage pipeline has no hook for them yet).
+    Every atom carries its own numbers and its own `AbilityTargets`, and they
+    all share the cast's one resolved centre, so a single cast can damage
+    enemies and mend allies. **Atom 0 aims the cast** (`AbilityDef::aim`) —
+    `cast_center`'s auto-pick and doctrine's trigger count both ask it who they
+    are looking for. `combat::apply_atom` is the one applier, used by the
+    instant path and by the `ScheduledEffect` entities that pay out an
+    `OverTime` clause. A mechanic that is a new COMBINATION of atoms is a row
+    in `abilities.ron` and no Rust at all (`FrostNova` is the shipped proof);
+    a mechanic that is a genuinely new VERB is a new atom, and that is the
+    line. `check_values` refuses the combinations the grammar can express and
+    the game cannot mean.
   * **Research** — `ResearchKind` (Attack/Armor), the `research_step` cost
     ladder, the `TeamResearch` resource and the `Researching` component. The
     game's one purchase that buys a *property of the faction* rather than a
@@ -245,7 +261,7 @@ Deaths → Fog → Input → CoCommand → AiThink → Think → Intent
 | `Input` | ui.rs gesture chain, `bridge::poll_commands`, command.rs dispatchers, hotkeys, `status_probe` |
 | `CoCommand` | copilot.rs `CopilotSet` |
 | `AiThink` | `ai::ai_think`, `seed_machine_autocast` |
-| `Think` | doctrine.rs — postures, retreat, leash, auto-cast |
+| `Think` | doctrine.rs — postures, retreat, leash, auto-cast; trigger.rs — the trigger evaluator, the contingent member of the same family |
 | `Intent` | `intent::apply_intents` (wraps `IntentApply`) |
 | `Movement` | units.rs — spawn, path, steer, separate |
 | `Combat` | combat.rs — acquire, engage, projectiles, abilities, damage |

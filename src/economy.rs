@@ -1832,6 +1832,8 @@ fn training_queues(
                 rally: rally.map(|r| r.target),
                 // …and stamps this building's `DoctrineTemplate`, if it has one.
                 source: Some(entity),
+                // Trained, not called.
+                summoned: None,
             });
         }
     }

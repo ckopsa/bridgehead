@@ -730,6 +730,7 @@ fn ingest_wire(
                         source: IntentSource::Copilot,
                         tag,
                         intent,
+                        trigger: None,
                     });
                 }
                 Ok(intent) => {
@@ -1123,6 +1124,7 @@ fn resolve_proposals(
                 // the directive that asked for it.
                 tag: format!("prop {} cmd {j}", proposal.id),
                 intent,
+                trigger: None,
             });
         }
         feed.push(
@@ -1769,6 +1771,45 @@ mod tests {
         assert_eq!(passing, DOCTRINE_VERBS.to_vec());
         assert_eq!(direct_verbs(TrustPolicy::Split), DOCTRINE_VERBS.to_vec());
         assert!(direct_verbs(TrustPolicy::Strict).is_empty());
+    }
+
+    /// **A co-commander must ask before arming a trigger** (`wc3clone-pec`).
+    ///
+    /// Triggers look like doctrine — standing policy, engine-executed, cheap to
+    /// overwrite — and the split still puts them on the propose side, because
+    /// the line sits where the COST OF BEING WRONG is rather than where the
+    /// verb's shape is. A trigger whose `then` is `train` or `attack` is an
+    /// irreversible act that has merely been postponed, and it is *harder* to
+    /// veto than the immediate version because it happens when nobody is
+    /// looking. `trigger_clear` rides along: silently disarming the rule your
+    /// partner is relying on is the same surprise in the other direction.
+    #[test]
+    fn a_copilot_proposes_triggers_rather_than_arming_them() {
+        for intent in [
+            Intent::TriggerSet {
+                name: "home-guard".to_string(),
+                when: TriggerWhen::BaseUnderAttack,
+                then: Box::new(Intent::Train {
+                    building: 1,
+                    unit: "Footman".to_string(),
+                }),
+                repeat: None,
+            },
+            Intent::TriggerClear { name: None },
+        ] {
+            assert!(
+                !is_doctrine_verb(&intent),
+                "{} must not go direct",
+                intent.verb()
+            );
+            assert!(!direct_allowed(TrustPolicy::Split, &intent));
+            assert!(
+                !DOCTRINE_VERBS.contains(&intent.verb()),
+                "and must not be advertised as direct"
+            );
+            // `full` is the experiment knob and still means everything direct.
+            assert!(direct_allowed(TrustPolicy::Full, &intent));
+        }
     }
 
     /// The refusal has to teach: a model reading it mid-match must be able to
