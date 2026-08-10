@@ -6,6 +6,7 @@ mod bridge;
 mod combat;
 mod command;
 mod copilot;
+mod data;
 mod doctrine;
 mod economy;
 mod intent;

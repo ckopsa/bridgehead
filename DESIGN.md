@@ -97,6 +97,11 @@ Win by destroying all enemy buildings.
   nearest own TownHall), processes `TrainingQueue` (pays at enqueue time — the
   enqueuer only checks affordability; economy deducts, checks supply, spawns via
   `SpawnUnitEvent` near the building when done, refunds nothing on death).
+- `data.rs`: the content data loader. Reads `assets/data/*.ron` into the stat
+  tables shared.rs's accessors hand out (`unit_stats`, `building_stats`,
+  `abilities_of_unit`, `item_def`, `research_step`, …), validates them, and
+  panics at startup naming the offending row if they do not hold up. See
+  "Content data files" below for the contract.
 - `ui.rs`: selection (left click + drag box over own units/buildings), right-click
   context orders (enemy → Attack, resource node → Harvest for workers, ground →
   Move; A+click → AttackMove), building placement mode with ghost + affordability
@@ -142,6 +147,79 @@ Win by destroying all enemy buildings.
   provide supply until it's removed by economy.rs.
 - **Selection**: `Selected` marker is written only by ui.rs.
 - Teams: every unit/building/projectile-owner entity has a `Team` component.
+
+## Content data files (`assets/data/*.ron`)
+
+Every stat table in the game is a RON file, not a `match` arm. This is a merge
+decision before it is anything else: row literals inside one big `match`
+interleave silently — git merges two agents' hunks cleanly because they touch
+different lines — and the damage only surfaces as a missing-field compile error
+some commits later, if at all. One record per row in a data file either
+conflicts loudly (both edited the same record) or not at all.
+
+| File | Table | Accessors in `shared.rs` |
+| --- | --- | --- |
+| `units.ron` | `UnitStats`, name, description, tech gate | `unit_stats`, `kind_name`, `unit_description`, `unit_requires` |
+| `buildings.ron` | `BuildingStats`, name, description, `requires`, `trains`, `researches`, `upgrades_to` | `building_stats`, `building_name`, `building_description`, `building_requires`, `trainable`, `building_researches`, `building_upgrades_to` |
+| `abilities.ron` | `AbilityDef` rows + per-caster slot lists + default auto-cast | `abilities_of_unit`, `abilities_of_building`, `default_autocast` |
+| `items.ron` | `ItemDef` (Shop shelf) | `item_def` |
+| `research.ron` | ladder ids/labels/descriptions, the shared price list, the forge | `ResearchKind::{id,label,description}`, `research_step`, `research_building` |
+
+**What is data and what is code.** *Every number and every flag* is data.
+*Identity and rules* stay in Rust:
+
+- `UnitKind` / `BuildingKind` / `ItemId` / `ResearchKind` / `StatusKind` stay
+  enums. A KIND is code identity — it needs a variant and a mesh arm in
+  `units.rs` regardless — and making kinds dynamic would buy nothing but the
+  loss of exhaustiveness everywhere else.
+- Derived facts stay derived: `building_tier`, `upgrade_root`, `is_hall`,
+  `building_placeable`, `upgrade_cost`, `unit_tier`, `tech_tier_for`. The
+  upgrade LADDER is one data field (`upgrades_to`) and everything else is walked
+  from it, so a fourth hall rung is a data change.
+- Formulas stay code: `research_bonus`, `effective_stats`, `damage_after_armor`,
+  `upkeep_rate`, `bounty_value`, hero level curves.
+- Singleton constants stay code (`POTION_HEAL`, `BOOTS_HASTE`,
+  `HERO_XP_RADIUS`, `RESEARCH_MAX_LEVEL`, `MIN_DAMAGE_PER_HIT`, the
+  `StatusKind` caps and tints). They are one line each, so a merge conflicts on
+  them loudly already; a file per scalar would be ceremony without a payoff.
+  The line is *tables move, scalars stay*.
+
+**How to add a row.** Open the file, copy the nearest record, change the values,
+and put the balance rationale in a `//` comment next to the number it explains —
+the data files carry the design commentary that used to live beside the literals.
+Adding a whole new KIND is: the enum variant, the entry in `ALL_*_KINDS`, the
+mesh/colour arm in `units.rs`, and the record. The loader refuses to start if
+the last one is missing and names the variant.
+
+**Load mechanism.** Each table is compiled in with `include_str!` and is the
+default, so `cargo run` works from any working directory and a shipped binary
+carries its own content. `WC3_DATA_DIR=<dir>` makes the loader prefer
+`<dir>/<file>.ron` for any file present there and fall back to the built-in copy
+for the rest, so a modder or a balance pass ships only the files they changed:
+
+```bash
+WC3_DATA_DIR=assets/data cargo run          # edits to assets/data/*.ron take
+                                            # effect on the next launch, no rebuild
+```
+
+Without `WC3_DATA_DIR` the built-in copy wins, and editing a `.ron` triggers a
+recompile of the crate (cargo tracks `include_str!` inputs) — correct, but a
+rebuild. The override path is the one to use while tuning.
+
+The tables are `LazyLock`s, so "loaded before anything reads a stat" is
+structural rather than a system-ordering promise: the first read is the load, in
+a windowed run, a headless run or a unit test. `CorePlugin::build` additionally
+forces the load during `App` construction so a bad file is a startup panic.
+
+**Validation.** The loader refuses to start, listing every problem it found, if
+a variant has no row or has two, a referenced ability name does not exist, an
+auto-cast names an ability its own caster does not have, a name collides under
+`normalize_name` (the intent parser would then be ambiguous), a unit is trained
+by nothing, the upgrade ladder is not a tree, the research steps do not cover
+`1..=RESEARCH_MAX_LEVEL`, or any of hp / vision / speed / range /
+attack_cooldown / train_time / footprint / multipliers is not positive. Costs
+are `u32`, so "no negative costs" is the type system's job. `src/data.rs`'s
+tests prove the validator bites by handing it deliberately broken tables.
 
 ## Bevy 0.16 API notes (avoid stale idioms)
 
