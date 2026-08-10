@@ -69,11 +69,22 @@ const MAX_CARDS: usize = 12;
 const CARD_PX: f32 = 44.0;
 const CARD_GAP: f32 = 5.0;
 
-/// Command card: 3x3 grid.
-const CMD_SLOTS: usize = 9;
+/// Command card: 4x3 grid.
+///
+/// It was 3x3 until the Blacksmith became the eighth placeable building: a
+/// worker card is `[A] [S]` plus one entry per buildable kind, so eight kinds
+/// need ten slots and the ninth-and-tenth would have been dropped by the
+/// `truncate` at the end of `command_entries` — silently, which is the worst
+/// way for a building to become unbuildable.
+///
+/// It grew a COLUMN rather than a row because the console is height-bound
+/// (`CONSOLE_H` is 200px and three rows of 52 plus gaps and margins already
+/// spend 184 of it); a fourth row would not fit, and a fourth column costs
+/// 52px of the selection panel's flex-grow width, which has it to spare.
+const CMD_SLOTS: usize = 12;
 const CMD_PX: f32 = 52.0;
 const CMD_GAP: f32 = 6.0;
-const CMD_COLS: f32 = 3.0;
+const CMD_COLS: f32 = 4.0;
 
 const CONSOLE_BG: Color = Color::srgb(0.07, 0.08, 0.11);
 const PANEL_BG: Color = Color::srgba(0.04, 0.05, 0.08, 0.86);
@@ -352,6 +363,11 @@ enum CmdAction {
     /// Convert the single selected own building into its next tier in place.
     /// Carries the RESULT, so the button can name what you get.
     Upgrade(BuildingKind),
+    /// Start the next rung of a team-wide research ladder at the single
+    /// selected own forge. Carries the LADDER, not the level — the level is
+    /// always current+1 and resolving it here would let a stale card (these
+    /// are rebuilt from last frame's layout) buy the wrong rung.
+    Research(ResearchKind),
     /// Consume the selected own hero's inventory slot.
     UseSlot(usize),
     /// Doctrine: toggle `LeashPolicy` on the whole own-unit selection.
@@ -691,6 +707,65 @@ struct HeroCmds {
     upgrade: Option<(BuildingKind, u32, u32)>,
     /// Inventory of the selected own hero (all None when none is selected).
     items: [Option<ItemId>; 2],
+    /// Research buttons for the single selected own completed forge, in ladder
+    /// order. Empty for every other building.
+    research: Vec<ResearchCmd>,
+}
+
+/// One research button's state. Everything the card needs to decide what the
+/// button says and whether it does anything.
+#[derive(Clone, Copy)]
+struct ResearchCmd {
+    kind: ResearchKind,
+    /// Levels the TEAM already holds — not a property of this forge.
+    level: u32,
+    /// Cost and duration of the next rung; `None` at the cap.
+    next: Option<ResearchStep>,
+    /// Fraction complete, when THIS forge is working on THIS ladder.
+    in_progress: Option<f32>,
+    /// This forge is busy with the OTHER ladder. One job per forge: the answer
+    /// to "I want both at once" is a second Blacksmith.
+    blocked: bool,
+}
+
+/// The research buttons offered by the single selected building.
+///
+/// A free function taking plain values because `HeroCmds` is assembled twice —
+/// once in `command_input` to dispatch a key press, once in `update_hud` to
+/// draw the card — and a button whose enabled-ness is computed by two copies of
+/// the same logic is a button that will eventually disagree with its own
+/// hotkey. Every other field of `HeroCmds` is duplicated at both sites; this
+/// one is not.
+fn research_cmds(
+    kind: BuildingKind,
+    done: bool,
+    levels: ResearchState,
+    active: Option<&Researching>,
+) -> Vec<ResearchCmd> {
+    if !done {
+        return Vec::new();
+    }
+    building_researches(kind)
+        .iter()
+        .map(|&k| ResearchCmd {
+            kind: k,
+            level: levels.level(k),
+            next: levels.next_step(k),
+            in_progress: active.filter(|a| a.kind == k).map(|a| {
+                ((a.total - a.remaining) / a.total.max(0.001)).clamp(0.0, 1.0)
+            }),
+            blocked: active.is_some_and(|a| a.kind != k),
+        })
+        .collect()
+}
+
+/// Player-facing name for a research ladder — short, because it has to fit a
+/// 52px tile. `ResearchKind::label` is the long form the event feed uses.
+fn research_name(kind: ResearchKind) -> &'static str {
+    match kind {
+        ResearchKind::Attack => "Attack",
+        ResearchKind::Armor => "Armor",
+    }
 }
 
 /// The town hall's hero button(s). A team plays exactly one hero class: the
@@ -735,6 +810,12 @@ fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
         BuildingKind::Wall => Some((4, KeyCode::KeyL, "L")),
         BuildingKind::Workshop => Some((5, KeyCode::KeyK, "K")),
         BuildingKind::Shop => Some((6, KeyCode::KeyN, "N")),
+        // I, the last free letter in the census above. Slot 7 is what pushed
+        // the command card from 3x3 to 4x3 (see `CMD_SLOTS`): with eight
+        // placeable kinds, `[A] [S]` plus eight build cards is ten entries, and
+        // at nine slots the truncation at the end of `command_entries` would
+        // have silently eaten this one.
+        BuildingKind::Blacksmith => Some((7, KeyCode::KeyI, "I")),
         // Reached by upgrading a hall, never by placing one — no build card,
         // and `build_cards` filters on `building_placeable` besides.
         BuildingKind::Keep | BuildingKind::Castle => None,
@@ -805,10 +886,22 @@ fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
 /// their shape. The matching WRITES live in `CardActions` — two bundles because
 /// `command_input` is near Bevy's 16-parameter ceiling and these five params
 /// would otherwise blow through it.
+/// It now also carries what the RESEARCH buttons read — the team's completed
+/// levels and which forges are mid-job. Same justification: these are reads the
+/// card needs in two systems (`command_input` builds the entries, `update_hud`
+/// rebuilds them to draw), and bundling them keeps both under Bevy's
+/// 16-parameter ceiling. `update_hud` takes the whole bundle rather than
+/// `TechTiers` and `AbilityCooldowns` loose, which is a parameter cheaper than
+/// it used to be and removes a second spelling of the same two reads.
 #[derive(SystemParam)]
 struct CastLookup<'w, 's> {
     tiers: Res<'w, TechTiers>,
     cooldowns: Query<'w, 's, &'static AbilityCooldowns>,
+    /// The team's completed research levels — what a research button reads to
+    /// decide whether it is buyable, in progress, or already at the cap.
+    research: Res<'w, TeamResearch>,
+    /// Forges mid-job, looked up by entity like `cooldowns`.
+    researching: Query<'w, 's, &'static Researching>,
 }
 
 /// Every UNLOCKED ability of a caster, priced and cooled, ready for the card.
@@ -981,6 +1074,56 @@ fn command_entries(
                 out.push(entry);
             }
 
+            // Research. [Q]/[W] by ladder index, reusing the production
+            // letters exactly as the Shop's buy buttons do: a Blacksmith trains
+            // nothing, so Q and W are free on its card and the player's muscle
+            // memory for "first button on a building" carries over intact.
+            //
+            // The button is inert in three different ways, and says which:
+            // already at the cap, this forge working on this ladder, or this
+            // forge working on the other one. All three read as dark tiles; the
+            // cost caption is what distinguishes them, because a player who
+            // pressed [Q] and got nothing deserves to be told why.
+            for (i, r) in hero.research.iter().enumerate() {
+                let Some((key, hotkey)) = TRAIN_KEYS.get(i).copied() else {
+                    continue;
+                };
+                let mut entry = CmdEntry::plain(
+                    CmdAction::Research(r.kind),
+                    key,
+                    hotkey,
+                    // The level shown is the one this button BUYS, so the card
+                    // reads as a purchase rather than as a status line.
+                    &match (r.in_progress, r.next) {
+                        (Some(_), _) => format!("{} {}", research_name(r.kind), r.level + 1),
+                        (None, Some(step)) => {
+                            format!("{} {}", research_name(r.kind), step.level)
+                        }
+                        (None, None) => {
+                            format!("{} {}", research_name(r.kind), RESEARCH_MAX_LEVEL)
+                        }
+                    },
+                );
+                match (r.in_progress, r.next) {
+                    (Some(frac), _) => {
+                        entry.enabled = false;
+                        entry.cost = format!("{:.0}%", frac * 100.0);
+                    }
+                    (None, None) => {
+                        entry.enabled = false;
+                        entry.cost = "maxed".to_string();
+                    }
+                    (None, Some(step)) => {
+                        entry = entry.priced(step.cost_gold, step.cost_lumber);
+                        if r.blocked {
+                            entry.enabled = false;
+                            entry.cost = "forge busy".to_string();
+                        }
+                    }
+                }
+                out.push(entry);
+            }
+
             // Tier up in place. [U] because it is the last free letter that
             // says what it does; the card has room here because a hall spends
             // at most four slots on training and Call to Arms.
@@ -1104,6 +1247,7 @@ fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Wall",
         BuildingKind::Workshop => "Workshop",
         BuildingKind::Shop => "Shop",
+        BuildingKind::Blacksmith => "Blacksmith",
         BuildingKind::Keep => "Keep",
         BuildingKind::Castle => "Castle",
     }
@@ -2123,6 +2267,16 @@ fn command_input(
                 .map(|((gold, lumber, _), to)| (to, gold, lumber))
         }),
         items: own_heroes.first().map(|(_, _, _, inv)| inv.0).unwrap_or_default(),
+        research: single
+            .map(|(entity, kind, done, _)| {
+                research_cmds(
+                    kind,
+                    done,
+                    cast.research.get(Team::Human),
+                    cast.researching.get(entity).ok(),
+                )
+            })
+            .unwrap_or_default(),
     };
 
     // Completed own buildings = the tech state every build entry is gated on.
@@ -2231,6 +2385,23 @@ fn command_input(
                             item: item_def(item).name.to_string(),
                         },
                     );
+                }
+            }
+            CmdAction::Research(kind) => {
+                // intent.rs owns the verdict (ownership, cap, busy forge,
+                // affordability) and economy.rs owns the money, exactly as they
+                // do for the bridge's `research` command. The card's job is
+                // only to have meant it.
+                if let Some((entity, bkind, true, false)) = single {
+                    if building_researches(bkind).contains(&kind) {
+                        say(
+                            &mut submissions,
+                            Intent::Research {
+                                building: intent_id(entity),
+                                upgrade: kind.id().to_string(),
+                            },
+                        );
+                    }
                 }
             }
             CmdAction::Upgrade(to) => {
@@ -3846,7 +4017,10 @@ fn update_hud(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     ai_controlled: Res<AiControlled>,
-    tiers: Res<TechTiers>,
+    // The same reads `command_input` builds its entries from, so the card the
+    // player sees and the card the keyboard dispatches against are computed
+    // from one set of facts.
+    cast: CastLookup,
     // Latched the frame the match ends: was this an AI-vs-AI spectate?
     mut spectated: Local<Option<bool>>,
     mut texts: Query<(&Slot, &mut Text, &mut TextColor)>,
@@ -3886,9 +4060,6 @@ fn update_hud(
         ),
         With<Selected>,
     >,
-    // Per-ability cooldowns of the selected caster (hero or building), by
-    // entity — one lookup serves both, so neither selection query carries it.
-    cooldowns: Query<&AbilityCooldowns>,
 ) {
     let econ = *economies.get(Team::Human);
     let supply_blocked = econ.supply_cap > 0 && econ.supply_used >= econ.supply_cap;
@@ -3981,9 +4152,12 @@ fn update_hud(
             }
         }
     } else if total == 1 && building_count == 1 {
-        if let Some((_, building, health, team, queue, under, upgrading)) =
+        if let Some((sel_entity, building, health, team, queue, under, upgrading)) =
             sel_buildings.iter().next()
         {
+            // Looked up by entity rather than added to `sel_buildings`, so the
+            // seven-column query (and its four destructures) keeps its shape.
+            let researching = cast.researching.get(sel_entity).ok();
             show_single = true;
             name = building_name(building.kind).to_string();
             portrait_letter = initial(&name);
@@ -4010,6 +4184,26 @@ fn update_hud(
                     );
                 } else if stats.supply_provided > 0 {
                     stats_text = format!("Supply +{}", stats.supply_provided);
+                }
+                // A forge reads out the TEAM's levels, not its own — the whole
+                // point of research is that it belongs to the faction and not
+                // to the building that bought it, and a second Blacksmith
+                // showing the same numbers is the clearest way to say so.
+                let ladders = building_researches(building.kind);
+                if !ladders.is_empty() {
+                    let levels = cast.research.get(Team::Human);
+                    stats_text = ladders
+                        .iter()
+                        .map(|&k| {
+                            format!(
+                                "{} {}/{}",
+                                research_name(k),
+                                levels.level(k),
+                                RESEARCH_MAX_LEVEL
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("    ");
                 }
                 // A building on an upgrade ladder always says which rung it is
                 // on — the tier is what tech requirements are written against.
@@ -4038,6 +4232,21 @@ fn update_hud(
                     for kind in queue.iter().flat_map(|q| q.queue.iter()) {
                         queue_letters.push(initial(unit_name(*kind)));
                     }
+                } else if let Some(job) = researching {
+                    // A forge working owns the bar for the same reason a
+                    // conversion does: it is the one thing about this building
+                    // that is changing, and it has nothing else to report.
+                    let total = job.total.max(0.001);
+                    prog = ((total - job.remaining) / total).clamp(0.0, 1.0);
+                    show_prog = true;
+                    extra_text = format!(
+                        "Researching {} {}: {:.0}%   ({:.0}s left, +{:.0} to every unit)",
+                        research_name(job.kind),
+                        job.to_level,
+                        prog * 100.0,
+                        job.remaining.max(0.0),
+                        research_bonus(job.kind, job.to_level),
+                    );
                 } else if let Some(queue) = queue {
                     for kind in queue.queue.iter() {
                         queue_letters.push(initial(unit_name(*kind)));
@@ -4154,9 +4363,9 @@ fn update_hud(
                 let hero = h?;
                 Some(ability_slots(
                     abilities_of_unit(u.kind),
-                    UnlockCtx::new(hero.level, tiers.get(Team::Human)),
+                    UnlockCtx::new(hero.level, cast.tiers.get(Team::Human)),
                     Some(hero),
-                    cooldowns.get(e).ok(),
+                    cast.cooldowns.get(e).ok(),
                 ))
             })
             .unwrap_or_default(),
@@ -4165,9 +4374,9 @@ fn update_hud(
             .map(|(entity, kind, _, _)| {
                 ability_slots(
                     abilities_of_building(kind),
-                    UnlockCtx::building(tiers.get(Team::Human)),
+                    UnlockCtx::building(cast.tiers.get(Team::Human)),
                     None,
-                    cooldowns.get(entity).ok(),
+                    cast.cooldowns.get(entity).ok(),
                 )
             })
             .unwrap_or_default(),
@@ -4189,6 +4398,16 @@ fn update_hud(
             .and_then(|(_, _, _, _, _, _, _, _, _, _, inv, _)| inv.copied())
             .unwrap_or_default()
             .0,
+        research: single
+            .map(|(entity, kind, done, _)| {
+                research_cmds(
+                    kind,
+                    done,
+                    cast.research.get(Team::Human),
+                    cast.researching.get(entity).ok(),
+                )
+            })
+            .unwrap_or_default(),
     };
     let completed: Vec<BuildingKind> = all_buildings
         .iter()

@@ -47,8 +47,21 @@ Win by destroying all enemy buildings.
     `tech_tier_for` derives the team's `TechTier` from the highest hall rung it
     has standing (`is_hall` + `building_tier`), so a completed Keep opens every
     `TeamTier(T2)` ability and losing it closes them again.
+  * **Research** — `ResearchKind` (Attack/Armor), the `research_step` cost
+    ladder, the `TeamResearch` resource and the `Researching` component. The
+    game's one purchase that buys a *property of the faction* rather than a
+    thing: +1/+2/+3 flat damage on every unit attack and -1/-2/-3 flat damage
+    off every hit a unit takes, retroactive to units already alive and
+    surviving the Blacksmith that bought them. It reaches the simulation
+    through the same one stat law as everything else —
+    `effective_stats_with(base, status, ResearchBonus)` — as two flat terms
+    (`bonus_damage`, `flat_armor`) applied OUTSIDE every multiplier, so a
+    Catapult's 6x siege bonus can never scale an army upgrade. `combat.rs`
+    adds the first at the swing and subtracts the second at `apply_damage`,
+    floored by `damage_after_armor` so armour is a discount and never an
+    immunity. Structures are deliberately excluded from both.
 - `intent.rs` (v2): the **intent compiler** — the single place a player's
-  meaning becomes game state. `shared::Intent` is the vocabulary (24 verbs,
+  meaning becomes game state. `shared::Intent` is the vocabulary (25 verbs,
   serde-serializable, wire-identical to the bridge protocol); `ui.rs` compiles
   mouse gestures into it and `bridge.rs` deserializes `commands.json` into it,
   and neither may mutate the world any other way. It is also where fog stops
@@ -75,7 +88,10 @@ Win by destroying all enemy buildings.
   `Order::Attack`, chase via `MoveTo`, attack cooldowns, projectiles for
   `projectile: true` units, damage to `Health`, floating health bars.
   Death/despawn itself is handled centrally in shared.rs.
-- `economy.rs`: handles `SpawnBuildingEvent`, construction progress,
+- `economy.rs`: handles `SpawnBuildingEvent`, construction progress, research
+  (`StartResearch` pays and starts the clock, `Researching` ticks down, the
+  team's `TeamResearch` level rises on completion — and this module, not the
+  compiler, is what enforces one job per forge; see docs/INTENT.md),
   `Order::Build` (worker walks to site, pays, spawns UnderConstruction building,
   blocks NavGrid), `Order::Harvest`/`ReturnResources` loop (gold mines & trees →
   nearest own TownHall), processes `TrainingQueue` (pays at enqueue time — the
