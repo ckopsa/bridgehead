@@ -80,13 +80,15 @@ pub fn asset_score(
             s.cost_gold + s.cost_lumber
         })
         .sum();
-    let building_value: u32 = buildings
+    // `building_value`, not `building_stats`, so a Keep counts as the hall
+    // plus everything paid to raise it — upgrading is investment, not spending.
+    let building_worth: u32 = buildings
         .map(|k| {
-            let s = building_stats(k);
-            s.cost_gold + s.cost_lumber
+            let (gold, lumber) = building_value(k);
+            gold + lumber
         })
         .sum();
-    unit_value + building_value + economy.gold + economy.lumber
+    unit_value + building_worth + economy.gold + economy.lumber
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +163,12 @@ pub enum BuildingKind {
     Workshop,
     /// Item vendor: heroes buy consumables here.
     Shop,
+    /// Tier 2 of the town hall ladder. Never placed — a TownHall upgrades into
+    /// one in place (see `building_upgrades_to`). Trains everything the hall
+    /// trained, and is the tech gate future tier-2 content names.
+    Keep,
+    /// Tier 3 of the town hall ladder, upgraded from a Keep.
+    Castle,
 }
 
 pub const ALL_UNIT_KINDS: [UnitKind; 7] = [
@@ -172,7 +180,7 @@ pub const ALL_UNIT_KINDS: [UnitKind; 7] = [
     UnitKind::Raider,
     UnitKind::Priestess,
 ];
-pub const ALL_BUILDING_KINDS: [BuildingKind; 7] = [
+pub const ALL_BUILDING_KINDS: [BuildingKind; 9] = [
     BuildingKind::TownHall,
     BuildingKind::Barracks,
     BuildingKind::Farm,
@@ -180,6 +188,8 @@ pub const ALL_BUILDING_KINDS: [BuildingKind; 7] = [
     BuildingKind::Wall,
     BuildingKind::Workshop,
     BuildingKind::Shop,
+    BuildingKind::Keep,
+    BuildingKind::Castle,
 ];
 
 pub struct UnitStats {
@@ -378,7 +388,151 @@ pub fn building_stats(kind: BuildingKind) -> BuildingStats {
             cost_gold: 75, cost_lumber: 60, hp: 400.0, build_time: 15.0,
             supply_provided: 0, size: 4.0, attack: None,
         },
+        // Tier 2/3 halls. `cost_*` and `build_time` are the price and duration
+        // of the UPGRADE STEP that produces them, not of a placement — these
+        // kinds are unplaceable (`building_placeable`), so there is no other
+        // reading, and `upgrade_cost` derives straight from this table.
+        // Footprint stays 8.0 all the way up: an upgrade must never need room
+        // the original hall did not already occupy, or a tightly packed base
+        // could not tier up at all. HP is the visible reward for the money.
+        BuildingKind::Keep => BuildingStats {
+            cost_gold: 320, cost_lumber: 160, hp: 1700.0, build_time: 40.0,
+            supply_provided: 10, size: 8.0, attack: None,
+        },
+        BuildingKind::Castle => BuildingStats {
+            cost_gold: 480, cost_lumber: 240, hp: 2200.0, build_time: 50.0,
+            supply_provided: 10, size: 8.0, attack: None,
+        },
     }
+}
+
+// ---------------------------------------------------------------------------
+// The upgrade ladder
+// ---------------------------------------------------------------------------
+//
+// A building can convert IN PLACE into the next kind up its ladder: same
+// entity, same position, same footprint, bigger body, bigger HP pool. Today
+// the only ladder is TownHall -> Keep -> Castle, but nothing below names those
+// kinds directly: the ladder is data (`building_upgrades_to`), the tier is
+// derived from it, and requirement satisfaction is a tier COMPARISON rather
+// than kind equality — so a Castle satisfies "requires Keep" for free, and a
+// second ladder added later works without touching a single consumer.
+
+/// The kind this one upgrades into, and the sole definition of the ladder.
+pub fn building_upgrades_to(kind: BuildingKind) -> Option<BuildingKind> {
+    match kind {
+        BuildingKind::TownHall => Some(BuildingKind::Keep),
+        BuildingKind::Keep => Some(BuildingKind::Castle),
+        _ => None,
+    }
+}
+
+/// The inverse of `building_upgrades_to`.
+pub fn building_upgraded_from(kind: BuildingKind) -> Option<BuildingKind> {
+    ALL_BUILDING_KINDS
+        .into_iter()
+        .find(|k| building_upgrades_to(*k) == Some(kind))
+}
+
+/// Gold, lumber and seconds to convert `kind` into its next tier. `None` for
+/// anything at the top of its ladder (or not on one). The numbers live in
+/// `building_stats` of the RESULT, so there is exactly one cost table.
+pub fn upgrade_cost(kind: BuildingKind) -> Option<(u32, u32, f32)> {
+    building_upgrades_to(kind).map(|to| {
+        let s = building_stats(to);
+        (s.cost_gold, s.cost_lumber, s.build_time)
+    })
+}
+
+/// The tier-1 kind at the bottom of this kind's ladder (itself, for the
+/// overwhelming majority that are not on one).
+pub fn upgrade_root(kind: BuildingKind) -> BuildingKind {
+    let mut current = kind;
+    // The ladder is short and acyclic; the bound is pure paranoia.
+    for _ in 0..ALL_BUILDING_KINDS.len() {
+        match building_upgraded_from(current) {
+            Some(prev) => current = prev,
+            None => break,
+        }
+    }
+    current
+}
+
+/// 1 for a base building, 2 and 3 for the rungs above it. This is the number
+/// tier-gated content is written against ("requires tier 2") and the number
+/// the catalog and every snapshot report.
+pub fn building_tier(kind: BuildingKind) -> u32 {
+    let mut tier = 1;
+    let mut current = kind;
+    for _ in 0..ALL_BUILDING_KINDS.len() {
+        match building_upgraded_from(current) {
+            Some(prev) => {
+                tier += 1;
+                current = prev;
+            }
+            None => break,
+        }
+    }
+    tier
+}
+
+/// Can a worker place this kind directly? False for everything reachable only
+/// by upgrading, which is what keeps a Keep out of the build menu, out of the
+/// `build` bridge command, and out of the AI's build order.
+pub fn building_placeable(kind: BuildingKind) -> bool {
+    building_upgraded_from(kind).is_none()
+}
+
+/// Is a standing `owned` building enough to satisfy a requirement naming
+/// `req`? Same ladder and at least as high answers yes — so "requires Keep" is
+/// met by a Keep OR a Castle, and a team is never punished for teching up.
+pub fn building_satisfies(owned: BuildingKind, req: BuildingKind) -> bool {
+    upgrade_root(owned) == upgrade_root(req) && building_tier(owned) >= building_tier(req)
+}
+
+/// Everything on the town hall ladder. The one question the drop-off logic,
+/// Town Portal, rally fallbacks and the AI's base bookkeeping actually mean
+/// when they used to ask `kind == TownHall`.
+pub fn is_hall(kind: BuildingKind) -> bool {
+    upgrade_root(kind) == BuildingKind::TownHall
+}
+
+/// Total resources sunk into a building including every upgrade below it — a
+/// Keep is a TownHall *plus* its upgrade. Used by `asset_score`, so teching up
+/// can never lower a team's material worth.
+pub fn building_value(kind: BuildingKind) -> (u32, u32) {
+    let mut gold = 0;
+    let mut lumber = 0;
+    let mut current = Some(kind);
+    for _ in 0..ALL_BUILDING_KINDS.len() {
+        let Some(k) = current else { break };
+        let s = building_stats(k);
+        gold += s.cost_gold;
+        lumber += s.cost_lumber;
+        current = building_upgraded_from(k);
+    }
+    (gold, lumber)
+}
+
+/// A building converting in place. economy.rs inserts it (after taking the
+/// money), ticks it down, and swaps `Building.kind` when it hits zero. While
+/// it is present the building keeps its supply and its training QUEUE, but
+/// trains nothing — the workforce is busy on the scaffolding.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Upgrading {
+    /// What it becomes on completion.
+    pub to: BuildingKind,
+    pub remaining: f32,
+    /// The full duration, so a renderer can show a progress fraction.
+    pub total: f32,
+}
+
+/// Ask a building to start upgrading. Written by ui.rs, bridge.rs and ai.rs;
+/// economy.rs validates (ours, finished, has a next tier, not already
+/// upgrading) and pays — the same division of labour as `Order::Build`.
+#[derive(Event, Debug)]
+pub struct UpgradeBuilding {
+    pub building: Entity,
 }
 
 /// Tech requirements: completed buildings a team must own before this
@@ -404,17 +558,27 @@ pub fn unit_requires(kind: UnitKind) -> &'static [BuildingKind] {
 
 /// Does `team` satisfy `reqs` right now? Pass an iterator over the team's
 /// COMPLETED building kinds.
+///
+/// Satisfaction is `building_satisfies`, not equality: a requirement naming a
+/// tier is met by that tier or anything above it on the same ladder. A team
+/// that upgraded its Keep into a Castle keeps everything the Keep unlocked.
 pub fn requirements_met(
     reqs: &[BuildingKind],
     completed: impl Iterator<Item = BuildingKind> + Clone,
 ) -> bool {
-    reqs.iter().all(|r| completed.clone().any(|b| b == *r))
+    reqs.iter()
+        .all(|r| completed.clone().any(|b| building_satisfies(b, *r)))
 }
 
 /// What each building can train.
 pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
     match kind {
-        BuildingKind::TownHall => &[UnitKind::Worker, UnitKind::Hero, UnitKind::Priestess],
+        // The whole hall ladder trains the same roster: an upgraded hall is
+        // still the hall. This is also what keeps a Keep counting as a
+        // PRODUCTION building for the win condition — see `check_game_over`.
+        BuildingKind::TownHall | BuildingKind::Keep | BuildingKind::Castle => {
+            &[UnitKind::Worker, UnitKind::Hero, UnitKind::Priestess]
+        }
         BuildingKind::Barracks => &[UnitKind::Footman, UnitKind::Archer, UnitKind::Raider],
         BuildingKind::Workshop => &[UnitKind::Catapult],
         BuildingKind::Farm | BuildingKind::Tower | BuildingKind::Wall | BuildingKind::Shop => &[],
@@ -451,6 +615,8 @@ pub fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Wall => "Wall",
         BuildingKind::Workshop => "Workshop",
         BuildingKind::Shop => "Shop",
+        BuildingKind::Keep => "Keep",
+        BuildingKind::Castle => "Castle",
     }
 }
 
@@ -468,7 +634,16 @@ pub fn unit_description(kind: UnitKind) -> &'static str {
 
 pub fn building_description(kind: BuildingKind) -> &'static str {
     match kind {
-        BuildingKind::TownHall => "Resource drop-off. Trains Workers and the Hero.",
+        BuildingKind::TownHall => {
+            "Tier 1 hall. Resource drop-off. Trains Workers and the Hero. Upgrades to a Keep."
+        }
+        BuildingKind::Keep => {
+            "Tier 2 hall: everything the TownHall was, with a deeper HP pool. \
+             Satisfies tier-1 requirements and unlocks tier-2 content. Upgrades to a Castle."
+        }
+        BuildingKind::Castle => {
+            "Tier 3 hall: the top of the ladder. Satisfies every hall requirement below it."
+        }
         BuildingKind::Barracks => "Trains Footmen and Archers.",
         BuildingKind::Farm => "+6 supply. Build ahead of the cap or production stalls.",
         BuildingKind::Tower => "Static defense: shoots arrows at enemies in range.",
@@ -508,12 +683,30 @@ pub struct CatalogAttack {
     pub can_hit_air: bool,
 }
 
+/// One rung of an upgrade ladder, as it appears on the lower rung's catalog
+/// entry. Everything needed to plan a tier-up is here: what you get, what it
+/// costs, and how long the building is busy becoming it.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogUpgrade {
+    /// Catalog id of the resulting building.
+    pub to: &'static str,
+    pub cost_gold: u32,
+    pub cost_lumber: u32,
+    /// Seconds of in-place conversion. Training pauses for exactly this long.
+    pub upgrade_time: f32,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct CatalogBuilding {
     pub id: &'static str,
+    /// For a placeable building, the price a worker pays to put it down. For an
+    /// upgrade-only building (`placeable: false`) this is the price of the
+    /// upgrade step that produces it — the same numbers as the lower rung's
+    /// `upgrades_to`.
     pub cost_gold: u32,
     pub cost_lumber: u32,
     pub hp: f32,
+    /// Seconds to construct — or, for an upgrade-only kind, to convert into.
     pub build_time: f32,
     pub supply_provided: u32,
     pub size: f32,
@@ -521,6 +714,18 @@ pub struct CatalogBuilding {
     pub built_by: &'static str,
     pub requires: Vec<&'static str>,
     pub trains: Vec<&'static str>,
+    /// Rung on this building's upgrade ladder: 1 for everything that is not
+    /// upgraded from something else. A requirement naming a tier is satisfied
+    /// by that tier OR ANY HIGHER one on the same ladder, so "requires Keep"
+    /// is also met by a Castle.
+    pub tier: u32,
+    /// False for kinds that exist only as the result of an upgrade — they have
+    /// no build button, no `build` command, and no place in a build order.
+    pub placeable: bool,
+    /// The next rung up, or null at the top of the ladder.
+    pub upgrades_to: Option<CatalogUpgrade>,
+    /// Catalog id of the rung below, or null for a base building.
+    pub upgraded_from: Option<&'static str>,
     pub description: &'static str,
 }
 
@@ -605,9 +810,20 @@ pub fn game_catalog() -> Catalog {
                         cooldown: a.cooldown,
                         can_hit_air: a.can_hit_air,
                     }),
-                    built_by: "Worker",
+                    built_by: if building_placeable(k) { "Worker" } else { "Upgrade" },
                     requires: building_requires(k).iter().map(|b| building_name(*b)).collect(),
                     trains: trainable(k).iter().map(|u| kind_name(*u)).collect(),
+                    tier: building_tier(k),
+                    placeable: building_placeable(k),
+                    upgrades_to: upgrade_cost(k).map(|(gold, lumber, time)| CatalogUpgrade {
+                        to: building_name(
+                            building_upgrades_to(k).expect("upgrade_cost implies a next tier"),
+                        ),
+                        cost_gold: gold,
+                        cost_lumber: lumber,
+                        upgrade_time: time,
+                    }),
+                    upgraded_from: building_upgraded_from(k).map(building_name),
                     description: building_description(k),
                 }
             })
@@ -927,7 +1143,9 @@ pub fn ability_of_unit(kind: UnitKind) -> Option<AbilityDef> {
 
 pub fn ability_of_building(kind: BuildingKind) -> Option<AbilityDef> {
     match kind {
-        BuildingKind::TownHall => Some(AbilityDef {
+        // The whole hall ladder keeps Call to Arms: an upgrade must never take
+        // an ability away from the player who paid for it.
+        BuildingKind::TownHall | BuildingKind::Keep | BuildingKind::Castle => Some(AbilityDef {
             name: "CallToArms",
             effect: AbilityEffect::Militia,
             mana_cost: 0.0,
@@ -1593,6 +1811,7 @@ impl Plugin for CorePlugin {
             .add_event::<BuyItem>()
             .add_event::<UseItem>()
             .add_event::<TeleportRequest>()
+            .add_event::<UpgradeBuilding>()
             .add_systems(Startup, (initial_spawns, apply_env_speed))
             .add_systems(
                 Update,
@@ -2000,6 +2219,36 @@ impl GameEvents {
         match team {
             Team::Human => &self.human.events,
             Team::Claude => &self.claude.events,
+        }
+    }
+
+    /// Append one event to a team's OWN feed, out of band of the once-a-second
+    /// diff. The diff can only report what it can see in two consecutive
+    /// snapshots of the world; a discrete act with no lasting trace — an
+    /// upgrade being ordered, say — has to announce itself. Callers must push
+    /// to the acting team only: this is the seam through which an information
+    /// asymmetry could be introduced, and the rule that keeps it shut is that
+    /// nobody ever pushes to `team.enemy()`.
+    pub fn push(
+        &mut self,
+        team: Team,
+        t: f32,
+        message: String,
+        severity: EventSeverity,
+        pos: Option<Vec3>,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let events = &mut self.team_mut(team).events;
+        events.push_back(GameEvent {
+            seq,
+            t: ev_r1(t),
+            message,
+            severity,
+            pos,
+        });
+        while events.len() > MAX_GAME_EVENTS {
+            events.pop_front();
         }
     }
 
@@ -2453,4 +2702,129 @@ fn diff_team(
     memo.bounties = cur_bounties;
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the upgrade ladder's invariants
+// ---------------------------------------------------------------------------
+//
+// These are the properties four content beads are about to build on, so they
+// are pinned here rather than left to a sim to notice. Every one is written
+// against the derived helpers, not against `Keep`/`Castle` literals where it
+// can be avoided — a second ladder should inherit the guarantees.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_hall_ladder_is_three_rungs_and_agrees_with_itself() {
+        assert_eq!(building_upgrades_to(BuildingKind::TownHall), Some(BuildingKind::Keep));
+        assert_eq!(building_upgrades_to(BuildingKind::Keep), Some(BuildingKind::Castle));
+        assert_eq!(building_upgrades_to(BuildingKind::Castle), None);
+        // `upgraded_from` is derived, so this is a real round-trip check.
+        for kind in ALL_BUILDING_KINDS {
+            if let Some(next) = building_upgrades_to(kind) {
+                assert_eq!(building_upgraded_from(next), Some(kind));
+                assert_eq!(building_tier(next), building_tier(kind) + 1);
+                assert_eq!(upgrade_root(next), upgrade_root(kind));
+            }
+        }
+        assert_eq!(building_tier(BuildingKind::TownHall), 1);
+        assert_eq!(building_tier(BuildingKind::Keep), 2);
+        assert_eq!(building_tier(BuildingKind::Castle), 3);
+    }
+
+    #[test]
+    fn requirements_compare_tiers_rather_than_kinds() {
+        // The whole point of the tier rule: a team that teched past the
+        // requirement still satisfies it.
+        let castle = [BuildingKind::Castle];
+        assert!(requirements_met(&[BuildingKind::Keep], castle.iter().copied()));
+        assert!(requirements_met(&[BuildingKind::TownHall], castle.iter().copied()));
+        // ...but teching does not run backwards.
+        let hall = [BuildingKind::TownHall];
+        assert!(!requirements_met(&[BuildingKind::Keep], hall.iter().copied()));
+        // And ladders never bleed into each other.
+        assert!(!building_satisfies(BuildingKind::Castle, BuildingKind::Barracks));
+        assert!(building_satisfies(BuildingKind::Barracks, BuildingKind::Barracks));
+    }
+
+    #[test]
+    fn every_rung_of_the_hall_ladder_is_a_hall_and_a_production_building() {
+        for kind in [BuildingKind::TownHall, BuildingKind::Keep, BuildingKind::Castle] {
+            assert!(is_hall(kind), "{} must count as a hall", building_name(kind));
+            // The win condition is "has any building that can train", so a
+            // team whose only building is a Castle must not be declared dead.
+            assert!(
+                !trainable(kind).is_empty(),
+                "{} must stay a production building",
+                building_name(kind)
+            );
+            // Hero training/revival lives on the hall card.
+            assert!(trainable(kind).contains(&UnitKind::Hero));
+            // Call to Arms must survive the upgrade.
+            assert!(ability_of_building(kind).is_some());
+        }
+    }
+
+    #[test]
+    fn upgrade_only_kinds_are_never_placeable_and_never_shrink_the_building() {
+        for kind in ALL_BUILDING_KINDS {
+            let placeable = building_placeable(kind);
+            assert_eq!(placeable, building_upgraded_from(kind).is_none());
+            let Some(next) = building_upgrades_to(kind) else {
+                continue;
+            };
+            assert!(!building_placeable(next));
+            let (from, to) = (building_stats(kind), building_stats(next));
+            // A tier-up is a reward: more HP, never a smaller HP pool...
+            assert!(to.hp > from.hp, "{} must out-HP {}", building_name(next), building_name(kind));
+            // ...and never a bigger footprint, or a packed base could not tech.
+            assert!(
+                to.size <= from.size,
+                "{} must not need more ground than {}",
+                building_name(next),
+                building_name(kind)
+            );
+            // Supply must not drop, or upgrading could strand an army.
+            assert!(to.supply_provided >= from.supply_provided);
+            // Cumulative worth strictly grows, so `asset_score` can never
+            // punish a team for teching up.
+            let (gold_before, lumber_before) = building_value(kind);
+            let (gold_after, lumber_after) = building_value(next);
+            assert!(gold_after > gold_before && lumber_after > lumber_before);
+        }
+    }
+
+    #[test]
+    fn the_catalog_alone_reconstructs_the_whole_ladder() {
+        // An agent reading catalog.json and nothing else must be able to walk
+        // TownHall -> Keep -> Castle and price every step.
+        let catalog = game_catalog();
+        let find = |id: &str| {
+            catalog
+                .buildings
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the catalog"))
+        };
+        let mut id = "TownHall";
+        let mut walked = vec![id];
+        let mut paid = (0, 0);
+        while let Some(step) = find(id).upgrades_to.as_ref() {
+            paid = (paid.0 + step.cost_gold, paid.1 + step.cost_lumber);
+            assert!(step.upgrade_time > 0.0);
+            let next = find(step.to);
+            assert_eq!(next.upgraded_from, Some(id));
+            assert_eq!(next.tier, find(id).tier + 1);
+            assert!(!next.placeable);
+            // The rung's own cost IS the price of the step that makes it.
+            assert_eq!((next.cost_gold, next.cost_lumber), (step.cost_gold, step.cost_lumber));
+            id = step.to;
+            walked.push(id);
+        }
+        assert_eq!(walked, vec!["TownHall", "Keep", "Castle"]);
+        assert_eq!(paid, (320 + 480, 160 + 240));
+    }
 }
