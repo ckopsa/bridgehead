@@ -1066,7 +1066,7 @@ fn resolve_proposals(
     let Some(team) = copilot.seat else { return };
 
     // A finished match answers every outstanding question at once.
-    if game_over.0.is_some() {
+    if game_over.winner.is_some() {
         copilot.pending.clear();
         return;
     }

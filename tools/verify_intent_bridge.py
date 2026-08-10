@@ -25,6 +25,13 @@ EXPECTED_TOP_KEYS = {
     "trees_near", "events", "fog",
 }
 
+# Keys that appear only in states this check does not run in, so the assertion
+# above stays an EXACT-set check for the live match it actually inspects.
+#   * game_over_reason ("razed"/"surrender") exists only once a match has ended
+#     — see docs/INTENT.md, "Which win was it": `game_over` itself keeps its
+#     historical string-or-null shape precisely so this tooling never breaks.
+OPTIONAL_TOP_KEYS = {"applied", "game_over_reason"}
+
 
 def upgrade_price(st):
     """What the catalog says the hall's next tier costs."""
@@ -72,7 +79,7 @@ def main():
 
     # --- contract: the snapshot key set is unchanged ------------------------
     keys = set(st.keys())
-    missing, extra = EXPECTED_TOP_KEYS - keys, keys - EXPECTED_TOP_KEYS
+    missing, extra = EXPECTED_TOP_KEYS - keys, keys - EXPECTED_TOP_KEYS - OPTIONAL_TOP_KEYS
     assert not missing, f"FAIL: snapshot lost keys {missing}"
     assert not extra, f"FAIL: snapshot gained keys {extra}"
     unit_keys = set(st["units"][0].keys()) if st["units"] else set()

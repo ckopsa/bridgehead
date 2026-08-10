@@ -482,6 +482,151 @@ behaviour** — it changed how many places can cause it.
 
 ---
 
+## Legibility: what the round-9 and round-10 AARs cost
+
+*`wc3clone-pbd`, `wc3clone-vjy`, `wc3clone-azo`, `wc3clone-d4y`. Four bugs, no new
+verbs and no behaviour change — every one of them was the engine knowing something
+and declining to say it.*
+
+The fairness invariant says both seats reach the same verdicts. It says nothing about
+whether a verdict is **usable**, and four arena rounds found the gap: a commander who
+is refused for a reason they cannot act on has been told no in a language they do not
+speak. Each fix below is a string or a field, and each is pinned by a test, because a
+teaching error message that nobody asserts on is a comment.
+
+### Where a gate is written is where it must be read
+
+`buildings[].trains` was a bare id list, so the Barracks advertised the Raider with
+nothing on that entry to say it waits on a Workshop. The gate did exist — in
+`units[].requires`, on the other side of the catalog, behind a join nothing advertised.
+A commander reading a *roster* has no reason to suspect a join is needed, and it cost
+one their scout timing.
+
+`buildings[].trains_gated` is the same roster with each unit's gate attached:
+
+```json
+"trains": ["Footman", "Archer", "Spearman", "Raider", "Knight", "Champion", "Priestess"],
+"trains_gated": [
+  {"unit": "Footman", "requires": [],          "tier": 1},
+  {"unit": "Raider",  "requires": ["Workshop"], "tier": 1},
+  {"unit": "Knight",  "requires": ["Castle"],   "tier": 3}
+]
+```
+
+`trains` is kept verbatim and in the same order — it is the historical shape and tools
+read it — and the two are asserted parallel element-for-element, so they can differ in
+how much they say and never in what they say. `requires` here is the gate **beyond**
+owning the trainer; whatever gates the trainer is the same entry's `requires`, so one
+building entry is the whole answer. The Sorcerer is the case that proves the shape:
+its own list is legitimately empty, because its gate is on the Arcane Sanctum, and the
+Sanctum's `requires: ["Keep"]` is right there.
+
+### A rejection names the building that will accept the order
+
+Round 9's commander met the Raider gate as two true, individually useless sentences:
+
+| where | old | new |
+|---|---|---|
+| at the Barracks | `Raider requires Workshop` | `Raider trains at the Barracks once a Workshop stands (you have none)` |
+| at the Workshop | `Workshop cannot train Raider` | `Workshop cannot train Raider — Raider trains at the Barracks` |
+
+The first, read *at the Barracks*, reads as "wrong building" — so they moved the order
+to the Workshop and got the second. Neither ever said **keep training it here**. The new
+first string names the Barracks even though the reader is standing at it; that redundancy
+is the entire fix.
+
+Two clauses generalise it. On the hall ladder, `you have none` is a lie to somebody
+looking straight at their TownHall, so the parenthesis names what they hold and what to
+do to it: `Knight trains at the Barracks once a Castle stands (yours is a TownHall —
+upgrade it)`. And the wrong-building string carries the *trainer's* own gate, because
+the Sorcerer has no building to name until it has one:
+`Barracks cannot train Sorcerer — Sorcerer trains at the Sanctum (you have no Sanctum;
+it needs a Keep)`.
+
+### A refusal that names no alternative is a refusal to help
+
+`site (56.0, -56.0) is blocked for TownHall` cost both round-9 commanders 20s+ of
+probing at 2-unit increments, because it named neither the rule nor a way out. It now
+carries both:
+
+```
+cmd 0: site (56.0, -56.0) is blocked for TownHall — needs 8x8 clear
+       (mines block 6x6, trees 2x2, buildings their own footprint);
+       nearest legal: (52.0, -62.0)
+```
+
+**The real clearance rule, which turns out to be simpler than it looked.** There is no
+"keep away from mines" rule and no clearance ring. A request is clamped to the map
+interior, snapped by `snap_footprint` so its edges land on 2.0-unit nav-cell boundaries,
+and then every cell the footprint touches must be unblocked (`NavGrid::rect_is_free`).
+Cells are blocked by impassable terrain, a gold mine's 6x6 square, a tree's 2x2, and
+each standing building's own `size`. Units never block. So the apparent mine-clearance
+is just two footprints that cannot overlap: a TownHall (8x8) beside a mine (6x6) needs
+its centre 7.0 clear on an axis — which is exactly why the site the eye picks is the
+site that fails. `buildings[].size` already exported the footprint; what was missing was
+anyone saying it was load-bearing.
+
+The hint is computed on the nav lattice through the *same* `snap_footprint` +
+`rect_is_free` pair the rejection just applied, so it is legal by construction rather
+than by two functions agreeing — and the test proves it by feeding the hint back through
+the compiler and demanding acceptance, rather than by eyeballing the string. Ties break
+on `(distance, x, z)` so both seats are given identical advice. Beyond 15 units it says
+`no legal site within 15` instead of pointing somewhere useless. This is bridge-seat
+parity work: the UI ghost has always previewed and snapped.
+
+### Which win was it
+
+`game_over` has always been the winning team's name or `null`, and round 9's winner
+could not tell a razed base from a concession — two endings that call for completely
+different AARs.
+
+**The non-breaking shape is a sibling key, and the check that decided it:**
+`tools/bridge_view.py` prints `f"{s['game_over']} wins"`, `tools/bridge_wait.py` tests
+it for truthiness, and `tools/COMMANDER_BRIEF.md` polls "until `game_over` is non-null".
+Turning it into `{winner, reason}` breaks all three at the exact moment a match ends.
+So `game_over` keeps its shape forever and `game_over_reason` sits beside it, carrying
+`"razed"` or `"surrender"`. It is `skip_serializing_if = "Option::is_none"`, so it is
+**absent for the entire live match** and the snapshot's historical key set is untouched
+right up to the last tick — `verify_intent_bridge.py`'s exact-key-set assertion runs
+mid-match and passes unmodified.
+
+In the engine the pair is one resource with one setter (`GameOver::decide(winner,
+reason)`), so a winner with no reason is unrepresentable rather than merely unlikely.
+The human's banner sub-line and the headless exit log print the same two words.
+
+### One sentence standing for four failures
+
+*`wc3clone-d4y`, round 10.* `{"type":"cast","hero":<expansion TownHall id>,
+"ability":"CallToArms"}` came back `caster N is not a hero or an own ability building`,
+while the identical command worked at the same team's Keep.
+
+**The compiler was right and so was the catalog.** `abilities_of_building` is
+`is_hall`-gated, so every rung of the ladder casts; the lookup is a direct
+`buildings.get(entity)` with no one-hall-per-team `find`; the snapshot reports
+`abilities` on every own hall and ids are plain `to_bits()`. A test with a Keep *and* a
+second expansion TownHall passes against the unmodified code.
+
+What was wrong was that **one string stood for four distinct failures** — a dead or
+unknown id, an enemy-owned caster, an own building with no ability, an own unit with no
+ability — and the wording it chose pointed at the tech tree, the only one of the four
+that was never happening. So the commander checked the catalog, found TownHall correctly
+listed as a Call to Arms caster, and filed a bug against the roster. Each failure now
+answers for itself:
+
+| what the id names | now |
+|---|---|
+| nothing | `caster N not found — no unit or building has that id (it may have died since the snapshot you read)` |
+| the enemy's | `caster N is not yours` |
+| own building, no ability | `Farm has no ability` |
+| own unit, no ability | `Footman has no ability` |
+| own building still going up | `building N is under construction` (unchanged — it was always right) |
+
+The lesson is the one this whole section is about: a diagnostic that cannot distinguish
+its cases will be read as whichever case it *sounds* like, and the reader will go and
+investigate that one.
+
+---
+
 ## Speaking it: English, and "why are you doing that?"
 
 *`wc3clone-ge4`. Two additions, both built on the fact that `Intent` is a value

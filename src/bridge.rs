@@ -510,6 +510,24 @@ struct StateOut {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     applied: Vec<AppliedOut>,
     game_over: Option<&'static str>,
+    /// **Which win it was**: `"razed"` (the loser has no production buildings
+    /// left) or `"surrender"`. Round-9's winner could not tell the two apart —
+    /// a conceded match and a fought-out one call for completely different
+    /// AARs, and `game_over` alone never distinguished them.
+    ///
+    /// Deliberately a SIBLING key rather than turning `game_over` into
+    /// `{winner, reason}`. `game_over` is read as a team name or null by
+    /// tools/bridge_view.py (`f"{s['game_over']} wins"`), tools/bridge_wait.py
+    /// and tools/COMMANDER_BRIEF.md's poll loop; an object there breaks all
+    /// three the moment a match ends, which is exactly the moment nobody is
+    /// watching the tooling. So `game_over` keeps its shape forever.
+    ///
+    /// `skip_serializing_if` keeps it ABSENT for the entire live match, so the
+    /// snapshot's historical key set is untouched right up to the last tick —
+    /// `verify_intent_bridge.py`'s exact-key-set assertion runs mid-match and
+    /// still passes unmodified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    game_over_reason: Option<&'static str>,
     me: MeOut,
     /// The ground both seats are fighting over: which layout is loaded and
     /// where its impassable terrain can be crossed. The human sees the canyon
@@ -1655,7 +1673,8 @@ fn write_seat_snapshot(
                 delay: r1(a.delay),
             })
             .collect(),
-        game_over: game_over.0.map(team_name),
+        game_over: game_over.winner.map(team_name),
+        game_over_reason: game_over.reason.map(GameOverReason::name),
         me: MeOut {
             gold: eco.gold,
             lumber: eco.lumber,
@@ -2008,7 +2027,7 @@ fn poll_commands(
         // batch being acknowledged, never the one before it.
         intent_applied.get_mut(seat.team).clear();
 
-        if game_over.0.is_some() {
+        if game_over.winner.is_some() {
             seat.errors
                 .push("batch: game over — commands ignored".to_string());
         } else {
