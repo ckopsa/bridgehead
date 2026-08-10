@@ -93,6 +93,30 @@ const INVENTORY_SLOTS: usize = Inventory([None; 2]).0.len();
 /// list every batch; this only bounds a long single-player session.
 const MAX_ERRORS: usize = 64;
 
+/// Channel tag on a rejection raised to the human's alert stack. The bridge's
+/// errors are prefixed `cmd 3:` because a commander needs to know *which* of
+/// the commands it just wrote was refused; a gesture is always the one the
+/// player just made, so the human's prefix names the outcome instead. What
+/// follows the colon is byte-identical to what the bridge is told.
+const UI_NOTICE_PREFIX: &str = "order refused";
+
+/// How long the same rejection stays quiet after the player has been told once
+/// (game seconds). A right-click held down on an illegal target re-fails
+/// identically every frame, and the player needs to hear that once.
+const UI_NOTICE_REPEAT_S: f32 = 4.0;
+
+/// How many distinct recent rejections the limiter remembers. A gesture can
+/// fail several ways at once (three dead units in one selection is three
+/// errors), and those errors then repeat *as a set* every frame — so a
+/// one-slot memory would let them take turns evicting each other and flood
+/// anyway. Comfortably larger than the alert stack, and bounded.
+const UI_NOTICE_MEMORY: usize = 12;
+
+/// Most rejection notices to raise in one frame, however many failed in it.
+/// The alert stack is six rows and they are shared with the match's actual
+/// news — a fumbled click must never push "hostiles near base" off the screen.
+const UI_NOTICE_BURST: usize = 2;
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -107,6 +131,7 @@ impl Plugin for IntentPlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<SubmitIntent>()
             .init_resource::<IntentErrors>()
+            .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
             // `.after(FogSet)`: an intent is judged against the visibility its
             // issuer has right now, the same grid the snapshot and the HUD are
@@ -192,6 +217,82 @@ pub struct IntentEvents<'w> {
 }
 
 // ---------------------------------------------------------------------------
+// Telling the human its gesture was refused
+// ---------------------------------------------------------------------------
+
+/// The rate limiter for rejections raised to the human's alert stack.
+///
+/// A bridge commander has always been told why a command was refused: the
+/// errors ride back in the next snapshot's `errors` array, and reading them is
+/// step 2 of the loop in tools/COMMANDER_BRIEF.md. The human at the keyboard
+/// got nothing — the identical string was written to `IntentErrors`, sat in a
+/// list only bridge.rs reads, and was overwritten. Same compiler, same
+/// verdict, one seat told and one not, which is the fairness claim failing in
+/// the *reverse* direction from the usual worry.
+///
+/// So the errors go to the human's existing news channel (`GameEvents`, which
+/// the alert stack already renders and Space already focuses) as
+/// `Warning`-severity notices. Rendering, not routing, is where the two seats
+/// are allowed to differ: a file reader gets forty lines of history and all
+/// the time in the world, a human gets six rows that fade.
+///
+/// The limiter exists because the two channels have different failure modes. A
+/// bridge batch is a discrete document and its errors arrive once; a gesture
+/// is a held mouse button that can re-fail at frame rate. Without this, one
+/// stuck right-click would evict every real alert on screen.
+#[derive(Resource, Default)]
+struct UiNotices {
+    /// Recent messages and the game time each was raised. Bounded by
+    /// `UI_NOTICE_MEMORY`; entries expire after `UI_NOTICE_REPEAT_S`.
+    recent: std::collections::VecDeque<(String, f32)>,
+}
+
+impl UiNotices {
+    /// Raise up to `UI_NOTICE_BURST` of `errors` on `team`'s feed, skipping
+    /// anything already said recently. `budget` is the frame's remaining
+    /// allowance, so several failed gestures in one frame share one cap
+    /// instead of getting one each.
+    fn raise(
+        &mut self,
+        feed: &mut GameEvents,
+        team: Team,
+        now: f32,
+        tag: &str,
+        errors: &[String],
+        budget: &mut usize,
+    ) {
+        self.recent
+            .retain(|(_, when)| now - *when < UI_NOTICE_REPEAT_S);
+        for error in errors {
+            if *budget == 0 {
+                return;
+            }
+            // The tag is the channel label, not part of the error: the bridge
+            // needs `cmd 3:` to find the command in its batch, the human needs
+            // to know a gesture bounced. Everything after it is verbatim.
+            let body = error
+                .strip_prefix(&format!("{tag}: "))
+                .unwrap_or(error)
+                .to_string();
+            if self.recent.iter().any(|(seen, _)| *seen == body) {
+                continue;
+            }
+            let message = format!("{UI_NOTICE_PREFIX}: {body}");
+            self.recent.push_back((body, now));
+            while self.recent.len() > UI_NOTICE_MEMORY {
+                self.recent.pop_front();
+            }
+            *budget -= 1;
+            // `pos: None` — a refusal happened at the cursor, not on the map,
+            // and handing Space a camera jump to a place nothing occurred at
+            // would be worse than skipping it (the focus walk skips
+            // placeless alerts by design).
+            feed.push(team, now, message, EventSeverity::Warning, None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The compiler
 // ---------------------------------------------------------------------------
 
@@ -212,6 +313,8 @@ fn apply_intents(
     mut ai_controlled: ResMut<AiControlled>,
     mut error_log: ResMut<IntentErrors>,
     mut log: ResMut<IntentLog>,
+    mut feed: ResMut<GameEvents>,
+    mut notices: ResMut<UiNotices>,
     mut events: IntentEvents,
     mut world: IntentWorld,
 ) {
@@ -222,6 +325,8 @@ fn apply_intents(
         return;
     }
     let now = time.elapsed_secs();
+    // One allowance for the whole frame, shared by every gesture in it.
+    let mut notice_budget = UI_NOTICE_BURST;
     for submission in batch {
         let mut errors: Vec<String> = Vec::new();
         compile_intent(
@@ -243,6 +348,19 @@ fn apply_intents(
             &mut world,
         );
         log.record(now, &submission, &errors);
+        // The human's copy of the error channel. Source decides which renderer
+        // is told, never whether the intent was legal — the verdict above was
+        // reached without consulting it.
+        if submission.source == IntentSource::Ui && !errors.is_empty() {
+            notices.raise(
+                &mut feed,
+                submission.team,
+                now,
+                &submission.tag,
+                &errors,
+                &mut notice_budget,
+            );
+        }
         let sink = error_log.get_mut(submission.team);
         sink.extend(errors);
         if sink.len() > MAX_ERRORS {
@@ -1442,20 +1560,16 @@ pub fn parse_target_classes(names: &[String]) -> Result<Vec<TargetClass>, String
 }
 
 pub fn parse_target_class(name: &str) -> Option<TargetClass> {
+    let wanted = normalize_name(name);
     ALL_TARGET_CLASSES
         .iter()
         .copied()
-        .find(|c| c.name().eq_ignore_ascii_case(name))
+        .find(|c| normalize_name(c.name()) == wanted)
 }
 
-/// Loose form of a name on the wire: case, spaces, dashes and underscores are
-/// all noise, so `"town_hall"`, `"Town Hall"` and `"townhall"` are one name.
-fn normalize_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
+// `normalize_name` is `shared::normalize_name` — the one name matcher, moved
+// next to the catalog it folds the names of so that abilities (resolved in
+// shared.rs) and everything else (resolved here) cannot drift apart again.
 
 /// Both parsers match against the catalog's own ids (`shared::kind_name` /
 /// `building_name`), so a kind added to the shared enums is orderable through
@@ -1506,6 +1620,304 @@ pub fn set_autopilot(ai_controlled: &mut AiControlled, team: Team, on: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app running the real compiler against a real (if bare) world.
+    ///
+    /// Everything `apply_intents` reads, defaulted, plus the five event
+    /// channels it writes. `IntentLog` is replaced with a disabled one after
+    /// the plugin installs it: a unit test must not depend on `WC3_INTENT_LOG`
+    /// and must not leave a file behind.
+    fn compiler_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<Economies>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<NavGrid>()
+            .init_resource::<TeamResearch>()
+            .init_resource::<SquadOrders>()
+            .init_resource::<AiControlled>()
+            .init_resource::<GameEvents>()
+            .add_event::<CastAbility>()
+            .add_event::<BuyItem>()
+            .add_event::<UseItem>()
+            .add_event::<UpgradeBuilding>()
+            .add_event::<StartResearch>()
+            .add_plugins(IntentPlugin);
+        app.insert_resource(IntentLog {
+            path: None,
+            file: None,
+            broken: false,
+        });
+        // Pin the fog mode: the ambient `WC3_FOG` must not decide an outcome.
+        app.insert_resource(FogGrids::test_dark());
+        app
+    }
+
+    /// Remember `building` (an enemy structure) in `team`'s grid, exactly as
+    /// `update_fog` does, without needing a scout to walk there and back.
+    fn remember(app: &mut App, team: Team, building: Entity, kind: BuildingKind, pos: Vec3) {
+        app.world_mut().resource_mut::<FogGrids>().test_remember(
+            team,
+            RememberedBuilding {
+                id: building.to_bits(),
+                team: team.enemy(),
+                kind,
+                pos,
+                hp: 700.0,
+                max_hp: 700.0,
+                done: true,
+                last_seen: 0.0,
+            },
+        );
+    }
+
+    /// The gap docs/INTENT.md called "the one residual asymmetry", closed.
+    ///
+    /// The compiler's rule has always been `knows_entity` — visible now OR a
+    /// remembered structure — while the human's right-click picker only
+    /// offered what `fog_sees` allowed. A scouted barracks standing in the fog
+    /// was therefore a legal target for a bridge commander and un-clickable
+    /// for the human: the AI could express something the human could not,
+    /// which is the one direction THESIS.md's fairness claim cannot survive.
+    ///
+    /// `ui.rs::right_mouse` now picks against `FogGrid::ghosts()` — the same
+    /// iterator that draws the boxes on screen — and hands the record's `id`
+    /// straight to `Intent::Attack`. That id is the real entity's `to_bits()`,
+    /// so this test asserts the two halves that makes the gesture work: the
+    /// id round-trips to the live entity, and the intent built from it is the
+    /// *same value* a commander types and compiles to a real `Order::Attack`.
+    #[test]
+    fn a_remembered_building_is_attackable_by_id() {
+        let barracks_at = Vec3::new(40.0, 0.0, 40.0);
+        let mut app = compiler_app();
+
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+        let barracks = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Claude,
+                Transform::from_translation(barracks_at),
+                Health::new(700.0),
+            ))
+            .id();
+        remember(&mut app, Team::Human, barracks, BuildingKind::Barracks, barracks_at);
+
+        // The picker's premise: the record is a ghost (not currently seen),
+        // and its id resolves back to the entity the compiler will look up.
+        {
+            let grid = app.world().resource::<FogGrids>().get(Team::Human);
+            let ghost = grid.ghosts().next().expect("the barracks is remembered");
+            assert!(!grid.sees(ghost.pos), "a ghost is by definition unseen");
+            assert_eq!(Entity::try_from_bits(ghost.id), Ok(barracks));
+            assert!(grid.knows_entity(ghost.id, ghost.pos));
+        }
+
+        // The gesture. `intent_id` is `Entity::to_bits`, which is what the
+        // ghost record stores — so this is character-for-character the JSON a
+        // commander sends, and the assertion below says so.
+        let gesture = Intent::Attack {
+            units: vec![soldier.to_bits()],
+            target: barracks.to_bits(),
+        };
+        let typed: Intent = serde_json::from_str(&format!(
+            r#"{{"type":"attack","units":[{}],"target":{}}}"#,
+            soldier.to_bits(),
+            barracks.to_bits()
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&gesture).unwrap(),
+            serde_json::to_value(&typed).unwrap()
+        );
+
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, gesture));
+        app.update();
+
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "attacking a remembered structure is legal — it is the rule the \
+             compiler has always had, and now the human can reach it"
+        );
+        assert!(
+            matches!(
+                app.world().entity(soldier).get::<Order>(),
+                Some(Order::Attack(hit)) if *hit == barracks
+            ),
+            "the same verb the bridge uses, against the same entity"
+        );
+    }
+
+    /// A ghost can be a lie, and the interface must let the player find that
+    /// out the same way a commander does — by ordering the attack and being
+    /// told. The building is razed while nobody is watching, so the memory
+    /// survives (docs/FOG.md: "the correct amount of wrong"), the click still
+    /// lands, and the refusal is the same string the bridge would receive.
+    ///
+    /// This is also the end-to-end check on the error channel: a `ui`-source
+    /// rejection reaches the human's `GameEvents` feed, which is the buffer
+    /// the alert stack renders.
+    #[test]
+    fn a_refused_gesture_reaches_the_humans_alert_stack() {
+        let barracks_at = Vec3::new(40.0, 0.0, 40.0);
+        let mut app = compiler_app();
+
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+        let barracks = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Claude,
+                Transform::from_translation(barracks_at),
+                Health::new(700.0),
+            ))
+            .id();
+        remember(&mut app, Team::Human, barracks, BuildingKind::Barracks, barracks_at);
+        // Razed behind our back. The ghost stays — and so does the gesture.
+        app.world_mut().entity_mut(barracks).despawn();
+
+        let stale = barracks.to_bits();
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Attack {
+                units: vec![soldier.to_bits()],
+                target: stale,
+            },
+        ));
+        app.update();
+
+        let expected = format!("target {stale} not found");
+        assert_eq!(
+            app.world().resource::<IntentErrors>().get(Team::Human),
+            &[format!("ui: {expected}")],
+            "the bridge's error string, unchanged, in the bridge's channel"
+        );
+        let feed = app.world().resource::<GameEvents>();
+        let notices: Vec<&GameEvent> = feed
+            .feed(Team::Human)
+            .iter()
+            .filter(|e| e.message.starts_with(UI_NOTICE_PREFIX))
+            .collect();
+        assert_eq!(notices.len(), 1, "the player is told exactly once");
+        assert_eq!(notices[0].message, format!("{UI_NOTICE_PREFIX}: {expected}"));
+        assert_eq!(notices[0].severity, EventSeverity::Warning);
+        // Never the opponent's business that we fumbled an order.
+        assert!(feed.feed(Team::Claude).is_empty());
+    }
+
+    /// A held-down right-click on an illegal target re-submits the identical
+    /// gesture every frame. The alert stack is six rows and shares them with
+    /// the match's real news, so one stuck mouse button must not be able to
+    /// evict "hostiles near base". Told once, then silent.
+    #[test]
+    fn a_held_click_cannot_flood_the_alert_stack() {
+        let mut app = compiler_app();
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+
+        for _ in 0..60 {
+            app.world_mut().send_event(SubmitIntent::ui(
+                Team::Human,
+                Intent::Attack {
+                    units: vec![soldier.to_bits()],
+                    target: 999_999,
+                },
+            ));
+            app.update();
+        }
+
+        let notices = app
+            .world()
+            .resource::<GameEvents>()
+            .feed(Team::Human)
+            .iter()
+            .filter(|e| e.message.starts_with(UI_NOTICE_PREFIX))
+            .count();
+        assert_eq!(notices, 1, "sixty identical refusals are one piece of news");
+
+        // A DIFFERENT refusal still gets through — the limiter suppresses
+        // repetition, not the channel.
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Build {
+                worker: soldier.to_bits(),
+                kind: "Nonsense".to_string(),
+                x: 0.0,
+                z: 0.0,
+            },
+        ));
+        app.update();
+        let notices = app
+            .world()
+            .resource::<GameEvents>()
+            .feed(Team::Human)
+            .iter()
+            .filter(|e| e.message.starts_with(UI_NOTICE_PREFIX))
+            .count();
+        assert_eq!(notices, 2, "a new problem is still news");
+    }
+
+    /// A bridge seat already reads its errors out of the snapshot; raising
+    /// them on the event feed as well would double-report them and put one
+    /// seat's mistakes into an artifact the other seat's renderer reads from.
+    /// Source picks the channel, and that is the whole of what source decides.
+    #[test]
+    fn a_bridge_rejection_does_not_touch_the_event_feed() {
+        let mut app = compiler_app();
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: Intent::Attack {
+                units: vec![soldier.to_bits()],
+                target: 999_999,
+            },
+        });
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<IntentErrors>().get(Team::Human),
+            &["cmd 0: target 999999 not found".to_string()],
+            "the bridge's own channel is unchanged"
+        );
+        assert!(
+            app.world()
+                .resource::<GameEvents>()
+                .feed(Team::Human)
+                .is_empty(),
+            "and nothing leaked into the human renderer's feed"
+        );
+    }
 
     /// The wire format is the schema: every historical bridge command must
     /// still deserialize into an `Intent`, and the tags must be unchanged.
@@ -1673,6 +2085,48 @@ mod tests {
         assert_eq!(parse_research_kind("armour"), None);
         assert_eq!(parse_research_kind("damage"), None);
         assert_eq!(parse_research_kind(""), None);
+    }
+
+    /// Ability ids parse the same loose way every other name on the wire does.
+    ///
+    /// This was the last name in the language matched by
+    /// `eq_ignore_ascii_case` rather than `normalize_name`, which meant
+    /// `"CallToArms"` and `"calltoarms"` worked while `"Call to Arms"` — the
+    /// spelling a person types, and the one a reader mentally inserts a space
+    /// into when reading `catalog.abilities` — was an unknown ability. A
+    /// vocabulary with two matching rules is two vocabularies.
+    #[test]
+    fn ability_ids_parse_like_every_other_name() {
+        let hall = abilities_of_building(BuildingKind::TownHall);
+        // Every old form still resolves: normalising is strictly looser than
+        // case folding, so nothing that parsed before stopped parsing.
+        assert_eq!(ability_index_by_id(hall, "CallToArms"), Some(0));
+        assert_eq!(ability_index_by_id(hall, "calltoarms"), Some(0));
+        assert_eq!(ability_index_by_id(hall, "CALLTOARMS"), Some(0));
+        // ...and the spellings that used to be rejected now land.
+        assert_eq!(ability_index_by_id(hall, "Call to Arms"), Some(0));
+        assert_eq!(ability_index_by_id(hall, "call_to_arms"), Some(0));
+        assert_eq!(ability_index_by_id(hall, "call-to-arms"), Some(0));
+
+        // The hero kit, including a second slot, so this is not a one-row
+        // coincidence.
+        let champion = abilities_of_unit(UnitKind::Hero);
+        assert_eq!(ability_index_by_id(champion, "Slam"), Some(0));
+        assert_eq!(ability_index_by_id(champion, " war cry "), Some(1));
+
+        // A wrong name is still a rejected cast, not a silent slot 0.
+        assert_eq!(ability_index_by_id(hall, "CallToArm"), None);
+        assert_eq!(ability_index_by_id(hall, ""), None);
+
+        // The selector reached through the wire form agrees, because it is the
+        // same function underneath — this is the path a `cast` command takes.
+        let selector: AbilitySelector = serde_json::from_str(r#""Call to Arms""#).unwrap();
+        assert!(matches!(selector, AbilitySelector::Id(_)));
+
+        // Target classes are the other holdout the unification swept up.
+        assert_eq!(parse_target_class("hero"), Some(TargetClass::Hero));
+        assert_eq!(parse_target_class("Hero"), Some(TargetClass::Hero));
+        assert_eq!(parse_target_class("wizard"), None);
     }
 
     /// The claim the whole module exists to make: a human gesture and a bridge

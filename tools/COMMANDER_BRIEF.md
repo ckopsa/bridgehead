@@ -35,7 +35,11 @@ Production:
   90s cooldown). Add `"ability":<index>` or `"ability":"Slam"` to pick a specific one — casters
   can have several, each with its own cooldown and unlock condition. Every caster's slots are
   listed in the snapshot as `units[].abilities` / `buildings[].abilities`
-  (`index`, `cd`, `unlocked`, `ready`, `requires`), and described in catalog `abilities`.
+  (`index`, `cd`, `unlocked`, `ready`, `requires`), and described in catalog `abilities`
+  (where `unlock_hero_level` / `unlock_tier` give the gate as a number). Names are matched
+  loosely — case, spaces, dashes and underscores are all noise, so `"Call to Arms"`,
+  `"calltoarms"` and `"call_to_arms"` are one ability. The same holds for unit, building,
+  item and research names, and for `priority` classes.
 - `{"type":"buy","shop":id,"item":"HealingPotion"|"TownPortal"}` — your living hero buys the item
   (2 inventory slots; see catalog `items`). `{"type":"use_item","slot":0}` consumes it.
   TownPortal teleports your hero + nearby own units to your nearest TownHall — the expansion-saver.
@@ -62,11 +66,18 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
   hopeless position — no income, no army, no path back. Preferable to dragging out a decided game.
 
 ## What you can build/train: read `<SEAT>/catalog.json`
-The FULL content catalog — every unit, building, and ability: costs, stats,
-train/build times, what produces what, and `requires` (tech prerequisites).
+The FULL content catalog — every unit, building, ability, research and item:
+costs, stats, train/build times, what produces what, and what gates it.
 Read it ONCE at match start; it is the authoritative content reference.
+
+**The catalog IS the tech tree — no prose needed.** `requires` on everything
+lists what must be STANDING (trainer included, transitively) and `tier` says how
+far up the hall ladder that puts you; `upgrades_to`/`upgraded_from` walk
+TownHall→Keep→Castle with every price on it. T2 arrives ~min 3-5, T3 ~min 6-9.
+
 The live snapshot's `unlocked` map tells you which entries' requirements you
-currently satisfy (e.g. Towers need a Barracks first).
+currently satisfy — but it checks tech gates only, not whether you own the
+trainer, so cross-check against `requires`.
 
 ## The rules of the world (not in the catalog)
 - **FOG OF WAR — read this before you read `units`.** Your snapshot shows only what your
@@ -113,7 +124,10 @@ currently satisfy (e.g. Towers need a Barracks first).
 - **Choose your hero class at first training** (see catalog: units with abilities). Your team's
   class locks in — revival always restores the class you chose. Choose for your gameplan.
 - Counter triangle: fortifications stop armies, siege outranges fortifications, fast cavalry
-  dives siege. Check catalog `vs_*` multipliers.
+  dives siege. It is all data: catalog `units[].class` says what a unit IS, and
+  `vs_building_mult` / `vs_siege_mult` / `vs_cavalry_mult` say what it eats. The
+  multipliers are keyed off the CLASS, so a Spearman's anti-cavalry bonus lands on the
+  Knight and the Raider alike. `damage` with `attack_cooldown` gives you dps.
 - Ranged units/towers outrange melee; footmen tank; workers fight terribly.
 - Towers shoot at enemy units in range on their own; Walls just block pathing and soak hits.
   Defense is a real strategy — and SIEGE is its counter: check the catalog for what outranges towers.

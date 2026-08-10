@@ -727,6 +727,68 @@ pub fn unit_requires(kind: UnitKind) -> &'static [BuildingKind] {
     }
 }
 
+/// Everything that must be STANDING before a team can train `kind`: the
+/// building that trains it, whatever gates that building, and whatever gates
+/// the unit itself — transitively, to the bottom.
+///
+/// `unit_requires` above is deliberately partial. It lists requirements
+/// *beyond* owning the trainer, which is the right shape for
+/// `requirements_met` (the trainer is checked separately, by the order being
+/// given at it) and the wrong shape for a CATALOG. Exported raw it says
+/// `Footman: requires []` — which reads as "buildable from nothing" — and
+/// `Catapult: requires []`, hiding a real Barracks→Workshop chain behind a
+/// join the JSON never advertises. The caveat that made those entries true
+/// lived in a Rust doc comment, and serde does not export doc comments.
+///
+/// So this is the shape the catalog ships: complete, and needing no prose.
+/// Order is a usable build order — trainer first, then its gates.
+pub fn unit_tech_chain(kind: UnitKind) -> Vec<BuildingKind> {
+    fn add(chain: &mut Vec<BuildingKind>, b: BuildingKind) {
+        if !chain.contains(&b) {
+            chain.push(b);
+        }
+    }
+    let mut chain: Vec<BuildingKind> = Vec::new();
+    // The LOWEST rung that trains it is the one to name: `building_satisfies`
+    // makes a requirement of "TownHall" mean "TownHall or better", so naming
+    // the base rung covers the Keep and Castle that also train Workers
+    // without listing three alternatives a reader would have to know are ORs.
+    if let Some(trainer) = ALL_BUILDING_KINDS
+        .iter()
+        .copied()
+        .find(|b| trainable(*b).contains(&kind))
+    {
+        add(&mut chain, trainer);
+    }
+    for req in unit_requires(kind) {
+        add(&mut chain, *req);
+    }
+    // Breadth-first over what those in turn need, so the list stays in build
+    // order and a cycle (there are none, but the data is editable) terminates.
+    let mut i = 0;
+    while i < chain.len() {
+        for req in building_requires(chain[i]) {
+            add(&mut chain, *req);
+        }
+        i += 1;
+    }
+    chain
+}
+
+/// The team tech tier a unit needs — the highest rung anything in its chain
+/// sits on. Non-hall buildings are all tier 1, so this reduces to "how far up
+/// the hall ladder must I be", which is exactly what `tech_tier_for` measures.
+///
+/// Honest rather than flattering: a Catapult is tier 1, because a Workshop
+/// needs only a Barracks and no hall upgrade at all.
+pub fn unit_tier(kind: UnitKind) -> u32 {
+    unit_tech_chain(kind)
+        .iter()
+        .map(|b| building_tier(*b))
+        .max()
+        .unwrap_or(1)
+}
+
 /// Does `team` satisfy `reqs` right now? Pass an iterator over the team's
 /// COMPLETED building kinds.
 ///
@@ -1214,9 +1276,26 @@ pub struct CatalogUnit {
     pub hp: f32,
     pub damage: f32,
     pub range: f32,
+    /// Seconds between attacks. Exported because every balance claim in the
+    /// descriptions is stated in dps, and `damage` alone cannot produce one.
+    pub attack_cooldown: f32,
     pub speed: f32,
     pub train_time: f32,
+    /// Which `TargetClass` this kind IS — the class a `priority` command
+    /// names, and the class the `vs_*` multipliers below are keyed against.
+    /// Load-bearing for the counter triangle: a Knight and a Raider are both
+    /// `Cavalry`, so a Spearman's `vs_cavalry_mult` lands on both, and no
+    /// amount of reading the two unit entries side by side would reveal that
+    /// without this field.
+    pub class: Option<&'static str>,
+    /// Damage multipliers, all three of them. Only `vs_building_mult` used to
+    /// be here, which made tools/COMMANDER_BRIEF.md's "check catalog `vs_*`
+    /// multipliers" an instruction that could not be followed: the anti-siege
+    /// and anti-cavalry legs of the counter triangle existed in `combat.rs`
+    /// and in English inside `description`, and nowhere a machine could read.
     pub vs_building_mult: f32,
+    pub vs_siege_mult: f32,
+    pub vs_cavalry_mult: f32,
     /// Airborne: ignores terrain and buildings when moving, and can only be
     /// attacked by things whose `can_hit_air` is true.
     pub flying: bool,
@@ -1224,8 +1303,16 @@ pub struct CatalogUnit {
     pub can_hit_ground: bool,
     /// Sight radius — how far this kind lifts fog of war for its team.
     pub vision: f32,
+    /// The lowest rung that trains this kind. Higher rungs of the same ladder
+    /// train it too — `tier`/`upgraded_from` on the building say so.
     pub trained_at: &'static str,
+    /// **Everything that must be standing to train this**, transitively,
+    /// including `trained_at` itself and anything that gates it. In build
+    /// order. See `unit_tech_chain`: this used to list only the extras beyond
+    /// the trainer, so a Footman claimed to require nothing at all.
     pub requires: Vec<&'static str>,
+    /// Team tech tier this unit needs — the highest `tier` in `requires`.
+    pub tier: u32,
     pub description: &'static str,
 }
 
@@ -1270,6 +1357,16 @@ pub struct CatalogBuilding {
     pub built_by: &'static str,
     pub requires: Vec<&'static str>,
     pub trains: Vec<&'static str>,
+    /// Research ladders this building can start (`research[].id`). The inverse
+    /// of `research[].researched_at`, which was the only direction exported —
+    /// so "what is a Blacksmith FOR" needed the reader to scan a different
+    /// array on the off chance.
+    pub researches: Vec<&'static str>,
+    /// Items this building sells (`items[].id`), in shelf order. The inverse
+    /// of `items[].sold_at`, and the catalog half of the live snapshot's
+    /// `buildings[].sells` — which carries the same ids with this team's tier
+    /// already applied.
+    pub sells: Vec<&'static str>,
     /// Rung on this building's upgrade ladder: 1 for everything that is not
     /// upgraded from something else. A requirement naming a tier is satisfied
     /// by that tier OR ANY HIGHER one on the same ladder, so "requires Keep"
@@ -1307,7 +1404,18 @@ pub struct CatalogAbility {
     pub duration: f32,
     pub hits_air: bool,
     /// Human-readable unlock condition: "always", "hero level N", "tier TN".
+    /// Kept verbatim — the snapshot's `requires` uses the same text and the
+    /// HUD prints it — but it is prose, so the two fields below carry the same
+    /// predicate as numbers. Both null means "always".
     pub unlock: String,
+    /// Hero level the caster must reach, when that is the gate. Nothing else
+    /// in the catalog says how a hero levels, but this at least names the
+    /// quantity rather than burying `5` inside a sentence.
+    pub unlock_hero_level: Option<u32>,
+    /// Team tech tier required, when that is the gate — the same 1/2/3 scale
+    /// as `buildings[].tier` and `items[].tier`, so the three gating systems
+    /// are finally comparable without parsing "tier T2" out of a string.
+    pub unlock_tier: Option<u32>,
     pub description: &'static str,
 }
 
@@ -1411,15 +1519,21 @@ pub fn game_catalog() -> Catalog {
                     hp: s.hp,
                     damage: s.damage,
                     range: s.range,
+                    attack_cooldown: s.attack_cooldown,
                     speed: s.speed,
                     train_time: s.train_time,
+                    class: TargetClass::of(Some(k), false).map(|c| c.name()),
                     vs_building_mult: s.vs_building_mult,
+                    vs_siege_mult: s.vs_siege_mult,
+                    vs_cavalry_mult: s.vs_cavalry_mult,
                     flying: s.flying,
                     can_hit_air: s.can_hit_air,
                     can_hit_ground: s.can_hit_ground,
                     vision: s.vision,
                     trained_at: trainer_of(k),
-                    requires: unit_requires(k).iter().map(|b| building_name(*b)).collect(),
+                    // The FULL chain, not just the extras beyond the trainer.
+                    requires: unit_tech_chain(k).iter().map(|b| building_name(*b)).collect(),
+                    tier: unit_tier(k),
                     description: unit_description(k),
                 }
             })
@@ -1446,6 +1560,12 @@ pub fn game_catalog() -> Catalog {
                     built_by: if building_placeable(k) { "Worker" } else { "Upgrade" },
                     requires: building_requires(k).iter().map(|b| building_name(*b)).collect(),
                     trains: trainable(k).iter().map(|u| kind_name(*u)).collect(),
+                    researches: building_researches(k).iter().map(|r| r.id()).collect(),
+                    sells: if k == BuildingKind::Shop {
+                        ALL_ITEMS.iter().map(|i| item_def(*i).name).collect()
+                    } else {
+                        Vec::new()
+                    },
                     tier: building_tier(k),
                     placeable: building_placeable(k),
                     upgrades_to: upgrade_cost(k).map(|(gold, lumber, time)| CatalogUpgrade {
@@ -1476,6 +1596,14 @@ pub fn game_catalog() -> Catalog {
                 duration: a.duration,
                 hits_air: a.hits_air,
                 unlock: unlock_label(a.unlock),
+                unlock_hero_level: match a.unlock {
+                    AbilityUnlock::HeroLevel(n) => Some(n),
+                    _ => None,
+                },
+                unlock_tier: match a.unlock {
+                    AbilityUnlock::TeamTier(t) => Some(t.level()),
+                    _ => None,
+                },
                 description: a.description,
             };
             let mut out = Vec::new();
@@ -2469,9 +2597,34 @@ pub fn first_unlocked_ability(list: &[AbilityDef], ctx: UnlockCtx) -> Option<usi
     list.iter().position(|def| ability_unlocked(def, ctx))
 }
 
-/// Slot of the ability with this id (case-insensitive), unlocked or not.
+/// Loose form of a name on the wire: case, spaces, dashes and underscores are
+/// all noise, so `"town_hall"`, `"Town Hall"` and `"townhall"` are one name.
+///
+/// **This is the one name matcher.** Every player-facing name — unit kinds,
+/// building kinds, research ladders, items, abilities, target classes — is
+/// compared through here, so a commander who spells a name the way the catalog
+/// prints it is never told it does not exist. It lives in shared.rs rather
+/// than intent.rs because the catalog it folds names *of* lives here, and
+/// because `ability_index_by_id` below is the shared.rs consumer that used to
+/// have its own, stricter rule.
+pub fn normalize_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Slot of the ability with this id, unlocked or not.
+///
+/// Matched through `normalize_name`, exactly like every other name on the
+/// wire. This used to be `eq_ignore_ascii_case`, which made `"CallToArms"` and
+/// `"calltoarms"` work while `"Call to Arms"` — the spelling a person actually
+/// types — did not. The old forms are a strict subset of what normalising
+/// accepts, so nothing that parsed before stopped parsing.
 pub fn ability_index_by_id(list: &[AbilityDef], id: &str) -> Option<usize> {
-    list.iter().position(|def| def.name.eq_ignore_ascii_case(id))
+    let wanted = normalize_name(id);
+    list.iter()
+        .position(|def| normalize_name(def.name) == wanted)
 }
 
 /// Enemies inside Warcry's radius (and allies to buff) before the scripted
@@ -3356,6 +3509,33 @@ impl FogGrids {
     /// skip painting an overlay that would be entirely transparent.
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Test-only: a fully dark, fog-enabled pair, so a test in another module
+    /// can pin the mode instead of inheriting whatever `WC3_FOG` happens to
+    /// say. Deliberately `#[cfg(test)]` rather than a widened public API —
+    /// nothing outside a test may seed a team's knowledge, and the compiler
+    /// should be the thing enforcing that rather than a comment.
+    #[cfg(test)]
+    pub fn test_dark() -> Self {
+        FogGrids {
+            enabled: true,
+            human: FogGrid::dark(),
+            claude: FogGrid::dark(),
+            ..Default::default()
+        }
+    }
+
+    /// Test-only: plant a memory in `team`'s grid, exactly as `update_fog`
+    /// does when the structure is in sight, without a scout having to walk
+    /// there and back.
+    #[cfg(test)]
+    pub fn test_remember(&mut self, team: Team, record: RememberedBuilding) {
+        let grid = match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        };
+        grid.ghosts.insert(record.id, record);
     }
 
     pub fn get(&self, team: Team) -> &FogGrid {
@@ -4349,8 +4529,14 @@ impl Intent {
     }
 }
 
-/// Who spelled the intent. The compiler treats every source identically — this
-/// is recorded for the replay log, not consulted for authority.
+/// Who spelled the intent. The compiler treats every source identically when
+/// deciding whether it is *legal* — this is never consulted for authority.
+///
+/// It is consulted for one thing: which renderer gets told when an intent is
+/// refused. A bridge seat reads its errors out of the next snapshot; a human
+/// has no snapshot, so a `Ui` rejection is also raised on that team's
+/// `GameEvents` feed for the alert stack. Same verdict, same string, delivered
+/// down the channel the seat is actually reading.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum IntentSource {
@@ -6437,6 +6623,186 @@ mod tests {
         }
         assert_eq!(walked, vec!["TownHall", "Keep", "Castle"]);
         assert_eq!(paid, (320 + 480, 160 + 240));
+    }
+
+    /// The other half of "the catalog IS the tech tree": not just the hall
+    /// ladder, but **every gated kind's full requirement chain**, reconstructed
+    /// from `Catalog` and nothing else — no `unit_requires`, no `trainable`,
+    /// no prose.
+    ///
+    /// The gap this pins shut: `units[].requires` used to carry only the
+    /// requirements *beyond* owning the trainer, a caveat that lived in a Rust
+    /// doc comment. Exported that way the catalog stated `Footman: requires
+    /// []` — buildable from nothing — and `Catapult: requires []`, silently
+    /// hiding a Barracks→Workshop chain. An agent could not tell a tier-1 unit
+    /// from a tier-3 one without a join it was never told to make.
+    #[test]
+    fn the_catalog_alone_reconstructs_every_requirement_chain() {
+        let catalog = game_catalog();
+        let building = |id: &str| {
+            catalog
+                .buildings
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the catalog"))
+        };
+        let unit = |id: &str| {
+            catalog
+                .units
+                .iter()
+                .find(|u| u.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the catalog"))
+        };
+
+        // --- reconstruct, using catalog fields only -----------------------
+        // Everything a build order must contain to reach `id`: each named
+        // building, whatever IT requires, and — for an upgrade-only rung —
+        // every rung below it, walked down via `upgraded_from`.
+        let full_chain = |seeds: &[&str]| -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            let mut queue: Vec<String> = seeds.iter().map(|s| s.to_string()).collect();
+            while let Some(id) = queue.pop() {
+                if out.contains(&id) {
+                    continue;
+                }
+                let b = building(&id);
+                out.push(id);
+                queue.extend(b.requires.iter().map(|r| r.to_string()));
+                queue.extend(b.upgraded_from.map(|r| r.to_string()));
+            }
+            out.sort();
+            out
+        };
+        let chain_of = |id: &str| {
+            let u = unit(id);
+            let seeds: Vec<&str> = u.requires.to_vec();
+            full_chain(&seeds)
+        };
+        let expect = |got: Vec<String>, want: &[&str]| {
+            let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want);
+        };
+
+        // --- every gated kind, bottom to top ------------------------------
+        // A basic unit names its trainer. This is the entry that used to be
+        // an empty list.
+        expect(chain_of("Footman"), &["Barracks"]);
+        expect(chain_of("Worker"), &["TownHall"]);
+        // The Raider's Workshop gate drags in the Workshop's own Barracks
+        // gate — the two-step chain that was entirely invisible before.
+        expect(chain_of("Raider"), &["Barracks", "Workshop"]);
+        expect(chain_of("Catapult"), &["Barracks", "Workshop"]);
+        // The tier-3 pair: a Castle, which means a Keep, which means a hall.
+        expect(chain_of("Knight"), &["Barracks", "TownHall", "Keep", "Castle"]);
+        expect(
+            chain_of("GryphonRider"),
+            &["Barracks", "Workshop", "TownHall", "Keep", "Castle"],
+        );
+
+        // --- and the chains agree with the tiers --------------------------
+        // `tier` is not an independent claim a reader has to trust: it is the
+        // highest rung in the chain, and the catalog proves it against itself.
+        for u in &catalog.units {
+            let chain = chain_of(u.id);
+            let reconstructed = chain
+                .iter()
+                .map(|id| building(id).tier)
+                .max()
+                .expect("every unit has a trainer");
+            assert_eq!(
+                u.tier, reconstructed,
+                "{}: tier {} disagrees with its own requirement chain {chain:?}",
+                u.id, u.tier
+            );
+            // The chain must bottom out somewhere a worker can actually
+            // start: at least one placeable, ungated tier-1 building.
+            assert!(
+                chain
+                    .iter()
+                    .any(|id| { let b = building(id); b.placeable && b.tier == 1 && b.requires.is_empty() }),
+                "{}: nothing in {chain:?} can be built from an empty base",
+                u.id
+            );
+            // `trained_at` is in the chain, so the two fields cannot drift.
+            assert!(
+                u.requires.contains(&u.trained_at),
+                "{}: trained_at {} is missing from requires",
+                u.id,
+                u.trained_at
+            );
+        }
+        // Nothing is buildable above the top of the hall ladder.
+        assert_eq!(catalog.units.iter().map(|u| u.tier).max(), Some(3));
+        // The Catapult is honestly tier 1: a Workshop needs no hall upgrade.
+        assert_eq!(unit("Catapult").tier, 1);
+        assert_eq!(unit("Knight").tier, 3);
+
+        // --- the counter triangle, as data rather than as English ----------
+        // `class` plus the three multipliers is the whole triangle. Without
+        // `class` even an exported `vs_cavalry_mult` would be unusable: no
+        // field would say that a Knight is what it hits.
+        let cavalry: Vec<&str> = catalog
+            .units
+            .iter()
+            .filter(|u| u.class == Some("Cavalry"))
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(cavalry, vec!["Raider", "Knight"]);
+        let anti_cavalry: Vec<&str> = catalog
+            .units
+            .iter()
+            .filter(|u| u.vs_cavalry_mult > 1.0)
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(anti_cavalry, vec!["Spearman"]);
+        let anti_siege: Vec<&str> = catalog
+            .units
+            .iter()
+            .filter(|u| u.vs_siege_mult > 1.0)
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(anti_siege, vec!["Raider"]);
+        assert_eq!(unit("Catapult").class, Some("Siege"));
+        // Siege is the answer to fortification, and it says so numerically.
+        assert!(unit("Catapult").vs_building_mult > 1.0);
+        // dps is computable, which is what every description quotes.
+        assert!(catalog.units.iter().all(|u| u.attack_cooldown > 0.0));
+
+        // --- the reverse indices agree with the forward ones ---------------
+        for r in &catalog.research {
+            assert!(
+                building(r.researched_at).researches.contains(&r.id),
+                "{} is researched at {} but that building does not list it",
+                r.id,
+                r.researched_at
+            );
+        }
+        for i in &catalog.items {
+            assert!(
+                building(i.sold_at).sells.contains(&i.id),
+                "{} is sold at {} but that building does not list it",
+                i.id,
+                i.sold_at
+            );
+        }
+        // Ability gates are numbers, not sentences to parse.
+        let ult = catalog
+            .abilities
+            .iter()
+            .find(|a| a.id == "Warcry")
+            .expect("the Champion's ultimate");
+        assert_eq!(ult.unlock_hero_level, Some(5));
+        assert_eq!(ult.unlock_tier, None);
+        assert_eq!(ult.unlock, "hero level 5");
+        for a in &catalog.abilities {
+            assert_eq!(
+                a.unlock == "always",
+                a.unlock_hero_level.is_none() && a.unlock_tier.is_none(),
+                "{}: the prose and the numbers disagree about the gate",
+                a.id
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
