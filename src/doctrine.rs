@@ -37,6 +37,7 @@ use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use std::time::Duration;
 
+use crate::command::PendingOrder;
 use crate::shared::*;
 
 // ---------------------------------------------------------------------------
@@ -318,10 +319,20 @@ fn idle_instinct(
 
 /// Recall anyone who wandered (or was baited) outside their anchor radius.
 /// Retreat outranks the leash — a fleeing unit is allowed to leave.
+#[allow(clippy::type_complexity)]
 fn enforce_leash(
     mut commands: Commands,
     time: Res<Time>,
-    query: Query<(Entity, &LeashPolicy, &Transform, &Order), (With<Unit>, Without<Retreating>)>,
+    // `Without<PendingOrder>`: a unit waiting on a delayed direct order is
+    // BUSY, not adrift. Without this guard a leash would haul it home and the
+    // order the player actually gave would land on a unit that had already
+    // been dragged somewhere else — the "my orders sometimes just vanish" bug
+    // docs/TEMPO.md §4 warns about. Same idiom as `Without<Retreating>`
+    // alongside it: another claim on this unit outranks the leash.
+    query: Query<
+        (Entity, &LeashPolicy, &Transform, &Order),
+        (With<Unit>, Without<Retreating>, Without<PendingOrder>),
+    >,
 ) {
     let now = time.elapsed_secs();
     for (entity, leash, tf, order) in &query {
@@ -552,9 +563,16 @@ fn run_squad_postures(
     mut commands: Commands,
     time: Res<Time>,
     mut squad_orders: ResMut<SquadOrders>,
+    // `Without<PendingOrder>`: `re_taskable` reads a unit awaiting a delayed
+    // direct order as idle (it IS idle — its order has not arrived yet), so
+    // the squad executor would fold it back into the posture and the direct
+    // order would be clobbered before it ever landed. docs/TEMPO.md §4 calls
+    // this the single most likely source of a "my orders vanish" report. The
+    // guard also states the design: doctrine owns a unit until a player
+    // reaches past it, and reaching past it takes time.
     members: Query<
         (Entity, &SquadId, &Team, &Transform, &Order, Option<&MoveTo>),
-        (With<Unit>, Without<Retreating>),
+        (With<Unit>, Without<Retreating>, Without<PendingOrder>),
     >,
     // Read-only, so it may freely overlap `members` (defenders can themselves
     // be somebody else's threat).
@@ -788,6 +806,7 @@ fn recover_retreaters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{CommandLatency, CommandNodes};
 
     /// A world with just the doctrine resources and no scripted AI on either
     /// seat, so `machine_driven` is false for `Team::Human` — i.e. the human is
@@ -1082,5 +1101,129 @@ mod tests {
             Order::AttackMove(p) => assert!(xz_dist(p, objective) <= SQUAD_ARRIVE),
             other => panic!("a human-set posture stopped executing after handback: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Chain of Command (docs/TEMPO.md §3) — the doctrine side of the contract
+    // -----------------------------------------------------------------------
+
+    /// docs/TEMPO.md §4's named integration hazard, as a test. A unit waiting
+    /// on a delayed direct order sits on `Order::Idle` with no `MoveTo`, which
+    /// is *exactly* what `re_taskable` calls available — so without the
+    /// `Without<PendingOrder>` guard the squad executor folds it back into the
+    /// posture and the player's order is clobbered before it ever arrives.
+    /// This is the "my orders sometimes just vanish" bug, pinned.
+    #[test]
+    fn a_squad_does_not_clobber_an_order_still_in_transit() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+
+        let objective = Vec3::new(30.0, 0.0, 30.0);
+        let waiting = spawn_footman(&mut app, Team::Human, Vec3::new(-60.0, 0.0, -60.0));
+        let free = spawn_footman(&mut app, Team::Human, Vec3::new(-58.0, 0.0, -60.0));
+        for unit in [waiting, free] {
+            app.world_mut().entity_mut(unit).insert(SquadId(1));
+        }
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+        // A direct order the player gave, still travelling.
+        app.world_mut().entity_mut(waiting).insert(PendingOrder {
+            order: Order::Move(Vec3::new(-70.0, 0.0, 0.0)),
+            provenance: Provenance::instinct("idle", 97.0),
+            ready_at: 99.0,
+            issued_at: 97.0,
+        });
+
+        app.update();
+
+        assert!(
+            matches!(order_of(&app, waiting), Order::Idle),
+            "the squad re-tasked a unit whose direct order had not arrived yet — \
+             the order would have been silently lost"
+        );
+        assert!(
+            app.world().entity(waiting).get::<PendingOrder>().is_some(),
+            "the in-transit order must survive a posture tick"
+        );
+        // The guard is narrow: a squadmate with nothing in transit is still
+        // commanded exactly as before.
+        assert!(
+            matches!(order_of(&app, free), Order::AttackMove(_)),
+            "the guard leaked and stopped the posture from executing at all"
+        );
+    }
+
+    /// Same hazard, the leash half. A leashed unit awaiting a direct order out
+    /// of its anchor radius must not be hauled home first — the recall would
+    /// win the race against the order that supersedes it.
+    #[test]
+    fn a_leash_does_not_recall_a_unit_with_an_order_in_transit() {
+        let mut app = world();
+        app.add_systems(Update, enforce_leash);
+
+        let anchor = Vec3::new(-60.0, 0.0, -60.0);
+        let far = Vec3::new(20.0, 0.0, 20.0);
+        let waiting = spawn_footman(&mut app, Team::Human, far);
+        let stray = spawn_footman(&mut app, Team::Human, far);
+        for unit in [waiting, stray] {
+            app.world_mut()
+                .entity_mut(unit)
+                .insert(LeashPolicy { anchor, radius: 10.0 });
+        }
+        app.world_mut().entity_mut(waiting).insert(PendingOrder {
+            order: Order::AttackMove(far),
+            provenance: Provenance::instinct("idle", 97.0),
+            ready_at: 99.0,
+            issued_at: 97.0,
+        });
+
+        app.update();
+
+        assert!(
+            matches!(order_of(&app, waiting), Order::Idle),
+            "the leash recalled a unit whose direct order was still travelling"
+        );
+        assert!(
+            matches!(order_of(&app, stray), Order::Move(_)),
+            "the guard leaked and the leash stopped working"
+        );
+    }
+
+    /// **Standing orders are local.** The doctrine executor is the fast path,
+    /// and it stays instant for every seat no matter how far from a command
+    /// node the unit is standing and no matter what the latency curve says.
+    /// That asymmetry IS the mechanism (docs/TEMPO.md §3), so it is worth a
+    /// test that fails loudly if anyone ever routes doctrine through the
+    /// issuer "for consistency".
+    #[test]
+    fn doctrine_dispatches_instantly_however_far_from_home_it_reaches() {
+        let mut app = world();
+        // Latency at maximum everywhere: on, and this team owns no command
+        // nodes at all.
+        app.insert_resource(CommandLatency { on: true, ..Default::default() })
+            .insert_resource(CommandNodes { nodes: Vec::new(), ready: true })
+            .add_systems(Update, run_squad_postures);
+
+        let objective = Vec3::new(30.0, 0.0, 30.0);
+        // Standing in the far corner, as disconnected as a unit can be.
+        let member = spawn_footman(&mut app, Team::Human, Vec3::new(-95.0, 0.0, -95.0));
+        app.world_mut().entity_mut(member).insert(SquadId(1));
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+
+        app.update();
+
+        assert!(
+            app.world().entity(member).get::<PendingOrder>().is_none(),
+            "doctrine's own order went into transit — standing orders must be local"
+        );
+        assert!(
+            matches!(order_of(&app, member), Order::AttackMove(_)),
+            "the engine's standing order did not dispatch in the same frame"
+        );
     }
 }

@@ -16,6 +16,7 @@
 //! the team being thought for. All difficulty knobs live in the const block
 //! below.
 
+use crate::command::{CommandLink, OrderIssuer};
 use crate::shared::*;
 // The map's published geography. Read-only, and the same three facts a bridge
 // commander is handed in every snapshot (`map.chokepoints`) — the scripted AI
@@ -804,6 +805,12 @@ fn ai_think(
     units: UnitQuery,
     mut buildings: BuildingQuery,
     nodes: NodeQuery,
+    // docs/TEMPO.md §3: THE SCRIPTED AI PAYS LATENCY TOO. It is the third
+    // seat, and "if autopilot is exempt it becomes a cheat and C1 is violated
+    // at the third seat" is the spike's own wording. ai.rs does not go through
+    // the intent compiler (a known, documented asymmetry — docs/INTENT.md), so
+    // it reaches the same mechanism through the same helper the compiler uses.
+    link: CommandLink,
 ) {
     if game_over.0.is_some() {
         return;
@@ -833,6 +840,7 @@ fn ai_think(
             fog.get(team),
             &mut commands,
             &mut events,
+            &mut link.issuer(now),
             &team_research,
             &units,
             &mut buildings,
@@ -856,6 +864,11 @@ fn think(
     fog: &FogGrid,
     commands: &mut Commands,
     events: &mut AiEvents,
+    // Every unit order below is issued through this, exactly as a human's
+    // right-click and a bridge commander's `move` are. See the `Order::` sites
+    // in this function: each one names the unit's own position, so the script
+    // pays the same distance-to-command-node cost anybody else does.
+    issuer: &mut OrderIssuer,
     team_research: &TeamResearch,
     units: &UnitQuery,
     buildings: &mut BuildingQuery,
@@ -1115,9 +1128,14 @@ fn think(
         if w.tag != Tag::Move {
             let a = (w.entity.index() % 8) as f32 * std::f32::consts::TAU / 8.0;
             let safe = base + Vec3::new(a.cos(), 0.0, a.sin()) * 6.0;
-            commands
-                .entity(w.entity)
-                .try_insert((Order::Move(safe), script("flee", now)));
+            issuer.issue(
+                commands,
+                me,
+                w.pos,
+                w.entity,
+                Order::Move(safe),
+                script("flee", now),
+            );
         }
     }
 
@@ -1326,9 +1344,16 @@ fn think(
                 };
                 if let Some(site) = site {
                     if let Some(builder) = pick_builder(&workers, &fleeing, site) {
-                        commands
-                            .entity(builder)
-                            .try_insert((Order::Build { kind, pos: site }, script("build", now)));
+                        // Exempt from link latency, exactly as a human's or a
+                        // commander's `build` is — same row of command.rs's
+                        // verb table, same reason (the worker walks there
+                        // anyway). It still carries its reason.
+                        issuer.issue_instant(
+                            commands,
+                            builder,
+                            Order::Build { kind, pos: site },
+                            script("build", now),
+                        );
                         brain.pending_build = Some(builder);
                         busy_worker = Some(builder);
                         // economy.rs pays at placement; assume it lands.
@@ -1591,9 +1616,14 @@ fn think(
         if w.carrying {
             // Stranded with a full load (e.g. after a failed drop-off):
             // deliver it; economy.rs resumes the remembered node afterwards.
-            commands
-                .entity(w.entity)
-                .try_insert((Order::ReturnResources, script("haul", now)));
+            issuer.issue(
+                commands,
+                me,
+                w.pos,
+                w.entity,
+                Order::ReturnResources,
+                script("haul", now),
+            );
             continue;
         }
         brain.harvest_counter = brain.harvest_counter.wrapping_add(1);
@@ -1606,9 +1636,14 @@ fn think(
         let node = nearest_node(nodes, w.pos, first)
             .or_else(|| nearest_node(nodes, w.pos, other_resource(first)));
         if let Some(node) = node {
-            commands
-                .entity(w.entity)
-                .try_insert((Order::Harvest(node), script("harvest", now)));
+            issuer.issue(
+                commands,
+                me,
+                w.pos,
+                w.entity,
+                Order::Harvest(node),
+                script("harvest", now),
+            );
         }
     }
 
@@ -1622,7 +1657,7 @@ fn think(
     let mut shift_skip: Vec<Entity> = fleeing.clone();
     shift_skip.extend(busy_worker);
     shift_skip.extend(brain.pending_build);
-    rebalance_mines(&mines, &workers, &shift_skip, nodes, commands, now);
+    rebalance_mines(me, &mines, &workers, &shift_skip, nodes, commands, now, issuer);
 
     // --- training ------------------------------------------------------------
     let mut worker_count = workers.len();
@@ -1957,7 +1992,12 @@ fn think(
             .filter(|e| e.distance(*pos) <= slam_radius)
             .count();
         if nearby >= SLAM_MIN_TARGETS {
-            events.casts.write(CastAbility::new(hero.entity));
+            // Through the issuer like everything else the script orders. A
+            // hero IS a command node, so this computes zero and fires in the
+            // same frame it always did — but routing it here means the day the
+            // script learns to hand-fire a Sorcerer, the third seat pays for
+            // that reach automatically instead of quietly not paying.
+            issuer.issue_cast(commands, &mut events.casts, me, hero.pos, hero.entity, None);
         }
     }
 
@@ -1966,9 +2006,14 @@ fn think(
     if let Some(threat_pos) = threat {
         // Defense overrides everything, wave or not.
         for u in &army {
-            commands
-                .entity(u.entity)
-                .try_insert((Order::AttackMove(threat_pos), script("defend", now)));
+            issuer.issue(
+                commands,
+                me,
+                u.pos,
+                u.entity,
+                Order::AttackMove(threat_pos),
+                script("defend", now),
+            );
         }
         return;
     }
@@ -1982,18 +2027,28 @@ fn think(
             brain.wave_target = wave_objective(me, fog, nav, &enemy_buildings, centroid);
             brain.wave_started = now;
             for u in &army {
-                commands
-                    .entity(u.entity)
-                    .try_insert((Order::AttackMove(brain.wave_target), script("wave", now)));
+                issuer.issue(
+                    commands,
+                    me,
+                    u.pos,
+                    u.entity,
+                    Order::AttackMove(brain.wave_target),
+                    script("wave", now),
+                );
             }
         } else {
             // Stragglers rejoin the push.
             let target = brain.wave_target;
             for u in &army {
                 if u.free() {
-                    commands
-                        .entity(u.entity)
-                        .try_insert((Order::AttackMove(target), script("wave", now)));
+                    issuer.issue(
+                        commands,
+                        me,
+                        u.pos,
+                        u.entity,
+                        Order::AttackMove(target),
+                        script("wave", now),
+                    );
                 }
             }
         }
@@ -2004,17 +2059,27 @@ fn think(
         brain.next_wave_size = (brain.next_wave_size + WAVE_SIZE_STEP).min(WAVE_SIZE_CAP);
         let target = brain.wave_target;
         for u in &army {
-            commands
-                .entity(u.entity)
-                .try_insert((Order::AttackMove(target), script("wave", now)));
+            issuer.issue(
+                commands,
+                me,
+                u.pos,
+                u.entity,
+                Order::AttackMove(target),
+                script("wave", now),
+            );
         }
     } else {
         // Gather at the rally point while the army builds up.
         for u in &army {
             if u.free() && u.pos.distance(rally) > RALLY_ARRIVE_DIST {
-                commands
-                    .entity(u.entity)
-                    .try_insert((Order::AttackMove(rally), script("rally", now)));
+                issuer.issue(
+                    commands,
+                    me,
+                    u.pos,
+                    u.entity,
+                    Order::AttackMove(rally),
+                    script("rally", now),
+                );
             }
         }
     }
@@ -2433,13 +2498,16 @@ fn post_of(posts: &[&MineInfo], worker: &UnitInfo, nodes: &NodeQuery) -> Option<
 
 /// Even out the crews across every mine we can actually deliver from, a couple
 /// of workers per tick, and only while the gap is worth walking for.
+#[allow(clippy::too_many_arguments)]
 fn rebalance_mines(
+    me: Team,
     mines: &[MineInfo],
     workers: &[UnitInfo],
     skip: &[Entity],
     nodes: &NodeQuery,
     commands: &mut Commands,
     now: f32,
+    issuer: &mut OrderIssuer,
 ) {
     // A mine with no finished hall near it is not a posting: sending workers
     // there would just make them haul their load back to the old base.
@@ -2488,10 +2556,15 @@ fn rebalance_mines(
             .partial_cmp(&xz_dist(*b, target.pos))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    for (worker, _) in pool.into_iter().take(quota) {
-        commands
-            .entity(worker)
-            .try_insert((Order::Harvest(target.entity), script("harvest", now)));
+    for (worker, pos) in pool.into_iter().take(quota) {
+        issuer.issue(
+            commands,
+            me,
+            pos,
+            worker,
+            Order::Harvest(target.entity),
+            script("harvest", now),
+        );
     }
 }
 
@@ -2643,6 +2716,7 @@ fn pick_site(nav: &NavGrid, anchor: Vec3, footprint: f32) -> Option<Vec3> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{CommandLatency, CommandNodes, PendingOrder, DEFAULT_HALL_RADIUS};
     use crate::terrain::{ChokePoint, MapKind};
 
     // -- Castle trigger (wc3clone-0m8) ------------------------------------
@@ -2880,6 +2954,15 @@ mod tests {
             .add_event::<StartResearch>()
             .add_event::<BuyItem>()
             .add_event::<UseItem>()
+            // Chain of Command, off: this bead is about WHAT the script decides,
+            // not how long the decision takes to arrive. With latency on, the
+            // Tower order would sit in `PendingOrder` and the assertion below
+            // would be testing the wrong module.
+            .insert_resource(CommandLatency { on: false, ..Default::default() })
+            .insert_resource(CommandNodes {
+                nodes: vec![(Team::Claude, Team::Claude.base_pos(), DEFAULT_HALL_RADIUS)],
+                ready: true,
+            })
             .add_systems(Update, ai_think);
         // Claude only, so the assertions below can name one brain.
         app.insert_resource(AiControlled { human: false, claude: true });
@@ -2949,14 +3032,6 @@ mod tests {
         // through to the Spearman rule, which is what the control asserts.
         app.world_mut().resource_mut::<AiState>().claude.army_counter = 3;
         barracks
-    }
-
-    /// One think tick.
-    fn think_once(app: &mut App) {
-        app.world_mut()
-            .resource_mut::<Time>()
-            .advance_by(std::time::Duration::from_secs_f32(THINK_INTERVAL * 1.5));
-        app.update();
     }
 
     fn queued(app: &mut App, building: Entity) -> Vec<UnitKind> {
@@ -3340,5 +3415,112 @@ mod tests {
                 ));
             }
         }
+    }
+
+    // -- Chain of Command, third seat (docs/TEMPO.md §3) -------------------
+
+    /// A world with just enough around it for one scripted think tick, and a
+    /// Claude team whose only command node is its own hall.
+    fn ai_world(latency_on: bool) -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<AiState>()
+            .init_resource::<GameOver>()
+            .insert_resource(AiControlled { human: false, claude: true })
+            .init_resource::<Economies>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<NavGrid>()
+            .init_resource::<FogGrids>()
+            .init_resource::<TeamResearch>()
+            .add_event::<CastAbility>()
+            .add_event::<UpgradeBuilding>()
+            .add_event::<StartResearch>()
+            .add_event::<BuyItem>()
+            .add_event::<UseItem>()
+            .insert_resource(CommandLatency { on: latency_on, ..Default::default() })
+            .insert_resource(CommandNodes {
+                nodes: vec![(Team::Claude, Team::Claude.base_pos(), DEFAULT_HALL_RADIUS)],
+                ready: true,
+            })
+            .add_systems(Update, ai_think);
+        app
+    }
+
+    /// One lone soldier, standing in the enemy's half of the map — as far from
+    /// its own chain of command as the map allows.
+    fn spawn_far_soldier(app: &mut App) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Claude,
+                Transform::from_translation(Team::Human.base_pos()),
+                Order::Idle,
+                // `UnitQuery` requires it — a unit with no `Health` is
+                // invisible to the scripted commander entirely.
+                Health::new(100.0),
+            ))
+            .id()
+    }
+
+    fn think_once(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(THINK_INTERVAL + 0.05));
+        app.update();
+    }
+
+    /// **All three seats pay.** docs/TEMPO.md §3 requires it in as many words —
+    /// "the scripted AI pays latency too, or autopilot becomes a cheat and C1
+    /// is violated at the third seat". `ai.rs` does not speak through the
+    /// intent compiler, so this is the test that keeps it honest: an order the
+    /// script gives a unit standing on the far side of the map is held in
+    /// transit exactly like a human's or a commander's would be.
+    #[test]
+    fn the_scripted_ai_pays_latency_like_everybody_else() {
+        let mut app = ai_world(true);
+        let soldier = spawn_far_soldier(&mut app);
+
+        think_once(&mut app);
+
+        let pending = app
+            .world()
+            .entity(soldier)
+            .get::<PendingOrder>()
+            .unwrap_or_else(|| {
+                panic!("the scripted AI's order landed instantly — autopilot is cheating")
+            });
+        assert!(
+            pending.link() > 0.0,
+            "the AI was charged a zero link from the wrong side of the map"
+        );
+        // And, like anyone else's, the order it was already carrying is
+        // undisturbed until the new one arrives.
+        assert!(
+            matches!(app.world().entity(soldier).get::<Order>(), Some(Order::Idle)),
+            "an in-transit order must not change what the unit is doing yet"
+        );
+    }
+
+    /// The off-flag identity at the third seat: with `WC3_COMMAND_LATENCY`
+    /// unset the scripted AI writes `Order`s exactly where it always did, and
+    /// no `PendingOrder` can exist anywhere.
+    #[test]
+    fn the_scripted_ai_is_unchanged_with_the_flag_off() {
+        let mut app = ai_world(false);
+        let soldier = spawn_far_soldier(&mut app);
+
+        think_once(&mut app);
+
+        assert!(
+            app.world().entity(soldier).get::<PendingOrder>().is_none(),
+            "the feature is off; nothing may be in transit"
+        );
+        assert!(
+            matches!(
+                app.world().entity(soldier).get::<Order>(),
+                Some(Order::AttackMove(_))
+            ),
+            "with latency off the script's order must land in the same frame it always did"
+        );
     }
 }
