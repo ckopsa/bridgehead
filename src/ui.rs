@@ -3,8 +3,14 @@
 //! Owns: `Selected` marker, selection rings, right-click context orders,
 //! building placement ghost, command hotkeys/buttons, control groups, and the
 //! bevy_ui HUD: a top resource bar plus a classic WC3-style bottom console
-//! (minimap | selection panel | command card), the drag rectangle and the
-//! game-over banner.
+//! (minimap | selection panel | command card), the drag rectangle, the
+//! game-over banner, and the top-right alert stack.
+//!
+//! The alert stack renders `shared::GameEvents` — the very buffer bridge.rs
+//! serializes for an external commander, filtered to `Team::Human` the same way
+//! the bridge filters to its seat. One producer, two renderers: whatever the
+//! machine is told about the match, the player is told too. Space (or a click
+//! on a row) sends the camera to where the news came from.
 //!
 //! All world picking is analytic: the cursor is projected onto the Y=0 plane
 //! with `shared::cursor_to_ground` and distance-tested in XZ against entity
@@ -19,7 +25,7 @@
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, SystemCursorIcon};
 use bevy::winit::cursor::CursorIcon;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::shared::*;
 
@@ -76,6 +82,33 @@ const MINIMAP_BG: Color = Color::srgb(0.06, 0.10, 0.07);
 /// two never read as the same thing.
 const BOUNTY_DOT: Color = Color::srgb(1.0, 0.93, 0.55);
 
+/// Alert stack: how many notifications are on screen at once. Small on purpose
+/// — the point is to catch an eye, and a wall of text catches nothing.
+const NOTIF_SLOTS: usize = 6;
+const NOTIF_W: f32 = 322.0;
+/// Minimum row height; a long message wraps and grows past it.
+const NOTIF_ROW_H: f32 = 24.0;
+const NOTIF_GAP: f32 = 4.0;
+/// Real seconds a notification stays on screen, and how much of that tail it
+/// spends fading. Real, not game, time: `WC3_SPEED` accelerates the war, not
+/// the eye reading about it.
+const NOTIF_LIFETIME: f32 = 9.0;
+const NOTIF_FADE: f32 = 2.5;
+const NOTIF_FONT: f32 = 13.0;
+/// Cap on how much of a narrow window the stack may take. A tiling WM can hand
+/// the game a window slimmer than `NOTIF_W`, and a fixed-width stack pinned to
+/// the right edge then runs off the left one.
+const NOTIF_MAX_FRAC: f32 = 0.9;
+/// Height budgeted per row when hit-testing (see `notif_rect`). A row is one
+/// line of text most of the time, but a long message in a narrow window wraps,
+/// and no analytic guess can know which. Two lines' worth means the stack
+/// occasionally swallows a click just under it — much better than leaking one
+/// through as a stray move order on the battlefield behind.
+const NOTIF_ROW_HIT_H: f32 = NOTIF_ROW_H + NOTIF_FONT + NOTIF_GAP;
+/// Jump the camera to the newest alert, then the one before it, and so on.
+/// Space is free: letters are command hotkeys, arrows pan, `.` cycles workers.
+const NOTIF_FOCUS_KEY: KeyCode = KeyCode::Space;
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -85,6 +118,7 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiState>()
+            .init_resource::<Notifications>()
             .add_systems(Startup, (setup_ui, setup_hover).chain())
             .add_systems(
                 Update,
@@ -93,6 +127,10 @@ impl Plugin for UiPlugin {
                     surrender_hotkey,
                     command_input,
                     panel_clicks,
+                    // Before `minimap_input`: both write `CameraFocus` and
+                    // terrain.rs honours the last one, so a live minimap drag
+                    // outranks a Space press from earlier in the frame.
+                    notification_input,
                     control_groups,
                     minimap_input,
                     left_mouse,
@@ -103,6 +141,7 @@ impl Plugin for UiPlugin {
                     sync_selection_rings,
                     update_minimap,
                     update_minimap_bounties,
+                    update_notifications,
                     update_hud,
                 )
                     .chain(),
@@ -141,6 +180,10 @@ struct UiState {
     card_actions: Vec<CmdAction>,
     /// Number of live queue tiles (refreshed by `update_hud`).
     queue_len: usize,
+    /// Number of visible alert rows (refreshed by `update_notifications`), so
+    /// `cursor_over_hud` can tell a click on a notification from a world click
+    /// without walking the UI tree.
+    notif_rows: usize,
 }
 
 #[derive(Resource)]
@@ -173,6 +216,21 @@ struct Ghost;
 /// The rubber-band selection rectangle UI node.
 #[derive(Component)]
 struct DragRect;
+
+/// One pooled alert row (index 0 = topmost = newest) and the text inside it.
+/// Deliberately *not* `El`/`Slot`: those exist so `update_hud` can hold all of
+/// its mutable `Node`/`Text` access in one query, and the alert stack is driven
+/// by a different clock from different data. Its own markers keep the two
+/// systems from ever fighting over the same node.
+#[derive(Component)]
+struct NotifRow(usize);
+
+#[derive(Component)]
+struct NotifText(usize);
+
+/// The "[Space] focus" footer under the stack; hidden when the stack is empty.
+#[derive(Component)]
+struct NotifHint;
 
 /// The single world-space ring shown under whatever the cursor would pick.
 #[derive(Component)]
@@ -953,9 +1011,41 @@ fn placement_valid(nav: &NavGrid, econ: &Economy, kind: BuildingKind, pos: Vec3)
     nav.rect_is_free(pos, stats.size) && econ.can_afford(stats.cost_gold, stats.cost_lumber)
 }
 
-/// Cursor sitting on top of a HUD panel? Then it isn't a world click.
-fn cursor_over_hud(cursor: Vec2, window: &Window) -> bool {
-    cursor.y < TOP_BAR_H || cursor.y > window.height() - CONSOLE_H
+/// Cursor sitting on top of a HUD panel? Then it isn't a world click. The bar
+/// and the console are fixed strips; the alert stack floats, so it only counts
+/// while it actually has rows in it.
+fn cursor_over_hud(cursor: Vec2, window: &Window, ui: &UiState) -> bool {
+    if cursor.y < TOP_BAR_H || cursor.y > window.height() - CONSOLE_H {
+        return true;
+    }
+    notif_rect(window, ui.notif_rows).is_some_and(|r| r.contains(cursor))
+}
+
+/// Screen-space rectangle of the alert stack, or `None` when it is empty.
+/// Analytic like `minimap_rect`: the stack is pinned to the top-right corner
+/// under the resource bar, so its extent follows from the row count. Width
+/// mirrors `notif_width` and height is deliberately generous — see
+/// `NOTIF_ROW_HIT_H`.
+fn notif_rect(window: &Window, rows: usize) -> Option<Rect> {
+    if rows == 0 {
+        return None;
+    }
+    let width = notif_width(window);
+    let top = TOP_BAR_H + PAD;
+    let left = (window.width() - PAD - width).max(0.0);
+    Some(Rect::new(
+        left,
+        top,
+        left + width,
+        top + rows as f32 * NOTIF_ROW_HIT_H,
+    ))
+}
+
+/// How wide the alert stack actually renders: `NOTIF_W`, unless the window is
+/// too narrow to give it that much. Must agree with the `max_width` the stack
+/// node carries, or the hit rect and the pixels drift apart.
+fn notif_width(window: &Window) -> f32 {
+    NOTIF_W.min(window.width() * NOTIF_MAX_FRAC)
 }
 
 /// Screen-space rectangle of the minimap. The console is a fixed-height strip
@@ -1232,6 +1322,76 @@ fn setup_ui(
                 26.0,
                 Color::srgb(0.85, 0.85, 0.9),
                 Slot::BannerSub,
+            ));
+        });
+
+    spawn_notifications(&mut commands);
+}
+
+/// The alert stack: a fixed pool of rows in the top-right corner, hidden until
+/// something happens. Pooled and mutated in place like every other refreshed
+/// node in this file — nothing here is ever spawned or despawned mid-match.
+///
+/// Top-right is the only large piece of screen the HUD does not already own:
+/// the resource bar is a thin strip above it, the console and minimap are at
+/// the bottom. It sits under the game-over banner's `ZIndex(10)` so a finished
+/// match is never obscured by news about it.
+fn spawn_notifications(commands: &mut Commands) {
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(PAD),
+            top: Val::Px(TOP_BAR_H + PAD),
+            width: Val::Px(NOTIF_W),
+            // A tiling window manager will happily hand this game a window
+            // narrower than the stack; without the cap the rows run off the
+            // left edge and the messages lose their first few words.
+            max_width: Val::Percent(NOTIF_MAX_FRAC * 100.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::FlexEnd,
+            row_gap: Val::Px(NOTIF_GAP),
+            ..default()
+        })
+        .with_children(|stack| {
+            for i in 0..NOTIF_SLOTS {
+                stack
+                    .spawn((
+                        Button,
+                        Node {
+                            width: Val::Percent(100.0),
+                            min_height: Val::Px(NOTIF_ROW_H),
+                            align_items: AlignItems::Center,
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                            // A severity-coloured spine down the left edge: the
+                            // part you read from the corner of your eye.
+                            border: UiRect::left(Val::Px(3.0)),
+                            display: Display::None,
+                            ..default()
+                        },
+                        BackgroundColor(PANEL_BG),
+                        BorderColor(EDGE),
+                        NotifRow(i),
+                    ))
+                    .with_children(|row| {
+                        row.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: NOTIF_FONT,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                            NotifText(i),
+                        ));
+                    });
+            }
+            stack.spawn((
+                Text::new(""),
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.55, 0.60, 0.70)),
+                NotifHint,
             ));
         });
 }
@@ -2174,7 +2334,7 @@ fn left_mouse(
     // ---- press ----------------------------------------------------------
     if buttons.just_pressed(MouseButton::Left) {
         if let Some(cursor) = cursor {
-            if !cursor_over_hud(cursor, window) {
+            if !cursor_over_hud(cursor, window, &ui) {
                 let ground = cursor_to_ground(camera, cam_tf, cursor);
 
                 // Placement confirm.
@@ -2327,7 +2487,7 @@ fn left_mouse(
         }
 
         // Plain click: closest own unit, else own building, else clear.
-        if cursor_over_hud(cursor, window) {
+        if cursor_over_hud(cursor, window, &ui) {
             return;
         }
         let Some(ground) = cursor_to_ground(camera, cam_tf, cursor) else {
@@ -2404,7 +2564,7 @@ fn right_mouse(
         return;
     };
     // Console clicks belong to the console (minimap_input handles them).
-    if cursor_over_hud(cursor, window) {
+    if cursor_over_hud(cursor, window, &ui) {
         return;
     }
 
@@ -3580,7 +3740,7 @@ fn hover_feedback(
     let pickable = game_over.0.is_none() && state.placement.is_none() && !state.dragging;
     if pickable {
         if let (Some(cursor), Ok((cam, cam_tf))) = (window.cursor_position(), camera.single()) {
-            if !cursor_over_hud(cursor, window) {
+            if !cursor_over_hud(cursor, window, &state) {
                 if let Some(ground) = cursor_to_ground(cam, cam_tf, cursor) {
                     // Closest unit first (units win ties against buildings),
                     // then buildings, then resource nodes.
@@ -3684,6 +3844,211 @@ fn surrender_hotkey(
         _ => {
             info!("Press F12 again within 3 seconds to surrender");
             *armed_at = Some(now);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alert stack: the human's half of the shared event feed
+// ---------------------------------------------------------------------------
+//
+// An external commander reads `shared::GameEvents` out of `bridge/<seat>/
+// state.json` and cannot miss a line of it. Before this existed, the human
+// looked at the map and missed whatever wasn't on screen — the same match, two
+// very different amounts of knowledge, and the difference had nothing to do
+// with skill.
+//
+// So this renders the identical buffer, filtered to `Team::Human` exactly the
+// way the bridge filters to its seat's team. Not a similar feed built from
+// similar queries: the same `GameEvent`s, in the same order, with the same
+// text. If the diff ever learns a new event, both sides learn it in the same
+// commit. Nothing here produces — production lives in shared.rs.
+//
+// The renderers differ where the *readers* differ, and only there. A file
+// reader gets forty lines of history and all the time in the world; a human
+// gets six lines, colour-coded, that fade after nine seconds, and one key to
+// send the camera where the news came from.
+
+#[derive(Resource, Default)]
+struct Notifications {
+    /// Highest `GameEvent::seq` already pulled off the shared feed. Monotonic,
+    /// so a frame that misses nothing and a frame that misses forty events are
+    /// handled by the same line of code.
+    seen: u64,
+    /// Newest first, so index 0 is the top row and the first thing Space finds.
+    live: VecDeque<Notice>,
+    /// Where the next Space press starts looking. Reset to the top whenever
+    /// fresh news arrives — the newest alert is almost always the one you meant.
+    focus_cursor: usize,
+}
+
+/// One alert on screen: a `GameEvent` plus the wall-clock moment it appeared.
+struct Notice {
+    message: String,
+    severity: EventSeverity,
+    pos: Option<Vec3>,
+    /// `Time<Real>` seconds. Real time on purpose: at `WC3_SPEED=8` a
+    /// game-time lifetime would blink out before it could be read.
+    born: f32,
+}
+
+fn severity_color(severity: EventSeverity) -> Color {
+    match severity {
+        // The same three colours the rest of the HUD already means things by:
+        // doctrine blue, resource gold, damage red.
+        EventSeverity::Info => Color::srgb(0.62, 0.80, 1.0),
+        EventSeverity::Warning => Color::srgb(1.0, 0.86, 0.35),
+        EventSeverity::Critical => Color::srgb(1.0, 0.42, 0.36),
+    }
+}
+
+/// Full opacity until the last `NOTIF_FADE` seconds, then a linear fade out.
+fn notif_alpha(age: f32) -> f32 {
+    ((NOTIF_LIFETIME - age) / NOTIF_FADE).clamp(0.0, 1.0)
+}
+
+/// Space (or a click on a row) sends the camera to where an alert happened,
+/// reusing the same `CameraFocus` event the minimap and the idle-worker key
+/// already speak. Runs before `minimap_input` in the chain so an in-progress
+/// minimap drag — a live, deliberate act — always wins the frame.
+fn notification_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    game_over: Res<GameOver>,
+    mut notes: ResMut<Notifications>,
+    mut focus: EventWriter<CameraFocus>,
+    pressed_rows: Query<(&Interaction, &NotifRow), Changed<Interaction>>,
+) {
+    if game_over.0.is_some() {
+        return;
+    }
+
+    // A click names its alert exactly; Space then continues down from there.
+    for (interaction, row) in &pressed_rows {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if let Some(pos) = notes.live.get(row.0).and_then(|n| n.pos) {
+            focus.write(CameraFocus { pos });
+            notes.focus_cursor = row.0 + 1;
+            return;
+        }
+    }
+
+    if !keys.just_pressed(NOTIF_FOCUS_KEY) {
+        return;
+    }
+    // Newest placeable alert first, then older ones, wrapping — the same
+    // round-robin the idle-worker key uses. Alerts without a location (there
+    // are none today, but the contract allows them) are skipped, not counted.
+    let n = notes.live.len();
+    for step in 0..n {
+        let i = (notes.focus_cursor + step) % n;
+        if let Some(pos) = notes.live[i].pos {
+            focus.write(CameraFocus { pos });
+            notes.focus_cursor = (i + 1) % n;
+            return;
+        }
+    }
+}
+
+/// Drain the shared feed into the stack, expire what has had its time, and
+/// paint the pool. Pooled and mutated in place — nothing is spawned or
+/// despawned, matching every other refreshed part of this HUD.
+#[allow(clippy::type_complexity)]
+fn update_notifications(
+    real: Res<Time<Real>>,
+    feed: Res<GameEvents>,
+    mut notes: ResMut<Notifications>,
+    mut ui: ResMut<UiState>,
+    mut rows: Query<(
+        &NotifRow,
+        &mut Node,
+        &mut BackgroundColor,
+        &mut BorderColor,
+        Option<&Interaction>,
+    )>,
+    mut texts: Query<(&NotifText, &mut Text, &mut TextColor), Without<NotifHint>>,
+    mut hint: Query<&mut Text, With<NotifHint>>,
+) {
+    let now = real.elapsed_secs();
+
+    // --- pull whatever is new --------------------------------------------
+    // `Team::Human` is the whole filter, and it is the same one the bridge
+    // applies to its seat: a renderer sees one team's feed and has no way to
+    // ask for the other's.
+    for event in feed.feed(Team::Human) {
+        if event.seq <= notes.seen {
+            continue;
+        }
+        notes.seen = event.seq;
+        notes.live.push_front(Notice {
+            message: event.message.clone(),
+            severity: event.severity,
+            pos: event.pos,
+            born: now,
+        });
+        notes.focus_cursor = 0;
+    }
+    notes.live.truncate(NOTIF_SLOTS);
+
+    // Ordered newest-first and stamped in arrival order, so everything stale
+    // is at the back and one pop per expiry suffices.
+    while notes
+        .live
+        .back()
+        .is_some_and(|n| now - n.born >= NOTIF_LIFETIME)
+    {
+        notes.live.pop_back();
+    }
+
+    // Hand the row count to `cursor_over_hud` so a click on an alert is not
+    // also a click on the battlefield behind it.
+    ui.notif_rows = notes.live.len();
+
+    // --- paint -------------------------------------------------------------
+    for (row, mut node, mut bg, mut border, interaction) in &mut rows {
+        let Some(notice) = notes.live.get(row.0) else {
+            node.display = Display::None;
+            continue;
+        };
+        node.display = Display::Flex;
+        let alpha = notif_alpha(now - notice.born);
+        let base = match interaction {
+            Some(Interaction::Pressed) => lighten(PANEL_BG, 0.24),
+            Some(Interaction::Hovered) => lighten(PANEL_BG, 0.14),
+            _ => PANEL_BG,
+        };
+        // `lighten` returns an opaque colour; the panel is translucent and the
+        // fade needs the alpha channel, so set it explicitly either way.
+        bg.0 = base.with_alpha(PANEL_BG.alpha() * alpha);
+        border.0 = severity_color(notice.severity).with_alpha(alpha);
+    }
+
+    for (slot, mut text, mut color) in &mut texts {
+        match notes.live.get(slot.0) {
+            Some(notice) => {
+                if text.0 != notice.message {
+                    text.0.clone_from(&notice.message);
+                }
+                let tint = lighten(severity_color(notice.severity), 0.15);
+                color.0 = tint.with_alpha(notif_alpha(now - notice.born));
+            }
+            None => {
+                if !text.0.is_empty() {
+                    text.0.clear();
+                }
+            }
+        }
+    }
+
+    if let Ok(mut text) = hint.single_mut() {
+        let wanted = if notes.live.is_empty() {
+            ""
+        } else {
+            "[Space] focus alert"
+        };
+        if text.0 != wanted {
+            text.0 = wanted.to_string();
         }
     }
 }

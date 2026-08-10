@@ -23,7 +23,13 @@ Win by destroying all enemy buildings.
 
 - `shared.rs` (integrator-owned): Team, UnitKind/BuildingKind + stats tables,
   Health, Order, MoveTo, NavGrid, Economies, spawn events, GameOver, CorePlugin
-  (initial town hall + 5 workers per team, death cleanup, supply recount, win check).
+  (initial town hall + 5 workers per team, death cleanup, supply recount, win check),
+  and `GameEvents` — the per-team alert feed (losses, hero milestones, base
+  threats, squad wipes, bounties), diffed once per team per second. It lives
+  here and not in a consumer because it has two renderers: bridge.rs serializes
+  it into `state.json` for an external commander, ui.rs draws it as HUD
+  notifications for the player. A feed with two producers is two feeds, and two
+  feeds is an information advantage for whichever side has the better one.
 - `terrain.rs`: ground, doodads, resource nodes (gold mines at
   `GOLD_MINE_POSITIONS`, tree clusters), lighting, **RTS camera** (spawns the
   `MainCamera`), blocks trees/mines in `NavGrid`.
@@ -46,7 +52,9 @@ Win by destroying all enemy buildings.
   Move; A+click → AttackMove), building placement mode with ghost + affordability
   (writes `Order::Build`), training hotkeys/buttons on selected production
   buildings (push to `TrainingQueue` if affordable), top resource bar,
-  selection info panel, game-over banner from `GameOver`.
+  selection info panel, game-over banner from `GameOver`, top-right alert stack
+  rendering `GameEvents::feed(Team::Human)` (severity colours, fade-out, Space
+  or click focuses the camera via `CameraFocus`).
 - `ai.rs`: the Claude faction. Assigns idle workers to harvest, maintains build
   order (farms before supply block, barracks, more workers), trains army,
   attack-moves waves at the human base. Acts ONLY through the same primitives the

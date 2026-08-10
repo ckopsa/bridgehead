@@ -98,7 +98,12 @@
 //! The snapshot reports doctrine back (`units[].squad` / `units[].policies`,
 //! plus a top-level `squads` array) and carries an `events` ring buffer: a
 //! game-time-stamped log of losses, damage, hero milestones, base threats and
-//! squad wipes, built by diffing consecutive snapshots inside this file.
+//! squad wipes. The bridge does not build that log — `shared::GameEvents` does,
+//! once per team per tick, and ui.rs renders the identical buffer as HUD
+//! notifications for the player at the keyboard. That is deliberate: an event
+//! feed only one side can read is an advantage, not a channel. The bridge is
+//! one renderer of a shared artifact, the HUD is the other, and the wire format
+//! here (`[[game_time, message], ...]`) is unchanged by the move.
 //!
 //! Every failure mode — missing file, malformed JSON, dead entity, unaffordable
 //! order — turns into an error string carried in the next snapshot's `errors`
@@ -107,7 +112,7 @@
 use crate::shared::*;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -141,24 +146,6 @@ const INVENTORY_SLOTS: usize = Inventory([None; 2]).0.len();
 /// How many trees to include in the snapshot (there are hundreds).
 const TREES_NEAR: usize = 12;
 
-/// Enemy combat units this close to home count toward the base-threat event.
-const THREAT_RADIUS: f32 = 45.0;
-/// Hero HP fraction whose downward crossing raises a "hero low" event.
-const HERO_LOW_FRAC: f32 = 0.35;
-/// Building HP fraction whose downward crossing raises an "under attack" event.
-const BUILDING_HURT_FRAC: f32 = 0.5;
-/// A tick that loses this many units of one kind is reported as one line.
-const LOSS_AGGREGATE: usize = 3;
-/// Sudden growth in the base-threat count that re-raises the event.
-const THREAT_SPIKE: usize = 3;
-/// Ring-buffer capacity for the event stream. Every snapshot carries the whole
-/// buffer, so a commander polling every ~15s still sees everything that
-/// happened in between; the reader filters by timestamp.
-const MAX_EVENTS: usize = 40;
-/// Slack on a vanished bounty's deadline before we call its disappearance
-/// early (i.e. claimed rather than timed out). Snapshot clocks are rounded to
-/// one decimal, so an exact comparison would misread a natural expiry.
-const BOUNTY_EXPIRY_EPS: f32 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Plugin & state
@@ -204,12 +191,6 @@ struct Seat {
     /// (mtime, len) of this seat's `commands.json` when it was last read, so an
     /// unchanged file is not re-parsed four times a second.
     last_stat: Option<(std::time::SystemTime, u64)>,
-    /// Game-time-stamped notable happenings, oldest first, capped at
-    /// `MAX_EVENTS`. Produced purely by diffing consecutive snapshots (see
-    /// `diff_events`) — no other module knows this exists.
-    events: VecDeque<(f32, String)>,
-    /// The previous tick's own-team picture, the other half of that diff.
-    prev: EventMemo,
 }
 
 impl Seat {
@@ -227,8 +208,6 @@ impl Seat {
             errors: Vec::new(),
             force_snapshot: true,
             last_stat: None,
-            events: VecDeque::new(),
-            prev: EventMemo::default(),
         }
     }
 }
@@ -247,34 +226,6 @@ fn seat_name(team: Team) -> &'static str {
 #[derive(Resource, Default)]
 struct Bridge {
     seats: Vec<Seat>,
-}
-
-/// Everything `diff_events` needs to remember from one snapshot to the next.
-/// Module-private by design: the event stream is a bridge concern, not a
-/// shared-contract one. One of these per seat — never shared.
-#[derive(Default)]
-struct EventMemo {
-    /// False until the first snapshot has been recorded. The first tick only
-    /// seeds this memo — with nothing to diff against, every unit would
-    /// otherwise look newly noteworthy.
-    seeded: bool,
-    /// own unit id -> (kind, last known position)
-    units: HashMap<u64, (&'static str, [f32; 2])>,
-    /// own building id -> (kind, position, hp, max_hp)
-    buildings: HashMap<u64, (&'static str, [f32; 2], f32, f32)>,
-    hero_alive: bool,
-    hero_level: u32,
-    /// Latched so "hero low" fires once per crossing rather than every tick.
-    hero_low: bool,
-    threat: usize,
-    squad_members: HashMap<u8, usize>,
-    /// Largest membership seen since each squad was last empty. A squad that
-    /// bleeds out one member per tick is still a squad that got wiped, so the
-    /// report keys off this rather than the previous tick's count.
-    squad_peak: HashMap<u8, usize>,
-    /// bounty entity id -> (position, gold, expiry deadline). Bounties are the
-    /// one thing in this memo that isn't own-team: treasure is neutral.
-    bounties: HashMap<u64, ([f32; 2], u32, f32)>,
 }
 
 fn bridge_enabled(bridge: Res<Bridge>) -> bool {
@@ -621,6 +572,7 @@ fn write_snapshot(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     squad_orders: Res<SquadOrders>,
+    feed: Res<GameEvents>,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
     nodes: SnapshotNodes,
@@ -641,6 +593,7 @@ fn write_snapshot(
             &records,
             &game_over,
             &squad_orders,
+            &feed,
             &units,
             &buildings,
             &nodes,
@@ -659,6 +612,7 @@ fn write_seat_snapshot(
     records: &HeroRecords,
     game_over: &GameOver,
     squad_orders: &SquadOrders,
+    feed: &GameEvents,
     units: &SnapshotUnits,
     buildings: &SnapshotBuildings,
     nodes: &SnapshotNodes,
@@ -816,19 +770,15 @@ fn write_seat_snapshot(
         })
         .collect();
 
-    // Diff this picture against this seat's previous one before publishing it.
-    diff_events(
-        now,
-        me,
-        &mut seat.prev,
-        &mut seat.events,
-        &units_out,
-        &buildings_out,
-        &members,
-        squad_orders,
-        &bounty_snaps,
-    );
-    let events: Vec<(f32, String)> = seat.events.iter().cloned().collect();
+    // The event stream is not ours to compute: shared.rs runs one diff per team
+    // per tick and the HUD reads the identical buffer. We only serialize this
+    // seat's half of it — `severity` and `pos` are renderer sugar a file reader
+    // does not need, and the wire format predates them.
+    let events: Vec<(f32, String)> = feed
+        .feed(me)
+        .iter()
+        .map(|e| (e.t, e.message.clone()))
+        .collect();
 
     let eco = *economies.get(me);
     let (hero_gold, hero_lumber, hero_time) = hero_train_cost(records, me);
@@ -931,19 +881,13 @@ fn requirement_error(
 }
 
 // ---------------------------------------------------------------------------
-// Event stream: snapshot-to-snapshot diffing
+// Squad membership
 // ---------------------------------------------------------------------------
 //
-// A commander polling once every ten or fifteen seconds used to see only the
-// aftermath: fewer units, less base, no idea what happened. The event stream
-// closes that gap without any other module's cooperation — nothing here hooks
-// combat or economy, it simply remembers the last own-team picture and reports
-// what changed. Everything is game-time stamped and kept in a ring buffer that
-// outlives individual snapshots, so a slow reader misses nothing; it just
-// filters by timestamp against what it already saw.
-//
-// "Own" means the seat's team, so the two seats produce mirror-image streams
-// from the same world.
+// The event stream used to be computed here, from a private diff of consecutive
+// snapshots. It now lives in `shared::GameEvents`, produced once per team per
+// tick — because the HUD needs the same stream, and a feed with two producers
+// is two feeds. See the "Event feed" section of shared.rs.
 
 /// Count squad members per id, own team only (the snapshot only carries
 /// `squad` for our own units, so enemies can't leak in here).
@@ -957,234 +901,6 @@ fn squad_members(units_out: &[UnitOut]) -> HashMap<u8, usize> {
     counts
 }
 
-/// Compare this tick's own-team picture with the previous one and append any
-/// notable differences to the seat's ring buffer.
-#[allow(clippy::too_many_arguments)]
-fn diff_events(
-    now: f32,
-    me: Team,
-    memo: &mut EventMemo,
-    events: &mut VecDeque<(f32, String)>,
-    units_out: &[UnitOut],
-    buildings_out: &[BuildingOut],
-    members: &HashMap<u8, usize>,
-    squad_orders: &SquadOrders,
-    bounties: &[BountySnap],
-) {
-    let mine = team_name(me);
-    let home = me.base_pos();
-
-    // --- gather the current picture -------------------------------------
-    let mut cur_units: HashMap<u64, (&'static str, [f32; 2])> = HashMap::new();
-    let mut hero_alive = false;
-    let mut hero_level = memo.hero_level;
-    let mut hero_frac = 1.0f32;
-    let mut hostiles: Vec<[f32; 2]> = Vec::new();
-    for u in units_out {
-        if u.team == mine {
-            cur_units.insert(u.id, (u.kind, u.pos));
-            if let Some(h) = &u.hero {
-                hero_alive = true;
-                hero_level = h.level;
-                hero_frac = if u.max_hp > 0.0 { u.hp / u.max_hp } else { 1.0 };
-            }
-        } else if u.kind != "Worker" {
-            // Workers wander; only combat units count as a threat.
-            let d = (u.pos[0] - home.x).hypot(u.pos[1] - home.z);
-            if d <= THREAT_RADIUS {
-                hostiles.push(u.pos);
-            }
-        }
-    }
-
-    let mut cur_buildings: HashMap<u64, (&'static str, [f32; 2], f32, f32)> = HashMap::new();
-    for b in buildings_out {
-        if b.team == mine {
-            cur_buildings.insert(b.id, (b.kind, b.pos, b.hp, b.max_hp));
-        }
-    }
-
-    let threat = hostiles.len();
-
-    let cur_bounties: HashMap<u64, ([f32; 2], u32, f32)> = bounties
-        .iter()
-        .map(|b| (b.id, (b.pos, b.gold, b.expires_at)))
-        .collect();
-
-    // The very first tick has nothing to compare against; seed and stay quiet.
-    if !memo.seeded {
-        memo.seeded = true;
-        memo.units = cur_units;
-        memo.buildings = cur_buildings;
-        memo.hero_alive = hero_alive;
-        memo.hero_level = hero_level;
-        memo.hero_low = hero_alive && hero_frac < HERO_LOW_FRAC;
-        memo.threat = threat;
-        memo.squad_members = members.clone();
-        memo.squad_peak = members.clone();
-        memo.bounties = cur_bounties;
-        return;
-    }
-
-    let mut out: Vec<String> = Vec::new();
-
-    // --- unit losses ----------------------------------------------------
-    // Grouped by kind so a wiped squad reads as one line, not eight.
-    let mut lost: HashMap<&'static str, Vec<[f32; 2]>> = HashMap::new();
-    for (id, (kind, pos)) in &memo.units {
-        if cur_units.contains_key(id) || is_hero_name(kind) {
-            continue; // the hero gets its own, better, event below
-        }
-        lost.entry(kind).or_default().push(*pos);
-    }
-    let mut lost: Vec<(&'static str, Vec<[f32; 2]>)> = lost.into_iter().collect();
-    lost.sort_unstable_by_key(|(kind, _)| *kind);
-    for (kind, positions) in lost {
-        if positions.len() >= LOSS_AGGREGATE {
-            let (cx, cz) = centroid(&positions);
-            out.push(format!(
-                "lost {} {kind} near ({cx:.1},{cz:.1})",
-                positions.len()
-            ));
-        } else {
-            for p in positions {
-                out.push(format!("lost {kind} @({:.1},{:.1})", p[0], p[1]));
-            }
-        }
-    }
-
-    // --- buildings destroyed or newly hurt ------------------------------
-    let mut building_ids: Vec<&u64> = memo.buildings.keys().collect();
-    building_ids.sort_unstable();
-    for id in building_ids {
-        let (kind, pos, hp, max_hp) = memo.buildings[id];
-        match cur_buildings.get(id) {
-            None => out.push(format!("{kind} @({:.1},{:.1}) destroyed", pos[0], pos[1])),
-            Some((_, now_pos, now_hp, now_max)) => {
-                let was_hurt = max_hp > 0.0 && hp / max_hp < BUILDING_HURT_FRAC;
-                let is_hurt = *now_max > 0.0 && now_hp / now_max < BUILDING_HURT_FRAC;
-                if is_hurt && !was_hurt {
-                    out.push(format!(
-                        "{kind} @({:.1},{:.1}) under attack ({:.0}/{:.0})",
-                        now_pos[0], now_pos[1], now_hp, now_max
-                    ));
-                }
-            }
-        }
-    }
-
-    // --- the Champion ---------------------------------------------------
-    if memo.hero_alive && !hero_alive {
-        out.push("hero died".to_string());
-    }
-    if memo.hero_alive && hero_alive && hero_level > memo.hero_level {
-        out.push(format!("hero level up: {hero_level}"));
-    }
-    let hero_low = hero_alive && hero_frac < HERO_LOW_FRAC;
-    if hero_low && !memo.hero_low {
-        out.push(format!("hero low: {}%", (hero_frac * 100.0).round() as i32));
-    }
-
-    // --- pressure on the base -------------------------------------------
-    // Report the arrival of a threat, and any sharp escalation of one, but not
-    // every tick a siege continues — the commander can read `units` for that.
-    if threat > 0 && (memo.threat == 0 || threat >= memo.threat + THREAT_SPIKE) {
-        let (cx, cz) = centroid(&hostiles);
-        out.push(format!("{threat} hostiles near base @({cx:.1},{cz:.1})"));
-    }
-
-    // --- squad wipes ----------------------------------------------------
-    let mut posture_ids: Vec<u8> = squad_orders
-        .0
-        .keys()
-        .filter(|(team, _)| *team == me)
-        .map(|(_, id)| *id)
-        .collect();
-    posture_ids.sort_unstable();
-    for (&id, &n) in members {
-        let peak = memo.squad_peak.entry(id).or_insert(0);
-        *peak = (*peak).max(n);
-    }
-    for id in posture_ids {
-        let before = memo.squad_members.get(&id).copied().unwrap_or(0);
-        let after = members.get(&id).copied().unwrap_or(0);
-        let peak = memo.squad_peak.get(&id).copied().unwrap_or(0);
-        if after == 0 && before > 0 && peak >= 2 {
-            out.push(format!("squad {id} wiped"));
-        }
-    }
-    // An emptied squad forgets its peak, so a rebuilt one can be wiped again.
-    memo.squad_peak
-        .retain(|id, _| members.get(id).copied().unwrap_or(0) > 0);
-
-    // --- bounty caches ---------------------------------------------------
-    // Deliberately *unattributed*. bounty.rs despawns a cache the moment
-    // somebody claims it, and it does not record who — a claim is not visible
-    // in any snapshot, and diffing our own gold cannot separate a bounty from
-    // the harvest income arriving in the same second. So the feed reports the
-    // observable fact only: a cache appeared, and a cache went away before its
-    // deadline (i.e. somebody took it — possibly us). A commander that had a
-    // unit on the spot knows it was theirs; one that did not knows it lost the
-    // race. Caches that simply time out say nothing: `expires_in` already
-    // counted them down in every snapshot.
-    for b in bounties {
-        if !memo.bounties.contains_key(&b.id) {
-            out.push(format!(
-                "bounty spawned: {}g @({:.1},{:.1})",
-                b.gold, b.pos[0], b.pos[1]
-            ));
-        }
-    }
-    let mut gone: Vec<(&u64, &([f32; 2], u32, f32))> = memo
-        .bounties
-        .iter()
-        .filter(|(id, _)| !cur_bounties.contains_key(*id))
-        .collect();
-    gone.sort_unstable_by_key(|(id, _)| **id);
-    for (_, (pos, _, expires_at)) in gone {
-        // Tolerance absorbs the snapshot's rounded clock; anything still short
-        // of its deadline was taken, not timed out.
-        if now + BOUNTY_EXPIRY_EPS < *expires_at {
-            out.push(format!("bounty gone @({:.1},{:.1})", pos[0], pos[1]));
-        }
-    }
-
-    // --- publish & remember ---------------------------------------------
-    for message in out {
-        events.push_back((now, message));
-    }
-    while events.len() > MAX_EVENTS {
-        events.pop_front();
-    }
-
-    memo.units = cur_units;
-    memo.buildings = cur_buildings;
-    memo.hero_alive = hero_alive;
-    memo.hero_level = hero_level;
-    memo.hero_low = hero_low;
-    memo.threat = threat;
-    memo.squad_members = members.clone();
-    memo.bounties = cur_bounties;
-}
-
-/// Is this snapshot `kind` string one of the hero classes? Derived from the
-/// shared tables, so a third class needs no edit here.
-fn is_hero_name(kind: &str) -> bool {
-    ALL_UNIT_KINDS
-        .iter()
-        .any(|k| is_hero_kind(*k) && kind_name(*k) == kind)
-}
-
-fn centroid(points: &[[f32; 2]]) -> (f32, f32) {
-    if points.is_empty() {
-        return (0.0, 0.0);
-    }
-    let n = points.len() as f32;
-    (
-        points.iter().map(|p| p[0]).sum::<f32>() / n,
-        points.iter().map(|p| p[1]).sum::<f32>() / n,
-    )
-}
 
 // ---------------------------------------------------------------------------
 // Commands: bridge/<seat>/commands.json -> orders

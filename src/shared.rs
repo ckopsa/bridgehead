@@ -1439,6 +1439,7 @@ impl Plugin for CorePlugin {
             .init_resource::<AiControlled>()
             .init_resource::<ExternallyCommanded>()
             .init_resource::<SquadOrders>()
+            .init_resource::<GameEvents>()
             .add_event::<SpawnUnitEvent>()
             .add_event::<SpawnBuildingEvent>()
             .add_event::<CameraFocus>()
@@ -1462,6 +1463,10 @@ impl Plugin for CorePlugin {
                     check_game_over,
                     debug_log,
                     speed_hotkeys,
+                    // After `apply_death`, so a unit that died this frame is
+                    // already gone from the picture the diff walks — the feed
+                    // reports losses on the tick they happen, not the next one.
+                    produce_game_events.after(apply_death),
                 ),
             );
     }
@@ -1734,4 +1739,575 @@ fn check_game_over(
             game_over.0 = Some(team.enemy());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Event feed — one producer, two renderers
+// ---------------------------------------------------------------------------
+//
+// A commander polling a file every ten seconds used to see only the aftermath:
+// fewer units, less base, no idea what happened. bridge.rs closed that gap with
+// a private snapshot-to-snapshot diff — and in doing so handed the machine a
+// faculty the human at the keyboard did not have. A human can miss a raid on
+// the far side of the map. The bridge commander never missed anything.
+//
+// So the diff lives here now, in the contract, and it runs once per team per
+// tick regardless of who is watching. bridge.rs serializes the feed into
+// `state.json`; ui.rs renders the same feed as HUD notifications. Neither one
+// produces. Equitable access means the *feed* is the shared artifact and the
+// renderer is merely a matter of which interface you happen to sit behind.
+//
+// Nothing here hooks combat or economy: the producer remembers the last
+// per-team picture of the world and reports what changed. Everything is
+// game-time stamped and kept in a ring buffer that outlives individual reads,
+// so a slow reader misses nothing — it filters by `seq` against what it saw.
+//
+// "Own" means the team the feed belongs to, so the two feeds are mirror images
+// built from one world, and neither carries knowledge the other's owner could
+// not have had. A team's feed reports *its* losses, *its* hero, threats to
+// *its* base. Bounty caches are the one shared entry: treasure glowing on open
+// ground is public information.
+
+/// Enemy combat units this close to home count toward the base-threat event.
+const THREAT_RADIUS: f32 = 45.0;
+/// Hero HP fraction whose downward crossing raises a "hero low" event.
+const HERO_LOW_FRAC: f32 = 0.35;
+/// Building HP fraction whose downward crossing raises an "under attack" event.
+const BUILDING_HURT_FRAC: f32 = 0.5;
+/// A tick that loses this many units of one kind is reported as one line.
+const LOSS_AGGREGATE: usize = 3;
+/// Sudden growth in the base-threat count that re-raises the event.
+const THREAT_SPIKE: usize = 3;
+/// Slack on a vanished bounty's deadline before we call its disappearance
+/// early (i.e. claimed rather than timed out). Event clocks are rounded to one
+/// decimal, so an exact comparison would misread a natural expiry.
+const BOUNTY_EXPIRY_EPS: f32 = 0.5;
+
+/// Ring-buffer capacity per team. A bridge snapshot carries the whole buffer,
+/// so a commander polling every ~15s still sees everything that happened in
+/// between; the reader filters by `seq`.
+pub const MAX_GAME_EVENTS: usize = 40;
+
+/// Wall-clock seconds between diffs. Deliberately real time, not game time:
+/// the feed exists to keep a *watcher* current, and a watcher's attention runs
+/// at one second per second no matter what `WC3_SPEED` is doing.
+const EVENT_INTERVAL: f32 = 1.0;
+
+/// How loud an event is. The bridge ignores this — its reader has the message
+/// text and all the time in the world to think about it. The HUD colours by it,
+/// because a human glancing at the corner of the screen has neither.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EventSeverity {
+    /// Worth knowing, costs nothing: a level-up, a bounty appearing.
+    Info,
+    /// Something of yours is being spent: units lost, a building taking damage.
+    Warning,
+    /// Act now: hero down or nearly down, a building gone, hostiles at home.
+    Critical,
+}
+
+/// One notable happening, from one team's point of view.
+#[derive(Clone, Debug)]
+pub struct GameEvent {
+    /// Monotonic across the whole match and both teams. A reader that remembers
+    /// the highest `seq` it has handled can neither double-report nor silently
+    /// skip, even when the ring buffer drops entries between reads.
+    pub seq: u64,
+    /// Game time (`Time::elapsed_secs`), one decimal.
+    pub t: f32,
+    /// The wire text. bridge.rs ships this verbatim; the HUD shows it verbatim.
+    pub message: String,
+    pub severity: EventSeverity,
+    /// Where on the ground it happened, when that is meaningful — a renderer
+    /// can focus the camera here. `None` for events without a place.
+    pub pos: Option<Vec3>,
+}
+
+/// Per-team ring buffers plus the memory the diff runs against.
+#[derive(Resource)]
+pub struct GameEvents {
+    human: TeamFeed,
+    claude: TeamFeed,
+    /// Real-time cadence of the diff, shared by both teams so their feeds are
+    /// built from the identical instant.
+    timer: Timer,
+    /// Run the first diff immediately rather than a second in, so the memo is
+    /// seeded from the opening position.
+    force: bool,
+    next_seq: u64,
+}
+
+impl Default for GameEvents {
+    fn default() -> Self {
+        GameEvents {
+            human: TeamFeed::default(),
+            claude: TeamFeed::default(),
+            timer: Timer::from_seconds(EVENT_INTERVAL, TimerMode::Repeating),
+            force: true,
+            next_seq: 1,
+        }
+    }
+}
+
+impl GameEvents {
+    /// That team's events, oldest first. This is the whole public surface:
+    /// readers never write, and a reader for one team cannot stumble into the
+    /// other's feed because it must name a team to get anything at all.
+    pub fn feed(&self, team: Team) -> &VecDeque<GameEvent> {
+        match team {
+            Team::Human => &self.human.events,
+            Team::Claude => &self.claude.events,
+        }
+    }
+
+    fn team_mut(&mut self, team: Team) -> &mut TeamFeed {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TeamFeed {
+    events: VecDeque<GameEvent>,
+    memo: EventMemo,
+}
+
+/// Everything the diff needs to remember from one tick to the next, for one
+/// team. Private: the memo is the producer's business, and exposing it would
+/// invite a renderer to start producing.
+#[derive(Default)]
+struct EventMemo {
+    /// False until the first picture has been recorded. The first tick only
+    /// seeds — with nothing to diff against, every unit would look newly
+    /// noteworthy.
+    seeded: bool,
+    /// own unit id -> (kind, last known position)
+    units: std::collections::HashMap<u64, (UnitKind, [f32; 2])>,
+    /// own building id -> (kind, position, hp, max_hp)
+    buildings: std::collections::HashMap<u64, (BuildingKind, [f32; 2], f32, f32)>,
+    hero_alive: bool,
+    hero_level: u32,
+    /// Last place the hero was seen, so "hero died" still has somewhere to
+    /// point a camera after the entity is gone.
+    hero_pos: [f32; 2],
+    /// Latched so "hero low" fires once per crossing rather than every tick.
+    hero_low: bool,
+    threat: usize,
+    squad_members: std::collections::HashMap<u8, usize>,
+    /// Largest membership seen since each squad was last empty. A squad that
+    /// bleeds out one member per tick is still a squad that got wiped, so the
+    /// report keys off this rather than the previous tick's count.
+    squad_peak: std::collections::HashMap<u8, usize>,
+    /// Last known centre of mass per squad — where to look when one is wiped.
+    squad_pos: std::collections::HashMap<u8, [f32; 2]>,
+    /// bounty entity id -> (position, gold, expiry deadline). Bounties are the
+    /// one thing in this memo that isn't own-team: treasure is neutral.
+    bounties: std::collections::HashMap<u64, ([f32; 2], u32, f32)>,
+}
+
+/// One decimal place — event text stays terse and diffs cleanly.
+fn ev_r1(v: f32) -> f32 {
+    (v * 10.0).round() / 10.0
+}
+
+fn ev_centroid(points: &[[f32; 2]]) -> (f32, f32) {
+    let n = points.len().max(1) as f32;
+    let sx: f32 = points.iter().map(|p| p[0]).sum();
+    let sz: f32 = points.iter().map(|p| p[1]).sum();
+    (sx / n, sz / n)
+}
+
+/// XZ pair back onto the ground plane, for `GameEvent::pos`.
+fn ev_ground(p: [f32; 2]) -> Vec3 {
+    Vec3::new(p[0], 0.0, p[1])
+}
+
+/// One tick's flat view of a unit. The world is walked once and both teams'
+/// diffs read the same slice, so the two feeds can never disagree about what
+/// was on the map.
+struct EvUnit {
+    id: u64,
+    team: Team,
+    kind: UnitKind,
+    pos: [f32; 2],
+    hp: f32,
+    max_hp: f32,
+    hero_level: Option<u32>,
+    squad: Option<u8>,
+}
+
+struct EvBuilding {
+    id: u64,
+    team: Team,
+    kind: BuildingKind,
+    pos: [f32; 2],
+    hp: f32,
+    max_hp: f32,
+}
+
+struct EvBounty {
+    id: u64,
+    pos: [f32; 2],
+    gold: u32,
+    expires_at: f32,
+}
+
+/// Walk the world once per real second and append what changed to each team's
+/// ring buffer. Registered by `CorePlugin`, so the feed exists in every run
+/// mode — headless, windowed, bridged — and every renderer can rely on it.
+fn produce_game_events(
+    time: Res<Time>,
+    real: Res<Time<Real>>,
+    mut feed: ResMut<GameEvents>,
+    squad_orders: Res<SquadOrders>,
+    unit_q: Query<(
+        Entity,
+        &Unit,
+        &Team,
+        &Transform,
+        &Health,
+        Option<&Hero>,
+        Option<&SquadId>,
+    )>,
+    building_q: Query<(Entity, &Building, &Team, &Transform, &Health)>,
+    bounty_q: Query<(Entity, &Bounty, &Transform)>,
+) {
+    let due = feed.timer.tick(real.delta()).just_finished();
+    if !due && !feed.force {
+        return;
+    }
+    feed.force = false;
+    let now = ev_r1(time.elapsed_secs());
+
+    let mut units: Vec<EvUnit> = unit_q
+        .iter()
+        .map(|(e, unit, team, tf, health, hero, squad)| EvUnit {
+            id: e.to_bits(),
+            team: *team,
+            kind: unit.kind,
+            pos: [ev_r1(tf.translation.x), ev_r1(tf.translation.z)],
+            hp: ev_r1(health.current),
+            max_hp: ev_r1(health.max),
+            hero_level: hero.map(|h| h.level),
+            squad: squad.map(|s| s.0),
+        })
+        .collect();
+    units.sort_unstable_by_key(|u| u.id);
+
+    let mut buildings: Vec<EvBuilding> = building_q
+        .iter()
+        .map(|(e, building, team, tf, health)| EvBuilding {
+            id: e.to_bits(),
+            team: *team,
+            kind: building.kind,
+            pos: [ev_r1(tf.translation.x), ev_r1(tf.translation.z)],
+            hp: ev_r1(health.current),
+            max_hp: ev_r1(health.max),
+        })
+        .collect();
+    buildings.sort_unstable_by_key(|b| b.id);
+
+    let mut bounties: Vec<EvBounty> = bounty_q
+        .iter()
+        .map(|(e, bounty, tf)| EvBounty {
+            id: e.to_bits(),
+            pos: [ev_r1(tf.translation.x), ev_r1(tf.translation.z)],
+            gold: bounty.gold,
+            expires_at: bounty.expires_at,
+        })
+        .collect();
+    bounties.sort_unstable_by_key(|b| b.id);
+
+    for team in [Team::Human, Team::Claude] {
+        let produced = diff_team(
+            team,
+            now,
+            &mut feed.team_mut(team).memo,
+            &units,
+            &buildings,
+            &bounties,
+            &squad_orders,
+        );
+        for (message, severity, pos) in produced {
+            let seq = feed.next_seq;
+            feed.next_seq += 1;
+            let events = &mut feed.team_mut(team).events;
+            events.push_back(GameEvent {
+                seq,
+                t: now,
+                message,
+                severity,
+                pos,
+            });
+            while events.len() > MAX_GAME_EVENTS {
+                events.pop_front();
+            }
+        }
+    }
+}
+
+/// Compare this tick's picture against `memo` from one team's point of view and
+/// return the notable differences, in a stable order.
+///
+/// This is the whole event vocabulary. The message text is a wire format —
+/// external commanders parse it — so the strings must not drift.
+fn diff_team(
+    me: Team,
+    now: f32,
+    memo: &mut EventMemo,
+    units: &[EvUnit],
+    buildings: &[EvBuilding],
+    bounties: &[EvBounty],
+    squad_orders: &SquadOrders,
+) -> Vec<(String, EventSeverity, Option<Vec3>)> {
+    use std::collections::HashMap;
+
+    let home = me.base_pos();
+
+    // --- gather the current picture -------------------------------------
+    let mut cur_units: HashMap<u64, (UnitKind, [f32; 2])> = HashMap::new();
+    let mut hero_alive = false;
+    let mut hero_level = memo.hero_level;
+    let mut hero_frac = 1.0f32;
+    let mut hero_pos = memo.hero_pos;
+    let mut hostiles: Vec<[f32; 2]> = Vec::new();
+    let mut members: HashMap<u8, usize> = HashMap::new();
+    let mut squad_points: HashMap<u8, Vec<[f32; 2]>> = HashMap::new();
+    for u in units {
+        if u.team == me {
+            cur_units.insert(u.id, (u.kind, u.pos));
+            if let Some(level) = u.hero_level {
+                hero_alive = true;
+                hero_level = level;
+                hero_pos = u.pos;
+                hero_frac = if u.max_hp > 0.0 { u.hp / u.max_hp } else { 1.0 };
+            }
+            if let Some(id) = u.squad {
+                *members.entry(id).or_insert(0) += 1;
+                squad_points.entry(id).or_default().push(u.pos);
+            }
+        } else if u.kind != UnitKind::Worker {
+            // Workers wander; only combat units count as a threat.
+            let d = (u.pos[0] - home.x).hypot(u.pos[1] - home.z);
+            if d <= THREAT_RADIUS {
+                hostiles.push(u.pos);
+            }
+        }
+    }
+
+    let mut cur_buildings: HashMap<u64, (BuildingKind, [f32; 2], f32, f32)> = HashMap::new();
+    for b in buildings {
+        if b.team == me {
+            cur_buildings.insert(b.id, (b.kind, b.pos, b.hp, b.max_hp));
+        }
+    }
+
+    let threat = hostiles.len();
+
+    let cur_bounties: HashMap<u64, ([f32; 2], u32, f32)> = bounties
+        .iter()
+        .map(|b| (b.id, (b.pos, b.gold, b.expires_at)))
+        .collect();
+
+    // Remember where each live squad stands, so a wipe report has a location.
+    for (id, points) in &squad_points {
+        let (cx, cz) = ev_centroid(points);
+        memo.squad_pos.insert(*id, [cx, cz]);
+    }
+
+    // The very first tick has nothing to compare against; seed and stay quiet.
+    if !memo.seeded {
+        memo.seeded = true;
+        memo.units = cur_units;
+        memo.buildings = cur_buildings;
+        memo.hero_alive = hero_alive;
+        memo.hero_level = hero_level;
+        memo.hero_pos = hero_pos;
+        memo.hero_low = hero_alive && hero_frac < HERO_LOW_FRAC;
+        memo.threat = threat;
+        memo.squad_members = members.clone();
+        memo.squad_peak = members;
+        memo.bounties = cur_bounties;
+        return Vec::new();
+    }
+
+    let mut out: Vec<(String, EventSeverity, Option<Vec3>)> = Vec::new();
+
+    // --- unit losses ----------------------------------------------------
+    // Grouped by kind so a wiped squad reads as one line, not eight. Keyed and
+    // ordered by the *name*, which is what goes out on the wire.
+    let mut lost: HashMap<&'static str, Vec<[f32; 2]>> = HashMap::new();
+    for (id, (kind, pos)) in &memo.units {
+        if cur_units.contains_key(id) || is_hero_kind(*kind) {
+            continue; // the hero gets its own, better, event below
+        }
+        lost.entry(kind_name(*kind)).or_default().push(*pos);
+    }
+    let mut lost: Vec<(&'static str, Vec<[f32; 2]>)> = lost.into_iter().collect();
+    lost.sort_unstable_by_key(|(kind, _)| *kind);
+    for (kind, positions) in lost {
+        if positions.len() >= LOSS_AGGREGATE {
+            let (cx, cz) = ev_centroid(&positions);
+            out.push((
+                format!("lost {} {kind} near ({cx:.1},{cz:.1})", positions.len()),
+                EventSeverity::Warning,
+                Some(ev_ground([cx, cz])),
+            ));
+        } else {
+            for p in positions {
+                out.push((
+                    format!("lost {kind} @({:.1},{:.1})", p[0], p[1]),
+                    EventSeverity::Warning,
+                    Some(ev_ground(p)),
+                ));
+            }
+        }
+    }
+
+    // --- buildings destroyed or newly hurt ------------------------------
+    let mut building_ids: Vec<u64> = memo.buildings.keys().copied().collect();
+    building_ids.sort_unstable();
+    for id in building_ids {
+        let (kind, pos, hp, max_hp) = memo.buildings[&id];
+        let name = building_name(kind);
+        match cur_buildings.get(&id) {
+            None => out.push((
+                format!("{name} @({:.1},{:.1}) destroyed", pos[0], pos[1]),
+                EventSeverity::Critical,
+                Some(ev_ground(pos)),
+            )),
+            Some((_, now_pos, now_hp, now_max)) => {
+                let was_hurt = max_hp > 0.0 && hp / max_hp < BUILDING_HURT_FRAC;
+                let is_hurt = *now_max > 0.0 && now_hp / now_max < BUILDING_HURT_FRAC;
+                if is_hurt && !was_hurt {
+                    out.push((
+                        format!(
+                            "{name} @({:.1},{:.1}) under attack ({:.0}/{:.0})",
+                            now_pos[0], now_pos[1], now_hp, now_max
+                        ),
+                        EventSeverity::Warning,
+                        Some(ev_ground(*now_pos)),
+                    ));
+                }
+            }
+        }
+    }
+
+    // --- the Champion ---------------------------------------------------
+    if memo.hero_alive && !hero_alive {
+        out.push((
+            "hero died".to_string(),
+            EventSeverity::Critical,
+            Some(ev_ground(memo.hero_pos)),
+        ));
+    }
+    if memo.hero_alive && hero_alive && hero_level > memo.hero_level {
+        out.push((
+            format!("hero level up: {hero_level}"),
+            EventSeverity::Info,
+            Some(ev_ground(hero_pos)),
+        ));
+    }
+    let hero_low = hero_alive && hero_frac < HERO_LOW_FRAC;
+    if hero_low && !memo.hero_low {
+        out.push((
+            format!("hero low: {}%", (hero_frac * 100.0).round() as i32),
+            EventSeverity::Critical,
+            Some(ev_ground(hero_pos)),
+        ));
+    }
+
+    // --- pressure on the base -------------------------------------------
+    // Report the arrival of a threat, and any sharp escalation of one, but not
+    // every tick a siege continues — a watcher can see the rest for itself.
+    if threat > 0 && (memo.threat == 0 || threat >= memo.threat + THREAT_SPIKE) {
+        let (cx, cz) = ev_centroid(&hostiles);
+        out.push((
+            format!("{threat} hostiles near base @({cx:.1},{cz:.1})"),
+            EventSeverity::Critical,
+            Some(ev_ground([cx, cz])),
+        ));
+    }
+
+    // --- squad wipes ----------------------------------------------------
+    let mut posture_ids: Vec<u8> = squad_orders
+        .0
+        .keys()
+        .filter(|(team, _)| *team == me)
+        .map(|(_, id)| *id)
+        .collect();
+    posture_ids.sort_unstable();
+    for (&id, &n) in &members {
+        let peak = memo.squad_peak.entry(id).or_insert(0);
+        *peak = (*peak).max(n);
+    }
+    for id in posture_ids {
+        let before = memo.squad_members.get(&id).copied().unwrap_or(0);
+        let after = members.get(&id).copied().unwrap_or(0);
+        let peak = memo.squad_peak.get(&id).copied().unwrap_or(0);
+        if after == 0 && before > 0 && peak >= 2 {
+            out.push((
+                format!("squad {id} wiped"),
+                EventSeverity::Critical,
+                memo.squad_pos.get(&id).copied().map(ev_ground),
+            ));
+        }
+    }
+    // An emptied squad forgets its peak and its place, so a rebuilt one can be
+    // wiped again — and reported where it died the second time, not the first.
+    memo.squad_peak
+        .retain(|id, _| members.get(id).copied().unwrap_or(0) > 0);
+    memo.squad_pos.retain(|id, _| members.contains_key(id));
+
+    // --- bounty caches ---------------------------------------------------
+    // Deliberately *unattributed*. bounty.rs despawns a cache the moment
+    // somebody claims it, and it does not record who — a claim is not visible
+    // in any snapshot, and diffing our own gold cannot separate a bounty from
+    // the harvest income arriving in the same second. So the feed reports the
+    // observable fact only: a cache appeared, and a cache went away before its
+    // deadline (i.e. somebody took it — possibly us). A watcher with a unit on
+    // the spot knows the gold was its own; one without knows it lost the race.
+    // Caches that simply time out say nothing: the glow on the ground and the
+    // snapshot's `expires_in` already counted them down.
+    for b in bounties {
+        if !memo.bounties.contains_key(&b.id) {
+            out.push((
+                format!("bounty spawned: {}g @({:.1},{:.1})", b.gold, b.pos[0], b.pos[1]),
+                EventSeverity::Info,
+                Some(ev_ground(b.pos)),
+            ));
+        }
+    }
+    let mut gone: Vec<(&u64, &([f32; 2], u32, f32))> = memo
+        .bounties
+        .iter()
+        .filter(|(id, _)| !cur_bounties.contains_key(*id))
+        .collect();
+    gone.sort_unstable_by_key(|(id, _)| **id);
+    for (_, (pos, _, expires_at)) in gone {
+        // Tolerance absorbs the rounded clock; anything still short of its
+        // deadline was taken, not timed out.
+        if now + BOUNTY_EXPIRY_EPS < *expires_at {
+            out.push((
+                format!("bounty gone @({:.1},{:.1})", pos[0], pos[1]),
+                EventSeverity::Info,
+                Some(ev_ground(*pos)),
+            ));
+        }
+    }
+
+    // --- remember --------------------------------------------------------
+    memo.units = cur_units;
+    memo.buildings = cur_buildings;
+    memo.hero_alive = hero_alive;
+    memo.hero_level = hero_level;
+    memo.hero_pos = hero_pos;
+    memo.hero_low = hero_low;
+    memo.threat = threat;
+    memo.squad_members = members;
+    memo.bounties = cur_bounties;
+
+    out
 }
