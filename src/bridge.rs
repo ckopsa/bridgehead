@@ -6,7 +6,13 @@
 //! value opens one *seat* per faction it names:
 //!   * `1` / `red` / `claude` — the Claude (red) faction, in `bridge/red/`,
 //!   * `blue` / `human` — the Human (blue) faction, in `bridge/blue/`,
-//!   * `both` / `2` — both seats at once, so two commanders can fight.
+//!   * `both` / `2` — both seats at once, so two commanders can fight,
+//!   * `copilot` / `co` — CO-COMMAND: one seat on `Team::Human`, in
+//!     `bridge/copilot/`, *beside* the player at the keyboard rather than
+//!     opposite them. Transport is identical; what differs is that its
+//!     non-doctrine commands are proposals until the human approves them, and
+//!     that it does not displace anybody. See copilot.rs and
+//!     docs/INTENT.md § co-command.
 //!
 //! NOTE (breaking change): a seat's files live in `bridge/<seat>/`, not directly
 //! in `bridge/` as they did when there was only one seat. `WC3_BRIDGE=1` now
@@ -120,6 +126,12 @@
 //! right now?" for every catalog entry, computed from the seat's own completed
 //! buildings. The same check gates the `build` and `train` commands, so a
 //! commander that respects `unlocked` never has an order bounced by economy.rs.
+//! For a unit that means BOTH halves of "right now" — the tech gates met and a
+//! finished building of ours that trains it standing somewhere. The map used to
+//! report only the first half, so a team with no Barracks read `Footman: true`;
+//! the honest answer, and the one that stops a `train` bouncing, is no. Planning
+//! ahead is still the catalog's job: `units[].requires` lists the whole chain,
+//! trainer included, and does not care what you own yet.
 //!
 //! Abilities and items are described by the catalog (`abilities`, `items`) and
 //! driven by three commands: `cast` takes any caster — a hero of either class
@@ -169,6 +181,7 @@
 //! array instead of a panic.
 
 use crate::command::{CommandLink, PendingOrder};
+use crate::copilot::{Copilot, CopilotWire, Proposal};
 use crate::intent::{set_autopilot, IntentApply};
 use crate::shared::*;
 use bevy::ecs::system::SystemParam;
@@ -209,6 +222,12 @@ const TREES_NEAR: usize = 12;
 
 pub struct BridgePlugin;
 
+/// `poll_commands`, as a set copilot.rs can order after: a co-commander's
+/// negotiation layer sits between reading the wire and compiling it, and needs
+/// to be in the same frame as both.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BridgePoll;
+
 impl Plugin for BridgePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Bridge>()
@@ -224,7 +243,7 @@ impl Plugin for BridgePlugin {
                 // the previous frame's. (`IntentApply` is itself `.after(FogSet)`,
                 // so the compiler judges visibility against the same grid.)
                 (
-                    poll_commands.before(IntentApply),
+                    poll_commands.in_set(BridgePoll).before(IntentApply),
                     write_snapshot.after(IntentApply),
                 )
                     .after(FogSet)
@@ -233,12 +252,27 @@ impl Plugin for BridgePlugin {
     }
 }
 
+/// What a seat *is* to its faction. Transport is identical either way; this
+/// decides the directory name, whether the scripted AI is displaced, and
+/// whether commands go through the negotiation layer in copilot.rs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeatRole {
+    /// The seat IS the faction: it replaces the scripted macro AI and is the
+    /// only author on its side. The historical behaviour of every seat.
+    Commander,
+    /// The seat is a SECOND author on a faction the human is playing. It does
+    /// not displace anybody, and its non-doctrine commands are proposals until
+    /// the human approves them. See copilot.rs.
+    Copilot,
+}
+
 /// One external commander's channel: its faction, its directory, and all of the
 /// protocol state that must never be shared with another seat.
 struct Seat {
     /// The faction this seat commands. Every "own"/"me"/"enemy" decision in
     /// this file is taken against it.
     team: Team,
+    role: SeatRole,
     /// `bridge/red` or `bridge/blue`.
     dir: PathBuf,
     /// `<dir>/state.json`, `<dir>/state.tmp`, `<dir>/commands.json`.
@@ -262,10 +296,11 @@ struct Seat {
 }
 
 impl Seat {
-    fn new(team: Team) -> Self {
-        let dir = PathBuf::from(BRIDGE_DIR).join(seat_name(team));
+    fn new(team: Team, role: SeatRole) -> Self {
+        let dir = PathBuf::from(BRIDGE_DIR).join(seat_dir(team, role));
         Seat {
             team,
+            role,
             state_file: dir.join(STATE_NAME),
             state_tmp: dir.join(STATE_TMP_NAME),
             commands_file: dir.join(COMMANDS_NAME),
@@ -281,11 +316,14 @@ impl Seat {
 }
 
 /// Directory (and log) name of a seat: red plays Claude, blue plays Human —
-/// the same colours the game window uses.
-fn seat_name(team: Team) -> &'static str {
-    match team {
-        Team::Claude => "red",
-        Team::Human => "blue",
+/// the same colours the game window uses. A co-commander gets its own name
+/// rather than its team's colour, because it is not the faction: `bridge/blue`
+/// is "whoever is playing blue", and in copilot mode that is the human.
+fn seat_dir(team: Team, role: SeatRole) -> &'static str {
+    match (role, team) {
+        (SeatRole::Copilot, _) => "copilot",
+        (SeatRole::Commander, Team::Claude) => "red",
+        (SeatRole::Commander, Team::Human) => "blue",
     }
 }
 
@@ -300,18 +338,27 @@ fn bridge_enabled(bridge: Res<Bridge>) -> bool {
     !bridge.seats.is_empty()
 }
 
-/// Which factions `WC3_BRIDGE` asks for. `None` means "leave the bridge off".
-fn seats_from_env(raw: &str) -> Option<Vec<Team>> {
+/// Which factions `WC3_BRIDGE` asks for, and in what role. `None` means "leave
+/// the bridge off".
+fn seats_from_env(raw: &str) -> Option<Vec<(Team, SeatRole)>> {
+    use SeatRole::{Commander, Copilot};
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "0" => None,
-        "1" | "red" | "claude" => Some(vec![Team::Claude]),
-        "blue" | "human" => Some(vec![Team::Human]),
-        "both" | "2" => Some(vec![Team::Claude, Team::Human]),
+        "1" | "red" | "claude" => Some(vec![(Team::Claude, Commander)]),
+        "blue" | "human" => Some(vec![(Team::Human, Commander)]),
+        "both" | "2" => Some(vec![(Team::Claude, Commander), (Team::Human, Commander)]),
+        // CO-COMMAND. One seat, on the HUMAN's team, alongside the player at
+        // the keyboard rather than opposite them. Deliberately its own value
+        // instead of a modifier on `blue`: "who else is playing this faction"
+        // and "which faction is this" are different questions, and a mode that
+        // changes what approval a command needs should be impossible to enter
+        // by accident.
+        "copilot" | "co" => Some(vec![(Team::Human, Copilot)]),
         // Anything else truthy keeps the historical "any value enables it"
         // behaviour rather than silently starting no bridge at all.
         other => {
             warn!("{BRIDGE_ENV}: unrecognized value '{other}' — assuming 'red'");
-            Some(vec![Team::Claude])
+            Some(vec![(Team::Claude, Commander)])
         }
     }
 }
@@ -322,6 +369,7 @@ fn bridge_startup(
     mut bridge: ResMut<Bridge>,
     mut ai_controlled: ResMut<AiControlled>,
     mut external: ResMut<ExternallyCommanded>,
+    mut copilot: ResMut<Copilot>,
 ) {
     let Ok(raw) = std::env::var(BRIDGE_ENV) else {
         return;
@@ -340,8 +388,8 @@ fn bridge_startup(
         }
     };
 
-    for team in teams {
-        let seat = Seat::new(team);
+    for (team, role) in teams {
+        let seat = Seat::new(team, role);
         if let Err(err) = std::fs::create_dir_all(&seat.dir) {
             error!(
                 "{BRIDGE_ENV}: cannot create {}/ ({err}) — {:?} seat disabled",
@@ -364,23 +412,56 @@ fn bridge_startup(
                 );
             }
         }
-        // The external commander replaces the scripted macro AI on *its* side
-        // only; the other faction keeps whatever ai.rs decided.
-        set_autopilot(&mut ai_controlled, team, false);
-        // ...but the team is still machine-driven, which is what keeps
-        // doctrine's default-squad autonomy active for it.
-        match team {
-            Team::Human => external.human = true,
-            Team::Claude => external.claude = true,
+        match role {
+            SeatRole::Commander => {
+                // The external commander replaces the scripted macro AI on
+                // *its* side only; the other faction keeps whatever ai.rs
+                // decided.
+                set_autopilot(&mut ai_controlled, team, false);
+                // ...but the team is still machine-driven, which is what keeps
+                // doctrine's default-squad autonomy active for it.
+                match team {
+                    Team::Human => external.human = true,
+                    Team::Claude => external.claude = true,
+                }
+                info!(
+                    "{BRIDGE_ENV}: live bridge seat '{}' active — {:?} is under external \
+                     control (snapshot {}, commands {})",
+                    seat_dir(team, role),
+                    team,
+                    seat.state_file.display(),
+                    seat.commands_file.display()
+                );
+            }
+            SeatRole::Copilot => {
+                // Deliberately NEITHER of the two lines above.
+                //
+                // `ExternallyCommanded` is what tells doctrine.rs "a machine
+                // is driving this team, so pool its idle units into squad 0
+                // and seed them a posture" — an autonomy floor that exists to
+                // compensate for a slow commander. There is no slow commander
+                // here: there is a human with a mouse, who keeps full
+                // authority over where their idle units stand. Setting the
+                // flag would have the engine start quietly enrolling the
+                // player's army the moment a co-commander connected, which is
+                // the opposite of asking permission.
+                //
+                // Nor is autopilot touched: `Team::Human` is not AI-controlled
+                // by default, and if the player *has* handed their faction to
+                // the scripted AI, a co-commander connecting is no reason to
+                // take it back for them.
+                copilot.seat(team);
+                info!(
+                    "{BRIDGE_ENV}: CO-COMMAND seat active — {:?} is played by the human \
+                     at the keyboard WITH a co-commander (trust: {}, snapshot {}, \
+                     commands {})",
+                    team,
+                    copilot.policy.name(),
+                    seat.state_file.display(),
+                    seat.commands_file.display()
+                );
+            }
         }
-        info!(
-            "{BRIDGE_ENV}: live bridge seat '{}' active — {:?} is under external \
-             control (snapshot {}, commands {})",
-            seat_name(team),
-            team,
-            seat.state_file.display(),
-            seat.commands_file.display()
-        );
         bridge.seats.push(seat);
     }
 }
@@ -450,6 +531,75 @@ struct StateOut {
     /// reading it. Absent entirely when `WC3_COMMAND_LATENCY` is off.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     command_nodes: Vec<CommandNodeOut>,
+
+    // --- co-command (copilot seats only) ---------------------------------
+    //
+    // All three are `Option` and skipped when absent, so an ordinary seat's
+    // snapshot keeps exactly the 16 keys it has always had, byte-shape
+    // identical. A copilot seat gets them always — including as empty lists,
+    // so the shape a co-commander parses does not change the moment its first
+    // proposal lands.
+    /// This seat's own etiquette, read out of the game rather than out of the
+    /// environment: which verbs it may send directly, how long a proposal
+    /// lives, how many may be outstanding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copilot: Option<CopilotOut>,
+    /// Directives this seat has proposed that the human has not answered yet,
+    /// oldest first. A proposal leaves this list by being approved, vetoed or
+    /// lapsing — and all three outcomes are announced in `events`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposals: Option<Vec<ProposalOut>>,
+    /// **The other half of legibility.** The recent intents of this seat's
+    /// team, oldest first, each tagged with which author spelled it — so the
+    /// ones tagged `"ui"` are the human's own, in the same English the replay
+    /// log will show. Without this a co-commander would be the only one of the
+    /// two partners who cannot see what the other just did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partner_log: Option<Vec<JournalOut>>,
+}
+
+/// The co-command contract, as this seat sees it.
+#[derive(Serialize)]
+struct CopilotOut {
+    /// `"split"` (default), `"full"` or `"strict"` — `WC3_COPILOT_TRUST`.
+    trust: &'static str,
+    /// Verbs this seat may send WITHOUT a `propose` wrapper. `["*"]` under
+    /// full trust, empty under strict. Anything not here is refused with an
+    /// error that shows the wrapper.
+    direct: Vec<&'static str>,
+    /// Game seconds an unanswered proposal survives.
+    propose_ttl: f32,
+    /// How many proposals may be outstanding before new ones are refused.
+    max_pending: usize,
+}
+
+/// One directive waiting on the human.
+#[derive(Serialize)]
+struct ProposalOut {
+    id: u32,
+    /// What this seat said it was for.
+    note: String,
+    /// The compiled English of each command — the same `Intent::sentence()`
+    /// the human is reading off the HUD and the log will write afterwards.
+    sentences: Vec<String>,
+    /// What the human was told this would disturb: their squads, their recent
+    /// orders. Empty when it steps on nothing.
+    conflicts: Vec<String>,
+    /// Game seconds until it lapses unanswered.
+    expires_in: f32,
+}
+
+/// One remembered intent of this team, whoever wrote it.
+#[derive(Serialize)]
+struct JournalOut {
+    t: f32,
+    /// `"ui"` (the human at the keyboard), `"copilot"` (this seat), or
+    /// `"bridge"`. The same tag `units[].why` carries.
+    source: &'static str,
+    verb: &'static str,
+    sentence: String,
+    /// False when the compiler refused some or all of it.
+    ok: bool,
 }
 
 /// One delivered command and its realised link cost, in seconds.
@@ -998,6 +1148,17 @@ struct SeatVerdicts<'w> {
     applied: Res<'w, IntentApplied>,
 }
 
+/// The co-command side-channel: the pending proposal queue and the team's
+/// recent intent history. Bundled for the same reason `TeamTech` is — this
+/// system sits on Bevy's 16-parameter ceiling, and these two answer the one
+/// question ("what has been said on this team, and what is still being asked")
+/// that only a copilot seat's snapshot carries.
+#[derive(SystemParam)]
+struct CoCommand<'w> {
+    copilot: Res<'w, Copilot>,
+    journal: Res<'w, IntentJournal>,
+}
+
 fn write_snapshot(
     time: Res<Time>,
     real: Res<Time<Real>>,
@@ -1010,6 +1171,7 @@ fn write_snapshot(
     feed: Res<GameEvents>,
     fog: Res<FogGrids>,
     verdicts: SeatVerdicts,
+    co: CoCommand,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
     neutrals: SnapshotNeutrals,
@@ -1029,6 +1191,20 @@ fn write_snapshot(
         seat.force_snapshot = false;
         // The seat's own team's fog — the whole point of a per-seat snapshot.
         let seat_fog = fog.get(seat.team);
+        // The co-command block, for the one role that has one. An ordinary
+        // seat is handed `None` and serializes exactly what it always did.
+        let co_out = (seat.role == SeatRole::Copilot).then(|| {
+            (
+                CopilotOut {
+                    trust: co.copilot.policy.name(),
+                    direct: crate::copilot::direct_verbs(co.copilot.policy),
+                    propose_ttl: crate::copilot::PROPOSAL_TTL,
+                    max_pending: crate::copilot::MAX_PENDING,
+                },
+                proposals_out(&co.copilot.pending, now),
+                journal_out(co.journal.get(seat.team)),
+            )
+        });
         write_seat_snapshot(
             seat,
             now,
@@ -1042,6 +1218,7 @@ fn write_snapshot(
             (fog.enabled(), seat_fog),
             verdicts.errors.get(seat.team),
             verdicts.applied.get(seat.team),
+            co_out,
             &units,
             &buildings,
             &neutrals.nodes,
@@ -1067,10 +1244,20 @@ fn write_seat_snapshot(
     fog: (bool, &FogGrid),
     // Per-command validation errors this team's intents produced, from the
     // shared compiler. Reported alongside the seat's own batch-level errors.
+    //
+    // NOTE for co-command: `IntentErrors` is keyed by TEAM, not by seat, so a
+    // copilot's array also carries the human's refused gestures (`ui: …`).
+    // That is deliberate rather than tolerated — a partner who can see that
+    // your click just bounced off a stale ghost is a partner who can stop
+    // proposing around it.
     intent_errors: &[String],
     // What the rest of that batch cost to deliver — see `StateOut::applied`.
     // Empty whenever nothing was charged, which is always with the feature off.
     intent_applied: &[AppliedCommand],
+    // `Some` for a copilot seat: its etiquette, its pending queue, its team's
+    // recent sentences. `None` for every other seat, which is what keeps their
+    // wire format unchanged.
+    co: Option<(CopilotOut, Vec<ProposalOut>, Vec<JournalOut>)>,
     units: &SnapshotUnits,
     buildings: &SnapshotBuildings,
     nodes: &SnapshotNodes,
@@ -1356,6 +1543,10 @@ fn write_seat_snapshot(
     let hero_slots_used = (my_hero_classes.len() + queued_hero_classes.len()) as u32;
 
     let map = crate::terrain::active_map();
+    let (copilot_out, proposals_out, partner_log) = match co {
+        Some((copilot, proposals, journal)) => (Some(copilot), Some(proposals), Some(journal)),
+        None => (None, None, None),
+    };
     let command_nodes: Vec<CommandNodeOut> = if link.latency.on {
         link.nodes
             .own(me)
@@ -1491,6 +1682,9 @@ fn write_seat_snapshot(
         bounties: bounties_out,
         events,
         command_nodes,
+        copilot: copilot_out,
+        proposals: proposals_out,
+        partner_log,
     };
 
     let json = match serde_json::to_string(&state) {
@@ -1522,6 +1716,19 @@ fn write_seat_snapshot(
 /// Every catalog entry -> can this team build/train it with what it has
 /// standing right now. Derived from the shared kind tables, so new content is
 /// reported without touching this file.
+///
+/// "Right now" is the whole contract, and for a UNIT it takes two facts, not
+/// one. `unit_requires` is deliberately partial — it lists the gates BEYOND
+/// owning the trainer, because the trainer is normally checked by the order
+/// being given AT it. A map built from that half alone answered `Footman: true`
+/// for a team with no Barracks: every tech gate satisfied (there are none),
+/// and nowhere on the map to train one. That is not a caveat, it is a wrong
+/// answer to the only question this map is asked, and it cost a commander a
+/// bounced `train` to discover.
+///
+/// So a unit is unlocked when its tech gates are met AND this team has a
+/// finished building standing that trains it. Buildings are unchanged: nothing
+/// produces a building except a worker, which every team always has.
 fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
     let mut out = BTreeMap::new();
     for kind in ALL_BUILDING_KINDS {
@@ -1537,9 +1744,10 @@ fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
         );
     }
     for kind in ALL_UNIT_KINDS {
+        let has_trainer = completed.iter().any(|b| trainable(*b).contains(&kind));
         out.insert(
             kind_name(kind),
-            requirements_met(unit_requires(kind), completed.iter().copied()),
+            has_trainer && requirements_met(unit_requires(kind), completed.iter().copied()),
         );
     }
     out
@@ -1553,6 +1761,40 @@ fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
 // snapshots. It now lives in `shared::GameEvents`, produced once per team per
 // tick — because the HUD needs the same stream, and a feed with two producers
 // is two feeds. See the "Event feed" section of shared.rs.
+
+// ---------------------------------------------------------------------------
+// Co-command serializers
+// ---------------------------------------------------------------------------
+
+/// The pending queue, oldest first — the same order the human's panel shows
+/// and the same order their approve/veto keys walk, so "#3" means one thing.
+fn proposals_out(pending: &[Proposal], now: f32) -> Vec<ProposalOut> {
+    pending
+        .iter()
+        .map(|p| ProposalOut {
+            id: p.id,
+            note: p.note.clone(),
+            sentences: p.sentences.clone(),
+            conflicts: p.conflicts.clone(),
+            expires_in: r1(p.expires_in(now)),
+        })
+        .collect()
+}
+
+/// The team's recent sentences, oldest last-in-the-array first — same order as
+/// `events`, so a reader that walks one walks the other the same way.
+fn journal_out(entries: &std::collections::VecDeque<JournalEntry>) -> Vec<JournalOut> {
+    entries
+        .iter()
+        .map(|e| JournalOut {
+            t: e.t,
+            source: e.source.name(),
+            verb: e.verb,
+            sentence: e.sentence.clone(),
+            ok: e.ok,
+        })
+        .collect()
+}
 
 /// Count squad members per id, own team only (the snapshot only carries
 /// `squad` for our own units, so enemies can't leak in here).
@@ -1607,6 +1849,7 @@ fn poll_commands(
     mut intent_errors: ResMut<IntentErrors>,
     mut intent_applied: ResMut<IntentApplied>,
     mut submissions: EventWriter<SubmitIntent>,
+    mut copilot_wire: EventWriter<CopilotWire>,
 ) {
     let delta = real.delta();
     // Every seat is polled independently; one seat's unreadable or malformed
@@ -1662,20 +1905,34 @@ fn poll_commands(
                 .push("batch: game over — commands ignored".to_string());
         } else {
             for (i, raw) in batch.commands.iter().enumerate() {
+                // The historical error prefix, so a commander that greps for
+                // `cmd 3` still finds its third command — both roles.
+                let tag = format!("cmd {i}");
+                if seat.role == SeatRole::Copilot {
+                    // Transport stops here. A co-commander's wire carries one
+                    // shape an ordinary seat's does not (`propose`), and what
+                    // it is allowed to say without asking is a question about
+                    // partnership rather than about files — so copilot.rs
+                    // parses and classifies, in this same frame.
+                    copilot_wire.write(CopilotWire {
+                        team: seat.team,
+                        tag,
+                        raw: raw.clone(),
+                    });
+                    continue;
+                }
                 match serde_json::from_value::<Intent>(raw.clone()) {
                     Ok(intent) => {
                         submissions.write(SubmitIntent {
                             team: seat.team,
                             source: IntentSource::Bridge,
-                            // The historical error prefix, so a commander that
-                            // greps for `cmd 3` still finds its third command.
-                            tag: format!("cmd {i}"),
+                            tag,
                             intent,
                         });
                     }
                     Err(err) => intent_errors
                         .get_mut(seat.team)
-                        .push(format!("cmd {i}: unrecognized command ({err})")),
+                        .push(format!("{tag}: unrecognized command ({err})")),
                 }
             }
         }
@@ -1753,5 +2010,75 @@ mod tests {
             unit_requires(UnitKind::Spearman).is_empty(),
             "the tier-1 answer to cavalry must not itself be tech-gated"
         );
+    }
+
+    /// The bug this replaced: a team holding nothing but its town hall was told
+    /// `Footman: true`, because the Footman has no tech gate and the map never
+    /// asked where one would be trained.
+    #[test]
+    fn unlocked_needs_the_trainer_standing_not_just_the_tech() {
+        let opening = unlocked_map(&[BuildingKind::TownHall]);
+        assert_eq!(
+            opening["Footman"], false,
+            "no Barracks means no Footman, whatever the tech table says"
+        );
+        assert_eq!(opening["Archer"], false);
+        assert_eq!(opening["Spearman"], false);
+        // The hall trains these three itself, so they are honestly available.
+        assert_eq!(opening["Worker"], true);
+        assert_eq!(opening["Hero"], true);
+        assert_eq!(opening["Priestess"], true);
+        // Buildings are unaffected: a worker is the trainer, and every team
+        // has one.
+        assert_eq!(opening["Barracks"], true);
+        assert_eq!(opening["Tower"], false, "Tower is still gated on Barracks");
+
+        let with_barracks = unlocked_map(&[BuildingKind::TownHall, BuildingKind::Barracks]);
+        assert_eq!(with_barracks["Footman"], true);
+        assert_eq!(with_barracks["Tower"], true);
+    }
+
+    /// Both halves are required, in both directions: owning the trainer is not
+    /// enough when the unit carries its own gate, and satisfying the gate is
+    /// not enough without the trainer.
+    #[test]
+    fn a_unit_gate_and_its_trainer_are_both_load_bearing() {
+        // Castle satisfies the Knight's gate; without a Barracks he has no
+        // stable.
+        let castle_only = unlocked_map(&[BuildingKind::Castle]);
+        assert_eq!(castle_only["Knight"], false);
+        assert_eq!(
+            castle_only["GryphonRider"], false,
+            "the Gryphon needs the Workshop as well as the Castle"
+        );
+
+        // Barracks without the Castle: the gate bites instead.
+        let barracks_only = unlocked_map(&[BuildingKind::TownHall, BuildingKind::Barracks]);
+        assert_eq!(barracks_only["Knight"], false);
+
+        let both = unlocked_map(&[BuildingKind::Castle, BuildingKind::Barracks]);
+        assert_eq!(both["Knight"], true);
+
+        // And the Gryphon's full chain, which is what the AI's air path needs
+        // standing before it can ever pick one: Castle + Workshop.
+        let air = unlocked_map(&[
+            BuildingKind::Castle,
+            BuildingKind::Barracks,
+            BuildingKind::Workshop,
+        ]);
+        assert_eq!(air["GryphonRider"], true);
+        assert_eq!(air["Catapult"], true);
+    }
+
+    /// A Keep is a TownHall that grew: intersecting with trainers must go
+    /// through `trainable`, which knows the whole hall ladder, and not through
+    /// `kind == TownHall`.
+    #[test]
+    fn an_upgraded_hall_still_trains_its_roster() {
+        for hall in [BuildingKind::Keep, BuildingKind::Castle] {
+            let map = unlocked_map(&[hall]);
+            assert_eq!(map["Worker"], true, "{hall:?} must still train workers");
+            assert_eq!(map["Priestess"], true);
+        }
     }
 }

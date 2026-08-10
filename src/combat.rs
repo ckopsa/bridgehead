@@ -1711,6 +1711,271 @@ fn update_health_bars(
 // than a strictly-better Footman: it must beat cavalry it could never catch,
 // and it must lose to the same gold spent on Footmen.
 
+// ---------------------------------------------------------------------------
+// Fixed-clock simulation harness (test-only)
+// ---------------------------------------------------------------------------
+
+/// A headless `App` whose clock is advanced by hand, so a test can run the
+/// REAL combat systems at a fixed timestep and get the same answer every run.
+///
+/// # Why this exists
+///
+/// Every balance assertion in this repo used to be arithmetic — `engage()`
+/// below re-implements the trade loop from the stat tables, because `Time`
+/// under `MinimalPlugins` is driven by the wall clock: `app.update()` in a test
+/// advances the world by however long the previous line happened to take. You
+/// cannot assert "the Spearman wins with 30% health left" against a clock that
+/// is different on every machine, so nobody tried; the probes re-derived the
+/// rules instead of exercising them. A re-implementation can only ever confirm
+/// that the tables say what the test thinks they say. It cannot catch a bug in
+/// `engagement`, in `apply_damage`, in acquisition, or in the order in which
+/// they run — which is where balance actually lives.
+///
+/// The fix is small: build the `App` WITHOUT `TimePlugin` (so nothing
+/// overwrites `Time` from the wall clock), insert a bare `Time`, and call
+/// `Time::advance_by` yourself before each `app.update()`. The clock is then a
+/// number the test chose. `shared.rs`'s fog tests already do this by hand for
+/// single steps; this wraps the same trick in something a duel can run 6000
+/// ticks through.
+///
+/// The clock is `Time<()>` and not `Time<Virtual>` on purpose: `Time<()>` is
+/// the resource every gameplay system in this crate reads (`time.delta_secs()`,
+/// `time.elapsed_secs()`), and with no `TimePlugin` present there is nothing to
+/// generalise it from. Advancing the one clock the systems read is the whole
+/// mechanism.
+///
+/// # How a future balance bead should use it
+///
+/// ```ignore
+/// let mut sim = FixedClockSim::new();
+/// sim.spawn_unit(UnitKind::Spearman, Team::Human, Vec3::new(-1.0, 0.0, 0.0));
+/// sim.spawn_unit(UnitKind::Raider,   Team::Claude, Vec3::new( 1.0, 0.0, 0.0));
+/// let elapsed = sim.run_until_one_side_falls();
+/// assert_eq!(sim.alive(Team::Claude), 0);
+/// assert!(sim.team_hp_fraction(Team::Human) > 0.25);
+/// ```
+///
+/// Assert on outcomes and generous margins, not on exact HP: the point is to
+/// run the real rules, and real rules acquire targets on a 200ms timer, so a
+/// tick or two of jitter around the edges is expected and healthy. If your
+/// assertion needs `DT` to be a specific value to hold, it is measuring the
+/// harness, not the game.
+///
+/// # What is in the world, and what is deliberately not
+///
+/// Registered: `ensure_combat_state`, `handle_attack_orders`, `acquire_targets`,
+/// `engagement`, `tower_*`, `update_projectiles`, `apply_damage`, and shared's
+/// `apply_damage` follow-through — `apply_death` (so a corpse stops swinging)
+/// and `tick_status_effects` (so a Slow expires). `TransformPlugin` runs, so
+/// the chase repositioning `engagement` does reaches `GlobalTransform`.
+///
+/// NOT registered, and each omission is a real limit:
+/// - **units.rs movement.** `engagement` closes distance by inserting `MoveTo`
+///   and letting units.rs walk it; with no units.rs, a unit out of range stands
+///   there wanting to move. **Spawn combatants within weapon range** (that is
+///   what `spawn_duel` does) or you will time out with everyone at full health.
+/// - **economy.rs / ai.rs.** Nothing is trained, harvested or paid for. Spawn
+///   the board you want to measure.
+/// - **`cast_abilities` / `use_items`.** They need the ability, item and hero
+///   plumbing; a duel does not. Add them (and their resources) the day a bead
+///   needs to measure an ability.
+///
+/// The harness is `#[cfg(test)] pub(crate)` so tests in any module can build
+/// one: it lives here because it must construct combat.rs's private
+/// `CombatAssets`, and a balance probe is a combat question anyway.
+#[cfg(test)]
+pub(crate) struct FixedClockSim {
+    app: App,
+    /// Seconds advanced so far — the harness's own count, not the clock's, so
+    /// it stays exact regardless of float accumulation inside `Time`.
+    elapsed: f32,
+}
+
+#[cfg(test)]
+impl FixedClockSim {
+    /// The timestep. 50 Hz: fine enough that a 0.6s attack cooldown lands
+    /// within a couple of percent of its true value, coarse enough that a
+    /// two-minute duel is 6000 updates and still runs in well under a second.
+    pub(crate) const DT: f32 = 0.02;
+
+    /// How long `run_until_one_side_falls` will wait before declaring a
+    /// stalemate. Two game-minutes, the same ceiling the arithmetic probe uses.
+    pub(crate) const TIMEOUT: f32 = 120.0;
+
+    pub(crate) fn new() -> Self {
+        let mut app = App::new();
+        // No TimePlugin: this `Time` is ours, and only `step` moves it.
+        app.init_resource::<Time>()
+            .init_resource::<NavGrid>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<TeamResearch>()
+            .add_event::<DamageEvent>()
+            .add_event::<XpDrop>()
+            .insert_resource(CombatAssets::test_stub())
+            .add_plugins(bevy::transform::TransformPlugin)
+            .add_systems(
+                Update,
+                (
+                    ensure_combat_state,
+                    ensure_tower_state,
+                    handle_attack_orders,
+                    acquire_targets.run_if(on_timer(Duration::from_millis(200))),
+                    tower_acquire.run_if(on_timer(Duration::from_millis(200))),
+                    engagement,
+                    tower_fire,
+                    update_projectiles,
+                    apply_damage,
+                    // The shared follow-through, in the order CorePlugin runs
+                    // it: the dead are removed before the next tick asks them
+                    // to swing.
+                    crate::shared::apply_death,
+                    crate::shared::tick_status_effects,
+                )
+                    .chain(),
+            );
+        Self { app, elapsed: 0.0 }
+    }
+
+    /// Put a unit on the board at full health, idle, with its `GlobalTransform`
+    /// seeded — the same contract units.rs's spawner honours, and the reason
+    /// combat does not read a fresh spawn as sitting at the origin.
+    pub(crate) fn spawn_unit(&mut self, kind: UnitKind, team: Team, pos: Vec3) -> Entity {
+        let transform = Transform::from_translation(pos);
+        self.app
+            .world_mut()
+            .spawn((
+                Unit { kind },
+                team,
+                Health::new(unit_stats(kind).hp),
+                Order::Idle,
+                transform,
+                GlobalTransform::from(transform),
+            ))
+            .id()
+    }
+
+    /// `a_n` of one kind against `b_n` of another, placed in a line close
+    /// enough that BOTH sides are already inside their own weapon range — the
+    /// harness runs no pathfinding, so a duel that has to walk never starts.
+    ///
+    /// Ranks are spread by a body-width along Z so nobody is spawned inside
+    /// anybody, and the two sides sit on either side of the origin.
+    pub(crate) fn spawn_duel(
+        &mut self,
+        a_kind: UnitKind,
+        a_n: usize,
+        b_kind: UnitKind,
+        b_n: usize,
+    ) -> (Vec<Entity>, Vec<Entity>) {
+        // Half the SHORTER of the two reaches, so the longer-ranged side is not
+        // handed a free opening volley the melee side cannot answer. Contact is
+        // contact; who should have got there first is a movement question, and
+        // movement is not what a balance probe is measuring.
+        let gap = unit_stats(a_kind)
+            .range
+            .min(unit_stats(b_kind).range)
+            .max(1.0)
+            * 0.5;
+        let rank = |n: usize, i: usize| (i as f32 - (n as f32 - 1.0) * 0.5) * 1.6;
+        let a = (0..a_n)
+            .map(|i| self.spawn_unit(a_kind, Team::Human, Vec3::new(-gap, 0.0, rank(a_n, i))))
+            .collect();
+        let b = (0..b_n)
+            .map(|i| self.spawn_unit(b_kind, Team::Claude, Vec3::new(gap, 0.0, rank(b_n, i))))
+            .collect();
+        (a, b)
+    }
+
+    /// One tick: advance the clock by exactly `DT`, then run the schedule.
+    pub(crate) fn step(&mut self) {
+        self.app
+            .world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(Self::DT));
+        self.app.update();
+        self.elapsed += Self::DT;
+    }
+
+    /// Step until `done` says so or `TIMEOUT` game-seconds pass. Returns the
+    /// elapsed game time, so a pacing bead can assert on "how long", not only
+    /// on "who".
+    pub(crate) fn run_until(&mut self, mut done: impl FnMut(&mut Self) -> bool) -> f32 {
+        let start = self.elapsed;
+        while self.elapsed - start < Self::TIMEOUT {
+            if done(self) {
+                break;
+            }
+            self.step();
+        }
+        self.elapsed - start
+    }
+
+    /// The common case: run until one team has nothing left alive.
+    pub(crate) fn run_until_one_side_falls(&mut self) -> f32 {
+        self.run_until(|sim| {
+            sim.alive(Team::Human) == 0 || sim.alive(Team::Claude) == 0
+        })
+    }
+
+    /// Living units of a team. Dead ones are despawned by `apply_death`, so
+    /// this is a straight count.
+    pub(crate) fn alive(&mut self, team: Team) -> usize {
+        self.app
+            .world_mut()
+            .query::<(&Unit, &Team, &Health)>()
+            .iter(self.app.world())
+            .filter(|(_, t, hp)| **t == team && hp.current > 0.0)
+            .count()
+    }
+
+    /// A team's surviving health as a fraction of what its units started with —
+    /// "wins comfortably" as a number rather than a vibe. Uses each survivor's
+    /// `max`, so it needs no record of the starting board.
+    pub(crate) fn team_hp_fraction(&mut self, team: Team) -> f32 {
+        let (current, max) = self
+            .app
+            .world_mut()
+            .query::<(&Team, &Health)>()
+            .iter(self.app.world())
+            .filter(|(t, _)| **t == team)
+            .fold((0.0, 0.0), |(c, m), (_, hp)| (c + hp.current.max(0.0), m + hp.max));
+        if max <= 0.0 { 0.0 } else { current / max }
+    }
+
+    /// Escape hatch for anything the accessors above do not cover — spawning a
+    /// building, stamping doctrine, reading a component off a survivor.
+    #[allow(dead_code)]
+    pub(crate) fn world_mut(&mut self) -> &mut World {
+        self.app.world_mut()
+    }
+}
+
+#[cfg(test)]
+impl CombatAssets {
+    /// Every handle default (dangling), every per-index table filled to the
+    /// length its lookup indexes. Nothing renders in a headless test, but
+    /// `engagement` and `tower_fire` take `Res<CombatAssets>` to hang meshes
+    /// off projectiles, so the resource has to EXIST — and `hp_mat` /
+    /// `status_mat` index into their vectors, so empty ones would panic the
+    /// day a probe adds health bars.
+    fn test_stub() -> Self {
+        Self {
+            quad: Handle::default(),
+            bar_bg: Handle::default(),
+            hp_mats: vec![Handle::default(); 9],
+            proj_mesh: Handle::default(),
+            proj_human: Handle::default(),
+            proj_claude: Handle::default(),
+            proj_holy: Handle::default(),
+            ring_mesh: Handle::default(),
+            shock_mat: Handle::default(),
+            shock_heal_mat: Handle::default(),
+            shock_militia_mat: Handle::default(),
+            status_mats: vec![Handle::default(); ALL_STATUS_KINDS.len()],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1856,6 +2121,56 @@ mod tests {
             // walking one Spearman at a Raider is not free.
             left > 0.25,
             "Spearman should finish comfortably ahead, had {left:.3} left",
+        );
+    }
+
+    /// The same claim as `spearman_beats_raider_one_on_one`, made by the game
+    /// instead of by a re-implementation of it.
+    ///
+    /// This is the proof that `FixedClockSim` works, and the template every
+    /// future balance bead should copy. Nothing here reads a stat table: two
+    /// units are put on a board, the real `acquire_targets` finds them each
+    /// other, the real `engagement` swings on the real cooldown, the real
+    /// `apply_damage` subtracts through `damage_after_armor`, and the real
+    /// `apply_death` removes the loser. The margin is asserted loosely on
+    /// purpose — acquisition runs on a 200ms timer, so the winner's exact
+    /// remaining HP moves by a tick's worth of damage depending on where the
+    /// fight starts relative to that timer, and a probe that pinned it would be
+    /// measuring the harness.
+    ///
+    /// It is kept ALONGSIDE the arithmetic version rather than replacing it:
+    /// two independent derivations agreeing is the point. If they ever
+    /// disagree, the systems are wrong or the arithmetic model has drifted
+    /// from them, and either is worth being told about.
+    #[test]
+    fn spearman_beats_raider_one_on_one_in_a_real_sim() {
+        let mut sim = FixedClockSim::new();
+        sim.spawn_duel(UnitKind::Spearman, 1, UnitKind::Raider, 1);
+
+        let elapsed = sim.run_until_one_side_falls();
+
+        assert_eq!(sim.alive(Team::Claude), 0, "the Raider should die");
+        assert_eq!(sim.alive(Team::Human), 1, "the Spearman should live");
+        assert!(
+            elapsed < FixedClockSim::TIMEOUT,
+            "the duel must resolve, not time out — nobody moved, so a timeout \
+             means the two never acquired each other"
+        );
+        let left = sim.team_hp_fraction(Team::Human);
+        assert!(
+            left > 0.25,
+            "Spearman should finish comfortably ahead, had {left:.3} left",
+        );
+
+        // The two derivations agree: the arithmetic probe's margin and the
+        // simulated one land in the same place, which is the whole reason to
+        // trust either.
+        let arithmetic = engage(UnitKind::Spearman, 1, UnitKind::Raider, 1)
+            .a_hp_fraction(UnitKind::Spearman, 1);
+        assert!(
+            (left - arithmetic).abs() < 0.15,
+            "simulated margin {left:.3} and arithmetic margin {arithmetic:.3} \
+             should describe the same fight",
         );
     }
 

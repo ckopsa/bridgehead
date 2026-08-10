@@ -4,13 +4,20 @@
 //! building placement ghost, command hotkeys/buttons, control groups, and the
 //! bevy_ui HUD: a top resource bar plus a classic WC3-style bottom console
 //! (minimap | selection panel | command card), the drag rectangle, the
-//! game-over banner, and the top-right alert stack.
+//! game-over banner, the top-right alert stack, and the top-left co-command
+//! proposal panel.
 //!
 //! The alert stack renders `shared::GameEvents` — the very buffer bridge.rs
 //! serializes for an external commander, filtered to `Team::Human` the same way
 //! the bridge filters to its seat. One producer, two renderers: whatever the
 //! machine is told about the match, the player is told too. Space (or a click
 //! on a row) sends the camera to where the news came from.
+//!
+//! The proposal panel is the human's half of co-command (copilot.rs): a
+//! co-commander's pending directives, with the reason it gave and the compiled
+//! English of every command, answered with `[Enter]` / `[Backspace]` or the
+//! per-card buttons. Left, not right, and on its own clock — see the comment
+//! above `PROP_SLOTS`.
 //!
 //! All world picking is analytic: the cursor is projected onto the Y=0 plane
 //! with `shared::cursor_to_ground` and distance-tested in XZ against entity
@@ -32,6 +39,7 @@ use bevy::winit::cursor::CursorIcon;
 use std::collections::{HashMap, VecDeque};
 
 use crate::command::{CommandLink, PendingOrder};
+use crate::copilot::{Copilot, CopilotSet, ProposalVerdict, PROPOSAL_TTL};
 use crate::intent::IntentApply;
 use crate::shared::*;
 
@@ -56,6 +64,19 @@ const GUARD_RADIUS: f32 = 18.0;
 const FALLBACK_FRAC: f32 = 0.35;
 /// Enemies inside a caster's ability radius before [T Auto-Cast] fires.
 const AUTOCAST_MIN_ENEMIES: u32 = 3;
+/// Ability slots the doctrine card offers an auto-cast toggle for. Three is
+/// every ability any caster in the game has (the Champion's two, plus the
+/// probe-only third), and three is exactly what the card has room for once the
+/// postures, the parameterised pair and the page toggle have taken their slots.
+const MAX_AUTOCAST_SLOTS: usize = 3;
+/// Hotkeys for those per-ability toggles, doctrine page only. Z/X/C are the
+/// item and Blacksmith keys on page ONE; a hotkey is per-card, and page two
+/// spends none of them.
+const AUTOCAST_KEYS: [(KeyCode, &str); MAX_AUTOCAST_SLOTS] = [
+    (KeyCode::KeyZ, "Z"),
+    (KeyCode::KeyX, "X"),
+    (KeyCode::KeyC, "C"),
+];
 
 /// Retreat thresholds the doctrine card's [F] steps through, in order. The
 /// coarse [V] toggle writes `FALLBACK_FRAC` and nothing else; this is the
@@ -65,6 +86,67 @@ const FALLBACK_STEPS: [f32; 3] = [0.25, 0.35, 0.50];
 /// Leash radii the doctrine card's [G] steps through. `GUARD_RADIUS` is the
 /// middle rung, so the quick preset and the parameterised control agree.
 const LEASH_STEPS: [f32; 3] = [10.0, 18.0, 30.0];
+/// ---- Free entry ----------------------------------------------------------
+///
+/// The presets above are three rungs; `Intent::Retreat`/`Intent::Leash` carry
+/// an arbitrary float, and a bridge commander types whatever it likes. That
+/// gap is the last place in the doctrine vocabulary where the two seats are not
+/// equal — not in what can be SAID, but in what can be said PRECISELY. These
+/// increments close it: `[-]`/`[=]` walk the retreat threshold and `[[]`/`[]]`
+/// walk the leash radius, one increment per press, over the whole legal range.
+///
+/// Keys rather than a text field because this is a game with a command card,
+/// and a modal number box in the middle of a fight is not an affordance, it is
+/// an interruption. `-`/`=` and `[`/`]` are the only adjacent free pairs left
+/// on the keyboard (every letter is a command hotkey somewhere in this file),
+/// they are unshifted, and they read as "less/more" without a legend.
+const FALLBACK_NUDGE: f32 = 0.05;
+/// Lowest threshold worth expressing. Nudging below it turns the policy off,
+/// which is the same place the [F] cycle wraps to — one concept, one exit.
+const FALLBACK_MIN: f32 = 0.05;
+/// A unit that retreats above this is retreating at full health.
+const FALLBACK_MAX: f32 = 0.95;
+const LEASH_NUDGE: f32 = 2.0;
+const LEASH_MIN: f32 = 2.0;
+/// A leash wider than the map's half-width is not a leash.
+const LEASH_MAX: f32 = 60.0;
+
+/// Move `current` one increment and clamp, or turn the policy off.
+///
+/// From "off" the first press lands on `start` (the middle preset) rather than
+/// at the bottom of the range: the player pressing `[=]` on an unleashed
+/// selection means "start leashing", and starting at radius 2 would be a
+/// technically-correct answer to a question nobody asked. Nudging below `lo`
+/// returns `None` — the same "off" the cycle wraps to, so the two controls
+/// agree about what the bottom of the scale is.
+fn nudge_value(current: Option<f32>, up: bool, step: f32, start: f32, lo: f32, hi: f32) -> Option<f32> {
+    let Some(current) = current else {
+        return Some(start);
+    };
+    let next = current + if up { step } else { -step };
+    (next >= lo - 1e-4).then(|| next.min(hi))
+}
+
+/// The corner badge on a selection tile: the squad id, or nothing at all.
+///
+/// Deliberately not "-" or "0" for a unit in no squad. The badge exists to make
+/// a MIXED selection legible at a glance, and a grid where every tile carries a
+/// mark is a grid where no mark stands out.
+fn squad_badge(squad: Option<u8>) -> String {
+    squad.map(|id| id.to_string()).unwrap_or_default()
+}
+
+/// Render a doctrine number without lying about it: whole values lose the
+/// decimal point, everything else keeps one digit. A caption that rounded 37.5
+/// to 38 would show a threshold no unit on the field is using.
+fn trim_num(v: f32) -> String {
+    if (v - v.round()).abs() < 0.05 {
+        format!("{:.0}", v)
+    } else {
+        format!("{:.1}", v)
+    }
+}
+
 /// Radius written by the doctrine card's Defend posture.
 const DEFEND_RADIUS: f32 = 22.0;
 /// Highest squad id a human gesture will ever mint. Matches the three control
@@ -149,6 +231,48 @@ const NOTIF_ROW_HIT_H: f32 = NOTIF_ROW_H + NOTIF_FONT + NOTIF_GAP;
 /// Space is free: letters are command hotkeys, arrows pan, `.` cycles workers.
 const NOTIF_FOCUS_KEY: KeyCode = KeyCode::Space;
 
+// --- Co-command: the proposal panel ----------------------------------------
+//
+// Where it sits is a design decision, not a layout accident. The alert stack
+// owns the top-right and is built for news: six rows that fade after nine
+// seconds. A proposal is not news, it is an OPEN QUESTION with a twenty-second
+// clock, and putting it in a stack that expires on a different timer would
+// mean the thing you must answer scrolls away under the thing you need not.
+//
+// So: top-left, the last large area the HUD does not own (the minimap is
+// bottom-left, the console bottom, the resource bar a thin strip above). The
+// ARRIVAL is still announced in the alert stack, which is where the player's
+// eye already goes — transient notice on the right, standing decision on the
+// left. The visual vocabulary is the alert stack's, because it should read as
+// the same HUD: `PANEL_BG`, a coloured spine down the left edge, and amber for
+// "something of yours is affected", which is what amber already means here.
+
+/// One card per possible pending proposal; `copilot::MAX_PENDING` is the cap
+/// that makes the pool exact rather than a guess.
+const PROP_SLOTS: usize = crate::copilot::MAX_PENDING;
+const PROP_W: f32 = 360.0;
+/// Same narrow-window guard as the alert stack.
+const PROP_MAX_FRAC: f32 = 0.44;
+const PROP_FONT: f32 = 13.0;
+const PROP_HEAD_FONT: f32 = 12.0;
+const PROP_GAP: f32 = 6.0;
+/// Most sentences printed per card before the rest are summarised. Bounds the
+/// card's height, which is what makes `prop_rect` able to hit-test it.
+const PROP_MAX_SENTENCES: usize = 4;
+/// Height budgeted per card when hit-testing. Generous for the same reason
+/// `NOTIF_ROW_HIT_H` is: a card's real height depends on how much of the note
+/// wraps, no analytic guess can know, and swallowing a click just under the
+/// panel is far better than leaking one through as a stray order.
+const PROP_CARD_HIT_H: f32 = 132.0;
+/// Approve / veto the OLDEST pending proposal — the one closest to lapsing,
+/// and the top card. Both keys are free: every letter is a command hotkey,
+/// Space focuses alerts, `.` cycles workers.
+const PROP_APPROVE_KEY: KeyCode = KeyCode::Enter;
+const PROP_VETO_KEY: KeyCode = KeyCode::Backspace;
+/// The co-commander's colour. Deliberately NOT one of the three severity
+/// colours: "my partner said this" must never read as "the game says this".
+const PROP_ACCENT: Color = Color::srgb(0.68, 0.63, 1.0);
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -192,7 +316,12 @@ impl Plugin for UiPlugin {
                     )
                         .chain(),
                     (
-                        update_ghost,
+                        // Grouped, not listed: the two armed-gesture previews
+                        // read the cursor and write nothing else anybody here
+                        // reads, so their order relative to each other is
+                        // genuinely free — which is exactly what a nested tuple
+                        // says, while keeping the group's place in the chain.
+                        (update_ghost, update_posture_marker),
                         update_rally_flag,
                         // Chain of Command feedback. Like every system here it
                         // runs before the compiler, so a click gets its marker
@@ -218,6 +347,21 @@ impl Plugin for UiPlugin {
                     .chain()
                     .before(IntentApply)
                     .after(FogSet),
+            )
+            // Co-command's two systems sit OUTSIDE the input chain above,
+            // which is at Bevy's 20-system tuple ceiling — and they want
+            // different ordering anyway. `proposal_input` only has to beat
+            // `CopilotSet`, so a verdict given this frame is resolved this
+            // frame and its orders compile with the rest of the frame's
+            // intents. `update_proposals` is the one HUD system that must run
+            // AFTER the frame's decisions: a proposal the player just answered
+            // should leave the screen immediately, not flicker one more time.
+            .add_systems(
+                Update,
+                (
+                    proposal_input.before(CopilotSet),
+                    update_proposals.after(CopilotSet),
+                ),
             );
     }
 }
@@ -263,6 +407,10 @@ struct UiState {
     /// `cursor_over_hud` can tell a click on a notification from a world click
     /// without walking the UI tree.
     notif_rows: usize,
+    /// Number of visible co-command proposal cards (refreshed by
+    /// `update_proposals`), for the same reason `notif_rows` exists: a click
+    /// on "Approve" must not also be a move order on the ground behind it.
+    prop_cards: usize,
     /// The hero the player most recently had selected — the Shop's customer.
     ///
     /// A Shop's buy card is drawn for a BUILDING selection, so at the moment of
@@ -310,6 +458,17 @@ struct HasRing(Entity);
 #[derive(Component)]
 struct Ghost;
 
+/// The single translucent disc under the cursor while a squad posture is armed
+/// and waiting for its ground click.
+///
+/// Building placement has had a ghost since the first version, and arming a
+/// posture is the same gesture with the same two steps — but it showed nothing,
+/// so "where exactly is the Defend circle going to sit" was answerable only
+/// after the click, by reading the sentence in the log. The disc is drawn at
+/// the posture's real radius, so a Defend ring you place is the ring you get.
+#[derive(Component)]
+struct PostureMarker;
+
 /// The rubber-band selection rectangle UI node.
 #[derive(Component)]
 struct DragRect;
@@ -330,6 +489,38 @@ struct NotifText(usize);
 struct NotifHint;
 
 /// The single world-space ring shown under whatever the cursor would pick.
+/// One pooled proposal card, by queue index (0 = oldest = the hotkeys' target).
+#[derive(Component)]
+struct PropCard(usize);
+
+/// Which line of which card a text node is. One marker component with a part
+/// tag rather than three marker types, because three `&mut Text` queries in one
+/// system would need three mutually-exclusive `Without` filters to satisfy
+/// Bevy B0001 — and one query with a discriminant is the same information
+/// without the aliasing puzzle.
+#[derive(Component, Clone, Copy)]
+struct PropText {
+    card: usize,
+    part: PropPart,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PropPart {
+    /// `#3   copilot   14s   [Enter] approve  [Bksp] veto`
+    Head,
+    /// The co-commander's stated reason.
+    Note,
+    /// The compiled sentences, then any conflict tags.
+    Body,
+}
+
+/// One of a card's two buttons. `approve` false is the veto.
+#[derive(Component, Clone, Copy)]
+struct PropBtn {
+    card: usize,
+    approve: bool,
+}
+
 #[derive(Component)]
 struct HoverRing;
 
@@ -422,6 +613,16 @@ enum Slot {
     Coverage,
     Overflow,
     CardLetter(usize),
+    /// Squad badge in the corner of a selection tile — the digit `Ctrl+N` and
+    /// the bridge's `squad` verb both write. Empty for a unit in no squad and
+    /// for every building.
+    ///
+    /// A multi-select used to be an anonymous grid of initials: the doctrine
+    /// card would say "squad 1" (the first unit's), the player would set a
+    /// posture, and two of the six tiles would quietly not be in it. The badge
+    /// is how a mixed selection becomes visible BEFORE the order, which is the
+    /// only time it can still be fixed.
+    CardSquad(usize),
     QueueLetter(usize),
     CmdKey(usize),
     CmdLabel(usize),
@@ -463,7 +664,8 @@ enum PostureKind {
     Defend,
     Push,
     Forage,
-    /// Screen the team's hero. Needs no click — the target is a unit.
+    /// Screen one of our own units. Arms a click like the others — the click
+    /// picks a UNIT rather than a point.
     Escort,
 }
 
@@ -473,12 +675,22 @@ impl PostureKind {
             PostureKind::Defend => "Defend",
             PostureKind::Push => "Push",
             PostureKind::Forage => "Forage",
-            PostureKind::Escort => "Escort Hero",
+            PostureKind::Escort => "Escort",
         }
     }
-    /// True when the gesture is "press, then click the ground".
-    fn needs_point(self) -> bool {
-        !matches!(self, PostureKind::Escort)
+    /// True when the gesture is "press, then click one of our units".
+    ///
+    /// Escort used to be issued outright at press time, aimed at the team's
+    /// lowest-entity-id living hero, because the hero was the only escortee the
+    /// UI could name. `PostureIntent::Escort` has always taken any own unit —
+    /// a commander could screen a Catapult, a Priestess, or the one Worker
+    /// walking out to expand — so the human seat was strictly less expressive
+    /// than the bridge on this one verb. Arming a unit click closes it, and
+    /// costs the player nothing: escorting the hero is now "press R, click the
+    /// hero", one click more than before and the only click that was ever
+    /// ambiguous.
+    fn needs_unit(self) -> bool {
+        matches!(self, PostureKind::Escort)
     }
 }
 
@@ -520,8 +732,11 @@ enum CmdAction {
     ToggleFallback,
     /// Doctrine: advance the `TargetPriority` preset by one step.
     CyclePriority,
-    /// Doctrine: toggle `AutoCastPolicy` on every selected own hero.
+    /// Doctrine: toggle `AutoCastPolicy` slot 0 on every selected own hero.
+    /// The quick switch; page two has one of these per ability.
     ToggleAutoCast,
+    /// Doctrine (page two): toggle the auto-cast rule for ONE ability slot.
+    ToggleAutoCastSlot(usize),
 
     // --- page two: the doctrine card -------------------------------------
     /// Flip between the orders card and the doctrine card.
@@ -536,6 +751,12 @@ enum CmdAction {
     CycleFallback,
     /// Step the leash radius: off -> 10 -> 18 -> 30 -> off.
     CycleLeash,
+    /// Nudge the retreat threshold by one increment (`true` = up). The presets
+    /// are a fast path, not the vocabulary: the wire carries any float and so
+    /// must the human.
+    NudgeFallback(bool),
+    /// Nudge the leash radius by one increment (`true` = up).
+    NudgeLeash(bool),
     /// Step the selected building's template squad: none -> 1 -> 2 -> 3 -> none.
     TemplateSquad,
     /// Step the selected building's template retreat threshold.
@@ -650,7 +871,15 @@ struct UnitDoctrine {
     retreat: Option<f32>,
     prio: PrioPreset,
     autocast: bool,
+    /// Which ability SLOTS carry an auto-cast rule. `AutoCastPolicy` has been
+    /// per-slot since abilities v2; the card only ever read "is the component
+    /// there at all", which is why a hero with two spells had one toggle and no
+    /// way to say which spell it meant.
+    autocast_slots: [bool; MAX_AUTOCAST_SLOTS],
     hero: bool,
+    /// The caster's kind, so the card can name its abilities. `None` for
+    /// anything with no ability list.
+    caster: Option<UnitKind>,
     /// Squad membership — the same handle `Ctrl+N` and the bridge's `squad`
     /// verb write, and the thing a posture is about.
     squad: Option<u8>,
@@ -662,17 +891,25 @@ impl UnitDoctrine {
         retreat: Option<&RetreatPolicy>,
         prio: Option<&TargetPriority>,
         autocast: Option<&AutoCastPolicy>,
-        // `hero`: does this unit have anything to auto-cast? Any caster, not
-        // just a hero — the Sorcerer's whole doctrine is its auto-cast toggle.
-        hero: bool,
+        // The unit's kind, which is what decides whether it has anything to
+        // auto-cast at all. Any caster counts, not just a hero — the
+        // Sorcerer's whole doctrine is its auto-cast toggle.
+        kind: UnitKind,
         squad: Option<&SquadId>,
     ) -> Self {
+        let abilities = abilities_of_unit(kind);
+        let mut autocast_slots = [false; MAX_AUTOCAST_SLOTS];
+        for (i, flag) in autocast_slots.iter_mut().enumerate() {
+            *flag = autocast.is_some_and(|p| p.min_enemies_for(i).is_some_and(|n| n > 0));
+        }
         UnitDoctrine {
             leash: leash.map(|l| l.radius),
             retreat: retreat.map(|r| r.below_frac),
             prio: PrioPreset::of(prio.and_then(|p| p.0.first().copied())),
             autocast: autocast.is_some(),
-            hero,
+            autocast_slots,
+            hero: !abilities.is_empty(),
+            caster: (!abilities.is_empty()).then_some(kind),
             squad: squad.map(|s| s.0),
         }
     }
@@ -693,6 +930,16 @@ struct DoctrineState {
     fallback: usize,
     fallback_frac: f32,
     autocast: usize,
+    /// Casters carrying an auto-cast rule for each ability slot.
+    autocast_slots: [usize; MAX_AUTOCAST_SLOTS],
+    /// Kind of the FIRST selected caster — whose ability list names the
+    /// per-ability toggles. A mixed Champion+Sorcerer selection therefore shows
+    /// the Champion's spells; the intent it submits names a SLOT, which is what
+    /// `AutoCastPolicy` stores, so the Sorcerer's slot 0 is set alongside the
+    /// Champion's. Naming the slot after one caster's ability is a caption
+    /// problem, not a correctness one, and the alternative (refusing to show
+    /// the toggle for mixed selections) removes a control for no gain.
+    caster: Option<UnitKind>,
     /// Preset of the FIRST selected unit (lowest entity index).
     prio: PrioPreset,
     /// Squad of the FIRST selected unit — the squad a posture gesture is about.
@@ -710,11 +957,17 @@ impl DoctrineState {
             units: sorted.len(),
             prio: sorted.first().map(|u| u.prio).unwrap_or_default(),
             squad: first_squad,
+            caster: sorted.iter().find_map(|u| u.caster),
             ..default()
         };
         for u in sorted {
             if u.hero {
                 s.heroes += 1;
+                for (slot, set) in u.autocast_slots.iter().enumerate() {
+                    if *set {
+                        s.autocast_slots[slot] += 1;
+                    }
+                }
             }
             if u.squad.is_some() && u.squad == first_squad {
                 s.in_squad += 1;
@@ -749,6 +1002,13 @@ impl DoctrineState {
     }
     fn autocast_active(&self) -> bool {
         Self::most(self.autocast, self.heroes)
+    }
+    /// "Most of the selected casters auto-cast ability slot N."
+    fn autocast_slot_active(&self, slot: usize) -> bool {
+        Self::most(
+            self.autocast_slots.get(slot).copied().unwrap_or(0),
+            self.heroes,
+        )
     }
     /// Radius the current selection is leashed at, for the [G] cycle. `None`
     /// means "no leash", which is the first rung.
@@ -1770,8 +2030,6 @@ struct DoctrineCard {
     /// `SquadOrders` — i.e. when doctrine.rs is actually executing something.
     posture: Option<PostureKind>,
     tmpl: TemplateView,
-    /// The team has a living hero somewhere, so Escort has a target.
-    hero_alive: bool,
 }
 
 /// Page two: the doctrine card. This is the half of docs/TEMPO.md §2.0 that
@@ -1781,12 +2039,15 @@ struct DoctrineCard {
 /// have typed, and the log cannot tell which happened.
 ///
 ///   units selected      Q Defend  W Push  E Forage | R Escort  T Stand Down
-///                       F Fall back%  G Guard r  P Priority | I Orders   (9)
+///                       F Fall back%  G Guard r  P Priority
+///                       Z/X/C Auto <ability>, one per slot | I Orders  (<=12)
 ///   production building Q Squad  W Fall back%  E Priority  R Auto-cast
 ///                       T Clear | I Orders                              (6)
 ///
-/// The ground-pointed postures (Defend/Push/Forage) arm a click, exactly like
-/// building placement; Escort needs no point because its target is the hero.
+/// Every posture arms a click, exactly like building placement does:
+/// Defend/Push/Forage want a point, Escort wants one of our own units.
+/// `[-]/[=]` and `[[]/[]]` nudge the two numbers and are raw keys with no tile
+/// — see `FALLBACK_NUDGE` for why they are keys rather than buttons.
 fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
     let doc = card.doc;
     let mut out: Vec<CmdEntry> = Vec::new();
@@ -1800,11 +2061,11 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         ] {
             let mut entry = CmdEntry::plain(CmdAction::SetPosture(kind), key, hotkey, kind.label())
                 .active(card.posture == Some(kind));
-            if kind.needs_point() {
-                entry.cost = "click ground".to_string();
+            entry.cost = if kind.needs_unit() {
+                "click a unit".to_string()
             } else {
-                entry.enabled = card.hero_alive;
-            }
+                "click ground".to_string()
+            };
             out.push(entry);
         }
         let mut stand_down =
@@ -1813,33 +2074,39 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         out.push(stand_down);
 
         // The parameterised pair. Captions name the CURRENT value, like [P]
-        // does, so the card always reads as state rather than as a verb.
+        // does, so the card always reads as state rather than as a verb — and
+        // the cost line names the nudge keys, which are the only doctrine
+        // controls with no tile of their own.
         let fallback = doc.fallback_value();
-        out.push(
-            CmdEntry::plain(
-                CmdAction::CycleFallback,
-                KeyCode::KeyF,
-                "F",
-                &match fallback {
-                    Some(frac) => format!("Fall back {:.0}%", frac * 100.0),
-                    None => "Fall back".to_string(),
-                },
-            )
-            .active(fallback.is_some()),
-        );
+        let mut fallback_entry = CmdEntry::plain(
+            CmdAction::CycleFallback,
+            KeyCode::KeyF,
+            "F",
+            &match fallback {
+                // One decimal, not zero: `[-]`/`[=]` move in 5-point steps but
+                // a commander can send 37.5, and a caption that rounded it
+                // would show a number the unit is not actually using.
+                Some(frac) => format!("Fall back {}%", trim_num(frac * 100.0)),
+                None => "Fall back".to_string(),
+            },
+        )
+        .active(fallback.is_some());
+        fallback_entry.cost = "- / = tune".to_string();
+        out.push(fallback_entry);
+
         let leash = doc.leash_value();
-        out.push(
-            CmdEntry::plain(
-                CmdAction::CycleLeash,
-                KeyCode::KeyG,
-                "G",
-                &match leash {
-                    Some(r) => format!("Guard r{:.0}", r),
-                    None => "Guard".to_string(),
-                },
-            )
-            .active(leash.is_some()),
-        );
+        let mut leash_entry = CmdEntry::plain(
+            CmdAction::CycleLeash,
+            KeyCode::KeyG,
+            "G",
+            &match leash {
+                Some(r) => format!("Guard r{}", trim_num(r)),
+                None => "Guard".to_string(),
+            },
+        )
+        .active(leash.is_some());
+        leash_entry.cost = "[ / ] tune".to_string();
+        out.push(leash_entry);
         out.push(
             CmdEntry::plain(
                 CmdAction::CyclePriority,
@@ -1849,6 +2116,32 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
             )
             .active(doc.prio != PrioPreset::None),
         );
+
+        // One auto-cast toggle per ability the selected casters have. Page
+        // one's [T] is the quick switch for slot 0 and stays exactly that; a
+        // Champion who has learned Warcry can only be told to auto-cast it
+        // here, because slot 0 is the only slot [T] can name.
+        if let Some(caster) = doc.caster {
+            for (slot, def) in abilities_of_unit(caster)
+                .iter()
+                .enumerate()
+                .take(MAX_AUTOCAST_SLOTS)
+            {
+                let (key, hotkey) = AUTOCAST_KEYS[slot];
+                let mut entry = CmdEntry::plain(
+                    CmdAction::ToggleAutoCastSlot(slot),
+                    key,
+                    hotkey,
+                    &format!("Auto {}", def.name),
+                )
+                .active(doc.autocast_slot_active(slot));
+                // The threshold is the rule: "auto-cast" with no number is a
+                // caster that fires at one enemy, and this card has always
+                // meant three.
+                entry.cost = format!("{AUTOCAST_MIN_ENEMIES}+ foes");
+                out.push(entry);
+            }
+        }
     } else if card.tmpl.capable {
         let t = card.tmpl;
         out.push(
@@ -2027,6 +2320,25 @@ fn cursor_over_hud(cursor: Vec2, window: &Window, ui: &UiState) -> bool {
         return true;
     }
     notif_rect(window, ui.notif_rows).is_some_and(|r| r.contains(cursor))
+        || prop_rect(window, ui.prop_cards).is_some_and(|r| r.contains(cursor))
+}
+
+/// Screen-space rectangle of the proposal panel, or `None` when nothing is
+/// pending. Analytic like `notif_rect`, and generous for the same reason — see
+/// `PROP_CARD_HIT_H`. Top-LEFT, so it never overlaps the alert stack's rect and
+/// the two hit tests stay independent.
+fn prop_rect(window: &Window, cards: usize) -> Option<Rect> {
+    if cards == 0 {
+        return None;
+    }
+    let width = PROP_W.min(window.width() * PROP_MAX_FRAC);
+    let top = TOP_BAR_H + PAD;
+    Some(Rect::new(
+        PAD,
+        top,
+        PAD + width,
+        top + cards as f32 * (PROP_CARD_HIT_H + PROP_GAP),
+    ))
 }
 
 /// Screen-space rectangle of the alert stack, or `None` when it is empty.
@@ -2180,8 +2492,8 @@ fn ground_intent(
 /// handler and the tests take the same path, and so "what does clicking here
 /// mean" is answerable without a window.
 ///
-/// `None` for Escort, which names a unit and is therefore issued outright at
-/// press time rather than arming a click.
+/// `None` for Escort, which names a unit rather than a point — see
+/// `posture_unit_intent`, its twin for the other kind of click.
 fn posture_intent(arm: PostureArm, ground: Vec3) -> Option<Intent> {
     let p = clamp_to_map(ground);
     let posture = match arm.kind {
@@ -2198,6 +2510,26 @@ fn posture_intent(arm: PostureArm, ground: Vec3) -> Option<Intent> {
         id: arm.squad,
         posture: Some(posture),
     })
+}
+
+/// The unit-clicking half of the same gesture. `None` for every posture that
+/// wants a point, so the two functions are total together and neither can be
+/// called for the wrong kind of click by accident.
+///
+/// The caller is responsible for having picked one of OUR units: intent.rs
+/// re-checks ownership anyway (`unit N not found/not yours`), but a UI that
+/// let you click an enemy and then quietly did nothing would be worse than one
+/// that never offered the click.
+fn posture_unit_intent(arm: PostureArm, target: Entity) -> Option<Intent> {
+    match arm.kind {
+        PostureKind::Escort => Some(Intent::Posture {
+            id: arm.squad,
+            posture: Some(PostureIntent::Escort {
+                unit: intent_id(target),
+            }),
+        }),
+        _ => None,
+    }
 }
 
 /// Pull the entities out of a `(Entity, UnitKind, carrying)` selection slice.
@@ -2276,6 +2608,25 @@ fn setup_ui(
         Transform::from_xyz(0.0, -50.0, 0.0),
         Visibility::Hidden,
         Ghost,
+    ));
+
+    // --- pending-posture disc (one pooled entity, like the ghost) ----------
+    let posture_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.42, 0.68, 1.0, 0.30),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    commands.spawn((
+        // A unit-radius disc lying in the XZ plane, scaled per posture. Same
+        // shape language as the selection ring, so "a circle on the ground"
+        // keeps meaning "an area, not a thing".
+        Mesh3d(meshes.add(Circle::new(1.0))),
+        MeshMaterial3d(posture_mat.clone()),
+        Transform::from_xyz(0.0, -50.0, 0.0)
+            .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+        Visibility::Hidden,
+        PostureMarker,
     ));
 
     // --- rally banner (one pooled entity: pole + pennant) -----------------
@@ -2424,6 +2775,126 @@ fn setup_ui(
         });
 
     spawn_notifications(&mut commands);
+    spawn_proposals(&mut commands);
+}
+
+/// The co-commander's pending directives: a fixed pool of cards in the
+/// top-left, hidden until a partner asks for something. Pooled and mutated in
+/// place like every other refreshed node in this file.
+fn spawn_proposals(commands: &mut Commands) {
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(PAD),
+            top: Val::Px(TOP_BAR_H + PAD),
+            width: Val::Px(PROP_W),
+            max_width: Val::Percent(PROP_MAX_FRAC * 100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(PROP_GAP),
+            ..default()
+        })
+        .with_children(|panel| {
+            for i in 0..PROP_SLOTS {
+                panel
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(3.0),
+                            padding: UiRect::axes(Val::Px(9.0), Val::Px(6.0)),
+                            // The same severity spine the alert stack uses,
+                            // in the co-commander's own colour.
+                            border: UiRect::left(Val::Px(3.0)),
+                            display: Display::None,
+                            ..default()
+                        },
+                        BackgroundColor(PANEL_BG),
+                        BorderColor(PROP_ACCENT),
+                        PropCard(i),
+                    ))
+                    .with_children(|card| {
+                        card.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: PROP_HEAD_FONT,
+                                ..default()
+                            },
+                            TextColor(PROP_ACCENT),
+                            PropText {
+                                card: i,
+                                part: PropPart::Head,
+                            },
+                        ));
+                        card.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: PROP_FONT,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                            PropText {
+                                card: i,
+                                part: PropPart::Note,
+                            },
+                        ));
+                        card.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: PROP_FONT,
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.72, 0.76, 0.86)),
+                            PropText {
+                                card: i,
+                                part: PropPart::Body,
+                            },
+                        ));
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(6.0),
+                            margin: UiRect::top(Val::Px(3.0)),
+                            ..default()
+                        })
+                        .with_children(|btns| {
+                            for approve in [true, false] {
+                                btns.spawn((
+                                    Button,
+                                    Node {
+                                        padding: UiRect::axes(Val::Px(9.0), Val::Px(3.0)),
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(SLOT_BG),
+                                    BorderColor(if approve {
+                                        PROP_ACCENT
+                                    } else {
+                                        EDGE
+                                    }),
+                                    PropBtn { card: i, approve },
+                                ))
+                                .with_children(|b| {
+                                    b.spawn((
+                                        Text::new(if approve {
+                                            "Approve"
+                                        } else {
+                                            "Veto"
+                                        }),
+                                        TextFont {
+                                            font_size: PROP_HEAD_FONT,
+                                            ..default()
+                                        },
+                                        TextColor(if approve {
+                                            PROP_ACCENT
+                                        } else {
+                                            Color::srgb(0.72, 0.74, 0.80)
+                                        }),
+                                    ));
+                                });
+                            }
+                        });
+                    });
+            }
+        });
 }
 
 /// The alert stack: a fixed pool of rows in the top-right corner, hidden until
@@ -2756,6 +3227,24 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                     ))
                     .with_children(|card| {
                         card.spawn(text_bundle("", 20.0, Color::WHITE, Slot::CardLetter(i)));
+                        // Squad badge, top-right. Absolute so it sits over the
+                        // centred initial instead of pushing it around, and the
+                        // same blue the doctrine summary line uses — squad is
+                        // one idea and it should have one colour.
+                        card.spawn((
+                            text_bundle(
+                                "",
+                                11.0,
+                                Color::srgb(0.62, 0.80, 1.0),
+                                Slot::CardSquad(i),
+                            ),
+                            Node {
+                                position_type: PositionType::Absolute,
+                                right: Val::Px(2.0),
+                                top: Val::Px(0.0),
+                                ..default()
+                            },
+                        ));
                         card.spawn((
                             Node {
                                 position_type: PositionType::Absolute,
@@ -3009,9 +3498,7 @@ fn command_input(
                         retreat,
                         prio,
                         autocast,
-                        // Any caster, not just a hero — the Sorcerer's whole
-                        // doctrine is its auto-cast toggle.
-                        !abilities_of_unit(u.kind).is_empty(),
+                        u.kind,
                         squad,
                     ),
                 )
@@ -3156,7 +3643,6 @@ fn command_input(
             .and_then(|s| cast.squads.0.get(&(Team::Human, s)))
             .map(posture_kind),
         tmpl: single_template,
-        hero_alive: team_hero.is_some(),
     };
     let entries = command_entries(
         ui.page,
@@ -3191,6 +3677,23 @@ fn command_input(
         && (!own_units.is_empty() || single_template.capable)
     {
         actions.push(CmdAction::TogglePage);
+    }
+    // The free-entry nudges, doctrine page only, raw keys only — they are
+    // deliberately NOT card entries. The card is a menu of what you can do; the
+    // nudge is a refinement of a value the card already shows, and the two
+    // captions say which keys do it. Adding four more tiles for it would have
+    // pushed the card past `CMD_SLOTS` and silently dropped the page toggle.
+    if !ctrl && ui.page == CardPage::Doctrine && !own_units.is_empty() {
+        for (key, action) in [
+            (KeyCode::Minus, CmdAction::NudgeFallback(false)),
+            (KeyCode::Equal, CmdAction::NudgeFallback(true)),
+            (KeyCode::BracketLeft, CmdAction::NudgeLeash(false)),
+            (KeyCode::BracketRight, CmdAction::NudgeLeash(true)),
+        ] {
+            if keys.just_pressed(key) {
+                actions.push(action);
+            }
+        }
     }
     for (interaction, el) in &pressed_buttons {
         if *interaction != Interaction::Pressed {
@@ -3493,6 +3996,29 @@ fn command_input(
                     },
                 );
             }
+            CmdAction::ToggleAutoCastSlot(slot) => {
+                if own_casters.is_empty() {
+                    continue;
+                }
+                let units: Vec<IntentId> =
+                    own_casters.iter().map(|(e, _, _, _)| intent_id(*e)).collect();
+                say(
+                    &mut submissions,
+                    Intent::Autocast {
+                        units,
+                        min_enemies: Some(if doc.autocast_slot_active(slot) {
+                            0 // "clear this one rule"
+                        } else {
+                            AUTOCAST_MIN_ENEMIES
+                        }),
+                        // The one line that makes this per-ability: an explicit
+                        // slot instead of the `None` that means "slot 0".
+                        // intent.rs edits that rule and leaves the others
+                        // standing, so two spells can carry two policies.
+                        ability: Some(AbilitySelector::Index(slot)),
+                    },
+                );
+            }
             // --- page two: the doctrine card -------------------------------
             CmdAction::TogglePage => {
                 ui.page = match ui.page {
@@ -3509,29 +4035,14 @@ fn command_input(
                 let Some(squad) = resolve_squad(&mut submissions) else {
                     continue;
                 };
-                match kind {
-                    // Escort names a unit, not a point, so it needs no click.
-                    PostureKind::Escort => {
-                        let Some((hero, _)) = team_hero else { continue };
-                        say(
-                            &mut submissions,
-                            Intent::Posture {
-                                id: squad,
-                                posture: Some(PostureIntent::Escort {
-                                    unit: intent_id(hero),
-                                }),
-                            },
-                        );
-                    }
-                    // The rest are "press, then click the ground" — the same
-                    // two-step building placement already teaches.
-                    _ => {
-                        ui.posture_place = Some(PostureArm { squad, kind });
-                        ui.attack_move_armed = false;
-                        ui.placement = None;
-                        ui.wall_chain.clear();
-                    }
-                }
+                // Every posture is now "press, then click" — the same two-step
+                // building placement already teaches. Three of them want a
+                // point and Escort wants a unit; `left_mouse` reads
+                // `PostureKind::needs_unit` to know which click it is holding.
+                ui.posture_place = Some(PostureArm { squad, kind });
+                ui.attack_move_armed = false;
+                ui.placement = None;
+                ui.wall_chain.clear();
             }
             CmdAction::ClearPosture => {
                 // Clearing a posture leaves membership intact: the squad stops
@@ -3570,6 +4081,81 @@ fn command_input(
                             below: Some(0.0),
                             x: None,
                             z: None,
+                        },
+                    ),
+                }
+            }
+            // The nudges reuse the cycles' sentences exactly — same verb, same
+            // rally/anchor derivation, same "0.0 means off" spelling. Only the
+            // number is arrived at differently, which is the whole point: a
+            // free-entry control that produced a DIFFERENT intent would be a
+            // second dialect of the same idea.
+            CmdAction::NudgeFallback(up) => {
+                if own_units.is_empty() {
+                    continue;
+                }
+                match nudge_value(
+                    doc.fallback_value(),
+                    up,
+                    FALLBACK_NUDGE,
+                    FALLBACK_STEPS[1],
+                    FALLBACK_MIN,
+                    FALLBACK_MAX,
+                ) {
+                    Some(below) => {
+                        let rally = nearest_hall(centroid());
+                        say(
+                            &mut submissions,
+                            Intent::Retreat {
+                                units: own_ids(),
+                                below: Some(below),
+                                x: Some(rally.x),
+                                z: Some(rally.z),
+                            },
+                        );
+                    }
+                    None => say(
+                        &mut submissions,
+                        Intent::Retreat {
+                            units: own_ids(),
+                            below: Some(0.0),
+                            x: None,
+                            z: None,
+                        },
+                    ),
+                }
+            }
+            CmdAction::NudgeLeash(up) => {
+                if own_units.is_empty() {
+                    continue;
+                }
+                match nudge_value(
+                    doc.leash_value(),
+                    up,
+                    LEASH_NUDGE,
+                    LEASH_STEPS[1],
+                    LEASH_MIN,
+                    LEASH_MAX,
+                ) {
+                    Some(radius) => {
+                        let anchor = clamp_to_map(centroid());
+                        say(
+                            &mut submissions,
+                            Intent::Leash {
+                                units: own_ids(),
+                                x: Some(anchor.x),
+                                z: Some(anchor.z),
+                                radius: Some(radius),
+                            },
+                        );
+                    }
+                    None => say(
+                        &mut submissions,
+                        Intent::Leash {
+                            units: own_ids(),
+                            x: None,
+                            z: None,
+                            radius: Some(0.0),
                         },
                     ),
                 }
@@ -4066,6 +4652,40 @@ fn left_mouse(
                 // one `posture` sentence — the same object a commander sends
                 // as {"type":"posture","id":1,"posture":{...}}.
                 if let Some(arm) = ui.posture_place {
+                    if arm.kind.needs_unit() {
+                        // Escort: the click names one of OUR units. Same picker
+                        // the plain-click selection uses — nearest own unit
+                        // within `UNIT_PICK_RADIUS` of where the ray meets that
+                        // unit's altitude, so a Gryphon is clickable where it
+                        // is drawn rather than where its shadow falls.
+                        let picked = ground.and_then(|g| {
+                            let ray = cursor_ray(camera, cam_tf, cursor);
+                            let mut best: Option<(Entity, f32)> = None;
+                            for (e, tf, _, team, _) in &units {
+                                if *team != Team::Human {
+                                    continue;
+                                }
+                                let d = dist_xz(
+                                    tf.translation,
+                                    pick_point_for(ray, g, tf.translation.y),
+                                );
+                                if d <= UNIT_PICK_RADIUS && best.is_none_or(|(_, bd)| d < bd) {
+                                    best = Some((e, d));
+                                }
+                            }
+                            best.map(|(e, _)| e)
+                        });
+                        // A miss leaves the gesture ARMED. Clicking a point is
+                        // hard to miss; clicking a 0.7-radius unit in a moving
+                        // fight is not, and disarming on every near-miss would
+                        // make the escortee you actually wanted the one target
+                        // you keep failing to pick.
+                        if let Some(intent) = picked.and_then(|e| posture_unit_intent(arm, e)) {
+                            say(&mut submissions, intent);
+                            ui.posture_place = None;
+                        }
+                        return;
+                    }
                     if let Some(intent) = ground.and_then(|g| posture_intent(arm, g)) {
                         say(&mut submissions, intent);
                     }
@@ -4557,6 +5177,64 @@ fn update_ghost(
     if mat.0 != wanted {
         *mat = MeshMaterial3d(wanted);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pending-posture marker
+// ---------------------------------------------------------------------------
+
+/// How wide the pending-posture disc is drawn, per posture kind.
+///
+/// Defend has a REAL radius (`DEFEND_RADIUS`) and the disc is that radius, so
+/// the circle the player is aiming is the circle doctrine.rs will hold. Push
+/// and Forage name a single point, so they get a small puck instead — big
+/// enough to see under the cursor, not big enough to imply an area they do not
+/// have. Escort names a unit and never reaches this function.
+fn posture_marker_radius(kind: PostureKind) -> Option<f32> {
+    match kind {
+        PostureKind::Defend => Some(DEFEND_RADIUS),
+        PostureKind::Push | PostureKind::Forage => Some(3.0),
+        PostureKind::Escort => None,
+    }
+}
+
+/// The doctrine card's twin of `update_ghost`: while a ground-pointed posture
+/// is armed, park a translucent disc on the ground point the cursor is over.
+///
+/// It uses `clamp_to_map` — the same clamp `posture_intent` applies — so the
+/// disc never shows a spot the order would not actually be given at.
+fn update_posture_marker(
+    ui: Res<UiState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    mut marker: Query<(&mut Transform, &mut Visibility), With<PostureMarker>>,
+) {
+    let Ok((mut tf, mut vis)) = marker.single_mut() else {
+        return;
+    };
+
+    let radius = ui
+        .posture_place
+        .and_then(|arm| posture_marker_radius(arm.kind));
+    let (Some(radius), Ok(window), Ok((camera, cam_tf))) =
+        (radius, windows.single(), camera_q.single())
+    else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+    let Some(ground) = window
+        .cursor_position()
+        .and_then(|cursor| cursor_to_ground(camera, cam_tf, cursor))
+    else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+
+    let p = clamp_to_map(ground);
+    // Just off the ground plane, under the units rather than through them.
+    tf.translation = Vec3::new(p.x, 0.06, p.z);
+    tf.scale = Vec3::splat(radius);
+    *vis = Visibility::Visible;
 }
 
 // ---------------------------------------------------------------------------
@@ -5400,6 +6078,10 @@ struct CardView {
     letter: String,
     hp: f32,
     color: Color,
+    /// Squad membership, for the corner badge. `None` for a unit in no squad
+    /// and for every building — a building is never a squad member, it stamps
+    /// one via its template.
+    squad: Option<u8>,
 }
 
 /// Everything the panel needs to answer **"why is this selection doing that,
@@ -5704,7 +6386,7 @@ fn update_hud(
         }
     } else if total > 1 {
         show_multi = true;
-        for (e, unit, health, team, _, hero, _, _, _, _, _, _, _) in &sel_units {
+        for (e, unit, health, team, _, hero, _, _, _, _, _, _, squad) in &sel_units {
             cards.push(CardView {
                 entity: e,
                 // Heroes show "H<level>" instead of a plain initial.
@@ -5714,6 +6396,9 @@ fn update_hud(
                 },
                 hp: (health.current / health.max.max(0.001)).clamp(0.0, 1.0),
                 color: team.color(),
+                // Own units only: an enemy's squad is not ours to know, and
+                // the snapshot does not report it either.
+                squad: (*team == Team::Human).then(|| squad.map(|s| s.0)).flatten(),
             });
         }
         for (e, building, health, team, _, _, _, _) in &sel_buildings {
@@ -5722,6 +6407,7 @@ fn update_hud(
                 letter: initial(building_name(building.kind)),
                 hp: (health.current / health.max.max(0.001)).clamp(0.0, 1.0),
                 color: lighten(team.color(), 0.12),
+                squad: None,
             });
         }
         cards.sort_by_key(|c| c.entity.index());
@@ -5753,8 +6439,7 @@ fn update_hud(
                         retreat,
                         prio,
                         autocast,
-                        // Any caster, not just a hero.
-                        !abilities_of_unit(u.kind).is_empty(),
+                        u.kind,
                         squad,
                     ),
                 )
@@ -5937,7 +6622,6 @@ fn update_hud(
             doc,
             posture: live_posture.map(posture_kind),
             tmpl: single_template,
-            hero_alive: team_hero.is_some(),
         },
         &completed,
     );
@@ -5973,9 +6657,17 @@ fn update_hud(
         )
     } else if let Some(arm) = ui.posture_place {
         format!(
-            "Squad {} - {} posture armed: left-click the ground it is about (Right-click / Esc cancels)",
+            "Squad {} - {} posture armed: left-click {} (Right-click / Esc cancels)",
             arm.squad,
-            arm.kind.label()
+            arm.kind.label(),
+            if arm.kind.needs_unit() {
+                // Says "keeps trying" because it does: a missed unit click
+                // leaves the gesture armed, and a hint that implied otherwise
+                // would have the player re-press R after every near-miss.
+                "one of your units to screen - misses keep trying"
+            } else {
+                "the ground it is about"
+            }
         )
     } else if ui.attack_move_armed {
         "Attack-move armed - left-click a destination (Esc cancels)".to_string()
@@ -6056,6 +6748,9 @@ fn update_hud(
             Slot::Overflow => text.0 = overflow_text.clone(),
             Slot::CardLetter(i) => {
                 text.0 = cards.get(i).map(|c| c.letter.clone()).unwrap_or_default();
+            }
+            Slot::CardSquad(i) => {
+                text.0 = squad_badge(cards.get(i).and_then(|c| c.squad));
             }
             Slot::QueueLetter(i) => {
                 text.0 = queue_letters.get(i).cloned().unwrap_or_default();
@@ -6638,6 +7333,163 @@ fn update_notifications(
 }
 
 // ---------------------------------------------------------------------------
+// Co-command: answering the partner
+// ---------------------------------------------------------------------------
+//
+// The human's whole half of the negotiation is two keys and two buttons. That
+// is on purpose: an approval that costs a menu is an approval that gets given
+// on reflex, and the point of the loop is that the player actually reads the
+// note before their gold is spent.
+//
+// `[Enter]` and `[Backspace]` act on the OLDEST pending proposal — the top
+// card, the one whose clock is shortest. A player mid-fight can answer without
+// aiming a mouse; a player with a moment can click the card they mean.
+
+/// Turn the two keys and the per-card buttons into `ProposalVerdict`s.
+/// copilot.rs is the only thing that acts on them — this system knows nothing
+/// about what a proposal contains, which is what keeps the rendering side out
+/// of the trust policy.
+fn proposal_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    game_over: Res<GameOver>,
+    copilot: Res<Copilot>,
+    mut verdicts: EventWriter<ProposalVerdict>,
+    pressed: Query<(&Interaction, &PropBtn), Changed<Interaction>>,
+) {
+    if game_over.0.is_some() || copilot.seat.is_none() {
+        return;
+    }
+    // A click names its proposal exactly.
+    for (interaction, btn) in &pressed {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if let Some(proposal) = copilot.pending.get(btn.card) {
+            verdicts.write(ProposalVerdict {
+                id: proposal.id,
+                approve: btn.approve,
+            });
+        }
+    }
+    // The keys always mean the top card.
+    let Some(top) = copilot.pending.first() else {
+        return;
+    };
+    if keys.just_pressed(PROP_APPROVE_KEY) {
+        verdicts.write(ProposalVerdict {
+            id: top.id,
+            approve: true,
+        });
+    } else if keys.just_pressed(PROP_VETO_KEY) {
+        verdicts.write(ProposalVerdict {
+            id: top.id,
+            approve: false,
+        });
+    }
+}
+
+/// Paint the pending queue. Runs `.after(CopilotSet)`, so a proposal answered
+/// this frame is off the screen this frame rather than blinking once more.
+fn update_proposals(
+    time: Res<Time>,
+    copilot: Res<Copilot>,
+    mut ui: ResMut<UiState>,
+    mut cards: Query<(&PropCard, &mut Node, &mut BackgroundColor)>,
+    mut texts: Query<(&PropText, &mut Text)>,
+    mut buttons: Query<(&PropBtn, &mut Node), Without<PropCard>>,
+) {
+    let now = time.elapsed_secs();
+    let pending = &copilot.pending;
+    // Hand the count to `cursor_over_hud` so a click on a card is not also a
+    // click on the battlefield behind it.
+    ui.prop_cards = pending.len();
+
+    for (card, mut node, mut bg) in &mut cards {
+        let Some(proposal) = pending.get(card.0) else {
+            node.display = Display::None;
+            continue;
+        };
+        node.display = Display::Flex;
+        // The top card — the one the keys answer — reads slightly brighter, so
+        // "which one will Enter take?" is answerable without counting.
+        bg.0 = if card.0 == 0 {
+            lighten(PANEL_BG, 0.10).with_alpha(PANEL_BG.alpha())
+        } else {
+            PANEL_BG
+        };
+        let _ = proposal;
+    }
+
+    for (btn, mut node) in &mut buttons {
+        node.display = if btn.card < pending.len() {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+
+    for (slot, mut text) in &mut texts {
+        let wanted = match pending.get(slot.card) {
+            None => String::new(),
+            Some(proposal) => match slot.part {
+                PropPart::Head => {
+                    let left = proposal.expires_in(now);
+                    // The age is the honest way to show a clock in a game with
+                    // `WC3_SPEED`: game seconds, the same unit the co-commander
+                    // read off its snapshot when it wrote this.
+                    let keys = if slot.card == 0 {
+                        "   [Enter] approve   [Bksp] veto"
+                    } else {
+                        ""
+                    };
+                    // ASCII only, here and in `proposal_body`. Bevy's default
+                    // font has no glyph for `·`, and a HUD that renders its
+                    // own bullet points as tofu boxes is a HUD nobody reads
+                    // twice — caught by looking at the screenshot, which is
+                    // the only way this class of bug is ever caught.
+                    format!(
+                        "#{}  copilot   {left:.0}s left   ({}/{}){keys}",
+                        proposal.id,
+                        (now - proposal.proposed_at).min(PROPOSAL_TTL).round(),
+                        PROPOSAL_TTL.round(),
+                    )
+                }
+                PropPart::Note => proposal.note.clone(),
+                PropPart::Body => proposal_body(proposal),
+            },
+        };
+        if text.0 != wanted {
+            text.0 = wanted;
+        }
+    }
+}
+
+/// The card's lower half: what would happen, then what it would disturb.
+///
+/// The sentences are `Intent::sentence()` — the identical English the replay
+/// log writes and a bridge commander's own compile prints back. Nothing here
+/// renders a proposal into words; the intent layer already did, which is why
+/// the human is reading exactly what the co-commander asked for rather than a
+/// summary of it.
+fn proposal_body(proposal: &crate::copilot::Proposal) -> String {
+    let mut lines: Vec<String> = proposal
+        .sentences
+        .iter()
+        .take(PROP_MAX_SENTENCES)
+        .map(|s| format!("  - {s}"))
+        .collect();
+    if let Some(rest) = proposal.sentences.len().checked_sub(PROP_MAX_SENTENCES) {
+        if rest > 0 {
+            lines.push(format!("  - (+{rest} more)"));
+        }
+    }
+    for conflict in &proposal.conflicts {
+        lines.push(format!("  ! {conflict}"));
+    }
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // Tests — the human half of docs/TEMPO.md's doctrine parity
 // ---------------------------------------------------------------------------
 
@@ -6762,6 +7614,137 @@ mod tests {
         assert_eq!(app.world().resource::<Notifications>().live.len(), 1);
     }
 
+    // -----------------------------------------------------------------
+    // Co-command: the human's half of the negotiation
+    // -----------------------------------------------------------------
+
+    fn a_proposal(id: u32, note: &str, sentences: &[&str], conflicts: &[&str]) -> crate::copilot::Proposal {
+        crate::copilot::Proposal {
+            id,
+            note: note.to_string(),
+            intents: vec![Intent::Stop { units: vec![1] }],
+            sentences: sentences.iter().map(|s| s.to_string()).collect(),
+            conflicts: conflicts.iter().map(|s| s.to_string()).collect(),
+            proposed_at: 0.0,
+            expires_at: PROPOSAL_TTL,
+            pos: None,
+        }
+    }
+
+    /// The panel and its two keys, with no window and no renderer — the same
+    /// headless-App discipline the doctrine-card gesture tests use. Every
+    /// keystroke below goes through the production system.
+    fn proposal_app(pending: Vec<crate::copilot::Proposal>) -> App {
+        let mut app = App::new();
+        app.init_resource::<UiState>()
+            .init_resource::<Time>()
+            .init_resource::<GameOver>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(Copilot::seated_with(Team::Human, pending))
+            .add_event::<ProposalVerdict>()
+            .add_systems(Startup, |mut commands: Commands| {
+                spawn_proposals(&mut commands)
+            })
+            .add_systems(Update, (proposal_input, update_proposals).chain());
+        app
+    }
+
+    fn verdicts(app: &mut App) -> Vec<ProposalVerdict> {
+        let events = app.world().resource::<Events<ProposalVerdict>>();
+        events.get_cursor().read(events).copied().collect()
+    }
+
+    /// The approve path, through the real hotkey.
+    ///
+    /// This is the human side of `copilot::a_proposal_waits_then_lands_stamped_by_the_copilot`:
+    /// that test proves an approved batch reaches the compiler stamped by the
+    /// partner, this one proves a keystroke is what approves it. Between them
+    /// the loop has no hand-waved step.
+    #[test]
+    fn enter_approves_the_top_proposal_and_backspace_vetoes_it() {
+        let mut app = proposal_app(vec![
+            a_proposal(7, "take the ford", &["3 units attack-move to (0.0, 0.0)"], &[]),
+            a_proposal(8, "and build a tower", &["worker 41 builds Tower at (1.0, 2.0)"], &[]),
+        ]);
+
+        press(&mut app, &[PROP_APPROVE_KEY]);
+        let said = verdicts(&mut app);
+        assert_eq!(said.len(), 1, "one key, one verdict");
+        // The OLDEST — the top card, the one whose clock is shortest. Not the
+        // newest, which is what a stack would have given.
+        assert_eq!(said[0].id, 7);
+        assert!(said[0].approve);
+
+        let mut app = proposal_app(vec![a_proposal(7, "spend it all", &["x"], &[])]);
+        press(&mut app, &[PROP_VETO_KEY]);
+        let said = verdicts(&mut app);
+        assert_eq!(said.len(), 1);
+        assert_eq!((said[0].id, said[0].approve), (7, false));
+    }
+
+    /// Nothing pending, nothing to answer — a stray Enter must not become a
+    /// verdict for a proposal that lapsed a second ago.
+    #[test]
+    fn the_keys_are_inert_with_an_empty_queue() {
+        let mut app = proposal_app(Vec::new());
+        press(&mut app, &[PROP_APPROVE_KEY]);
+        assert!(verdicts(&mut app).is_empty());
+        assert_eq!(app.world().resource::<UiState>().prop_cards, 0);
+    }
+
+    /// What the card actually says. The note is the co-commander's argument,
+    /// the sentences are `Intent::sentence()` — the same English the replay
+    /// log writes — and the conflict tags are the part that makes approval an
+    /// informed act rather than a reflex.
+    #[test]
+    fn a_card_shows_the_note_the_sentences_and_the_conflicts() {
+        let mut app = proposal_app(vec![a_proposal(
+            3,
+            "their push is committed — counter now",
+            &["squad 1 pushes to (40.0, 40.0)", "4 units focus Siege"],
+            &["re-tasks squad 1 (defend)"],
+        )]);
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query::<(&PropText, &Text)>();
+        let mut head = String::new();
+        let mut note = String::new();
+        let mut body = String::new();
+        for (slot, text) in q.iter(world) {
+            if slot.card != 0 {
+                // Unused cards are blanked, not left showing the last match's
+                // directive.
+                assert!(text.0.is_empty(), "card {} should be blank", slot.card);
+                continue;
+            }
+            match slot.part {
+                PropPart::Head => head = text.0.clone(),
+                PropPart::Note => note = text.0.clone(),
+                PropPart::Body => body = text.0.clone(),
+            }
+        }
+
+        assert!(head.starts_with("#3  copilot"), "got {head:?}");
+        assert!(head.contains("[Enter] approve"), "the top card names its keys");
+        assert_eq!(note, "their push is committed — counter now");
+        assert!(body.contains("- squad 1 pushes to (40.0, 40.0)"));
+        assert!(body.contains("- 4 units focus Siege"));
+        // The conflict is marked differently from the sentences: one says what
+        // would happen, the other says what it would cost you.
+        assert!(body.contains("! re-tasks squad 1 (defend)"), "got {body:?}");
+        // Everything the panel draws must be renderable by the default font —
+        // Bevy's has no `·`, and the first screenshot of this panel was full
+        // of tofu boxes where the bullets should have been.
+        assert!(
+            head.is_ascii() && body.is_ascii(),
+            "panel chrome must be ASCII: {head:?} / {body:?}"
+        );
+        // And the panel now occupies screen, so a click on "Approve" is not
+        // also a move order on the ground behind it.
+        assert_eq!(app.world().resource::<UiState>().prop_cards, 1);
+    }
+
     fn json(intent: &Intent) -> serde_json::Value {
         serde_json::to_value(intent).unwrap()
     }
@@ -6884,6 +7867,257 @@ mod tests {
         assert_eq!(cycle_step(Some(0.50), &FALLBACK_STEPS), None);
         assert_eq!(cycle_step(None, &LEASH_STEPS), Some(10.0));
         assert_eq!(cycle_step(Some(30.0), &LEASH_STEPS), None);
+    }
+
+    /// Three rungs is not a number line. The wire carries any float and a
+    /// commander types any float; `[-]/[=]` and `[[]/[]]` are how the human
+    /// says one — and they must produce the SAME sentence the preset key does,
+    /// or the seats have two dialects for one idea.
+    #[test]
+    fn the_nudge_keys_give_the_human_the_whole_number_line() {
+        let mut app = ui_app();
+        let unit = spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::Equal]);
+        press(&mut app, &[KeyCode::BracketRight]);
+
+        // No intent compiler is running here, so the components never appear
+        // and each press starts from "off" — which is exactly the case worth
+        // pinning: the first nudge lands on the middle preset rather than at
+        // the bottom of the range.
+        let sentences: Vec<String> = said(&app).iter().map(|i| i.sentence()).collect();
+        assert_eq!(
+            sentences,
+            vec![
+                format!(
+                    "unit {} fall back to (-70.0, -70.0) below 35% health",
+                    intent_id(unit)
+                ),
+                format!("unit {} hold within 18 of (-10.0, -10.0)", intent_id(unit)),
+            ]
+        );
+
+        // The ladder itself: any value, not just the three rungs.
+        assert_eq!(
+            nudge_value(Some(0.35), true, FALLBACK_NUDGE, 0.35, FALLBACK_MIN, FALLBACK_MAX),
+            Some(0.40)
+        );
+        // A bridge-written 0.375 stays off-grid rather than snapping.
+        let odd = nudge_value(Some(0.375), true, FALLBACK_NUDGE, 0.35, FALLBACK_MIN, FALLBACK_MAX);
+        assert!((odd.unwrap() - 0.425).abs() < 1e-5, "got {odd:?}");
+        // Down past the floor is "off" — the same exit the [F] cycle wraps to.
+        assert_eq!(
+            nudge_value(Some(FALLBACK_MIN), false, FALLBACK_NUDGE, 0.35, FALLBACK_MIN, FALLBACK_MAX),
+            None
+        );
+        // ...and the ceiling clamps instead of running away.
+        assert_eq!(
+            nudge_value(Some(FALLBACK_MAX), true, FALLBACK_NUDGE, 0.35, FALLBACK_MIN, FALLBACK_MAX),
+            Some(FALLBACK_MAX)
+        );
+        assert_eq!(
+            nudge_value(Some(LEASH_MAX), true, LEASH_NUDGE, 18.0, LEASH_MIN, LEASH_MAX),
+            Some(LEASH_MAX)
+        );
+        // Captions must not round a number the unit is really using.
+        assert_eq!(trim_num(37.5), "37.5");
+        assert_eq!(trim_num(35.0), "35");
+    }
+
+    /// `PostureIntent::Escort` always took any own unit; the card only ever
+    /// offered the hero. Now it arms a unit click like the other three arm a
+    /// ground click, and a Catapult can be given a screen.
+    #[test]
+    fn escort_can_screen_any_own_unit_not_just_the_hero() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        // The escortee: ours, and deliberately NOT a hero and NOT selected.
+        let catapult = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Catapult },
+                Team::Human,
+                Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
+                Health::new(220.0),
+                Order::Idle,
+            ))
+            .id();
+
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyR]);
+        let arm = app
+            .world()
+            .resource::<UiState>()
+            .posture_place
+            .expect("Escort should now arm a click instead of firing at the hero");
+        assert_eq!(arm.kind, PostureKind::Escort);
+        assert!(arm.kind.needs_unit());
+        // A ground click means nothing for this posture, and says nothing.
+        assert!(posture_intent(arm, Vec3::new(5.0, 0.0, 5.0)).is_none());
+
+        let click = posture_unit_intent(arm, catapult).unwrap();
+        assert_eq!(
+            click.sentence(),
+            format!("squad 1 escorts {}", intent_id(catapult))
+        );
+        let typed: Intent = serde_json::from_str(&format!(
+            r#"{{"type":"posture","id":1,"posture":{{"type":"escort","unit":{}}}}}"#,
+            intent_id(catapult)
+        ))
+        .unwrap();
+        assert_eq!(json(&click), json(&typed));
+    }
+
+    /// `AutoCastPolicy` has been per-slot since abilities v2 and the card had
+    /// one switch, wired to slot 0. A Champion who has learned Warcry could not
+    /// be told to auto-cast it from the human seat at all.
+    #[test]
+    fn autocast_is_per_ability_on_the_doctrine_card() {
+        let mut app = ui_app();
+        let hero = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Transform::from_translation(Vec3::new(-10.0, 0.0, -10.0)),
+                Health::new(600.0),
+                Order::Idle,
+                Hero { level: 6, xp: 0.0, mana: 200.0 },
+                Selected,
+            ))
+            .id();
+
+        press(&mut app, &[KeyCode::KeyI]);
+        // [X] is slot 1 — the Champion's SECOND ability.
+        press(&mut app, &[KeyCode::KeyX]);
+
+        let gesture = said(&app).last().expect("a rule should have been set");
+        let typed: Intent = serde_json::from_str(&format!(
+            r#"{{"type":"autocast","units":[{}],"min_enemies":{AUTOCAST_MIN_ENEMIES},"ability":1}}"#,
+            intent_id(hero)
+        ))
+        .unwrap();
+        assert_eq!(json(gesture), json(&typed));
+
+        // And the card really does offer one per ability, named after it.
+        let doc = DoctrineState::of(&[UnitDoctrine::read(
+            None,
+            None,
+            None,
+            None,
+            UnitKind::Hero,
+            None,
+        )]);
+        let entries = doctrine_entries(1, DoctrineCard { doc, ..default() });
+        let slots: Vec<CmdAction> = entries
+            .iter()
+            .map(|e| e.action)
+            .filter(|a| matches!(a, CmdAction::ToggleAutoCastSlot(_)))
+            .collect();
+        assert_eq!(
+            slots.len(),
+            abilities_of_unit(UnitKind::Hero).len(),
+            "one toggle per ability, no more and no fewer"
+        );
+        for (i, def) in abilities_of_unit(UnitKind::Hero).iter().enumerate() {
+            let entry = entries
+                .iter()
+                .find(|e| e.action == CmdAction::ToggleAutoCastSlot(i))
+                .unwrap();
+            assert!(entry.label.contains(def.name), "{} not named", def.name);
+        }
+        // A selection with nothing to cast gets none of them.
+        let footmen = DoctrineState::of(&[UnitDoctrine::read(
+            None,
+            None,
+            None,
+            None,
+            UnitKind::Footman,
+            None,
+        )]);
+        assert!(!doctrine_entries(1, DoctrineCard { doc: footmen, ..default() })
+            .iter()
+            .any(|e| matches!(e.action, CmdAction::ToggleAutoCastSlot(_))));
+    }
+
+    /// The doctrine page was never covered by the hotkey-uniqueness tests, and
+    /// it just gained five keys. A duplicate would mean one press firing two
+    /// orders — silently, since `command_input` walks every matching entry.
+    #[test]
+    fn the_doctrine_page_keeps_its_hotkeys_unique() {
+        let caster = DoctrineState::of(&[UnitDoctrine::read(
+            None,
+            None,
+            None,
+            None,
+            UnitKind::Hero,
+            None,
+        )]);
+        for (units, card) in [
+            (2usize, DoctrineCard { doc: caster, ..default() }),
+            (
+                0usize,
+                DoctrineCard {
+                    tmpl: TemplateView { capable: true, ..default() },
+                    ..default()
+                },
+            ),
+        ] {
+            let entries = doctrine_entries(units, card);
+            assert!(
+                entries.len() <= CMD_SLOTS,
+                "the doctrine card overflowed at {} entries",
+                entries.len()
+            );
+            let mut keys: Vec<KeyCode> = entries.iter().map(|e| e.key).collect();
+            keys.sort_by_key(|k| format!("{k:?}"));
+            let before = keys.len();
+            keys.dedup();
+            assert_eq!(before, keys.len(), "duplicate hotkey on the doctrine card");
+            assert!(
+                entries.last().map(|e| e.action) == Some(CmdAction::TogglePage),
+                "the way back must survive a full card"
+            );
+        }
+        // The four nudge keys are raw, not entries — they must not collide
+        // with any doctrine-card hotkey either.
+        let entries = doctrine_entries(2, DoctrineCard { doc: caster, ..default() });
+        for nudge in [
+            KeyCode::Minus,
+            KeyCode::Equal,
+            KeyCode::BracketLeft,
+            KeyCode::BracketRight,
+        ] {
+            assert!(
+                !entries.iter().any(|e| e.key == nudge),
+                "{nudge:?} is both a nudge and a card button"
+            );
+        }
+    }
+
+    /// The badge exists for one situation: a drag box that scooped up units
+    /// from two squads (or none). The doctrine card names ONE squad — the first
+    /// unit's — so without a per-tile mark the player aims a posture at a group
+    /// and only part of it moves.
+    #[test]
+    fn squad_badges_make_a_mixed_selection_visible() {
+        let of = |squad: Option<u8>| UnitDoctrine {
+            squad,
+            ..UnitDoctrine::read(None, None, None, None, UnitKind::Footman, None)
+        };
+        let mixed = DoctrineState::of(&[of(Some(1)), of(Some(2)), of(None)]);
+        assert_eq!(mixed.squad, Some(1), "the card speaks for the first unit");
+        assert!(
+            mixed.in_squad < mixed.units,
+            "and two of the three tiles are not in it — which is the whole \
+             hazard the badge is there to show"
+        );
+
+        // Badge text: the id, and nothing at all for a unit in no squad.
+        assert_eq!(squad_badge(Some(1)), "1");
+        assert_eq!(squad_badge(Some(3)), "3");
+        assert_eq!(squad_badge(None), "");
     }
 
     /// A production building carries standing doctrine for everything it will

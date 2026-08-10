@@ -132,7 +132,11 @@ impl Plugin for IntentPlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<SubmitIntent>()
             .init_resource::<IntentErrors>()
+            // Registered here rather than in CorePlugin for the same reason
+            // `IntentErrors` is: bridge.rs reads all three, but this file is
+            // the only thing that ever writes them.
             .init_resource::<IntentApplied>()
+            .init_resource::<IntentJournal>()
             .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
             // `.after(FogSet)`: an intent is judged against the visibility its
@@ -327,6 +331,7 @@ fn apply_intents(
     // The positive half of the same channel: what each command cost to deliver.
     mut applied_log: ResMut<IntentApplied>,
     mut log: ResMut<IntentLog>,
+    mut journal: ResMut<IntentJournal>,
     mut feed: ResMut<GameEvents>,
     mut notices: ResMut<UiNotices>,
     mut events: IntentEvents,
@@ -379,6 +384,20 @@ fn apply_intents(
             &mut issuer,
         );
         log.record(now, &submission, &errors, issuer.max_delay);
+        // The same record, kept in memory as well as on disk. The file is the
+        // match's, this is the seats': a co-commander reads its partner's
+        // recent sentences out of its snapshot (`partner_log`) and would
+        // otherwise be commanding next to someone it cannot hear.
+        journal.push(
+            submission.team,
+            JournalEntry {
+                t: (now * 10.0).round() / 10.0,
+                source: submission.source,
+                verb: submission.intent.verb(),
+                sentence: submission.intent.sentence(),
+                ok: errors.is_empty(),
+            },
+        );
         // The human's copy of the error channel. Source decides which renderer
         // is told, never whether the intent was legal — the verdict above was
         // reached without consulting it.
@@ -1536,6 +1555,17 @@ impl IntentLog {
         }
     }
 
+    /// A log that writes nothing. Tests take this so they depend on neither
+    /// `WC3_INTENT_LOG` nor the filesystem, and leave no file behind.
+    #[cfg(test)]
+    pub fn disabled() -> Self {
+        IntentLog {
+            path: None,
+            file: None,
+            broken: false,
+        }
+    }
+
     fn record(&mut self, now: f32, submission: &SubmitIntent, errors: &[String], raw_link: f32) {
         if self.path.is_none() || self.broken {
             return;
@@ -1954,11 +1984,7 @@ mod tests {
             .init_resource::<CommandNodes>()
             .init_resource::<CommandLatency>()
             .add_plugins(IntentPlugin);
-        app.insert_resource(IntentLog {
-            path: None,
-            file: None,
-            broken: false,
-        });
+        app.insert_resource(IntentLog::disabled());
         // Pin the fog mode: the ambient `WC3_FOG` must not decide an outcome.
         app.insert_resource(FogGrids::test_dark());
         app
@@ -2127,6 +2153,97 @@ mod tests {
             "silence means instant — an order that paid nothing must not be \
              acknowledged, or the wire gains a key with the feature off"
         );
+    }
+
+    /// The half of co-command's legibility that runs human -> AI.
+    ///
+    /// The human already sees their partner's directives — they arrive as
+    /// proposals with a note. Without a journal the partner could not see
+    /// theirs, and would be commanding next to someone it cannot hear. So
+    /// every intent the compiler handles is also remembered in memory, tagged
+    /// with which author spelled it, and a copilot seat serializes its team's
+    /// tail as `partner_log`.
+    ///
+    /// The point of the assertion is that this needed **no new vocabulary**:
+    /// what a co-commander reads is `Intent::sentence()` — the same string the
+    /// replay log writes and the same one the human's proposal card shows.
+    #[test]
+    fn every_authors_sentences_are_remembered_source_tagged() {
+        let mut app = compiler_app();
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+            ))
+            .id();
+
+        // The human right-clicks; then their co-commander installs doctrine.
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Move {
+                units: vec![soldier.to_bits()],
+                x: 12.0,
+                z: -4.0,
+            },
+        ));
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Copilot,
+            tag: "cmd 0".to_string(),
+            intent: Intent::Squad {
+                units: vec![soldier.to_bits()],
+                id: Some(1),
+            },
+        });
+        app.update();
+
+        let journal = app.world().resource::<IntentJournal>();
+        let human: Vec<String> = journal
+            .get(Team::Human)
+            .iter()
+            .map(|e| format!("{} | {}", e.source.name(), e.sentence))
+            .collect();
+        assert_eq!(
+            human,
+            vec![
+                format!("ui | move unit {} to (12.0, -4.0)", soldier.to_bits()),
+                format!("copilot | unit {} join squad 1", soldier.to_bits()),
+            ]
+        );
+        // One team's authors, one journal. The opponent's is untouched — a
+        // co-commander reads its partner, never the enemy's plan.
+        assert!(journal.get(Team::Claude).is_empty());
+    }
+
+    /// The journal is a tail, not a transcript: an hour-long match must not
+    /// grow a snapshot field without bound.
+    #[test]
+    fn the_journal_keeps_only_a_tail() {
+        let mut app = compiler_app();
+        for i in 0..JOURNAL_MAX + 5 {
+            app.world_mut().send_event(SubmitIntent::ui(
+                Team::Human,
+                Intent::Move {
+                    units: vec![i as u64],
+                    x: 0.0,
+                    z: 0.0,
+                },
+            ));
+        }
+        app.update();
+        let journal = app.world().resource::<IntentJournal>();
+        assert_eq!(journal.get(Team::Human).len(), JOURNAL_MAX);
+        // Oldest dropped, newest kept — the tail a partner actually wants.
+        assert!(journal
+            .get(Team::Human)
+            .back()
+            .is_some_and(|e| e.sentence.contains(&(JOURNAL_MAX + 4).to_string())));
+        // Rejections are kept too (these units do not exist): a partner
+        // learning that your last four clicks bounced is a partner who stops
+        // proposing around a plan you never actually issued.
+        assert!(journal.get(Team::Human).iter().all(|e| !e.ok));
     }
 
     /// Remember `building` (an enemy structure) in `team`'s grid, exactly as

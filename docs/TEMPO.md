@@ -590,12 +590,35 @@ sent both commands by hand.
 **Scoreboard against §2.0's 8-vs-4.** The human now has all seven doctrine verbs
 (`priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template`),
 parameterised rather than as toggles, with the coarse `[G]/[V]/[P]/[T]` presets
-kept on page one. What remains bridge-only is *range*, not vocabulary: the card
-steps retreat through 25/35/50% and leash through 10/18/30 where a commander
-writes any float; squad ids from a gesture are 1–3 where the wire takes any
-`u8`; `posture escort` targets the team's hero where the wire names any own
-unit; and per-ability `autocast` rules are still one rule on slot 0. Each is a
-UI affordance, not a missing verb — the intent submitted is the same value.
+kept on page one.
+
+**Range, closed (wc3clone-137).** Three of the four remaining gaps were about
+*range* rather than vocabulary, and they are gone:
+
+* **Retreat and leash are free-entry.** `[F]`/`[G]` still step the
+  25/35/50% and 10/18/30 presets — they are the fast path, and most of the time
+  a preset is what you want. `[-]`/`[=]` nudge the threshold and `[[]`/`[]]`
+  nudge the radius, one increment per press across the whole legal range, so
+  the human can say 0.375 exactly as a commander can. Both controls submit the
+  identical `Intent::Retreat`/`Intent::Leash`; only the arithmetic differs.
+* **`posture escort` names any own unit.** It arms a click like the other three
+  postures, and the click picks a unit instead of a point. Escorting the hero
+  is now one click rather than zero; escorting a Catapult, a Priestess or an
+  expanding Worker is now possible at all.
+* **`autocast` is per ability.** The doctrine page carries one toggle per
+  ability slot (`Z`/`X`/`C`, named after the ability), each submitting
+  `ability: <slot>` and editing that one rule. Page one's `[T]` is unchanged
+  and still means slot 0.
+
+Two affordances came with them: a translucent disc marks the pending posture
+point during click-to-place (at `DEFEND_RADIUS` for Defend, so the circle you
+aim is the circle you get), and every selection tile carries its squad id in the
+corner — the doctrine card speaks for the FIRST unit's squad, and a drag box
+that scooped up two squads used to look exactly like one that scooped up one.
+
+What is still narrower than the wire: squad ids from a gesture are 1–3 where the
+wire takes any `u8`. That one is deliberate — a gesture squad is a control
+group, and there are three control groups.
 
 ---
 
@@ -1082,3 +1105,41 @@ link rests on 1–5 samples per match; and the engine has no seed control, so
 replicates differ only by bounty-placement RNG and frame timing rather than by a
 controlled seed. Widening any of these is a flag away —
 `tools/link_sweep.py --help` documents the axes.
+
+### Reconciled against master (bead/hre, co-command)
+
+Co-command landed while this bead was in flight, and the interesting part is
+that the two beads collided in exactly the same three places — twice by
+converging on the same answer independently, which is usually a sign the answer
+was forced by the shape of the problem rather than chosen.
+
+**Both hit Bevy's 16-parameter ceiling on `write_snapshot`, and both solved it
+the same way.** This bead bundled the compiler's two verdict channels as
+`SeatVerdicts`; hre bundled the copilot queue and the intent journal as
+`CoCommand`, with a comment giving `TeamTech` as its precedent — the same
+precedent this one had cited. Merged, the two bundles sit side by side and the
+system is back to fifteen parameters, with headroom neither bead had alone.
+
+**Both hit Bevy's 20-element tuple limit on the UI's `Update` chain.** hre added
+`update_posture_marker` (the doctrine page's click-to-place point finally got a
+ground visual) and grouped it with `update_ghost` as an unordered pair, on the
+honest grounds that two armed-gesture previews cannot observe each other. This
+bead added two Chain of Command systems and split the chain into two internally
+chained groups. Both were needed: the pair alone is 20 elements and this bead's
+two would have made 22. The merged chain keeps hre's pair *inside* this bead's
+second group.
+
+**`IntentApplied` and `IntentJournal` turned out to be siblings.** Both are
+per-team, both are written only by the compiler, both are read only by
+bridge.rs, and both were registered in `IntentPlugin` next to `IntentErrors`
+with near-identical reasoning in the comment. They now sit together, and the
+comment says "all three" rather than "both".
+
+Nothing about the mechanism itself needed revisiting. The one thing worth
+re-checking was the flag-off wire, because a copilot seat now adds keys of its
+own: `tools/verify_intent_bridge.py` still passes on a plain seat with the
+latency flag off, which is the assertion that a v1 snapshot is still exactly its
+historical sixteen keys. Re-run after the merge, the acceptance sims hold too —
+`open` 2/2 decisive in both arms, `crossings` 5/6 flag-off (the one cap a
+baseline stalemate, in the arm where the classifier has no link telemetry to
+read) and 6/6 flag-on.

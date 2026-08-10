@@ -3774,6 +3774,21 @@ impl FogGrids {
         }
     }
 
+    /// Test-only twin of `test_dark`: both grids fully lit, fog still nominally
+    /// ON. For a test whose subject is what a team DOES about something it can
+    /// see, rather than whether it can see it — a scripted-AI reaction, say.
+    /// Pinning it here keeps the ambient `WC3_FOG` out of the outcome in both
+    /// directions.
+    #[cfg(test)]
+    pub fn test_revealed() -> Self {
+        FogGrids {
+            enabled: true,
+            human: FogGrid::revealed(),
+            claude: FogGrid::revealed(),
+            ..Default::default()
+        }
+    }
+
     /// Test-only: plant a memory in `team`'s grid, exactly as `update_fog`
     /// does when the structure is in sight, without a scout having to walk
     /// there and back.
@@ -4831,8 +4846,26 @@ impl Intent {
 pub enum IntentSource {
     /// A human gesture in ui.rs (mouse, hotkey, command card).
     Ui,
-    /// A command batch through the file bridge.
+    /// A command batch through the file bridge, from the seat that *is* the
+    /// faction — the opponent model in an LLM-vs-LLM or human-vs-LLM match.
     Bridge,
+    /// The CO-COMMANDER seat: a second author on the *same* team as the human
+    /// at the keyboard (`WC3_BRIDGE=copilot`, copilot.rs).
+    ///
+    /// A seat, not a script — which is why it gets its own rung here rather
+    /// than borrowing `Cause::Script`'s. Everything a co-commander mints is
+    /// attributed with zero extra plumbing: `Cause::Order { source }` already
+    /// answers "which of us moved this unit", the snapshot's `units[].why`
+    /// already renders it, and ui.rs's `why_line` already tallies mixed
+    /// answers across a selection — which is exactly the "did my partner
+    /// re-task my push?" readout.
+    ///
+    /// Still descriptive, never authoritative: the compiler reaches the same
+    /// verdict for all three. What *is* different — which of this seat's
+    /// intents need the human's approval first — is decided in copilot.rs,
+    /// upstream of submission, and is a matter of etiquette rather than of
+    /// legality (see docs/INTENT.md § co-command).
+    Copilot,
 }
 
 impl IntentSource {
@@ -4840,6 +4873,7 @@ impl IntentSource {
         match self {
             IntentSource::Ui => "ui",
             IntentSource::Bridge => "bridge",
+            IntentSource::Copilot => "copilot",
         }
     }
 }
@@ -5093,6 +5127,63 @@ impl IntentApplied {
         match team {
             Team::Human => &mut self.human,
             Team::Claude => &mut self.claude,
+        }
+    }
+}
+
+/// How many recent intents `IntentJournal` keeps per team.
+pub const JOURNAL_MAX: usize = 40;
+
+/// One remembered intent: what was said, by whom, and when.
+///
+/// Deliberately the *same four fields* `intent_log.jsonl` writes — this is the
+/// in-memory tail of that file, not a second record with its own vocabulary.
+#[derive(Clone, Debug)]
+pub struct JournalEntry {
+    pub t: f32,
+    pub source: IntentSource,
+    pub verb: &'static str,
+    /// `Intent::sentence()` — the half a person (or a partner) reads.
+    pub sentence: String,
+    pub ok: bool,
+}
+
+/// The recent intent history of each team, in memory, oldest first.
+///
+/// `intent_log.jsonl` is the *match record* and lives on disk; this is the
+/// tail of it a running seat can be shown. It exists for exactly one reason:
+/// **co-command needs the legibility to run both ways.** The human already
+/// sees the co-commander's directives (they arrive as proposals with a note
+/// and compiled sentences). Without this, the co-commander could not see the
+/// human's — it would be commanding half-blind, next to a partner it cannot
+/// read, which is the asymmetry THESIS.md's wager is against.
+///
+/// No new vocabulary: the entries are the same sentences `Intent::sentence()`
+/// renders for the log and the same `source` tags `units[].why` carries. A
+/// copilot seat serializes them as `partner_log`.
+#[derive(Resource, Default)]
+pub struct IntentJournal {
+    human: VecDeque<JournalEntry>,
+    claude: VecDeque<JournalEntry>,
+}
+
+impl IntentJournal {
+    pub fn get(&self, team: Team) -> &VecDeque<JournalEntry> {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+
+    /// Append one entry, dropping the oldest past `JOURNAL_MAX`.
+    pub fn push(&mut self, team: Team, entry: JournalEntry) {
+        let ring = match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        };
+        ring.push_back(entry);
+        while ring.len() > JOURNAL_MAX {
+            ring.pop_front();
         }
     }
 }
@@ -5360,7 +5451,11 @@ fn initial_spawns(
 
 /// Despawn anything whose Health reached zero; free building footprints,
 /// snapshot dying heroes for revival, and drop XP for nearby enemy heroes.
-fn apply_death(
+///
+/// `pub(crate)` only so combat.rs's fixed-clock test harness can register the
+/// real one: a simulated duel where the dead keep swinging measures nothing.
+/// It is still `CorePlugin`'s system and nobody else's to schedule.
+pub(crate) fn apply_death(
     mut commands: Commands,
     mut nav: ResMut<NavGrid>,
     mut records: ResMut<HeroRecords>,
@@ -5506,7 +5601,10 @@ fn tick_militia_and_cooldowns(
 /// This is the counterpart of `StatusEffects::apply`: content applies, shared
 /// expires. No content bead ever schedules its own removal, so a buff can
 /// never outlive its duration because somebody forgot a system.
-fn tick_status_effects(
+/// `pub(crate)` for the same reason as `apply_death`: combat.rs's fixed-clock
+/// harness needs the real expiry pass, or a Slow in a simulated duel would
+/// last forever.
+pub(crate) fn tick_status_effects(
     time: Res<Time>,
     mut commands: Commands,
     mut query: Query<(Entity, &mut StatusEffects, Option<&mut Health>)>,
