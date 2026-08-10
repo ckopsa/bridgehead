@@ -178,6 +178,22 @@ Compound gestures become *two sentences* rather than a special case: a
 right-click on a gold mine with a mixed selection submits a `harvest` for the
 workers and a `move` for everyone else, which is what it always meant.
 
+The doctrine card (`[I]`, added by docs/TEMPO.md's phase 0) is the same trick at
+the strategic layer. `Ctrl+1` is a `squad`; `[I][W]` then a ground click is a
+`posture`; `[I][F]` steps a retreat *threshold* rather than toggling one. A
+posture pressed on a selection that is not already one squad submits `squad`
+first and `posture` second — two sentences again — so the log reads:
+
+```
+  [ 91.6s] Human/ui: 3 units join squad 1
+  [100.2s] Human/ui: squad 1 pushes to (-59.4, -27.1)
+  [103.2s] Human/ui: 3 units fall back to (-70.0, -70.0) below 25% health
+  [104.1s] Human/ui: 3 units hold within 10 of (-61.0, -40.0)
+  [106.9s] Human/ui: squad 1 stands down (posture cleared)
+```
+
+Every one of those is a sentence only a bridge commander could produce before.
+
 ---
 
 ## Knowability: where fog validation lives
