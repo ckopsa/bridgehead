@@ -33,10 +33,13 @@ const SKY_COLOR: Color = Color::srgb(0.42, 0.62, 0.88);
 
 /// Gold mine footprint edge length (world units) blocked in the nav grid.
 const MINE_FOOTPRINT: f32 = 6.0;
-// Tuned down twice (10k → 5k → 3.5k): the map's total gold sets the game's
-// length. At 3.5k the mines die around minute 10-12, forcing the decisive
-// phase into the target 10-20 minute window.
-const MINE_GOLD: u32 = 3_500;
+// Tuned down twice (10k → 5k → 3.5k), then back UP to 5k after round 9: the
+// map's total gold sets the game's length, and 3.5k was cut when games ran 60
+// minutes — but the production-only win, uncapped bounty escalation, and the
+// smarter scripted AI have since shortened everything. At 3.5k a saturated
+// mine died around minute 4-5, deciding commander matches before tier 2
+// existed. 5k restores a mid-game without restoring the stall.
+const MINE_GOLD: u32 = 5_000;
 const TREE_LUMBER: u32 = 150;
 
 /// Camera pitch (radians below the horizon) and fixed yaw.
