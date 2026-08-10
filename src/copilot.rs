@@ -784,6 +784,7 @@ fn resolve_proposals(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{CommandLatency, CommandNodes};
     use crate::intent::{IntentLog, IntentPlugin};
 
     /// The whole co-command loop over a real world: the negotiation layer
@@ -807,6 +808,14 @@ mod tests {
             .add_event::<UseItem>()
             .add_event::<UpgradeBuilding>()
             .add_event::<StartResearch>()
+            // Chain of Command's two resources (docs/TEMPO.md §3), defaulted
+            // to `on: false` — an approved batch compiles the instant the
+            // human says yes, so nothing here is about propagation. Under
+            // latency a co-commander's approved order would travel exactly as
+            // any other direct order does, which is the point of it going
+            // through the same compiler.
+            .init_resource::<CommandNodes>()
+            .init_resource::<CommandLatency>()
             .add_plugins((IntentPlugin, CopilotPlugin));
         // A unit test must not depend on `WC3_INTENT_LOG` or leave a file.
         app.insert_resource(IntentLog::disabled());

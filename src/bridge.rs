@@ -126,6 +126,12 @@
 //! right now?" for every catalog entry, computed from the seat's own completed
 //! buildings. The same check gates the `build` and `train` commands, so a
 //! commander that respects `unlocked` never has an order bounced by economy.rs.
+//! For a unit that means BOTH halves of "right now" — the tech gates met and a
+//! finished building of ours that trains it standing somewhere. The map used to
+//! report only the first half, so a team with no Barracks read `Footman: true`;
+//! the honest answer, and the one that stops a `train` bouncing, is no. Planning
+//! ahead is still the catalog's job: `units[].requires` lists the whole chain,
+//! trainer included, and does not care what you own yet.
 //!
 //! Abilities and items are described by the catalog (`abilities`, `items`) and
 //! driven by three commands: `cast` takes any caster — a hero of either class
@@ -174,6 +180,7 @@
 //! order — turns into an error string carried in the next snapshot's `errors`
 //! array instead of a panic.
 
+use crate::command::{CommandLink, PendingOrder};
 use crate::copilot::{Copilot, CopilotWire, Proposal};
 use crate::intent::{set_autopilot, IntentApply};
 use crate::shared::*;
@@ -505,6 +512,14 @@ struct StateOut {
     bounties: Vec<BountyOut>,
     /// `[[game_time, message], ...]`, oldest first — see `diff_events`.
     events: Vec<(f32, String)>,
+    /// docs/TEMPO.md §3 — your own command nodes: the finished halls and the
+    /// living hero your orders radiate from. Orders to units inside one of
+    /// these circles arrive instantly; everything else pays for the distance.
+    /// Own team only, symmetric with what the HUD shows the human — and the
+    /// enemy's chain of command is something you learn by razing it, not by
+    /// reading it. Absent entirely when `WC3_COMMAND_LATENCY` is off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    command_nodes: Vec<CommandNodeOut>,
 
     // --- co-command (copilot seats only) ---------------------------------
     //
@@ -574,6 +589,14 @@ struct JournalOut {
     sentence: String,
     /// False when the compiler refused some or all of it.
     ok: bool,
+}
+
+/// One command node, as the commander sees it.
+#[derive(Serialize)]
+struct CommandNodeOut {
+    pos: [f32; 2],
+    /// Orders to a unit within this many world units of `pos` are free.
+    radius: f32,
 }
 
 /// The map, as neutral public information — identical in both seats'
@@ -754,6 +777,19 @@ struct UnitOut {
     /// no abilities and for the opponent's army.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     abilities: Vec<AbilityOut>,
+    /// docs/TEMPO.md §3 — Chain of Command. Own units only: seconds a direct
+    /// order to THIS unit would take to arrive, given where it is standing
+    /// relative to your nearest hall or your hero. `0.0` means it is inside a
+    /// command node's radius and your hands reach it instantly. Absent
+    /// entirely when `WC3_COMMAND_LATENCY` is off, which is also when it is
+    /// meaningless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<f32>,
+    /// An order you already gave this unit is still in transit. Absent
+    /// (rather than `false`) the rest of the time. Re-ordering a unit that is
+    /// `pending` replaces what was travelling — it does not queue behind it.
+    #[serde(skip_serializing_if = "is_false")]
+    pending: bool,
 }
 
 /// One ability slot of one caster, as the commander sees it. The catalog says
@@ -1027,6 +1063,9 @@ type SnapshotUnits<'w, 's> = Query<
             Option<&'static Inventory>,
             Has<Militia>,
             Option<&'static AbilityCooldowns>,
+            // docs/TEMPO.md §3: an order this unit has been given that has not
+            // reached it yet. Always `None` with WC3_COMMAND_LATENCY off.
+            Option<&'static PendingOrder>,
         ),
     ),
 >;
@@ -1054,6 +1093,15 @@ type SnapshotNodes<'w, 's> =
 
 type SnapshotBounties<'w, 's> =
     Query<'w, 's, (Entity, &'static Bounty, &'static Transform)>;
+
+/// The neutral furniture of the map: resource nodes and bounty caches. Bundled
+/// for the same reason `TeamTech` is — `write_snapshot` sits exactly on Bevy's
+/// 16-parameter ceiling, and Chain of Command needed one of those slots.
+#[derive(SystemParam)]
+struct SnapshotNeutrals<'w, 's> {
+    nodes: SnapshotNodes<'w, 's>,
+    bounties: SnapshotBounties<'w, 's>,
+}
 
 #[allow(clippy::too_many_arguments)]
 /// Per-team tech state the snapshot reports: how far up the hall ladder a team
@@ -1093,8 +1141,12 @@ fn write_snapshot(
     co: CoCommand,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
-    nodes: SnapshotNodes,
-    bounties: SnapshotBounties,
+    neutrals: SnapshotNeutrals,
+    // docs/TEMPO.md §3/§4: the seat's own command nodes, and the curve that
+    // says what an order to a given unit would cost. An information right —
+    // reported to a commander for exactly the same reason the HUD draws it for
+    // the human, and never for the opponent's team.
+    link: CommandLink,
 ) {
     let now = r1(time.elapsed_secs());
     let delta = real.delta();
@@ -1135,8 +1187,9 @@ fn write_snapshot(
             co_out,
             &units,
             &buildings,
-            &nodes,
-            &bounties,
+            &neutrals.nodes,
+            &neutrals.bounties,
+            &link,
         );
     }
 }
@@ -1172,6 +1225,7 @@ fn write_seat_snapshot(
     buildings: &SnapshotBuildings,
     nodes: &SnapshotNodes,
     bounties: &SnapshotBounties,
+    link: &CommandLink,
 ) {
     let me = seat.team;
     let (fog_enabled, fog) = fog;
@@ -1185,7 +1239,7 @@ fn write_seat_snapshot(
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(|(e, unit, team, tf, health, order, move_to, carrying, hero, doctrine, kit)| {
             let (squad, prio, retreat, leash, autocast, why) = doctrine;
-            let (inventory, militia, cooldowns) = kit;
+            let (inventory, militia, cooldowns, in_transit) = kit;
             let mine = *team == me;
             let has_policy =
                 prio.is_some() || retreat.is_some() || leash.is_some() || autocast.is_some();
@@ -1226,6 +1280,11 @@ fn write_seat_snapshot(
                     leash: leash.map(|l| [r1(l.anchor.x), r1(l.anchor.z), r1(l.radius)]),
                     autocast: autocast.and_then(|a| a.primary()),
                 }),
+                // What the chain of command costs to reach this unit, and
+                // whether something is already on its way to it.
+                link: (mine && link.latency.on)
+                    .then(|| r1(link.delay(*team, tf.translation))),
+                pending: mine && in_transit.is_some(),
                 // Our own casters only: abilities we can actually order.
                 abilities: if mine {
                     abilities_out(
@@ -1451,6 +1510,18 @@ fn write_seat_snapshot(
         Some((copilot, proposals, journal)) => (Some(copilot), Some(proposals), Some(journal)),
         None => (None, None, None),
     };
+    let command_nodes: Vec<CommandNodeOut> = if link.latency.on {
+        link.nodes
+            .own(me)
+            .map(|(pos, radius)| CommandNodeOut {
+                pos: [r1(pos.x), r1(pos.z)],
+                radius: r1(radius),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let state = StateOut {
         t: now,
         my_team: team_name(me),
@@ -1563,6 +1634,7 @@ fn write_seat_snapshot(
         trees_near,
         bounties: bounties_out,
         events,
+        command_nodes,
         copilot: copilot_out,
         proposals: proposals_out,
         partner_log,
@@ -1597,6 +1669,19 @@ fn write_seat_snapshot(
 /// Every catalog entry -> can this team build/train it with what it has
 /// standing right now. Derived from the shared kind tables, so new content is
 /// reported without touching this file.
+///
+/// "Right now" is the whole contract, and for a UNIT it takes two facts, not
+/// one. `unit_requires` is deliberately partial — it lists the gates BEYOND
+/// owning the trainer, because the trainer is normally checked by the order
+/// being given AT it. A map built from that half alone answered `Footman: true`
+/// for a team with no Barracks: every tech gate satisfied (there are none),
+/// and nowhere on the map to train one. That is not a caveat, it is a wrong
+/// answer to the only question this map is asked, and it cost a commander a
+/// bounced `train` to discover.
+///
+/// So a unit is unlocked when its tech gates are met AND this team has a
+/// finished building standing that trains it. Buildings are unchanged: nothing
+/// produces a building except a worker, which every team always has.
 fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
     let mut out = BTreeMap::new();
     for kind in ALL_BUILDING_KINDS {
@@ -1612,9 +1697,10 @@ fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
         );
     }
     for kind in ALL_UNIT_KINDS {
+        let has_trainer = completed.iter().any(|b| trainable(*b).contains(&kind));
         out.insert(
             kind_name(kind),
-            requirements_met(unit_requires(kind), completed.iter().copied()),
+            has_trainer && requirements_met(unit_requires(kind), completed.iter().copied()),
         );
     }
     out
@@ -1873,5 +1959,75 @@ mod tests {
             unit_requires(UnitKind::Spearman).is_empty(),
             "the tier-1 answer to cavalry must not itself be tech-gated"
         );
+    }
+
+    /// The bug this replaced: a team holding nothing but its town hall was told
+    /// `Footman: true`, because the Footman has no tech gate and the map never
+    /// asked where one would be trained.
+    #[test]
+    fn unlocked_needs_the_trainer_standing_not_just_the_tech() {
+        let opening = unlocked_map(&[BuildingKind::TownHall]);
+        assert_eq!(
+            opening["Footman"], false,
+            "no Barracks means no Footman, whatever the tech table says"
+        );
+        assert_eq!(opening["Archer"], false);
+        assert_eq!(opening["Spearman"], false);
+        // The hall trains these three itself, so they are honestly available.
+        assert_eq!(opening["Worker"], true);
+        assert_eq!(opening["Hero"], true);
+        assert_eq!(opening["Priestess"], true);
+        // Buildings are unaffected: a worker is the trainer, and every team
+        // has one.
+        assert_eq!(opening["Barracks"], true);
+        assert_eq!(opening["Tower"], false, "Tower is still gated on Barracks");
+
+        let with_barracks = unlocked_map(&[BuildingKind::TownHall, BuildingKind::Barracks]);
+        assert_eq!(with_barracks["Footman"], true);
+        assert_eq!(with_barracks["Tower"], true);
+    }
+
+    /// Both halves are required, in both directions: owning the trainer is not
+    /// enough when the unit carries its own gate, and satisfying the gate is
+    /// not enough without the trainer.
+    #[test]
+    fn a_unit_gate_and_its_trainer_are_both_load_bearing() {
+        // Castle satisfies the Knight's gate; without a Barracks he has no
+        // stable.
+        let castle_only = unlocked_map(&[BuildingKind::Castle]);
+        assert_eq!(castle_only["Knight"], false);
+        assert_eq!(
+            castle_only["GryphonRider"], false,
+            "the Gryphon needs the Workshop as well as the Castle"
+        );
+
+        // Barracks without the Castle: the gate bites instead.
+        let barracks_only = unlocked_map(&[BuildingKind::TownHall, BuildingKind::Barracks]);
+        assert_eq!(barracks_only["Knight"], false);
+
+        let both = unlocked_map(&[BuildingKind::Castle, BuildingKind::Barracks]);
+        assert_eq!(both["Knight"], true);
+
+        // And the Gryphon's full chain, which is what the AI's air path needs
+        // standing before it can ever pick one: Castle + Workshop.
+        let air = unlocked_map(&[
+            BuildingKind::Castle,
+            BuildingKind::Barracks,
+            BuildingKind::Workshop,
+        ]);
+        assert_eq!(air["GryphonRider"], true);
+        assert_eq!(air["Catapult"], true);
+    }
+
+    /// A Keep is a TownHall that grew: intersecting with trainers must go
+    /// through `trainable`, which knows the whole hall ladder, and not through
+    /// `kind == TownHall`.
+    #[test]
+    fn an_upgraded_hall_still_trains_its_roster() {
+        for hall in [BuildingKind::Keep, BuildingKind::Castle] {
+            let map = unlocked_map(&[hall]);
+            assert_eq!(map["Worker"], true, "{hall:?} must still train workers");
+            assert_eq!(map["Priestess"], true);
+        }
     }
 }

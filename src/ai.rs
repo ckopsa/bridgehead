@@ -16,6 +16,7 @@
 //! the team being thought for. All difficulty knobs live in the const block
 //! below.
 
+use crate::command::{CommandLink, OrderIssuer};
 use crate::shared::*;
 // The map's published geography. Read-only, and the same three facts a bridge
 // commander is handed in every snapshot (`map.chokepoints`) — the scripted AI
@@ -228,6 +229,51 @@ const GRYPHON_EVERY_NTH: u32 = 3;
 /// ...and only with this much gold banked after the reserve. A Gryphon is the
 /// last thing the script buys, never the thing it saves for.
 const GRYPHON_BANK_GOLD: u32 = 700;
+
+/// ---- Making the air branch observable ------------------------------------
+///
+/// The two constants above are so conservative that across every sim run of
+/// the era, NO scripted match ever produced a Gryphon: it needs a Castle, a
+/// Workshop, 700 gold spare after the reserve, and the siege counter on its
+/// every-third beat, all true on the same think tick. That is the correct
+/// default — the reasoning above is not a bug — but it meant the air branch
+/// and everything downstream of it (the enemy's archer shift, the reactive
+/// Tower) had never once run in a real match. Content nobody has seen is
+/// indistinguishable from content that does not work.
+///
+/// So the two gates are env-tunable, and ONLY the two gates: unset, they read
+/// their constants and the script's behaviour is byte-identical to before.
+/// `WC3_AI_GRYPHON_BANK=0 WC3_AI_GRYPHON_NTH=1 WC3_HEADLESS=1 cargo run` puts
+/// flyers in the air as soon as a Castle and Workshop stand, which is how the
+/// path gets exercised in a real sim rather than only in a unit test.
+///
+/// These are probe knobs, not balance knobs. A run with them set is not a
+/// baseline run and its timings mean nothing.
+const GRYPHON_BANK_ENV: &str = "WC3_AI_GRYPHON_BANK";
+const GRYPHON_NTH_ENV: &str = "WC3_AI_GRYPHON_NTH";
+
+/// Read a `u32` override once per process. Anything unparseable is ignored
+/// rather than fatal — a typo in a probe knob must not change a match.
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+/// `GRYPHON_BANK_GOLD`, or the `WC3_AI_GRYPHON_BANK` override.
+fn gryphon_bank_gold() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| env_u32(GRYPHON_BANK_ENV, GRYPHON_BANK_GOLD))
+}
+
+/// `GRYPHON_EVERY_NTH`, or the `WC3_AI_GRYPHON_NTH` override, floored at 1 —
+/// the value is a modulus, and a zero here would panic the think tick rather
+/// than mis-plan it.
+fn gryphon_every_nth() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| env_u32(GRYPHON_NTH_ENV, GRYPHON_EVERY_NTH).max(1))
+}
 
 /// Building placement: rings of candidate offsets around the base.
 const BUILD_PADDING: f32 = 2.0;
@@ -556,6 +602,19 @@ fn ai_apply_env(mut ai_controlled: ResMut<AiControlled>) {
         ai_controlled.human = true;
         info!("{AI_BOTH_ENV}: AI vs AI — the AI is playing Blue too");
     }
+    // Announce the probe knobs, and only when they are actually doing
+    // something: a run whose trace does not say it was tuned is a run somebody
+    // will later read as a baseline.
+    if gryphon_bank_gold() != GRYPHON_BANK_GOLD || gryphon_every_nth() != GRYPHON_EVERY_NTH {
+        info!(
+            "{GRYPHON_BANK_ENV}/{GRYPHON_NTH_ENV}: air branch tuned to bank {}g, every {} \
+             Workshop item (defaults {}g / {}) — NOT a baseline run",
+            gryphon_bank_gold(),
+            gryphon_every_nth(),
+            GRYPHON_BANK_GOLD,
+            GRYPHON_EVERY_NTH,
+        );
+    }
 }
 
 /// F9 hands Blue to the AI and back. Handing it back is deliberately a no-op
@@ -746,6 +805,12 @@ fn ai_think(
     units: UnitQuery,
     mut buildings: BuildingQuery,
     nodes: NodeQuery,
+    // docs/TEMPO.md §3: THE SCRIPTED AI PAYS LATENCY TOO. It is the third
+    // seat, and "if autopilot is exempt it becomes a cheat and C1 is violated
+    // at the third seat" is the spike's own wording. ai.rs does not go through
+    // the intent compiler (a known, documented asymmetry — docs/INTENT.md), so
+    // it reaches the same mechanism through the same helper the compiler uses.
+    link: CommandLink,
 ) {
     if game_over.0.is_some() {
         return;
@@ -775,6 +840,7 @@ fn ai_think(
             fog.get(team),
             &mut commands,
             &mut events,
+            &mut link.issuer(now),
             &team_research,
             &units,
             &mut buildings,
@@ -798,6 +864,11 @@ fn think(
     fog: &FogGrid,
     commands: &mut Commands,
     events: &mut AiEvents,
+    // Every unit order below is issued through this, exactly as a human's
+    // right-click and a bridge commander's `move` are. See the `Order::` sites
+    // in this function: each one names the unit's own position, so the script
+    // pays the same distance-to-command-node cost anybody else does.
+    issuer: &mut OrderIssuer,
     team_research: &TeamResearch,
     units: &UnitQuery,
     buildings: &mut BuildingQuery,
@@ -1057,9 +1128,14 @@ fn think(
         if w.tag != Tag::Move {
             let a = (w.entity.index() % 8) as f32 * std::f32::consts::TAU / 8.0;
             let safe = base + Vec3::new(a.cos(), 0.0, a.sin()) * 6.0;
-            commands
-                .entity(w.entity)
-                .try_insert((Order::Move(safe), script("flee", now)));
+            issuer.issue(
+                commands,
+                me,
+                w.pos,
+                w.entity,
+                Order::Move(safe),
+                script("flee", now),
+            );
         }
     }
 
@@ -1268,9 +1344,16 @@ fn think(
                 };
                 if let Some(site) = site {
                     if let Some(builder) = pick_builder(&workers, &fleeing, site) {
-                        commands
-                            .entity(builder)
-                            .try_insert((Order::Build { kind, pos: site }, script("build", now)));
+                        // Exempt from link latency, exactly as a human's or a
+                        // commander's `build` is — same row of command.rs's
+                        // verb table, same reason (the worker walks there
+                        // anyway). It still carries its reason.
+                        issuer.issue_instant(
+                            commands,
+                            builder,
+                            Order::Build { kind, pos: site },
+                            script("build", now),
+                        );
                         brain.pending_build = Some(builder);
                         busy_worker = Some(builder);
                         // economy.rs pays at placement; assume it lands.
@@ -1533,9 +1616,14 @@ fn think(
         if w.carrying {
             // Stranded with a full load (e.g. after a failed drop-off):
             // deliver it; economy.rs resumes the remembered node afterwards.
-            commands
-                .entity(w.entity)
-                .try_insert((Order::ReturnResources, script("haul", now)));
+            issuer.issue(
+                commands,
+                me,
+                w.pos,
+                w.entity,
+                Order::ReturnResources,
+                script("haul", now),
+            );
             continue;
         }
         brain.harvest_counter = brain.harvest_counter.wrapping_add(1);
@@ -1548,9 +1636,14 @@ fn think(
         let node = nearest_node(nodes, w.pos, first)
             .or_else(|| nearest_node(nodes, w.pos, other_resource(first)));
         if let Some(node) = node {
-            commands
-                .entity(w.entity)
-                .try_insert((Order::Harvest(node), script("harvest", now)));
+            issuer.issue(
+                commands,
+                me,
+                w.pos,
+                w.entity,
+                Order::Harvest(node),
+                script("harvest", now),
+            );
         }
     }
 
@@ -1564,7 +1657,7 @@ fn think(
     let mut shift_skip: Vec<Entity> = fleeing.clone();
     shift_skip.extend(busy_worker);
     shift_skip.extend(brain.pending_build);
-    rebalance_mines(&mines, &workers, &shift_skip, nodes, commands, now);
+    rebalance_mines(me, &mines, &workers, &shift_skip, nodes, commands, now, issuer);
 
     // --- training ------------------------------------------------------------
     let mut worker_count = workers.len();
@@ -1839,8 +1932,8 @@ fn think(
                 // cannot pay for silently degrades back to one rather than
                 // parking an unaffordable item at the front of the queue.
                 let want_air = current_tier >= 3
-                    && gold.saturating_sub(reserve_gold) >= GRYPHON_BANK_GOLD
-                    && brain.siege_counter % GRYPHON_EVERY_NTH == 0;
+                    && gold.saturating_sub(reserve_gold) >= gryphon_bank_gold()
+                    && brain.siege_counter % gryphon_every_nth() == 0;
                 let kind = if want_air {
                     UnitKind::GryphonRider
                 } else {
@@ -1899,7 +1992,12 @@ fn think(
             .filter(|e| e.distance(*pos) <= slam_radius)
             .count();
         if nearby >= SLAM_MIN_TARGETS {
-            events.casts.write(CastAbility::new(hero.entity));
+            // Through the issuer like everything else the script orders. A
+            // hero IS a command node, so this computes zero and fires in the
+            // same frame it always did — but routing it here means the day the
+            // script learns to hand-fire a Sorcerer, the third seat pays for
+            // that reach automatically instead of quietly not paying.
+            issuer.issue_cast(commands, &mut events.casts, me, hero.pos, hero.entity, None);
         }
     }
 
@@ -1908,9 +2006,14 @@ fn think(
     if let Some(threat_pos) = threat {
         // Defense overrides everything, wave or not.
         for u in &army {
-            commands
-                .entity(u.entity)
-                .try_insert((Order::AttackMove(threat_pos), script("defend", now)));
+            issuer.issue(
+                commands,
+                me,
+                u.pos,
+                u.entity,
+                Order::AttackMove(threat_pos),
+                script("defend", now),
+            );
         }
         return;
     }
@@ -1924,18 +2027,28 @@ fn think(
             brain.wave_target = wave_objective(me, fog, nav, &enemy_buildings, centroid);
             brain.wave_started = now;
             for u in &army {
-                commands
-                    .entity(u.entity)
-                    .try_insert((Order::AttackMove(brain.wave_target), script("wave", now)));
+                issuer.issue(
+                    commands,
+                    me,
+                    u.pos,
+                    u.entity,
+                    Order::AttackMove(brain.wave_target),
+                    script("wave", now),
+                );
             }
         } else {
             // Stragglers rejoin the push.
             let target = brain.wave_target;
             for u in &army {
                 if u.free() {
-                    commands
-                        .entity(u.entity)
-                        .try_insert((Order::AttackMove(target), script("wave", now)));
+                    issuer.issue(
+                        commands,
+                        me,
+                        u.pos,
+                        u.entity,
+                        Order::AttackMove(target),
+                        script("wave", now),
+                    );
                 }
             }
         }
@@ -1946,17 +2059,27 @@ fn think(
         brain.next_wave_size = (brain.next_wave_size + WAVE_SIZE_STEP).min(WAVE_SIZE_CAP);
         let target = brain.wave_target;
         for u in &army {
-            commands
-                .entity(u.entity)
-                .try_insert((Order::AttackMove(target), script("wave", now)));
+            issuer.issue(
+                commands,
+                me,
+                u.pos,
+                u.entity,
+                Order::AttackMove(target),
+                script("wave", now),
+            );
         }
     } else {
         // Gather at the rally point while the army builds up.
         for u in &army {
             if u.free() && u.pos.distance(rally) > RALLY_ARRIVE_DIST {
-                commands
-                    .entity(u.entity)
-                    .try_insert((Order::AttackMove(rally), script("rally", now)));
+                issuer.issue(
+                    commands,
+                    me,
+                    u.pos,
+                    u.entity,
+                    Order::AttackMove(rally),
+                    script("rally", now),
+                );
             }
         }
     }
@@ -2375,13 +2498,16 @@ fn post_of(posts: &[&MineInfo], worker: &UnitInfo, nodes: &NodeQuery) -> Option<
 
 /// Even out the crews across every mine we can actually deliver from, a couple
 /// of workers per tick, and only while the gap is worth walking for.
+#[allow(clippy::too_many_arguments)]
 fn rebalance_mines(
+    me: Team,
     mines: &[MineInfo],
     workers: &[UnitInfo],
     skip: &[Entity],
     nodes: &NodeQuery,
     commands: &mut Commands,
     now: f32,
+    issuer: &mut OrderIssuer,
 ) {
     // A mine with no finished hall near it is not a posting: sending workers
     // there would just make them haul their load back to the old base.
@@ -2430,10 +2556,15 @@ fn rebalance_mines(
             .partial_cmp(&xz_dist(*b, target.pos))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    for (worker, _) in pool.into_iter().take(quota) {
-        commands
-            .entity(worker)
-            .try_insert((Order::Harvest(target.entity), script("harvest", now)));
+    for (worker, pos) in pool.into_iter().take(quota) {
+        issuer.issue(
+            commands,
+            me,
+            pos,
+            worker,
+            Order::Harvest(target.entity),
+            script("harvest", now),
+        );
     }
 }
 
@@ -2585,6 +2716,7 @@ fn pick_site(nav: &NavGrid, anchor: Vec3, footprint: f32) -> Option<Vec3> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{CommandLatency, CommandNodes, PendingOrder, DEFAULT_HALL_RADIUS};
     use crate::terrain::{ChokePoint, MapKind};
 
     // -- Castle trigger (wc3clone-0m8) ------------------------------------
@@ -2787,6 +2919,377 @@ mod tests {
             pick_army_kind(KNIGHT_EVERY_NTH, true, false, 3, 4),
             UnitKind::Knight
         );
+    }
+
+    // -- The air reaction, end to end (wc3clone-il4) ------------------------
+    //
+    // Everything above this line tests the air reaction as arithmetic:
+    // `tick_alert` counts, `reactive_cadences` returns a different number,
+    // `tower_quota` returns a bigger one. None of it proves the script ever
+    // REACHES those functions, and the sim runs of the era proved it never
+    // had: no scripted match built a Gryphon (Castle + Workshop + 700g spare +
+    // the every-third beat, all on one tick), so no scripted match ever showed
+    // an enemy flyer to anybody, so the archer shift and the reactive Tower
+    // were dead code that passed its unit tests.
+    //
+    // What follows is the missing half: one real `ai_think` tick, on a real
+    // World, with a real enemy Gryphon in the fog, asserting the two things the
+    // script is supposed to DO about it. The knobs added for the sim
+    // (`WC3_AI_GRYPHON_BANK` / `_NTH`) let a headless run reach the same place
+    // the slow way; this reaches it in a millisecond and on every CI run.
+
+    /// A world with the scripted commander in it and nothing else: no fog to
+    /// walk through, no economy ticking, no units.rs to execute the orders.
+    /// One `app.update()` past the think timer is exactly one thought.
+    fn ai_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<AiState>()
+            .init_resource::<GameOver>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<NavGrid>()
+            .init_resource::<TeamResearch>()
+            .add_event::<CastAbility>()
+            .add_event::<UpgradeBuilding>()
+            .add_event::<StartResearch>()
+            .add_event::<BuyItem>()
+            .add_event::<UseItem>()
+            // Chain of Command, off: this bead is about WHAT the script decides,
+            // not how long the decision takes to arrive. With latency on, the
+            // Tower order would sit in `PendingOrder` and the assertion below
+            // would be testing the wrong module.
+            .insert_resource(CommandLatency { on: false, ..Default::default() })
+            .insert_resource(CommandNodes {
+                nodes: vec![(Team::Claude, Team::Claude.base_pos(), DEFAULT_HALL_RADIUS)],
+                ready: true,
+            })
+            .add_systems(Update, ai_think);
+        // Claude only, so the assertions below can name one brain.
+        app.insert_resource(AiControlled { human: false, claude: true });
+        // Lit, not dark: the subject is what the script does about a flyer it
+        // can see, not whether it can see it. `test_dark` would make this test
+        // pass for the wrong reason (no sighting, no reaction, no assertion).
+        app.insert_resource(FogGrids::test_revealed());
+        // Rich enough that no branch below is refused for money, and supplied
+        // enough that the Farm branch (which sits above the Tower) stays quiet.
+        let mut economies = Economies::default();
+        let claude = economies.get_mut(Team::Claude);
+        claude.gold = 900;
+        claude.lumber = 500;
+        claude.supply_used = 10;
+        claude.supply_cap = 60;
+        app.insert_resource(economies);
+        app
+    }
+
+    fn spawn_building(app: &mut App, kind: BuildingKind, team: Team, pos: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Building { kind },
+                team,
+                Transform::from_translation(pos),
+                TrainingQueue::default(),
+                Health::new(building_stats(kind).hp),
+            ))
+            .id()
+    }
+
+    fn spawn_unit(app: &mut App, kind: UnitKind, team: Team, pos: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind },
+                team,
+                Transform::from_translation(pos),
+                Order::Idle,
+                Health::new(unit_stats(kind).hp),
+            ))
+            .id()
+    }
+
+    /// A Claude base that has finished its opening: a hall, a Barracks, and a
+    /// worker line. No Tower yet, and the army counter parked one short of a
+    /// beat that only the AIR cadence divides.
+    fn claude_base(app: &mut App) -> Entity {
+        let home = Team::Claude.base_pos();
+        spawn_building(app, BuildingKind::TownHall, Team::Claude, home);
+        let barracks = spawn_building(
+            app,
+            BuildingKind::Barracks,
+            Team::Claude,
+            home + Vec3::new(-12.0, 0.0, 0.0),
+        );
+        for i in 0..5 {
+            spawn_unit(
+                app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        // next = 4: divisible by ARCHER_EVERY_NTH_AIR (2) but not by
+        // ARCHER_EVERY_NTH (3), so the very next Barracks item is an Archer if
+        // and only if air has been seen. Absent the alert the same beat falls
+        // through to the Spearman rule, which is what the control asserts.
+        app.world_mut().resource_mut::<AiState>().claude.army_counter = 3;
+        barracks
+    }
+
+    fn queued(app: &mut App, building: Entity) -> Vec<UnitKind> {
+        app.world()
+            .entity(building)
+            .get::<TrainingQueue>()
+            .map(|q| q.queue.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Is anybody building a Tower — i.e. did the reactive emplacement branch
+    /// actually reach a worker?
+    fn tower_ordered(app: &mut App) -> bool {
+        app.world_mut()
+            .query::<&Order>()
+            .iter(app.world())
+            .any(|o| matches!(o, Order::Build { kind: BuildingKind::Tower, .. }))
+    }
+
+    /// THE test this bead exists for. An enemy Gryphon in sight, one thought,
+    /// and both halves of the documented reaction have to be visible in the
+    /// world: the mix tightens toward Archers, and a Tower goes up.
+    #[test]
+    fn a_seen_gryphon_tightens_the_archer_cadence_and_buys_a_tower() {
+        let mut app = ai_app();
+        let barracks = claude_base(&mut app);
+        // The flyer, in Claude's face and in Claude's vision.
+        spawn_unit(
+            &mut app,
+            UnitKind::GryphonRider,
+            Team::Human,
+            Team::Claude.base_pos() + Vec3::new(-20.0, 0.0, -20.0),
+        );
+
+        think_once(&mut app);
+
+        // The sighting registered, as a decaying counter and not as a memory
+        // of where the thing was.
+        let alert = app.world().resource::<AiState>().claude.air_alert;
+        assert_eq!(alert, ALERT_TICKS, "the sighting must refill the alert");
+
+        // Reaction one: the Barracks queued the anti-air unit. This is the
+        // assertion the arithmetic tests could not make — it is the real
+        // `think` walking the real cadence into a real queue.
+        assert_eq!(
+            queued(&mut app, barracks),
+            vec![UnitKind::Archer],
+            "air contact must put an Archer in the Barracks, not a Footman"
+        );
+
+        // Reaction two: the emplacement. A flyer cannot be blocked or
+        // out-walked, so the script buys the thing that is already standing.
+        assert!(
+            tower_ordered(&mut app),
+            "a seen Gryphon must buy a reactive Tower"
+        );
+    }
+
+    /// The control, and the reason the test above means anything: the SAME
+    /// board with a ground unit instead of a flyer produces neither reaction.
+    /// Without this, a script that always built Archers and always built
+    /// Towers would pass.
+    #[test]
+    fn a_seen_footman_buys_neither_the_archer_nor_the_tower() {
+        let mut app = ai_app();
+        let barracks = claude_base(&mut app);
+        spawn_unit(
+            &mut app,
+            UnitKind::Footman,
+            Team::Human,
+            Team::Claude.base_pos() + Vec3::new(-20.0, 0.0, -20.0),
+        );
+
+        think_once(&mut app);
+
+        assert_eq!(app.world().resource::<AiState>().claude.air_alert, 0);
+        // The same beat (next = 4) that air contact turns into an Archer falls
+        // through to the Spearman rule when the sky is empty. What matters is
+        // that it is NOT the anti-air pick.
+        let standing = queued(&mut app, barracks);
+        assert_eq!(standing, vec![UnitKind::Spearman]);
+        assert!(
+            !standing.contains(&UnitKind::Archer),
+            "no flyer seen, so nothing should have shifted toward anti-air"
+        );
+        assert!(
+            !tower_ordered(&mut app),
+            "the reactive Tower is reactive — no flyer, no emplacement"
+        );
+    }
+
+    /// The alert is a fading memory, not a latch: once the Gryphon is gone the
+    /// mix goes back to standard. A permanent reaction would be an AI that
+    /// counters whatever it saw once, forever.
+    #[test]
+    fn the_air_reaction_lapses_when_the_sky_clears() {
+        let mut app = ai_app();
+        let barracks = claude_base(&mut app);
+        let gryphon = spawn_unit(
+            &mut app,
+            UnitKind::GryphonRider,
+            Team::Human,
+            Team::Claude.base_pos() + Vec3::new(-20.0, 0.0, -20.0),
+        );
+        think_once(&mut app);
+        assert_eq!(queued(&mut app, barracks), vec![UnitKind::Archer]);
+
+        // It leaves. Nothing else about the board changes.
+        app.world_mut().entity_mut(gryphon).despawn();
+        app.world_mut().resource_mut::<AiState>().claude.army_counter = 3;
+        app.world_mut()
+            .entity_mut(barracks)
+            .get_mut::<TrainingQueue>()
+            .unwrap()
+            .queue
+            .clear();
+        for _ in 0..ALERT_TICKS {
+            think_once(&mut app);
+        }
+        assert_eq!(
+            app.world().resource::<AiState>().claude.air_alert,
+            0,
+            "the alert must drain, or the reaction is permanent"
+        );
+    }
+
+    /// The other end of the same path: the script actually BUILDING a flyer.
+    ///
+    /// Four conditions have to be true on one think tick — a Castle standing, a
+    /// Workshop with room in its queue, the siege counter on its beat, and the
+    /// bank fat after the reserve — and no scripted match has ever had all four
+    /// at once, which is why nobody had seen this branch either. A headless run
+    /// with `WC3_AI_GRYPHON_BANK=0` still needs the match to LAST long enough to
+    /// reach tier 3, and the scripted matchup resolves at tier 2 (verified: both
+    /// maps end 6-7 minutes with the loser collapsing before its Castle). So the
+    /// board is built here instead of waited for.
+    #[test]
+    fn a_castle_and_a_fat_bank_put_a_gryphon_in_the_workshop() {
+        let mut app = ai_app();
+        let home = Team::Claude.base_pos();
+        spawn_building(&mut app, BuildingKind::Castle, Team::Claude, home);
+        spawn_building(
+            &mut app,
+            BuildingKind::Barracks,
+            Team::Claude,
+            home + Vec3::new(-12.0, 0.0, 0.0),
+        );
+        let workshop = spawn_building(
+            &mut app,
+            BuildingKind::Workshop,
+            Team::Claude,
+            home + Vec3::new(0.0, 0.0, -12.0),
+        );
+        for i in 0..5 {
+            spawn_unit(
+                &mut app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        {
+            // A long game's worth of line units behind us, so siege is due.
+            let mut state = app.world_mut().resource_mut::<AiState>();
+            state.claude.army_counter = 20;
+            state.claude.siege_counter = 0;
+        }
+        // Comfortably past `GRYPHON_BANK_GOLD` even after the reserve.
+        app.world_mut()
+            .resource_mut::<Economies>()
+            .get_mut(Team::Claude)
+            .gold = 3000;
+
+        think_once(&mut app);
+
+        assert_eq!(
+            queued(&mut app, workshop),
+            vec![UnitKind::GryphonRider],
+            "Castle + Workshop + a fat bank is the whole air gate"
+        );
+    }
+
+    /// ...and the gate is a gate. The same board with a thin treasury degrades
+    /// to a Catapult rather than parking an unpayable Gryphon at the front of
+    /// the queue — which is what the `affordable` fallback in the Workshop arm
+    /// is for, and what makes the air branch surplus spending rather than a
+    /// commitment.
+    #[test]
+    fn a_thin_bank_degrades_the_gryphon_back_to_a_catapult() {
+        let mut app = ai_app();
+        let home = Team::Claude.base_pos();
+        spawn_building(&mut app, BuildingKind::Castle, Team::Claude, home);
+        spawn_building(
+            &mut app,
+            BuildingKind::Barracks,
+            Team::Claude,
+            home + Vec3::new(-12.0, 0.0, 0.0),
+        );
+        let workshop = spawn_building(
+            &mut app,
+            BuildingKind::Workshop,
+            Team::Claude,
+            home + Vec3::new(0.0, 0.0, -12.0),
+        );
+        for i in 0..5 {
+            spawn_unit(
+                &mut app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        // A hero already on the field. Without one the script ring-fences 400g
+        // for the hero it wants, then buys it — and the Workshop is priced
+        // against what is left, which would make this test about the hero
+        // reserve rather than about the air gate.
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Hero },
+            Team::Claude,
+            Transform::from_translation(home),
+            Order::Idle,
+            Health::new(600.0),
+            Hero { level: 1, xp: 0.0, mana: 80.0 },
+        ));
+        {
+            let mut state = app.world_mut().resource_mut::<AiState>();
+            state.claude.army_counter = 20;
+            state.claude.siege_counter = 0;
+        }
+        // One gold under the gate. The script's reserves (a hero slot, a
+        // research rung) come off the top before either unit is priced, so this
+        // is a treasury that can pay for siege and cannot pay for air — which
+        // is exactly the state the fallback exists for.
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let claude = economies.get_mut(Team::Claude);
+            claude.gold = GRYPHON_BANK_GOLD - 1;
+            claude.lumber = 900;
+        }
+
+        think_once(&mut app);
+
+        assert_eq!(queued(&mut app, workshop), vec![UnitKind::Catapult]);
+    }
+
+    /// The probe knobs, which exist so a headless sim can reach the air branch
+    /// at all. Unset, they must read their constants exactly — a knob that
+    /// changes the default is a balance change wearing a debugging hat.
+    #[test]
+    fn the_gryphon_probe_knobs_default_to_the_shipped_constants() {
+        // These are process-wide `OnceLock`s read from the environment, and the
+        // test suite does not set them, so this is the shipped behaviour.
+        assert_eq!(gryphon_bank_gold(), GRYPHON_BANK_GOLD);
+        assert_eq!(gryphon_every_nth(), GRYPHON_EVERY_NTH);
+        // Parsing is total: rubbish and empty strings fall back rather than
+        // panicking mid-match, and the modulus can never reach zero.
+        assert_eq!(env_u32("WC3_AI_NO_SUCH_VAR_HOPEFULLY", 42), 42);
+        assert_eq!(env_u32(GRYPHON_NTH_ENV, GRYPHON_EVERY_NTH).max(1).max(1), GRYPHON_EVERY_NTH);
     }
 
     // -- Ford fortification (wc3clone-j0d) ---------------------------------
@@ -3031,5 +3534,112 @@ mod tests {
                 ));
             }
         }
+    }
+
+    // -- Chain of Command, third seat (docs/TEMPO.md §3) -------------------
+
+    /// A world with just enough around it for one scripted think tick, and a
+    /// Claude team whose only command node is its own hall.
+    fn ai_world(latency_on: bool) -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<AiState>()
+            .init_resource::<GameOver>()
+            .insert_resource(AiControlled { human: false, claude: true })
+            .init_resource::<Economies>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<NavGrid>()
+            .init_resource::<FogGrids>()
+            .init_resource::<TeamResearch>()
+            .add_event::<CastAbility>()
+            .add_event::<UpgradeBuilding>()
+            .add_event::<StartResearch>()
+            .add_event::<BuyItem>()
+            .add_event::<UseItem>()
+            .insert_resource(CommandLatency { on: latency_on, ..Default::default() })
+            .insert_resource(CommandNodes {
+                nodes: vec![(Team::Claude, Team::Claude.base_pos(), DEFAULT_HALL_RADIUS)],
+                ready: true,
+            })
+            .add_systems(Update, ai_think);
+        app
+    }
+
+    /// One lone soldier, standing in the enemy's half of the map — as far from
+    /// its own chain of command as the map allows.
+    fn spawn_far_soldier(app: &mut App) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Claude,
+                Transform::from_translation(Team::Human.base_pos()),
+                Order::Idle,
+                // `UnitQuery` requires it — a unit with no `Health` is
+                // invisible to the scripted commander entirely.
+                Health::new(100.0),
+            ))
+            .id()
+    }
+
+    fn think_once(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(THINK_INTERVAL + 0.05));
+        app.update();
+    }
+
+    /// **All three seats pay.** docs/TEMPO.md §3 requires it in as many words —
+    /// "the scripted AI pays latency too, or autopilot becomes a cheat and C1
+    /// is violated at the third seat". `ai.rs` does not speak through the
+    /// intent compiler, so this is the test that keeps it honest: an order the
+    /// script gives a unit standing on the far side of the map is held in
+    /// transit exactly like a human's or a commander's would be.
+    #[test]
+    fn the_scripted_ai_pays_latency_like_everybody_else() {
+        let mut app = ai_world(true);
+        let soldier = spawn_far_soldier(&mut app);
+
+        think_once(&mut app);
+
+        let pending = app
+            .world()
+            .entity(soldier)
+            .get::<PendingOrder>()
+            .unwrap_or_else(|| {
+                panic!("the scripted AI's order landed instantly — autopilot is cheating")
+            });
+        assert!(
+            pending.link() > 0.0,
+            "the AI was charged a zero link from the wrong side of the map"
+        );
+        // And, like anyone else's, the order it was already carrying is
+        // undisturbed until the new one arrives.
+        assert!(
+            matches!(app.world().entity(soldier).get::<Order>(), Some(Order::Idle)),
+            "an in-transit order must not change what the unit is doing yet"
+        );
+    }
+
+    /// The off-flag identity at the third seat: with `WC3_COMMAND_LATENCY`
+    /// unset the scripted AI writes `Order`s exactly where it always did, and
+    /// no `PendingOrder` can exist anywhere.
+    #[test]
+    fn the_scripted_ai_is_unchanged_with_the_flag_off() {
+        let mut app = ai_world(false);
+        let soldier = spawn_far_soldier(&mut app);
+
+        think_once(&mut app);
+
+        assert!(
+            app.world().entity(soldier).get::<PendingOrder>().is_none(),
+            "the feature is off; nothing may be in transit"
+        );
+        assert!(
+            matches!(
+                app.world().entity(soldier).get::<Order>(),
+                Some(Order::AttackMove(_))
+            ),
+            "with latency off the script's order must land in the same frame it always did"
+        );
     }
 }

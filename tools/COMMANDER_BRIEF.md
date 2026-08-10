@@ -272,9 +272,12 @@ lists what must be STANDING (trainer included, transitively) and `tier` says how
 far up the hall ladder that puts you; `upgrades_to`/`upgraded_from` walk
 TownHall→Keep→Castle with every price on it. T2 arrives ~min 3-5, T3 ~min 6-9.
 
-The live snapshot's `unlocked` map tells you which entries' requirements you
-currently satisfy — but it checks tech gates only, not whether you own the
-trainer, so cross-check against `requires`.
+The live snapshot's `unlocked` map answers "can I order this right now?" for
+every catalog entry — for a unit that means the tech gates are met AND you have
+a finished building standing that trains it, so `Footman` is false until a
+Barracks is up. No cross-check needed; if `unlocked` says true, `build`/`train`
+will accept it. Use catalog `requires` for PLANNING (what you'd need to build
+first), `unlocked` for ACTING.
 
 ## The rules of the world (not in the catalog)
 - **FOG OF WAR — read this before you read `units`.** Your snapshot shows only what your

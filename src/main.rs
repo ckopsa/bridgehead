@@ -4,6 +4,7 @@ mod ai;
 mod bounty;
 mod bridge;
 mod combat;
+mod command;
 mod copilot;
 mod doctrine;
 mod economy;
@@ -58,6 +59,10 @@ fn main() {
         // The intent compiler: the one path from a player's meaning to game
         // state. Registered before every interface plugin that submits to it.
         intent::IntentPlugin,
+        // Chain of Command (docs/TEMPO.md §3): direct orders take time to
+        // reach a unit far from your halls and your hero. Inert unless
+        // WC3_COMMAND_LATENCY is set, so v1 behaviour is the default.
+        command::CommandPlugin,
         terrain::TerrainPlugin { headless },
         units::UnitsPlugin,
         combat::CombatPlugin,

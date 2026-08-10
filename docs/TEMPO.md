@@ -590,9 +590,276 @@ sent both commands by hand.
 **Scoreboard against §2.0's 8-vs-4.** The human now has all seven doctrine verbs
 (`priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template`),
 parameterised rather than as toggles, with the coarse `[G]/[V]/[P]/[T]` presets
-kept on page one. What remains bridge-only is *range*, not vocabulary: the card
-steps retreat through 25/35/50% and leash through 10/18/30 where a commander
-writes any float; squad ids from a gesture are 1–3 where the wire takes any
-`u8`; `posture escort` targets the team's hero where the wire names any own
-unit; and per-ability `autocast` rules are still one rule on slot 0. Each is a
-UI affordance, not a missing verb — the intent submitted is the same value.
+kept on page one.
+
+**Range, closed (wc3clone-137).** Three of the four remaining gaps were about
+*range* rather than vocabulary, and they are gone:
+
+* **Retreat and leash are free-entry.** `[F]`/`[G]` still step the
+  25/35/50% and 10/18/30 presets — they are the fast path, and most of the time
+  a preset is what you want. `[-]`/`[=]` nudge the threshold and `[[]`/`[]]`
+  nudge the radius, one increment per press across the whole legal range, so
+  the human can say 0.375 exactly as a commander can. Both controls submit the
+  identical `Intent::Retreat`/`Intent::Leash`; only the arithmetic differs.
+* **`posture escort` names any own unit.** It arms a click like the other three
+  postures, and the click picks a unit instead of a point. Escorting the hero
+  is now one click rather than zero; escorting a Catapult, a Priestess or an
+  expanding Worker is now possible at all.
+* **`autocast` is per ability.** The doctrine page carries one toggle per
+  ability slot (`Z`/`X`/`C`, named after the ability), each submitting
+  `ability: <slot>` and editing that one rule. Page one's `[T]` is unchanged
+  and still means slot 0.
+
+Two affordances came with them: a translucent disc marks the pending posture
+point during click-to-place (at `DEFEND_RADIUS` for Defend, so the circle you
+aim is the circle you get), and every selection tile carries its squad id in the
+corner — the doctrine card speaks for the FIRST unit's squad, and a drag box
+that scooped up two squads used to look exactly like one that scooped up one.
+
+What is still narrower than the wire: squad ids from a gesture are 1–3 where the
+wire takes any `u8`. That one is deliberate — a gesture squad is a control
+group, and there are three control groups.
+
+---
+
+## 7. Phase 1 as built (issue 4, shipped)
+
+The latency core landed behind `WC3_COMMAND_LATENCY`, default off. What differs
+from §4's sketch is mostly *cheaper than planned*, plus one thing the sketch
+could not have known because only a sim could find it.
+
+**There was no 23-site refactor.** §4 budgeted 23 player-command `Order` writes
+across three files and proposed a `shared::issue_order` helper to route them
+through. The intent compiler (docs/INTENT.md) landed in between and collapsed
+`ui.rs` and `bridge.rs` into one choke point, so latency for those two seats is
+a substitution inside `compile_intent`'s order arms and nothing else. The
+"integration hazard" §4 flagged survived intact and was worth every word.
+
+**The verb table.** §4 asked the implementer to decide the exact set. It is in
+`command.rs`'s module docs, in full, with a reason per row. In summary:
+
+| Verb | Latency |
+|---|---|
+| `move`, `attackmove`, `attack`, `harvest`, `return`, `follow`, `stop` | **pays** |
+| `build` | exempt — §4's open question, answered as recommended |
+| `train`, `upgrade`, `cancel`, `research`, `rally` | exempt — addressed to a building, which stands at a node |
+| `cast` | **pays** for a unit caster, exempt for a building one — see below |
+| `use_item`, `buy` | exempt |
+| `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt — doctrine IS the fast path |
+| `autopilot`, `surrender` | exempt — match level |
+
+The `cast` row was originally not a carve-out but an identity: every caster in
+the game either *was* a command node (a hero) or *sat on* one, so a computed
+link would be zero for all of them, and charging it would have been ceremony.
+`every_caster_is_a_command_node` asserted exactly that so the claim could not
+rot in silence.
+
+**It rotted, and the test caught it.** The Sorcerer (bead/1qq4y0) is a caster
+that is not a hero — it stands in the middle of an army and debuffs. The test
+failed on the merge, which is the system working: the *identity* broke, the
+*framework* did not. Re-derived from the framework, the answer is unambiguous
+and the row moved:
+
+- **`cast` at a unit caster pays.** Hand-firing Slow on a Sorcerer in the middle
+  of a fight is precisely "reaching past your chain of command at the point of
+  contact", which is the thing this mechanism exists to price. For a hero it
+  still computes zero — a hero *is* a node — so hero micro is exactly as fast as
+  it was, and §C5's promise about TownPortal is untouched.
+- **`cast` at a building caster stays exempt**, because `abilities_of_building`
+  is still `is_hall`-only and a hall is a node. `every_building_caster_is_a_command_node`
+  is the old test, narrowed to the half that still holds, and it is what keeps
+  CallToArms instant.
+- **`autocast` stays exempt**, and this is the row that makes the Sorcerer
+  *interesting* rather than annoying: turning the debuff into standing policy
+  costs nothing and runs at machine speed, while hand-firing it at range costs
+  the link. C4 — "doctrine strictly better than micro at range" — landing on a
+  unit the design never anticipated, for free. The Sorcerer is even *born* with
+  an autocast policy, so the fast path is the default and the slow path is the
+  deliberate one.
+
+Mechanically a cast is an event rather than a component, so the delayed form is
+a second component, `PendingCast`, and a second dispatcher. Deferring the event
+rather than the verdict is what makes a late cast fizzle honestly: combat.rs
+reaches its mana/cooldown decision when the cast *arrives*, so an ability whose
+mana was spent while the order travelled simply does not go off — exactly as if
+the player had been slow.
+
+**The curve** is the recommended step plus ramp, with per-node radii so the
+phase-3 Outpost is one arm of `building_node_radius`:
+
+```
+slack   = distance to nearest own node - that node's radius   (0 if inside)
+latency = 0                                   when slack <= 0
+        = min(max, step + per_unit * slack)    otherwise
+        = max                                  when the team has NO nodes
+```
+
+Defaults, all env-overridable for the sweep: hall radius 30, hero radius 18,
+step 0.6s, ramp 0.02s per world unit, cap 3.0s. That puts a midfield engagement
+(~100 units from home, which on this map is the centre) at ~2.0s and the far
+corners at the cap — the 1.5–3s §C1 asked for. The hero's radius is deliberately
+smaller than a hall's: the mobile node is the one you buy fast hands with, and
+it should cost something to place.
+
+**All three seats pay.** `ai.rs` does not speak through the intent compiler, so
+it calls the same `OrderIssuer` directly at its nine unit-order sites. Its
+`build` is exempt on the same row as everybody else's. Two tests pin it, in both
+flag states — if autopilot ever stops paying, the suite says so.
+
+**The doctrine guards** (§4's integration hazard, and issue 5's subject) are in:
+`run_squad_postures` and `enforce_leash` both gained `Without<PendingOrder>`,
+because a unit awaiting a delayed order is indistinguishable from an idle one
+and would otherwise be re-tasked out from under its own orders. `rearm_retreat`
+now un-latches `Retreating` at *dispatch* rather than issue time, which is the
+behaviour §4 predicted and asked to have asserted deliberately. One knock-on
+worth naming: `run_squad_postures` computes its cohesion point from the
+`members` query, so in-transit members no longer contribute to the squad's
+centre of mass for the second or two they are travelling.
+
+**What a sim found that review did not.** With latency on, a `crossings` run hit
+the time cap with two workers frozen and the telemetry reading "2 orders in
+transit, mean link 3.00s" for twenty minutes of game time. The team had lost
+every hall and its hero, so it paid the cap on every order — and `ai.rs`
+re-issues its standing decision once a second, so each repeat replaced the last
+and restarted the clock. Nothing ever landed.
+
+The fix is a rule that is better design than the bug was a bug: **saying the
+same thing again does not restart the journey.** An order that matches the one
+already in transit is a no-op; a genuinely different one supersedes it and pays.
+Latency is the cost of *changing your mind* at range, not a tax per click — which
+also means a human holding down right-click cannot accidentally paralyse their
+own army, and neither can a commander re-sending an unchanged batch. Six sims
+across both maps after the fix: all decisive, no caps, no frozen units.
+
+**The snapshot** gained `command_nodes` (own team only) on `StateOut` and
+`link` / `pending` on `UnitOut`, all omitted when the feature is off — a
+flag-off snapshot is the same 16 keys it always was, verified live. What issue 6
+still owns is the `applied: [{cmd, delay}]` acknowledgement, which needs the
+compiler to report per-command realised delay back to the seat that sent it.
+
+**Evidence and observability.** The intent log annotates delayed sentences —
+`move unit 4294968182 to (0.0, 0.0) (+0.7s link)` — plus a structured `link`
+field, both absent when nothing was delayed, so a flag-off replay is
+character-for-character a v1 replay. `ai.rs` is not a player and writes no
+intent log, so an AI-vs-AI sweep would otherwise produce no evidence at all;
+`command::report_link_load` covers that with a periodic line giving orders in
+transit, mean link and worst link. That series is what issue 8's calibration
+should read: near-zero mean means the curve is not binding, a mean pinned at the
+cap means the armies have marched off the end of their own chain of command.
+
+**Not built here, by design:** the HUD feedback (issue 7) — without it the
+mechanic reads as input lag, which is exactly why the default stays off — and
+the forward Outpost (phase 3), which is one table entry in
+`building_node_radius` when its bead comes up.
+
+### Reconciled against master (bead/polish, bead/ai-bundle, bead/1qq4y0)
+
+Three beads landed while this one was in flight. What each cost is worth
+recording, because two of the three cost nothing and the reason is the same
+reason in both cases.
+
+**The ghost right-click (bead/polish) was priced without being touched.** It is
+a genuinely new direct-order path — the human can now attack a *remembered*
+building the picker previously refused — and it arrived after this mechanism was
+designed, with no knowledge of it. It pays the link correctly anyway, because it
+compiles to `Intent::Attack` and there is exactly one `Attack` arm.
+`a_ghost_attack_pays_the_link_like_any_other_direct_order` pins it. This is the
+choke point (docs/INTENT.md) paying for itself: **a new way of speaking cannot
+accidentally arrive at a privileged speed.** Had this bead been the 23-site
+refactor §4 budgeted, the ghost path would have been site 24 and nobody would
+have noticed.
+
+**ai.rs grew by ~1250 lines and needed no re-wiring.** Towers, ford
+fortification, reactive mixes, the Castle trigger rework and Shop usage all
+landed in the same function this bead had edited, and the merge left all ten
+issue sites intact with zero direct `try_insert(Order::…)` remaining in the
+file. The new AI *does* re-assert standing decisions more aggressively than the
+one this was written against — which would have made the livelock above worse,
+not better, and is a good argument for having fixed it as a rule rather than as
+a special case. Its new `buy`/`use_item` calls are exempt on the same row as
+every other seat's, and its Slam now goes through `issue_cast`: zero for a hero,
+but the day the script learns to hand-fire a Sorcerer it pays for that reach
+automatically instead of quietly not paying. Master had independently invented
+the same `AiEvents` bundle this bead needed for the parameter ceiling, which is
+two people finding the same wall.
+
+**Multiple heroes are multiple mobile nodes.** Hero slots per tier means a team
+can field more than one, and `refresh_command_nodes` collects the whole
+`With<Hero>` query rather than "the" hero, so this works by construction —
+`every_living_hero_is_its_own_command_node` keeps it working and pins the
+dead-hero rule beside it. It is a real strategic object: two heroes are two
+fast-hands zones, bought by putting two expensive units in two dangerous places.
+
+**One thing for the calibration bead — and a correction.** After the
+bead/ai-bundle merge this section reported that latency-on lengthened matches
+enough to matter: seven flag-off runs on `open` finished in 390-810s while
+seven flag-on runs produced two that hit the 1800s cap. **That reading did not
+survive the next merge and should not be carried forward.** Re-run against
+master after bead/ge4, the two arms are indistinguishable: flag-off gave 4
+decisive out of 5 with one cap on `crossings`; flag-on gave 5 decisive out of 6
+with one cap on `open`. Caps now appear in *both* arms at similar rates, so what
+was attributed to link latency was mostly master's own drift — the scripted AI
+grew towers and ford holds over the same period, and defensive play lengthens
+games whoever is issuing the orders.
+
+What is worth keeping from the observation is the shape of the failure, because
+it is the one the sweep must learn to recognise: every capped run in either arm
+has the same signature — mines dry, both armies alive and supplied, treasuries
+banking lumber, and (with the flag on) *no orders in transit* through the late
+game. That is the mine-exhaustion stalemate, not a tempo problem, and a sweep
+that reads match length alone will mistake one for the other. Read
+`report_link_load` alongside it: a stalemate with an empty in-transit queue is
+the economy running out, while a mean link pinned at the cap is armies that have
+marched off the end of their own chain of command.
+
+### Reconciled against bead/ge4 (the `why` layer)
+
+ge4 gave every unit an answer to "why are you doing that?" — a `Provenance`
+stamped in the same `Commands` call that mints the behaviour, so the answer
+cannot drift from the behaviour. Latency puts a gap between minting an order and
+the unit receiving it, which is exactly the case that layer had not met yet.
+
+**A delayed order carries its reason and stamps it on arrival.** `PendingOrder`
+holds the `Provenance` the compiler minted, so the verb and the interface that
+spoke it travel with the order; `dispatch_pending` rewrites its `at` to the
+arrival time as it lands. The alternative — stamping speech time — would have
+made `Provenance.at` mean two different things depending on the cause, since
+every other rung (doctrine's postures, a building's template) records the moment
+the behaviour *began*. A unit would have claimed to have been obeying an order
+for two seconds before it had received it.
+
+The speech time is not lost, and the two records join:
+
+```
+intent_log.jsonl : t=8.3  link=0.7  why="order:move by bridge t=9"
+                   sentence="move unit 4294968174 to (0.0, 0.0) (+0.7s link)"
+units[].why      :                  "order:move by bridge t=9"     // 8.3 + 0.7
+```
+
+This is a live capture, and the interesting line is the one not shown: while the
+order was in transit the unit answered `why: "idle"`. It had not started obeying
+yet, and it said so. That is the two layers agreeing rather than merely
+coexisting — the `why` layer describes what a unit is doing, and during a
+latency window a unit is genuinely still doing the old thing.
+
+Making that join exact needed two small choices: the log's `why` is rendered at
+`t + link` rather than at `t` (it is the join *key*, so it must be
+character-for-character what the unit will answer), and `at` is set from
+`ready_at` rather than from the dispatching frame's clock, so the join holds to
+the log's 0.1s resolution instead of drifting by a frame. For a group order
+spread across the map the log names the worst link, so its `why` joins against
+the last unit to receive the order; the others answer with their own, earlier
+arrival.
+
+**`PendingCast` carries no provenance, deliberately.** A cast mints no `Order`,
+so there is nothing to re-time: a unit's reason for being where it is is not
+changed by having thrown a spell, and overwriting it with `"cast"` would replace
+a standing answer with a momentary one. The log side is unchanged — a delayed
+cast annotates its sentence exactly as a delayed order does.
+
+**ai.rs composed cleanly.** ge4 wraps the script's orders in `script(what, now)`
+and this bead routes them through `OrderIssuer`; the composition is
+`issuer.issue(…, script(what, now))`, so the stamp goes *through* the latency
+layer rather than around it and survives the deferred dispatch. All eleven sites
+compose, and no direct `Order` write remains in either the compiler or the
+script.

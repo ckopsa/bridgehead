@@ -61,10 +61,16 @@ weakens the invariant:
   `Order`s and training-queue pushes directly, from ~9 call sites. It is engine
   baseline rather than a seat — nothing is measuring fairness against it today
   — but it means the invariant currently reads "no *human or bridge* mutation
-  path except intents". Routing `ai.rs` through the compiler is follow-up work
-  and is a prerequisite for docs/TEMPO.md's Chain of Command, which explicitly
-  requires all three seats to pay latency identically or "autopilot becomes a
-  cheat and C1 is violated at the third seat".
+  path except intents". Routing `ai.rs` through the compiler is follow-up work.
+
+  It is **not**, as this document originally guessed, a prerequisite for
+  docs/TEMPO.md's Chain of Command. That bead needed all three seats to pay
+  latency identically, and got it by having `ai.rs` call the same
+  `command::OrderIssuer` the compiler calls — the mechanism lives one layer
+  below the compiler, so the third seat can reach it without speaking the
+  language first. What routing `ai.rs` through intents would still buy is
+  attribution: its decisions would appear in `intent_log.jsonl` as sentences,
+  and the fairness invariant would read without a footnote.
 
 One more honest edge: `ui.rs::update_rally_flag` still removes a `RallyPoint`
 whose target has died. That is a validator reacting to a world event, not a
@@ -557,6 +563,11 @@ the human's selection panel, and the intent log, whose order lines carry the
 grep apart. Introspection is part of the decision surface, so it had to be
 equitable too, or one seat could ask a question the other could not.
 
+**Timing convention, once Chain of Command is on** (docs/TEMPO.md): a
+`Provenance.at` is always the moment the behaviour *began*, so a delayed order
+stamps its **arrival**, not the moment it was spoken — the log keeps the speech
+time as its own `t` and the gap as `link`, making the join `why.at == t + link`.
+
 **Why stamping at the mint site keeps paying.** Three branches landed between
 this design and its merge — a +1393-line scripted-AI expansion (towers, ford
 holds, reactive mixes, Castle, shop use), the ghost right-click attack, and a
@@ -798,13 +809,22 @@ stops proposing around a plan you never actually issued.
 - ~~**Closing the ghost-attack gap.**~~ **Done** — the picker reads
   `FogGrid::ghosts()` and produces the same `Intent::Attack` against the same
   id (see "The residual asymmetry" above). There is no longer a place where the
-  AI can express something the human cannot.
+  AI can express something the human cannot. It is also, as of Chain of
+  Command, a direct order like any other: attacking a remembered building from
+  across the map costs the link, because what is slow is reaching your own
+  soldier, not reaching the enemy.
 - ~~**Ability ids parse inconsistently.**~~ **Done** — `normalize_name` moved
   to shared.rs, next to the catalog whose names it folds, and now backs
   `ability_index_by_id` and `parse_target_class` as well. There is one name
   matcher, and `"Call to Arms"` works.
-- **Chain of Command (docs/TEMPO.md).** The spike asked for "a single choke
-  point where player commands become engine orders" and budgeted 23 call sites
-  across three files. There is now one function. `PendingOrder` latency becomes
-  a change inside `compile_intent`'s order arms rather than a 23-site refactor
-  — with the `ai.rs` caveat above.
+- **Chain of Command (docs/TEMPO.md) — shipped, and this layer is why it was
+  cheap.** The spike asked for "a single choke point where player commands
+  become engine orders" and budgeted 23 call sites across three files. Because
+  there was one function, latency for both player seats is a substitution
+  inside `compile_intent`'s order arms: eight verbs now issue through
+  `command::OrderIssuer` instead of `try_insert`, and the rest are documented
+  as instant with a reason each (docs/TEMPO.md §7). The compiler still
+  validates in the frame the intent arrives — only *application* is deferred —
+  so error strings, the wire format and the `cmd N:` prefixes are untouched.
+  The log gained one thing: a `(+N.Ns link)` suffix on any sentence the chain
+  of command delayed.
