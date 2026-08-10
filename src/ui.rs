@@ -755,14 +755,23 @@ fn build_cards() -> Vec<(u8, BuildingKind, KeyCode, &'static str)> {
     cards
 }
 
-/// Production hotkeys, by index into `trainable()`: Q, W, E, R. A Shop trains
+/// Production hotkeys, by index into `trainable()`: Q, W, E, R, T. A Shop trains
 /// nothing, so its buy buttons reuse the same letters without colliding, and
 /// the hero's [R] lives on a unit selection, never a building one.
-const TRAIN_KEYS: [(KeyCode, &str); 4] = [
+///
+/// [T] joined when the Castle-gated Knight took the Barracks' fifth slot. It is
+/// the next key along the same keyboard row, which keeps the row unbroken, and
+/// the only other [T] in the game is the hero's Auto-Slam toggle — a toggle
+/// that only exists on a UNIT selection, where no train button is ever drawn.
+/// Same reasoning as the Shop's buy buttons: production hotkeys collide with
+/// nothing because a building selection and a unit selection are disjoint
+/// cards.
+const TRAIN_KEYS: [(KeyCode, &str); 5] = [
     (KeyCode::KeyQ, "Q"),
     (KeyCode::KeyW, "W"),
     (KeyCode::KeyE, "E"),
     (KeyCode::KeyR, "R"),
+    (KeyCode::KeyT, "T"),
 ];
 
 /// Inventory-slot hotkeys, by slot index.
@@ -841,8 +850,8 @@ fn ability_slots(
 ///   fighters             A S | G V P                       (5)
 ///   hero                 A S R | Z X (carried items) | G V P T   (<=9)
 ///   town hall            Q(Worker) W/E(hero class) C(CallToArms)
-///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman)  (4)
-///   workshop             Q(Catapult)                       (1)
+///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman) T(Knight) (5)
+///   workshop             Q(Catapult) W(Gryphon Rider)      (2)
 ///   shop                 Q(Potion) W(Portal)               (2)
 ///
 /// Build commands never yield — a greyed [K Workshop] is how the player learns
@@ -1081,6 +1090,8 @@ fn unit_name(kind: UnitKind) -> &'static str {
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
         UnitKind::Spearman => "Spearman",
+        UnitKind::Knight => "Knight",
+        UnitKind::GryphonRider => "Gryphon",
     }
 }
 

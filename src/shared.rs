@@ -145,6 +145,14 @@ pub enum UnitKind {
     /// Anti-cavalry line infantry: cheap, slow, and feeble against everything
     /// except a horse, which it deletes. The tier-1 answer to Raiders.
     Spearman,
+    /// Castle-gated heavy shock cavalry: the tier-3 line-breaker. Raw stats and
+    /// speed with no type bonus at all — and `TargetClass::Cavalry`, so the
+    /// 90-gold Spearman is still the answer.
+    Knight,
+    /// Castle-gated air capstone: the first `flying: true` kind. Ignores the
+    /// nav grid, hits ground and air, and can only be answered by something
+    /// that shoots.
+    GryphonRider,
 }
 
 /// Hero-class unit kinds (carry the `Hero` component, count against the
@@ -174,7 +182,7 @@ pub enum BuildingKind {
     Castle,
 }
 
-pub const ALL_UNIT_KINDS: [UnitKind; 8] = [
+pub const ALL_UNIT_KINDS: [UnitKind; 10] = [
     UnitKind::Worker,
     UnitKind::Footman,
     UnitKind::Archer,
@@ -183,6 +191,8 @@ pub const ALL_UNIT_KINDS: [UnitKind; 8] = [
     UnitKind::Raider,
     UnitKind::Priestess,
     UnitKind::Spearman,
+    UnitKind::Knight,
+    UnitKind::GryphonRider,
 ];
 pub const ALL_BUILDING_KINDS: [BuildingKind; 9] = [
     BuildingKind::TownHall,
@@ -376,6 +386,60 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
             // and gets to choose the engagement, which is what makes the
             // counter a wall you walk into rather than a patrol that hunts you.
             vision: 18.0,
+        },
+        // Tier 3, Castle-gated, Barracks-trained: the line-breaker. Its whole
+        // design is that it has NO type multiplier — no anti-siege bonus (that
+        // stays the Raider's job), no anti-anything. What 270 gold buys is raw
+        // numbers: 350 hp and 29.6 dps, more than double a Footman's on both
+        // counts, at a speed nothing but cavalry can disengage from.
+        //
+        // And it is `TargetClass::Cavalry`, which is the point of the whole
+        // exercise: the counter to the most expensive melee unit in the game is
+        // still the cheapest, a 90-gold Spearman, because the triangle is drawn
+        // on classes rather than on tiers. Equal gold — one Knight against
+        // three Spearmen — the spear line wins and pays one body for it. A tech
+        // advantage buys tempo and reach, never immunity to a counter.
+        //
+        // Melee, so `can_hit_air: false`: a Knight army that never built an
+        // archer is helpless under a Gryphon, which is the other half of this
+        // bead's lesson.
+        UnitKind::Knight => UnitStats {
+            cost_gold: 270, cost_lumber: 60, supply: 4, hp: 350.0, damage: 34.0,
+            range: 2.4, attack_cooldown: 1.15, speed: 9.5, train_time: 20.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            // A shock line that closes at 9.5 needs to see the shape of what it
+            // is about to hit, so it out-sees the 18 of the spear picket that
+            // answers it. Still short of the Raider's 24: the Knight is the
+            // hammer, not the scout, and the light cavalry keeps its one
+            // remaining job.
+            vision: 20.0,
+        },
+        // Tier 3, Castle-gated, Workshop-trained: the flyer capstone, and the
+        // first kind in the game with `flying: true`. It ignores the nav grid
+        // entirely, so no wall, forest, canyon or tower net is a door it has to
+        // use, and it hits both planes.
+        //
+        // The price of that is paid in raw numbers, deliberately: 280 gold and
+        // 120 lumber buys 15.4 dps — barely more than the two Archers the same
+        // gold buys — because what a flyer is actually purchasing is that most
+        // of the enemy army cannot fight it at all. Every stat here is set
+        // against one target: 280 gold of Gryphon must LOSE to 270 gold of
+        // Archers. 200 hp is what makes that true, so massed ranged stays the
+        // answer to air and a flyer is a scalpel rather than an autowin.
+        UnitKind::GryphonRider => UnitStats {
+            cost_gold: 280, cost_lumber: 120, supply: 5, hp: 200.0, damage: 20.0,
+            range: 6.0, attack_cooldown: 1.3, speed: 9.0, train_time: 28.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: true, can_hit_air: true, can_hit_ground: true,
+            // Altitude is the oldest observation post there is, and fog is XZ
+            // only (docs/FOG.md), so height costs a flyer nothing and buys it
+            // reach. 26 is the widest eye any unit has — equal to a TownHall's,
+            // which is the comparison worth making: a Gryphon is a hall's worth
+            // of vision that MOVES, and scouting one across the map is the
+            // single best information purchase in the game. It is also why the
+            // unit is Castle-gated and 280 gold: sight this good arrives late.
+            vision: 26.0,
         },
     }
 }
@@ -618,6 +682,11 @@ pub fn unit_requires(kind: UnitKind) -> &'static [BuildingKind] {
         // before any reactive defense could finish. Workshop-gating makes
         // cavalry the mid-game flanking tool it was designed as.
         UnitKind::Raider => &[BuildingKind::Workshop],
+        // The tier-3 pair. Gating on the Castle rather than on a new building
+        // is what makes the hall ladder worth climbing: `requirements_met` uses
+        // `building_satisfies`, so this is a tier comparison, and a fourth rung
+        // added later would satisfy it for free.
+        UnitKind::Knight | UnitKind::GryphonRider => &[BuildingKind::Castle],
         _ => &[],
     }
 }
@@ -737,13 +806,23 @@ pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
         // Spearman is appended rather than slotted next to the Footman on
         // purpose: production hotkeys are positional, and moving Archer off W
         // to make room would retrain every existing pair of hands.
+        // Appended, never inserted, for the reason above: the Knight takes the
+        // fifth slot rather than displacing anyone's muscle memory.
         BuildingKind::Barracks => &[
             UnitKind::Footman,
             UnitKind::Archer,
             UnitKind::Raider,
             UnitKind::Spearman,
+            UnitKind::Knight,
         ],
-        BuildingKind::Workshop => &[UnitKind::Catapult],
+        // The Gryphon trains here rather than out of a new Aviary, and that is
+        // a design choice, not a shortcut. The Workshop is already the building
+        // whose entire job is "the answer to a tower turtle" — siege is the
+        // ground answer, air is the one that refuses to use the door. Putting
+        // both behind one 140g/100l investment keeps the building count flat,
+        // keeps the tech decision legible (one branch, two answers), and means
+        // a team that scouted a Workshop still does not know which is coming.
+        BuildingKind::Workshop => &[UnitKind::Catapult, UnitKind::GryphonRider],
         BuildingKind::Farm | BuildingKind::Tower | BuildingKind::Wall | BuildingKind::Shop => &[],
     }
 }
@@ -767,6 +846,8 @@ pub fn kind_name(kind: UnitKind) -> &'static str {
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
         UnitKind::Spearman => "Spearman",
+        UnitKind::Knight => "Knight",
+        UnitKind::GryphonRider => "GryphonRider",
     }
 }
 
@@ -793,7 +874,9 @@ pub fn unit_description(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it.",
         UnitKind::Raider => "Fast cavalry: 2x damage vs Catapults, excels at worker raids and map control. Melts under massed fire.",
         UnitKind::Priestess => "Support hero: ranged attack, Heal ability (AoE ally healing). One hero per team; revival preserves level and class.",
-        UnitKind::Spearman => "Cheap anti-cavalry line: 5x damage vs Raiders, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
+        UnitKind::Spearman => "Cheap anti-cavalry line: 5x damage vs Raiders and Knights, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
+        UnitKind::Knight => "Requires a Castle. Heavy shock cavalry: 350 hp at speed 9.5, no type bonus, just the best raw stats on the field. Breaks Footman and Archer lines at equal gold. Counter it with Spearmen — the Knight is cavalry, so it takes 5x from a spear, and 270g of Knight loses to 270g of Spearmen. Melee: cannot touch air.",
+        UnitKind::GryphonRider => "Requires a Castle; trained at the Workshop. Flying: ignores walls, forests and chokepoints entirely, and attacks both ground and air. Melee units and Catapults CANNOT hit it at all — only Archers, the Priestess and Towers can. Counter it with massed Archers: 270g of Archers beats one Gryphon. Sees 26, the widest eye in the game.",
     }
 }
 
@@ -809,11 +892,11 @@ pub fn building_description(kind: BuildingKind) -> &'static str {
         BuildingKind::Castle => {
             "Tier 3 hall: the top of the ladder. Satisfies every hall requirement below it."
         }
-        BuildingKind::Barracks => "Trains Footmen, Archers and Spearmen (and Raiders, once a Workshop stands).",
+        BuildingKind::Barracks => "Trains Footmen, Archers and Spearmen (Raiders once a Workshop stands, Knights once a Castle does).",
         BuildingKind::Farm => "+6 supply. Build ahead of the cap or production stalls.",
         BuildingKind::Tower => "Static defense: shoots arrows at enemies in range.",
         BuildingKind::Wall => "Cheap blocking segment. No function except HP in the way.",
-        BuildingKind::Workshop => "Siege works: trains Catapults. The answer to tower turtles.",
+        BuildingKind::Workshop => "Siege works: trains Catapults, and Gryphon Riders once a Castle stands. Both answers to a tower turtle — one knocks the door down, the other flies over it.",
         BuildingKind::Shop => "Item vendor: heroes buy consumables here (see catalog items).",
     }
 }
@@ -2145,7 +2228,11 @@ impl TargetClass {
             (Some(UnitKind::Footman) | Some(UnitKind::Spearman), _) => Some(TargetClass::Footman),
             (Some(UnitKind::Worker), _) => Some(TargetClass::Worker),
             (Some(UnitKind::Catapult), _) => Some(TargetClass::Siege),
-            (Some(UnitKind::Raider), _) => Some(TargetClass::Cavalry),
+            // The Knight rides in under the same class as the Raider, which is
+            // the entire counter-triangle in one line: `vs_cavalry_mult` is
+            // keyed off the CLASS, so a Spearman's 5x lands on a 270g tier-3
+            // Knight exactly as hard as on a 170g tier-2 Raider.
+            (Some(UnitKind::Raider) | Some(UnitKind::Knight), _) => Some(TargetClass::Cavalry),
             (None, true) => Some(TargetClass::Building),
             _ => None,
         }

@@ -50,6 +50,14 @@ const RAIDER_EVERY_NTH: u32 = 5;
 /// never mounts up. Reacting properly is a commander's job, and a commander
 /// gets the same unit through the same catalog.
 const SPEARMAN_EVERY_NTH: u32 = 4;
+/// Every Nth army unit is a Knight, but ONLY once a Castle stands. Checked
+/// first, so a tier-3 team's Barracks really does put a 270g line-breaker on
+/// the field instead of a fourth Footman — and checked at 7, so it is roughly
+/// one unit in seven and never the backbone. The script has no scouting memory
+/// and cannot tell a Spearman screen from an Archer line, so it must not lean
+/// on a unit that a 90-gold counter deletes; a commander reading the catalog
+/// can, and that difference is the point.
+const KNIGHT_EVERY_NTH: u32 = 7;
 
 /// Siege. A Workshop is a luxury: only once a Barracks stands and the treasury
 /// is comfortably ahead of army production does the AI branch into siege.
@@ -60,6 +68,20 @@ const WORKSHOP_GOLD: u32 = 350;
 const WORKSHOP_QUEUE_MAX: usize = 2;
 /// Target mix: one Catapult per this many Barracks-produced line units.
 const CATAPULT_PER_ARMY: u32 = 4;
+/// Every Nth Workshop item is a Gryphon Rider instead of a Catapult, once a
+/// Castle stands AND the bank is genuinely fat. Kept deliberately RARE.
+///
+/// The scripted AI does not build Towers (known gap, wc3clone-7gv) and does not
+/// mass Archers on purpose, so in an AI-vs-AI match neither side reliably holds
+/// the counter to air. A script that spent freely on flyers would therefore win
+/// on a unit the baseline cannot answer, and the scripted matchup would stop
+/// being the decisive, readable baseline the era runs measure against. So air
+/// appears — tier-3 content that never shows up is not content — but only out
+/// of surplus, and only about one Workshop item in three.
+const GRYPHON_EVERY_NTH: u32 = 3;
+/// ...and only with this much gold banked after the reserve. A Gryphon is the
+/// last thing the script buys, never the thing it saves for.
+const GRYPHON_BANK_GOLD: u32 = 700;
 
 /// Building placement: rings of candidate offsets around the base.
 const BUILD_PADDING: f32 = 2.0;
@@ -964,7 +986,14 @@ fn think(
                 let raider_ok = own_buildings
                     .iter()
                     .any(|ob| ob.kind == BuildingKind::Workshop && ob.done);
-                let wanted = if raider_ok && next % RAIDER_EVERY_NTH == 0 {
+                // Knights are Castle-gated the same way, and for the same
+                // reason: an unpayable item at the front stalls the Barracks.
+                // `current_tier` is the highest completed hall rung, so this is
+                // exactly the condition `unit_requires` will re-check on pay.
+                let knight_ok = current_tier >= 3;
+                let wanted = if knight_ok && next % KNIGHT_EVERY_NTH == 0 {
+                    UnitKind::Knight
+                } else if raider_ok && next % RAIDER_EVERY_NTH == 0 {
                     UnitKind::Raider
                 } else if next % ARCHER_EVERY_NTH == 0 {
                     UnitKind::Archer
@@ -1005,16 +1034,39 @@ fn think(
                 if brain.siege_counter * CATAPULT_PER_ARMY > brain.army_counter {
                     continue;
                 }
-                let s = unit_stats(UnitKind::Catapult);
-                if gold.saturating_sub(reserve_gold) >= s.cost_gold
-                    && lumber.saturating_sub(reserve_lumber) >= s.cost_lumber
-                    && headroom >= s.supply
-                {
+                // Air out of surplus only: a Castle standing, the bank fat, and
+                // the siege counter on its every-Nth beat. Everything else the
+                // Workshop makes is still a Catapult, and a Gryphon the script
+                // cannot pay for silently degrades back to one rather than
+                // parking an unaffordable item at the front of the queue.
+                let want_air = current_tier >= 3
+                    && gold.saturating_sub(reserve_gold) >= GRYPHON_BANK_GOLD
+                    && brain.siege_counter % GRYPHON_EVERY_NTH == 0;
+                let kind = if want_air {
+                    UnitKind::GryphonRider
+                } else {
+                    UnitKind::Catapult
+                };
+                let affordable = |k: UnitKind| {
+                    let s = unit_stats(k);
+                    gold.saturating_sub(reserve_gold) >= s.cost_gold
+                        && lumber.saturating_sub(reserve_lumber) >= s.cost_lumber
+                        && headroom >= s.supply
+                };
+                let kind = if affordable(kind) {
+                    Some(kind)
+                } else if kind != UnitKind::Catapult && affordable(UnitKind::Catapult) {
+                    Some(UnitKind::Catapult)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    let s = unit_stats(kind);
                     gold -= s.cost_gold;
                     lumber -= s.cost_lumber;
                     headroom -= s.supply;
                     brain.siege_counter = brain.siege_counter.wrapping_add(1);
-                    orders.push((b.entity, UnitKind::Catapult));
+                    orders.push((b.entity, kind));
                 }
             }
             // Non-producing buildings (and any future kinds the scripted AI
