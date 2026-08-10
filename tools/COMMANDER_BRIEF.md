@@ -30,8 +30,12 @@ Production:
 - `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free; you pay on placement)
 - `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"}` (queue cap 7)
 - `{"type":"cancel","building":id,"index":n}`  `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}`
-- `{"type":"cast","hero":id}` — cast the caster's ability (heroes: their class ability;
-  a TownHall id works too: CallToArms turns nearby workers into fighters for 40s, 90s cooldown).
+- `{"type":"cast","hero":id}` — cast the caster's first available ability (heroes: their class
+  ability; a TownHall id works too: CallToArms turns nearby workers into fighters for 40s,
+  90s cooldown). Add `"ability":<index>` or `"ability":"Slam"` to pick a specific one — casters
+  can have several, each with its own cooldown and unlock condition. Every caster's slots are
+  listed in the snapshot as `units[].abilities` / `buildings[].abilities`
+  (`index`, `cd`, `unlocked`, `ready`, `requires`), and described in catalog `abilities`.
 - `{"type":"buy","shop":id,"item":"HealingPotion"|"TownPortal"}` — your living hero buys the item
   (2 inventory slots; see catalog `items`). `{"type":"use_item","slot":0}` consumes it.
   TownPortal teleports your hero + nearby own units to your nearest TownHall — the expansion-saver.
@@ -40,7 +44,9 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
   Hero (both hero types), Archer, Footman, Worker, Building, Siege (catapults), Cavalry (raiders).
 - `{"type":"retreat","units":[ids],"below":0.35,"x":..,"z":..}` — auto fall-back when hurt
 - `{"type":"leash","units":[ids],"x":..,"z":..,"radius":20}` — never chase/fight beyond anchor (radius 0 clears)
-- `{"type":"autocast","units":[hero_id],"min_enemies":3}` — hero slams automatically
+- `{"type":"autocast","units":[hero_id],"min_enemies":3}` — hero slams automatically. Add
+  `"ability":<index|"Name">` to govern a specific ability; each one keeps its own trigger, and
+  `min_enemies:0` clears just that rule.
 - `{"type":"squad","units":[ids],"id":1}` then `{"type":"posture","id":1,"posture":{"type":"defend","x":..,"z":..,"radius":18}}`
   (`"push"` with x/z, `"escort"` with `"unit":id`, or `"forage"` with x/z muster) — squads
   re-task themselves every second and ADVANCE COHESIVELY: a strung-out Push/Forage squad gathers before pressing on, so slow units set the pace and you arrive as one force. Defend postures are REACTIVE: enemies entering the radius
@@ -63,6 +69,25 @@ The live snapshot's `unlocked` map tells you which entries' requirements you
 currently satisfy (e.g. Towers need a Barracks first).
 
 ## The rules of the world (not in the catalog)
+- **FOG OF WAR — read this before you read `units`.** Your snapshot shows only what your
+  team can currently SEE, and it is the same rule the human player's screen obeys. So:
+  - **An empty `units` list means "I have no information", not "there are no enemies."**
+    Check the top-level `fog` object (`enabled`, `explored`, `visible`) before drawing any
+    conclusion from silence. `explored: 0.1` means you have looked at a tenth of the map.
+  - Enemy **units** appear only while you can see them, and are never remembered. An army
+    that leaves your sight is simply gone from the snapshot — it has NOT died.
+  - Enemy **buildings** you have scouted stay in `buildings` as remembered ghosts carrying
+    `last_seen` (game time of the sighting). A ghost may be stale: the building may have
+    been destroyed, or upgraded to a higher tier, since. `last_seen` present == memory;
+    absent == you are looking at it right now.
+  - `bounties` lists only caches you can SEE. Treasure you have no eyes on is invisible.
+  - Still public and unfiltered: `map`, `mines` (position AND remaining gold), `trees_near`.
+    Map geography is not a secret; what the enemy is DOING with it is.
+  - You cannot `attack` an id you cannot see or remember — it is rejected as
+    `target N is not visible`. Use `attack_move` to advance into the unknown.
+  - **Scout deliberately.** Vision radius is per-kind in `catalog.json` (`vision`).
+    Raiders see 24 and are the cheapest eyes on the map; Catapults see 14 but shoot 20, so
+    unescorted siege is firing blind. Halls see furthest of all and grow with the tier.
 - Map ±100. Your base corner and the enemy's are opposite. **Read `map` in your snapshot**:
   it names the layout, summarises what the ground does to a plan, and lists every `chokes`
   entry — the only gaps through impassable terrain. On a map with chokes, walls/towers at a
@@ -77,7 +102,8 @@ currently satisfy (e.g. Towers need a Barracks first).
 - **Mines are finite** (3500 each — they die around minute 10). The map runs dry; late-game armies are irreplaceable.
   Long passive games punish you twice (upkeep + exhaustion) — force the issue.
 - **Bounty caches**: neutral treasure spawns in the contested middle every ~90s (watch the
-  `bounties` list and event feed). First team to walk any unit onto one banks its gold —
+  `bounties` list and event feed — but see fog above: you only see caches you have eyes on,
+  so holding the middle is now also how you FIND them). First team to walk any unit onto one banks its gold —
   UNTAXED, and the value escalates WITHOUT LIMIT (~750 by min 20, 1000+ by min 30) —
   the map itself forces a decision. Ceding the middle
   cedes an economy. After the mines die, bounties are the only income on the map.

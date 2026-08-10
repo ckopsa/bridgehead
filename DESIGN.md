@@ -30,6 +30,23 @@ Win by destroying all enemy buildings.
   it into `state.json` for an external commander, ui.rs draws it as HUD
   notifications for the player. A feed with two producers is two feeds, and two
   feeds is an information advantage for whichever side has the better one.
+  It also owns two frameworks every content bead builds on:
+  * **Status effects** — `StatusKind` (Slow/Haste/ArmorBuff/DamageBuff/
+    HealOverTime), `StatusEffect`, the `StatusEffects` component, and
+    `effective_stats(BaseStats, Option<&StatusEffects>)`, **the one modifier
+    function**: units.rs and combat.rs ask it for move speed, attack cooldown
+    and damage dealt/taken instead of reading the stat tables. Debuffs refresh,
+    buffs stack, magnitudes are capped per kind, and `tick_status_effects`
+    expires everything centrally (combat.rs draws the ground ring).
+  * **Abilities v2** — `abilities_of_unit` / `abilities_of_building` return a
+    LIST per caster; each `AbilityDef` carries an `AbilityUnlock` predicate
+    (always / hero level / `TechTier`) and an effect that may be
+    `ApplyStatus`. `CastAbility { caster, ability: Option<AbilitySelector> }`
+    picks a slot (`None` = first unlocked); cooldowns live per slot in
+    `AbilityCooldowns` and auto-cast rules per slot in `AutoCastPolicy`.
+    `tech_tier_for` derives the team's `TechTier` from the highest hall rung it
+    has standing (`is_hall` + `building_tier`), so a completed Keep opens every
+    `TeamTier(T2)` ability and losing it closes them again.
 - `terrain.rs`: ground, doodads, resource nodes (gold mines at
   `GOLD_MINE_POSITIONS`, tree clusters), lighting, **RTS camera** (spawns the
   `MainCamera`), blocks trees/mines in `NavGrid`, and owns the **map layout**:
@@ -104,6 +121,12 @@ Win by destroying all enemy buildings.
   alive; when following `Order::Attack(target)`/`Harvest(target)`, always
   `if let Ok(..) = query.get(target)` and fall back to Idle if the target is gone.
 - `Query::single()`/`single_mut()` return `Result` in 0.16 — use `let Ok(x) = q.single() else { return; }`.
+- **`GlobalTransform` is only propagated in `PostUpdate`.** Any ROOT entity you
+  spawn *or* teleport during `Update` must seed/update its own
+  `GlobalTransform::from(transform)` in the same statement that writes the
+  `Transform` — otherwise every `GlobalTransform` reader that frame (combat.rs
+  reads positions that way) sees the origin for a fresh spawn, or the stale
+  pre-teleport position for a mover.
 
 ## Verification
 

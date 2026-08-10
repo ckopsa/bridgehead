@@ -31,6 +31,10 @@ const NODE_DANGER_RADIUS: f32 = 16.0;
 const BUILD_START_SCALE: f32 = 0.4;
 /// Buildings start at this fraction of their max HP.
 const BUILD_START_HP: f32 = 0.1;
+/// How far a building's roofline sinks while it is upgrading in place. Far
+/// gentler than `BUILD_START_SCALE`: the building is still standing and still
+/// providing supply, it is merely under scaffolding.
+const UPGRADE_SCAFFOLD_SCALE: f32 = 0.85;
 
 // ---------------------------------------------------------------------------
 // Plugin
@@ -45,6 +49,8 @@ impl Plugin for EconomyPlugin {
             (
                 spawn_buildings,
                 construction_progress,
+                start_upgrades,
+                upgrade_progress,
                 order_changed,
                 build_sites,
                 harvest_loop,
@@ -166,6 +172,90 @@ fn setup_economy_assets(
             },
         ],
     );
+
+    // --- Keep: the town hall grown a storey, with four corner turrets ------
+    // Same 8-wide footprint as the TownHall (an upgrade must never need ground
+    // the original did not already hold) but half again as tall, and the
+    // turrets are the read at a glance: this base has teched.
+    {
+        let mut keep = vec![
+            Part {
+                mesh: meshes.add(Cuboid::new(8.0, 4.4, 8.0)),
+                tf: Transform::from_xyz(0.0, 2.2, 0.0),
+                mat: 0,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(5.6, 2.6, 5.6)),
+                tf: Transform::from_xyz(0.0, 5.7, 0.0),
+                mat: 1,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(1.4, 2.6, 1.4)),
+                tf: Transform::from_xyz(0.0, 8.3, 0.0),
+                mat: 2,
+            },
+        ];
+        let turret = meshes.add(Cylinder::new(0.8, 6.0));
+        let cap = meshes.add(Cylinder::new(1.0, 0.5));
+        for (sx, sz) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+            keep.push(Part {
+                mesh: turret.clone(),
+                tf: Transform::from_xyz(3.2 * sx, 3.0, 3.2 * sz),
+                mat: 0,
+            });
+            keep.push(Part {
+                mesh: cap.clone(),
+                tf: Transform::from_xyz(3.2 * sx, 6.25, 3.2 * sz),
+                mat: 2,
+            });
+        }
+        parts.insert(BuildingKind::Keep, keep);
+    }
+
+    // --- Castle: skirted curtain wall, tall corner towers, central spire ---
+    // Still 8 wide on the grid; ~12 tall, which makes it the highest thing on
+    // the field by a clear margin. Tier is meant to be legible from the camera.
+    {
+        let mut castle = vec![
+            // Skirt: a wider, low plinth reading as a curtain wall.
+            Part {
+                mesh: meshes.add(Cuboid::new(8.4, 1.4, 8.4)),
+                tf: Transform::from_xyz(0.0, 0.7, 0.0),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(7.2, 5.0, 7.2)),
+                tf: Transform::from_xyz(0.0, 3.2, 0.0),
+                mat: 0,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(5.0, 3.0, 5.0)),
+                tf: Transform::from_xyz(0.0, 7.2, 0.0),
+                mat: 1,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(1.6, 3.2, 1.6)),
+                tf: Transform::from_xyz(0.0, 10.4, 0.0)
+                    .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4)),
+                mat: 2,
+            },
+        ];
+        let tower = meshes.add(Cylinder::new(0.95, 9.0));
+        let cap = meshes.add(Cylinder::new(1.15, 0.6));
+        for (sx, sz) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+            castle.push(Part {
+                mesh: tower.clone(),
+                tf: Transform::from_xyz(3.3 * sx, 4.5, 3.3 * sz),
+                mat: 0,
+            });
+            castle.push(Part {
+                mesh: cap.clone(),
+                tf: Transform::from_xyz(3.3 * sx, 9.3, 3.3 * sz),
+                mat: 2,
+            });
+        }
+        parts.insert(BuildingKind::Castle, castle);
+    }
 
     // --- Barracks: wide hall + flat roof slab + banner pole ----------------
     parts.insert(
@@ -561,22 +651,7 @@ fn spawn_buildings(
             ))
             .id();
 
-        // Team-tinted procedural body.
-        let palette = assets
-            .palette(ev.kind, ev.team)
-            .expect("team materials initialised in setup");
-        if let Some(parts) = assets.parts.get(&ev.kind) {
-            for part in parts {
-                let child = commands
-                    .spawn((
-                        Mesh3d(part.mesh.clone()),
-                        MeshMaterial3d(palette[part.mat].clone()),
-                        part.tf,
-                    ))
-                    .id();
-                commands.entity(root).add_child(child);
-            }
-        }
+        spawn_body(&mut commands, &assets, root, ev.kind, ev.team);
 
         if !ev.completed {
             commands.entity(root).insert(UnderConstruction {
@@ -590,6 +665,33 @@ fn spawn_buildings(
         }
 
         nav.set_blocked_rect(pos, stats.size, true);
+    }
+}
+
+/// Attach a kind's team-tinted procedural body to a building root. Used at
+/// spawn and again when an upgrade swaps one silhouette for the next.
+fn spawn_body(
+    commands: &mut Commands,
+    assets: &EconomyAssets,
+    root: Entity,
+    kind: BuildingKind,
+    team: Team,
+) {
+    let palette = assets
+        .palette(kind, team)
+        .expect("team materials initialised in setup");
+    let Some(parts) = assets.parts.get(&kind) else {
+        return;
+    };
+    for part in parts {
+        let child = commands
+            .spawn((
+                Mesh3d(part.mesh.clone()),
+                MeshMaterial3d(palette[part.mat].clone()),
+                part.tf,
+            ))
+            .id();
+        commands.entity(root).add_child(child);
     }
 }
 
@@ -630,6 +732,202 @@ fn construction_progress(
             let frac = (1.0 - uc.remaining / build_time).clamp(0.0, 1.0);
             tf.scale.y = BUILD_START_SCALE + (1.0 - BUILD_START_SCALE) * frac;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2b. In-place upgrades (TownHall -> Keep -> Castle)
+// ---------------------------------------------------------------------------
+//
+// An upgrade is a construction that happens to already have a building on the
+// site. It keeps the entity, the position, the footprint, the rally point, the
+// doctrine template and — deliberately — the training QUEUE: paying to tech up
+// must never cost a player the four Footmen they had lined up. What it does
+// cost is the TIME: `training_queues` skips an `Upgrading` building entirely,
+// so the queue and its progress freeze on the spot and thaw untouched when the
+// scaffolding comes down. That pause is the real price of teching mid-fight.
+//
+// Money changes hands once, here, the instant the order is accepted — unlike
+// `Order::Build`, no worker has to walk anywhere first, so there is no window
+// in which a training queue could spend the down payment.
+
+/// `UpgradeBuilding` -> validate, pay, start the conversion.
+///
+/// Rejections are `debug!` and nothing else: ui.rs, bridge.rs and ai.rs all
+/// pre-check, so anything that lands here failed because the world moved
+/// between the request and this frame.
+#[allow(clippy::too_many_arguments)]
+fn start_upgrades(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut events: EventReader<UpgradeBuilding>,
+    mut economies: ResMut<Economies>,
+    mut feed: ResMut<GameEvents>,
+    buildings: Query<(
+        &Building,
+        &Team,
+        &Transform,
+        Option<&UnderConstruction>,
+        Option<&Upgrading>,
+    )>,
+) {
+    for ev in events.read() {
+        let Ok((building, team, tf, under, upgrading)) = buildings.get(ev.building) else {
+            debug!("UpgradeBuilding: {:?} is not a building", ev.building);
+            continue;
+        };
+        if under.is_some() {
+            debug!("UpgradeBuilding: {:?} is still under construction", ev.building);
+            continue;
+        }
+        if upgrading.is_some() {
+            debug!("UpgradeBuilding: {:?} is already upgrading", ev.building);
+            continue;
+        }
+        let Some(to) = building_upgrades_to(building.kind) else {
+            debug!(
+                "UpgradeBuilding: {} is at the top of its ladder",
+                building_name(building.kind)
+            );
+            continue;
+        };
+        let (cost_gold, cost_lumber, upgrade_time) =
+            upgrade_cost(building.kind).expect("a next tier implies a cost");
+        if !economies.get_mut(*team).pay(cost_gold, cost_lumber) {
+            debug!(
+                "UpgradeBuilding: {:?} cannot afford {} ({cost_gold}g {cost_lumber}l)",
+                team,
+                building_name(to)
+            );
+            continue;
+        }
+
+        commands.entity(ev.building).try_insert(Upgrading {
+            to,
+            remaining: upgrade_time,
+            total: upgrade_time,
+        });
+        let pos = flat(tf.translation);
+        info!(
+            "[{:?}] {} -> {} upgrade started at ({:.0},{:.0}) — {cost_gold}g {cost_lumber}l, \
+             {upgrade_time:.0}s (training paused)",
+            team,
+            building_name(building.kind),
+            building_name(to),
+            pos.x,
+            pos.z
+        );
+        // Own feed only. The enemy learns a base teched by looking at it.
+        feed.push(
+            *team,
+            time.elapsed_secs(),
+            format!("{} upgrade started @({:.1},{:.1})", building_name(to), pos.x, pos.z),
+            EventSeverity::Info,
+            Some(pos),
+        );
+    }
+}
+
+/// Tick every conversion; on completion swap the kind, the body and the HP
+/// pool, and tell the owner.
+#[allow(clippy::too_many_arguments)]
+fn upgrade_progress(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut nav: ResMut<NavGrid>,
+    assets: Res<EconomyAssets>,
+    mut feed: ResMut<GameEvents>,
+    mut query: Query<(
+        Entity,
+        &mut Building,
+        &Team,
+        &mut Upgrading,
+        &mut Transform,
+        &mut Health,
+        Option<&Children>,
+    )>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    for (entity, mut building, team, mut upgrading, mut tf, mut health, children) in &mut query {
+        upgrading.remaining -= dt;
+        if upgrading.remaining > 0.0 {
+            // Scaffolding: the roofline sits low and rises back as the work
+            // finishes, so an upgrade in progress is visible on the field and
+            // not only in the HUD.
+            let frac = (1.0 - upgrading.remaining / upgrading.total.max(0.01)).clamp(0.0, 1.0);
+            tf.scale.y = UPGRADE_SCAFFOLD_SCALE + (1.0 - UPGRADE_SCAFFOLD_SCALE) * frac;
+            continue;
+        }
+
+        let from = building.kind;
+        let to = upgrading.to;
+        let old_stats = building_stats(from);
+        let new_stats = building_stats(to);
+
+        // Carry the damage across as a FRACTION: a hall at half health becomes
+        // a Keep at half health. Upgrading is not a repair, and a player who
+        // starts one under fire does not get to un-take the damage.
+        let frac = if health.max > 0.0 {
+            (health.current / health.max).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        health.max = new_stats.hp;
+        health.current = new_stats.hp * frac;
+
+        // Footprints are equal all the way up today, but re-blocking honestly
+        // costs nothing and means a future ladder with a wider top rung works.
+        if (new_stats.size - old_stats.size).abs() > f32::EPSILON {
+            nav.set_blocked_rect(tf.translation, old_stats.size, false);
+            nav.set_blocked_rect(tf.translation, new_stats.size, true);
+        }
+
+        // New silhouette: drop the old body, raise the new one.
+        if let Some(children) = children {
+            for child in children.iter() {
+                commands.entity(child).try_despawn();
+            }
+        }
+        building.kind = to;
+        tf.scale.y = 1.0;
+        spawn_body(&mut commands, &assets, entity, to, *team);
+
+        // A rung that trains nothing would have to shed its queue; nothing on
+        // today's ladder does, but deriving it keeps the invariant honest.
+        if is_production(to) {
+            if !is_production(from) {
+                commands
+                    .entity(entity)
+                    .try_insert((TrainingQueue::default(), PaidFront(false)));
+            }
+        } else {
+            commands
+                .entity(entity)
+                .try_remove::<TrainingQueue>()
+                .try_remove::<PaidFront>();
+        }
+
+        commands.entity(entity).try_remove::<Upgrading>();
+        let pos = flat(tf.translation);
+        info!(
+            "[{:?}] {} upgrade complete at ({:.0},{:.0}) — tier {}, {:.0} HP",
+            team,
+            building_name(to),
+            pos.x,
+            pos.z,
+            building_tier(to),
+            new_stats.hp
+        );
+        feed.push(
+            *team,
+            time.elapsed_secs(),
+            format!("{} upgrade complete @({:.1},{:.1})", building_name(to), pos.x, pos.z),
+            EventSeverity::Info,
+            Some(pos),
+        );
     }
 }
 
@@ -1016,17 +1314,23 @@ fn harvest_loop(
                     continue;
                 };
 
-                let mut best: Option<(f32, Vec3)> = None;
+                // Any rung of the hall ladder takes a delivery: upgrading the
+                // TownHall a worker crew depends on must not strand the crew.
+                let mut best: Option<(f32, Vec3, f32)> = None;
                 for (hall_tf, hall_team, building) in &halls {
-                    if hall_team != team || building.kind != BuildingKind::TownHall {
+                    if hall_team != team || !is_hall(building.kind) {
                         continue;
                     }
                     let d = xz_dist(pos, hall_tf.translation);
-                    if best.map_or(true, |(bd, _)| d < bd) {
-                        best = Some((d, flat(hall_tf.translation)));
+                    if best.map_or(true, |(bd, _, _)| d < bd) {
+                        best = Some((
+                            d,
+                            flat(hall_tf.translation),
+                            building_stats(building.kind).size,
+                        ));
                     }
                 }
-                let Some((dist, hall_pos)) = best else {
+                let Some((dist, hall_pos, hall_size)) = best else {
                     // No drop-off point; hold the load and idle.
                     commands
                         .entity(entity)
@@ -1035,7 +1339,6 @@ fn harvest_loop(
                     continue;
                 };
 
-                let hall_size = building_stats(BuildingKind::TownHall).size;
                 if dist <= hall_size * 0.5 + 5.0 {
                     let economy = economies.get_mut(*team);
                     match load.0 {
@@ -1093,6 +1396,12 @@ fn training_queues(
             &mut TrainingQueue,
             Option<&mut PaidFront>,
             Option<&RallyPoint>,
+            // Present while the building is converting to its next tier. NOT
+            // filtered out of the query: a hall that already PAID for a hero
+            // at its queue front still holds the team's one hero slot while it
+            // upgrades, and dropping it from this iteration would let a second
+            // hall pay for a second hero.
+            Option<&Upgrading>,
         ),
         Without<UnderConstruction>,
     >,
@@ -1116,14 +1425,22 @@ fn training_queues(
         .filter(|(_, hp)| hp.current > 0.0)
         .map(|(t, _)| *t)
         .collect();
-    for (_, _, team, _, queue, paid, _) in buildings.iter() {
+    for (_, _, team, _, queue, paid, _, _) in buildings.iter() {
         let front_is_hero = queue.queue.front().is_some_and(|&k| is_hero_kind(k));
         if front_is_hero && paid.is_some_and(|p| p.0) && !hero_committed.contains(team) {
             hero_committed.push(*team);
         }
     }
 
-    for (entity, building, team, tf, mut queue, paid, rally) in &mut buildings {
+    for (entity, building, team, tf, mut queue, paid, rally, upgrading) in &mut buildings {
+        // Training PAUSES for the duration of an in-place upgrade. Nothing is
+        // popped, nothing is refunded and `queue.progress` is left exactly
+        // where it was, so the queue resumes mid-item when the scaffolding
+        // comes down. `continue` before the progress tick is the whole
+        // mechanism.
+        if upgrading.is_some() {
+            continue;
+        }
         let mut paid_front = paid.map(|p| p.0).unwrap_or(false);
 
         let Some(&front) = queue.queue.front() else {

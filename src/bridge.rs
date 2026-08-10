@@ -89,6 +89,19 @@
 //! snapshot reports only `buildings[].template: true` for own buildings that
 //! carry one — the commander wrote the details, it knows them.
 //!
+//! Tech tiers are the `upgrade` command: `{"type":"upgrade","building":<id>}`
+//! converts one of our own finished buildings into the next rung of its ladder
+//! in place (`catalog.buildings[].upgrades_to` says which, at what price, for
+//! how long). It is validated like `build` and `train` — ours, finished, has a
+//! next tier, not already converting, affordable — and paid in full the moment
+//! it is accepted, because no worker has to walk anywhere first. The building
+//! keeps its id, position, footprint, rally, template and training queue; what
+//! it loses is production TIME, since a converting building trains nothing.
+//! The snapshot answers back with `buildings[].tier`, `buildings[].upgrading`
+//! (`{to, remaining}`) and the seat's headline `me.tier`. Requirements are
+//! compared by tier, not by kind, so a Castle satisfies anything that asks for
+//! a Keep.
+//!
 //! The catalog is static, so tech *availability* rides along with every
 //! snapshot instead: a top-level `unlocked` map answers "may I build/train this
 //! right now?" for every catalog entry, computed from the seat's own completed
@@ -143,6 +156,7 @@
 //! array instead of a panic.
 
 use crate::shared::*;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -443,6 +457,10 @@ struct MeOut {
     supply_cap: u32,
     /// Fraction of each gold delivery you actually receive (upkeep tax).
     upkeep_rate: f32,
+    /// Highest hall tier you have STANDING and finished: 1 TownHall, 2 Keep,
+    /// 3 Castle. The one number tier-gated content is written against; the
+    /// per-building `tier` field says where each hall individually sits.
+    tier: u32,
     hero_record: Option<HeroRecordOut>,
     hero_cost: CostOut,
 }
@@ -495,6 +513,58 @@ struct UnitOut {
     /// case is "no doctrine", and an empty object per unit is pure noise.
     #[serde(skip_serializing_if = "Option::is_none")]
     policies: Option<PoliciesOut>,
+    /// Own casters only: every ability this unit HAS, with its slot index, its
+    /// own cooldown and whether it is unlocked yet. This is what a `cast`
+    /// command's optional `ability` field selects from. Absent for units with
+    /// no abilities and for the opponent's army.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    abilities: Vec<AbilityOut>,
+}
+
+/// One ability slot of one caster, as the commander sees it. The catalog says
+/// what an ability DOES; this says whether this caster can use it right now.
+#[derive(Serialize)]
+struct AbilityOut {
+    /// `AbilityDef::name` — accepted as the `ability` field of a `cast`.
+    id: &'static str,
+    /// Slot index — also accepted as the `ability` field of a `cast`.
+    index: usize,
+    /// Seconds until this slot may be cast again (0 = ready).
+    cd: f32,
+    /// Has this caster met the unlock condition?
+    unlocked: bool,
+    /// Unlocked, off cooldown, and affordable (heroes pay mana).
+    ready: bool,
+    mana_cost: f32,
+    /// The unlock condition, verbatim, when it is not yet met.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires: Option<String>,
+}
+
+/// Build the per-caster ability view. One function for heroes and buildings —
+/// the readiness rule is shared.rs's, so the snapshot can never promise a cast
+/// combat.rs would refuse.
+fn abilities_out(
+    list: &'static [AbilityDef],
+    ctx: UnlockCtx,
+    hero: Option<&Hero>,
+    cooldowns: Option<&AbilityCooldowns>,
+) -> Vec<AbilityOut> {
+    list.iter()
+        .enumerate()
+        .map(|(index, def)| {
+            let unlocked = ability_unlocked(def, ctx);
+            AbilityOut {
+                id: def.name,
+                index,
+                cd: r1(cooldowns.map_or(0.0, |c| c.remaining(index))),
+                unlocked,
+                ready: unlocked && ability_ready(def, hero, cooldowns, index),
+                mana_cost: r1(def.mana_cost),
+                requires: (!unlocked).then(|| unlock_label(def.unlock)),
+            }
+        })
+        .collect()
 }
 
 /// Mirror of the doctrine components, in the same shape the `priority` /
@@ -527,6 +597,9 @@ struct HeroOut {
     xp_next: f32,
     mana: f32,
     max_mana: f32,
+    /// Cooldown of the hero's FIRST ability. Kept as a scalar for readers
+    /// written against the one-ability world; `UnitOut::abilities` carries the
+    /// full per-slot picture.
     cd: f32,
 }
 
@@ -541,21 +614,48 @@ struct BuildingOut {
     done: bool,
     queue: Vec<&'static str>,
     progress: f32,
-    /// Own buildings with an active ability only: seconds until it may be cast
-    /// again (0 = ready). Absent for buildings that have no ability.
+    /// Own buildings with an active ability only: seconds until the FIRST one
+    /// may be cast again (0 = ready). Absent for buildings that have no
+    /// ability. `abilities` below is the per-slot version.
     #[serde(skip_serializing_if = "Option::is_none")]
     ability_cd: Option<f32>,
+    /// Own ability buildings only: every slot, with unlock and cooldown state.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    abilities: Vec<AbilityOut>,
     /// Own production buildings only, and only when a `template` command has
     /// installed a `DoctrineTemplate`: a flag, not the contents — the
     /// commander that set the template already knows what is in it.
     #[serde(skip_serializing_if = "is_false")]
     template: bool,
+    /// Rung on this building's upgrade ladder — 1 for everything not on one.
+    /// Not secret: a Keep looks like a Keep to anyone LOOKING at it. Under fog
+    /// that qualifier does the work — an unseen building is not in this array
+    /// at all, and a remembered one reports the tier it wore when last
+    /// observed, which is exactly what a scout brings home.
+    tier: u32,
+    /// Present only while this building is converting to its next tier. The
+    /// `upgrade` command starts one; while it runs the building trains nothing
+    /// (the queue is frozen, not cancelled). Never set on a remembered ghost:
+    /// a conversion is a live thing, and a stale progress bar would be
+    /// invented intelligence rather than preserved intelligence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upgrading: Option<UpgradeOut>,
     /// Present ONLY on remembered enemy structures: the game time at which
     /// this seat last actually saw it. Everything else in the record is the
     /// state observed at that moment and may since have changed — including
-    /// the building having been destroyed. Absent means "observed right now".
+    /// the building having upgraded to a higher tier, or been destroyed.
+    /// Absent means "observed right now".
     #[serde(skip_serializing_if = "Option::is_none")]
     last_seen: Option<f32>,
+}
+
+/// An in-place upgrade in progress, as it appears in a snapshot.
+#[derive(Serialize)]
+struct UpgradeOut {
+    /// Catalog id of what it is becoming.
+    to: &'static str,
+    /// Seconds left on the conversion.
+    remaining: f32,
 }
 
 fn is_false(flag: &bool) -> bool {
@@ -631,8 +731,13 @@ type SnapshotUnits<'w, 's> = Query<
             Option<&'static LeashPolicy>,
             Option<&'static AutoCastPolicy>,
         ),
-        // Hero kit & Call-to-Arms state, nested for the same reason.
-        (Option<&'static Inventory>, Has<Militia>),
+        // Hero kit, Call-to-Arms state and per-ability cooldowns, nested for
+        // the same reason.
+        (
+            Option<&'static Inventory>,
+            Has<Militia>,
+            Option<&'static AbilityCooldowns>,
+        ),
     ),
 >;
 
@@ -648,7 +753,8 @@ type SnapshotBuildings<'w, 's> = Query<
         Option<&'static UnderConstruction>,
         Option<&'static TrainingQueue>,
         Option<&'static DoctrineTemplate>,
-        Option<&'static AbilityCooldown>,
+        Option<&'static AbilityCooldowns>,
+        Option<&'static Upgrading>,
     ),
 >;
 
@@ -667,6 +773,7 @@ fn write_snapshot(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     squad_orders: Res<SquadOrders>,
+    tiers: Res<TechTiers>,
     feed: Res<GameEvents>,
     fog: Res<FogGrids>,
     units: SnapshotUnits,
@@ -691,6 +798,7 @@ fn write_snapshot(
             &records,
             &game_over,
             &squad_orders,
+            &tiers,
             &feed,
             (fog.enabled(), seat_fog),
             &units,
@@ -711,6 +819,7 @@ fn write_seat_snapshot(
     records: &HeroRecords,
     game_over: &GameOver,
     squad_orders: &SquadOrders,
+    tiers: &TechTiers,
     feed: &GameEvents,
     fog: (bool, &FogGrid),
     units: &SnapshotUnits,
@@ -730,7 +839,7 @@ fn write_seat_snapshot(
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(|(e, unit, team, tf, health, order, move_to, carrying, hero, doctrine, kit)| {
             let (squad, prio, retreat, leash, autocast) = doctrine;
-            let (inventory, militia) = kit;
+            let (inventory, militia, cooldowns) = kit;
             let mine = *team == me;
             let has_policy =
                 prio.is_some() || retreat.is_some() || leash.is_some() || autocast.is_some();
@@ -750,7 +859,7 @@ fn write_seat_snapshot(
                     xp_next: r1(Hero::xp_to_next(h.level)),
                     mana: r1(h.mana),
                     max_mana: r1(Hero::max_mana(h.level)),
-                    cd: r1(h.ability_cooldown),
+                    cd: r1(cooldowns.map_or(0.0, |c| c.remaining(0))),
                 }),
                 items: inventory.map(|inv| {
                     inv.0
@@ -766,8 +875,19 @@ fn write_seat_snapshot(
                     retreat: retreat
                         .map(|r| [r1(r.below_frac), r1(r.rally.x), r1(r.rally.z)]),
                     leash: leash.map(|l| [r1(l.anchor.x), r1(l.anchor.z), r1(l.radius)]),
-                    autocast: autocast.map(|a| a.min_enemies),
+                    autocast: autocast.and_then(|a| a.primary()),
                 }),
+                // Our own casters only: abilities we can actually order.
+                abilities: if mine {
+                    abilities_out(
+                        abilities_of_unit(unit.kind),
+                        UnlockCtx::new(hero.map_or(0, |h| h.level), tiers.get(me)),
+                        hero,
+                        cooldowns,
+                    )
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect();
@@ -779,7 +899,8 @@ fn write_seat_snapshot(
     let mut buildings_out: Vec<BuildingOut> = buildings
         .iter()
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
-        .map(|(e, building, team, tf, health, under, queue, template, cooldown)| BuildingOut {
+        .map(
+            |(e, building, team, tf, health, under, queue, template, cooldown, upgrading)| BuildingOut {
             id: e.to_bits(),
             team: team_name(*team),
             kind: building_name(building.kind),
@@ -792,13 +913,29 @@ fn write_seat_snapshot(
                 .unwrap_or_default(),
             progress: r1(queue.map(|q| q.progress).unwrap_or(0.0)),
             // Our own casters only: an ability we can actually order.
-            ability_cd: (*team == me && ability_of_building(building.kind).is_some())
-                .then(|| r1(cooldown.map(|c| c.0).unwrap_or(0.0))),
+            ability_cd: (*team == me && !abilities_of_building(building.kind).is_empty())
+                .then(|| r1(cooldown.map_or(0.0, |c| c.remaining(0)))),
+            abilities: if *team == me {
+                abilities_out(
+                    abilities_of_building(building.kind),
+                    UnlockCtx::building(tiers.get(me)),
+                    None,
+                    cooldown,
+                )
+            } else {
+                Vec::new()
+            },
             // Never for the opponent: a template is command structure.
             template: *team == me && template.is_some(),
+            tier: building_tier(building.kind),
+            upgrading: upgrading.map(|u| UpgradeOut {
+                to: building_name(u.to),
+                remaining: r1(u.remaining),
+            }),
             // Observed this instant.
             last_seen: None,
-        })
+            },
+        )
         .collect();
 
     // Memory. Everything this seat scouted and can no longer see, reported at
@@ -819,7 +956,14 @@ fn write_seat_snapshot(
             queue: Vec::new(),
             progress: 0.0,
             ability_cd: None,
+            abilities: Vec::new(),
             template: false,
+            // The tier it wore when last observed. A hall that has since been
+            // upgraded behind our back still reports the old rung — the memory
+            // is stale in exactly the way the scouting report was.
+            tier: building_tier(ghost.kind),
+            // Never on a ghost: see the field's doc.
+            upgrading: None,
             last_seen: Some(ghost.last_seen),
         });
     }
@@ -828,7 +972,7 @@ fn write_seat_snapshot(
     // Tech state, for this seat only: what its completed buildings unlock.
     let completed: Vec<BuildingKind> = buildings
         .iter()
-        .filter(|(_, _, team, _, _, under, _, _, _)| **team == me && under.is_none())
+        .filter(|(_, _, team, _, _, under, _, _, _, _)| **team == me && under.is_none())
         .map(|(_, building, ..)| building.kind)
         .collect();
     let unlocked = unlocked_map(&completed);
@@ -933,6 +1077,12 @@ fn write_seat_snapshot(
             supply_used: eco.supply_used,
             supply_cap: eco.supply_cap,
             upkeep_rate: upkeep_rate(eco.supply_used),
+            tier: completed
+                .iter()
+                .filter(|k| is_hall(**k))
+                .map(|k| building_tier(*k))
+                .max()
+                .unwrap_or(0),
             hero_record: records.get(me).map(|r| HeroRecordOut {
                 level: r.level,
                 xp: r1(r.xp),
@@ -1004,9 +1154,15 @@ fn write_seat_snapshot(
 fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
     let mut out = BTreeMap::new();
     for kind in ALL_BUILDING_KINDS {
+        // An upgrade-only kind is never "buildable", however much tech you
+        // have: the honest answer to "may I place this right now" is no, and
+        // the route to one is the catalog's `upgrades_to` plus the `upgrade`
+        // command. Reporting `true` here would send a commander to a `build`
+        // that always bounces.
         out.insert(
             building_name(kind),
-            requirements_met(building_requires(kind), completed.iter().copied()),
+            building_placeable(kind)
+                && requirements_met(building_requires(kind), completed.iter().copied()),
         );
     }
     for kind in ALL_UNIT_KINDS {
@@ -1029,9 +1185,11 @@ fn requirement_error(
     if requirements_met(reqs, completed.iter().copied()) {
         return None;
     }
+    // Tier-aware, exactly like `requirements_met`: a Castle covers a "requires
+    // Keep", so it must not be listed as the thing you are missing.
     let missing: Vec<&str> = reqs
         .iter()
-        .filter(|r| !completed.contains(r))
+        .filter(|r| !completed.iter().any(|owned| building_satisfies(*owned, **r)))
         .map(|r| building_name(*r))
         .collect();
     Some(format!("cmd {index}: {what} requires {}", missing.join(" + ")))
@@ -1112,6 +1270,13 @@ enum Cmd {
         building: u64,
         unit: String,
     },
+    /// Convert one of our own finished buildings into its next tier IN PLACE
+    /// (`catalog.buildings[].upgrades_to`). Paid in full the moment it is
+    /// accepted; the building keeps its position, footprint, rally and
+    /// training queue, but trains nothing until the conversion finishes.
+    Upgrade {
+        building: u64,
+    },
     Cancel {
         building: u64,
         index: usize,
@@ -1122,13 +1287,21 @@ enum Cmd {
         z: Option<f32>,
         target: Option<u64>,
     },
-    /// Cast the caster's one ability. The caster is a hero (`ability_of_unit`)
-    /// or one of our own finished buildings (`ability_of_building`, today only
-    /// the TownHall's Call to Arms). `hero` is the historical field name;
-    /// `caster` says what it really means now.
+    /// Cast one of the caster's abilities. The caster is a hero
+    /// (`abilities_of_unit`) or one of our own finished buildings
+    /// (`abilities_of_building`, today only the TownHall's Call to Arms).
+    /// `hero` is the historical field name; `caster` says what it really means.
+    ///
+    /// `ability` picks a slot — either the integer index or the ability id
+    /// (`"Slam"`, case-insensitive) as listed in `units[].abilities` /
+    /// `buildings[].abilities` in the snapshot and in the catalog. OMIT IT for
+    /// the caster's first unlocked ability: `{"cmd":"cast","hero":123}` means
+    /// exactly what it always meant.
     Cast {
         #[serde(alias = "caster")]
         hero: u64,
+        #[serde(default)]
+        ability: Option<AbilityRef>,
     },
     /// Buy a consumable at one of our own finished Shops. The buyer is implied:
     /// a team has at most one living hero, and only heroes carry an inventory.
@@ -1174,11 +1347,15 @@ enum Cmd {
         #[serde(default)]
         radius: Option<f32>,
     },
-    /// Champion-only. `min_enemies` omitted, null, or 0 clears the policy.
+    /// Heroes only. `min_enemies` omitted, null, or 0 clears the rule.
+    /// `ability` names the slot the rule governs (index or id); omitted, it
+    /// means the first slot, which is what it always meant.
     Autocast {
         units: Vec<u64>,
         #[serde(default)]
         min_enemies: Option<u32>,
+        #[serde(default)]
+        ability: Option<AbilityRef>,
     },
     /// Squad membership. `id` omitted or null removes the units from any squad.
     Squad {
@@ -1210,6 +1387,33 @@ enum Cmd {
     },
 }
 
+/// How a command names one of a caster's abilities: `2` (slot index) or
+/// `"Slam"` (id, case-insensitive). Untagged, so the wire form is just the
+/// bare number or string a commander already reads out of the snapshot.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+enum AbilityRef {
+    Index(usize),
+    Id(String),
+}
+
+impl AbilityRef {
+    fn selector(&self) -> AbilitySelector {
+        match self {
+            AbilityRef::Index(i) => AbilitySelector::Index(*i),
+            AbilityRef::Id(id) => AbilitySelector::Id(id.clone()),
+        }
+    }
+    /// Resolve to a slot of `list`, unlocked or not — `autocast` writes rules
+    /// for abilities a hero has not levelled into yet, and that is fine.
+    fn slot(&self, list: &[AbilityDef]) -> Option<usize> {
+        match self {
+            AbilityRef::Index(i) => (*i < list.len()).then_some(*i),
+            AbilityRef::Id(id) => ability_index_by_id(list, id),
+        }
+    }
+}
+
 /// The `retreat` piece of a `template` command: break off below `below` (a
 /// fraction in the open range 0..1) and fall back to x/z.
 #[derive(Deserialize)]
@@ -1232,8 +1436,19 @@ enum PostureIn {
 
 /// Entity first so the seat's own hero can be *found*, not just checked — the
 /// `buy` and `use_item` commands name no unit and infer it from the team.
-type CmdUnits<'w, 's> =
-    Query<'w, 's, (Entity, &'static Unit, &'static Team, &'static Transform)>;
+type CmdUnits<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Unit,
+        &'static Team,
+        &'static Transform,
+        // Read-only: `autocast` edits ONE rule of a policy that may already
+        // hold others, so the applier has to see the current one.
+        Option<&'static AutoCastPolicy>,
+    ),
+>;
 
 type CmdBuildings<'w, 's> = Query<
     'w,
@@ -1243,8 +1458,22 @@ type CmdBuildings<'w, 's> = Query<
         &'static Team,
         Option<&'static UnderConstruction>,
         Option<&'static mut TrainingQueue>,
+        Option<&'static Upgrading>,
     ),
 >;
+
+/// The events a command batch can emit. Bundled for the same reason ui.rs
+/// bundles its own: `poll_commands` is at Bevy's 16-parameter ceiling, and the
+/// next command that needs a writer should not have to reshape the system.
+/// (Fog spent one of those slots on `FogGrids`, which is what put this system
+/// against the ceiling in the first place.)
+#[derive(SystemParam)]
+struct CmdEvents<'w> {
+    casts: EventWriter<'w, CastAbility>,
+    buys: EventWriter<'w, BuyItem>,
+    item_uses: EventWriter<'w, UseItem>,
+    upgrades: EventWriter<'w, UpgradeBuilding>,
+}
 
 /// Anything that can be attacked: a live unit or building with a team. The
 /// `Transform` is carried so an attack order can be checked against the seat's
@@ -1262,16 +1491,6 @@ type CmdTargets<'w, 's> = Query<
 
 type CmdNodes<'w, 's> = Query<'w, 's, &'static ResourceNode>;
 
-/// The three event writers a batch can fire, as one parameter. Purely a
-/// budget device: `poll_commands` needs the fog grid to validate attack
-/// targets, and Bevy allows a system 16 parameters.
-#[derive(bevy::ecs::system::SystemParam)]
-struct CmdEvents<'w> {
-    casts: EventWriter<'w, CastAbility>,
-    buys: EventWriter<'w, BuyItem>,
-    item_uses: EventWriter<'w, UseItem>,
-}
-
 #[allow(clippy::too_many_arguments)]
 fn poll_commands(
     real: Res<Time<Real>>,
@@ -1284,19 +1503,12 @@ fn poll_commands(
     mut squad_orders: ResMut<SquadOrders>,
     fog: Res<FogGrids>,
     mut commands: Commands,
-    events: CmdEvents,
+    mut events: CmdEvents,
     units: CmdUnits,
     mut buildings: CmdBuildings,
     targets: CmdTargets,
     nodes: CmdNodes,
 ) {
-    // Unpack the budget bundle straight back into the three writers, so the
-    // batch applier below reads exactly as it did before.
-    let CmdEvents {
-        mut casts,
-        mut buys,
-        mut item_uses,
-    } = events;
     let delta = real.delta();
     // Every seat is polled independently; one seat's unreadable or malformed
     // file leaves the other's protocol state untouched.
@@ -1352,9 +1564,7 @@ fn poll_commands(
                 fog.get(seat.team),
                 &mut squad_orders,
                 &mut commands,
-                &mut casts,
-                &mut buys,
-                &mut item_uses,
+                &mut events,
                 &units,
                 &mut buildings,
                 &targets,
@@ -1385,9 +1595,7 @@ fn apply_batch(
     fog: &FogGrid,
     squad_orders: &mut SquadOrders,
     commands: &mut Commands,
-    casts: &mut EventWriter<CastAbility>,
-    buys: &mut EventWriter<BuyItem>,
-    item_uses: &mut EventWriter<UseItem>,
+    events: &mut CmdEvents,
     units: &CmdUnits,
     buildings: &mut CmdBuildings,
     targets: &CmdTargets,
@@ -1493,7 +1701,7 @@ fn apply_batch(
             Cmd::Follow { units: ids, target } => {
                 let leader = match entity_of(target) {
                     Some(e) => match units.get(e) {
-                        Ok((_, _, team, _)) if *team == me => e,
+                        Ok((_, _, team, _, _)) if *team == me => e,
                         _ => {
                             errors.push(format!("cmd {i}: unit {target} not found/not yours"));
                             continue;
@@ -1574,6 +1782,45 @@ fn apply_batch(
                     pos,
                 });
             }
+            Cmd::Upgrade { building } => {
+                let Some(entity) = entity_of(building) else {
+                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
+                    continue;
+                };
+                let Ok((b, team, under, _, upgrading)) = buildings.get(entity) else {
+                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
+                    continue;
+                };
+                if *team != me {
+                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
+                    continue;
+                }
+                if under.is_some() {
+                    errors.push(format!("cmd {i}: building {building} is under construction"));
+                    continue;
+                }
+                if upgrading.is_some() {
+                    errors.push(format!("cmd {i}: building {building} is already upgrading"));
+                    continue;
+                }
+                let name = building_name(b.kind);
+                let Some((cost_gold, cost_lumber, _)) = upgrade_cost(b.kind) else {
+                    errors.push(format!("cmd {i}: {name} has no upgrade"));
+                    continue;
+                };
+                if !economies.get(me).can_afford(cost_gold, cost_lumber) {
+                    let to = building_name(
+                        building_upgrades_to(b.kind).expect("a cost implies a next tier"),
+                    );
+                    errors.push(format!(
+                        "cmd {i}: cannot afford {to} ({cost_gold}g {cost_lumber}l)"
+                    ));
+                    continue;
+                }
+                // economy.rs takes the money and starts the conversion — the
+                // same single owner of every payment the UI goes through.
+                events.upgrades.write(UpgradeBuilding { building: entity });
+            }
             Cmd::Train { building, unit } => {
                 let Some(kind) = parse_unit_kind(&unit) else {
                     errors.push(format!("cmd {i}: unknown unit kind '{unit}'"));
@@ -1592,7 +1839,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
-                let Ok((b, team, under, queue)) = buildings.get_mut(entity) else {
+                let Ok((b, team, under, queue, _)) = buildings.get_mut(entity) else {
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
@@ -1619,8 +1866,12 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: training queue full ({MAX_QUEUE})"));
                     continue;
                 }
-                // The Champion is priced by `hero_train_cost` (full, then revival).
-                let (cost_gold, cost_lumber) = if kind == UnitKind::Hero {
+                // Hero classes are priced by `hero_train_cost` (full, then
+                // revival) — every hero kind, not just the Champion: pricing
+                // the Priestess off her raw stats let a seat buy a revival at
+                // full price (or worse, a first hero cheaply) depending on the
+                // record. `is_hero_kind` is the same test economy.rs charges by.
+                let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
                     let (g, l, _) = hero_train_cost(records, me);
                     (g, l)
                 } else {
@@ -1641,7 +1892,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
-                let Ok((_, team, _, queue)) = buildings.get_mut(entity) else {
+                let Ok((_, team, _, queue, _)) = buildings.get_mut(entity) else {
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
@@ -1672,7 +1923,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
-                let Ok((b, team, _, _)) = buildings.get(entity) else {
+                let Ok((b, team, _, _, _)) = buildings.get(entity) else {
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
@@ -1697,7 +1948,7 @@ fn apply_batch(
                         // own units makes new units follow it.
                         Some(e) if nodes.get(e).is_ok() => Some(RallyTarget::Node(e)),
                         Some(e) => match units.get(e) {
-                            Ok((_, _, team, _)) if *team == me => Some(RallyTarget::Unit(e)),
+                            Ok((_, _, team, _, _)) if *team == me => Some(RallyTarget::Unit(e)),
                             _ => None,
                         },
                         None => None,
@@ -1713,36 +1964,40 @@ fn apply_batch(
                     )),
                 }
             }
-            Cmd::Cast { hero } => {
+            Cmd::Cast { hero, ability } => {
                 let Some(entity) = entity_of(hero) else {
                     errors.push(format!("cmd {i}: caster {hero} not found/not yours"));
                     continue;
                 };
                 // A caster is either one of our heroes (any class — the Hero
-                // component and `ability_of_unit` agree on which kinds have an
-                // ability) or one of our finished buildings with an ability.
-                // combat.rs owns the mana/cooldown verdict either way, exactly
-                // as it does for the R and C hotkeys.
-                let unit_caster = matches!(
-                    units.get(entity),
-                    Ok((_, u, team, _)) if *team == me && ability_of_unit(u.kind).is_some()
-                );
-                if !unit_caster {
+                // component and the unit ability table agree on which kinds
+                // have one) or one of our finished buildings with an ability.
+                // combat.rs owns the unlock/mana/cooldown verdict either way,
+                // exactly as it does for the R and C hotkeys.
+                let unit_list = match units.get(entity) {
+                    Ok((_, u, team, _, _)) if *team == me => abilities_of_unit(u.kind),
+                    _ => &[][..],
+                };
+                let list = if !unit_list.is_empty() {
+                    unit_list
+                } else {
                     match buildings.get(entity) {
-                        Ok((b, team, under, _)) if *team == me => {
+                        Ok((b, team, under, _, _)) if *team == me => {
                             if under.is_some() {
                                 errors.push(format!(
                                     "cmd {i}: building {hero} is under construction"
                                 ));
                                 continue;
                             }
-                            if ability_of_building(b.kind).is_none() {
+                            let list = abilities_of_building(b.kind);
+                            if list.is_empty() {
                                 errors.push(format!(
                                     "cmd {i}: {} has no ability",
                                     building_name(b.kind)
                                 ));
                                 continue;
                             }
+                            list
                         }
                         _ => {
                             errors.push(format!(
@@ -1751,8 +2006,27 @@ fn apply_batch(
                             continue;
                         }
                     }
-                }
-                casts.write(CastAbility { caster: entity });
+                };
+                // A named slot is checked for EXISTENCE here so a typo is an
+                // error instead of a silent no-op; whether it is unlocked and
+                // off cooldown stays combat.rs's call.
+                let selector = match &ability {
+                    None => None,
+                    Some(reference) => {
+                        if reference.slot(list).is_none() {
+                            errors.push(format!(
+                                "cmd {i}: caster {hero} has no ability {reference:?} (has {})",
+                                list.iter()
+                                    .map(|d| d.name)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                            continue;
+                        }
+                        Some(reference.selector())
+                    }
+                };
+                events.casts.write(CastAbility { caster: entity, ability: selector });
             }
             Cmd::Buy { shop, item } => {
                 let Some(item) = parse_item(&item) else {
@@ -1763,7 +2037,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {shop} not found/not yours"));
                     continue;
                 };
-                let Ok((b, team, under, _)) = buildings.get(entity) else {
+                let Ok((b, team, under, _, _)) = buildings.get(entity) else {
                     errors.push(format!("cmd {i}: building {shop} not found/not yours"));
                     continue;
                 };
@@ -1789,7 +2063,7 @@ fn apply_batch(
                 };
                 // economy.rs re-validates and pays (gold, free slot, distance-
                 // free just like the UI's Shop card).
-                buys.write(BuyItem {
+                events.buys.write(BuyItem {
                     shop: entity,
                     hero,
                     item,
@@ -1808,7 +2082,7 @@ fn apply_batch(
                     continue;
                 };
                 // combat.rs checks the slot is actually filled.
-                item_uses.write(UseItem { hero, slot });
+                events.item_uses.write(UseItem { hero, slot });
             }
             Cmd::Autopilot { on } => {
                 // Only ever this seat's own faction.
@@ -1912,22 +2186,48 @@ fn apply_batch(
             Cmd::Autocast {
                 units: ids,
                 min_enemies,
+                ability,
             } => {
                 let min_enemies = min_enemies.unwrap_or(0);
                 for (entity, _) in own_units(&ids, units, me, i, errors) {
                     // Any hero class can auto-cast; nothing else has an ability.
-                    if !matches!(units.get(entity), Ok((_, u, _, _)) if is_hero_kind(u.kind)) {
+                    let Ok((_, unit, _, _, policy)) = units.get(entity) else {
+                        continue;
+                    };
+                    if !is_hero_kind(unit.kind) {
                         errors.push(format!(
                             "cmd {i}: unit {} is not a hero",
                             entity.to_bits()
                         ));
                         continue;
                     }
-                    let mut ec = commands.entity(entity);
+                    let list = abilities_of_unit(unit.kind);
+                    let slot = match &ability {
+                        None => 0,
+                        Some(reference) => match reference.slot(list) {
+                            Some(slot) => slot,
+                            None => {
+                                errors.push(format!(
+                                    "cmd {i}: unit {} has no ability {reference:?}",
+                                    entity.to_bits()
+                                ));
+                                continue;
+                            }
+                        },
+                    };
+                    // Edit ONE rule and keep the rest: a hero told to auto-heal
+                    // does not thereby stop auto-slamming.
+                    let mut next = policy.cloned().unwrap_or_default();
                     if min_enemies == 0 {
+                        next.clear_ability(slot);
+                    } else {
+                        next.set(slot, min_enemies);
+                    }
+                    let mut ec = commands.entity(entity);
+                    if next.is_empty() {
                         ec.try_remove::<AutoCastPolicy>();
                     } else {
-                        ec.try_insert(AutoCastPolicy { min_enemies });
+                        ec.try_insert(next);
                     }
                 }
             }
@@ -1996,7 +2296,7 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
-                let Ok((b, team, under, queue)) = buildings.get(entity) else {
+                let Ok((b, team, under, queue, _)) = buildings.get(entity) else {
                     errors.push(format!("cmd {i}: building {building} not found/not yours"));
                     continue;
                 };
@@ -2082,7 +2382,7 @@ fn entity_of(id: u64) -> Option<Entity> {
 fn own_unit(id: u64, units: &CmdUnits, me: Team) -> Option<(Entity, Vec3)> {
     let entity = entity_of(id)?;
     match units.get(entity) {
-        Ok((_, _, team, tf)) if *team == me => Some((entity, tf.translation)),
+        Ok((_, _, team, tf, _)) if *team == me => Some((entity, tf.translation)),
         _ => None,
     }
 }
@@ -2092,7 +2392,7 @@ fn own_unit(id: u64, units: &CmdUnits, me: Team) -> Option<(Entity, Vec3)> {
 fn own_hero(units: &CmdUnits, me: Team) -> Option<Entity> {
     units
         .iter()
-        .find(|(_, u, team, _)| **team == me && is_hero_kind(u.kind))
+        .find(|(_, u, team, _, _)| **team == me && is_hero_kind(u.kind))
         .map(|(entity, ..)| entity)
 }
 
@@ -2124,13 +2424,13 @@ fn own_units(
 fn completed_kinds(buildings: &CmdBuildings, me: Team) -> Vec<BuildingKind> {
     buildings
         .iter()
-        .filter(|(_, team, under, _)| **team == me && under.is_none())
+        .filter(|(_, team, under, _, _)| **team == me && under.is_none())
         .map(|(building, ..)| building.kind)
         .collect()
 }
 
 fn is_worker(units: &CmdUnits, entity: Entity) -> bool {
-    matches!(units.get(entity), Ok((_, u, _, _)) if u.kind == UnitKind::Worker)
+    matches!(units.get(entity), Ok((_, u, _, _, _)) if u.kind == UnitKind::Worker)
 }
 
 /// Move / AttackMove for a group, spread over the UI's formation grid.
@@ -2291,4 +2591,42 @@ fn parse_item(name: &str) -> Option<ItemId> {
     ALL_ITEMS
         .into_iter()
         .find(|id| normalize_name(item_def(*id).name) == wanted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seat-facing surface is a projection of the catalog, not a list
+    /// maintained alongside it: a kind added to `ALL_UNIT_KINDS` and
+    /// `trainable()` becomes orderable over the bridge with no bridge change
+    /// at all. This is the property that lets both kinds of player — the one
+    /// reading a command card and the one reading `state.json` — discover new
+    /// content the same way, so it is worth a test rather than a comment.
+    #[test]
+    fn every_unit_kind_is_orderable_by_name() {
+        for kind in ALL_UNIT_KINDS {
+            assert_eq!(
+                parse_unit_kind(kind_name(kind)),
+                Some(kind),
+                "{} is in the catalog but not orderable",
+                kind_name(kind)
+            );
+        }
+        // Seats type what they like; names are normalized, not matched raw.
+        assert_eq!(parse_unit_kind("spearman"), Some(UnitKind::Spearman));
+        assert_eq!(parse_unit_kind("Spear Man"), Some(UnitKind::Spearman));
+        assert_eq!(parse_unit_kind("pikeman"), None);
+    }
+
+    /// ...and the Barracks really does offer it, so the order has somewhere
+    /// to land.
+    #[test]
+    fn barracks_trains_the_spearman() {
+        assert!(trainable(BuildingKind::Barracks).contains(&UnitKind::Spearman));
+        assert!(
+            unit_requires(UnitKind::Spearman).is_empty(),
+            "the tier-1 answer to cavalry must not itself be tech-gated"
+        );
+    }
 }

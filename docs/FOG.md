@@ -76,6 +76,7 @@ can find are different questions, and the gap between them is where scouting liv
 | Worker | 12 | 1.8 | not a scout |
 | Footman | 16 | 2.0 | the baseline |
 | Archer | 18 | 14 | sees a little past its own reach |
+| Spearman | 18 | 2.6 | a picket must see the riders coming — but still short of the Raider's 24, so cavalry keeps the initiative |
 | Catapult | 14 | 20 | **sees less than it shoots** — siege needs spotters |
 | Raider | 24 | 2.2 | **the scout**: sees far, can barely hit anything |
 | Hero (Champion) | 20 | 2.4 | leaders see |
@@ -83,6 +84,8 @@ can find are different questions, and the gap between them is where scouting liv
 
 | Building | Vision | Note |
 |---|---:|---|
+| **Castle** | **34** | top of the ladder: the hall alone watches the approach a Tower would |
+| **Keep** | **30** | |
 | TownHall | 26 | a base is a team's permanent eyes |
 | Tower | 20 | exceeds its 16 attack range — never shoots at what the team cannot see |
 | Barracks | 18 | |
@@ -90,6 +93,20 @@ can find are different questions, and the gap between them is where scouting liv
 | Shop | 14 | |
 | Farm | 12 | |
 | Wall | 8 | |
+
+Vision climbs the **TownHall → Keep → Castle** ladder for the same reason HP does: what an
+upgrade buys is a taller fortification, so each rung watches a little further over its own
+ground. It is a real if modest reward, and it is asserted monotonic by
+`upgrade_only_kinds_are_never_placeable_and_never_shrink_the_building` alongside the
+existing hp/size/supply invariants — a tier-up must never *narrow* what a hall sees, or
+teching up would blind you in your own base and the fog would punish the reward.
+
+Nothing in the fog code special-cases `BuildingKind::TownHall`; radius comes from the
+per-kind table, so `is_hall` never needed to appear here and a fourth rung would work with
+no edit. `Building.kind` mutates in place when a hall tiers up, and vision is read from the
+live kind every tick rather than cached at spawn, so the new radius applies the moment the
+conversion lands. Buildings mid-`Upgrading` are seen, hidden and remembered like any
+other: they keep `Building`/`Team`/`Transform`, and only their `scale.y` is animated.
 
 Buildings provide vision **while under construction** too: a builder standing on a
 foundation is looking around.
@@ -109,6 +126,14 @@ A ghost is forgotten **only when the team can see that the thing is gone**. Walk
 the rubble and the memory clears; stay away and you go on believing the barracks is still
 standing. That is precisely the mistake fog of war exists to let you make — a ghost can be
 stale, and it is the correct amount of wrong.
+
+A ghost is **honestly stale about tier, too**. A scouted TownHall that upgrades to a Keep
+with nobody watching keeps reporting *TownHall* — the rung the scout actually saw, not the
+one it has no way to know about — and `buildings[].tier` on that record is derived from the
+remembered kind. Every rung shares an 8.0 footprint, so a ghost drawn from the stale kind
+is still the right size on screen. `upgrading` is never set on a ghost: a conversion is a
+live thing, and a stale progress bar would be invented intelligence rather than preserved
+intelligence. Covered by `a_hall_that_tiers_up_behind_the_fog_keeps_its_stale_ghost`.
 
 `FogGrid::ghosts()` yields only records whose cell is **not currently visible**. The
 backing map holds everything ever seen, including things visible right now; without that
