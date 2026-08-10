@@ -521,6 +521,14 @@ fn spawn_units(
             entity.insert((hero, Inventory::default()));
         }
 
+        // A body an `EffectAtom::Summon` called up: identical to a trained one
+        // in every way except that it knows when to leave (shared.rs expires
+        // it). Stamped here because this is where units are made, so a summon
+        // can never diverge from a trained unit by accident.
+        if let Some(summoned) = ev.summoned {
+            entity.insert(summoned);
+        }
+
         // Set when a `DoctrineTemplate` had an explicit opinion about
         // auto-cast, so the per-kind default below does not overrule it.
         let mut stamped_autocast = false;

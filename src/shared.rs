@@ -1201,6 +1201,92 @@ pub struct CatalogBuilding {
     pub description: &'static str,
 }
 
+/// One atom of an ability, as a commander reads it. Every field beyond `atom`
+/// and `schedule` is optional because the atoms genuinely differ: a summon has
+/// a `count` and no `magnitude`, a hex has a `magnitude` and no `count`, and
+/// padding both with nulls would only invite a commander to average them.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogEffect {
+    /// `"damage" | "heal" | "status" | "militia" | "summon" | "teleport"`.
+    pub atom: &'static str,
+    /// `"instant" | "over_time"`. (`on_hit`/`on_death` are schema only — the
+    /// loader refuses them, so they never reach the wire.)
+    pub schedule: &'static str,
+    /// Whose bodies in the radius this atom looks for: `"enemies"`,
+    /// `"allies"`, `"own_workers"`. Absent for atoms that fire at the centre.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub targets: Option<&'static str>,
+    /// HP dealt or restored, per application.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magnitude: Option<f32>,
+    /// Seconds the status (or the militia service) lasts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// Seconds a summon survives; absent means permanent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<&'static str>,
+    /// `over_time` only: seconds between applications, and how many there are
+    /// (the FIRST lands at the cast).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticks: Option<u32>,
+}
+
+impl CatalogEffect {
+    pub fn of(effect: &Effect) -> CatalogEffect {
+        let (interval, ticks) = match effect.schedule {
+            EffectSchedule::OverTime { interval, ticks } => (Some(interval), Some(ticks)),
+            _ => (None, None),
+        };
+        let mut out = CatalogEffect {
+            atom: effect.atom.name(),
+            schedule: effect.schedule.name(),
+            targets: effect.atom.targets().map(|t| t.name()),
+            amount: None,
+            status: None,
+            magnitude: None,
+            duration: None,
+            unit_kind: None,
+            count: None,
+            lifetime: None,
+            destination: None,
+            interval,
+            ticks,
+        };
+        match effect.atom {
+            EffectAtom::Damage { amount, .. } | EffectAtom::Heal { amount, .. } => {
+                out.amount = Some(amount);
+            }
+            EffectAtom::ApplyStatus { status, magnitude, duration, .. } => {
+                out.status = Some(status.name());
+                out.magnitude = Some(magnitude);
+                out.duration = Some(duration);
+            }
+            EffectAtom::Militia { duration, .. } => out.duration = Some(duration),
+            EffectAtom::Summon { unit_kind, count, lifetime } => {
+                out.unit_kind = Some(kind_name(unit_kind));
+                out.count = Some(count);
+                out.lifetime = lifetime;
+            }
+            EffectAtom::Teleport { destination, .. } => {
+                out.destination = Some(destination.name());
+            }
+        }
+        out
+    }
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct CatalogAbility {
     pub id: &'static str,
@@ -1208,7 +1294,16 @@ pub struct CatalogAbility {
     /// Slot in the caster's ability list — what a `cast` command's `ability`
     /// field accepts as an integer, and the order the hotkeys follow.
     pub index: usize,
+    /// **The v2 headline**: the wire name of the FIRST atom. Kept so a
+    /// commander written before v3 still reads. `effects` below is the whole
+    /// sentence, and it is what a commander should read now.
     pub effect: &'static str,
+    /// **The composition** — every atom this ability applies, in the order it
+    /// applies them, with its own numbers, its own targets and its own
+    /// schedule. An ability is a sentence: the demo row in abilities.ron is
+    /// `[damage 60 enemies, status slow 0.35 for 4s enemies]`, and nothing in
+    /// the engine knows its name.
+    pub effects: Vec<CatalogEffect>,
     /// Status kind applied, for `effect == "status"`.
     pub status: Option<&'static str>,
     /// A second status the same cast lays down, with its own magnitude —
@@ -1431,16 +1526,17 @@ pub fn game_catalog() -> Catalog {
                 id: a.name,
                 caster,
                 index,
-                effect: a.effect.name(),
-                status: a.effect.status().map(|s| s.name()),
-                status2: a.effect.extra_status().map(|(k, m)| (k.name(), m)),
+                effect: a.effect_name(),
+                effects: a.effects.iter().map(CatalogEffect::of).collect(),
+                status: a.status().map(|s| s.name()),
+                status2: a.extra_status().map(|(k, m)| (k.name(), m)),
                 target: a.target.name(),
                 target_range: a.target.range(),
                 mana_cost: a.mana_cost,
                 cooldown: a.cooldown,
                 radius: a.radius,
-                power: a.power,
-                duration: a.duration,
+                power: a.power(),
+                duration: a.duration(),
                 hits_air: a.hits_air,
                 unlock: unlock_label(a.unlock),
                 unlock_hero_level: match a.unlock {
@@ -2087,7 +2183,7 @@ pub fn hero_ability_radius() -> f32 {
 }
 #[allow(dead_code)]
 pub fn hero_ability_damage() -> f32 {
-    hero_slam().power
+    hero_slam().power()
 }
 /// Reviving a fallen hero (level preserved) is cheaper and faster than the
 /// first training. See `hero_train_cost`.
@@ -2169,6 +2265,17 @@ pub enum AbilityTargets {
     /// Own units (buildings are never "allies" for buff purposes).
     Allies,
     OwnWorkers,
+}
+
+impl AbilityTargets {
+    /// Wire name for the catalog's per-atom export.
+    pub fn name(self) -> &'static str {
+        match self {
+            AbilityTargets::Enemies => "enemies",
+            AbilityTargets::Allies => "allies",
+            AbilityTargets::OwnWorkers => "own_workers",
+        }
+    }
 }
 
 /// **Where an ability's effect lands** — the geometry half of an `AbilityDef`,
@@ -2331,67 +2438,268 @@ pub fn best_cast_focus(
     best.map(|(i, focus, caught, _)| (i, focus, caught))
 }
 
-// `Eq` is out: `ApplyStatus::also` carries a magnitude, and a magnitude is an
-// f32. Nothing compares ability effects for hashing or set membership.
+// ---------------------------------------------------------------------------
+// v3: COMPOSABLE EFFECTS — an ability is a sentence, not a variant
+// ---------------------------------------------------------------------------
+//
+// v2's `AbilityEffect` was a closed enum: `Damage | Heal | Militia |
+// ApplyStatus{also}`. Every genuinely new mechanic needed a new variant, a new
+// arm in combat.rs, a new arm in doctrine.rs and a new arm in the catalog — and
+// the seams of that were already visible in `ApplyStatus::also`, which existed
+// for exactly one ability (Sanctuary) because "two statuses on one button" had
+// nowhere else to live.
+//
+// v3 splits the question in three, each answered independently by data:
+//
+//   * WHAT      — an `EffectAtom`: the smallest thing a cast can do to the
+//                 world. An ability carries a LIST of them, applied in order
+//                 from one resolved centre. `also` retires into a second atom.
+//   * WHEN      — an `EffectSchedule` per atom: now, or spread over time.
+//   * WHO/WHERE — `AbilityTarget` (the centre, v3-b1x) and each atom's own
+//                 `AbilityTargets` (whose bodies inside the radius it looks
+//                 for). One cast can damage enemies AND heal allies.
+//
+// The promise this makes to content: a mechanic that is a combination of
+// things the engine already does is a ROW, not a patch. The demo ability at
+// the bottom of abilities.ron is the proof — a damage-and-slow nuke that no
+// line of Rust knows the name of.
+
+/// **Where a `Teleport` atom sends its passengers.** One variant today, named
+/// rather than numeric so the next destination (a beacon, the caster's own
+/// starting position) is a row rather than a schema change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
+pub enum TeleportDestination {
+    /// The nearest rung of the caster's own hall ladder — the same search the
+    /// Town Portal and the Scroll of Mass Teleport already make.
+    NearestHall,
+}
+
+impl TeleportDestination {
+    pub fn name(self) -> &'static str {
+        match self {
+            TeleportDestination::NearestHall => "nearest_hall",
+        }
+    }
+}
+
+fn targets_enemies() -> AbilityTargets {
+    AbilityTargets::Enemies
+}
+fn targets_allies() -> AbilityTargets {
+    AbilityTargets::Allies
+}
+fn targets_own_workers() -> AbilityTargets {
+    AbilityTargets::OwnWorkers
+}
+
+/// **One indivisible thing a cast does.** The vocabulary content writes in.
+///
+/// Every atom carries its OWN numbers — there is no shared `power` field an
+/// atom has to reinterpret, which is what made the v2 row read "power: 40" and
+/// mean "40 seconds" for one ability and "40 damage" for the next.
+///
+/// Two shapes live here, and the difference is structural rather than
+/// stylistic: most atoms are PER-BODY (they ask `effect_hits` about everyone
+/// inside the radius), while `Summon` and `Teleport` happen ONCE at the centre.
+/// `per_target()` is the seam.
+//
+// `Eq` is out: magnitudes are f32. Nothing compares atoms for hashing or set
+// membership.
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize)]
-pub enum AbilityEffect {
-    /// AoE damage around the caster (scaled by hero level).
-    Damage,
-    /// AoE ally healing around the caster (scaled by hero level).
-    Heal,
-    /// Own workers in radius become Militia for `power` seconds.
-    Militia,
-    /// AoE timed status effect: `power` is the magnitude, `duration` the
-    /// seconds. This is the variant that makes the whole status framework
-    /// reachable from pure data — Sorcerer's Slow, Boots of Speed, Warcry and
-    /// Sanctuary are all table rows, not code.
+#[serde(deny_unknown_fields)]
+pub enum EffectAtom {
+    /// Hurt everyone the `targets` predicate catches. The one atom that counts
+    /// BUILDINGS as victims — a shockwave cracks a wall, a heal does not mend
+    /// one and a hex does not confuse one.
+    ///
+    /// Scales with the caster's hero level (`Hero::damage_mult`), as v2's
+    /// `Damage` always did.
+    Damage {
+        amount: f32,
+        #[serde(default = "targets_enemies")]
+        targets: AbilityTargets,
+    },
+    /// Restore HP. Scales with hero level, exactly as v2's `Heal` did.
+    Heal {
+        amount: f32,
+        #[serde(default = "targets_allies")]
+        targets: AbilityTargets,
+    },
+    /// Lay a timed status through the status framework's one public door,
+    /// `StatusEffects::apply` — so stacking policy, caps and central expiry are
+    /// the same as every other producer's.
+    ///
+    /// Magnitude is NOT hero-scaled: a 40% slow is 40% from a level 1 caster
+    /// and from a level 10 one. That was v2's behaviour and it is deliberate —
+    /// crowd control that sharpens with level is how a hero stops being a unit
+    /// and starts being a win condition.
     ApplyStatus {
         status: StatusKind,
+        magnitude: f32,
+        duration: f32,
         targets: AbilityTargets,
-        /// A SECOND status laid down by the same cast, with its own magnitude.
-        /// Everything else — radius, targets, duration — is shared with the
-        /// primary status, because it is one cast.
-        ///
-        /// This is the framework's only concession to the Priestess ultimate:
-        /// Sanctuary both heals over time AND hardens, and "two abilities on
-        /// one button" or "an ability that casts another ability" would both
-        /// have cost more than one optional pair. `None` for every other row.
-        also: Option<(StatusKind, f32)>,
+    },
+    /// Own workers pick up arms for `duration` seconds.
+    ///
+    /// **Why this is its own atom and not `Summon`** (the v3 bead asked): a
+    /// summon CREATES a body, militia TRANSFORMS one. The worker keeps its
+    /// entity, its gold, its harvest order and its identity, and goes back to
+    /// mining when the timer runs out. Expressing it as `Summon` would mean
+    /// killing five workers and spawning five fighters — different food, a
+    /// different economy, five deaths on the ledger and five workers who never
+    /// come back. The mechanic is a modifier on an existing body, so it stays
+    /// an atom of its own.
+    Militia {
+        duration: f32,
+        #[serde(default = "targets_own_workers")]
+        targets: AbilityTargets,
+    },
+    /// Put `count` new units of `unit_kind` on the caster's team at the cast
+    /// centre. `lifetime` is seconds before they vanish — `None` is permanent.
+    ///
+    /// A summon is not TRAINED: it costs no gold, occupies no production queue
+    /// and answers to the same orders any other unit does while it lives.
+    Summon {
+        unit_kind: UnitKind,
+        count: u32,
+        #[serde(default)]
+        lifetime: Option<f32>,
+    },
+    /// Recall the caster and its neighbours, through the same
+    /// `TeleportRequest` the Town Portal has always used.
+    ///
+    /// The request gathers around the CASTER (that is what a recall is), so the
+    /// validator refuses this atom on a thrown row — see `check_values`.
+    Teleport {
+        destination: TeleportDestination,
+        /// Leave workers where they stand, as the Scroll of Mass Teleport does.
+        #[serde(default)]
+        army_only: bool,
     },
 }
 
-impl AbilityEffect {
-    /// Wire name used by the catalog and the bridge snapshot.
+impl EffectAtom {
+    /// Wire name for the catalog. The v2 names are kept verbatim (`"status"`
+    /// for `ApplyStatus`) so a commander's parser does not have to learn two
+    /// spellings of the same word.
     pub fn name(self) -> &'static str {
         match self {
-            AbilityEffect::Damage => "damage",
-            AbilityEffect::Heal => "heal",
-            AbilityEffect::Militia => "militia",
-            AbilityEffect::ApplyStatus { .. } => "status",
+            EffectAtom::Damage { .. } => "damage",
+            EffectAtom::Heal { .. } => "heal",
+            EffectAtom::ApplyStatus { .. } => "status",
+            EffectAtom::Militia { .. } => "militia",
+            EffectAtom::Summon { .. } => "summon",
+            EffectAtom::Teleport { .. } => "teleport",
         }
     }
-    /// The status kind this effect applies, when it applies one.
-    pub fn status(self) -> Option<StatusKind> {
+    /// Whose bodies inside the radius this atom looks for — `None` for the
+    /// atoms that happen once at the centre rather than to a crowd.
+    pub fn targets(self) -> Option<AbilityTargets> {
         match self {
-            AbilityEffect::ApplyStatus { status, .. } => Some(status),
+            EffectAtom::Damage { targets, .. }
+            | EffectAtom::Heal { targets, .. }
+            | EffectAtom::ApplyStatus { targets, .. }
+            | EffectAtom::Militia { targets, .. } => Some(targets),
+            EffectAtom::Summon { .. } | EffectAtom::Teleport { .. } => None,
+        }
+    }
+    /// Does this atom visit every body in the radius (rather than firing once
+    /// at the centre)?
+    pub fn per_target(self) -> bool {
+        self.targets().is_some()
+    }
+    /// The status this atom lays down, if it lays one: `(kind, magnitude,
+    /// duration)`.
+    pub fn status(self) -> Option<(StatusKind, f32, f32)> {
+        match self {
+            EffectAtom::ApplyStatus { status, magnitude, duration, .. } => {
+                Some((status, magnitude, duration))
+            }
             _ => None,
         }
     }
-    /// The optional second status and its magnitude — see `ApplyStatus::also`.
-    pub fn extra_status(self) -> Option<(StatusKind, f32)> {
-        match self {
-            AbilityEffect::ApplyStatus { also, .. } => also,
-            _ => None,
-        }
-    }
-    /// Does this effect restore HP (instantly or over time)? Auto-cast asks,
-    /// so that a healing ability waits for someone who is actually hurt
-    /// instead of firing at a column of full-health allies.
+    /// Does this atom restore HP (instantly or over time)? Auto-cast asks, so
+    /// that a healing ability waits for someone who is actually hurt instead of
+    /// firing at a column of full-health allies.
     pub fn heals(self) -> bool {
-        matches!(self, AbilityEffect::Heal)
-            || self.status() == Some(StatusKind::HealOverTime)
-            || self.extra_status().map(|(k, _)| k) == Some(StatusKind::HealOverTime)
+        matches!(self, EffectAtom::Heal { .. })
+            || self.status().map(|(k, _, _)| k) == Some(StatusKind::HealOverTime)
     }
+    /// Does a hero's level multiply this atom's headline number? Damage and
+    /// healing grow with the hero; durations, magnitudes and body counts do
+    /// not.
+    pub fn scales_with_level(self) -> bool {
+        matches!(self, EffectAtom::Damage { .. } | EffectAtom::Heal { .. })
+    }
+    /// The one number a UI or an AI would print for this atom — damage, HP,
+    /// status magnitude, militia seconds, summon count. `duration()` is the
+    /// other half; between them they reproduce v2's `power`/`duration` pair.
+    pub fn power(self) -> f32 {
+        match self {
+            EffectAtom::Damage { amount, .. } | EffectAtom::Heal { amount, .. } => amount,
+            EffectAtom::ApplyStatus { magnitude, .. } => magnitude,
+            EffectAtom::Militia { duration, .. } => duration,
+            EffectAtom::Summon { count, .. } => count as f32,
+            EffectAtom::Teleport { .. } => 0.0,
+        }
+    }
+}
+
+/// **When an atom happens.** The timing half of the grammar.
+///
+/// `Instant` and `OverTime` are implemented end to end. `OnHit` and `OnDeath`
+/// are the schema, and the validator refuses them with "not yet supported":
+/// both need a hook the damage pipeline does not have (a per-unit charge store
+/// consulted by every attacker, and a death callback that survives the
+/// despawn), and inventing one on the way past would have been a second combat
+/// system smuggled in under a data change. They are written down here so the
+/// bead that builds those hooks is a wiring job with a name already agreed.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum EffectSchedule {
+    /// Everything at the moment of the cast. What every v2 ability meant.
+    #[default]
+    Instant,
+    /// `ticks` applications, `interval` seconds apart. **The first tick lands
+    /// at the cast**, so `ticks: 3, interval: 1.0` is "now, +1s, +2s" — a
+    /// 1-tick `OverTime` is exactly an `Instant`.
+    ///
+    /// The field is re-evaluated at the recorded CENTRE on every tick rather
+    /// than snapshotted at the cast: a lingering blizzard is a place, so
+    /// walking out of it works and walking into it is a mistake.
+    OverTime { interval: f32, ticks: u32 },
+    /// The caster's next `attacks` attacks carry this atom. NOT IMPLEMENTED.
+    OnHit { attacks: u32 },
+    /// Fires when the affected body dies. NOT IMPLEMENTED.
+    OnDeath,
+}
+
+impl EffectSchedule {
+    pub fn name(self) -> &'static str {
+        match self {
+            EffectSchedule::Instant => "instant",
+            EffectSchedule::OverTime { .. } => "over_time",
+            EffectSchedule::OnHit { .. } => "on_hit",
+            EffectSchedule::OnDeath => "on_death",
+        }
+    }
+    /// Is this schedule wired to anything yet? The validator's gate, kept here
+    /// so the answer lives beside the variants rather than in data.rs.
+    pub fn supported(self) -> bool {
+        matches!(self, EffectSchedule::Instant | EffectSchedule::OverTime { .. })
+    }
+}
+
+/// One clause of an ability: an atom and its schedule.
+///
+/// `schedule` is defaulted, so a row that means "now" — which is nearly every
+/// row — says nothing at all and reads as `(atom: Damage(amount: 45.0))`.
+#[derive(Clone, Copy, PartialEq, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Effect {
+    pub atom: EffectAtom,
+    #[serde(default)]
+    pub schedule: EffectSchedule,
 }
 
 /// When an ability becomes castable.
@@ -2412,7 +2720,16 @@ pub enum AbilityUnlock {
 pub struct AbilityDef {
     /// Stable id: the catalog key, the bridge selector, the button caption.
     pub name: &'static str,
-    pub effect: AbilityEffect,
+    /// **What this ability does, in order.** One atom is the common case; two
+    /// is Sanctuary (heal-over-time plus armour), and so is the demo nuke in
+    /// abilities.ron (damage plus slow). The list is never empty — the loader refuses that.
+    ///
+    /// Order matters in exactly one place beyond execution order: the FIRST
+    /// atom is the ability's AIM. `cast_center`'s auto-pick and doctrine's
+    /// trigger count both ask atom 0 who it is looking for, because a spell
+    /// has one centre and something has to decide it. Put the atom the ability
+    /// is *about* first — for a nuke that also slows, that is the damage.
+    pub effects: &'static [Effect],
     /// **Where the radius is centred.** `AbilityTarget::Caster` is the default
     /// in every sense that matters — it is what every row said implicitly
     /// before this field existed, and what a row means when its author has no
@@ -2424,11 +2741,6 @@ pub struct AbilityDef {
     /// How far the effect spreads from its centre — which is the caster for a
     /// `Caster` row and the chosen point/unit for a targeted one.
     pub radius: f32,
-    /// Damage / heal amount, duration seconds for Militia, or the status
-    /// MAGNITUDE for `ApplyStatus`.
-    pub power: f32,
-    /// Seconds a status effect lasts. `ApplyStatus` only; 0.0 elsewhere.
-    pub duration: f32,
     /// Does the effect reach AIRBORNE units in its radius? A shockwave that
     /// travels along the ground does not; healing light does. combat.rs
     /// filters by this, and doctrine.rs will not auto-cast at targets the
@@ -2436,6 +2748,71 @@ pub struct AbilityDef {
     pub hits_air: bool,
     pub unlock: AbilityUnlock,
     pub description: &'static str,
+}
+
+impl AbilityDef {
+    /// **The aim atom.** Atom 0 decides where a targeted cast points and whom
+    /// doctrine counts before pulling the trigger, because a cast has one
+    /// centre and one of the atoms has to own it. Documented on `effects`.
+    ///
+    /// The loader refuses an empty effect list precisely so this cannot fail;
+    /// the fallback is a harmless zero-damage atom rather than a panic in a
+    /// system that runs every frame.
+    pub fn aim(&self) -> EffectAtom {
+        self.effects.first().map(|e| e.atom).unwrap_or(EffectAtom::Damage {
+            amount: 0.0,
+            targets: AbilityTargets::Enemies,
+        })
+    }
+    /// Wire name of the ability's headline effect — the v2 `effect` field,
+    /// still emitted by the catalog so a commander written against v2 keeps
+    /// reading. `effects[]` is the full sentence.
+    pub fn effect_name(&self) -> &'static str {
+        self.aim().name()
+    }
+    /// The v2 `power` field: the headline number of the FIRST atom. Byte-for-
+    /// byte what the old field held for every shipped row — 45 damage for
+    /// Slam, 60 HP for Heal, 40 seconds for CallToArms, 0.4 for Slow.
+    pub fn power(&self) -> f32 {
+        self.aim().power()
+    }
+    /// The v2 `duration` field: seconds the applied STATUS lasts, 0 for
+    /// everything else. Militia's seconds live in `power()`, exactly as they
+    /// did in v2 — the pair is reproduced, oddity included, because the
+    /// catalog is a wire format and a wire format's job is not to improve.
+    pub fn duration(&self) -> f32 {
+        self.effects
+            .iter()
+            .find_map(|e| e.atom.status().map(|(_, _, d)| d))
+            .unwrap_or(0.0)
+    }
+    /// First status this ability lays down (the v2 `status` catalog field).
+    pub fn status(&self) -> Option<StatusKind> {
+        self.effects.iter().find_map(|e| e.atom.status().map(|(k, _, _)| k))
+    }
+    /// SECOND status and its magnitude (the v2 `status2` catalog field, which
+    /// was `ApplyStatus::also`). It is now simply the second status atom —
+    /// which is what `also` always was, spelled honestly.
+    pub fn extra_status(&self) -> Option<(StatusKind, f32)> {
+        self.effects
+            .iter()
+            .filter_map(|e| e.atom.status())
+            .nth(1)
+            .map(|(k, m, _)| (k, m))
+    }
+    /// Does ANY atom restore HP? Auto-cast asks before firing a heal at a
+    /// healthy army.
+    pub fn heals(&self) -> bool {
+        self.effects.iter().any(|e| e.atom.heals())
+    }
+    /// Does any atom lay `kind` on `who`? Doctrine's Warcry rule asks this
+    /// rather than pattern-matching a whole effect, so a row that buffs damage
+    /// as its SECOND clause is still recognised as an offensive buff.
+    pub fn applies(&self, kind: StatusKind, who: AbilityTargets) -> bool {
+        self.effects.iter().any(|e| {
+            e.atom.status().map(|(k, _, _)| k) == Some(kind) && e.atom.targets() == Some(who)
+        })
+    }
 }
 
 // The ability table itself lives in `assets/data/abilities.ron`, along with
@@ -2673,6 +3050,18 @@ pub struct Militia {
 
 /// Damage a Militia worker deals in place of its normal 5.
 pub const MILITIA_DAMAGE: f32 = 16.0;
+
+/// **A body that was called, not trained** — the mark an `EffectAtom::Summon`
+/// leaves on the units it creates.
+///
+/// `until` is when it goes home; `None` is a permanent summon (a row may want
+/// one, and "permanent" should not have to be spelled as a very large number).
+/// `tick_militia_and_cooldowns` owns the expiry, beside the militia timer it
+/// most resembles: both are "this body is temporarily something else".
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Summoned {
+    pub until: Option<f32>,
+}
 
 // ---------------------------------------------------------------------------
 // Hero items: bought at a Shop, carried in a small hero inventory,
@@ -5059,6 +5448,10 @@ pub struct SpawnUnitEvent {
     /// The building that produced this unit (None for initial spawns).
     /// units.rs reads its `DoctrineTemplate`, if any, and applies it.
     pub source: Option<Entity>,
+    /// Set by an `EffectAtom::Summon`: this body was CALLED, and units.rs
+    /// stamps it with the component that says when it goes home. `None` for
+    /// every trained or scripted spawn, which is all of them but one.
+    pub summoned: Option<Summoned>,
 }
 
 /// A team concedes the match. Written by ui.rs (player) or bridge.rs
@@ -5563,6 +5956,7 @@ fn initial_spawns(
                 pos,
                 rally: None,
                 source: None,
+                summoned: None,
             });
         }
     }
@@ -5688,19 +6082,32 @@ fn regen_health(
     }
 }
 
-/// Expire Call-to-Arms militia and tick every caster's per-ability cooldowns.
-/// One system for heroes and buildings alike — `AbilityCooldowns` is the only
-/// cooldown store there is.
+/// Expire Call-to-Arms militia and temporary summons, and tick every caster's
+/// per-ability cooldowns. One system for heroes and buildings alike —
+/// `AbilityCooldowns` is the only cooldown store there is.
 fn tick_militia_and_cooldowns(
     time: Res<Time>,
     mut commands: Commands,
     militia: Query<(Entity, &Militia)>,
+    summons: Query<(Entity, &Summoned)>,
     mut cooldowns: Query<(Entity, &mut AbilityCooldowns)>,
 ) {
     let now = time.elapsed_secs();
     for (entity, m) in &militia {
         if now >= m.until {
             commands.entity(entity).try_remove::<Militia>();
+        }
+    }
+    // A summon whose time is up simply LEAVES. It is not killed: no death, no
+    // bounty, no XP, no corpse for the enemy to have earned — the body was
+    // never theirs to take. (Everything derived from live units — supply, the
+    // snapshot's army counts, fog — recounts itself every frame, so the
+    // departure needs no bookkeeping of its own.)
+    for (entity, s) in &summons {
+        if let Some(until) = s.until {
+            if now >= until {
+                commands.entity(entity).try_despawn();
+            }
         }
     }
     let dt = time.delta_secs();
@@ -7430,7 +7837,7 @@ mod tests {
     fn existing_abilities_are_slot_zero_and_unchanged() {
         let champion = abilities_of_unit(UnitKind::Hero);
         assert_eq!(champion[0].name, "Slam");
-        assert_eq!(champion[0].effect, AbilityEffect::Damage);
+        assert!(matches!(champion[0].aim(), EffectAtom::Damage { amount, .. } if amount == 45.0));
         assert!(!champion[0].hits_air);
         assert_eq!(champion[0].mana_cost, hero_ability_cost());
 
@@ -7531,8 +7938,8 @@ mod tests {
         assert!(slow.radius * slow.radius < OLD_RADIUS * OLD_RADIUS * 0.4);
         // Everything that made it Slow is untouched — this bead moved geometry
         // and nothing else.
-        assert_eq!(slow.power, 0.4);
-        assert_eq!(slow.duration, 5.0);
+        assert_eq!(slow.power(), 0.4);
+        assert_eq!(slow.duration(), 5.0);
         assert_eq!(slow.cooldown, 9.0);
         assert_eq!(slow.mana_cost, 0.0);
         assert!(slow.hits_air);
@@ -7643,17 +8050,19 @@ mod tests {
             slam(),
             AbilityDef {
                 name: "TestWarcry",
-                effect: AbilityEffect::ApplyStatus {
-                    status: StatusKind::DamageBuff,
-                    targets: AbilityTargets::Allies,
-                    also: None,
-                },
+                effects: &[Effect {
+                    atom: EffectAtom::ApplyStatus {
+                        status: StatusKind::DamageBuff,
+                        magnitude: 0.3,
+                        duration: 12.0,
+                        targets: AbilityTargets::Allies,
+                    },
+                    schedule: EffectSchedule::Instant,
+                }],
                 target: AbilityTarget::Caster,
                 mana_cost: 50.0,
                 cooldown: 30.0,
                 radius: 10.0,
-                power: 0.3,
-                duration: 12.0,
                 hits_air: true,
                 unlock: AbilityUnlock::HeroLevel(4),
                 description: "test",
@@ -7824,19 +8233,19 @@ mod tests {
     #[test]
     fn sanctuary_is_one_cast_carrying_two_statuses() {
         let sanctuary = abilities_of_unit(UnitKind::Priestess)[1];
-        assert_eq!(sanctuary.effect.status(), Some(StatusKind::HealOverTime));
+        assert_eq!(sanctuary.status(), Some(StatusKind::HealOverTime));
         assert_eq!(
-            sanctuary.effect.extra_status(),
+            sanctuary.extra_status(),
             Some((StatusKind::ArmorBuff, 0.25))
         );
-        assert!(sanctuary.effect.heals());
+        assert!(sanctuary.heals());
         // Warcry is the single-status shape, and is NOT a heal — the auto-cast
         // trigger keys off exactly this.
         let warcry = abilities_of_unit(UnitKind::Hero)[1];
-        assert_eq!(warcry.effect.extra_status(), None);
-        assert!(!warcry.effect.heals());
-        assert!(slam().effect.extra_status().is_none() && !slam().effect.heals());
-        assert!(heal().effect.heals());
+        assert_eq!(warcry.extra_status(), None);
+        assert!(!warcry.heals());
+        assert!(slam().extra_status().is_none() && !slam().heals());
+        assert!(heal().heals());
     }
 
     #[test]
@@ -7848,37 +8257,37 @@ mod tests {
         let warcry = abilities_of_unit(UnitKind::Hero)[1];
         let mut buffed = StatusEffects::new();
         buffed.apply(StatusEffect::new(
-            warcry.effect.status().unwrap(),
-            warcry.power,
+            warcry.status().unwrap(),
+            warcry.power(),
             0.0,
-            warcry.duration,
+            warcry.duration(),
             StatusSource::Ability,
         ));
         assert!((effective_stats(footman, Some(&buffed)).damage_mult - 1.30).abs() < 1e-6);
 
         // Sanctuary: both statuses, one cast, one duration.
         let sanctuary = abilities_of_unit(UnitKind::Priestess)[1];
-        let (extra, magnitude) = sanctuary.effect.extra_status().unwrap();
+        let (extra, magnitude) = sanctuary.extra_status().unwrap();
         let mut warded = StatusEffects::new();
         warded.apply(StatusEffect::new(
-            sanctuary.effect.status().unwrap(),
-            sanctuary.power,
+            sanctuary.status().unwrap(),
+            sanctuary.power(),
             0.0,
-            sanctuary.duration,
+            sanctuary.duration(),
             StatusSource::Ability,
         ));
         warded.apply(StatusEffect::new(
             extra,
             magnitude,
             0.0,
-            sanctuary.duration,
+            sanctuary.duration(),
             StatusSource::Ability,
         ));
         let eff = effective_stats(footman, Some(&warded));
         assert!((eff.heal_per_second - 15.0).abs() < 1e-6);
         assert!((eff.damage_taken_mult - 0.75).abs() < 1e-6);
         // Both instances die on the same tick — one cast, one expiry.
-        assert!(warded.expire(sanctuary.duration + 0.01));
+        assert!(warded.expire(sanctuary.duration() + 0.01));
         assert!(warded.is_empty());
 
         // Boots of Speed: +40% legs, and legs only.
@@ -8004,6 +8413,104 @@ mod tests {
         let sanctuary = catalog.abilities.iter().find(|a| a.id == "Sanctuary").unwrap();
         assert_eq!(sanctuary.status, Some("HealOverTime"));
         assert_eq!(sanctuary.status2, Some(("ArmorBuff", 0.25)));
+    }
+
+    /// **A called body goes home; it does not die.** The summon timer sits
+    /// beside the militia timer because they are the same kind of promise, and
+    /// the difference from a death is the point: no bounty, no XP, no kill on
+    /// the enemy's ledger for a body that was never theirs to take.
+    #[test]
+    fn a_summon_leaves_when_its_time_is_up() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .add_systems(Update, tick_militia_and_cooldowns);
+        let temporary = app
+            .world_mut()
+            .spawn((Unit { kind: UnitKind::Footman }, Summoned { until: Some(30.0) }))
+            .id();
+        let permanent = app
+            .world_mut()
+            .spawn((Unit { kind: UnitKind::Footman }, Summoned { until: None }))
+            .id();
+
+        app.update();
+        assert!(app.world().get_entity(temporary).is_ok(), "not yet");
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(31.0));
+        app.update();
+        assert!(app.world().get_entity(temporary).is_err(), "its time was up");
+        assert!(
+            app.world().get_entity(permanent).is_ok(),
+            "a summon with no lifetime stays until something kills it"
+        );
+    }
+
+    /// **The catalog reads the composition.** A commander should not have to
+    /// infer that Sanctuary does two things from a `status2` field bolted onto
+    /// a one-effect schema: `effects[]` is the sentence, clause by clause,
+    /// with each clause's own numbers and its own side.
+    ///
+    /// The v2 fields are asserted alongside, because they are still on the
+    /// wire and a commander written against them must keep working.
+    #[test]
+    fn catalog_exports_abilities_atom_by_atom() {
+        let catalog = game_catalog();
+        let row = |id: &str| {
+            catalog
+                .abilities
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap_or_else(|| panic!("catalog lost {id}"))
+                .clone()
+        };
+
+        // One clause: a shockwave.
+        let slam = row("Slam");
+        assert_eq!(slam.effects.len(), 1);
+        assert_eq!(slam.effects[0].atom, "damage");
+        assert_eq!(slam.effects[0].schedule, "instant");
+        assert_eq!(slam.effects[0].amount, Some(45.0));
+        assert_eq!(slam.effects[0].targets, Some("enemies"));
+        assert_eq!(slam.effects[0].status, None);
+        assert_eq!(slam.effect, "damage", "the v2 headline still says damage");
+        assert_eq!(slam.power, 45.0);
+
+        // Two clauses: the row `also` used to hide.
+        let sanctuary = row("Sanctuary");
+        assert_eq!(sanctuary.effects.len(), 2, "Sanctuary is two clauses, and says so");
+        assert_eq!(
+            sanctuary
+                .effects
+                .iter()
+                .map(|e| (e.atom, e.status, e.magnitude, e.duration, e.targets))
+                .collect::<Vec<_>>(),
+            vec![
+                ("status", Some("HealOverTime"), Some(15.0), Some(6.0), Some("allies")),
+                ("status", Some("ArmorBuff"), Some(0.25), Some(6.0), Some("allies")),
+            ],
+        );
+
+        // Militia's seconds are a duration in the composition, even though the
+        // v2 `power` field has always carried them.
+        let call = row("CallToArms");
+        assert_eq!(call.effects[0].atom, "militia");
+        assert_eq!(call.effects[0].duration, Some(40.0));
+        assert_eq!(call.effects[0].targets, Some("own_workers"));
+        assert_eq!(call.power, 40.0, "the v2 pair is reproduced exactly");
+        assert_eq!(call.duration, 0.0);
+
+        // Nothing on the wire carries a schedule the engine cannot run.
+        for ability in &catalog.abilities {
+            for clause in &ability.effects {
+                assert_eq!(
+                    clause.schedule, "instant",
+                    "{}: shipping content is all instant today",
+                    ability.id
+                );
+            }
+        }
     }
 
     #[test]
@@ -8355,22 +8862,23 @@ mod tests {
         let def = slow_def();
         assert_eq!(def.name, "Slow");
         assert_eq!(
-            def.effect,
-            AbilityEffect::ApplyStatus {
+            def.effects.iter().map(|e| e.atom).collect::<Vec<_>>(),
+            vec![EffectAtom::ApplyStatus {
                 status: StatusKind::Slow,
+                magnitude: 0.4,
+                duration: 5.0,
                 targets: AbilityTargets::Enemies,
-                also: None,
-            },
-            "Slow must reach the status framework through ApplyStatus, not a new variant",
+            }],
+            "Slow must reach the status framework through an ApplyStatus ATOM, not a new variant",
         );
 
         // Exactly what `cast_abilities` constructs for an ApplyStatus effect.
         let mut effects = StatusEffects::new();
         effects.apply(StatusEffect::new(
             StatusKind::Slow,
-            def.power,
+            def.power(),
             0.0,
-            def.duration,
+            def.duration(),
             StatusSource::Ability,
         ));
 
@@ -8400,7 +8908,7 @@ mod tests {
 
         // And it ends. `tick_status_effects` calls exactly this.
         let mut expired = effects.clone();
-        assert!(expired.expire(def.duration + 0.01));
+        assert!(expired.expire(def.duration() + 0.01));
         assert!(expired.is_empty());
         let recovered = effective_unit_stats(charger, Some(&expired));
         assert!((recovered.speed - base.speed).abs() < 1e-4);
@@ -8416,14 +8924,14 @@ mod tests {
         for i in 0..3 {
             effects.apply(StatusEffect::new(
                 StatusKind::Slow,
-                def.power,
+                def.power(),
                 i as f32,
-                def.duration,
+                def.duration(),
                 StatusSource::Ability,
             ));
         }
         assert_eq!(effects.iter().count(), 1);
-        assert!((effects.magnitude(StatusKind::Slow) - def.power).abs() < 1e-4);
+        assert!((effects.magnitude(StatusKind::Slow) - def.power()).abs() < 1e-4);
     }
 
     /// The Sorcerer is the first caster in the game that is not a hero: no

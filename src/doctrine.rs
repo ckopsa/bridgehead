@@ -453,16 +453,27 @@ fn auto_cast_abilities(
                     if !def.hits_air && is_flying_kind(other_unit.kind) {
                         return false;
                     }
-                    match def.effect {
-                        AbilityEffect::Damage => *other_team != team,
-                        AbilityEffect::Heal => {
+                    // **Counted by the AIM atom** — the same atom combat.rs
+                    // will point the cast with. Doctrine must count what the
+                    // cast will actually chase, or a two-atom ability would be
+                    // triggered by the crowd its second clause wants and then
+                    // aimed at the crowd its first clause wants.
+                    match def.aim() {
+                        EffectAtom::Damage { .. } => *other_team != team,
+                        EffectAtom::Heal { .. } => {
                             *other_team == team
                                 && health.max > 0.0
                                 && health.current < health.max * HEAL_FRAC
                         }
-                        // No auto-cast path for militia (buildings cast it).
-                        AbilityEffect::Militia => false,
-                        AbilityEffect::ApplyStatus { targets, .. } => match targets {
+                        // No auto-cast path for militia (buildings cast it),
+                        // nor for the two atoms that affect nobody in
+                        // particular: a summon or a recall has no crowd to
+                        // count, so a `min_targets` rule over one is
+                        // meaningless rather than merely unusual.
+                        EffectAtom::Militia { .. }
+                        | EffectAtom::Summon { .. }
+                        | EffectAtom::Teleport { .. } => false,
+                        EffectAtom::ApplyStatus { targets, .. } => match targets {
                             AbilityTargets::Enemies => *other_team != team,
                             // An ally buff that HEALS counts only allies who
                             // need healing — same reasoning as `Heal` above,
@@ -470,7 +481,7 @@ fn auto_cast_abilities(
                             // which ability it is.
                             AbilityTargets::Allies => {
                                 *other_team == team
-                                    && (!def.effect.heals()
+                                    && (!def.heals()
                                         || (health.max > 0.0
                                             && health.current < health.max * HOT_FRAC))
                             }
@@ -517,14 +528,10 @@ fn auto_cast_abilities(
             // would burn its 45s ultimate on mining. So the same threshold is
             // asked twice — enough allies to buff AND enough enemies to fight.
             // Defensive and healing ally buffs need no such second opinion.
-            if matches!(
-                def.effect,
-                AbilityEffect::ApplyStatus {
-                    status: StatusKind::DamageBuff,
-                    targets: AbilityTargets::Allies,
-                    ..
-                }
-            ) {
+            // Asked of the ATOMS rather than of the whole effect, so a row
+            // that buffs damage as its second clause is still recognised as an
+            // offensive buff and still waits for a fight.
+            if def.applies(StatusKind::DamageBuff, AbilityTargets::Allies) {
                 let enemies = others
                     .iter()
                     .filter(|(other_team, other_tf, health, other_unit)| {
