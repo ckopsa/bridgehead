@@ -141,6 +141,14 @@
 //! inventory. The snapshot answers back with `units[].items`,
 //! `units[].militia` and `buildings[].ability_cd`.
 //!
+//! `use_item` also takes an optional `destination` — a building id naming
+//! WHICH of your own standing halls a teleport item arrives at, read straight
+//! off the `buildings[]` you already have. Omitted, both scrolls fall back to
+//! the hall nearest the hero, which is what they always did. The catalog
+//! advertises the option as `items[].destination: "choosable"`, so a commander
+//! can discover it without being told. See docs/INTENT.md, "Which hall a
+//! teleport item means".
+//!
 //! MAP GEOGRAPHY IS PUBLIC, and always was: the `map` block (layout, summary,
 //! chokepoints), `mines` (position and remaining gold) and `trees_near` ship
 //! unfiltered to both seats, exactly as ui.rs paints mines and the terrain

@@ -112,7 +112,7 @@ the schema.
 |---|---|
 | `cast` | `{hero:id, ability?, x?, z?, target?}` (alias `caster`) — any own CASTER: hero, Sorcerer, or ability building |
 | `buy` | `{shop:id, item:"HealingPotion", hero?:id}` — `hero` optional, see below |
-| `use_item` | `{slot:0, hero?:id}` |
+| `use_item` | `{slot:0, hero?:id, destination?:id}` — `destination` names WHICH hall a teleport item arrives at; see below |
 
 The shop shelf is TIERED. `catalog.items[].tier` gives each item's required
 tech tier (1/2/3), and every own finished Shop reports the shelf with this
@@ -232,6 +232,75 @@ drawn from, and the Shop — whose card is a *building* selection, with no hero
 selected to read — sells to the last hero the player had selected (`last_hero`),
 falling back to the same lowest-id default. So the button that shows you the
 Priestess's potion is the button that drinks the Priestess's potion.
+
+### Which hall a teleport item means
+
+Both teleport items used to target **the hall nearest the hero**, which reads
+as a sensible default and is wrong in the exact case they exist for. Round 10
+turned on it: the army was escorting the expansion, the main was dying 130
+units away, and the Scroll of Mass Teleport — pressed to save the main — would
+have recalled everyone *to the expansion they were already standing on*. The
+default is not a decision; it just happens to be right when you have one base
+and silently useless when you have two.
+
+So `use_item` takes an optional `destination`: a building id, validated as
+**your own, finished, and a hall**. Both scrolls honour it. `TownPortal` takes
+the hero plus allies within `PORTAL_RADIUS`; `ScrollOfMassTeleport` takes the
+hero plus every own non-worker on the map — the `army_only` rule is untouched,
+workers stay on the gold whichever hall you name.
+
+Three rules, and each one is load-bearing:
+
+* **Omitted is the old behaviour.** No `destination` means the hall nearest the
+  hero, exactly as before, and the field is `skip_serializing_if =
+  "Option::is_none"` so the historic wire shape is byte-identical. A commander
+  written before this existed keeps working and keeps meaning what it meant.
+* **A bad destination is refused, not downgraded.** Anything that is not your
+  own standing hall earns `cmd N: destination 123 is not your standing hall`
+  and the item does **not** fire — the slot is not spent. Falling back to
+  "nearest" would be the original bug wearing the new field's clothes: the
+  scroll would go somewhere else and look like it worked. One message for all
+  four failures (unknown id, enemy building, not a hall, still under
+  construction) because "your standing hall" already names every condition, and
+  a finer answer would hand a seat a building id it could not otherwise have.
+* **A destination that dies between the order and the frame falls back.** The
+  item is consumed up front, so refusing at execution time would burn a
+  250-gold scroll for nothing. intent.rs is the layer that says no; combat.rs's
+  job is to always do something sane, and the something is the rule that has
+  always applied when nobody chose.
+
+The sentence carries the choice (`hero 7 uses item in slot 0, bound for hall
+34`), and the arrival announces itself into the acting team's event feed by
+name: `hero ports the army to the Keep at (-70.0, -70.0)`. Coordinates alone
+would not tell a commander whether the scroll did what it was aimed at.
+
+`use_item` stays **exempt** from Chain of Command latency (docs/TEMPO.md §4).
+Nothing about naming a hall changes the reason: the item is spent from a hero's
+bag and a hero is a command node, so the link is zero however the destination
+is spelled. Pinned by
+`intent::tests::choosing_a_destination_does_not_start_charging_for_the_item`.
+
+The two interfaces meet in the middle here as usual. A commander types the
+building id, which it reads off `buildings[]` in its own snapshot; the catalog
+advertises the option as `items[].destination: "choosable"` so it is
+discoverable without reading this file. The human never types an id: pressing
+the item key **arms a hall-pick** and the next left-click on one of your halls
+— in the world, or on the minimap, where the other base actually is — completes
+it. With exactly one hall standing the key fires immediately with no
+destination at all, because a ceremony that always has one answer is a tax
+rather than a decision. Escape cancels it innermost-first, like every other
+armed mode.
+
+**A hall under attack is named, not highlighted.** The hint line while the pick
+is armed reads `UNDER ATTACK: Keep at (-70,-70)`, driven by the same
+`BUILDING_HURT_FRAC` threshold the alert stack and the bridge event feed use to
+call a building "under attack" — so the two lines agree by construction rather
+than by coincidence. A *highlight* was considered and rejected as not cheap:
+the world view's rings are parented on selection and the minimap draws
+buildings as flat state-free dots, so either would be new render plumbing for
+one transient mode. (`GameEvents`' structured threat state was the other
+candidate and is the wrong shape — one hostile count for the whole base, not a
+per-hall verdict.)
 
 **A caster is anything with an ability list**, not a hero. `cast` always asked
 `abilities_of_unit(kind)` rather than "does it carry a `Hero` component", so the

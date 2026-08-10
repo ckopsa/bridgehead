@@ -808,7 +808,11 @@ fn spawn_units(
 /// keeps its own `unit_y` and its relative offset to the centre (clamped, so an
 /// arriving group lands as a loose blob instead of one stack), and everyone
 /// moved has `MoveTo` + path state cleared — they arrive standing still.
-fn handle_teleports(
+/// `pub(crate)` for one reason: a destination is now a DECISION, and the only
+/// test that can check the decision was honoured is one that runs the item and
+/// the move together — combat.rs picks the hall, this system is what actually
+/// puts the army on it. See the probe in combat.rs's test module.
+pub(crate) fn handle_teleports(
     mut commands: Commands,
     mut events: EventReader<TeleportRequest>,
     nav: Res<NavGrid>,

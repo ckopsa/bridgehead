@@ -1799,6 +1799,12 @@ fn think(
                 events.uses.write(UseItem {
                     hero: hero.entity,
                     slot,
+                    // The scripted AI does not pick a hall. `None` is the
+                    // nearest one, which is exactly what it got before the
+                    // field existed — the baseline this ladder measures
+                    // against must not move because a commander gained an
+                    // option the script never had.
+                    destination: None,
                 });
             }
             Some(ItemAction::Buy(id)) => {

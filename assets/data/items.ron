@@ -30,7 +30,7 @@
             name: "TownPortal",
             cost_gold: 150,
             tier: T1,
-            description: "Teleports the hero and nearby own units to the nearest own TownHall.",
+            description: "Teleports the hero and nearby own units to one of your own standing halls. Destination is CHOOSABLE: use_item takes an optional `destination` building id; omit it for the hall nearest the hero.",
         ),
     ),
     (
@@ -57,7 +57,7 @@
             name: "ScrollOfMassTeleport",
             cost_gold: 250,
             tier: T3,
-            description: "Recalls the hero and EVERY own non-worker unit on the map to the hall nearest the hero.",
+            description: "Recalls the hero and EVERY own non-worker unit on the map to one of your own standing halls. Destination is CHOOSABLE: use_item takes an optional `destination` building id; omit it for the hall nearest the hero. Aiming it at the hall that is NOT nearest is the whole point — an army at the expansion defends the main by porting away from itself.",
         ),
     ),
 ]
