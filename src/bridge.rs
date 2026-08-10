@@ -399,6 +399,10 @@ struct StateOut {
     errors: Vec<String>,
     game_over: Option<&'static str>,
     me: MeOut,
+    /// The ground both seats are fighting over: which layout is loaded and
+    /// where its impassable terrain can be crossed. The human sees the canyon
+    /// on screen and on the minimap; this is the same fact in JSON.
+    map: MapOut,
     /// `catalog.json` entry id -> may this seat build/train it right now?
     /// Every unit and building in the catalog appears, whether or not it has
     /// requirements, so a commander can gate its build order on one lookup.
@@ -413,6 +417,31 @@ struct StateOut {
     bounties: Vec<BountyOut>,
     /// `[[game_time, message], ...]`, oldest first — see `diff_events`.
     events: Vec<(f32, String)>,
+}
+
+/// The map, as neutral public information — identical in both seats'
+/// snapshots, because both players are looking at the same ground.
+#[derive(Serialize)]
+struct MapOut {
+    /// The `WC3_MAP` value that produced this world: `"open"`, `"crossings"`.
+    name: &'static str,
+    /// What the layout means for a plan, in one sentence.
+    summary: &'static str,
+    /// Every layout this build offers, so a commander can see what else exists
+    /// without being told (the human reads the same list from `WC3_MAP`).
+    available: Vec<&'static str>,
+    /// Gaps in the impassable terrain — empty on a map that has none. Armies,
+    /// workers and expansions can only cross here.
+    chokes: Vec<ChokeOut>,
+}
+
+#[derive(Serialize)]
+struct ChokeOut {
+    name: &'static str,
+    pos: [f32; 2],
+    /// Opening width in world units. Anything standing in the gap (a gold mine,
+    /// a wall, a tower) narrows it further.
+    width: f32,
 }
 
 #[derive(Serialize)]
@@ -833,6 +862,7 @@ fn write_seat_snapshot(
     let eco = *economies.get(me);
     let (hero_gold, hero_lumber, hero_time) = hero_train_cost(records, me);
 
+    let map = crate::terrain::active_map();
     let state = StateOut {
         t: now,
         my_team: team_name(me),
@@ -854,6 +884,20 @@ fn write_seat_snapshot(
                 lumber: hero_lumber,
                 time: hero_time,
             },
+        },
+        map: MapOut {
+            name: map.id(),
+            summary: map.summary(),
+            available: crate::terrain::MapKind::ALL.iter().map(|m| m.id()).collect(),
+            chokes: map
+                .chokepoints()
+                .into_iter()
+                .map(|c| ChokeOut {
+                    name: c.name,
+                    pos: [r1(c.pos.x), r1(c.pos.z)],
+                    width: r1(c.width),
+                })
+                .collect(),
         },
         unlocked,
         units: units_out,

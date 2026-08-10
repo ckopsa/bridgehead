@@ -2743,8 +2743,14 @@ fn sync_selection_rings(
 // Minimap rendering
 // ---------------------------------------------------------------------------
 
-/// Trees and gold mines never move — one dot each, spawned on the first frame
-/// after terrain.rs has created them (Startup ordering isn't guaranteed).
+/// Trees, gold mines and impassable terrain never move — one dot each, spawned
+/// on the first frame after terrain.rs has created them (Startup ordering isn't
+/// guaranteed).
+///
+/// The terrain dots matter for fairness as much as for convenience: a bridge
+/// commander is told the map's chokepoints in every snapshot, so the human must
+/// be able to see where the ground is closed without panning the camera along
+/// it.
 fn minimap_static_markers(
     mut commands: Commands,
     mut done: Local<bool>,
@@ -2773,6 +2779,26 @@ fn minimap_static_markers(
                 ..default()
             },
             BackgroundColor(color),
+            MinimapStatic,
+            ChildOf(root),
+        ));
+    }
+
+    // Impassable terrain (none on the open map): dots slightly larger than a
+    // nav cell so the barrier reads as one continuous wall.
+    let rock = Color::srgb(0.26, 0.26, 0.30);
+    for cell in crate::terrain::barrier_cells() {
+        let p = world_to_minimap(cell);
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(p.x - 1.25),
+                top: Val::Px(p.y - 1.25),
+                width: Val::Px(2.5),
+                height: Val::Px(2.5),
+                ..default()
+            },
+            BackgroundColor(rock),
             MinimapStatic,
             ChildOf(root),
         ));

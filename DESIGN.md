@@ -26,7 +26,11 @@ Win by destroying all enemy buildings.
   (initial town hall + 5 workers per team, death cleanup, supply recount, win check).
 - `terrain.rs`: ground, doodads, resource nodes (gold mines at
   `GOLD_MINE_POSITIONS`, tree clusters), lighting, **RTS camera** (spawns the
-  `MainCamera`), blocks trees/mines in `NavGrid`.
+  `MainCamera`), blocks trees/mines in `NavGrid`, and owns the **map layout**:
+  `WC3_MAP=open|crossings` (default `open`) picks one, `crossings` blocking a
+  canyon with three fords in the `NavGrid`. Both players learn the layout the
+  same way — bridge.rs ships `map` (name, summary, chokepoints) in every
+  snapshot, ui.rs paints the barrier on the minimap.
 - `units.rs`: handles `SpawnUnitEvent` (meshes per kind/team), executes
   `Order::Move`/`Order::AttackMove` by inserting `MoveTo`, implements `MoveTo`
   pathfinding (A* over `NavGrid`) + steering + local separation, removes `MoveTo`
