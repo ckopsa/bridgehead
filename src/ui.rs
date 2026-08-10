@@ -713,6 +713,10 @@ struct ShopState {
     hero: bool,
     /// That hero has a free inventory slot.
     room: bool,
+    /// The team's tech tier — the shelf is tiered, so a Shop built at T1 shows
+    /// the T2 banner and the T3 scroll as locked rather than hiding them. A
+    /// player has to be able to see what climbing the ladder buys.
+    tier: TechTier,
 }
 
 /// Where a building sits on the worker's build card: `(slot, key, caption)`,
@@ -767,6 +771,17 @@ const TRAIN_KEYS: [(KeyCode, &str); 4] = [
 
 /// Inventory-slot hotkeys, by slot index.
 const ITEM_KEYS: [(KeyCode, &str); 2] = [(KeyCode::KeyZ, "Z"), (KeyCode::KeyX, "X")];
+
+/// Shop-shelf hotkeys, by index into `ALL_ITEMS`. Q W E R are the production
+/// letters (a Shop trains nothing, so they never collide), and [I] — the one
+/// letter `build_card_slot`'s roster left unclaimed — takes the fifth rung.
+const SHOP_KEYS: [(KeyCode, &str); 5] = [
+    (KeyCode::KeyQ, "Q"),
+    (KeyCode::KeyW, "W"),
+    (KeyCode::KeyE, "E"),
+    (KeyCode::KeyR, "R"),
+    (KeyCode::KeyI, "I"),
+];
 
 /// Hero ability hotkeys, by ability slot. [R] is where the one hero ability
 /// has always lived, so a Champion or Priestess with a single spell is
@@ -1000,14 +1015,22 @@ fn command_entries(
             // full inventory, or with an empty purse.
             if let Some(shop) = hero.shop {
                 for (i, item) in ALL_ITEMS.iter().enumerate() {
-                    let Some((key, hotkey)) = TRAIN_KEYS.get(i).copied() else {
+                    let Some((key, hotkey)) = SHOP_KEYS.get(i).copied() else {
                         continue;
                     };
                     let def = item_def(*item);
-                    let mut entry =
-                        CmdEntry::plain(CmdAction::Buy(*item), key, hotkey, item_name(*item))
-                            .priced(def.cost_gold, 0);
-                    entry.enabled = shop.hero && shop.room;
+                    let unlocked = item_unlocked(*item, shop.tier);
+                    // A locked rung says WHAT IT COSTS in tech, not just that
+                    // it is dark: "Banner T2" is a build order, "Banner"
+                    // greyed out is a mystery.
+                    let caption = if unlocked {
+                        item_name(*item).to_string()
+                    } else {
+                        format!("{} {}", item_name(*item), def.tier.name())
+                    };
+                    let mut entry = CmdEntry::plain(CmdAction::Buy(*item), key, hotkey, &caption)
+                        .priced(def.cost_gold, 0);
+                    entry.enabled = shop.hero && shop.room && unlocked;
                     out.push(entry);
                 }
             }
@@ -1090,6 +1113,9 @@ fn item_name(id: ItemId) -> &'static str {
     match id {
         ItemId::HealingPotion => "Potion",
         ItemId::TownPortal => "Portal",
+        ItemId::BootsOfSpeed => "Boots",
+        ItemId::BannerOfCommand => "Banner",
+        ItemId::ScrollOfMassTeleport => "MassTP",
     }
 }
 
@@ -2114,6 +2140,7 @@ fn command_input(
             (done && kind == BuildingKind::Shop).then(|| ShopState {
                 hero: team_hero.is_some(),
                 room: team_hero.is_some_and(|(_, inv)| inv.0.iter().any(|s| s.is_none())),
+                tier: cast.tiers.get(Team::Human),
             })
         }),
         upgrade: single.and_then(|(_, kind, done, upgrading)| {
@@ -4183,6 +4210,7 @@ fn update_hud(
                 room: team_hero
                     .and_then(|(_, inv)| inv)
                     .is_some_and(|inv| inv.0.iter().any(|s| s.is_none())),
+                tier: tiers.get(Team::Human),
             })
         }),
         items: selected_hero

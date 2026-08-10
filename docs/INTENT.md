@@ -107,6 +107,18 @@ the schema.
 | `buy` | `{shop:id, item:"HealingPotion"}` — buyer implied by team |
 | `use_item` | `{slot:0}` |
 
+The shop shelf is TIERED. `catalog.items[].tier` gives each item's required
+tech tier (1/2/3), and every own finished Shop reports the shelf with this
+team's tier already applied as `buildings[].sells[] = {id, cost_gold, tier,
+locked}`. Buying a locked rung is refused by the compiler with
+`cmd N: BannerOfCommand requires tier T2 (you are T1)`, and economy.rs
+re-checks on the frame it pays — so losing the Keep closes the rung again.
+
+Hero ultimates are ordinary second ability slots gated on
+`AbilityUnlock::HeroLevel(5)`: `{"type":"cast","hero":<id>,"ability":"Warcry"}`
+(Champion) or `"Sanctuary"` (Priestess). `units[].abilities[]` reports each
+slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
+
 ### Doctrine — standing policy the engine executes at machine speed
 | Verb | Shape | Clears when |
 |---|---|---|

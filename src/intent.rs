@@ -723,6 +723,27 @@ fn compile_intent(
                 errors.push(format!("{tag}: building {shop} is under construction"));
                 return;
             }
+            // The shelf is tiered. Derived from our standing completed
+            // buildings by the same function that feeds `TechTiers`, so this
+            // needs no extra resource and cannot disagree with economy.rs's
+            // authoritative check — it only turns a silent race-log into a
+            // sentence a commander can act on.
+            let def = item_def(item);
+            let tier = tech_tier_for(
+                buildings
+                    .iter()
+                    .filter(|(_, team, under, _, _)| **team == me && under.is_none())
+                    .map(|(b, _, _, _, _)| b.kind),
+            );
+            if !item_unlocked(item, tier) {
+                errors.push(format!(
+                    "{tag}: {} requires tier {} (you are {})",
+                    def.name,
+                    def.tier.name(),
+                    tier.name()
+                ));
+                return;
+            }
             // The buyer is implied: a team fields exactly one hero.
             let Some(hero) = own_hero(units, me) else {
                 errors.push(format!("{tag}: no living hero to buy for"));

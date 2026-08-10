@@ -314,6 +314,9 @@ fn auto_cast_abilities(
 ) {
     /// A hurt ally is one below this fraction of max HP.
     const HEAL_FRAC: f32 = 0.7;
+    /// A heal-over-time is a 60s commitment, not a 12s top-up, so Sanctuary
+    /// waits for allies that are properly in trouble rather than scratched.
+    const HOT_FRAC: f32 = 0.6;
 
     for (entity, policy, hero, unit, team, tf, cooldowns) in &heroes {
         let list = abilities_of_unit(unit.kind);
@@ -354,7 +357,16 @@ fn auto_cast_abilities(
                         AbilityEffect::Militia => false,
                         AbilityEffect::ApplyStatus { targets, .. } => match targets {
                             AbilityTargets::Enemies => *other_team != team,
-                            AbilityTargets::Allies => *other_team == team,
+                            // An ally buff that HEALS counts only allies who
+                            // need healing — same reasoning as `Heal` above,
+                            // asked of what the effect does rather than of
+                            // which ability it is.
+                            AbilityTargets::Allies => {
+                                *other_team == team
+                                    && (!def.effect.heals()
+                                        || (health.max > 0.0
+                                            && health.current < health.max * HOT_FRAC))
+                            }
                             AbilityTargets::OwnWorkers => {
                                 *other_team == team && other_unit.kind == UnitKind::Worker
                             }
@@ -363,9 +375,36 @@ fn auto_cast_abilities(
                 })
                 .count() as u32;
             // A trigger of 0 still needs someone to affect — never cast at air.
-            if count >= min_targets.max(1) {
-                casts.write(CastAbility::index(entity, index));
+            if count < min_targets.max(1) {
+                continue;
             }
+            // An OFFENSIVE ally buff (Warcry) is worth nothing without a
+            // fight: without this a Champion walking past its own worker line
+            // would burn its 45s ultimate on mining. So the same threshold is
+            // asked twice — enough allies to buff AND enough enemies to fight.
+            // Defensive and healing ally buffs need no such second opinion.
+            if matches!(
+                def.effect,
+                AbilityEffect::ApplyStatus {
+                    status: StatusKind::DamageBuff,
+                    targets: AbilityTargets::Allies,
+                    ..
+                }
+            ) {
+                let enemies = others
+                    .iter()
+                    .filter(|(other_team, other_tf, health, other_unit)| {
+                        *other_team != team
+                            && health.current > 0.0
+                            && xz_dist(tf.translation, other_tf.translation) <= def.radius
+                            && (def.hits_air || !is_flying_kind(other_unit.kind))
+                    })
+                    .count() as u32;
+                if enemies < min_targets.max(1) {
+                    continue;
+                }
+            }
+            casts.write(CastAbility::index(entity, index));
         }
     }
 }
