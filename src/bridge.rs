@@ -32,13 +32,19 @@
 //! disturb the other, and both may command in the same tick.
 //!
 //! When the env var is absent every system early-returns before touching the
-//! filesystem, so a normal `cargo run` never creates `bridge/`.
+//! filesystem, so a normal `cargo run` never creates `bridge/`. (The intent
+//! log is separate and has its own lazy-open rule — see intent.rs.)
 //!
-//! Like ai.rs, the bridge acts ONLY through the primitives the UI uses: it
-//! writes `Order` components with `try_insert`, pushes `UnitKind`s onto its own
-//! buildings' `TrainingQueue`, sets `RallyPoint`, and sends `CastAbility`.
-//! It never spawns anything, never writes `Health`, never touches enemy
-//! entities, and only *reads* its own `Economies` entry (economy.rs pays).
+//! The bridge does not act on the world at all any more. It deserializes each
+//! command into a `shared::Intent` and submits it; intent.rs validates and
+//! applies it — the very same compiler the human's mouse gestures go through.
+//! That is stronger than the old promise that the bridge "acts only through the
+//! primitives the UI uses", because it is no longer a promise: there is one
+//! implementation, so the two seats cannot drift apart. See docs/INTENT.md.
+//!
+//! The wire format did not change, because the wire format *is* the schema:
+//! `Intent`'s serde shape is the historical command shape, field for field.
+//!
 //! Enemy units and buildings are reported in the snapshot (full vision parity
 //! with the scripted AI) but enemy gold/lumber never is — and a seat only ever
 //! sees its *own* squads and policies, never the opponent's command structure.
@@ -50,10 +56,11 @@
 //!
 //! Beyond one-shot orders the commander can also install *doctrine*: standing
 //! policies (`priority`, `retreat`, `leash`, `autocast`) and squads
-//! (`squad`, `posture`). The bridge only writes those components and the
-//! `SquadOrders` resource — doctrine.rs and combat.rs act on them. Setting a
-//! policy is therefore as cheap as any other command, and a commander that
-//! polls slowly still gets sensible behaviour between polls.
+//! (`squad`, `posture`). These are intents like any other; the compiler writes
+//! the components and the `SquadOrders` resource, and doctrine.rs and combat.rs
+//! act on them. Setting a policy is therefore as cheap as any other command,
+//! and a commander that polls slowly still gets sensible behaviour between
+//! polls.
 //!
 //! Even a commander that says nothing gets an army: doctrine.rs enrols every
 //! unassigned army unit (workers excepted) into squad 0 and seeds it a `Defend`
@@ -109,6 +116,7 @@
 //! order — turns into an error string carried in the next snapshot's `errors`
 //! array instead of a panic.
 
+use crate::intent::{set_autopilot, IntentApply};
 use crate::shared::*;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -137,12 +145,6 @@ const SNAPSHOT_INTERVAL: f32 = 1.0;
 /// Wall-clock seconds between `commands.json` polls.
 const POLL_INTERVAL: f32 = 0.25;
 
-/// Same formation grid the UI uses for multi-unit ground orders.
-const FORMATION_SPACING: f32 = 2.6;
-/// Same training queue cap the UI enforces.
-const MAX_QUEUE: usize = 7;
-/// Hero inventory size, read off the shared component so it cannot drift.
-const INVENTORY_SLOTS: usize = Inventory([None; 2]).0.len();
 /// How many trees to include in the snapshot (there are hundreds).
 const TREES_NEAR: usize = 12;
 
@@ -159,10 +161,14 @@ impl Plugin for BridgePlugin {
             .add_systems(Startup, bridge_startup)
             .add_systems(
                 Update,
-                // Poll first, snapshot second: a batch applied this frame is
-                // visible in the snapshot written the same frame.
-                (poll_commands, write_snapshot)
-                    .chain()
+                // Poll, compile, snapshot — in that order, so a batch read this
+                // frame is applied this frame and its validation errors ride
+                // out in the snapshot written the same frame. The middle step
+                // belongs to intent.rs now; the bridge only brackets it.
+                (
+                    poll_commands.before(IntentApply),
+                    write_snapshot.after(IntentApply),
+                )
                     .run_if(bridge_enabled),
             );
     }
@@ -184,7 +190,10 @@ struct Seat {
     poll_timer: Timer,
     /// Highest `seq` applied so far; batches at or below it are ignored.
     last_seq: u64,
-    /// Errors produced by the most recent batch (or its parse attempt).
+    /// File- and batch-level errors from the most recent poll (unreadable
+    /// file, malformed JSON, commands after game over). Per-command errors
+    /// live in `shared::IntentErrors`, written by the compiler; the snapshot
+    /// concatenates the two.
     errors: Vec<String>,
     /// Write a snapshot on the next tick regardless of the timer.
     force_snapshot: bool,
@@ -328,13 +337,6 @@ fn write_catalog(dir: &Path, json: &str) {
     }
 }
 
-/// Hand a faction to (or take it from) the scripted macro AI.
-fn set_autopilot(ai_controlled: &mut AiControlled, team: Team, on: bool) {
-    match team {
-        Team::Claude => ai_controlled.claude = on,
-        Team::Human => ai_controlled.human = on,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Snapshot: world -> bridge/<seat>/state.json
@@ -609,6 +611,7 @@ fn write_snapshot(
     game_over: Res<GameOver>,
     squad_orders: Res<SquadOrders>,
     feed: Res<GameEvents>,
+    intent_errors: Res<IntentErrors>,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
     nodes: SnapshotNodes,
@@ -630,6 +633,7 @@ fn write_snapshot(
             &game_over,
             &squad_orders,
             &feed,
+            intent_errors.get(seat.team),
             &units,
             &buildings,
             &nodes,
@@ -649,6 +653,9 @@ fn write_seat_snapshot(
     game_over: &GameOver,
     squad_orders: &SquadOrders,
     feed: &GameEvents,
+    // Per-command validation errors this team's intents produced, from the
+    // shared compiler. Reported alongside the seat's own batch-level errors.
+    intent_errors: &[String],
     units: &SnapshotUnits,
     buildings: &SnapshotBuildings,
     nodes: &SnapshotNodes,
@@ -825,7 +832,14 @@ fn write_seat_snapshot(
         t: now,
         my_team: team_name(me),
         seq_applied: seat.last_seq,
-        errors: seat.errors.clone(),
+        // Batch-level first, then the compiler's per-command verdicts — one
+        // flat array of strings, exactly the shape the protocol always had.
+        errors: seat
+            .errors
+            .iter()
+            .chain(intent_errors.iter())
+            .cloned()
+            .collect(),
         game_over: game_over.0.map(team_name),
         me: MeOut {
             gold: eco.gold,
@@ -913,24 +927,6 @@ fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
     out
 }
 
-/// `None` when `reqs` are satisfied, otherwise the error line to report, e.g.
-/// `"cmd 3: Tower requires Barracks"`.
-fn requirement_error(
-    index: usize,
-    what: &'static str,
-    reqs: &[BuildingKind],
-    completed: &[BuildingKind],
-) -> Option<String> {
-    if requirements_met(reqs, completed.iter().copied()) {
-        return None;
-    }
-    let missing: Vec<&str> = reqs
-        .iter()
-        .filter(|r| !completed.contains(r))
-        .map(|r| building_name(*r))
-        .collect();
-    Some(format!("cmd {index}: {what} requires {}", missing.join(" + ")))
-}
 
 // ---------------------------------------------------------------------------
 // Squad membership
@@ -955,8 +951,22 @@ fn squad_members(units_out: &[UnitOut]) -> HashMap<u8, usize> {
 
 
 // ---------------------------------------------------------------------------
-// Commands: bridge/<seat>/commands.json -> orders
+// Commands: bridge/<seat>/commands.json -> Intent
 // ---------------------------------------------------------------------------
+//
+// This file used to be where a command became game state. It is not any more.
+// The bridge's whole job on this side is now transport and protocol: read the
+// file, honour `seq`, deserialize each command into a `shared::Intent`, and
+// submit it. intent.rs validates it and applies it — the same compiler the
+// human's mouse gestures go through, so neither seat has a private path into
+// the world.
+//
+// The wire format did not change, because the wire format *is* the schema:
+// `Intent`'s serde shape is the historical command shape, tag for tag and
+// field for field, `caster` alias and `use_item` rename included.
+// `tools/bridge_send.py`, `bridge_view.py` and every COMMANDER_BRIEF.md flow
+// keep working untouched, and rejected commands come back as the same strings
+// in the same `errors` array, still prefixed `cmd <i>`.
 
 #[derive(Deserialize)]
 struct Batch {
@@ -966,212 +976,16 @@ struct Batch {
     commands: Vec<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum Cmd {
-    Move {
-        units: Vec<u64>,
-        x: f32,
-        z: f32,
-    },
-    AttackMove {
-        units: Vec<u64>,
-        x: f32,
-        z: f32,
-    },
-    Attack {
-        units: Vec<u64>,
-        target: u64,
-    },
-    Harvest {
-        units: Vec<u64>,
-        target: u64,
-    },
-    Return {
-        units: Vec<u64>,
-    },
-    Follow {
-        units: Vec<u64>,
-        target: u64,
-    },
-    Stop {
-        units: Vec<u64>,
-    },
-    Build {
-        worker: u64,
-        kind: String,
-        x: f32,
-        z: f32,
-    },
-    Train {
-        building: u64,
-        unit: String,
-    },
-    Cancel {
-        building: u64,
-        index: usize,
-    },
-    Rally {
-        building: u64,
-        x: Option<f32>,
-        z: Option<f32>,
-        target: Option<u64>,
-    },
-    /// Cast the caster's one ability. The caster is a hero (`ability_of_unit`)
-    /// or one of our own finished buildings (`ability_of_building`, today only
-    /// the TownHall's Call to Arms). `hero` is the historical field name;
-    /// `caster` says what it really means now.
-    Cast {
-        #[serde(alias = "caster")]
-        hero: u64,
-    },
-    /// Buy a consumable at one of our own finished Shops. The buyer is implied:
-    /// a team has at most one living hero, and only heroes carry an inventory.
-    Buy {
-        shop: u64,
-        item: String,
-    },
-    /// Consume the hero's inventory slot 0 or 1.
-    #[serde(rename = "use_item")]
-    UseSlot {
-        slot: usize,
-    },
-    Autopilot {
-        on: bool,
-    },
-    /// Concede the match: the opponent immediately wins.
-    Surrender,
-    // --- doctrine: standing policies the executor carries out every tick ---
-    /// Focus-fire order. Empty/omitted `classes` clears the policy.
-    Priority {
-        units: Vec<u64>,
-        #[serde(default)]
-        classes: Vec<String>,
-    },
-    /// Break off below `below` (a fraction in the open range 0..1) and fall
-    /// back to x/z. `below` omitted, null, or 0 clears the policy.
-    Retreat {
-        units: Vec<u64>,
-        #[serde(default)]
-        below: Option<f32>,
-        #[serde(default)]
-        x: Option<f32>,
-        #[serde(default)]
-        z: Option<f32>,
-    },
-    /// Anchor to x/z within `radius`. `radius <= 0` clears the policy.
-    Leash {
-        units: Vec<u64>,
-        #[serde(default)]
-        x: Option<f32>,
-        #[serde(default)]
-        z: Option<f32>,
-        #[serde(default)]
-        radius: Option<f32>,
-    },
-    /// Champion-only. `min_enemies` omitted, null, or 0 clears the policy.
-    Autocast {
-        units: Vec<u64>,
-        #[serde(default)]
-        min_enemies: Option<u32>,
-    },
-    /// Squad membership. `id` omitted or null removes the units from any squad.
-    Squad {
-        units: Vec<u64>,
-        #[serde(default)]
-        id: Option<u8>,
-    },
-    /// What a squad is for. `posture` omitted or null clears the entry, which
-    /// leaves the members where they are without disbanding the squad.
-    Posture {
-        id: u8,
-        #[serde(default)]
-        posture: Option<PostureIn>,
-    },
-    /// Standing doctrine for everything a production building trains from now
-    /// on. Each piece is independent and absolute: whatever is given replaces
-    /// the whole template, and every piece omitted or null is left unset. A
-    /// command with no pieces at all removes the template entirely.
-    Template {
-        building: u64,
-        #[serde(default)]
-        squad: Option<u8>,
-        #[serde(default)]
-        retreat: Option<RetreatIn>,
-        #[serde(default)]
-        priority: Option<Vec<String>>,
-        #[serde(default)]
-        autocast: Option<u32>,
-    },
-}
-
-/// The `retreat` piece of a `template` command: break off below `below` (a
-/// fraction in the open range 0..1) and fall back to x/z.
-#[derive(Deserialize)]
-struct RetreatIn {
-    below: f32,
-    x: f32,
-    z: f32,
-}
-
-/// The inner object of a `posture` command.
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum PostureIn {
-    Defend { x: f32, z: f32, radius: f32 },
-    Push { x: f32, z: f32 },
-    Escort { unit: u64 },
-    /// Hunt bounty caches; x/z is the muster point held while none exist.
-    Forage { x: f32, z: f32 },
-}
-
-/// Entity first so the seat's own hero can be *found*, not just checked — the
-/// `buy` and `use_item` commands name no unit and infer it from the team.
-type CmdUnits<'w, 's> =
-    Query<'w, 's, (Entity, &'static Unit, &'static Team, &'static Transform)>;
-
-type CmdBuildings<'w, 's> = Query<
-    'w,
-    's,
-    (
-        &'static Building,
-        &'static Team,
-        Option<&'static UnderConstruction>,
-        Option<&'static mut TrainingQueue>,
-    ),
->;
-
-/// Anything that can be attacked: a live unit or building with a team.
-type CmdTargets<'w, 's> = Query<
-    'w,
-    's,
-    (
-        &'static Team,
-        Option<&'static Unit>,
-        Option<&'static Building>,
-    ),
->;
-
-type CmdNodes<'w, 's> = Query<'w, 's, &'static ResourceNode>;
-
-#[allow(clippy::too_many_arguments)]
+/// Read each seat's `commands.json` and submit its contents as intents.
+///
+/// Ordered `.before(IntentApply)`, so everything submitted here is compiled
+/// before this frame's snapshot is written.
 fn poll_commands(
     real: Res<Time<Real>>,
     mut bridge: ResMut<Bridge>,
-    mut ai_controlled: ResMut<AiControlled>,
     game_over: Res<GameOver>,
-    economies: Res<Economies>,
-    records: Res<HeroRecords>,
-    nav: Res<NavGrid>,
-    mut squad_orders: ResMut<SquadOrders>,
-    mut commands: Commands,
-    mut casts: EventWriter<CastAbility>,
-    mut buys: EventWriter<BuyItem>,
-    mut item_uses: EventWriter<UseItem>,
-    units: CmdUnits,
-    mut buildings: CmdBuildings,
-    targets: CmdTargets,
-    nodes: CmdNodes,
+    mut intent_errors: ResMut<IntentErrors>,
+    mut submissions: EventWriter<SubmitIntent>,
 ) {
     let delta = real.delta();
     // Every seat is polled independently; one seat's unreadable or malformed
@@ -1213,849 +1027,45 @@ fn poll_commands(
             continue;
         }
 
-        let mut errors: Vec<String> = Vec::new();
+        // A new batch replaces the last one's verdict, exactly as before: the
+        // seat's own file-level errors and the compiler's per-command errors
+        // for this team both start empty.
+        seat.errors.clear();
+        intent_errors.get_mut(seat.team).clear();
+
         if game_over.0.is_some() {
-            errors.push("batch: game over — commands ignored".to_string());
+            seat.errors
+                .push("batch: game over — commands ignored".to_string());
         } else {
-            apply_batch(
-                &batch,
-                seat.team,
-                &mut errors,
-                &mut ai_controlled,
-                &economies,
-                &records,
-                &nav,
-                &mut squad_orders,
-                &mut commands,
-                &mut casts,
-                &mut buys,
-                &mut item_uses,
-                &units,
-                &mut buildings,
-                &targets,
-                &nodes,
-            );
+            for (i, raw) in batch.commands.iter().enumerate() {
+                match serde_json::from_value::<Intent>(raw.clone()) {
+                    Ok(intent) => {
+                        submissions.write(SubmitIntent {
+                            team: seat.team,
+                            source: IntentSource::Bridge,
+                            // The historical error prefix, so a commander that
+                            // greps for `cmd 3` still finds its third command.
+                            tag: format!("cmd {i}"),
+                            intent,
+                        });
+                    }
+                    Err(err) => intent_errors
+                        .get_mut(seat.team)
+                        .push(format!("cmd {i}: unrecognized command ({err})")),
+                }
+            }
         }
 
         seat.last_seq = batch.seq;
-        seat.errors = errors;
         // Publish the result of this batch immediately instead of up to a
         // second later.
         seat.force_snapshot = true;
     }
 }
 
-/// Apply one seat's batch. `me` is that seat's team: every ownership check,
-/// economy read and squad key below is taken against it, so the same code runs
-/// for red and blue without either being able to touch the other's units.
-#[allow(clippy::too_many_arguments)]
-fn apply_batch(
-    batch: &Batch,
-    me: Team,
-    errors: &mut Vec<String>,
-    ai_controlled: &mut AiControlled,
-    economies: &Economies,
-    records: &HeroRecords,
-    nav: &NavGrid,
-    squad_orders: &mut SquadOrders,
-    commands: &mut Commands,
-    casts: &mut EventWriter<CastAbility>,
-    buys: &mut EventWriter<BuyItem>,
-    item_uses: &mut EventWriter<UseItem>,
-    units: &CmdUnits,
-    buildings: &mut CmdBuildings,
-    targets: &CmdTargets,
-    nodes: &CmdNodes,
-) {
-    for (i, raw) in batch.commands.iter().enumerate() {
-        let cmd: Cmd = match serde_json::from_value(raw.clone()) {
-            Ok(cmd) => cmd,
-            Err(err) => {
-                errors.push(format!("cmd {i}: unrecognized command ({err})"));
-                continue;
-            }
-        };
-        match cmd {
-            Cmd::Move { units: ids, x, z } => {
-                ground_order(
-                    commands,
-                    errors,
-                    i,
-                    &ids,
-                    units,
-                    me,
-                    Vec3::new(x, 0.0, z),
-                    false,
-                );
-            }
-            Cmd::AttackMove { units: ids, x, z } => {
-                ground_order(
-                    commands,
-                    errors,
-                    i,
-                    &ids,
-                    units,
-                    me,
-                    Vec3::new(x, 0.0, z),
-                    true,
-                );
-            }
-            Cmd::Attack { units: ids, target } => {
-                let Some(target_entity) = entity_of(target) else {
-                    errors.push(format!("cmd {i}: target {target} not found"));
-                    continue;
-                };
-                match targets.get(target_entity) {
-                    Ok((team, unit, building)) => {
-                        // Only the seat's enemy is a legal attack target.
-                        if *team != me.enemy() {
-                            errors.push(format!("cmd {i}: target {target} is your own"));
-                            continue;
-                        }
-                        if unit.is_none() && building.is_none() {
-                            errors.push(format!("cmd {i}: target {target} is not attackable"));
-                            continue;
-                        }
-                    }
-                    Err(_) => {
-                        errors.push(format!("cmd {i}: target {target} not found"));
-                        continue;
-                    }
-                }
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    commands
-                        .entity(entity)
-                        .try_insert(Order::Attack(target_entity));
-                }
-            }
-            Cmd::Harvest { units: ids, target } => {
-                // Resource nodes are neutral: either seat may harvest any of
-                // them.
-                let node = match entity_of(target).filter(|e| nodes.get(*e).is_ok()) {
-                    Some(node) => node,
-                    None => {
-                        errors.push(format!("cmd {i}: resource node {target} not found"));
-                        continue;
-                    }
-                };
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    // Only workers can gather; anyone else would just stand there.
-                    if !is_worker(units, entity) {
-                        errors.push(format!(
-                            "cmd {i}: unit {} is not a Worker",
-                            entity.to_bits()
-                        ));
-                        continue;
-                    }
-                    commands.entity(entity).try_insert(Order::Harvest(node));
-                }
-            }
-            Cmd::Return { units: ids } => {
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    commands.entity(entity).try_insert(Order::ReturnResources);
-                }
-            }
-            Cmd::Follow { units: ids, target } => {
-                let leader = match entity_of(target) {
-                    Some(e) => match units.get(e) {
-                        Ok((_, _, team, _)) if *team == me => e,
-                        _ => {
-                            errors.push(format!("cmd {i}: unit {target} not found/not yours"));
-                            continue;
-                        }
-                    },
-                    None => {
-                        errors.push(format!("cmd {i}: unit {target} not found/not yours"));
-                        continue;
-                    }
-                };
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    if entity == leader {
-                        continue; // a unit following itself would deadlock its own order
-                    }
-                    commands.entity(entity).try_insert(Order::Follow(leader));
-                }
-            }
-            Cmd::Stop { units: ids } => {
-                // The established Stop: re-issue a Move to the unit's own spot,
-                // which halts it and clears any attack target.
-                for (entity, pos) in own_units(&ids, units, me, i, errors) {
-                    commands.entity(entity).try_insert(Order::Move(pos));
-                }
-            }
-            Cmd::Build {
-                worker,
-                kind,
-                x,
-                z,
-            } => {
-                let Some(building_kind) = parse_building_kind(&kind) else {
-                    errors.push(format!("cmd {i}: unknown building kind '{kind}'"));
-                    continue;
-                };
-                let Some((entity, _)) = own_unit(worker, units, me) else {
-                    errors.push(format!("cmd {i}: unit {worker} not found/not yours"));
-                    continue;
-                };
-                if !is_worker(units, entity) {
-                    errors.push(format!("cmd {i}: unit {worker} is not a Worker"));
-                    continue;
-                }
-                // Same tech gate economy.rs applies at placement — reported
-                // here so the commander learns why instead of watching a
-                // worker walk out and come back empty-handed.
-                if let Some(err) = requirement_error(
-                    i,
-                    building_name(building_kind),
-                    building_requires(building_kind),
-                    &completed_kinds(buildings, me),
-                ) {
-                    errors.push(err);
-                    continue;
-                }
-                let stats = building_stats(building_kind);
-                // Snap to nav-cell boundaries exactly like the placement ghost.
-                let pos = snap_footprint(clamp_to_map(Vec3::new(x, 0.0, z)), stats.size);
-                if !nav.rect_is_free(pos, stats.size) {
-                    errors.push(format!(
-                        "cmd {i}: site ({:.1}, {:.1}) is blocked for {kind}",
-                        pos.x, pos.z
-                    ));
-                    continue;
-                }
-                if !economies
-                    .get(me)
-                    .can_afford(stats.cost_gold, stats.cost_lumber)
-                {
-                    errors.push(format!(
-                        "cmd {i}: cannot afford {kind} ({}g {}l)",
-                        stats.cost_gold, stats.cost_lumber
-                    ));
-                    continue;
-                }
-                // economy.rs pays when the worker reaches the site, same as the UI.
-                commands.entity(entity).try_insert(Order::Build {
-                    kind: building_kind,
-                    pos,
-                });
-            }
-            Cmd::Train { building, unit } => {
-                let Some(kind) = parse_unit_kind(&unit) else {
-                    errors.push(format!("cmd {i}: unknown unit kind '{unit}'"));
-                    continue;
-                };
-                // Read the tech state before taking the mutable borrow of the
-                // producing building below.
-                let completed = completed_kinds(buildings, me);
-                if let Some(err) =
-                    requirement_error(i, kind_name(kind), unit_requires(kind), &completed)
-                {
-                    errors.push(err);
-                    continue;
-                }
-                let Some(entity) = entity_of(building) else {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                };
-                let Ok((b, team, under, queue)) = buildings.get_mut(entity) else {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                };
-                if *team != me {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                }
-                if under.is_some() {
-                    errors.push(format!("cmd {i}: building {building} is under construction"));
-                    continue;
-                }
-                if !trainable(b.kind).contains(&kind) {
-                    errors.push(format!(
-                        "cmd {i}: {} cannot train {unit}",
-                        building_name(b.kind)
-                    ));
-                    continue;
-                }
-                let Some(mut queue) = queue else {
-                    errors.push(format!("cmd {i}: building {building} has no training queue"));
-                    continue;
-                };
-                if queue.queue.len() >= MAX_QUEUE {
-                    errors.push(format!("cmd {i}: training queue full ({MAX_QUEUE})"));
-                    continue;
-                }
-                // The Champion is priced by `hero_train_cost` (full, then revival).
-                let (cost_gold, cost_lumber) = if kind == UnitKind::Hero {
-                    let (g, l, _) = hero_train_cost(records, me);
-                    (g, l)
-                } else {
-                    let s = unit_stats(kind);
-                    (s.cost_gold, s.cost_lumber)
-                };
-                if !economies.get(me).can_afford(cost_gold, cost_lumber) {
-                    errors.push(format!(
-                        "cmd {i}: cannot afford {unit} ({cost_gold}g {cost_lumber}l)"
-                    ));
-                    continue;
-                }
-                // Gate only — economy.rs deducts when training starts.
-                queue.queue.push_back(kind);
-            }
-            Cmd::Cancel { building, index } => {
-                let Some(entity) = entity_of(building) else {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                };
-                let Ok((_, team, _, queue)) = buildings.get_mut(entity) else {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                };
-                if *team != me {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                }
-                let Some(mut queue) = queue else {
-                    errors.push(format!("cmd {i}: building {building} has no training queue"));
-                    continue;
-                };
-                if index >= queue.queue.len() {
-                    errors.push(format!("cmd {i}: queue index {index} out of range"));
-                    continue;
-                }
-                queue.queue.remove(index);
-                if index == 0 {
-                    queue.progress = 0.0;
-                }
-            }
-            Cmd::Rally {
-                building,
-                x,
-                z,
-                target,
-            } => {
-                let Some(entity) = entity_of(building) else {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                };
-                let Ok((b, team, _, _)) = buildings.get(entity) else {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                };
-                if *team != me {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                }
-                if trainable(b.kind).is_empty() {
-                    errors.push(format!(
-                        "cmd {i}: {} produces no units",
-                        building_name(b.kind)
-                    ));
-                    continue;
-                }
-                let rally = match (x, z, target) {
-                    (Some(x), Some(z), _) => {
-                        Some(RallyTarget::Ground(clamp_to_map(Vec3::new(x, 0.0, z))))
-                    }
-                    (_, _, Some(id)) => match entity_of(id) {
-                        // A resource node (neutral, so either seat may name
-                        // one) makes new workers start gathering; one of our
-                        // own units makes new units follow it.
-                        Some(e) if nodes.get(e).is_ok() => Some(RallyTarget::Node(e)),
-                        Some(e) => match units.get(e) {
-                            Ok((_, _, team, _)) if *team == me => Some(RallyTarget::Unit(e)),
-                            _ => None,
-                        },
-                        None => None,
-                    },
-                    _ => None,
-                };
-                match rally {
-                    Some(target) => {
-                        commands.entity(entity).try_insert(RallyPoint { target });
-                    }
-                    None => errors.push(format!(
-                        "cmd {i}: rally needs x/z or a valid node/own-unit target"
-                    )),
-                }
-            }
-            Cmd::Cast { hero } => {
-                let Some(entity) = entity_of(hero) else {
-                    errors.push(format!("cmd {i}: caster {hero} not found/not yours"));
-                    continue;
-                };
-                // A caster is either one of our heroes (any class — the Hero
-                // component and `ability_of_unit` agree on which kinds have an
-                // ability) or one of our finished buildings with an ability.
-                // combat.rs owns the mana/cooldown verdict either way, exactly
-                // as it does for the R and C hotkeys.
-                let unit_caster = matches!(
-                    units.get(entity),
-                    Ok((_, u, team, _)) if *team == me && ability_of_unit(u.kind).is_some()
-                );
-                if !unit_caster {
-                    match buildings.get(entity) {
-                        Ok((b, team, under, _)) if *team == me => {
-                            if under.is_some() {
-                                errors.push(format!(
-                                    "cmd {i}: building {hero} is under construction"
-                                ));
-                                continue;
-                            }
-                            if ability_of_building(b.kind).is_none() {
-                                errors.push(format!(
-                                    "cmd {i}: {} has no ability",
-                                    building_name(b.kind)
-                                ));
-                                continue;
-                            }
-                        }
-                        _ => {
-                            errors.push(format!(
-                                "cmd {i}: caster {hero} is not a hero or an own ability building"
-                            ));
-                            continue;
-                        }
-                    }
-                }
-                casts.write(CastAbility { caster: entity });
-            }
-            Cmd::Buy { shop, item } => {
-                let Some(item) = parse_item(&item) else {
-                    errors.push(format!("cmd {i}: unknown item '{item}'"));
-                    continue;
-                };
-                let Some(entity) = entity_of(shop) else {
-                    errors.push(format!("cmd {i}: building {shop} not found/not yours"));
-                    continue;
-                };
-                let Ok((b, team, under, _)) = buildings.get(entity) else {
-                    errors.push(format!("cmd {i}: building {shop} not found/not yours"));
-                    continue;
-                };
-                if *team != me {
-                    errors.push(format!("cmd {i}: building {shop} not found/not yours"));
-                    continue;
-                }
-                if b.kind != BuildingKind::Shop {
-                    errors.push(format!(
-                        "cmd {i}: {} does not sell items",
-                        building_name(b.kind)
-                    ));
-                    continue;
-                }
-                if under.is_some() {
-                    errors.push(format!("cmd {i}: building {shop} is under construction"));
-                    continue;
-                }
-                // The buyer is implied: a team fields exactly one hero.
-                let Some(hero) = own_hero(units, me) else {
-                    errors.push(format!("cmd {i}: no living hero to buy for"));
-                    continue;
-                };
-                // economy.rs re-validates and pays (gold, free slot, distance-
-                // free just like the UI's Shop card).
-                buys.write(BuyItem {
-                    shop: entity,
-                    hero,
-                    item,
-                });
-            }
-            Cmd::UseSlot { slot } => {
-                if slot >= INVENTORY_SLOTS {
-                    errors.push(format!(
-                        "cmd {i}: item slot {slot} out of range (0..{})",
-                        INVENTORY_SLOTS - 1
-                    ));
-                    continue;
-                }
-                let Some(hero) = own_hero(units, me) else {
-                    errors.push(format!("cmd {i}: no living hero to use an item"));
-                    continue;
-                };
-                // combat.rs checks the slot is actually filled.
-                item_uses.write(UseItem { hero, slot });
-            }
-            Cmd::Autopilot { on } => {
-                // Only ever this seat's own faction.
-                set_autopilot(ai_controlled, me, on);
-                info!(
-                    "bridge: autopilot {} for {:?} — scripted AI {} the macro game",
-                    if on { "ON" } else { "OFF" },
-                    me,
-                    if on { "takes over" } else { "releases" }
-                );
-            }
-            Cmd::Surrender => {
-                info!("bridge: {:?} seat surrenders", me);
-                commands.send_event(Surrender { team: me });
-            }
-            Cmd::Priority {
-                units: ids,
-                classes,
-            } => {
-                // One bad class name invalidates the whole list rather than
-                // silently installing a priority order the commander didn't ask
-                // for.
-                let parsed = match parse_target_classes(&classes) {
-                    Ok(parsed) => parsed,
-                    Err(name) => {
-                        errors.push(format!("cmd {i}: unknown target class '{name}'"));
-                        continue;
-                    }
-                };
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    let mut ec = commands.entity(entity);
-                    if parsed.is_empty() {
-                        ec.try_remove::<TargetPriority>();
-                    } else {
-                        ec.try_insert(TargetPriority(parsed.clone()));
-                    }
-                }
-            }
-            Cmd::Retreat {
-                units: ids,
-                below,
-                x,
-                z,
-            } => {
-                let below_frac = below.unwrap_or(0.0);
-                let clear = below_frac == 0.0;
-                if !clear && !(below_frac > 0.0 && below_frac < 1.0) {
-                    errors.push(format!(
-                        "cmd {i}: retreat 'below' must be a fraction in (0,1), got {below_frac}"
-                    ));
-                    continue;
-                }
-                let rally = match (x, z) {
-                    (Some(x), Some(z)) => Some(clamp_to_map(Vec3::new(x, 0.0, z))),
-                    _ => None,
-                };
-                if !clear && rally.is_none() {
-                    errors.push(format!("cmd {i}: retreat needs a rally x/z"));
-                    continue;
-                }
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    let mut ec = commands.entity(entity);
-                    match rally {
-                        Some(rally) if !clear => {
-                            ec.try_insert(RetreatPolicy { below_frac, rally });
-                        }
-                        _ => {
-                            ec.try_remove::<RetreatPolicy>();
-                        }
-                    }
-                }
-            }
-            Cmd::Leash {
-                units: ids,
-                x,
-                z,
-                radius,
-            } => {
-                let radius = radius.unwrap_or(0.0);
-                let clear = !(radius > 0.0);
-                let anchor = match (x, z) {
-                    (Some(x), Some(z)) => Some(clamp_to_map(Vec3::new(x, 0.0, z))),
-                    _ => None,
-                };
-                if !clear && anchor.is_none() {
-                    errors.push(format!("cmd {i}: leash needs an anchor x/z"));
-                    continue;
-                }
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    let mut ec = commands.entity(entity);
-                    match anchor {
-                        Some(anchor) if !clear => {
-                            ec.try_insert(LeashPolicy { anchor, radius });
-                        }
-                        _ => {
-                            ec.try_remove::<LeashPolicy>();
-                        }
-                    }
-                }
-            }
-            Cmd::Autocast {
-                units: ids,
-                min_enemies,
-            } => {
-                let min_enemies = min_enemies.unwrap_or(0);
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    // Any hero class can auto-cast; nothing else has an ability.
-                    if !matches!(units.get(entity), Ok((_, u, _, _)) if is_hero_kind(u.kind)) {
-                        errors.push(format!(
-                            "cmd {i}: unit {} is not a hero",
-                            entity.to_bits()
-                        ));
-                        continue;
-                    }
-                    let mut ec = commands.entity(entity);
-                    if min_enemies == 0 {
-                        ec.try_remove::<AutoCastPolicy>();
-                    } else {
-                        ec.try_insert(AutoCastPolicy { min_enemies });
-                    }
-                }
-            }
-            Cmd::Squad { units: ids, id } => {
-                for (entity, _) in own_units(&ids, units, me, i, errors) {
-                    let mut ec = commands.entity(entity);
-                    match id {
-                        Some(id) => {
-                            ec.try_insert(SquadId(id));
-                        }
-                        None => {
-                            ec.try_remove::<SquadId>();
-                        }
-                    }
-                }
-            }
-            Cmd::Posture { id, posture } => {
-                // Squad ids are per-team, so red's squad 1 and blue's squad 1
-                // are different squads.
-                let posture = match posture {
-                    None => {
-                        // Clearing a posture leaves membership intact: the squad
-                        // simply stops being re-tasked.
-                        squad_orders.0.remove(&(me, id));
-                        continue;
-                    }
-                    Some(PostureIn::Defend { x, z, radius }) => {
-                        if !(radius > 0.0) {
-                            errors.push(format!(
-                                "cmd {i}: defend radius must be > 0, got {radius}"
-                            ));
-                            continue;
-                        }
-                        SquadPosture::Defend {
-                            pos: clamp_to_map(Vec3::new(x, 0.0, z)),
-                            radius,
-                        }
-                    }
-                    Some(PostureIn::Push { x, z }) => SquadPosture::Push {
-                        pos: clamp_to_map(Vec3::new(x, 0.0, z)),
-                    },
-                    Some(PostureIn::Forage { x, z }) => SquadPosture::Forage {
-                        muster: clamp_to_map(Vec3::new(x, 0.0, z)),
-                    },
-                    Some(PostureIn::Escort { unit }) => {
-                        let Some((target, _)) = own_unit(unit, units, me) else {
-                            errors
-                                .push(format!("cmd {i}: unit {unit} not found/not yours"));
-                            continue;
-                        };
-                        SquadPosture::Escort { unit: target }
-                    }
-                };
-                squad_orders.0.insert((me, id), posture);
-            }
-            Cmd::Template {
-                building,
-                squad,
-                retreat,
-                priority,
-                autocast,
-            } => {
-                // Only our own, finished, unit-producing buildings can carry a
-                // template — anywhere else it would never be read.
-                let Some(entity) = entity_of(building) else {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                };
-                let Ok((b, team, under, queue)) = buildings.get(entity) else {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                };
-                if *team != me {
-                    errors.push(format!("cmd {i}: building {building} not found/not yours"));
-                    continue;
-                }
-                if under.is_some() {
-                    errors.push(format!("cmd {i}: building {building} is under construction"));
-                    continue;
-                }
-                if queue.is_none() {
-                    errors.push(format!(
-                        "cmd {i}: {} has no training queue",
-                        building_name(b.kind)
-                    ));
-                    continue;
-                }
-                // Same class parsing (and same all-or-nothing rule) as the
-                // `priority` command; an empty list means "no priority piece".
-                let priority = match priority {
-                    Some(names) => match parse_target_classes(&names) {
-                        Ok(parsed) => (!parsed.is_empty()).then_some(parsed),
-                        Err(name) => {
-                            errors.push(format!("cmd {i}: unknown target class '{name}'"));
-                            continue;
-                        }
-                    },
-                    None => None,
-                };
-                let retreat = match retreat {
-                    Some(r) => {
-                        if !(r.below > 0.0 && r.below < 1.0) {
-                            errors.push(format!(
-                                "cmd {i}: template retreat 'below' must be a fraction in (0,1), \
-                                 got {}",
-                                r.below
-                            ));
-                            continue;
-                        }
-                        Some(RetreatPolicy {
-                            below_frac: r.below,
-                            rally: clamp_to_map(Vec3::new(r.x, 0.0, r.z)),
-                        })
-                    }
-                    None => None,
-                };
-                // 0 reads as "off" here exactly as it does in `autocast`.
-                let autocast = autocast.filter(|n| *n > 0);
-
-                let template = DoctrineTemplate {
-                    squad,
-                    retreat,
-                    priority,
-                    autocast,
-                };
-                let empty = template.squad.is_none()
-                    && template.retreat.is_none()
-                    && template.priority.is_none()
-                    && template.autocast.is_none();
-                let mut ec = commands.entity(entity);
-                if empty {
-                    ec.try_remove::<DoctrineTemplate>();
-                } else {
-                    ec.try_insert(template);
-                }
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Ids on the wire are `Entity::to_bits`; invalid bit patterns resolve to None
-/// instead of panicking.
-fn entity_of(id: u64) -> Option<Entity> {
-    Entity::try_from_bits(id).ok()
-}
-
-/// Resolve one id to a living unit of the seat's own team.
-fn own_unit(id: u64, units: &CmdUnits, me: Team) -> Option<(Entity, Vec3)> {
-    let entity = entity_of(id)?;
-    match units.get(entity) {
-        Ok((_, _, team, tf)) if *team == me => Some((entity, tf.translation)),
-        _ => None,
-    }
-}
-
-/// The seat's living hero, whichever class it plays. `buy` and `use_item` name
-/// no unit: a team has at most one hero, so there is nothing to disambiguate.
-fn own_hero(units: &CmdUnits, me: Team) -> Option<Entity> {
-    units
-        .iter()
-        .find(|(_, u, team, _)| **team == me && is_hero_kind(u.kind))
-        .map(|(entity, ..)| entity)
-}
-
-/// Resolve a list of ids to living units of the seat's own team, recording one
-/// error per id that doesn't qualify (an enemy's unit included).
-fn own_units(
-    ids: &[u64],
-    units: &CmdUnits,
-    me: Team,
-    index: usize,
-    errors: &mut Vec<String>,
-) -> Vec<(Entity, Vec3)> {
-    if ids.is_empty() {
-        errors.push(format!("cmd {index}: no units given"));
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(ids.len());
-    for &id in ids {
-        match own_unit(id, units, me) {
-            Some(found) => out.push(found),
-            None => errors.push(format!("cmd {index}: unit {id} not found/not yours")),
-        }
-    }
-    out
-}
-
-/// The seat's completed (not under construction) buildings — the input to
-/// every requirement check on the command path.
-fn completed_kinds(buildings: &CmdBuildings, me: Team) -> Vec<BuildingKind> {
-    buildings
-        .iter()
-        .filter(|(_, team, under, _)| **team == me && under.is_none())
-        .map(|(building, ..)| building.kind)
-        .collect()
-}
-
-fn is_worker(units: &CmdUnits, entity: Entity) -> bool {
-    matches!(units.get(entity), Ok((_, u, _, _)) if u.kind == UnitKind::Worker)
-}
-
-/// Move / AttackMove for a group, spread over the UI's formation grid.
-#[allow(clippy::too_many_arguments)]
-fn ground_order(
-    commands: &mut Commands,
-    errors: &mut Vec<String>,
-    index: usize,
-    ids: &[u64],
-    units: &CmdUnits,
-    me: Team,
-    ground: Vec3,
-    attack_move: bool,
-) {
-    let group = own_units(ids, units, me, index, errors);
-    let count = group.len();
-    for (i, (entity, _)) in group.into_iter().enumerate() {
-        let p = clamp_to_map(ground + formation_offset(i, count));
-        let order = if attack_move {
-            Order::AttackMove(p)
-        } else {
-            Order::Move(p)
-        };
-        commands.entity(entity).try_insert(order);
-    }
-}
-
-/// Deterministic grid offsets so a group doesn't pile onto one spot.
-fn formation_offset(index: usize, count: usize) -> Vec3 {
-    if count <= 1 {
-        return Vec3::ZERO;
-    }
-    let cols = (count as f32).sqrt().ceil().max(1.0) as usize;
-    let rows = count.div_ceil(cols);
-    let col = index % cols;
-    let row = index / cols;
-    Vec3::new(
-        (col as f32 - (cols as f32 - 1.0) * 0.5) * FORMATION_SPACING,
-        0.0,
-        (row as f32 - (rows as f32 - 1.0) * 0.5) * FORMATION_SPACING,
-    )
-}
-
-fn clamp_to_map(p: Vec3) -> Vec3 {
-    Vec3::new(
-        p.x.clamp(-MAP_HALF + 2.0, MAP_HALF - 2.0),
-        0.0,
-        p.z.clamp(-MAP_HALF + 2.0, MAP_HALF - 2.0),
-    )
-}
-
-/// Snap a footprint centre so its edges land on nav-cell boundaries.
-fn snap_footprint(p: Vec3, size: f32) -> Vec3 {
-    let half = size * 0.5;
-    Vec3::new(
-        ((p.x - half) / CELL).round() * CELL + half,
-        0.0,
-        ((p.z - half) / CELL).round() * CELL + half,
-    )
-}
 
 /// One decimal place — snapshots stay small and diff cleanly.
 fn r1(v: f32) -> f32 {
@@ -2088,27 +1098,6 @@ fn target_class_name(class: TargetClass) -> &'static str {
     class.name()
 }
 
-/// Parse a whole class list, all-or-nothing: `Err(name)` names the first
-/// unknown class so the caller can reject the command outright rather than
-/// install a focus-fire order nobody asked for.
-fn parse_target_classes(names: &[String]) -> Result<Vec<TargetClass>, String> {
-    let mut out = Vec::with_capacity(names.len());
-    for name in names {
-        match parse_target_class(name) {
-            Some(class) => out.push(class),
-            None => return Err(name.clone()),
-        }
-    }
-    Ok(out)
-}
-
-fn parse_target_class(name: &str) -> Option<TargetClass> {
-    ALL_TARGET_CLASSES
-        .iter()
-        .copied()
-        .find(|c| c.name().eq_ignore_ascii_case(name))
-}
-
 /// One-line rendering of a posture for the snapshot.
 fn posture_name(posture: &SquadPosture) -> String {
     match posture {
@@ -2121,39 +1110,4 @@ fn posture_name(posture: &SquadPosture) -> String {
             format!("forage@({:.1},{:.1})", muster.x, muster.z)
         }
     }
-}
-
-/// Loose form of a name on the wire: case, spaces, dashes and underscores are
-/// all noise, so `"town_hall"`, `"Town Hall"` and `"townhall"` are one name.
-fn normalize_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
-
-/// Both parsers match against the catalog's own ids (`shared::kind_name` /
-/// `building_name`), so a kind added to the shared enums is orderable through
-/// the bridge the moment it exists — no table here to fall out of date.
-fn parse_unit_kind(name: &str) -> Option<UnitKind> {
-    let wanted = normalize_name(name);
-    ALL_UNIT_KINDS
-        .into_iter()
-        .find(|k| normalize_name(kind_name(*k)) == wanted)
-}
-
-fn parse_building_kind(name: &str) -> Option<BuildingKind> {
-    let wanted = normalize_name(name);
-    ALL_BUILDING_KINDS
-        .into_iter()
-        .find(|k| normalize_name(building_name(*k)) == wanted)
-}
-
-/// Items parse off the catalog's own ids too (`item_def(..).name`), so
-/// `"town_portal"`, `"Town Portal"` and `"TownPortal"` are one item.
-fn parse_item(name: &str) -> Option<ItemId> {
-    let wanted = normalize_name(name);
-    ALL_ITEMS
-        .into_iter()
-        .find(|id| normalize_name(item_def(*id).name) == wanted)
 }

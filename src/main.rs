@@ -6,6 +6,7 @@ mod bridge;
 mod combat;
 mod doctrine;
 mod economy;
+mod intent;
 mod shared;
 mod terrain;
 mod ui;
@@ -53,6 +54,9 @@ fn main() {
 
     app.add_plugins((
         shared::CorePlugin,
+        // The intent compiler: the one path from a player's meaning to game
+        // state. Registered before every interface plugin that submits to it.
+        intent::IntentPlugin,
         terrain::TerrainPlugin { headless },
         units::UnitsPlugin,
         combat::CombatPlugin,

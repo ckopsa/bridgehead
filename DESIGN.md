@@ -30,6 +30,16 @@ Win by destroying all enemy buildings.
   it into `state.json` for an external commander, ui.rs draws it as HUD
   notifications for the player. A feed with two producers is two feeds, and two
   feeds is an information advantage for whichever side has the better one.
+- `intent.rs` (v2): the **intent compiler** — the single place a player's
+  meaning becomes game state. `shared::Intent` is the vocabulary (23 verbs,
+  serde-serializable, wire-identical to the bridge protocol); `ui.rs` compiles
+  mouse gestures into it and `bridge.rs` deserializes `commands.json` into it,
+  and neither may mutate the world any other way. Also writes the per-match
+  intent log (`bridge/intent_log.jsonl`): every intent as an English sentence
+  plus its serialized form, so a replay reads the same regardless of who was
+  playing. Engine follow-through (economy/combat/doctrine) and the scripted
+  `ai.rs` are not players and still write components directly. Ordering is via
+  the `IntentApply` system set. See docs/INTENT.md.
 - `terrain.rs`: ground, doodads, resource nodes (gold mines at
   `GOLD_MINE_POSITIONS`, tree clusters), lighting, **RTS camera** (spawns the
   `MainCamera`), blocks trees/mines in `NavGrid`, and owns the **map layout**:
@@ -53,9 +63,11 @@ Win by destroying all enemy buildings.
   `SpawnUnitEvent` near the building when done, refunds nothing on death).
 - `ui.rs`: selection (left click + drag box over own units/buildings), right-click
   context orders (enemy → Attack, resource node → Harvest for workers, ground →
-  Move; A+click → AttackMove), building placement mode with ghost + affordability
-  (writes `Order::Build`), training hotkeys/buttons on selected production
-  buildings (push to `TrainingQueue` if affordable), top resource bar,
+  Move; A+click → AttackMove), building placement mode with ghost + affordability,
+  training hotkeys/buttons on selected production
+  buildings, doctrine toggles on the command card — all of which *compile to
+  `Intent` values and submit them*; ui.rs mutates no game state itself. Plus the
+  top resource bar,
   selection info panel, game-over banner from `GameOver`, top-right alert stack
   rendering `GameEvents::feed(Team::Human)` (severity colours, fade-out, Space
   or click focuses the camera via `CameraFocus`).
@@ -63,13 +75,20 @@ Win by destroying all enemy buildings.
   order (farms before supply block, barracks, more workers), trains army,
   attack-moves waves at the human base. Acts ONLY through the same primitives the
   UI uses: writing `Order`, pushing to `TrainingQueue` (after checking/paying the
-  same way), sending events. Never teleports or cheats resources.
+  same way), sending events. Never teleports or cheats resources. It is engine
+  baseline rather than a seat, so it still writes those directly instead of
+  going through `intent.rs` — a known asymmetry, noted in docs/INTENT.md.
 
 ## Cross-module conventions
 
-- **Orders**: `ui.rs`/`ai.rs` set `Order` on entities. Executors react via
-  `Changed<Order>` and then own the follow-through. A module handling one order
-  variant must tolerate the order being overwritten at any time (always re-check).
+- **Orders**: `intent.rs` (for the two player interfaces) and `ai.rs` set
+  `Order` on entities. Executors react via `Changed<Order>` and then own the
+  follow-through. A module handling one order variant must tolerate the order
+  being overwritten at any time (always re-check).
+- **Player intent**: `ui.rs` and `bridge.rs` never mutate game state. They
+  build `shared::Intent` values and write `SubmitIntent`; `intent.rs` validates
+  and applies. Adding a player-facing capability means adding a verb to
+  `Intent`, which adds it to both seats at once.
 - **Movement**: only `units.rs` moves unit Transforms. Everyone else inserts
   `MoveTo { target }` (or an Order that units.rs turns into movement). Absence of
   `MoveTo` == not moving. Insert a fresh `MoveTo` to re-path.
