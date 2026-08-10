@@ -13,6 +13,9 @@
 //!   * `bridge.rs` deserializes `commands.json` straight into `Intent` values;
 //!     the wire format *is* the schema, so the protocol did not change when the
 //!     compiler moved here.
+//!   * `ai.rs`, the scripted commander, builds `Intent` values out of the
+//!     decisions its think tick reaches — the third seat, and since
+//!     wc3clone-jem no longer an exception to any of this.
 //!
 //! Everything downstream of this file is unchanged: the compiler writes the
 //! same `Order` components, `TrainingQueue` pushes, `RallyPoint`s, doctrine
@@ -23,22 +26,23 @@
 //!
 //! ## The fairness invariant
 //!
-//! **No player-facing mutation path exists except intent submission.** That is
-//! what makes THESIS.md's structural claim checkable rather than aspirational:
-//! the AI cannot act in ways the human cannot, and — the half we had been
-//! failing — the human cannot be denied a verb the AI has, because there is one
-//! list of verbs and one compiler reading it.
+//! **No commander mutates game state except through intent submission.** No
+//! footnote, no "except the script". That is what makes THESIS.md's structural
+//! claim checkable rather than aspirational: the AI cannot act in ways the
+//! human cannot, and — the half we had been failing — the human cannot be
+//! denied a verb the AI has, because there is one list of verbs and one
+//! compiler reading it. All three seats speak it: `ui`, `bridge`/`copilot`,
+//! and `script`.
 //!
-//! Two things are deliberately *not* players and stay as they are:
+//! One thing is deliberately *not* a commander and stays as it is:
 //!
 //!   * **Engine systems.** economy.rs's harvest follow-through and payments,
 //!     combat.rs's chase, doctrine.rs's squad re-tasking and retreat triggers
 //!     are the engine executing standing policy at machine speed. They write
 //!     `Order`s directly and always will — that asymmetry *is* the tempo design
-//!     (see docs/TEMPO.md §C4).
-//!   * **The scripted `ai.rs`.** It is engine baseline, not a seat: it still
-//!     writes `Order`s, queue pushes and `UpgradeBuilding` directly. This is a
-//!     known asymmetry, documented in docs/INTENT.md, and the natural next bead.
+//!     (see docs/TEMPO.md §C4). The distinction that matters is not "human vs
+//!     machine" but "deciding vs executing": ai.rs *decides*, so it speaks;
+//!     doctrine.rs *executes what was already decided*, so it does not.
 //!
 //! ## Knowability
 //!
@@ -452,11 +456,27 @@ fn apply_intents(
                 &mut notice_budget,
             );
         }
-        let sink = error_log.get_mut(submission.team);
-        sink.extend(errors);
-        if sink.len() > MAX_ERRORS {
-            let overflow = sink.len() - MAX_ERRORS;
-            sink.drain(..overflow);
+        // Where a refusal is DELIVERED — never whether it happened. The
+        // scripted commander reads no snapshot and watches no alert stack, so
+        // putting its errors in the team's channel would hand a seat sharing
+        // that faction (autopilot handed back mid-match, a co-commander) a list
+        // of failures it did not cause and cannot act on. It re-thinks every
+        // second and simply tries again, so the useful audience for a script
+        // rejection is whoever is reading a sim's `RUST_LOG=debug` trace.
+        //
+        // The verdict itself already went everywhere it goes: the intent log
+        // has the sentence, its `ok: false` and the error strings verbatim.
+        if submission.source == IntentSource::Script {
+            for error in &errors {
+                debug!("[script {:?}] refused: {error}", submission.team);
+            }
+        } else {
+            let sink = error_log.get_mut(submission.team);
+            sink.extend(errors);
+            if sink.len() > MAX_ERRORS {
+                let overflow = sink.len() - MAX_ERRORS;
+                sink.drain(..overflow);
+            }
         }
 
         // **The acknowledgement** (docs/TEMPO.md §4, issue 6). The human at the

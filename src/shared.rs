@@ -5591,6 +5591,25 @@ pub enum IntentSource {
     /// upstream of submission, and is a matter of etiquette rather than of
     /// legality (see docs/INTENT.md § co-command).
     Copilot,
+    /// The SCRIPTED COMMANDER (ai.rs), which drives the Claude faction always
+    /// and either faction under `autopilot`.
+    ///
+    /// It used to be the last thing in the game that changed state without
+    /// saying anything: it wrote `Order`s, pushed `TrainingQueue`s and sent
+    /// `UpgradeBuilding` straight through, which meant the fairness invariant
+    /// had to be stated with a footnote. It is a seat now. Every action it
+    /// takes is a `SubmitIntent` like anybody else's — validated by the same
+    /// compiler, refused by the same rules, priced by the same link, and
+    /// written to the same replay log, so a replay finally names all three
+    /// authors instead of two and a silence.
+    ///
+    /// Descriptive, never authoritative, exactly like the three above: the
+    /// compiler reaches its verdict without consulting this field. What the
+    /// variant *does* decide is where a refusal is delivered — a script has no
+    /// snapshot and no alert stack, so its errors go to the debug log (see
+    /// `apply_intents`) rather than into a seat's error channel it does not
+    /// read and a human never caused.
+    Script,
 }
 
 impl IntentSource {
@@ -5599,6 +5618,7 @@ impl IntentSource {
             IntentSource::Ui => "ui",
             IntentSource::Bridge => "bridge",
             IntentSource::Copilot => "copilot",
+            IntentSource::Script => "script",
         }
     }
 }
@@ -5661,9 +5681,12 @@ pub enum Cause {
         kind: &'static str,
         building: Entity,
     },
-    /// The scripted `ai.rs` baseline. Not a seat (see docs/INTENT.md), so it
-    /// gets its own rung rather than borrowing `Order`'s.
-    Script { what: &'static str },
+    // NOTE: there used to be a `Script { what }` rung here, for the scripted
+    // `ai.rs` baseline, "not a seat, so it gets its own rung rather than
+    // borrowing `Order`'s". ai.rs is a seat now (`IntentSource::Script`), and
+    // its orders come out of the compiler stamped `order:<verb> by script`
+    // like everybody else's — which is the whole of the answer, and one rung
+    // fewer to explain.
     /// Engine default: nothing above applies. `"idle"` renders bare.
     Instinct { what: &'static str },
 }
@@ -5688,7 +5711,7 @@ impl Provenance {
     /// posture:push sq1               squad 1's standing posture
     /// policy:retreat t=210           a retreat threshold fired
     /// template:Barracks#4294968163   stamped at spawn by that building
-    /// script:wave                    the scripted AI baseline
+    /// order:attackmove by script t=5 the scripted AI, speaking as a seat
     /// instinct:flee                  an engine reflex
     /// idle                           nothing to do
     /// ```
@@ -5713,7 +5736,6 @@ impl Provenance {
                 kind,
                 building,
             } => format!("{how}:{kind}#{}", building.to_bits()),
-            Cause::Script { what } => format!("script:{what}"),
             // The one bare word: "idle" is the absence of a reason, and
             // dressing it up as `instinct:idle` would imply there was one.
             Cause::Instinct { what } if what == "idle" => "idle".to_string(),
@@ -5837,6 +5859,31 @@ impl SubmitIntent {
             tag: format!("trigger:{name}"),
             intent,
             trigger: Some(name),
+        }
+    }
+
+    /// A decision from the scripted commander (ai.rs).
+    ///
+    /// One flat tag rather than the bridge's `cmd 3`: a batch is a document
+    /// whose commands need distinguishing, a think tick is a stream of
+    /// independent sentences and nobody is going to look one of them up by
+    /// number. What the tag does buy is a debug line that says *who* was
+    /// refused without having to read the verb.
+    pub fn script(team: Team, intent: Intent) -> Self {
+        SubmitIntent {
+            team,
+            source: IntentSource::Script,
+            tag: "script".to_string(),
+            intent,
+            // **The script pays.** `None` is load-bearing here, not a default
+            // filled in to satisfy the compiler: `apply_intents` hands a
+            // trigger-fired intent the `exempt_issuer`, and a scripted think
+            // tick is not a trigger firing — it is a commander deciding, at
+            // the moment of deciding, which is the thing the link prices.
+            // docs/TEMPO.md §3's "the scripted AI pays latency too, or
+            // autopilot becomes a cheat at the third seat" is enforced by this
+            // field being what it is.
+            trigger: None,
         }
     }
 }
@@ -8128,7 +8175,15 @@ mod tests {
                 12.0,
                 stamped,
             ),
-            (Cause::Script { what: "wave" }, 5.0, "script:wave".to_string()),
+            (
+                // The third seat, since wc3clone-jem: the scripted commander
+                // submits intents like the other two, so its wave reads as an
+                // ORDER by `script` rather than as a rung of its own. Nothing
+                // in the format is special-cased for it — that IS the claim.
+                Cause::Order { verb: "attackmove", source: IntentSource::Script },
+                5.0,
+                "order:attackmove by script t=5".to_string(),
+            ),
             (
                 Cause::Instinct { what: "auto-enroll" },
                 5.0,
