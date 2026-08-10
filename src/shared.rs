@@ -3774,6 +3774,21 @@ impl FogGrids {
         }
     }
 
+    /// Test-only twin of `test_dark`: both grids fully lit, fog still nominally
+    /// ON. For a test whose subject is what a team DOES about something it can
+    /// see, rather than whether it can see it — a scripted-AI reaction, say.
+    /// Pinning it here keeps the ambient `WC3_FOG` out of the outcome in both
+    /// directions.
+    #[cfg(test)]
+    pub fn test_revealed() -> Self {
+        FogGrids {
+            enabled: true,
+            human: FogGrid::revealed(),
+            claude: FogGrid::revealed(),
+            ..Default::default()
+        }
+    }
+
     /// Test-only: plant a memory in `team`'s grid, exactly as `update_fog`
     /// does when the structure is in sight, without a scout having to walk
     /// there and back.
@@ -5313,7 +5328,11 @@ fn initial_spawns(
 
 /// Despawn anything whose Health reached zero; free building footprints,
 /// snapshot dying heroes for revival, and drop XP for nearby enemy heroes.
-fn apply_death(
+///
+/// `pub(crate)` only so combat.rs's fixed-clock test harness can register the
+/// real one: a simulated duel where the dead keep swinging measures nothing.
+/// It is still `CorePlugin`'s system and nobody else's to schedule.
+pub(crate) fn apply_death(
     mut commands: Commands,
     mut nav: ResMut<NavGrid>,
     mut records: ResMut<HeroRecords>,
@@ -5459,7 +5478,10 @@ fn tick_militia_and_cooldowns(
 /// This is the counterpart of `StatusEffects::apply`: content applies, shared
 /// expires. No content bead ever schedules its own removal, so a buff can
 /// never outlive its duration because somebody forgot a system.
-fn tick_status_effects(
+/// `pub(crate)` for the same reason as `apply_death`: combat.rs's fixed-clock
+/// harness needs the real expiry pass, or a Slow in a simulated duel would
+/// last forever.
+pub(crate) fn tick_status_effects(
     time: Res<Time>,
     mut commands: Commands,
     mut query: Query<(Entity, &mut StatusEffects, Option<&mut Health>)>,

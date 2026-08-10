@@ -590,12 +590,35 @@ sent both commands by hand.
 **Scoreboard against §2.0's 8-vs-4.** The human now has all seven doctrine verbs
 (`priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template`),
 parameterised rather than as toggles, with the coarse `[G]/[V]/[P]/[T]` presets
-kept on page one. What remains bridge-only is *range*, not vocabulary: the card
-steps retreat through 25/35/50% and leash through 10/18/30 where a commander
-writes any float; squad ids from a gesture are 1–3 where the wire takes any
-`u8`; `posture escort` targets the team's hero where the wire names any own
-unit; and per-ability `autocast` rules are still one rule on slot 0. Each is a
-UI affordance, not a missing verb — the intent submitted is the same value.
+kept on page one.
+
+**Range, closed (wc3clone-137).** Three of the four remaining gaps were about
+*range* rather than vocabulary, and they are gone:
+
+* **Retreat and leash are free-entry.** `[F]`/`[G]` still step the
+  25/35/50% and 10/18/30 presets — they are the fast path, and most of the time
+  a preset is what you want. `[-]`/`[=]` nudge the threshold and `[[]`/`[]]`
+  nudge the radius, one increment per press across the whole legal range, so
+  the human can say 0.375 exactly as a commander can. Both controls submit the
+  identical `Intent::Retreat`/`Intent::Leash`; only the arithmetic differs.
+* **`posture escort` names any own unit.** It arms a click like the other three
+  postures, and the click picks a unit instead of a point. Escorting the hero
+  is now one click rather than zero; escorting a Catapult, a Priestess or an
+  expanding Worker is now possible at all.
+* **`autocast` is per ability.** The doctrine page carries one toggle per
+  ability slot (`Z`/`X`/`C`, named after the ability), each submitting
+  `ability: <slot>` and editing that one rule. Page one's `[T]` is unchanged
+  and still means slot 0.
+
+Two affordances came with them: a translucent disc marks the pending posture
+point during click-to-place (at `DEFEND_RADIUS` for Defend, so the circle you
+aim is the circle you get), and every selection tile carries its squad id in the
+corner — the doctrine card speaks for the FIRST unit's squad, and a drag box
+that scooped up two squads used to look exactly like one that scooped up one.
+
+What is still narrower than the wire: squad ids from a gesture are 1–3 where the
+wire takes any `u8`. That one is deliberate — a gesture squad is a control
+group, and there are three control groups.
 
 ---
 
