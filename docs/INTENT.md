@@ -28,9 +28,16 @@ There is now one list of verbs and one compiler.
 
 ## The fairness invariant
 
-> **No player-facing mutation path exists except intent submission.**
+> **No commander mutates game state except through intent submission.**
 
-`ui.rs` and `bridge.rs` contain zero writes to `Order`, `TrainingQueue`,
+It read "no *player-facing* mutation path exists except intent submission"
+until wc3clone-jem, and the hedge was carrying real weight: the scripted
+`ai.rs` was the one commander in the game still writing components directly.
+It speaks the language now, so the sentence needs no qualifier and names no
+exception. Three seats — `ui`, `bridge`/`copilot`, `script` — one verb list,
+one compiler.
+
+`ui.rs`, `bridge.rs` and `ai.rs` contain zero writes to `Order`, `TrainingQueue`,
 `RallyPoint`, `TargetPriority`, `RetreatPolicy`, `LeashPolicy`,
 `AutoCastPolicy`, `SquadId`, `DoctrineTemplate` or `SquadOrders`, and zero
 sends of `CastAbility` / `BuyItem` / `UseItem` / `UpgradeBuilding` /
@@ -46,10 +53,99 @@ right-click meant, which worker is nearest the build site, what "guard" implies
 as an anchor and a radius. That is the human interface's real job. What comes
 out the other side is a value a commander could have typed.
 
+### The third seat
+
+`ai.rs` is a seat. Since **wc3clone-jem** the scripted commander mutates
+nothing: every action it takes is a `SubmitIntent` with
+`IntentSource::Script`, built out of the same `shared::Intent` values ui.rs
+compiles from a right-click and bridge.rs deserializes from `commands.json`,
+read by the same compiler in the same frame. There is no longer a footnote on
+the invariant, and no longer a rung of `Cause` that only the script could
+produce.
+
+What it converted, site by site: `move` (workers fleeing melee), `attackmove`
+(defend, the three wave branches, the rally gather), `harvest` (idle-worker
+assignment and the multi-mine rebalance), `return` (stranded haulers), `build`
+(the whole build order, expansions and ford emplacements included), `train`
+(workers, the army mix, casters, siege, heroes and revivals), `upgrade` (hall
+tier-ups), `research` (the forge ladder), `buy` and `use_item` (the Shop
+rules), `cast` (the Champion's Slam), and `autocast` (the ultimate doctrine a
+machine-driven team installs on its heroes).
+
+Four things follow, and they are the reason the bead was worth doing:
+
+- **It is validated.** The compiler refuses the script exactly as it refuses a
+  commander — fog, ownership, tech gates, prices, hero slots, queue caps. The
+  one place this bites is build placement, where `Intent::Build` snaps a site
+  to the nav lattice *before* checking the ground; `ai.rs` therefore snaps its
+  candidate first and vets the snapped point. Its site pickers clear
+  `size + BUILD_PADDING` — a full cell of slack per side against a half-cell
+  snap — so the snapped footprint is provably inside ground already known to
+  be free, and the conversion costs the script no placements.
+- **It appears in the replay.** `intent_log.jsonl` now records all three
+  authors. An AI-vs-AI sim writes a real transcript instead of nothing.
+- **It is attributable.** Its units answer `order:attackmove by script t=…`,
+  which joins against the log by the same rule everyone else joins by. (The
+  free-text `Cause::Script { what }` rung — `script:wave`, `script:flee` — is
+  gone with it. The *why* behind a script order lives in ai.rs's `info!` lines
+  and the log's sentence now, not on the unit.)
+- **It pays the link structurally.** docs/TEMPO.md §3 used to be satisfied
+  here by ai.rs reaching for `command::OrderIssuer` by hand — correct, and one
+  deleted call away from a cheat. It is satisfied by construction now: the
+  script has no way to issue an order except to ask the compiler to.
+
+Two consequences worth stating plainly.
+
+**Frame order.** The script's actions used to land in `SimSet::AiThink`,
+*before* doctrine ran in `SimSet::Think`. They land in `SimSet::Intent` now —
+same frame, four sets later, which is exactly where a human's right-click and a
+bridge command have always landed. Nothing is deferred by a tick. What changed
+is that a squad posture or a retreat trigger can no longer overwrite a script
+order given in the same frame: the script lost a privilege rather than gaining
+one, and it only bites on a faction under autopilot that is still carrying
+doctrine a player set before handing it over.
+
+**Cost: none measurable.** A think tick that used to write components now
+writes events for one system to drain a few sets later. Interleaved A/B on the
+release binaries, same map, same seed, 1800 frames, at a population both
+binaries reach identically (13 units / 5 buildings a side): **784ms before,
+780ms after** — the two are the same number. One sim's worth of extra event
+traffic is free, which is what you would hope from a handful of small `Vec`s a
+second going into a system that was already running. (Take the *minimum* of
+several interleaved runs if you repeat this: a contended machine reports
+whatever else it is doing, and early samples here disagreed by 2.5x in both
+directions before the box went quiet.)
+
+**What the sims say.** Eleven headless AI-vs-AI matches across both maps, with
+`WC3_COMMAND_LATENCY` on and off, all decisive; `WC3_SEED` determinism verified
+on both maps (65 and 45 identical fingerprints across paired runs), which is
+the check that the script submits in a deterministic order. Nine of eleven land
+in the documented 5–12min band, and `open`/42 lands at 628.7s against master's
+625.0s — the geometry really is preserved.
+
+The two that do not are `crossings` with latency **on**, which settles at
+280.5s (4.7min) regardless of seed. Master on that same configuration is
+*worse*: two of three seeds ran to the 900s cap without a verdict. The cause is
+the only geometry change the compiler forces — build sites snap to the nav
+lattice, so bases are laid out a cell differently, and an RTS amplifies that.
+It is a shift worth knowing about before the next balance pass, not a
+privilege: the script fights exactly the way it did.
+
+**Rejection.** The compiler can now say no to the script, which the old direct
+path could not. Nothing latches: a think tick states what it wants against the
+world it saw, the refusal is recorded, and the brain re-thinks a second later
+from the world as it is. Every optimistic flag re-derives itself — `pending_build`
+above all, which is released the moment no worker is actually building, and
+releases the expansion ring-fence with it. Script errors go to the **debug
+log**, not to `IntentErrors`: bridge.rs ships that list to whichever seat is
+reading, and a commander handed failures it did not cause would be debugging
+the autopilot instead of playing. The verdict is still on the record — the
+journal entry says `ok: false` and the intent log carries the string verbatim.
+
 ### Who is not a player
 
-Two categories deliberately keep writing components directly, and neither
-weakens the invariant:
+One category deliberately keeps writing components directly, and it does not
+weaken the invariant:
 
 - **Engine systems.** `economy.rs`'s harvest follow-through, `combat.rs`'s
   chase, `doctrine.rs`'s squad re-tasking and retreat triggers. These are the
@@ -57,20 +153,10 @@ weakens the invariant:
   it. Routing them through intents would be a category error — and it is
   exactly the line THESIS.md principle 3 draws ("the engine does what is fast;
   the player does what is wise").
-- **The scripted `ai.rs`.** *This is a known asymmetry.* `ai.rs` still writes
-  `Order`s and training-queue pushes directly, from ~9 call sites. It is engine
-  baseline rather than a seat — nothing is measuring fairness against it today
-  — but it means the invariant currently reads "no *human or bridge* mutation
-  path except intents". Routing `ai.rs` through the compiler is follow-up work.
 
-  It is **not**, as this document originally guessed, a prerequisite for
-  docs/TEMPO.md's Chain of Command. That bead needed all three seats to pay
-  latency identically, and got it by having `ai.rs` call the same
-  `command::OrderIssuer` the compiler calls — the mechanism lives one layer
-  below the compiler, so the third seat can reach it without speaking the
-  language first. What routing `ai.rs` through intents would still buy is
-  attribution: its decisions would appear in `intent_log.jsonl` as sentences,
-  and the fairness invariant would read without a footnote.
+The distinction that matters is not "human versus machine" — the script is a
+machine and it speaks — but **deciding versus executing**. `ai.rs` decides, so
+it speaks. `doctrine.rs` carries out a decision already made, so it does not.
 
 One more honest edge: `ui.rs::update_rally_flag` still removes a `RallyPoint`
 whose target has died. That is a validator reacting to a world event, not a
@@ -411,8 +497,50 @@ Every submitted intent — applied or rejected — is appended to
 `bridge/intent_log.jsonl` (override with `WC3_INTENT_LOG`; set it to `0` or
 empty to disable). The file is truncated at the first intent of a run, so it is
 one file per match. It is opened lazily, so a run in which nobody says anything
-leaves no file behind — an AI-vs-AI headless sim writes nothing, because
-`ai.rs` is not a player.
+leaves no file behind.
+
+Until **wc3clone-jem** an AI-vs-AI headless sim wrote nothing at all, because
+`ai.rs` was not a player. It is one now, so a scripted sim produces a full
+transcript. Measured across six AI-vs-AI matches on both maps, latency on and
+off: **4.7 to 10.6 intents per second across both factions**, i.e. 2.3–5.3 per
+team per second against a think tick that runs at 1Hz. A ten-minute match
+leaves a 3,000–5,000 line replay. Verb mix of one of them (`open`, seed 42,
+628.7s, 3,678 intents):
+
+```
+attackmove 3254   train 127   harvest 123   move 73   build 52   cast 20
+```
+
+`attackmove` is ~90% of it, and that is a real property of the script rather
+than an artifact: it states one order per unit for the army's current job
+(see below), and the `defend` branch restates the whole army every tick for as
+long as an enemy is standing in the base. The branches that *could* have been
+the worst offenders are already self-quieting, because ai.rs only speaks for
+units that are idle — a wave in contact, a worker line that is mining and a
+base at peace all say nothing. No dedupe layer was added: a few thousand lines
+per match is a replay, not a flood, and every suppression rule considered would
+have changed behaviour in a bead whose whole claim is that behaviour did not
+change.
+
+Volume is also the *reason* for one design decision worth knowing about.
+`move`/`attackmove` are the only verbs whose result depends on how many units
+one sentence names — `ground_order` spreads a group over `formation_offset`.
+Batching the military branches would have cut the log by ~6.6x (3,678 lines to
+555), and it also made the scripted baseline about **40% more lethal**: a
+spread line engages with more of itself at once, and `crossings` fell from
+~7.6min to ~4.75min. That is a genuine improvement to how the script fights and
+a genuine change to every balance number keyed to the baseline, so it did not
+belong in a plumbing bead. The script therefore says one `attackmove` per unit,
+all naming the same point — the geometry it always had. Nothing is privileged
+by that: a human can click units one at a time and a commander can send twenty
+one-unit `move`s, and the compiler prices each unit's link identically either
+way. Verbs with no geometry (`harvest`, `return`) *are* batched, because there
+the two spellings are indistinguishable in the world.
+
+Rejections across all six runs: **zero**. The compiler is stricter than the old
+direct path, and the script is written to want only legal things — the one
+place the two could have disagreed is build placement, which is why ai.rs snaps
+to the compiler's lattice before it vets the ground.
 
 Line 1 is a session header; every line after it is one intent:
 
@@ -746,8 +874,12 @@ behaviour, because there is no second place that could disagree.
 | squad posture | `doctrine.rs::run_squad_postures` | `posture:push sq1` |
 | standing policy | `doctrine.rs` retreat / leash triggers | `policy:retreat t=210` |
 | producing building | `units.rs::spawn_units` via `spawn_provenance` | `template:Barracks#4294968258` |
-| scripted baseline | `ai.rs` (not a seat, so its own rung) | `script:wave` |
 | engine default | auto-enrolment, idle instinct | `instinct:auto-enroll`, `idle` |
+
+There used to be a sixth rung — `script:wave`, for the scripted baseline, "not
+a seat, so its own rung". wc3clone-jem made it a seat and the rung collapsed
+into the first row: `order:attackmove by script t=5`, produced by the same arm
+of the same compiler as `by ui` and `by bridge`.
 
 Exposed three ways, and it is the *same string* in all three: the snapshot's
 `units[].why` (own units only — an opponent's chain of command is their plan),
@@ -795,10 +927,11 @@ Two implementation notes worth keeping:
   `Order::Harvest` intact, so nothing would ever expire the stamp and the
   worker would blame a five-second sprint for the rest of the match. Giving
   reflex behaviours an expiry is the general fix.
-- **`ai.rs` gets `Cause::Script`, not an `IntentSource`.** Correct today, since
-  it is engine baseline rather than a seat — but if `ai.rs` is ever routed
-  through the compiler (the prerequisite for TEMPO.md's Chain of Command), that
-  rung should collapse into `order:… by ai`.
+- ~~**`ai.rs` gets `Cause::Script`, not an `IntentSource`.**~~ **Done**
+  (wc3clone-jem), and the guess above was right about the shape: the rung
+  collapsed into `order:… by script`, an `IntentSource::Script` seat. It was
+  wrong about the prerequisite — Chain of Command reached the third seat a bead
+  earlier, one layer below the compiler.
 - **The tool cannot see money.** It happily compiles a `build` you cannot
   afford; economy.rs refuses it. That is the documented division below, but a
   `me.gold` check would turn a rejected batch into a better error.
@@ -828,10 +961,14 @@ already printed the same string, and `ui.rs::why_line` already tallied mixed
 answers across a selection. That tally *is* the "did my partner re-task my
 push?" readout; it needed no code at all.
 
-The rung is a **seat**, not `Cause::Script`. A co-commander pays the same
-latency, obeys the same fog and speaks the same 25 verbs; the scripted `ai.rs`
-does none of those things, and collapsing the two would have made "who moved
-this unit" unanswerable in exactly the case it is asked.
+The rung is a **seat**, not the old `Cause::Script`. A co-commander pays the
+same latency, obeys the same fog and speaks the same 25 verbs; the scripted
+`ai.rs` did none of those things at the time, and collapsing the two would have
+made "who moved this unit" unanswerable in exactly the case it is asked.
+(wc3clone-jem later made `ai.rs` do all three, so it became a seat of its own —
+`IntentSource::Script` — rather than borrowing this one. The reasoning is
+unchanged: distinct authors get distinct rungs, and there are three of them
+now.)
 
 ### The real design question was conflict policy
 

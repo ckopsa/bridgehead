@@ -164,7 +164,7 @@ the other cannot.
 | `policy:retreat t=210` | its retreat threshold fired; it is running home |
 | `template:Barracks#42` | it spawned with that building's doctrine template |
 | `rally:Barracks#42` | it spawned onto that building's rally point |
-| `script:wave` | the scripted AI is driving it (you are on `autopilot`) |
+| `order:attackmove by script t=123` | the scripted AI ordered it (you are on `autopilot`) — the third seat, same verbs, same compiler |
 | `instinct:auto-enroll` | nobody assigned it, so the engine pooled it in squad 0 |
 | `idle` | nothing to do — it has no reason at all |
 

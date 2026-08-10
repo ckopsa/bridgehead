@@ -706,6 +706,13 @@ it calls the same `OrderIssuer` directly at its nine unit-order sites. Its
 `build` is exempt on the same row as everybody else's. Two tests pin it, in both
 flag states — if autopilot ever stops paying, the suite says so.
 
+> **Superseded by wc3clone-jem.** `ai.rs` speaks through the compiler now, so
+> it no longer touches `OrderIssuer` at all: the third seat pays because there
+> is no other path from a scripted decision to an order, rather than because
+> this file remembered to make it. The two tests survive and assert something
+> stronger — the same `ground_order` arm prices all three seats. See
+> docs/INTENT.md § the third seat.
+
 **The doctrine guards** (§4's integration hazard, and issue 5's subject) are in:
 `run_squad_postures` and `enforce_leash` both gained `Without<PendingOrder>`,
 because a unit awaiting a delayed order is indistinguishable from an idle one
@@ -743,7 +750,13 @@ field, both absent when nothing was delayed, so a flag-off replay is
 character-for-character a v1 replay. `ai.rs` is not a player and writes no
 intent log, so an AI-vs-AI sweep would otherwise produce no evidence at all;
 `command::report_link_load` covers that with a periodic line giving orders in
-transit, mean link and worst link. That series is what issue 8's calibration
+transit, mean link and worst link.
+
+> **Superseded by wc3clone-jem** for the first half: `ai.rs` *is* a player, and
+> an AI-vs-AI sweep now writes a full intent log with its `link` annotations
+> intact — the scripted seat's sentences carry `(+0.7s link)` exactly as a
+> commander's do. `report_link_load` remains the aggregate view and is still
+> the series issue 8's calibration should read. That series is what issue 8's calibration
 should read: near-zero mean means the curve is not binding, a mean pinned at the
 cap means the armies have marched off the end of their own chain of command.
 
@@ -863,6 +876,12 @@ and this bead routes them through `OrderIssuer`; the composition is
 layer rather than around it and survives the deferred dispatch. All eleven sites
 compose, and no direct `Order` write remains in either the compiler or the
 script.
+
+> **Superseded by wc3clone-jem.** The `script(what, now)` provenance helper and
+> the `Cause::Script` rung it minted are both gone: the script's orders are
+> stamped by the compiler like everyone else's, as `order:<verb> by script`.
+> The composition question this paragraph answered no longer arises, because
+> there is only one mint site left.
 
 ---
 
