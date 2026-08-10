@@ -1,0 +1,116 @@
+{
+  "units": [
+    {
+      "id": "Worker",
+      "class": "Worker",
+      "trained_at": "TownHall",
+      "tier": 1
+    },
+    {
+      "id": "Footman",
+      "class": "Footman",
+      "trained_at": "Barracks",
+      "tier": 1
+    },
+    {
+      "id": "Archer",
+      "class": "Archer",
+      "trained_at": "Barracks",
+      "tier": 1
+    },
+    {
+      "id": "Raider",
+      "class": "Cavalry",
+      "trained_at": "Barracks",
+      "tier": 1
+    },
+    {
+      "id": "Spearman",
+      "class": "Footman",
+      "trained_at": "Barracks",
+      "tier": 1
+    },
+    {
+      "id": "Knight",
+      "class": "Cavalry",
+      "trained_at": "Barracks",
+      "tier": 3
+    },
+    {
+      "id": "Catapult",
+      "class": "Siege",
+      "trained_at": "Workshop",
+      "tier": 1
+    },
+    {
+      "id": "GryphonRider",
+      "class": "Archer",
+      "trained_at": "Workshop",
+      "tier": 3
+    },
+    {
+      "id": "Sorcerer",
+      "class": "Archer",
+      "trained_at": "Sanctum",
+      "tier": 2
+    },
+    {
+      "id": "Hero",
+      "class": "Hero",
+      "trained_at": "TownHall",
+      "tier": 1
+    },
+    {
+      "id": "Priestess",
+      "class": "Hero",
+      "trained_at": "TownHall",
+      "tier": 1
+    }
+  ],
+  "buildings": [
+    {
+      "id": "TownHall",
+      "trains": [
+        "Worker",
+        "Hero",
+        "Priestess"
+      ],
+      "tier": 1
+    },
+    {
+      "id": "Barracks",
+      "trains": [
+        "Footman",
+        "Archer",
+        "Raider",
+        "Spearman",
+        "Knight"
+      ]
+    },
+    {
+      "id": "Workshop",
+      "trains": [
+        "Catapult",
+        "GryphonRider"
+      ]
+    },
+    {
+      "id": "Sanctum",
+      "trains": [
+        "Sorcerer"
+      ]
+    },
+    {
+      "id": "Blacksmith",
+      "trains": []
+    },
+    {
+      "id": "Shop",
+      "trains": []
+    },
+    {
+      "id": "Farm",
+      "trains": []
+    }
+  ]
+}

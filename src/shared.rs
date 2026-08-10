@@ -3377,6 +3377,19 @@ pub enum SquadPosture {
     Forage { muster: Vec3 },
 }
 
+impl SquadPosture {
+    /// The bare posture word, matching the `posture` intent's `type` tag.
+    /// What a unit names when it says which posture is moving it.
+    pub fn word(&self) -> &'static str {
+        match self {
+            SquadPosture::Defend { .. } => "defend",
+            SquadPosture::Push { .. } => "push",
+            SquadPosture::Escort { .. } => "escort",
+            SquadPosture::Forage { .. } => "forage",
+        }
+    }
+}
+
 /// The default squad every army unit belongs to unless assigned elsewhere.
 /// doctrine.rs auto-enrolls postureless army units here and seeds a Defend
 /// posture at the team's base, so "commander does nothing" still yields a
@@ -4594,6 +4607,28 @@ impl Intent {
         }
     }
 
+    /// The verb this intent stamps into its targets' [`Provenance`], or `None`
+    /// for the intents that install policy, spend money or end the match
+    /// rather than changing what a unit is doing *right now*.
+    ///
+    /// The split is exactly the one a unit's "why" answer needs. `move` is a
+    /// reason to be walking somewhere; `retreat` is not a reason to be doing
+    /// anything yet — it becomes one only when doctrine.rs fires it, and
+    /// doctrine.rs stamps `policy:retreat` at that moment instead.
+    pub fn provenance_verb(&self) -> Option<&'static str> {
+        match self {
+            Intent::Move { .. }
+            | Intent::AttackMove { .. }
+            | Intent::Attack { .. }
+            | Intent::Harvest { .. }
+            | Intent::Return { .. }
+            | Intent::Follow { .. }
+            | Intent::Stop { .. }
+            | Intent::Build { .. } => Some(self.verb()),
+            _ => None,
+        }
+    }
+
     /// One English sentence saying what this intent means.
     ///
     /// This is the half of the replay log a person reads. It deliberately does
@@ -4806,6 +4841,160 @@ impl IntentSource {
             IntentSource::Ui => "ui",
             IntentSource::Bridge => "bridge",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provenance — every unit's answer to "why are you doing that?"
+// ---------------------------------------------------------------------------
+
+/// Why this unit is doing what it is doing, stamped at the moment its current
+/// behaviour was minted.
+///
+/// The chain THESIS.md promises is *posture <- squad <- template <- directive*,
+/// and each rung of it mints an `Order` somewhere different: the intent
+/// compiler for a direct order, doctrine.rs for a squad posture or a retreat
+/// trigger, units.rs for the template a producing building stamps, and the
+/// engine's own instincts for everything left over. Whoever writes the order
+/// writes the reason next to it, in the same `Commands` call — so the answer
+/// cannot drift from the behaviour, because there is no second place that
+/// could disagree.
+///
+/// Deliberately cheap: an enum of `Copy` scalars, no allocation, rendered to a
+/// string only when someone asks (`why()`), which is once a second per unit in
+/// the snapshot and once a frame for the handful of selected units.
+#[derive(Component, Clone, Copy, PartialEq, Debug)]
+pub struct Provenance {
+    pub cause: Cause,
+    /// Game seconds at which this behaviour was minted.
+    pub at: f32,
+}
+
+/// The rungs of the chain of command, as a flat enum.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Cause {
+    /// A direct order from a player — which verb, spelled by which interface.
+    /// Outranks everything below until doctrine re-tasks the unit.
+    Order {
+        verb: &'static str,
+        source: IntentSource,
+    },
+    /// The unit's squad has a standing posture and the engine is executing it.
+    Posture { squad: u8, posture: &'static str },
+    /// A standing policy fired: a retreat threshold, a leash snapping back.
+    Policy { policy: &'static str },
+    /// Inherited at spawn from the building that produced it — a doctrine
+    /// `template`, or just the building's `rally`.
+    Stamp {
+        /// `"template"` or `"rally"` — which of the building's stamps this was.
+        how: &'static str,
+        kind: &'static str,
+        building: Entity,
+    },
+    /// The scripted `ai.rs` baseline. Not a seat (see docs/INTENT.md), so it
+    /// gets its own rung rather than borrowing `Order`'s.
+    Script { what: &'static str },
+    /// Engine default: nothing above applies. `"idle"` renders bare.
+    Instinct { what: &'static str },
+}
+
+impl Provenance {
+    pub fn new(cause: Cause, at: f32) -> Self {
+        Provenance { cause, at }
+    }
+
+    /// Auto-enrolment, idle instinct and the like.
+    pub fn instinct(what: &'static str, at: f32) -> Self {
+        Provenance::new(Cause::Instinct { what }, at)
+    }
+
+    /// The compact one-line answer, shared verbatim by the snapshot's
+    /// `units[].why` and the human's selection panel. Same question, same
+    /// string, both seats — the equity claim applied to introspection.
+    ///
+    /// ```text
+    /// order:move by bridge t=123     a player said so, and when
+    /// posture:push sq1               squad 1's standing posture
+    /// policy:retreat t=210           a retreat threshold fired
+    /// template:Barracks#4294968163   stamped at spawn by that building
+    /// script:wave                    the scripted AI baseline
+    /// instinct:flee                  an engine reflex
+    /// idle                           nothing to do
+    /// ```
+    pub fn why(&self) -> String {
+        match self.cause {
+            Cause::Order { verb, source } => {
+                format!("order:{verb} by {} t={:.0}", source.name(), self.at)
+            }
+            Cause::Posture { squad, posture } => format!("posture:{posture} sq{squad}"),
+            Cause::Policy { policy } => format!("policy:{policy} t={:.0}", self.at),
+            Cause::Stamp {
+                how,
+                kind,
+                building,
+            } => format!("{how}:{kind}#{}", building.to_bits()),
+            Cause::Script { what } => format!("script:{what}"),
+            // The one bare word: "idle" is the absence of a reason, and
+            // dressing it up as `instinct:idle` would imply there was one.
+            Cause::Instinct { what } if what == "idle" => "idle".to_string(),
+            Cause::Instinct { what } => format!("instinct:{what}"),
+        }
+    }
+}
+
+/// What a freshly trained unit answers when asked who sent it.
+///
+/// A pure function so the rule is testable without standing up a renderer:
+/// `spawn_units` needs mesh assets to run at all, and "which rung of the chain
+/// does a new unit start on" is a decision worth checking on its own.
+///
+/// A template is the stronger claim — it stamped standing doctrine, not merely
+/// a destination — but a bare rally still decided this unit's first order, and
+/// "the barracks sent me" is the true answer either way. With neither, a fresh
+/// unit genuinely has no reason yet.
+pub fn spawn_provenance(
+    producer: Option<(Entity, BuildingKind)>,
+    has_template: bool,
+    rallied: bool,
+    now: f32,
+) -> Provenance {
+    match producer {
+        Some((building, kind)) if has_template || rallied => Provenance::new(
+            Cause::Stamp {
+                how: if has_template { "template" } else { "rally" },
+                kind: building_name(kind),
+                building,
+            },
+            now,
+        ),
+        _ => Provenance::instinct("idle", now),
+    }
+}
+
+/// What a unit with no `Provenance` component at all answers. Reached by units
+/// that have never been given a reason — the opening workers before anyone has
+/// spoken — and by anything that outlives its stamp.
+pub const NO_PROVENANCE: &str = "idle";
+
+/// Who is speaking and when, threaded through the intent compiler so every
+/// order it mints can stamp its own reason. One `Copy` parameter instead of
+/// two, because `compile_intent`'s signature is long enough already.
+#[derive(Clone, Copy, Debug)]
+pub struct IntentMark {
+    pub source: IntentSource,
+    pub at: f32,
+}
+
+impl IntentMark {
+    /// The provenance a direct order of `verb` stamps on its targets.
+    pub fn order(&self, verb: &'static str) -> Provenance {
+        Provenance::new(
+            Cause::Order {
+                verb,
+                source: self.source,
+            },
+            self.at,
+        )
     }
 }
 
@@ -6269,6 +6458,173 @@ fn diff_team(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every rung of the chain of command renders to one compact line, and
+    /// those lines are the literal contract: the bridge snapshot's
+    /// `units[].why`, the human selection panel and the intent log all print
+    /// this exact string. A commander greps one against the other, so the
+    /// format is data, not decoration.
+    #[test]
+    fn every_rung_of_the_chain_answers_in_one_line() {
+        let building = Entity::from_raw(42);
+        // Spelled from the entity rather than hardcoded: the point of the
+        // format is that it JOINS against `buildings[].id` in the snapshot,
+        // which is `Entity::to_bits` and nothing else.
+        let stamped = format!("template:Barracks#{}", building.to_bits());
+        let cases: [(Cause, f32, String); 8] = [
+            (
+                Cause::Order { verb: "move", source: IntentSource::Bridge },
+                123.4,
+                "order:move by bridge t=123".to_string(),
+            ),
+            (
+                // The equity claim in one assertion: the same order spelled by
+                // a mouse differs from the JSON one ONLY in the source word.
+                Cause::Order { verb: "move", source: IntentSource::Ui },
+                123.4,
+                "order:move by ui t=123".to_string(),
+            ),
+            (
+                Cause::Posture { squad: 1, posture: "push" },
+                91.6,
+                "posture:push sq1".to_string(),
+            ),
+            (
+                Cause::Posture { squad: 0, posture: "defend" },
+                0.0,
+                "posture:defend sq0".to_string(),
+            ),
+            (
+                Cause::Policy { policy: "retreat" },
+                210.0,
+                "policy:retreat t=210".to_string(),
+            ),
+            (
+                Cause::Stamp { how: "template", kind: "Barracks", building },
+                12.0,
+                stamped,
+            ),
+            (Cause::Script { what: "wave" }, 5.0, "script:wave".to_string()),
+            (
+                Cause::Instinct { what: "auto-enroll" },
+                5.0,
+                "instinct:auto-enroll".to_string(),
+            ),
+        ];
+        for (cause, at, expected) in cases {
+            let answer = Provenance::new(cause, at).why();
+            assert_eq!(answer, expected, "{cause:?} rendered wrong");
+            // It shares a line with the doctrine summary in the HUD and a JSON
+            // field in the snapshot, so it stays one short line or it stops
+            // being readable in either.
+            assert!(!answer.contains('\n'), "{answer} is not one line");
+            assert!(answer.len() <= 48, "{answer} is too long for the panel");
+        }
+
+        // "idle" is the absence of a reason and says so bare — dressing it up
+        // as `instinct:idle` would imply the engine had one.
+        assert_eq!(Provenance::instinct("idle", 77.0).why(), NO_PROVENANCE);
+        assert_eq!(NO_PROVENANCE, "idle");
+    }
+
+    /// The split that decides what a unit can say about itself: verbs that
+    /// change what it is DOING stamp a reason; verbs that install policy do
+    /// not, because their reason only exists on the frame doctrine.rs acts on
+    /// them (and then it reads `policy:...`, not `order:...`).
+    #[test]
+    fn only_behaviour_verbs_stamp_a_reason() {
+        let behaviour = [
+            r#"{"type":"move","units":[1],"x":1.0,"z":2.0}"#,
+            r#"{"type":"attackmove","units":[1],"x":1.0,"z":2.0}"#,
+            r#"{"type":"attack","units":[1],"target":9}"#,
+            r#"{"type":"harvest","units":[1],"target":9}"#,
+            r#"{"type":"return","units":[1]}"#,
+            r#"{"type":"follow","units":[1],"target":2}"#,
+            r#"{"type":"stop","units":[1]}"#,
+            r#"{"type":"build","worker":1,"kind":"Farm","x":0.0,"z":0.0}"#,
+        ];
+        for case in behaviour {
+            let intent: Intent = serde_json::from_str(case).unwrap();
+            assert_eq!(
+                intent.provenance_verb(),
+                Some(intent.verb()),
+                "{case} should stamp its own verb"
+            );
+        }
+
+        let policy_or_spending = [
+            r#"{"type":"retreat","units":[1],"below":0.35,"x":1.0,"z":2.0}"#,
+            r#"{"type":"leash","units":[1],"x":1.0,"z":2.0,"radius":20.0}"#,
+            r#"{"type":"priority","units":[1],"classes":["Hero"]}"#,
+            r#"{"type":"autocast","units":[1],"min_enemies":3}"#,
+            r#"{"type":"squad","units":[1],"id":1}"#,
+            r#"{"type":"posture","id":1,"posture":{"type":"push","x":1.0,"z":2.0}}"#,
+            r#"{"type":"template","building":1,"squad":1}"#,
+            r#"{"type":"train","building":1,"unit":"Footman"}"#,
+            r#"{"type":"rally","building":1,"x":1.0,"z":2.0}"#,
+            r#"{"type":"research","building":1,"upgrade":"attack"}"#,
+            r#"{"type":"buy","shop":1,"item":"HealingPotion"}"#,
+            r#"{"type":"surrender"}"#,
+        ];
+        for case in policy_or_spending {
+            let intent: Intent = serde_json::from_str(case).unwrap();
+            assert_eq!(intent.provenance_verb(), None, "{case} should stamp nothing");
+        }
+    }
+
+    /// The join between the two halves of the record: the log line for an
+    /// order carries the same string the units it moved will report, so
+    /// "why is that unit attacking?" and "who said so?" are one grep apart.
+    #[test]
+    fn the_log_tag_and_the_units_answer_are_the_same_string() {
+        let intent: Intent =
+            serde_json::from_str(r#"{"type":"move","units":[1,2],"x":40.0,"z":40.0}"#).unwrap();
+        let mark = IntentMark { source: IntentSource::Bridge, at: 21.5 };
+        let logged = mark.order(intent.provenance_verb().unwrap()).why();
+        let on_the_unit = Provenance::new(
+            Cause::Order { verb: "move", source: IntentSource::Bridge },
+            21.5,
+        )
+        .why();
+        assert_eq!(logged, on_the_unit);
+        assert_eq!(logged, "order:move by bridge t=22");
+    }
+
+    /// The template rung: a unit trained by a building that carries standing
+    /// doctrine starts life naming that building, and keeps naming it until a
+    /// posture or an order re-tasks it. This is the rung a commander uses to
+    /// tell "my template is working" from "my template never applied".
+    #[test]
+    fn a_trained_unit_names_the_building_that_stamped_it() {
+        let barracks = Entity::from_raw(7);
+        let producer = Some((barracks, BuildingKind::Barracks));
+
+        // A doctrine template is the strongest claim a building can make.
+        let templated = spawn_provenance(producer, true, true, 30.0);
+        assert_eq!(
+            templated.why(),
+            format!("template:Barracks#{}", barracks.to_bits())
+        );
+        // ...and it holds even when the building set no rally at all.
+        assert_eq!(
+            spawn_provenance(producer, true, false, 30.0).why(),
+            templated.why()
+        );
+
+        // A bare rally still decided the unit's first order, so it still
+        // answers with the building — just a weaker word for what it did.
+        assert_eq!(
+            spawn_provenance(producer, false, true, 30.0).why(),
+            format!("rally:Barracks#{}", barracks.to_bits())
+        );
+
+        // Neither: the unit genuinely has no reason yet, and says so. A stale
+        // rally (depleted node, dead followee) degrades to exactly this,
+        // rather than claiming a destination that no longer exists.
+        assert_eq!(spawn_provenance(producer, false, false, 30.0).why(), "idle");
+        // The opening workers have no producer at all.
+        assert_eq!(spawn_provenance(None, false, false, 0.0).why(), "idle");
+    }
 
     fn slow(magnitude: f32, now: f32, duration: f32) -> StatusEffect {
         StatusEffect::new(StatusKind::Slow, magnitude, now, duration, StatusSource::Debug)

@@ -352,6 +352,12 @@ fn apply_intents(
             submission.intent.clone(),
             submission.team,
             &submission.tag,
+            // Who is speaking and when. Every order this call mints stamps
+            // itself with this, so a unit can name the sentence that moved it.
+            IntentMark {
+                source: submission.source,
+                at: now,
+            },
             &mut errors,
             &mut ai_controlled,
             &tables.economies,
@@ -407,6 +413,7 @@ fn compile_intent(
     intent: Intent,
     me: Team,
     tag: &str,
+    mark: IntentMark,
     errors: &mut Vec<String>,
     ai_controlled: &mut AiControlled,
     economies: &Economies,
@@ -443,6 +450,7 @@ fn compile_intent(
                 commands,
                 errors,
                 tag,
+                mark.order("move"),
                 &ids,
                 units,
                 me,
@@ -456,6 +464,7 @@ fn compile_intent(
                 commands,
                 errors,
                 tag,
+                mark.order("attackmove"),
                 &ids,
                 units,
                 me,
@@ -497,9 +506,17 @@ fn compile_intent(
             }
             // The link is measured from the unit being ordered, not from its
             // target: what is slow is reaching your own soldier, not reaching
-            // the enemy.
+            // the enemy. The reason travels with the order and is re-timed to
+            // its arrival — see `command::dispatch_pending`.
             for (entity, pos) in own_units(&ids, units, me, tag, errors) {
-                issuer.issue(commands, me, pos, entity, Order::Attack(target_entity));
+                issuer.issue(
+                    commands,
+                    me,
+                    pos,
+                    entity,
+                    Order::Attack(target_entity),
+                    mark.order("attack"),
+                );
             }
         }
         Intent::Harvest { units: ids, target } => {
@@ -521,12 +538,26 @@ fn compile_intent(
                     ));
                     continue;
                 }
-                issuer.issue(commands, me, pos, entity, Order::Harvest(node));
+                issuer.issue(
+                    commands,
+                    me,
+                    pos,
+                    entity,
+                    Order::Harvest(node),
+                    mark.order("harvest"),
+                );
             }
         }
         Intent::Return { units: ids } => {
             for (entity, pos) in own_units(&ids, units, me, tag, errors) {
-                issuer.issue(commands, me, pos, entity, Order::ReturnResources);
+                issuer.issue(
+                    commands,
+                    me,
+                    pos,
+                    entity,
+                    Order::ReturnResources,
+                    mark.order("return"),
+                );
             }
         }
         Intent::Follow { units: ids, target } => {
@@ -547,7 +578,14 @@ fn compile_intent(
                 if entity == leader {
                     continue; // a unit following itself would deadlock its own order
                 }
-                issuer.issue(commands, me, pos, entity, Order::Follow(leader));
+                issuer.issue(
+                    commands,
+                    me,
+                    pos,
+                    entity,
+                    Order::Follow(leader),
+                    mark.order("follow"),
+                );
             }
         }
         Intent::Stop { units: ids } => {
@@ -557,7 +595,7 @@ fn compile_intent(
             // "advance", which is what stops latency from being escapable by
             // spamming stop.
             for (entity, pos) in own_units(&ids, units, me, tag, errors) {
-                issuer.issue(commands, me, pos, entity, Order::Move(pos));
+                issuer.issue(commands, me, pos, entity, Order::Move(pos), mark.order("stop"));
             }
         }
         Intent::Build {
@@ -617,7 +655,7 @@ fn compile_intent(
             // anyway, so the delay would be invisible at the point of contact
             // and would show up only as a slower economy. Taxing the build
             // order taxes macro, and macro is not the thing reaction speed was
-            // winning.
+            // winning. It still stamps its reason like every other verb.
             issuer.issue_instant(
                 commands,
                 entity,
@@ -625,6 +663,7 @@ fn compile_intent(
                     kind: building_kind,
                     pos,
                 },
+                mark.order("build"),
             );
         }
         Intent::Upgrade { building } => {
@@ -1409,6 +1448,13 @@ struct IntentRecord<'a> {
     /// line is character-for-character a v1 log line.
     #[serde(skip_serializing_if = "no_link")]
     link: f32,
+    /// The provenance string this intent stamps on the units it moves — the
+    /// join key between this log and a snapshot's `units[].why`. Grep a unit's
+    /// answer here and you land on the sentence that caused it. Absent for the
+    /// verbs that install policy rather than behaviour (their reason shows up
+    /// later, as `policy:…`, on the frame doctrine.rs acts on it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    why: Option<String>,
     /// False when validation rejected some or all of it.
     ok: bool,
     #[serde(skip_serializing_if = "no_errors")]
@@ -1460,11 +1506,11 @@ impl IntentLog {
         }
     }
 
-    fn record(&mut self, now: f32, submission: &SubmitIntent, errors: &[String], link: f32) {
+    fn record(&mut self, now: f32, submission: &SubmitIntent, errors: &[String], raw_link: f32) {
         if self.path.is_none() || self.broken {
             return;
         }
-        let link = (link * 10.0).round() / 10.0;
+        let link = (raw_link * 10.0).round() / 10.0;
         let record = IntentRecord {
             wall_ms: wall_ms(),
             t: (now * 10.0).round() / 10.0,
@@ -1474,6 +1520,25 @@ impl IntentLog {
             verb: submission.intent.verb(),
             sentence: link_sentence(&submission.intent, link),
             link,
+            why: submission.intent.provenance_verb().map(|verb| {
+                IntentMark {
+                    // ARRIVAL, not speech. This string is the join key
+                    // between this log and a snapshot's `units[].why`, so it
+                    // has to be character-for-character what the unit will
+                    // answer — and what the unit answers is stamped when the
+                    // order LANDS (`command::dispatch_pending`). The moment it
+                    // was spoken is not lost: it is this record's own `t`, and
+                    // `link` is the gap between the two.
+                    //
+                    // Raw rather than the rounded `link` above, so the two
+                    // renderings round identically instead of drifting by a
+                    // tenth.
+                    at: now + raw_link,
+                    source: submission.source,
+                }
+                .order(verb)
+                .why()
+            }),
             ok: errors.is_empty(),
             errors,
             intent: &submission.intent,
@@ -1670,6 +1735,7 @@ fn ground_order(
     commands: &mut Commands,
     errors: &mut Vec<String>,
     tag: &str,
+    why: Provenance,
     ids: &[IntentId],
     units: &IntentUnits,
     me: Team,
@@ -1688,8 +1754,11 @@ fn ground_order(
         };
         // Each member pays its OWN link, measured where it is standing now —
         // a group half in the base and half at the front arrives in two
-        // waves, which is the mechanic being honest rather than a bug.
-        issuer.issue(commands, me, pos, entity, order);
+        // waves, which is the mechanic being honest rather than a bug. (The
+        // log's `why` names the WORST of them, so it joins against the last
+        // unit to receive the order; the rest answer with their own, earlier
+        // arrival.)
+        issuer.issue(commands, me, pos, entity, order, why);
     }
 }
 

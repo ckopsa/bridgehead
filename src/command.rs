@@ -120,6 +120,11 @@ pub const DEFAULT_MAX: f32 = 3.0;
 #[derive(Component, Clone, Debug)]
 pub struct PendingOrder {
     pub order: Order,
+    /// The reason this order carries, minted when it was *spoken* so the verb
+    /// and the interface that said it travel with it (docs/INTENT.md's `why`
+    /// layer). Its `at` is rewritten to the arrival time on dispatch — see
+    /// [`dispatch_pending`] and the timing convention there.
+    pub provenance: Provenance,
     /// Game seconds at which it lands.
     pub ready_at: f32,
     /// Game seconds at which it was spoken. `ready_at - issued_at` is the
@@ -142,6 +147,15 @@ impl PendingOrder {
 /// Deferring the event rather than the verdict is what makes a late cast fizzle
 /// honestly — if the mana ran out while the order was travelling, the ability
 /// does not go off, exactly as if the player had been slow.
+///
+/// It carries no `Provenance`, and that is deliberate rather than an omission.
+/// A cast mints no `Order`, so there is nothing to re-time: the unit's reason
+/// for *being where it is and doing what it is doing* is not changed by having
+/// thrown a spell, and overwriting it with `"cast"` would replace a standing
+/// answer with a momentary one. The dispatch-time rule in [`dispatch_pending`]
+/// therefore has nothing to apply to here — while the log side is identical,
+/// because a delayed cast annotates its sentence exactly as a delayed order
+/// does.
 #[derive(Component, Clone, Debug)]
 pub struct PendingCast {
     /// Which ability, in the one selector type the whole game names slots with.
@@ -388,15 +402,17 @@ impl OrderIssuer<'_> {
         pos: Vec3,
         entity: Entity,
         order: Order,
+        provenance: Provenance,
     ) {
         let delay = self.delay(team, pos);
         if delay <= 0.0 {
-            self.issue_instant(commands, entity, order);
+            self.issue_instant(commands, entity, order, provenance);
             return;
         }
         self.max_delay = self.max_delay.max(delay);
         let pending = PendingOrder {
             order,
+            provenance,
             ready_at: self.now + delay,
             issued_at: self.now,
         };
@@ -476,9 +492,15 @@ impl OrderIssuer<'_> {
     /// **An exempt direct order** (see the verb table): applied now. It still
     /// cancels anything in transit, because an order a player has superseded
     /// must not land on top of the one that replaced it.
-    pub fn issue_instant(&mut self, commands: &mut Commands, entity: Entity, order: Order) {
+    pub fn issue_instant(
+        &mut self,
+        commands: &mut Commands,
+        entity: Entity,
+        order: Order,
+        provenance: Provenance,
+    ) {
         let mut ec = commands.entity(entity);
-        ec.try_insert(order);
+        ec.try_insert((order, provenance));
         if self.latency.on {
             ec.try_remove::<PendingOrder>();
         }
@@ -602,19 +624,49 @@ fn sync_marker(
 /// retreating unit at *dispatch* time rather than issue time. That is the
 /// intended reading: the unit is back on duty when the order actually reaches
 /// it, not when it was spoken.
+///
+/// ## The timing convention
+///
+/// The order's `Provenance` travels with it, carrying the verb and the
+/// interface that spoke it — but its `at` is **rewritten to the arrival time**.
+///
+/// `Provenance.at` means one thing everywhere in the codebase: *when this unit
+/// started doing this*. Doctrine stamps the tick its posture re-tasked the
+/// unit; a template stamps the moment of spawn. If a direct order alone
+/// recorded the moment it was *spoken*, the field would quietly mean two
+/// different things depending on the cause, and a reader sorting units by `at`
+/// to see what happened most recently would be told a unit had been obeying an
+/// order for seconds before it had actually received it.
+///
+/// The speech time is not lost — it is the intent log's `t`, and the log also
+/// carries `link`, so the two records join:
+///
+/// ```text
+/// intent_log.jsonl: {"t": 21.5, "link": 1.8, "sentence": "... (+1.8s link)"}
+/// units[].why:      "attack (bridge) t=23.3"          // 21.5 + 1.8
+/// ```
+///
+/// `at` is set to `ready_at` rather than to `now` deliberately: the order
+/// arrived when it arrived, and this system merely noticed on the next frame.
+/// Using `ready_at` makes the join above exact to the log's 0.1s resolution
+/// instead of off by a frame.
 fn dispatch_pending(
     mut commands: Commands,
     time: Res<Time>,
     pending: Query<(Entity, &PendingOrder)>,
 ) {
     let now = time.elapsed_secs();
-    for (entity, order) in &pending {
-        if now < order.ready_at {
+    for (entity, pending) in &pending {
+        if now < pending.ready_at {
             continue;
         }
+        let landed = Provenance {
+            at: pending.ready_at,
+            ..pending.provenance
+        };
         commands
             .entity(entity)
-            .try_insert(order.order.clone())
+            .try_insert((pending.order.clone(), landed))
             .try_remove::<PendingOrder>();
     }
 }
@@ -706,6 +758,12 @@ mod tests {
 
     fn at(x: f32, z: f32) -> Vec3 {
         Vec3::new(x, 0.0, z)
+    }
+
+    /// A reason for an order to carry, minted at speech time — the shape the
+    /// compiler hands the issuer (docs/INTENT.md's `why` layer).
+    fn test_why() -> Provenance {
+        IntentMark { source: IntentSource::Ui, at: 0.0 }.order("move")
     }
 
     /// The curve, as a curve: free inside the radius, a step the moment you
@@ -840,7 +898,7 @@ mod tests {
                 now: 10.0,
                 max_delay: 0.0,
             };
-            issuer.issue(&mut commands, Team::Human, far, entity, Order::Move(far));
+            issuer.issue(&mut commands, Team::Human, far, entity, Order::Move(far), test_why());
             assert_eq!(issuer.max_delay, 0.0);
         }
         queue.apply(world);
@@ -951,7 +1009,7 @@ mod tests {
                 max_delay: 0.0,
             };
             delay = issuer.delay(Team::Human, far);
-            issuer.issue(&mut commands, Team::Human, far, entity, Order::AttackMove(far));
+            issuer.issue(&mut commands, Team::Human, far, entity, Order::AttackMove(far), test_why());
             assert_eq!(issuer.max_delay, delay, "the issuer reports what it charged");
         }
         queue.apply(world);
@@ -996,6 +1054,84 @@ mod tests {
         );
     }
 
+    /// **The timing convention** (docs/INTENT.md, `dispatch_pending`). A
+    /// delayed order carries its reason — the verb and the interface that spoke
+    /// it — but the reason is stamped with the moment the order **landed**, not
+    /// the moment it was spoken.
+    ///
+    /// `Provenance.at` means "when this unit started doing this" everywhere
+    /// else in the codebase (doctrine stamps the tick it re-tasked a unit), and
+    /// a direct order must not be the one cause that means something different.
+    /// The speech time is not lost: it is the intent log's `t`, and the log's
+    /// `link` is the gap, so `why.at == t + link` is the join between a unit's
+    /// answer and the sentence that caused it.
+    #[test]
+    fn a_delayed_orders_reason_is_stamped_when_it_lands() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .insert_resource(tuned())
+            .insert_resource(cache(Vec::new()))
+            .add_systems(Update, dispatch_pending);
+
+        let spoken_at = 10.0;
+        let link = 2.5;
+        let entity = app
+            .world_mut()
+            .spawn((
+                Team::Human,
+                Order::Idle,
+                PendingOrder {
+                    order: Order::AttackMove(at(60.0, 60.0)),
+                    provenance: IntentMark {
+                        source: IntentSource::Bridge,
+                        at: spoken_at,
+                    }
+                    .order("attackmove"),
+                    ready_at: spoken_at + link,
+                    issued_at: spoken_at,
+                },
+            ))
+            .id();
+
+        // Arrive.
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(spoken_at + link + 0.05));
+        app.update();
+
+        let landed = app
+            .world()
+            .entity(entity)
+            .get::<Provenance>()
+            .expect("the order stamped its reason on arrival");
+        assert_eq!(
+            landed.at,
+            spoken_at + link,
+            "the reason must be timed to the order's ARRIVAL, not to when it \
+             was spoken — otherwise a unit claims to have been obeying an \
+             order it had not yet received"
+        );
+        // The cause itself travelled intact: the verb and the interface that
+        // said it are what the unit answers with.
+        assert!(
+            matches!(
+                landed.cause,
+                Cause::Order { verb: "attackmove", source: IntentSource::Bridge }
+            ),
+            "the reason lost its verb or its speaker in transit: {:?}",
+            landed.cause
+        );
+        // And that is exactly the string the log wrote at speech time + link,
+        // which is what makes the two records joinable.
+        let expected = IntentMark {
+            source: IntentSource::Bridge,
+            at: spoken_at + link,
+        }
+        .order("attackmove")
+        .why();
+        assert_eq!(landed.why(), expected);
+    }
+
     /// **The livelock.** Found in a headless `crossings` run, not in review: a
     /// team that had lost every hall and its hero paid the `max` link on every
     /// order, and `ai.rs` re-issues its standing decision once a second — so
@@ -1035,7 +1171,7 @@ mod tests {
                     now,
                     max_delay: 0.0,
                 };
-                issuer.issue(&mut commands, Team::Human, far, entity, order);
+                issuer.issue(&mut commands, Team::Human, far, entity, order, test_why());
             }
             queue.apply(world);
         };
@@ -1180,7 +1316,7 @@ mod tests {
             let mut commands = Commands::new(&mut queue, world);
             // No writer needed on the delayed path; a zero-delay cast would
             // have gone straight out through it instead.
-            let mut issuer = OrderIssuer {
+            let issuer = OrderIssuer {
                 nodes: &nodes,
                 latency: &latency,
                 now: 0.0,

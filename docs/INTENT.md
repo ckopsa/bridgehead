@@ -480,12 +480,140 @@ behaviour** — it changed how many places can cause it.
 
 ---
 
+---
+
+## Speaking it: English, and "why are you doing that?"
+
+*`wc3clone-ge4`. Two additions, both built on the fact that `Intent` is a value
+with a `sentence()` renderer.*
+
+### English is a third spelling, and it lives outside the engine
+
+`tools/intent_compile.py` compiles a natural-language directive plus a snapshot
+into a batch of `Intent` objects. It is a **tool, not an engine feature**, and
+that placement is the design: the game gains no NLP, no new verb, and no new
+mutation path. What it gains is a shorter way to write the same 25 verbs.
+
+```
+"hold the northwest ford, forage mid with the cavalry, retreat at 35%"
+  -> {"type":"squad","units":[…],"id":1}
+     {"type":"posture","id":1,"posture":{"type":"defend","x":-60.0,"z":60.0,"radius":18.0}}
+     …
+```
+
+Two layers, deterministic first. A pattern table covers the idioms that already
+appear in COMMANDER_BRIEF.md and eight rounds of AARs — hold/push/forage/escort,
+squad re-tasking, retreat thresholds, focus-fire, leash, autocast, templates,
+rally, train/build/harvest, tier-up, research, buy, scout, surrender. Place
+names come from the *snapshot*, not a hardcoded table: `map.chokes` gives
+"the northwest ford" its position, so the vocabulary changes when the map does.
+Whatever the table misses, an LLM fills — `--explain` prints the whole
+vocabulary, which is why the file's docstring says it *is* the prompt.
+
+The vocabulary is read from the game, not written down twice. Places come from
+`map.chokes`, `mines` and `bounties`; units, their classes and *which building
+trains each one* come from `catalog.json` when the seat has one — which, since
+bead/polish made the catalog transitively self-sufficient, means the tool's
+tech knowledge cannot go stale. It went stale exactly once, in the hardcoded
+table this replaced: the Raider moved from the Workshop to the Barracks and
+nothing here noticed. The built-in table survives only as an offline fallback.
+
+**The two-hero rule.** Hero slots climb the hall ladder, so `the hero` stopped
+naming one unit. It names the *class*, and that is correct for every verb whose
+payload is a list — both heroes is a fine answer to `autocast at 3`. The three
+verbs that take exactly one unit (`escort`, and `buy`/`use_item` now that both
+carry an optional `hero`) **refuse and name the disambiguating words** rather
+than taking the first or the nearest. This is the one place a guess is
+unrecoverable: an escort posture aimed at the wrong hero sends the army to the
+wrong side of the map, silently. `the champion` and `the priestess` resolve it;
+the Sorcerer, a caster but not a hero, is deliberately outside the word.
+
+It refuses rather than guesses. An unresolvable place, an unknown noun, a
+locked shop rung and a target class the engine does not have are all reported
+errors, never a silently different order. The one structural refusal is
+**conditionals**: "strike when their hero falls" has no verb, because the
+engine has no trigger system. The tool compiles the action, marks it deferred,
+and prints the command to run when the commander sees the condition in
+`events` — which is the honest shape of that request, not a limitation to
+paper over.
+
+The confirmation loop is `sentence()`. Compile, send, and the log reads back
+what the game understood in English. If the sentence is wrong, the compile was
+wrong, and you know before the army arrives.
+
+### Every unit answers "why are you doing that?"
+
+`shared::Provenance` is a `Copy` enum stamped by whoever mints the behaviour,
+in the same `Commands` call that mints it — so the answer cannot drift from the
+behaviour, because there is no second place that could disagree.
+
+| rung | written by | example |
+|---|---|---|
+| direct order | `intent.rs`, the eight behaviour verbs | `order:move by bridge t=123` |
+| squad posture | `doctrine.rs::run_squad_postures` | `posture:push sq1` |
+| standing policy | `doctrine.rs` retreat / leash triggers | `policy:retreat t=210` |
+| producing building | `units.rs::spawn_units` via `spawn_provenance` | `template:Barracks#4294968258` |
+| scripted baseline | `ai.rs` (not a seat, so its own rung) | `script:wave` |
+| engine default | auto-enrolment, idle instinct | `instinct:auto-enroll`, `idle` |
+
+Exposed three ways, and it is the *same string* in all three: the snapshot's
+`units[].why` (own units only — an opponent's chain of command is their plan),
+the human's selection panel, and the intent log, whose order lines carry the
+`why` they stamped so a unit's answer and the sentence that caused it are one
+grep apart. Introspection is part of the decision surface, so it had to be
+equitable too, or one seat could ask a question the other could not.
+
+**Timing convention, once Chain of Command is on** (docs/TEMPO.md): a
+`Provenance.at` is always the moment the behaviour *began*, so a delayed order
+stamps its **arrival**, not the moment it was spoken — the log keeps the speech
+time as its own `t` and the gap as `link`, making the join `why.at == t + link`.
+
+**Why stamping at the mint site keeps paying.** Three branches landed between
+this design and its merge — a +1393-line scripted-AI expansion (towers, ford
+holds, reactive mixes, Castle, shop use), the ghost right-click attack, and a
+second hero class — and none of them needed a new stamp. The AI's new
+behaviour is building *placement*, routed through the one `Order::Build` site
+that was already stamped; its Castle and shop work emits events, not orders;
+its reactive mixes are training-queue pushes. The ghost right-click submits
+`Intent::Attack` like every other attack gesture, so it inherits
+`mark.order("attack")` from the compiler — which is the fairness invariant
+paying for itself, since a UI path that *needed* its own stamp would have been
+a UI path that bypassed the compiler. The count of `Order` mint sites is the
+count of places provenance must be maintained, and that is a number the
+one-compiler layer already keeps small.
+
+Two implementation notes worth keeping:
+
+- **`Order::Idle` is caught once, not eight times.** It is written from eight
+  scattered engine systems and always means "the old reason expired", so a
+  single `Changed<Order>` system (`doctrine::idle_instinct`) handles all of
+  them. Nothing player-facing writes `Order::Idle` — `stop` re-issues a Move to
+  the unit's own spot — so it only ever overwrites a reason that has genuinely
+  lapsed.
+- **A blind forager still says `forage`.** `run_squad_postures` rewrites a
+  Forage squad with nothing visible to hunt into a Defend at its muster point,
+  but the stamp names the posture the *commander set*, because that is what
+  `squads[].posture` reports and a unit contradicting the readout above it is
+  worse than a coarse answer.
+
+### Follow-ups this left open
+
+- **The worker panic-flee has no stamp.** It is a `MoveTo` nudge that leaves
+  `Order::Harvest` intact, so nothing would ever expire the stamp and the
+  worker would blame a five-second sprint for the rest of the match. Giving
+  reflex behaviours an expiry is the general fix.
+- **`ai.rs` gets `Cause::Script`, not an `IntentSource`.** Correct today, since
+  it is engine baseline rather than a seat — but if `ai.rs` is ever routed
+  through the compiler (the prerequisite for TEMPO.md's Chain of Command), that
+  rung should collapse into `order:… by ai`.
+- **The tool cannot see money.** It happily compiles a `build` you cannot
+  afford; economy.rs refuses it. That is the documented division below, but a
+  `me.gold` check would turn a rejected batch into a better error.
+
+---
+
 ## What this unlocks
 
-- **`wc3clone-ge4` (NL→intent compiler).** Its target is now a concrete type
-  with a fixed serde shape and a `sentence()` renderer to check itself against:
-  compile English to `Intent`, print the sentence back, and the round trip is
-  the confirmation dialogue. It should emit `Intent` values, never JSON strings.
 - **`wc3clone-hre` (co-command).** Two authors submitting into one team is now
   a matter of two `SubmitIntent` producers with different `IntentSource`s —
   the compiler already tags, logs and attributes every intent, and already

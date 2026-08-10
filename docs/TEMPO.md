@@ -767,17 +767,76 @@ can field more than one, and `refresh_command_nodes` collects the whole
 dead-hero rule beside it. It is a real strategic object: two heroes are two
 fast-hands zones, bought by putting two expensive units in two dangerous places.
 
-**One thing for the calibration bead, stated plainly.** On the merged master,
-latency-on lengthens matches enough to matter: on `open`, 7 flag-off runs all
-finished decisively in 390–810s, while 7 flag-on runs gave 5 decisive
-(390–1050s) and 2 that hit the 1800s cap. The caps are *not* stuck armies —
-the telemetry shows no orders in transit through the late game, both armies are
-alive, and both treasuries are banking lumber with the gold mines dry. They are
-the mine-exhaustion stalemate, reached because slower propagation means slower
-armies means fewer decisive engagements before the map runs out of gold. Master
-also added towers and ford fortification in the meantime, which push the same
-way. The honest reading is that the defaults chosen here were calibrated against
-a pre-tower AI and are probably a notch too heavy for the current one; the dial
-to turn first is `WC3_LINK_HALL_RADIUS` up rather than `WC3_LINK_STEP` down,
-because the complaint is reach rather than reaction. That is issue 8's decision
-to make with a sweep, not this bead's to make with seven runs.
+**One thing for the calibration bead — and a correction.** After the
+bead/ai-bundle merge this section reported that latency-on lengthened matches
+enough to matter: seven flag-off runs on `open` finished in 390-810s while
+seven flag-on runs produced two that hit the 1800s cap. **That reading did not
+survive the next merge and should not be carried forward.** Re-run against
+master after bead/ge4, the two arms are indistinguishable: flag-off gave 4
+decisive out of 5 with one cap on `crossings`; flag-on gave 5 decisive out of 6
+with one cap on `open`. Caps now appear in *both* arms at similar rates, so what
+was attributed to link latency was mostly master's own drift — the scripted AI
+grew towers and ford holds over the same period, and defensive play lengthens
+games whoever is issuing the orders.
+
+What is worth keeping from the observation is the shape of the failure, because
+it is the one the sweep must learn to recognise: every capped run in either arm
+has the same signature — mines dry, both armies alive and supplied, treasuries
+banking lumber, and (with the flag on) *no orders in transit* through the late
+game. That is the mine-exhaustion stalemate, not a tempo problem, and a sweep
+that reads match length alone will mistake one for the other. Read
+`report_link_load` alongside it: a stalemate with an empty in-transit queue is
+the economy running out, while a mean link pinned at the cap is armies that have
+marched off the end of their own chain of command.
+
+### Reconciled against bead/ge4 (the `why` layer)
+
+ge4 gave every unit an answer to "why are you doing that?" — a `Provenance`
+stamped in the same `Commands` call that mints the behaviour, so the answer
+cannot drift from the behaviour. Latency puts a gap between minting an order and
+the unit receiving it, which is exactly the case that layer had not met yet.
+
+**A delayed order carries its reason and stamps it on arrival.** `PendingOrder`
+holds the `Provenance` the compiler minted, so the verb and the interface that
+spoke it travel with the order; `dispatch_pending` rewrites its `at` to the
+arrival time as it lands. The alternative — stamping speech time — would have
+made `Provenance.at` mean two different things depending on the cause, since
+every other rung (doctrine's postures, a building's template) records the moment
+the behaviour *began*. A unit would have claimed to have been obeying an order
+for two seconds before it had received it.
+
+The speech time is not lost, and the two records join:
+
+```
+intent_log.jsonl : t=8.3  link=0.7  why="order:move by bridge t=9"
+                   sentence="move unit 4294968174 to (0.0, 0.0) (+0.7s link)"
+units[].why      :                  "order:move by bridge t=9"     // 8.3 + 0.7
+```
+
+This is a live capture, and the interesting line is the one not shown: while the
+order was in transit the unit answered `why: "idle"`. It had not started obeying
+yet, and it said so. That is the two layers agreeing rather than merely
+coexisting — the `why` layer describes what a unit is doing, and during a
+latency window a unit is genuinely still doing the old thing.
+
+Making that join exact needed two small choices: the log's `why` is rendered at
+`t + link` rather than at `t` (it is the join *key*, so it must be
+character-for-character what the unit will answer), and `at` is set from
+`ready_at` rather than from the dispatching frame's clock, so the join holds to
+the log's 0.1s resolution instead of drifting by a frame. For a group order
+spread across the map the log names the worst link, so its `why` joins against
+the last unit to receive the order; the others answer with their own, earlier
+arrival.
+
+**`PendingCast` carries no provenance, deliberately.** A cast mints no `Order`,
+so there is nothing to re-time: a unit's reason for being where it is is not
+changed by having thrown a spell, and overwriting it with `"cast"` would replace
+a standing answer with a momentary one. The log side is unchanged — a delayed
+cast annotates its sentence exactly as a delayed order does.
+
+**ai.rs composed cleanly.** ge4 wraps the script's orders in `script(what, now)`
+and this bead routes them through `OrderIssuer`; the composition is
+`issuer.issue(…, script(what, now))`, so the stamp goes *through* the latency
+layer rather than around it and survives the deferred dispatch. All eleven sites
+compose, and no direct `Order` write remains in either the compiler or the
+script.
