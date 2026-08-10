@@ -335,6 +335,15 @@ Consequences of it being a flat quad rather than a shader:
 
 ### Scenery obeys the fog — the third renderer
 
+![Before and after: doodads under the fog](fog-scenery-before-after.png)
+
+*The same camera, the same map seed, the same 800×600 window. **Left:** the flat quad
+darkens the ground and nothing else, so four rocks standing in fogged terrain are lit as if
+it were noon. **Right:** the same four rocks wear their cell's shade. Measured peak
+luminance across those four doodads: **171.8 → 103.6**, and their contrast against the
+fogged ground beside them falls from 3.16× to 1.91× — dimmed with the earth they stand on
+rather than glowing out of it.*
+
 The quad lies at `y = 0.16`, so it can darken nothing taller than 0.16, which is nothing.
 A rock is half a unit across and a pine's canopy is four units up: both stood in full
 daylight over black or half-black earth. The floor said *unexplored* and the forest on it
