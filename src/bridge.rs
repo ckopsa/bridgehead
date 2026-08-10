@@ -181,7 +181,7 @@
 //! array instead of a panic.
 
 use crate::command::{CommandLink, PendingOrder};
-use crate::copilot::{Copilot, CopilotWire, Proposal};
+use crate::copilot::{Copilot, CopilotWire, Proposal, Resolution};
 use crate::intent::{set_autopilot, IntentApply};
 use crate::shared::*;
 use bevy::ecs::system::SystemParam;
@@ -451,9 +451,18 @@ fn bridge_startup(
                 // the scripted AI, a co-commander connecting is no reason to
                 // take it back for them.
                 copilot.seat(team);
+                // The scripted approver is announced at the seat, not buried
+                // in the snapshot: a sim log that does not say "nobody human
+                // answered these" is a result somebody will misread later.
+                let approver = match copilot.auto_approve {
+                    Some(delay) => {
+                        format!(", SCRIPTED APPROVER: auto-approving after {delay}s")
+                    }
+                    None => String::new(),
+                };
                 info!(
                     "{BRIDGE_ENV}: CO-COMMAND seat active — {:?} is played by the human \
-                     at the keyboard WITH a co-commander (trust: {}, snapshot {}, \
+                     at the keyboard WITH a co-commander (trust: {}{approver}, snapshot {}, \
                      commands {})",
                     team,
                     copilot.policy.name(),
@@ -534,10 +543,21 @@ struct StateOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     copilot: Option<CopilotOut>,
     /// Directives this seat has proposed that the human has not answered yet,
-    /// oldest first. A proposal leaves this list by being approved, vetoed or
-    /// lapsing — and all three outcomes are announced in `events`.
+    /// in **answer order** — urgent first, then oldest. A proposal leaves this
+    /// list by being approved, vetoed or lapsing.
     #[serde(skip_serializing_if = "Option::is_none")]
     proposals: Option<Vec<ProposalOut>>,
+    /// The last few proposals that LEFT `proposals`, oldest first, each with
+    /// how it ended — and, on a veto, which of the three answers it was.
+    ///
+    /// A tail rather than a terminal `status` left on `proposals` for one
+    /// cycle: a seat polling slower than the snapshot ticks would miss a
+    /// one-write status, and "did my partner ever answer #3, and what did they
+    /// say?" is exactly the question you ask when you have *not* kept up. It
+    /// also keeps `proposals` meaning one thing — the queue you can still act
+    /// on — instead of a mixed list every reader has to filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_resolutions: Option<Vec<ResolutionOut>>,
     /// **The other half of legibility.** The recent intents of this seat's
     /// team, oldest first, each tagged with which author spelled it — so the
     /// ones tagged `"ui"` are the human's own, in the same English the replay
@@ -559,7 +579,23 @@ struct CopilotOut {
     /// Game seconds an unanswered proposal survives.
     propose_ttl: f32,
     /// How many proposals may be outstanding before new ones are refused.
+    /// Unchanged by urgency: the cap is about how many questions a human can
+    /// hold, and marking one urgent does not add attention.
     max_pending: usize,
+    /// The values `severity` accepts on a `propose` wrapper, least urgent
+    /// first. The first is the default.
+    severities: [&'static str; 2],
+    /// Every veto reason your partner can answer with, mapped to what it asks
+    /// of you next. Advertised for the same reason `direct` is: a
+    /// co-commander should learn its etiquette by reading the snapshot, not by
+    /// being told out of band.
+    veto_reasons: BTreeMap<&'static str, &'static str>,
+    /// Present only when a SCRIPTED approver is standing in for the human
+    /// (`WC3_COPILOT_AUTOAPPROVE`, sims only): the seconds it waits before
+    /// approving. Absent in every real match — so a seat can tell whether the
+    /// thing answering it is a person.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_approve_after: Option<f32>,
 }
 
 /// One directive waiting on the human.
@@ -574,8 +610,34 @@ struct ProposalOut {
     /// What the human was told this would disturb: their squads, their recent
     /// orders. Empty when it steps on nothing.
     conflicts: Vec<String>,
+    /// `"routine"` or `"urgent"` — as sent, echoed back so a seat can see that
+    /// its urgency was accepted rather than assume it.
+    severity: &'static str,
     /// Game seconds until it lapses unanswered.
     expires_in: f32,
+}
+
+/// One proposal that has been answered, and how.
+#[derive(Serialize)]
+struct ResolutionOut {
+    id: u32,
+    /// Game seconds at which it was answered.
+    t: f32,
+    /// The seat's own note, echoed back — a resolution names the IDEA, not
+    /// just a number the model has to have remembered.
+    note: String,
+    severity: &'static str,
+    /// `"approved"`, `"vetoed"` or `"expired"`. There is no `"pending"`:
+    /// being in `proposals` is what pending means, and a status that restates
+    /// a list membership is a second source of truth.
+    outcome: &'static str,
+    /// Vetoes only: `"not_now"`, `"never"` or `"wrong_target"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// Vetoes only: what that reason asks you to do next, in one clause, so
+    /// acting on a veto correctly needs no second document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advice: Option<&'static str>,
 }
 
 /// One remembered intent of this team, whoever wrote it.
@@ -1160,17 +1222,22 @@ fn write_snapshot(
         let seat_fog = fog.get(seat.team);
         // The co-command block, for the one role that has one. An ordinary
         // seat is handed `None` and serializes exactly what it always did.
-        let co_out = (seat.role == SeatRole::Copilot).then(|| {
-            (
-                CopilotOut {
-                    trust: co.copilot.policy.name(),
-                    direct: crate::copilot::direct_verbs(co.copilot.policy),
-                    propose_ttl: crate::copilot::PROPOSAL_TTL,
-                    max_pending: crate::copilot::MAX_PENDING,
-                },
-                proposals_out(&co.copilot.pending, now),
-                journal_out(co.journal.get(seat.team)),
-            )
+        let co_out = (seat.role == SeatRole::Copilot).then(|| CoOut {
+            copilot: CopilotOut {
+                trust: co.copilot.policy.name(),
+                direct: crate::copilot::direct_verbs(co.copilot.policy),
+                propose_ttl: crate::copilot::PROPOSAL_TTL,
+                max_pending: crate::copilot::MAX_PENDING,
+                severities: crate::copilot::ProposalSeverity::NAMES,
+                veto_reasons: crate::copilot::VetoReason::all()
+                    .into_iter()
+                    .map(|r| (r.wire(), r.advice()))
+                    .collect(),
+                auto_approve_after: co.copilot.auto_approve,
+            },
+            proposals: proposals_out(&co.copilot.pending, now),
+            recent_resolutions: resolutions_out(&co.copilot.resolved),
+            partner_log: journal_out(co.journal.get(seat.team)),
         });
         write_seat_snapshot(
             seat,
@@ -1217,10 +1284,10 @@ fn write_seat_snapshot(
     // your click just bounced off a stale ghost is a partner who can stop
     // proposing around it.
     intent_errors: &[String],
-    // `Some` for a copilot seat: its etiquette, its pending queue, its team's
-    // recent sentences. `None` for every other seat, which is what keeps their
-    // wire format unchanged.
-    co: Option<(CopilotOut, Vec<ProposalOut>, Vec<JournalOut>)>,
+    // `Some` for a copilot seat: its etiquette, its pending queue, what became
+    // of the ones it already asked, and its team's recent sentences. `None`
+    // for every other seat, which is what keeps their wire format unchanged.
+    co: Option<CoOut>,
     units: &SnapshotUnits,
     buildings: &SnapshotBuildings,
     nodes: &SnapshotNodes,
@@ -1506,9 +1573,16 @@ fn write_seat_snapshot(
     let hero_slots_used = (my_hero_classes.len() + queued_hero_classes.len()) as u32;
 
     let map = crate::terrain::active_map();
-    let (copilot_out, proposals_out, partner_log) = match co {
-        Some((copilot, proposals, journal)) => (Some(copilot), Some(proposals), Some(journal)),
-        None => (None, None, None),
+    // All four co-command keys appear together or not at all — including as
+    // empty lists — so the shape a co-commander parses never changes under it.
+    let (copilot_out, proposals_out, resolutions_out, partner_log) = match co {
+        Some(co) => (
+            Some(co.copilot),
+            Some(co.proposals),
+            Some(co.recent_resolutions),
+            Some(co.partner_log),
+        ),
+        None => (None, None, None, None),
     };
     let command_nodes: Vec<CommandNodeOut> = if link.latency.on {
         link.nodes
@@ -1637,6 +1711,7 @@ fn write_seat_snapshot(
         command_nodes,
         copilot: copilot_out,
         proposals: proposals_out,
+        recent_resolutions: resolutions_out,
         partner_log,
     };
 
@@ -1719,8 +1794,22 @@ fn unlocked_map(completed: &[BuildingKind]) -> BTreeMap<&'static str, bool> {
 // Co-command serializers
 // ---------------------------------------------------------------------------
 
-/// The pending queue, oldest first — the same order the human's panel shows
-/// and the same order their approve/veto keys walk, so "#3" means one thing.
+/// Everything only a copilot seat's snapshot carries, built once per write.
+///
+/// A struct rather than the tuple this used to be: four positional fields of
+/// which two are `Vec`s of different things is exactly the shape that gets
+/// swapped at a call site and compiles.
+struct CoOut {
+    copilot: CopilotOut,
+    proposals: Vec<ProposalOut>,
+    recent_resolutions: Vec<ResolutionOut>,
+    partner_log: Vec<JournalOut>,
+}
+
+/// The pending queue in ANSWER order — urgent first, then oldest — which is
+/// the order the human's panel shows and their approve/veto keys walk, so the
+/// first entry here is the one `[Enter]` takes. `copilot::insert_index` keeps
+/// `pending` in that order, so this is a straight copy and never a sort.
 fn proposals_out(pending: &[Proposal], now: f32) -> Vec<ProposalOut> {
     pending
         .iter()
@@ -1729,7 +1818,26 @@ fn proposals_out(pending: &[Proposal], now: f32) -> Vec<ProposalOut> {
             note: p.note.clone(),
             sentences: p.sentences.clone(),
             conflicts: p.conflicts.clone(),
+            severity: p.severity.name(),
             expires_in: r1(p.expires_in(now)),
+        })
+        .collect()
+}
+
+/// The answered-proposal tail, oldest first — same direction as `events`,
+/// `proposals` and `partner_log`, so a reader that walks one walks them all
+/// the same way.
+fn resolutions_out(resolved: &std::collections::VecDeque<Resolution>) -> Vec<ResolutionOut> {
+    resolved
+        .iter()
+        .map(|r| ResolutionOut {
+            id: r.id,
+            t: r1(r.at),
+            note: r.note.clone(),
+            severity: r.severity.name(),
+            outcome: r.outcome.name(),
+            reason: r.outcome.reason().map(|reason| reason.wire()),
+            advice: r.outcome.reason().map(|reason| reason.advice()),
         })
         .collect()
 }
@@ -2029,5 +2137,155 @@ mod tests {
             assert_eq!(map["Worker"], true, "{hall:?} must still train workers");
             assert_eq!(map["Priestess"], true);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Co-command on the wire
+    // -----------------------------------------------------------------------
+
+    use crate::copilot::{Outcome, ProposalSeverity, Resolution, VetoReason};
+
+    fn a_resolution(id: u32, outcome: Outcome) -> Resolution {
+        Resolution {
+            id,
+            at: 12.25,
+            note: "hit their siege".to_string(),
+            severity: ProposalSeverity::Urgent,
+            outcome,
+        }
+    }
+
+    /// **The veto reason, end to end on the wire.** The human's answer is
+    /// worth nothing to a co-commander unless it survives serialization as
+    /// something a model can match on — so this parses the JSON back rather
+    /// than inspecting the Rust structs, which is the only way to catch a
+    /// field that got renamed, skipped or nested one level too deep.
+    #[test]
+    fn a_veto_reason_round_trips_through_the_snapshot_json() {
+        let resolved: std::collections::VecDeque<Resolution> = [
+            a_resolution(1, Outcome::Vetoed(VetoReason::NotNow)),
+            a_resolution(2, Outcome::Vetoed(VetoReason::Never)),
+            a_resolution(3, Outcome::Vetoed(VetoReason::WrongTarget)),
+            a_resolution(4, Outcome::Approved),
+            a_resolution(5, Outcome::Expired),
+        ]
+        .into();
+        let json = serde_json::to_string(&resolutions_out(&resolved)).expect("serializes");
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parses");
+
+        assert_eq!(back.len(), 5, "oldest first, one entry each");
+        let reasons: Vec<Option<&str>> = back
+            .iter()
+            .map(|r| r["reason"].as_str())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                Some("not_now"),
+                Some("never"),
+                Some("wrong_target"),
+                None,
+                None
+            ],
+            "the three vetoes name themselves; an approval and a lapse have \
+             no reason to give, and the key is absent rather than null"
+        );
+        assert_eq!(
+            back.iter().map(|r| r["outcome"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["vetoed", "vetoed", "vetoed", "approved", "expired"]
+        );
+        // Every veto also carries what it ASKS FOR, so acting on one correctly
+        // needs no second document.
+        assert_eq!(
+            back[2]["advice"].as_str(),
+            Some("re-propose with a different target")
+        );
+        assert!(back[3].get("advice").is_none(), "no advice without a veto");
+        // And a resolution identifies the idea, not just a number the model
+        // has to have remembered.
+        assert_eq!(back[0]["note"].as_str(), Some("hit their siege"));
+        assert_eq!(back[0]["severity"].as_str(), Some("urgent"));
+        assert_eq!(back[0]["id"].as_u64(), Some(1));
+        assert_eq!(back[0]["t"].as_f64(), Some(12.3), "rounded like every other t");
+        // There is no `pending` outcome, because membership in `proposals` is
+        // what pending means.
+        assert!(
+            !json.contains("pending"),
+            "a status that restates a list membership is a second source of truth"
+        );
+    }
+
+    /// The queue goes out in ANSWER order with its severity attached, so a
+    /// co-commander can see that its urgency was accepted rather than assume
+    /// it — and can tell which proposal `[Enter]` will take.
+    #[test]
+    fn the_pending_queue_carries_its_severity_in_answer_order() {
+        let proposal = |id: u32, severity| Proposal {
+            id,
+            note: "n".to_string(),
+            intents: Vec::new(),
+            sentences: vec!["s".to_string()],
+            conflicts: Vec::new(),
+            severity,
+            proposed_at: 0.0,
+            expires_at: 20.0,
+            pos: None,
+        };
+        // Exactly the order `copilot::insert_index` maintains.
+        let pending = vec![
+            proposal(3, ProposalSeverity::Urgent),
+            proposal(1, ProposalSeverity::Routine),
+        ];
+        let out = serde_json::to_value(proposals_out(&pending, 5.0)).expect("serializes");
+        assert_eq!(out[0]["id"].as_u64(), Some(3));
+        assert_eq!(out[0]["severity"].as_str(), Some("urgent"));
+        assert_eq!(out[0]["expires_in"].as_f64(), Some(15.0));
+        assert_eq!(out[1]["id"].as_u64(), Some(1));
+        assert_eq!(out[1]["severity"].as_str(), Some("routine"));
+    }
+
+    /// The seat learns its own etiquette by reading, never out of band — so
+    /// the vocabulary the human can answer with, and the two words `severity`
+    /// accepts, are in the snapshot next to `direct`.
+    #[test]
+    fn the_copilot_block_advertises_the_whole_negotiation_vocabulary() {
+        let out = CopilotOut {
+            trust: "split",
+            direct: vec!["posture"],
+            propose_ttl: crate::copilot::PROPOSAL_TTL,
+            max_pending: crate::copilot::MAX_PENDING,
+            severities: ProposalSeverity::NAMES,
+            veto_reasons: VetoReason::all()
+                .into_iter()
+                .map(|r| (r.wire(), r.advice()))
+                .collect(),
+            auto_approve_after: None,
+        };
+        let json = serde_json::to_value(&out).expect("serializes");
+        assert_eq!(json["severities"][0].as_str(), Some("routine"));
+        assert_eq!(json["severities"][1].as_str(), Some("urgent"));
+        assert_eq!(
+            json["veto_reasons"]["never"].as_str(),
+            Some("do not re-propose this match")
+        );
+        assert_eq!(
+            json["veto_reasons"]["not_now"].as_str(),
+            Some("re-propose when conditions change")
+        );
+        // Absent in a real match: a seat must be able to tell whether the
+        // thing answering it is a person.
+        assert!(
+            json.get("auto_approve_after").is_none(),
+            "no scripted approver, no key"
+        );
+
+        let scripted = CopilotOut {
+            auto_approve_after: Some(3.0),
+            ..out
+        };
+        assert_eq!(
+            serde_json::to_value(&scripted).unwrap()["auto_approve_after"].as_f64(),
+            Some(3.0)
+        );
     }
 }
