@@ -1,0 +1,93 @@
+{
+  "t": 214.6,
+  "my_team": "Claude",
+  "seq_applied": 7,
+  "errors": [],
+  "game_over": null,
+  "me": {
+    "gold": 640,
+    "lumber": 310,
+    "supply_used": 28,
+    "supply_cap": 40,
+    "upkeep_rate": 1.0,
+    "tier": 2,
+    "hero_record": { "kind": "Hero", "level": 3 },
+    "hero_cost": { "gold": 220, "lumber": 0 },
+    "research": [
+      { "id": "attack", "name": "Weapon Grinding", "level": 1, "max_level": 3, "bonus": 2.0 },
+      { "id": "armor", "name": "Plating", "level": 0, "max_level": 3, "bonus": 0.0 }
+    ]
+  },
+  "map": {
+    "name": "crossings",
+    "summary": "A canyon splits the map corner to corner; three fords are the only ways across.",
+    "available": ["open", "crossings"],
+    "chokes": [
+      { "name": "northwest ford", "pos": [-60.0, 60.0], "width": 30.0 },
+      { "name": "center ford", "pos": [0.0, 0.0], "width": 16.0 },
+      { "name": "southeast ford", "pos": [60.0, -60.0], "width": 30.0 }
+    ]
+  },
+  "fog": { "enabled": true, "explored": 0.42, "visible": 0.11 },
+  "unlocked": {
+    "Farm": true, "Barracks": true, "Workshop": true, "Blacksmith": true,
+    "Shop": true, "Tower": true, "Wall": true, "TownHall": true,
+    "Footman": true, "Archer": true, "Raider": true, "Catapult": true,
+    "Knight": false, "GryphonRider": false, "Spearman": true, "Worker": true,
+    "Hero": true
+  },
+  "units": [
+    { "id": 4294968100, "team": "Claude", "kind": "Worker", "pos": [66.0, 72.0], "hp": 60.0, "max_hp": 60.0, "order": "Harvest", "moving": false, "carrying": true, "hero": null, "squad": null, "why": "order:harvest by bridge t=31" },
+    { "id": 4294968101, "team": "Claude", "kind": "Worker", "pos": [72.0, 68.0], "hp": 60.0, "max_hp": 60.0, "order": "Harvest", "moving": true, "carrying": false, "hero": null, "squad": null, "why": "order:harvest by bridge t=31" },
+    { "id": 4294968102, "team": "Claude", "kind": "Worker", "pos": [61.0, 77.0], "hp": 60.0, "max_hp": 60.0, "order": "Idle", "moving": false, "carrying": false, "hero": null, "squad": null, "why": "idle" },
+    { "id": 4294968110, "team": "Claude", "kind": "Footman", "pos": [55.0, 55.0], "hp": 220.0, "max_hp": 240.0, "order": "AttackMove", "moving": true, "carrying": false, "hero": null, "squad": 0, "why": "posture:defend sq0" },
+    { "id": 4294968111, "team": "Claude", "kind": "Footman", "pos": [58.0, 52.0], "hp": 240.0, "max_hp": 240.0, "order": "AttackMove", "moving": true, "carrying": false, "hero": null, "squad": 0, "why": "posture:defend sq0" },
+    { "id": 4294968112, "team": "Claude", "kind": "Footman", "pos": [52.0, 58.0], "hp": 180.0, "max_hp": 240.0, "order": "Idle", "moving": false, "carrying": false, "hero": null, "squad": 0, "why": "idle" },
+    { "id": 4294968120, "team": "Claude", "kind": "Archer", "pos": [60.0, 60.0], "hp": 130.0, "max_hp": 140.0, "order": "AttackMove", "moving": true, "carrying": false, "hero": null, "squad": 0, "why": "posture:defend sq0" },
+    { "id": 4294968121, "team": "Claude", "kind": "Archer", "pos": [62.0, 57.0], "hp": 140.0, "max_hp": 140.0, "order": "AttackMove", "moving": true, "carrying": false, "hero": null, "squad": 0, "why": "posture:defend sq0" },
+    { "id": 4294968130, "team": "Claude", "kind": "Raider", "pos": [40.0, 30.0], "hp": 200.0, "max_hp": 200.0, "order": "Idle", "moving": false, "carrying": false, "hero": null, "squad": 0, "why": "template:Workshop#4294968203" },
+    { "id": 4294968131, "team": "Claude", "kind": "Raider", "pos": [42.0, 27.0], "hp": 200.0, "max_hp": 200.0, "order": "Idle", "moving": false, "carrying": false, "hero": null, "squad": 0, "why": "template:Workshop#4294968203" },
+    { "id": 4294968132, "team": "Claude", "kind": "Raider", "pos": [38.0, 33.0], "hp": 155.0, "max_hp": 200.0, "order": "Idle", "moving": false, "carrying": false, "hero": null, "squad": 0, "why": "idle" },
+    { "id": 4294968140, "team": "Claude", "kind": "Catapult", "pos": [64.0, 64.0], "hp": 160.0, "max_hp": 160.0, "order": "Idle", "moving": false, "carrying": false, "hero": null, "squad": 0, "why": "idle" },
+    { "id": 4294968150, "team": "Claude", "kind": "Hero", "pos": [57.0, 57.0], "hp": 470.0, "max_hp": 520.0, "order": "AttackMove", "moving": true, "carrying": false, "hero": { "level": 3, "xp": 240.0, "xp_next": 400.0, "mana": 80.0, "max_mana": 130.0, "cd": 0.0 }, "squad": 0, "why": "posture:defend sq0" },
+    { "id": 4294967400, "team": "Human", "kind": "Footman", "pos": [8.0, -4.0], "hp": 210.0, "max_hp": 240.0, "order": "AttackMove", "moving": true, "carrying": false, "hero": null }
+  ],
+  "buildings": [
+    { "id": 4294968200, "team": "Claude", "kind": "Keep", "pos": [70.0, 70.0], "hp": 1400.0, "max_hp": 1400.0, "done": true, "queue": [], "progress": 0.0, "tier": 2 },
+    { "id": 4294968201, "team": "Claude", "kind": "Barracks", "pos": [62.0, 74.0], "hp": 700.0, "max_hp": 700.0, "done": true, "queue": ["Footman"], "progress": 0.4, "tier": 1, "template": true },
+    { "id": 4294968202, "team": "Claude", "kind": "Barracks", "pos": [74.0, 62.0], "hp": 700.0, "max_hp": 700.0, "done": true, "queue": [], "progress": 0.0, "tier": 1 },
+    { "id": 4294968203, "team": "Claude", "kind": "Workshop", "pos": [78.0, 72.0], "hp": 800.0, "max_hp": 800.0, "done": true, "queue": [], "progress": 0.0, "tier": 1, "template": true },
+    { "id": 4294968204, "team": "Claude", "kind": "Blacksmith", "pos": [66.0, 80.0], "hp": 600.0, "max_hp": 600.0, "done": true, "queue": [], "progress": 0.0, "tier": 1 },
+    { "id": 4294968205, "team": "Claude", "kind": "Shop", "pos": [80.0, 66.0], "hp": 500.0, "max_hp": 500.0, "done": true, "queue": [], "progress": 0.0, "tier": 1,
+      "sells": [
+        { "id": "HealingPotion", "cost_gold": 90, "tier": 1, "locked": false },
+        { "id": "TownPortal", "cost_gold": 180, "tier": 1, "locked": false },
+        { "id": "BannerOfCommand", "cost_gold": 350, "tier": 3, "locked": true }
+      ] },
+    { "id": 4294968206, "team": "Claude", "kind": "Farm", "pos": [84.0, 78.0], "hp": 400.0, "max_hp": 400.0, "done": true, "queue": [], "progress": 0.0, "tier": 1 },
+    { "id": 4294968210, "team": "Claude", "kind": "TownHall", "pos": [22.0, 46.0], "hp": 900.0, "max_hp": 1100.0, "done": true, "queue": [], "progress": 0.0, "tier": 1 },
+    { "id": 4294967300, "team": "Human", "kind": "TownHall", "pos": [-70.0, -70.0], "hp": 1100.0, "max_hp": 1100.0, "done": true, "queue": [], "progress": 0.0, "tier": 1, "last_seen": 96.2 },
+    { "id": 4294967301, "team": "Human", "kind": "Barracks", "pos": [-62.0, -74.0], "hp": 700.0, "max_hp": 700.0, "done": true, "queue": [], "progress": 0.0, "tier": 1, "last_seen": 96.2 }
+  ],
+  "squads": [
+    { "id": 0, "posture": "defend@(70.0,70.0)r=18", "members": 8 }
+  ],
+  "mines": [
+    { "id": 4294968300, "pos": [76.0, 62.0], "remaining": 1250 },
+    { "id": 4294968301, "pos": [22.0, 52.0], "remaining": 2900 },
+    { "id": 4294968302, "pos": [-58.0, 58.0], "remaining": 3500 },
+    { "id": 4294968303, "pos": [58.0, -58.0], "remaining": 3400 },
+    { "id": 4294968304, "pos": [-76.0, -62.0], "remaining": 900 }
+  ],
+  "trees_near": [
+    { "id": 4294968400, "pos": [64.0, 84.0] },
+    { "id": 4294968401, "pos": [86.0, 60.0] }
+  ],
+  "bounties": [
+    { "pos": [6.0, -12.0], "gold": 520, "expires_in": 44.0 }
+  ],
+  "events": [
+    [201.4, "bounty cache appeared near (6, -12)"],
+    [212.9, "hostiles near your expansion"]
+  ]
+}

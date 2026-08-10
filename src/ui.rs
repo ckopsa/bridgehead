@@ -358,6 +358,9 @@ enum Slot {
     Items,
     /// One-line doctrine summary of the selection (empty = no policies).
     Doctrine,
+    /// The selection's answer to "why are you doing that?" — verbatim the same
+    /// string the bridge reads from the snapshot's `units[].why`.
+    Why,
     Overflow,
     CardLetter(usize),
     QueueLetter(usize),
@@ -755,6 +758,45 @@ fn sorted_doctrine(mut list: Vec<(u32, UnitDoctrine)>) -> Vec<UnitDoctrine> {
 /// A live `SquadPosture`, in the panel's compact shorthand. The point is
 /// spelled out because a posture *is* its point — "defend" alone tells the
 /// player nothing about which ground they told the squad to hold.
+/// The selection's answer to "why are you doing that?", for the info panel.
+///
+/// Every string here is byte-identical to what the same unit reports in the
+/// bridge snapshot's `units[].why`. That is the whole point: introspection is
+/// part of the decision surface, and a human who cannot ask what their army is
+/// doing is not playing the same game as a commander who can read it.
+///
+/// One unit answers for itself. Several answer as a tally — "why is my army
+/// doing that" is usually the question of whether it is doing ONE thing, so a
+/// single line means the group is coherent and two mean it has split.
+fn why_line(answers: Vec<String>) -> String {
+    if answers.is_empty() {
+        return String::new();
+    }
+    let mut answers = answers;
+    answers.sort();
+    let mut tally: Vec<(String, usize)> = Vec::new();
+    for a in answers {
+        match tally.last_mut() {
+            Some((seen, n)) if *seen == a => *n += 1,
+            _ => tally.push((a, 1)),
+        }
+    }
+    if tally.len() == 1 {
+        return format!("Why: {}", tally[0].0);
+    }
+    // Commonest first: the majority reason is the one that describes the army.
+    tally.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let shown: Vec<String> = tally
+        .iter()
+        .take(2)
+        .map(|(reason, n)| format!("{reason} x{n}"))
+        .collect();
+    match tally.len().saturating_sub(2) {
+        0 => format!("Why: {}", shown.join("   ")),
+        rest => format!("Why: {}   (+{rest} more)", shown.join("   ")),
+    }
+}
+
 fn posture_tag(posture: &SquadPosture) -> String {
     match posture {
         SquadPosture::Defend { pos, radius } => {
@@ -2504,6 +2546,15 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                 13.0,
                 Color::srgb(0.62, 0.80, 1.0),
                 Slot::Doctrine,
+            ));
+            // "Why are you doing that?", under the standing orders that are
+            // usually the answer. Dimmer than the doctrine line because it is
+            // a readout of the engine's reasoning, not a setting to change.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(0.70, 0.70, 0.78),
+                Slot::Why,
             ));
             c.spawn(text_bundle(
                 "Left-click / drag to select.",
@@ -4906,6 +4957,10 @@ fn update_hud(
         ),
         With<Selected>,
     >,
+    // Kept as its own read-only query rather than a 14th column on
+    // `sel_units`: provenance is orthogonal to everything that panel shows,
+    // and widening that tuple means editing five positional destructures.
+    sel_why: Query<(&Team, Option<&Provenance>), (With<Selected>, With<Unit>)>,
     sel_buildings: Query<
         (
             Entity,
@@ -5215,6 +5270,15 @@ fn update_hud(
     } else {
         single_template.line()
     };
+    // Own units only — reading an opponent's chain of command would be reading
+    // their plan, which is exactly what the snapshot refuses the other seat.
+    let why_text = why_line(
+        sel_why
+            .iter()
+            .filter(|(team, _)| **team == Team::Human)
+            .map(|(_, why)| why.map_or_else(|| NO_PROVENANCE.to_string(), Provenance::why))
+            .collect(),
+    );
 
     // Hero commands: the ability of a selected hero (whichever class), the
     // train/revive button on a town hall while the team is hero-less, the
@@ -5418,6 +5482,7 @@ fn update_hud(
             Slot::Extra => text.0 = extra_text.clone(),
             Slot::Items => text.0 = items_text.clone(),
             Slot::Doctrine => text.0 = doctrine_line.clone(),
+            Slot::Why => text.0 = why_text.clone(),
             Slot::Overflow => text.0 = overflow_text.clone(),
             Slot::CardLetter(i) => {
                 text.0 = cards.get(i).map(|c| c.letter.clone()).unwrap_or_default();

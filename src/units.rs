@@ -320,16 +320,20 @@ fn unit_y(kind: UnitKind) -> f32 {
 fn spawn_units(
     mut commands: Commands,
     mut events: EventReader<SpawnUnitEvent>,
+    time: Res<Time>,
     assets: Option<Res<UnitAssets>>,
     nav: Res<NavGrid>,
     records: Res<HeroRecords>,
     nodes: Query<&Transform, With<ResourceNode>>,
     live_units: Query<Entity, With<Unit>>,
-    templates: Query<&DoctrineTemplate>,
+    // The producing building, for both halves of what it stamps: the doctrine
+    // template, and the name a trained unit gives when asked who sent it.
+    producers: Query<(&Building, Option<&DoctrineTemplate>)>,
 ) {
     let Some(assets) = assets else {
         return;
     };
+    let now = time.elapsed_secs();
 
     for ev in events.read() {
         let stats = unit_stats(ev.kind);
@@ -429,11 +433,24 @@ fn spawn_units(
             }
         };
 
+        // Who sent it, in the words it will use when asked.
+        let producer = ev.source.and_then(|src| producers.get(src).ok().map(|p| (src, p)));
+        let template = producer.and_then(|(_, (_, tmpl))| tmpl);
+        let why = spawn_provenance(
+            producer.map(|(entity, (building, _))| (entity, building.kind)),
+            template.is_some(),
+            // A rally that produced a real first order. A stale one (depleted
+            // node, dead followee) degraded to Idle above and is no reason.
+            !matches!(order, Order::Idle),
+            now,
+        );
+
         let mut entity = commands.spawn((
             Unit { kind: ev.kind },
             ev.team,
             health,
             order,
+            why,
             Mesh3d(body),
             MeshMaterial3d(body_mat),
             transform,
@@ -469,7 +486,7 @@ fn spawn_units(
         // Standing doctrine from the producing building, applied verbatim.
         // Deliberately touches nothing but doctrine components — the rally
         // point above already decided this unit's initial `Order`.
-        if let Some(template) = ev.source.and_then(|source| templates.get(source).ok()) {
+        if let Some(template) = template {
             if let Some(squad) = template.squad {
                 entity.insert(SquadId(squad));
             }

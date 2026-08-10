@@ -103,6 +103,9 @@ impl Plugin for DoctrinePlugin {
                 // Change-detection driven: must see every Order change, so it
                 // runs every frame (the query is tiny — only retreaters).
                 rearm_retreat,
+                // Also change-detection driven, and for the same reason: the
+                // frame a unit falls idle is the frame its old reason expired.
+                idle_instinct,
                 recover_retreaters.run_if(on_timer(Duration::from_millis(RETREAT_MS))),
                 trigger_retreat.run_if(on_timer(Duration::from_millis(RETREAT_MS))),
                 enforce_leash.run_if(on_timer(Duration::from_millis(LEASH_MS))),
@@ -230,8 +233,10 @@ fn threat_point(
 /// The `Retreating` marker keeps this from re-firing every tick.
 fn trigger_retreat(
     mut commands: Commands,
+    time: Res<Time>,
     query: Query<(Entity, &RetreatPolicy, &Health), (With<Unit>, Without<Retreating>)>,
 ) {
+    let now = time.elapsed_secs();
     for (entity, policy, health) in &query {
         // Dead-but-not-yet-despawned units are shared.rs's problem.
         if health.max <= 0.0 || health.current <= 0.0 {
@@ -243,9 +248,13 @@ fn trigger_retreat(
         let rally = policy.rally;
         // Order::Move disengages for free: combat.rs drops the AttackTarget on
         // any non-combat order, and units.rs paths us home.
-        commands
-            .entity(entity)
-            .try_insert((Order::Move(rally), Retreating { rally }));
+        commands.entity(entity).try_insert((
+            Order::Move(rally),
+            Retreating { rally },
+            // "Why am I running?" — because the threshold the commander set
+            // fired, not because anyone said so just now.
+            Provenance::new(Cause::Policy { policy: "retreat" }, now),
+        ));
     }
 }
 
@@ -263,6 +272,46 @@ fn rearm_retreat(
     }
 }
 
+/// Expire a unit's reason the moment its behaviour does.
+///
+/// `Order::Idle` is written from eight scattered places — a finished attack in
+/// combat.rs, an exhausted mine or a missing drop-off in economy.rs, a dead
+/// followee in units.rs — and every one of them means the same thing: whatever
+/// the unit was doing is over and nothing has replaced it. Stamping that at
+/// each site would be eight edits to keep in sync forever; catching the
+/// transition once is one system with a `Changed` filter, and it cannot fall
+/// out of date when a ninth site appears.
+///
+/// Nothing player-facing writes `Order::Idle` — the compiler's `stop` re-issues
+/// a Move to the unit's own spot — so this only ever overwrites a reason that
+/// has genuinely lapsed, never a live directive.
+fn idle_instinct(
+    mut commands: Commands,
+    time: Res<Time>,
+    query: Query<(Entity, &Order, Option<&Provenance>), Changed<Order>>,
+) {
+    let now = time.elapsed_secs();
+    for (entity, order, why) in &query {
+        if !matches!(order, Order::Idle) {
+            continue;
+        }
+        // Already answering "idle": leave the original timestamp alone rather
+        // than restamping it every time something else touches the Order.
+        if matches!(
+            why,
+            Some(Provenance {
+                cause: Cause::Instinct { what: "idle" },
+                ..
+            })
+        ) {
+            continue;
+        }
+        commands
+            .entity(entity)
+            .try_insert(Provenance::instinct("idle", now));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2. Leash (~2 Hz)
 // ---------------------------------------------------------------------------
@@ -271,8 +320,10 @@ fn rearm_retreat(
 /// Retreat outranks the leash — a fleeing unit is allowed to leave.
 fn enforce_leash(
     mut commands: Commands,
+    time: Res<Time>,
     query: Query<(Entity, &LeashPolicy, &Transform, &Order), (With<Unit>, Without<Retreating>)>,
 ) {
+    let now = time.elapsed_secs();
     for (entity, leash, tf, order) in &query {
         if xz_dist(tf.translation, leash.anchor) <= leash.radius {
             continue;
@@ -285,7 +336,9 @@ fn enforce_leash(
                 .entity(entity)
                 .try_insert(MoveTo { target: leash.anchor });
         } else {
-            commands.entity(entity).try_insert(wanted);
+            commands
+                .entity(entity)
+                .try_insert((wanted, Provenance::new(Cause::Policy { policy: "leash" }, now)));
         }
     }
 }
@@ -433,22 +486,39 @@ fn auto_cast_abilities(
 ///    freely and their posture sticks; this is a floor, not a leash.
 fn default_squad_autonomy(
     mut commands: Commands,
+    time: Res<Time>,
     mut squad_orders: ResMut<SquadOrders>,
     ai: Res<AiControlled>,
     external: Res<ExternallyCommanded>,
-    strays: Query<(Entity, &Unit, &Team, &Health), Without<SquadId>>,
+    strays: Query<(Entity, &Unit, &Team, &Health, Option<&Provenance>), Without<SquadId>>,
 ) {
+    let now = time.elapsed_secs();
     // Autonomy floors exist to compensate for slow machine commanders. A
     // human with a mouse keeps full authority: their idle units stay exactly
     // where they were put.
-    for (entity, unit, team, health) in &strays {
+    for (entity, unit, team, health, why) in &strays {
         if unit.kind == UnitKind::Worker
             || health.current <= 0.0
             || !machine_driven(&ai, &external, *team)
         {
             continue;
         }
-        commands.entity(entity).try_insert(SquadId(DEFAULT_SQUAD));
+        let mut enrolled = commands.entity(entity);
+        enrolled.try_insert(SquadId(DEFAULT_SQUAD));
+        // Nobody asked for this — the engine pooled an uncommanded unit so the
+        // army is not a field of statues, and it says so rather than passing
+        // the floor off as a decision.
+        //
+        // Only when the unit had no better answer, though: enrolment changes
+        // which squad may re-task it LATER, not what it is doing now, so a
+        // unit still walking to its barracks rally keeps the truer reason.
+        if !matches!(
+            why,
+            Some(Provenance { cause: Cause::Instinct { what }, .. }) if *what != "idle"
+        ) && !matches!(why, Some(Provenance { cause: Cause::Stamp { .. }, .. }))
+        {
+            enrolled.try_insert(Provenance::instinct("auto-enroll", now));
+        }
     }
 
     for team in [Team::Human, Team::Claude] {
@@ -477,6 +547,7 @@ fn default_squad_autonomy(
 #[allow(clippy::type_complexity)]
 fn run_squad_postures(
     mut commands: Commands,
+    time: Res<Time>,
     mut squad_orders: ResMut<SquadOrders>,
     members: Query<
         (Entity, &SquadId, &Team, &Transform, &Order, Option<&MoveTo>),
@@ -496,6 +567,7 @@ fn run_squad_postures(
     if squad_orders.0.is_empty() {
         return;
     }
+    let now = time.elapsed_secs();
     // Every cache on the map. Which of them a given squad may hunt is decided
     // per team below — the same list filtered two ways, never two lists.
     let all_bounties: Vec<Vec3> = bounties.iter().map(|tf| tf.translation).collect();
@@ -531,6 +603,13 @@ fn run_squad_postures(
                 continue;
             }
         }
+
+        // The word the commander actually set, captured before the
+        // Forage->Defend rewrite below. A blind forager holding its muster
+        // point is still a forage squad: `squads[].posture` in the snapshot
+        // says so, and a unit that answered "defend" here would contradict the
+        // very readout the commander is looking at.
+        let commanded = posture.word();
 
         let team_fog = fog.get(team);
         // Treasure THIS team can see. Forage used to hunt every cache on the
@@ -588,6 +667,18 @@ fn run_squad_postures(
             _ => None,
         };
 
+        // Every order this posture mints answers "why" the same way, so build
+        // the stamp once per squad rather than once per member. Reactive
+        // defense below is included deliberately: a defend squad diving a
+        // trespasser is still doing it *because* it is a defend squad.
+        let why = Provenance::new(
+            Cause::Posture {
+                squad,
+                posture: commanded,
+            },
+            now,
+        );
+
         for (entity, member_squad, member_team, tf, order, move_to) in &members {
             if *member_team != team || member_squad.0 != squad {
                 continue;
@@ -604,7 +695,7 @@ fn run_squad_postures(
                             .try_insert(MoveTo { target: threat_pos });
                     }
                 } else {
-                    commands.entity(entity).try_insert(wanted);
+                    commands.entity(entity).try_insert((wanted, why));
                 }
                 continue;
             }
@@ -658,7 +749,7 @@ fn run_squad_postures(
                 }
                 continue;
             }
-            commands.entity(entity).try_insert(wanted);
+            commands.entity(entity).try_insert((wanted, why));
         }
     }
 
@@ -724,6 +815,15 @@ mod tests {
         app.world().entity(entity).get::<Order>().cloned().unwrap()
     }
 
+    /// The unit's own answer to "why are you doing that?", exactly as the
+    /// snapshot and the selection panel print it.
+    fn why_of(app: &App, entity: Entity) -> String {
+        app.world()
+            .entity(entity)
+            .get::<Provenance>()
+            .map_or_else(|| NO_PROVENANCE.to_string(), Provenance::why)
+    }
+
     /// docs/TEMPO.md §2.0, the bug this bead exists to fix: a posture set by a
     /// HUMAN team (nothing machine-driven anywhere) must actually execute. On
     /// master this assertion fails — the member sits on `Order::Idle` forever.
@@ -774,6 +874,135 @@ mod tests {
             "a human unit with no squad was re-tasked by doctrine"
         );
         assert!(matches!(order_of(&app, member), Order::AttackMove(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Provenance: every unit answers "why are you doing that?"
+    // -----------------------------------------------------------------
+
+    /// The posture rung of the chain. A unit moved by its squad's standing
+    /// order names that squad and that posture — not the commander, who may
+    /// have set it minutes ago and is not what is moving it now.
+    #[test]
+    fn a_squad_member_names_the_posture_that_is_moving_it() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+
+        let unit = spawn_footman(&mut app, Team::Human, Vec3::new(-60.0, 0.0, -60.0));
+        app.world_mut().entity_mut(unit).insert(SquadId(3));
+        app.world_mut().resource_mut::<SquadOrders>().0.insert(
+            (Team::Human, 3),
+            SquadPosture::Push { pos: Vec3::new(30.0, 0.0, 30.0) },
+        );
+
+        app.update();
+
+        assert!(matches!(order_of(&app, unit), Order::AttackMove(_)));
+        assert_eq!(why_of(&app, unit), "posture:push sq3");
+    }
+
+    /// A forage squad with nothing it can see to hunt is executed through the
+    /// Defend path — but it is still a FORAGE squad, and that is what
+    /// `squads[].posture` reports to the commander. The unit must not answer
+    /// with the implementation detail and contradict the readout above it.
+    #[test]
+    fn a_blind_forager_names_the_posture_the_commander_set() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+
+        let muster = Vec3::new(0.0, 0.0, 0.0);
+        let unit = spawn_footman(&mut app, Team::Human, Vec3::new(-60.0, 0.0, -60.0));
+        app.world_mut().entity_mut(unit).insert(SquadId(2));
+        // No `Bounty` entities exist, so there is nothing to hunt.
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 2), SquadPosture::Forage { muster });
+
+        app.update();
+
+        assert!(matches!(order_of(&app, unit), Order::AttackMove(_)));
+        assert_eq!(why_of(&app, unit), "posture:forage sq2");
+    }
+
+    /// The policy rung. A unit running for home is not obeying an order anyone
+    /// gave just now — it is obeying a threshold — and saying so is the whole
+    /// difference between "my commander pulled me back" and "I broke".
+    #[test]
+    fn a_retreating_unit_blames_the_threshold() {
+        let mut app = world();
+        app.add_systems(Update, trigger_retreat);
+
+        let unit = spawn_footman(&mut app, Team::Human, Vec3::new(10.0, 0.0, 10.0));
+        app.world_mut().entity_mut(unit).insert(RetreatPolicy {
+            below_frac: 0.5,
+            rally: Vec3::new(-70.0, 0.0, -70.0),
+        });
+        app.world_mut().entity_mut(unit).get_mut::<Health>().unwrap().current = 20.0;
+
+        app.update();
+
+        assert!(matches!(order_of(&app, unit), Order::Move(_)));
+        assert_eq!(why_of(&app, unit), "policy:retreat t=0");
+    }
+
+    /// The engine-default rung. `Order::Idle` is written from eight scattered
+    /// engine systems and always means the same thing: the old reason expired.
+    /// One `Changed<Order>` system catches all of them.
+    #[test]
+    fn falling_idle_expires_whatever_reason_came_before() {
+        let mut app = world();
+        app.add_systems(Update, idle_instinct);
+
+        let done = spawn_footman(&mut app, Team::Human, Vec3::ZERO);
+        let busy = spawn_footman(&mut app, Team::Human, Vec3::new(5.0, 0.0, 0.0));
+        let stale = Provenance::new(
+            Cause::Order { verb: "move", source: IntentSource::Bridge },
+            12.0,
+        );
+        app.world_mut().entity_mut(done).insert(stale);
+        app.world_mut()
+            .entity_mut(busy)
+            .insert((Order::Move(Vec3::new(40.0, 0.0, 40.0)), stale));
+
+        app.update();
+
+        assert_eq!(why_of(&app, done), "idle", "an idle unit kept a dead reason");
+        assert_eq!(
+            why_of(&app, busy),
+            "order:move by bridge t=12",
+            "a unit still carrying out its order lost its reason"
+        );
+    }
+
+    /// Auto-enrolment is a floor the engine applies, not a decision anyone
+    /// made. It says so rather than passing itself off as a command.
+    #[test]
+    fn auto_enrolment_admits_nobody_asked_for_it() {
+        let mut app = world();
+        app.insert_resource(AiControlled { human: false, claude: true });
+        app.add_systems(Update, default_squad_autonomy);
+
+        let unit = spawn_footman(&mut app, Team::Claude, Vec3::new(60.0, 0.0, 60.0));
+
+        app.update();
+
+        assert_eq!(
+            app.world().entity(unit).get::<SquadId>().map(|s| s.0),
+            Some(DEFAULT_SQUAD)
+        );
+        assert_eq!(why_of(&app, unit), "instinct:auto-enroll");
+    }
+
+    /// A unit nobody has said anything to answers plainly rather than
+    /// inventing a reason, and the string is the one the snapshot uses too.
+    #[test]
+    fn a_unit_with_no_reason_says_idle() {
+        let app = world();
+        let mut app = app;
+        let unit = spawn_footman(&mut app, Team::Human, Vec3::ZERO);
+        assert_eq!(why_of(&app, unit), NO_PROVENANCE);
+        assert_eq!(NO_PROVENANCE, "idle");
     }
 
     /// The auto-enrol + seed floor exists to compensate for a slow MACHINE
