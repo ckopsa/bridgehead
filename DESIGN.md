@@ -86,8 +86,13 @@ Win by destroying all enemy buildings.
   Move; A+click → AttackMove), building placement mode with ghost + affordability
   training hotkeys/buttons on selected production buildings, `[U]` tier-up,
   hero/building ability hotkeys, doctrine toggles — all of which *compile to
-  `Intent` values and submit them*; ui.rs mutates no game state itself. Plus
-  the top resource bar,
+  `Intent` values and submit them*; ui.rs mutates no game state itself. The
+  command card has two pages, toggled by `[I]`: the classic orders card, and a
+  doctrine card carrying squad postures (click-to-place), a parameterised
+  retreat threshold and leash radius, and `DoctrineTemplate` stamping on a
+  production building. `Ctrl+1-3` assigns a control group *and* submits the
+  `squad` verb, so a control group and a squad are one object (docs/TEMPO.md).
+  Plus the top resource bar,
   selection info panel, game-over banner from `GameOver`, top-right alert stack
   rendering `GameEvents::feed(Team::Human)` (severity colours, fade-out, Space
   or click focuses the camera via `CameraFocus`).
