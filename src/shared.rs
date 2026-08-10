@@ -3789,6 +3789,16 @@ impl FogGrids {
         }
     }
 
+    /// Test-only: set one cell's state directly, so a renderer test can pin a
+    /// grid that holds all three states without standing up an army to look at
+    /// the map. Same `#[cfg(test)]` reasoning as `test_dark`.
+    #[cfg(test)]
+    pub fn test_set_cell(&mut self, team: Team, cx: usize, cz: usize, vis: CellVis) {
+        let grid = self.get_mut(team);
+        grid.cells[NavGrid::idx(cx, cz)] = vis;
+        grid.recount();
+    }
+
     /// Test-only: plant a memory in `team`'s grid, exactly as `update_fog`
     /// does when the structure is in sight, without a scout having to walk
     /// there and back.

@@ -5632,6 +5632,10 @@ struct FogAssets {
     /// Shared by the world quad's material and the minimap node — the literal
     /// "computed once, rendered twice".
     image: Handle<Image>,
+    /// The ground quad's material. Held so `update_fog_overlay` can republish
+    /// it and force its bind group to be rebuilt against the freshly uploaded
+    /// texture; see the note there.
+    fog_mat: Handle<StandardMaterial>,
     ghost_mesh: Handle<Mesh>,
     ghost_mat: Handle<StandardMaterial>,
 }
@@ -5695,7 +5699,7 @@ fn setup_fog(
 
     commands.spawn((
         Mesh3d(meshes.add(quad)),
-        MeshMaterial3d(fog_mat),
+        MeshMaterial3d(fog_mat.clone()),
         Transform::from_xyz(0.0, FOG_PLANE_Y, 0.0),
         FogPlane,
     ));
@@ -5736,9 +5740,24 @@ fn setup_fog(
 
     commands.insert_resource(FogAssets {
         image,
+        fog_mat,
         ghost_mesh,
         ghost_mat,
     });
+}
+
+/// How much black the overlay lays over a cell in each of the three states.
+///
+/// The whole legibility of the fog is these three numbers: a spectator should
+/// be able to read a team's vision off the ground without hunting for the
+/// boundary, so they are spread deliberately wide rather than being a gentle
+/// ramp.
+fn fog_alpha(cell: CellVis) -> f32 {
+    match cell {
+        CellVis::Unexplored => FOG_UNEXPLORED_ALPHA,
+        CellVis::Explored => FOG_EXPLORED_ALPHA,
+        CellVis::Visible => 0.0,
+    }
 }
 
 /// Repaint the fog texture from the human's grid. Cheap enough to do every
@@ -5748,6 +5767,7 @@ fn update_fog_overlay(
     fog: Res<FogGrids>,
     assets: Res<FogAssets>,
     mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut plane: Query<&mut Visibility, With<FogPlane>>,
     mut minimap_fog: Query<&mut Node, With<MinimapFog>>,
 ) {
@@ -5774,15 +5794,26 @@ fn update_fog_overlay(
         return;
     };
     for (i, cell) in fog.get(Team::Human).cells().iter().enumerate() {
-        let alpha = match cell {
-            CellVis::Unexplored => FOG_UNEXPLORED_ALPHA,
-            CellVis::Explored => FOG_EXPLORED_ALPHA,
-            CellVis::Visible => 0.0,
-        };
         // Texel layout is `NavGrid::idx` order, which is exactly the grid's
         // own iteration order — no transposition anywhere in the pipeline.
-        data[i * 4 + 3] = (alpha * 255.0) as u8;
+        data[i * 4 + 3] = (fog_alpha(*cell) * 255.0) as u8;
     }
+    // Repainting `data` marks the *image* asset modified, which re-uploads it
+    // and is all the minimap needs: the UI pipeline resolves the image handle
+    // to its current `GpuImage` every frame, so an `ImageNode` always samples
+    // the newest texture.
+    //
+    // A mesh material does NOT. A `StandardMaterial`'s bind group is built once
+    // and rebuilt only when the *material* asset changes, so it goes on
+    // pointing at the `GpuImage` that existed when it was prepared — the
+    // opening frame, where the start base is lit and nothing is explored yet.
+    // That is the whole bug: the minimap tracked the match while the ground
+    // wore a snapshot of the first quarter-second forever, which reads exactly
+    // like "the terrain has no fog on it at all".
+    //
+    // Touching the material republishes it so its bind group is rebuilt
+    // against the current texture. One material, once a frame.
+    let _ = materials.get_mut(&assets.fog_mat);
 }
 
 /// Take enemy units and buildings the player cannot see out of the 3D scene.
@@ -8787,5 +8818,120 @@ mod tests {
             .expect("the Workshop must offer the Gryphon Rider at T3");
         assert_eq!(gryphon.key, KeyCode::KeyW, "the Gryphon sits on [W]");
         assert!(gryphon.enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fog overlay
+    // -----------------------------------------------------------------------
+
+    /// The three states have to be three *visibly different* amounts of black,
+    /// in the right order. A ramp that collapsed any two of them together
+    /// would leave the ground unreadable even with every other part of the
+    /// pipeline working.
+    #[test]
+    fn the_three_fog_states_are_three_clearly_separated_shades() {
+        let vis = fog_alpha(CellVis::Visible);
+        let expl = fog_alpha(CellVis::Explored);
+        let unexp = fog_alpha(CellVis::Unexplored);
+
+        assert_eq!(vis, 0.0, "what a team can see now is not dimmed at all");
+        assert!(
+            vis < expl && expl < unexp,
+            "darkness must increase as knowledge decreases: {vis} / {expl} / {unexp}"
+        );
+        // A quarter of the range between neighbours is the floor for "told
+        // apart at a glance" — the states are 0.0 / 0.44 / 0.88 today.
+        assert!(
+            expl - vis > 0.25 && unexp - expl > 0.25,
+            "neighbouring states too close to distinguish: {vis} / {expl} / {unexp}"
+        );
+    }
+
+    /// **The regression this file exists to prevent.**
+    ///
+    /// Repainting the fog image is enough for the minimap and *not* enough for
+    /// the ground: the UI pipeline resolves an `ImageNode`'s handle to its
+    /// current `GpuImage` every frame, but a mesh material's bind group is
+    /// built once and rebuilt only when the *material* asset changes. Leave
+    /// the material alone and the quad samples the texture as it stood in the
+    /// opening frames forever — a lit disc around the start base, nothing ever
+    /// explored — while the minimap tracks the match perfectly. The two
+    /// renderings of one grid silently disagree, which is the one thing
+    /// docs/FOG.md promises cannot happen.
+    ///
+    /// So: painting the overlay must republish the material every time.
+    #[test]
+    fn repainting_the_fog_overlay_republishes_the_material_it_is_worn_by() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Image>()
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .insert_resource(FogGrids::test_dark())
+            .add_systems(Startup, setup_fog)
+            .add_systems(Update, update_fog_overlay);
+        app.update();
+
+        let fog_mat = app.world().resource::<FogAssets>().fog_mat.id();
+
+        // Drain whatever setup emitted, then run one more frame: that frame is
+        // the claim under test.
+        app.world_mut()
+            .resource_mut::<Events<AssetEvent<StandardMaterial>>>()
+            .clear();
+        app.update();
+
+        let events = app.world().resource::<Events<AssetEvent<StandardMaterial>>>();
+        let mut reader = events.get_cursor();
+        let republished = reader
+            .read(events)
+            .any(|e| matches!(e, AssetEvent::Modified { id } if *id == fog_mat));
+        assert!(
+            republished,
+            "the fog quad's material must be republished when the fog texture is \
+             repainted, or the ground goes on wearing the opening frame's fog"
+        );
+    }
+
+    /// The painted texture is the grid, texel for texel — including the
+    /// remembered middle state, which is the one that vanished when the
+    /// material went stale.
+    #[test]
+    fn the_fog_texture_carries_all_three_states_from_the_grid() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Image>()
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .insert_resource(FogGrids::test_dark())
+            .add_systems(Startup, setup_fog)
+            .add_systems(Update, update_fog_overlay);
+        app.update();
+
+        // Plant one cell of each state, exactly as a recompute would leave them.
+        app.world_mut()
+            .resource_mut::<FogGrids>()
+            .test_set_cell(Team::Human, 10, 10, CellVis::Visible);
+        app.world_mut()
+            .resource_mut::<FogGrids>()
+            .test_set_cell(Team::Human, 20, 20, CellVis::Explored);
+        app.update();
+
+        let image_handle = app.world().resource::<FogAssets>().image.clone();
+        let images = app.world().resource::<Assets<Image>>();
+        let data = images.get(&image_handle).unwrap().data.as_ref().unwrap();
+        let alpha_at = |cx: usize, cz: usize| data[NavGrid::idx(cx, cz) * 4 + 3];
+
+        assert_eq!(alpha_at(10, 10), 0, "a visible cell is not dimmed");
+        assert_eq!(
+            alpha_at(20, 20),
+            (FOG_EXPLORED_ALPHA * 255.0) as u8,
+            "a remembered cell wears the middle shade"
+        );
+        assert_eq!(
+            alpha_at(50, 50),
+            (FOG_UNEXPLORED_ALPHA * 255.0) as u8,
+            "unvisited ground stays dark"
+        );
     }
 }

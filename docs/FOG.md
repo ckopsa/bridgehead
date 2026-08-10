@@ -277,6 +277,23 @@ the boundary is soft rather than a staircase. The **same image handle** is mount
 minimap as an `ImageNode` (with `flip_y`, since the minimap draws +Z upward while the
 texture stores it downward), which is why the two views cannot drift apart.
 
+One texture, two renderers — and they do **not** pick up a repaint the same
+way. The UI resolves an `ImageNode`'s handle to its current `GpuImage` every
+frame, so the minimap is correct for free. A mesh material does not: a
+`StandardMaterial`'s bind group is built once and rebuilt only when the
+*material* asset changes, so a quad whose texture is repainted every frame goes
+on sampling the `GpuImage` that existed when its bind group was prepared.
+
+That failure is worth naming because of how it presents. The ground keeps
+wearing the **opening frame's** fog — a lit disc around the start base, and
+nothing explored anywhere, because on frame one nothing *is* explored yet —
+while the minimap tracks the match perfectly. Nothing errors, no state is
+wrong, and the two renderings of the one grid silently disagree, which is the
+single thing this document promises cannot happen. So `update_fog_overlay`
+republishes the quad's material every time it repaints the texture, and
+`repainting_the_fog_overlay_republishes_the_material_it_is_worn_by` fails if
+that line is ever removed.
+
 Consequences of it being a flat quad rather than a shader:
 
 - **Tall scenery would poke through it.** A forest in never-visited terrain would stand
