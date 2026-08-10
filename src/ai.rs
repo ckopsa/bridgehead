@@ -58,6 +58,36 @@ const BUILD_PADDING: f32 = 2.0;
 const BUILD_RING_RADII: [f32; 4] = [12.0, 16.0, 20.0, 25.0];
 const BUILD_RING_SPOKES: usize = 16;
 
+/// Expansion. A gold mine is finite (thousands, not endless), so a base that
+/// never expands simply stops earning halfway through a long game. A mine
+/// counts as *ours* once one of our TownHalls stands within this range — the
+/// starting hall sits ~19.2 away from its home mine, so this must clear that.
+const MINE_CLAIM_RADIUS: f32 = 26.0;
+/// Expand once the gold left across all claimed mines drops below this. Sized
+/// for lead time, not panic: the trek to a neutral mine plus a 40s build has to
+/// finish *before* the home mine runs dry.
+const EXPAND_GOLD_LEFT: u32 = 2000;
+/// ...or once we are running more gold workers than this per claimed mine.
+/// At the scripted worker target (~8 on gold) this never fires on its own; it
+/// exists so an over-saturated line — a commander's, or one inherited after a
+/// mine died — still gets a second mine to spread across.
+const WORKERS_PER_MINE: usize = 8;
+/// Never plant an expansion within this range of an enemy combat unit. Mirrors
+/// economy.rs's danger-aware auto-rebalance, with slack: a building can't run.
+const EXPAND_DANGER_RADIUS: f32 = 24.0;
+/// ...nor this close to the enemy's main base. Their home mine is inside this
+/// ring, so the script never tries to settle in someone else's front yard.
+const ENEMY_BASE_KEEPOUT: f32 = 45.0;
+/// Rings of candidate hall sites around the mine we are expanding to. The
+/// inner ring keeps the haul short without overlapping the mine's footprint.
+const EXPAND_RING_RADII: [f32; 4] = [10.0, 13.0, 16.0, 20.0];
+/// A worker within this of a mine is treated as working it (used only as a
+/// fallback when its `Order::Harvest` no longer names a live node).
+const MINE_WORKER_RADIUS: f32 = 16.0;
+/// Workers moved between mines per think tick — a trickle, so the line never
+/// abandons a mine wholesale.
+const SHIFT_PER_TICK: usize = 2;
+
 /// Military.
 const RALLY_DIST: f32 = 18.0;
 const RALLY_ARRIVE_DIST: f32 = 6.0;
@@ -101,6 +131,15 @@ impl Plugin for AiPlugin {
 struct AiBrain {
     /// Worker we last handed an `Order::Build` to (one build in flight).
     pending_build: Option<Entity>,
+    /// That in-flight build is an expansion TownHall. An expansion site is a
+    /// long walk from home, and economy.rs only takes the money when the
+    /// builder *arrives* — so the price has to stay ring-fenced for the whole
+    /// trip, or the Barracks spends it en route and the build is refused on
+    /// arrival (observed: three expansions ordered, none placed, income zero).
+    expansion_pending: bool,
+    /// Own TownHall count at the last thought — logged on change, which is how
+    /// an expansion completing (or being razed) shows up in a sim trace.
+    last_halls: usize,
     harvest_counter: u32,
     army_counter: u32,
     /// Catapults queued so far — paced against `army_counter`.
@@ -115,6 +154,8 @@ impl AiBrain {
     fn new(team: Team) -> Self {
         AiBrain {
             pending_build: None,
+            expansion_pending: false,
+            last_halls: 0,
             harvest_counter: 0,
             army_counter: 0,
             siege_counter: 0,
@@ -204,6 +245,10 @@ struct UnitInfo {
     tag: Tag,
     moving: bool,
     carrying: bool,
+    /// Node this worker was last *told* to harvest. Only a statement of
+    /// intent: economy.rs re-targets depleted nodes behind our back without
+    /// rewriting the order, so it can name a dead entity.
+    harvest_node: Option<Entity>,
 }
 
 impl UnitInfo {
@@ -223,6 +268,27 @@ struct BuildingInfo {
     pos: Vec3,
     done: bool,
     queue_len: usize,
+}
+
+/// A living gold mine, seen from one team's point of view.
+struct MineInfo {
+    entity: Entity,
+    pos: Vec3,
+    remaining: u32,
+    /// One of our TownHalls (finished or still scaffolding) is close enough
+    /// that this mine is already part of our economy.
+    claimed: bool,
+    /// ...and that hall is finished, so workers sent here have a drop-off.
+    has_depot: bool,
+}
+
+/// Where the AI wants its next mining base, and why.
+struct ExpansionPlan {
+    site: Vec3,
+    mine_pos: Vec3,
+    mine_gold: u32,
+    /// Gold left in the mines we already hold — the reason we are moving.
+    claimed_gold: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +405,10 @@ fn think(
             tag: order.map(tag_of).unwrap_or(Tag::Idle),
             moving: move_to.is_some(),
             carrying: carrying.is_some(),
+            harvest_node: match order {
+                Some(Order::Harvest(node)) => Some(*node),
+                _ => None,
+            },
         };
         if *team == me {
             if let Some(hero) = hero {
@@ -382,6 +452,46 @@ fn think(
         });
     }
 
+    // Gold mines, tagged with whether our economy already reaches them. Trees
+    // are deliberately ignored: lumber clusters are dense and near the base,
+    // and running out of them is not what stalls a long game.
+    let mut mines: Vec<MineInfo> = Vec::new();
+    for (entity, node, tf) in nodes.iter() {
+        if node.kind != ResourceKind::Gold || node.remaining == 0 {
+            continue;
+        }
+        let pos = flat(tf.translation);
+        let hall_within = |done_only: bool| {
+            own_buildings.iter().any(|b| {
+                b.kind == BuildingKind::TownHall
+                    && (b.done || !done_only)
+                    && xz_dist(b.pos, pos) < MINE_CLAIM_RADIUS
+            })
+        };
+        mines.push(MineInfo {
+            entity,
+            pos,
+            remaining: node.remaining,
+            claimed: hall_within(false),
+            has_depot: hall_within(true),
+        });
+    }
+
+    // Gold still standing in the mines our halls can actually reach — the
+    // number the expansion logic is really about.
+    let claimed_gold: u32 = mines.iter().filter(|m| m.claimed).map(|m| m.remaining).sum();
+    let halls = own_buildings
+        .iter()
+        .filter(|b| b.kind == BuildingKind::TownHall && b.done)
+        .count();
+    if halls != brain.last_halls {
+        info!(
+            "[ai {me:?}] town halls: {} -> {} | gold left in reachable mines: {claimed_gold}",
+            brain.last_halls, halls
+        );
+        brain.last_halls = halls;
+    }
+
     let eco = *economies.get(me);
     // Free supply, pessimistically counting units already in production.
     let mut headroom = eco
@@ -397,6 +507,9 @@ fn think(
             .any(|w| w.entity == builder && w.tag == Tag::Build);
         if !still_building {
             brain.pending_build = None;
+            // Either the hall is paid for and going up, or the worker gave up.
+            // Both end the ring-fence; a retry re-arms it next tick.
+            brain.expansion_pending = false;
         }
     }
 
@@ -433,6 +546,9 @@ fn think(
 
     // --- build order (one command in flight) ---------------------------------
     let mut busy_worker: Option<Entity> = None;
+    // Set when an expansion is wanted but not yet paid for, so army production
+    // stops eating the down payment (same trick as the Champion reserve).
+    let mut saving_for_expansion = false;
     if brain.pending_build.is_none() {
         let count_of = |kind: BuildingKind| own_buildings.iter().filter(|b| b.kind == kind).count();
         // Tech gates count only FINISHED buildings; `count_of` (which includes
@@ -444,12 +560,37 @@ fn think(
             own_buildings.iter().any(|b| b.kind == kind && !b.done)
         };
 
+        // A second mining base, planned before it is affordable so the site is
+        // already vetted (unclaimed, undefended-by-them, buildable) when the
+        // money lands. `None` while a TownHall is already going up: one
+        // expansion at a time, like every other line in this build order.
+        let expansion = if count_of(BuildingKind::TownHall) > 0
+            && !under_construction(BuildingKind::TownHall)
+        {
+            plan_expansion(
+                me,
+                &own_buildings,
+                &enemy_buildings,
+                &mines,
+                &workers,
+                &enemy_combat,
+                nav,
+            )
+        } else {
+            None
+        };
+
         let want = if count_of(BuildingKind::TownHall) == 0 {
             Some(BuildingKind::TownHall)
         } else if headroom < SUPPLY_BUFFER && !under_construction(BuildingKind::Farm) {
             Some(BuildingKind::Farm)
         } else if count_of(BuildingKind::Barracks) == 0 {
             Some(BuildingKind::Barracks)
+        } else if expansion.is_some() {
+            // Above the luxuries (second Barracks, Workshop) and below the
+            // army's first Barracks: income outlives any one more Footman, but
+            // a base with no defenders never gets to spend it.
+            Some(BuildingKind::TownHall)
         } else if gold > SECOND_BARRACKS_GOLD && count_of(BuildingKind::Barracks) < MAX_BARRACKS {
             Some(BuildingKind::Barracks)
         } else if done_count(BuildingKind::Barracks) >= 1
@@ -466,6 +607,9 @@ fn think(
 
         if let Some(kind) = want {
             let stats = building_stats(kind);
+            saving_for_expansion = expansion.is_some()
+                && kind == BuildingKind::TownHall
+                && !eco.can_afford(stats.cost_gold, stats.cost_lumber);
             if eco.can_afford(stats.cost_gold, stats.cost_lumber) {
                 // Anchor on the town hall, or any surviving building if the
                 // main base area has been razed.
@@ -475,7 +619,14 @@ fn think(
                     .or_else(|| own_buildings.first())
                     .map(|b| b.pos)
                     .unwrap_or(base);
-                if let Some(site) = pick_site(nav, anchor, stats.size + BUILD_PADDING) {
+                // An expansion hall goes next to its mine, not next to home —
+                // the whole point is a short haul at the *new* patch.
+                let expanding = kind == BuildingKind::TownHall && expansion.is_some();
+                let site = match &expansion {
+                    Some(plan) if expanding => Some(plan.site),
+                    _ => pick_site(nav, anchor, stats.size + BUILD_PADDING),
+                };
+                if let Some(site) = site {
                     if let Some(builder) = pick_builder(&workers, &fleeing, site) {
                         commands
                             .entity(builder)
@@ -485,6 +636,19 @@ fn think(
                         // economy.rs pays at placement; assume it lands.
                         gold = gold.saturating_sub(stats.cost_gold);
                         lumber = lumber.saturating_sub(stats.cost_lumber);
+                        if let (true, Some(plan)) = (expanding, &expansion) {
+                            brain.expansion_pending = true;
+                            info!(
+                                "[ai {me:?}] expanding: TownHall at ({:.0},{:.0}) for the mine at \
+                                 ({:.0},{:.0}) holding {} gold — held mines are down to {}",
+                                site.x,
+                                site.z,
+                                plan.mine_pos.x,
+                                plan.mine_pos.z,
+                                plan.mine_gold,
+                                plan.claimed_gold,
+                            );
+                        }
                     }
                 }
             }
@@ -521,6 +685,18 @@ fn think(
             commands.entity(w.entity).try_insert(Order::Harvest(node));
         }
     }
+
+    // --- spread the gold line across the mines we hold -----------------------
+    // economy.rs already re-crews a mine the moment it runs dry (danger-aware,
+    // map-wide). This is the other half of the job: moving workers onto a mine
+    // that is merely *new*, so a finished expansion isn't a hall standing next
+    // to an untouched patch while the home crew races the last of the old one.
+    // Nothing here fires while only one mine has a drop-off, so it can't fight
+    // the depletion rebalance.
+    let mut shift_skip: Vec<Entity> = fleeing.clone();
+    shift_skip.extend(busy_worker);
+    shift_skip.extend(brain.pending_build);
+    rebalance_mines(&mines, &workers, &shift_skip, nodes, commands);
 
     // --- training ------------------------------------------------------------
     let mut worker_count = workers.len();
@@ -559,12 +735,21 @@ fn think(
     // production doesn't keep the treasury permanently just below it. Supply is
     // deliberately NOT reserved: army units are what drives the farm trigger,
     // and holding 5 supply back would stall the whole build order.
-    let (reserve_gold, reserve_lumber) = if want_hero {
+    let (mut reserve_gold, mut reserve_lumber) = if want_hero {
         let (g, l, _) = hero_train_cost(records, me);
         (g, l)
     } else {
         (0, 0)
     };
+    // Same ring-fence for the expansion down payment, held both while saving
+    // up and for the whole walk out to the site. Without it the Barracks
+    // drains every delivery and a 385g/205l TownHall is never reached — the AI
+    // would "want" to expand forever while its last mine ran out.
+    if saving_for_expansion || brain.expansion_pending {
+        let stats = building_stats(BuildingKind::TownHall);
+        reserve_gold += stats.cost_gold;
+        reserve_lumber += stats.cost_lumber;
+    }
 
     for b in &own_buildings {
         if !b.done {
@@ -736,6 +921,211 @@ fn think(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Ground-plane projection — mines and buildings sit at y=0, units do not.
+fn flat(v: Vec3) -> Vec3 {
+    Vec3::new(v.x, 0.0, v.z)
+}
+
+fn xz_dist(a: Vec3, b: Vec3) -> f32 {
+    flat(a).distance(flat(b))
+}
+
+/// Decide whether a second (or third) mining base is wanted, and where it goes.
+///
+/// Two triggers, both dumb on purpose:
+/// * the gold left in the mines we already hold has dropped below a threshold
+///   chosen for *lead time* — the walk out plus a 40s build has to finish
+///   before the old mine dies, not after;
+/// * or we are running more workers than a mine can keep busy.
+///
+/// The target is the nearest live mine nobody has claimed, skipping anything
+/// standing in the enemy's front yard or with their army parked on it.
+#[allow(clippy::too_many_arguments)]
+fn plan_expansion(
+    me: Team,
+    own_buildings: &[BuildingInfo],
+    enemy_buildings: &[Vec3],
+    mines: &[MineInfo],
+    workers: &[UnitInfo],
+    enemy_combat: &[Vec3],
+    nav: &NavGrid,
+) -> Option<ExpansionPlan> {
+    let claimed_gold: u32 = mines.iter().filter(|m| m.claimed).map(|m| m.remaining).sum();
+    let claimed_count = mines.iter().filter(|m| m.claimed).count();
+    // Rough count of the gold half of the line (every LUMBER_EVERY_NTH worker
+    // goes to trees instead).
+    let gold_workers = workers.len() - workers.len() / LUMBER_EVERY_NTH as usize;
+    let saturated = claimed_count == 0 || gold_workers > WORKERS_PER_MINE * claimed_count;
+    if claimed_gold >= EXPAND_GOLD_LEFT && !saturated {
+        return None;
+    }
+
+    let home = own_buildings
+        .iter()
+        .find(|b| b.kind == BuildingKind::TownHall)
+        .map(|b| b.pos)
+        .unwrap_or(me.base_pos());
+    let enemy_base = me.enemy().base_pos();
+
+    let mut best: Option<(f32, &MineInfo)> = None;
+    for mine in mines {
+        if mine.claimed {
+            continue;
+        }
+        // Their home mine sits inside this ring. Settling there is a gift.
+        if xz_dist(mine.pos, enemy_base) < ENEMY_BASE_KEEPOUT {
+            continue;
+        }
+        // Someone already lives here. Same radius that makes a mine "ours"
+        // when the hall is ours: if it works as a drop-off for them, the mine
+        // is theirs and contesting it is a fight, not an expansion.
+        if enemy_buildings
+            .iter()
+            .any(|b| xz_dist(*b, mine.pos) < MINE_CLAIM_RADIUS)
+        {
+            continue;
+        }
+        if enemy_combat
+            .iter()
+            .any(|e| xz_dist(*e, mine.pos) < EXPAND_DANGER_RADIUS)
+        {
+            continue;
+        }
+        let d = xz_dist(mine.pos, home);
+        if best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, mine));
+        }
+    }
+    let (_, mine) = best?;
+
+    let footprint = building_stats(BuildingKind::TownHall).size + BUILD_PADDING;
+    let site = pick_expansion_site(nav, mine.pos, home, footprint)?;
+    Some(ExpansionPlan {
+        site,
+        mine_pos: mine.pos,
+        mine_gold: mine.remaining,
+        claimed_gold,
+    })
+}
+
+/// A hall site hugging `mine`: inner rings first (short haul), and within a
+/// ring the spot nearest `home` first, so the hall ends up on our side of the
+/// mine — shorter builder walk, shorter answer when it gets raided.
+fn pick_expansion_site(nav: &NavGrid, mine: Vec3, home: Vec3, footprint: f32) -> Option<Vec3> {
+    let limit = MAP_HALF - footprint;
+    for radius in EXPAND_RING_RADII {
+        let mut ring: Vec<Vec3> = Vec::new();
+        for spoke in 0..BUILD_RING_SPOKES {
+            let a = spoke as f32 * std::f32::consts::TAU / BUILD_RING_SPOKES as f32;
+            let pos = mine + Vec3::new(a.cos(), 0.0, a.sin()) * radius;
+            if pos.x.abs() > limit || pos.z.abs() > limit {
+                continue;
+            }
+            ring.push(flat(pos));
+        }
+        ring.sort_by(|a, b| {
+            xz_dist(*a, home)
+                .partial_cmp(&xz_dist(*b, home))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some(site) = ring.into_iter().find(|p| nav.rect_is_free(*p, footprint)) {
+            return Some(site);
+        }
+    }
+    None
+}
+
+/// Which mining post a worker belongs to. Intent first — the node its order
+/// names — so workers already walking to a new mine count at the destination
+/// instead of their origin; otherwise every tick would peel two more off the
+/// old mine and the whole crew would migrate. Position is only the fallback,
+/// for workers whose order names a node that no longer exists (economy.rs
+/// re-targets those silently). A worker on a live node that isn't a post —
+/// a lumberjack, most often — belongs to nobody and is left alone.
+fn post_of(posts: &[&MineInfo], worker: &UnitInfo, nodes: &NodeQuery) -> Option<usize> {
+    if let Some(node) = worker.harvest_node {
+        if let Some(i) = posts.iter().position(|m| m.entity == node) {
+            return Some(i);
+        }
+        if nodes.get(node).is_ok() {
+            return None;
+        }
+    }
+    posts
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| xz_dist(m.pos, worker.pos) < MINE_WORKER_RADIUS)
+        .min_by(|(_, a), (_, b)| {
+            xz_dist(a.pos, worker.pos)
+                .partial_cmp(&xz_dist(b.pos, worker.pos))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+}
+
+/// Even out the crews across every mine we can actually deliver from, a couple
+/// of workers per tick, and only while the gap is worth walking for.
+fn rebalance_mines(
+    mines: &[MineInfo],
+    workers: &[UnitInfo],
+    skip: &[Entity],
+    nodes: &NodeQuery,
+    commands: &mut Commands,
+) {
+    // A mine with no finished hall near it is not a posting: sending workers
+    // there would just make them haul their load back to the old base.
+    let posts: Vec<&MineInfo> = mines.iter().filter(|m| m.has_depot).collect();
+    if posts.len() < 2 {
+        return;
+    }
+
+    let mut crew = vec![0usize; posts.len()];
+    let mut movable: Vec<Vec<(Entity, Vec3)>> = vec![Vec::new(); posts.len()];
+    for w in workers {
+        let Some(i) = post_of(&posts, w, nodes) else {
+            continue;
+        };
+        crew[i] += 1;
+        // Counted but not moved: a builder mid-order, a worker fleeing, or one
+        // holding a load it should bank first.
+        if skip.contains(&w.entity) || w.tag == Tag::Build || w.carrying {
+            continue;
+        }
+        movable[i].push((w.entity, w.pos));
+    }
+
+    let by_crew = |pick: fn(&usize, &usize) -> bool| -> usize {
+        let mut best = 0;
+        for i in 1..crew.len() {
+            if pick(&crew[i], &crew[best]) {
+                best = i;
+            }
+        }
+        best
+    };
+    let src = by_crew(|a, b| a > b);
+    let dst = by_crew(|a, b| a < b);
+    if src == dst || crew[src] < crew[dst] + 2 {
+        return;
+    }
+    // Half the gap, so the two crews meet in the middle instead of trading
+    // places on the next tick.
+    let quota = ((crew[src] - crew[dst]) / 2).min(SHIFT_PER_TICK);
+
+    let target = posts[dst];
+    let mut pool = std::mem::take(&mut movable[src]);
+    pool.sort_by(|(_, a), (_, b)| {
+        xz_dist(*a, target.pos)
+            .partial_cmp(&xz_dist(*b, target.pos))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (worker, _) in pool.into_iter().take(quota) {
+        commands
+            .entity(worker)
+            .try_insert(Order::Harvest(target.entity));
+    }
+}
 
 fn other_resource(kind: ResourceKind) -> ResourceKind {
     match kind {
