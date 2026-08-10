@@ -5,6 +5,7 @@ mod bounty;
 mod bridge;
 mod combat;
 mod command;
+mod copilot;
 mod doctrine;
 mod economy;
 mod intent;
@@ -68,6 +69,9 @@ fn main() {
         economy::EconomyPlugin,
         ai::AiPlugin,
         bridge::BridgePlugin,
+        // Co-command: the negotiation layer between a co-commander's wire and
+        // the compiler. Inert unless `WC3_BRIDGE=copilot` seats one.
+        copilot::CopilotPlugin,
         doctrine::DoctrinePlugin,
         bounty::BountyPlugin,
     ))

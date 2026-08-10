@@ -3,6 +3,10 @@
 You command one faction of a Warcraft-3-style RTS through a file channel.
 Your seat directory is given in your instructions as `<SEAT>` (e.g. `bridge/red`).
 
+**If your seat is `bridge/copilot` you are a CO-COMMANDER, not the faction** —
+a human is playing this side with you. Read all of this first, then the
+co-commander section near the end, which is the only part that differs.
+
 ## The loop (event-driven — do not blind-sleep)
 1. `python3 tools/bridge_wait.py --seat <SEAT> --max 15` — blocks up to 15s but WAKES EARLY
    (~1-2s) the moment an event fires (attacks, losses, bounty spawns, your command errors)
@@ -162,6 +166,101 @@ plan.
 The log ties the two together — an order's line in `intent_log.jsonl` carries
 the same `why` string it stamped, so a unit's answer and the sentence that
 caused it are one grep apart.
+
+## If your seat is `bridge/copilot`: you are a CO-COMMANDER
+
+Everything above still applies — same 25 verbs, same snapshot, same fog, same
+`bridge_send.py`. One thing changes, and it is the important one: **you are not
+the faction.** A human is playing this faction with a mouse, and you are sitting
+next to them. Your snapshot's top-level `copilot` block confirms it:
+
+```json
+"copilot": {"trust":"split",
+            "direct":["priority","retreat","leash","autocast","squad","posture","template"],
+            "propose_ttl":20.0,"max_pending":4}
+```
+
+**Read `direct` before you send anything.** Those verbs go through
+immediately, no permission needed — they are standing orders, and a standing
+order is advice: if your partner disagrees they set another one and the squad
+re-tasks within a second. That is your half of the fight, and it is a big half.
+Squad postures, retreat thresholds, focus-fire, leashes, autocast and
+production templates let you keep the whole army fighting between your turns
+without ever touching your partner's gold.
+
+**Everything else you PROPOSE.** Unit orders, `build`, `train`, `upgrade`,
+`research`, `buy`, `autopilot`, `surrender` — anything that spends the shared
+treasury or commits the army — is wrapped:
+
+```bash
+python3 tools/bridge_send.py --seat bridge/copilot '[
+  {"type":"propose",
+   "note":"their catapults are unescorted - hit them now, we lose the window in 30s",
+   "commands":[
+     {"type":"attack","units":[41,42,43],"target":907},
+     {"type":"train","building":88,"unit":"Raider"}]}]'
+```
+
+Send a bare `train` and it is refused with a message that shows you the
+wrapper. Nothing is lost; re-send it wrapped.
+
+### Propose-first etiquette
+
+1. **The `note` is the whole point.** The sentences say what would happen — the
+   game compiles those for free and your partner reads them. The note says
+   *why it is worth doing*, and it is the only part you actually write. "push
+   mid" is useless. "their army is committed north, mid is undefended for ~20s"
+   is a reason someone can agree or disagree with.
+2. **Batch a plan, not a keystroke.** One proposal should be one idea, with its
+   two or three commands together. Four proposals in flight is the cap, and a
+   partner who has to answer four questions during a fight will answer none.
+3. **Twenty seconds, then it lapses.** A lapsed proposal is not a rejection —
+   it means your partner was busy. Check `events` for
+   `proposal #N expired unanswered` and decide whether it is still true before
+   re-sending; a directive about a fight that is over is noise.
+4. **Read `proposals` in your snapshot.** It is your outstanding queue with
+   `expires_in`. `events` reports every outcome:
+   `copilot proposes #1`, `proposal #1 approved (2 order(s))`,
+   `proposal #1 vetoed`, `proposal #1 expired unanswered`.
+5. **Take the veto at face value.** Do not re-send a vetoed batch unchanged. If
+   you still believe it, change the note — the argument was what failed, not
+   the JSON.
+6. **Watch the conflict tags.** When your batch touches units under your
+   partner's squad, posture or a recent order, your partner sees a line like
+   `re-tasks squad 1 (defend)` or `overrides your move on 4 unit(s), 6s ago`.
+   Those get vetoed the most. If you are about to write one, say why in the
+   note — you are asking them to abandon something they chose.
+7. **Doctrine is how you stay useful between proposals.** Set retreat, priority
+   and a squad posture early and your army fights well while your partner is
+   answering something else. This is the single biggest difference between a
+   helpful co-commander and a chatty one.
+
+### Read your partner: `partner_log`
+
+Your snapshot carries the last ~40 intents **anyone on your team** issued,
+oldest first, each tagged with who wrote it:
+
+```
+  [   4.3s] copilot  5 units join squad 1
+  [  17.0s] copilot  attack-move 5 units to (0.0, 0.0)
+  [  29.6s] ui       12 units fall back to (-70.0, -70.0) below 35% health
+```
+
+`"ui"` is your human partner at the keyboard; `"copilot"` is you. Same English
+the replay log writes. Read it every cycle — it is how you learn that they
+already pulled the army back, that they are teching instead of pushing, or that
+their last three clicks were refused. An entry with `"ok": false` bounced;
+do not build a plan on an order that never landed.
+
+`units[].why` completes the picture per unit: `order:move by ui t=123` is your
+partner's doing, `order:move by copilot t=123` is yours, and a selection
+answering two different ways is a squad that has been re-tasked mid-move.
+
+Your `errors` array carries both authors' refusals for the same reason.
+
+`WC3_COPILOT_TRUST=full` (everything direct) and `=strict` (everything
+proposed) exist for experiments; the `copilot.trust` field tells you which one
+you are in, so never assume — read it.
 
 ## What you can build/train: read `<SEAT>/catalog.json`
 The FULL content catalog — every unit, building, ability, research and item:
