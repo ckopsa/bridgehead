@@ -1036,7 +1036,8 @@ fn use_items(
                 let hall = halls
                     .iter()
                     .filter(|(building, hall_team, _)| {
-                        building.kind == BuildingKind::TownHall && *hall_team == team
+                        // Any rung of the hall ladder is home.
+                        is_hall(building.kind) && *hall_team == team
                     })
                     .map(|(_, _, hall_tf)| hall_tf.translation)
                     .min_by(|a, b| {
