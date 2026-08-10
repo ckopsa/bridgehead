@@ -104,7 +104,11 @@ impl Plugin for DoctrinePlugin {
                 default_squad_autonomy.run_if(on_timer(Duration::from_millis(SQUAD_MS))),
                 run_squad_postures.run_if(on_timer(Duration::from_millis(SQUAD_MS))),
             )
-                .chain(),
+                // Postures read this frame's fog (Forage targeting, Defend
+                // threat response), so the whole chain sits after the one
+                // producer of it.
+                .chain()
+                .after(FogSet),
         );
     }
 }
@@ -176,6 +180,7 @@ fn nearest_point(points: &[Vec3], from: Vec3) -> Option<Vec3> {
 /// turn into chasing the bait off the position. `None` = nothing to answer.
 fn threat_point(
     hostiles: &Query<(&Team, &Transform, &Health), With<Unit>>,
+    fog: &FogGrid,
     team: Team,
     pos: Vec3,
     radius: f32,
@@ -187,6 +192,13 @@ fn threat_point(
             continue;
         }
         if xz_dist(tf.translation, pos) > radius {
+            continue;
+        }
+        // Doctrine is the strategic layer running at machine speed on the
+        // player's behalf, so it obeys the player's fog. (The squad's own
+        // units still swing at whatever closes on them — that is combat.rs's
+        // aggro, which models their senses and is deliberately not gated.)
+        if !fog.sees(tf.translation) {
             continue;
         }
         sum += tf.translation;
@@ -401,13 +413,16 @@ fn run_squad_postures(
     // Live treasure. bounty.rs despawns a cache the instant it is claimed or
     // expires, so "still in this query" is the whole liveness test.
     bounties: Query<&Transform, With<Bounty>>,
+    fog: Res<FogGrids>,
     ai: Res<AiControlled>,
     external: Res<ExternallyCommanded>,
 ) {
     if squad_orders.0.is_empty() {
         return;
     }
-    let bounty_points: Vec<Vec3> = bounties.iter().map(|tf| tf.translation).collect();
+    // Every cache on the map. Which of them a given squad may hunt is decided
+    // per team below — the same list filtered two ways, never two lists.
+    let all_bounties: Vec<Vec3> = bounties.iter().map(|tf| tf.translation).collect();
     // Snapshot so we can drop lapsed escorts while iterating.
     let postures: Vec<((Team, u8), SquadPosture)> =
         squad_orders.0.iter().map(|(k, v)| (*k, *v)).collect();
@@ -429,9 +444,25 @@ fn run_squad_postures(
             }
         }
 
+        let team_fog = fog.get(team);
+        // Treasure THIS team can see. Forage used to hunt every cache on the
+        // map, which was the doctrine layer quietly handing whoever set it a
+        // map-wide treasure radar. Now a forager chases what its team has eyes
+        // on — which is the symmetric rule doing its job, and a real change to
+        // how the posture plays: Forage has become a posture for an army that
+        // is already out on the map, not a homing beacon.
+        let bounty_points: Vec<Vec3> = all_bounties
+            .iter()
+            .copied()
+            .filter(|p| team_fog.sees(*p))
+            .collect();
+
         // A Forage squad with nothing left to hunt IS a Defend squad sitting on
         // its muster point, so rewrite it into one and let the Defend path (and
         // its threat response) do the work — no second implementation to skew.
+        // "Nothing left to hunt" now means "nothing we can SEE to hunt", so a
+        // blind forager musters instead of marching on treasure it has no
+        // business knowing about.
         let posture = match posture {
             SquadPosture::Forage { muster } if bounty_points.is_empty() => SquadPosture::Defend {
                 pos: muster,
@@ -443,7 +474,9 @@ fn run_squad_postures(
         // A Defend squad that only walks stragglers home is furniture. If enemy
         // bodies are inside the held ground, everyone turns and answers them.
         let threat = match posture {
-            SquadPosture::Defend { pos, radius } => threat_point(&hostiles, team, pos, radius),
+            SquadPosture::Defend { pos, radius } => {
+                threat_point(&hostiles, team_fog, team, pos, radius)
+            }
             _ => None,
         };
 
@@ -517,8 +550,8 @@ fn run_squad_postures(
                 // forager that meets an enemy on the way should fight it — the
                 // contested middle is exactly where bounties spawn.
                 //
-                // The empty-map case became Defend above, so `muster` here is
-                // only a defensive fallback that should never be reached.
+                // The see-nothing case became Defend above, so `muster` here is
+                // only a defensive fallback.
                 SquadPosture::Forage { muster } => {
                     let target = regroup.unwrap_or_else(|| {
                         nearest_point(&bounty_points, tf.translation).unwrap_or(muster)

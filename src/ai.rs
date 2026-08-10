@@ -122,7 +122,9 @@ impl Plugin for AiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AiState>()
             .add_systems(Startup, ai_apply_env)
-            .add_systems(Update, (ai_toggle_hotkey, ai_think));
+            // `ai_think` after `FogSet`: the scripted commander plans from
+            // this frame's visibility, exactly like the bridge seats.
+            .add_systems(Update, (ai_toggle_hotkey, ai_think.after(FogSet)));
     }
 }
 
@@ -335,6 +337,7 @@ fn ai_think(
     economies: Res<Economies>,
     records: Res<HeroRecords>,
     nav: Res<NavGrid>,
+    fog: Res<FogGrids>,
     mut commands: Commands,
     mut casts: EventWriter<CastAbility>,
     units: UnitQuery,
@@ -366,6 +369,7 @@ fn ai_think(
             &economies,
             &records,
             &nav,
+            fog.get(team),
             &mut commands,
             &mut casts,
             &units,
@@ -384,6 +388,10 @@ fn think(
     economies: &Economies,
     records: &HeroRecords,
     nav: &NavGrid,
+    // This team's fog. Every enemy fact below is drawn through it, so the
+    // scripted commander plans from the same picture a bridge commander is
+    // sent and the same one the player is shown.
+    fog: &FogGrid,
     commands: &mut Commands,
     casts: &mut EventWriter<CastAbility>,
     units: &UnitQuery,
@@ -429,7 +437,12 @@ fn think(
                 UnitKind::Worker => workers.push(info),
                 _ => army.push(info),
             }
-        } else {
+        } else if fog.sees(info.pos) {
+            // Enemy units enter the plan only while somebody of ours is
+            // looking at them, and are never remembered afterwards. This is
+            // the single line that ends the omniscient-commander asymmetry:
+            // everything below — defence, worker flight, Slam timing — was
+            // reading the ECS directly and now reads what this team can see.
             enemy_any.push(info.pos);
             if !is_flying_kind(unit.kind) {
                 enemy_ground.push(info.pos);
@@ -448,7 +461,13 @@ fn think(
     let mut hero_queued = false;
     for (entity, building, team, tf, under, queue) in buildings.iter() {
         if *team != me {
-            enemy_buildings.push(tf.translation);
+            // Seen right now. Structures we merely REMEMBER are appended
+            // straight after, because a building does not walk away: acting on
+            // a scouted barracks long after the scout died is memory, not
+            // cheating, and it is exactly what a human does.
+            if fog.sees(tf.translation) {
+                enemy_buildings.push(tf.translation);
+            }
             continue;
         }
         let queue_len = queue.as_ref().map(|q| q.queue.len()).unwrap_or(0);
@@ -465,6 +484,7 @@ fn think(
             queue_len,
         });
     }
+    enemy_buildings.extend(fog.ghosts().map(|g| g.pos));
 
     // Gold mines, tagged with whether our economy already reaches them. Trees
     // are deliberately ignored: lumber clusters are dense and near the base,
@@ -899,8 +919,7 @@ fn think(
         } else if now - brain.wave_started > WAVE_TIMEOUT {
             // Stalled push: re-aim at whatever enemy building is closest.
             let centroid = army.iter().fold(Vec3::ZERO, |a, u| a + u.pos) / army.len() as f32;
-            brain.wave_target =
-                nearest_pos(&enemy_buildings, centroid).unwrap_or(me.enemy().base_pos());
+            brain.wave_target = wave_objective(me, fog, nav, &enemy_buildings, centroid);
             brain.wave_started = now;
             for u in &army {
                 commands
@@ -919,7 +938,7 @@ fn think(
     } else if army.len() >= brain.next_wave_size {
         brain.wave_active = true;
         brain.wave_started = now;
-        brain.wave_target = nearest_pos(&enemy_buildings, base).unwrap_or(me.enemy().base_pos());
+        brain.wave_target = wave_objective(me, fog, nav, &enemy_buildings, base);
         brain.next_wave_size = (brain.next_wave_size + WAVE_SIZE_STEP).min(WAVE_SIZE_CAP);
         let target = brain.wave_target;
         for u in &army {
@@ -1177,6 +1196,41 @@ fn nearest_pos(candidates: &[Vec3], from: Vec3) -> Option<Vec3> {
                 .partial_cmp(&b.distance(from))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
+}
+
+/// Where a wave marches, in strict order of preference:
+///
+/// 1. the nearest enemy structure this team KNOWS about — seen right now, or
+///    remembered from a scout that has since died;
+/// 2. failing that, the opponent's starting base, as long as we have never
+///    actually looked at it. It is the one enemy position every player is born
+///    knowing, and walking there is both an attack and a scouting run;
+/// 3. failing that, the nearest patch of map this team has never seen.
+///
+/// Clause 3 is what keeps fog from turning into a stalemate machine, and it is
+/// the minimal explore behaviour the scripted AI needed to survive this change.
+/// Before fog, "attack the enemy base" could never be wrong, because the enemy
+/// base was always in the snapshot. Now an opponent that loses its main and
+/// lives on an unscouted expansion is genuinely lost — and an army that only
+/// ever walks to a place it has already confirmed is empty would never find
+/// it, so the match would run to the time cap with both sides intact. Sweeping
+/// the unexplored is the cheapest behaviour that makes the win condition
+/// reachable again; it is not clever, and it is not meant to be.
+fn wave_objective(
+    me: Team,
+    fog: &FogGrid,
+    nav: &NavGrid,
+    known_enemy_buildings: &[Vec3],
+    from: Vec3,
+) -> Vec3 {
+    if let Some(target) = nearest_pos(known_enemy_buildings, from) {
+        return target;
+    }
+    let their_home = me.enemy().base_pos();
+    if !fog.known(their_home) {
+        return their_home;
+    }
+    nearest_unexplored(fog, from, nav).unwrap_or(their_home)
 }
 
 /// Prefer an idle worker, otherwise the nearest one that is merely harvesting.
