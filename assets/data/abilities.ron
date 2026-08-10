@@ -1,0 +1,199 @@
+// ---------------------------------------------------------------------------
+// abilities.ron — every ability in the game, and who casts what.
+//
+//   * `defs`             — the ability table. `name` is the stable id: the
+//                          catalog key, the bridge selector, the button
+//                          caption. Field meanings are on `AbilityDef` in
+//                          src/shared.rs.
+//   * `unit_casters`     — per `UnitKind`, the abilities it can ever cast, IN
+//                          SLOT ORDER. An ability's index in this list is its
+//                          handle everywhere (hotkey slot, cooldown slot,
+//                          autocast rule, bridge selector), so append, never
+//                          insert. A kind with no record here casts nothing.
+//   * `probe_abilities`  — appended to `abilities` only under
+//                          `WC3_STATUS_PROBE=1`. Dev instrumentation; never
+//                          present in a normal run.
+//   * `autocast`         — the standing doctrine a freshly trained unit of
+//                          this kind is BORN with, named by ability rather
+//                          than by slot index so a row inserted ahead of it
+//                          moves the rule with it.
+//   * `building_casters` — per building LADDER ROOT. A Keep and a Castle
+//                          inherit the TownHall's row, because an upgrade must
+//                          never take an ability away from the player who paid
+//                          for it.
+//
+// Content beads add abilities by adding rows here. No code changes.
+// ---------------------------------------------------------------------------
+(
+    defs: [
+        // The Champion slams the ground. Flyers overhead feel nothing — the
+        // melee hero's air answer is his archers, not his ability. These four
+        // numbers are also what `hero_ability_cost/cooldown/radius/damage`
+        // report to ai.rs; there is no second copy of them in code.
+        (
+            name: "Slam",
+            effect: Damage,
+            mana_cost: 40.0,
+            cooldown: 10.0,
+            radius: 7.0,
+            power: 45.0,
+            duration: 0.0,
+            hits_air: false,
+            unlock: Always,
+            description: "AoE damage around the Champion (ground only), scales with level.",
+        ),
+        // Healing light reaches up: air allies are still your allies.
+        (
+            name: "Heal",
+            effect: Heal,
+            mana_cost: 45.0,
+            cooldown: 12.0,
+            radius: 8.0,
+            power: 60.0,
+            duration: 0.0,
+            hits_air: true,
+            unlock: Always,
+            description: "Restores HP to all allies around the Priestess, air included, scales with level.",
+        ),
+        // Workers are ground units, so this never had an air question.
+        (
+            name: "CallToArms",
+            effect: Militia,
+            mana_cost: 0.0,
+            cooldown: 90.0,
+            radius: 16.0,
+            power: 40.0,
+            duration: 0.0,
+            hits_air: false,
+            unlock: Always,
+            description: "Own workers near the TownHall become fighters for 40s.",
+        ),
+        // --- hero ultimates: the second ability of each class, at level 5 ---
+        //
+        // Both are pure table rows: `ApplyStatus` at `Allies`, a `HeroLevel(5)`
+        // predicate, their own cooldown slot. Nothing in combat.rs, ui.rs,
+        // doctrine.rs or bridge.rs knows their names.
+        //
+        // They are also the reason a leveled hero is worth a war of its own. A
+        // team that keeps its Champion alive to level 5 gets a 45s army-wide
+        // damage spike; a team that kills it takes that away for the whole
+        // revive-and-relevel arc.
+        //
+        // Champion ultimate. Radius and duration are tuned so it is an
+        // ENGAGEMENT button, not a permanent aura: 8s of +30% inside 8 units,
+        // once every 45s. A shout carries — unlike the Slam this is not a
+        // ground shockwave, so the team's air units are inside the buff like
+        // everyone else.
+        (
+            name: "Warcry",
+            effect: ApplyStatus(status: DamageBuff, targets: Allies, also: None),
+            mana_cost: 75.0,
+            cooldown: 45.0,
+            radius: 8.0,
+            power: 0.30,
+            duration: 8.0,
+            hits_air: true,
+            unlock: HeroLevel(5),
+            description: "Ultimate: allies around the Champion deal +30% damage for 8s. Hero level 5.",
+        ),
+        // Priestess ultimate: the two-status row. 15 HP/s is roughly a
+        // Footman's health bar over the full 6s, and the 25% reduction is what
+        // makes the heal out-race incoming fire instead of merely trailing it.
+        // `also` is the framework's only concession to this ability: Sanctuary
+        // both heals over time AND hardens, and "two abilities on one button"
+        // would have cost more than one optional pair.
+        (
+            name: "Sanctuary",
+            effect: ApplyStatus(status: HealOverTime, targets: Allies, also: Some((ArmorBuff, 0.25))),
+            mana_cost: 90.0,
+            cooldown: 60.0,
+            radius: 7.0,
+            power: 15.0,
+            duration: 6.0,
+            hits_air: true,
+            unlock: HeroLevel(5),
+            description: "Ultimate: allies around the Priestess regain 15 HP/s and take 25% less damage for 6s. Hero level 5.",
+        ),
+        // The Sorcerer's Slow: the game's first shipping crowd control, and a
+        // pure table row — no new effect variant, no new system, no new
+        // component.
+        //
+        // Tuning notes, because every number here is a balance decision:
+        //
+        //   * magnitude 0.4 — a Raider drops from 10.5 to 6.3 speed (slower
+        //     than a Footman) and its 1.1s swing becomes 1.83s. That is what
+        //     "cripples a charge" has to mean: the dive still happens, it just
+        //     arrives late and hits at two thirds rate. `StackPolicy::Refresh`
+        //     means a second Sorcerer refreshes rather than compounds, so
+        //     massed casters can never approach the 0.75 cap and stun the
+        //     field.
+        //   * duration 5s against a 9s cooldown — a 55% uptime on one
+        //     Sorcerer. Long enough to decide a collision, short enough that a
+        //     retreat covered by Slow is a real cost in tempo.
+        //   * radius 8.0, centred on the caster — one unit past the
+        //     Priestess's Heal and comfortably inside the Sorcerer's own 11
+        //     attack range, so a caster standing behind its line still catches
+        //     everything crashing into the front rank.
+        //   * no mana — the Sorcerer is not a hero and carries no `Hero`
+        //     component, so its only gate is `AbilityCooldowns`.
+        //   * hits_air: true — this is a hex, not a shockwave.
+        //   * unlock: Always — the tech gate is the Sanctum (which requires a
+        //     Keep), so gating the spell on `TeamTier` as well would be the
+        //     same rule written twice, and would silently disarm every
+        //     Sorcerer alive the moment a team's Keep fell.
+        //   * `also: None` — Slow is one debuff and nothing else.
+        (
+            name: "Slow",
+            effect: ApplyStatus(status: Slow, targets: Enemies, also: None),
+            mana_cost: 0.0,
+            cooldown: 9.0,
+            radius: 8.0,
+            power: 0.4,
+            duration: 5.0,
+            hits_air: true,
+            unlock: Always,
+            description: "Slows every enemy within 8 of the Sorcerer by 40% (move AND attack speed) for 5s. Refreshes rather than stacks; no mana, 9s cooldown.",
+        ),
+        // Dev-only second Champion ability, present only under
+        // `WC3_STATUS_PROBE=1`. It exists so a real match can exercise the v2
+        // path end to end — a second ability on a caster, a level-gated
+        // unlock, its own cooldown slot, an explicit selector, and an
+        // `ApplyStatus` effect feeding the status framework — without shipping
+        // balance content the content beads have not designed yet.
+        //
+        // Gated on the TEAM TIER on purpose: this is the live test of the join
+        // between the ability framework and the hall ladder. It is locked
+        // while a team has only a TownHall and opens the moment its Keep
+        // finishes.
+        (
+            name: "ProbeChill",
+            effect: ApplyStatus(status: Slow, targets: Enemies, also: None),
+            mana_cost: 10.0,
+            cooldown: 8.0,
+            radius: 9.0,
+            power: 0.4,
+            duration: 6.0,
+            hits_air: false,
+            unlock: TeamTier(T2),
+            description: "Dev probe: slows enemies around the Champion by 40% for 6s. Requires tier 2.",
+        ),
+    ],
+
+    unit_casters: [
+        // Heroes deliberately have NO default autocast: their mana is a
+        // resource a player budgets, and a hero that spends it the instant one
+        // enemy wanders past is a hero with none left for the fight.
+        (kind: Hero,      abilities: ["Slam", "Warcry"],   probe_abilities: ["ProbeChill"], autocast: None),
+        (kind: Priestess, abilities: ["Heal", "Sanctuary"], probe_abilities: [],            autocast: None),
+        // One enemy in the bubble is enough: the cooldown is the only cost,
+        // and a Slow landed on a single Raider diving your workers is exactly
+        // the moment the unit was built for. A caster whose entire value is
+        // one debuff is worthless as a statue.
+        (kind: Sorcerer,  abilities: ["Slow"],              probe_abilities: [],            autocast: Some((ability: "Slow", min_targets: 1))),
+    ],
+
+    // Keyed by ladder ROOT: the Keep and the Castle inherit this row.
+    building_casters: [
+        (kind: TownHall, abilities: ["CallToArms"]),
+    ],
+)

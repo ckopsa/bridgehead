@@ -1,0 +1,226 @@
+// ---------------------------------------------------------------------------
+// buildings.ron — the building stat table, the tech graph and the upgrade
+// ladder.
+//
+// One record per `BuildingKind` variant, every variant exactly once. Field
+// meanings are documented on `BuildingStats` in src/shared.rs.
+//
+//   * `requires`     — buildings that must stand before a worker may place
+//                      this one. Compared through `building_satisfies`, so a
+//                      requirement of `Keep` is met by a Castle too.
+//   * `trains`       — the production roster, in COMMAND-CARD ORDER. Hotkeys
+//                      are positional: append, never insert, or you retrain
+//                      every pair of hands that ever played this game.
+//   * `researches`   — research ladders this building can run.
+//   * `upgrades_to`  — the next rung of this building's ladder. The whole
+//                      ladder is this one field: `building_tier`,
+//                      `upgrade_root`, `building_placeable`, `is_hall` and
+//                      `upgrade_cost` are all derived from it, and the price
+//                      of an upgrade is the `cost_*`/`build_time` of the
+//                      RESULT, so there is exactly one cost table.
+// ---------------------------------------------------------------------------
+[
+    (
+        kind: TownHall,
+        name: "TownHall",
+        description: "Tier 1 hall. Resource drop-off. Trains Workers and heroes (1 hero slot). Upgrades to a Keep.",
+        requires: [],
+        // The whole hall ladder trains the same roster: an upgraded hall is
+        // still the hall. Repeated verbatim on Keep and Castle below — the
+        // three rungs are three records on purpose, so a rung can diverge
+        // without a code change.
+        trains: [Worker, Hero, Priestess],
+        researches: [],
+        upgrades_to: Some(Keep),
+        stats: (
+            cost_gold: 385, cost_lumber: 205, hp: 1200.0, build_time: 40.0,
+            supply_provided: 10, size: 8.0, attack: None, vision: 26.0,
+        ),
+    ),
+    (
+        kind: Barracks,
+        name: "Barracks",
+        description: "Trains Footmen, Archers and Spearmen (Raiders once a Workshop stands, Knights once a Castle does).",
+        requires: [],
+        // Spearman is appended rather than slotted next to the Footman on
+        // purpose: production hotkeys are positional, and moving Archer off W
+        // to make room would retrain every existing pair of hands. Same for
+        // the Knight in the fifth slot.
+        trains: [Footman, Archer, Raider, Spearman, Knight],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 160, cost_lumber: 60, hp: 700.0, build_time: 25.0,
+            supply_provided: 0, size: 6.0, attack: None, vision: 18.0,
+        ),
+    ),
+    (
+        kind: Farm,
+        name: "Farm",
+        description: "+6 supply. Build ahead of the cap or production stalls.",
+        requires: [],
+        trains: [],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 80, cost_lumber: 20, hp: 350.0, build_time: 12.0,
+            supply_provided: 6, size: 4.0, attack: None, vision: 12.0,
+        ),
+    ),
+    // A Tower sees 20 against a 16 attack range, so it is never shooting at
+    // something the team cannot also see. Towers shoot air: static defense is
+    // the one thing a flyer cannot simply walk around, so a base that invested
+    // in towers is never helpless against air.
+    (
+        kind: Tower,
+        name: "Tower",
+        description: "Static defense: shoots arrows at enemies in range.",
+        requires: [Barracks],
+        trains: [],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 110, cost_lumber: 80, hp: 550.0, build_time: 25.0,
+            supply_provided: 0, size: 3.0,
+            attack: Some((damage: 16.0, range: 16.0, cooldown: 1.3, can_hit_air: true)),
+            vision: 20.0,
+        ),
+    ),
+    (
+        kind: Wall,
+        name: "Wall",
+        description: "Cheap blocking segment. No function except HP in the way.",
+        requires: [],
+        trains: [],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 25, cost_lumber: 10, hp: 300.0, build_time: 8.0,
+            supply_provided: 0, size: 2.0, attack: None, vision: 8.0,
+        ),
+    ),
+    // The Gryphon trains here rather than out of a new Aviary, and that is a
+    // design choice, not a shortcut. The Workshop is already the building
+    // whose entire job is "the answer to a tower turtle" — siege is the ground
+    // answer, air is the one that refuses to use the door. Putting both behind
+    // one 140g/100l investment keeps the building count flat, keeps the tech
+    // decision legible (one branch, two answers), and means a team that
+    // scouted a Workshop still does not know which is coming.
+    (
+        kind: Workshop,
+        name: "Workshop",
+        description: "Siege works: trains Catapults, and Gryphon Riders once a Castle stands. Both answers to a tower turtle — one knocks the door down, the other flies over it.",
+        requires: [Barracks],
+        trains: [Catapult, GryphonRider],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 140, cost_lumber: 100, hp: 550.0, build_time: 22.0,
+            supply_provided: 0, size: 5.0, attack: None, vision: 16.0,
+        ),
+    ),
+    (
+        kind: Shop,
+        name: "Shop",
+        description: "Item vendor: heroes buy consumables here (see catalog items).",
+        requires: [],
+        trains: [],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 75, cost_lumber: 60, hp: 400.0, build_time: 15.0,
+            supply_provided: 0, size: 4.0, attack: None, vision: 14.0,
+        ),
+    ),
+    // Research is the reward for teching, not an opening build: gating it
+    // behind the Keep means the 100g/50l first level is a choice made *after*
+    // the 320g/160l hall upgrade, so nobody buys +1 attack instead of their
+    // second barracks in the first four minutes.
+    //
+    // The Blacksmith trains nothing on purpose. It is the first building in
+    // the game whose entire output is a number, which also means it does NOT
+    // count as a production building for the win condition (`check_game_over`
+    // asks `!trainable(kind).is_empty()`) — a team down to one forge has
+    // already lost, and a Blacksmith should not keep a dead match alive.
+    //
+    // Vision 14: a forge is a workplace, not a watchtower. Deliberately at the
+    // bottom of the table alongside the Shop — per docs/FOG.md, sight is what
+    // a structure is FOR, and this one is for hammering.
+    (
+        kind: Blacksmith,
+        name: "Blacksmith",
+        description: "Tier 2 forge (requires a Keep). Researches the two team-wide ladders in catalog.research: Attack (+1/+2/+3 flat damage on every UNIT attack) and Armor (+1/+2/+3 flat damage reduction on every UNIT hit taken, never below 1 damage per hit). Bonuses are permanent, retroactive to units already alive, and survive the Blacksmith's death. One research at a time per forge; build a second Blacksmith to run both ladders at once.",
+        requires: [Keep],
+        trains: [],
+        researches: [Attack, Armor],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 140, cost_lumber: 80, hp: 600.0, build_time: 24.0,
+            supply_provided: 0, size: 5.0, attack: None, vision: 14.0,
+        ),
+    ),
+    // Tier 2/3 halls. `cost_*` and `build_time` are the price and duration of
+    // the UPGRADE STEP that produces them, not of a placement — these kinds
+    // are unplaceable (nothing lists them in `upgrades_to`... rather, they are
+    // the TARGET of an `upgrades_to`, which is what `building_placeable`
+    // reads), so there is no other reading.
+    //
+    // Footprint stays 8.0 all the way up: an upgrade must never need room the
+    // original hall did not already occupy, or a tightly packed base could not
+    // tier up at all. HP is the visible reward for the money.
+    //
+    // Vision climbs with the rung for the same reason HP does. A hall is its
+    // team's permanent eye over its own base (see TownHall's 26), and the
+    // thing you are buying with an upgrade is a taller fortification — so each
+    // rung watches a little further over its own ground. At Castle the hall
+    // alone covers the whole approach a Tower would, without the Tower.
+    // Strictly increasing, like every other number on this ladder.
+    (
+        kind: Keep,
+        name: "Keep",
+        description: "Tier 2 hall: everything the TownHall was, with a deeper HP pool. Opens a SECOND hero slot (distinct classes only) and unlocks tier-2 content such as the Arcane Sanctum. Satisfies tier-1 requirements. Upgrades to a Castle.",
+        requires: [],
+        trains: [Worker, Hero, Priestess],
+        researches: [],
+        upgrades_to: Some(Castle),
+        stats: (
+            cost_gold: 320, cost_lumber: 160, hp: 1700.0, build_time: 40.0,
+            supply_provided: 10, size: 8.0, attack: None, vision: 30.0,
+        ),
+    ),
+    (
+        kind: Castle,
+        name: "Castle",
+        description: "Tier 3 hall: the top of the ladder. A third hero slot (unusable until a third hero class ships). Satisfies every hall requirement below it.",
+        requires: [],
+        trains: [Worker, Hero, Priestess],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 480, cost_lumber: 240, hp: 2200.0, build_time: 50.0,
+            supply_provided: 10, size: 8.0, attack: None, vision: 34.0,
+        ),
+    ),
+    // Arcane Sanctum: the first building in the game gated on a Keep, so it is
+    // also the first concrete reason to climb the hall ladder at all.
+    // Lumber-heavy (a college is timber and parchment, and lumber is the
+    // resource an army does not compete for), and thin-walled — 480 hp on a
+    // 5.0 footprint is the softest production building on the field, because a
+    // tech building that also tanks is a tech building nobody has to raid.
+    //
+    // Vision level with the Barracks: the Sanctum is the caster's drill yard,
+    // not a watchtower.
+    (
+        kind: Sanctum,
+        name: "Sanctum",
+        description: "Arcane Sanctum: trains Sorcerers. Requires a Keep — the first thing a hall upgrade unlocks.",
+        requires: [Keep],
+        trains: [Sorcerer],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 150, cost_lumber: 130, hp: 480.0, build_time: 30.0,
+            supply_provided: 0, size: 5.0, attack: None, vision: 18.0,
+        ),
+    ),
+]

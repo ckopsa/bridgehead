@@ -1,0 +1,255 @@
+// ---------------------------------------------------------------------------
+// units.ron — the unit stat table.
+//
+// One record per `UnitKind` variant, every variant exactly once; the loader
+// (src/data.rs) refuses to start otherwise, naming the variant it could not
+// find. Field meanings are documented on `UnitStats` in src/shared.rs; the
+// balance rationale lives here, next to the number it explains.
+//
+// Anti-air is decided by ONE rule, applied to every kind below: a weapon that
+// leaves the hand can hit a flyer, a weapon swung by hand cannot. So archers,
+// the Priestess and towers shoot air; footmen, raiders, workers, militia and
+// the melee Champion cannot. Catapults are the deliberate exception to
+// "projectile == anti-air": siege is a ground bombardment weapon, and keeping
+// it air-blind is what makes flyers the clean counter to a siege push (which
+// is in turn the counter to the tower turtle flyers also bypass). Every
+// counter has a counter.
+//
+// `requires` is the TECH gate beyond owning the trainer building; the trainer
+// itself is `trains` in buildings.ron.
+// ---------------------------------------------------------------------------
+[
+    (
+        kind: Worker,
+        name: "Worker",
+        description: "Harvests gold/lumber, constructs buildings. Fights poorly.",
+        requires: [],
+        stats: (
+            cost_gold: 75, cost_lumber: 0, supply: 1, hp: 60.0, damage: 5.0,
+            range: 1.8, attack_cooldown: 1.5, speed: 8.0, train_time: 8.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 12.0,
+        ),
+    ),
+    (
+        kind: Footman,
+        name: "Footman",
+        description: "Cheap melee line unit. Tanks for archers.",
+        requires: [],
+        stats: (
+            cost_gold: 135, cost_lumber: 0, supply: 2, hp: 140.0, damage: 12.0,
+            range: 2.0, attack_cooldown: 1.2, speed: 7.0, train_time: 12.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 16.0,
+        ),
+    ),
+    // The line's anti-air: a footman screen is helpless overhead, archers
+    // behind it are not.
+    (
+        kind: Archer,
+        name: "Archer",
+        description: "Long-range attacker. Fragile; keep behind footmen.",
+        requires: [],
+        stats: (
+            cost_gold: 90, cost_lumber: 30, supply: 2, hp: 70.0, damage: 14.0,
+            range: 14.0, attack_cooldown: 1.5, speed: 7.0, train_time: 12.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
+            vision: 18.0,
+        ),
+    ),
+    // Base (level 1) stats; damage/HP grow per level — see `Hero` in shared.rs.
+    // The Champion swings a greatsword: no reach into the air, and its Slam is
+    // a ground shockwave (see abilities.ron). A team that plays the melee hero
+    // needs archers or towers to answer flyers.
+    (
+        kind: Hero,
+        name: "Hero",
+        description: "The Champion: melee hero, levels from nearby enemy deaths, AoE Slam ability, revivable at reduced cost with level preserved. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class.",
+        requires: [],
+        stats: (
+            cost_gold: 400, cost_lumber: 100, supply: 5, hp: 320.0, damage: 24.0,
+            range: 2.4, attack_cooldown: 1.1, speed: 7.5, train_time: 25.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 20.0,
+        ),
+    ),
+    // Outranges towers (20 vs 16) and pulverizes structures, but 15 damage
+    // vs units, 110 hp, and 4.5 speed means anything that reaches it wins.
+    // Ground-only by design: a boulder lobbed at a wall cannot track a
+    // flyer, so an all-in siege push is the thing air raiders punish.
+    (
+        kind: Catapult,
+        name: "Catapult",
+        description: "Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it.",
+        requires: [],
+        stats: (
+            cost_gold: 180, cost_lumber: 120, supply: 3, hp: 110.0, damage: 15.0,
+            range: 20.0, attack_cooldown: 3.0, speed: 4.5, train_time: 22.0, projectile: true,
+            vs_building_mult: 6.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 14.0,
+        ),
+    ),
+    // Speed is the weapon: dives catapults (2x) and worker lines, melts under
+    // focused fire. Gold-heavy so it competes with footmen for budget.
+    //
+    // Round-4 balance: an ungated Raider rush killed 14 workers by t=228
+    // before any reactive defense could finish. Workshop-gating makes cavalry
+    // the mid-game flanking tool it was designed as.
+    (
+        kind: Raider,
+        name: "Raider",
+        description: "Fast cavalry: 2x damage vs Catapults, excels at worker raids and map control. Melts under massed fire.",
+        requires: [Workshop],
+        stats: (
+            cost_gold: 170, cost_lumber: 30, supply: 3, hp: 130.0, damage: 16.0,
+            range: 2.2, attack_cooldown: 1.1, speed: 10.5, train_time: 16.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 2.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 24.0,
+        ),
+    ),
+    // Ranged support hero: heals instead of slams. Base (level 1) stats.
+    // Her bolts track upward, so the support hero is also the hero answer to
+    // air.
+    (
+        kind: Priestess,
+        name: "Priestess",
+        description: "Support hero: ranged attack, Heal ability (AoE ally healing). Occupies one hero slot — a Keep lets her stand alongside a Champion; revival preserves her own level.",
+        requires: [],
+        stats: (
+            cost_gold: 400, cost_lumber: 100, supply: 5, hp: 240.0, damage: 14.0,
+            range: 10.0, attack_cooldown: 1.4, speed: 7.5, train_time: 25.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
+            vision: 18.0,
+        ),
+    ),
+    // The counter-triangle's missing third leg. Before this, a team that met
+    // Raiders had nothing at tier 1 to answer them: Footmen are too slow to
+    // catch cavalry and too expensive to trade with it, Archers die to it. So
+    // the Spearman is deliberately BAD at everything else — 6 damage on a 1.7s
+    // thrust is the worst dps in the game, and a Footman beats one in a
+    // straight duel without dropping below half — and it buys that weakness
+    // back at 5x against a horse. What it is always worth is meat: 160 hp for
+    // 90 gold is the cheapest hit points on the field, so a spear line in
+    // front of archers is a real formation even in a match where the enemy
+    // never builds cavalry. Slow (5.5) so it can screen but never chase; the
+    // counter is a wall you walk cavalry into, not a hunter.
+    //
+    // vision 18: a picket that cannot see the riders coming is not a picket,
+    // so the anti-cavalry line watches a little further than a footman. Still
+    // well short of the Raider's 24: cavalry keeps the initiative and gets to
+    // choose the engagement, which is what makes the counter a wall you walk
+    // into rather than a patrol that hunts you.
+    (
+        kind: Spearman,
+        name: "Spearman",
+        description: "Cheap anti-cavalry line: 5x damage vs Raiders and Knights, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
+        requires: [],
+        stats: (
+            cost_gold: 90, cost_lumber: 0, supply: 2, hp: 160.0, damage: 6.0,
+            range: 2.6, attack_cooldown: 1.7, speed: 5.5, train_time: 10.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 5.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 18.0,
+        ),
+    ),
+    // The first crowd control in the game, and deliberately the worst fighter
+    // that has ever been worth 110 gold: 55 hp (less than an Archer), 8 damage
+    // on a 2.0s cast, and a 6.0 walk that cannot disengage from anything.
+    // Everything it is worth is `Slow` — the Sanctum's tier-2 price buys an
+    // EFFECT, not a body, which is the whole point of a caster. Missiles, so
+    // it shoots air like the Archer. Two Sorcerers are not twice the debuff
+    // (Slow refreshes rather than stacks — see `StackPolicy`), so a team wants
+    // a few, never a wall of them; what more Sorcerers buy is coverage of a
+    // wider frontage.
+    //
+    // vision 18: sees like an Archer. A caster whose ability is an 8-unit
+    // bubble around itself must see the charge coming from further out than it
+    // can throw the spell, or its auto-cast fires at the moment it is already
+    // being ridden down.
+    (
+        kind: Sorcerer,
+        name: "Sorcerer",
+        description: "Tier-2 caster (Arcane Sanctum, requires a Keep): auto-casts Slow, a -40% move and attack speed debuff on every enemy within 8 for 5s. Blunts cavalry charges and covers retreats. Barely fights; keep it behind the line.",
+        requires: [],
+        stats: (
+            cost_gold: 110, cost_lumber: 45, supply: 2, hp: 55.0, damage: 8.0,
+            range: 11.0, attack_cooldown: 2.0, speed: 6.0, train_time: 15.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
+            vision: 18.0,
+        ),
+    ),
+    // Tier 3, Castle-gated, Barracks-trained: the line-breaker. Its whole
+    // design is that it has NO type multiplier — no anti-siege bonus (that
+    // stays the Raider's job), no anti-anything. What 270 gold buys is raw
+    // numbers: 350 hp and 29.6 dps, more than double a Footman's on both
+    // counts, at a speed nothing but cavalry can disengage from.
+    //
+    // And it is `TargetClass::Cavalry`, which is the point of the whole
+    // exercise: the counter to the most expensive melee unit in the game is
+    // still the cheapest, a 90-gold Spearman, because the triangle is drawn on
+    // classes rather than on tiers. Equal gold — one Knight against three
+    // Spearmen — the spear line wins and pays one body for it. A tech
+    // advantage buys tempo and reach, never immunity to a counter.
+    //
+    // Melee, so `can_hit_air: false`: a Knight army that never built an archer
+    // is helpless under a Gryphon.
+    //
+    // vision 20: a shock line that closes at 9.5 needs to see the shape of
+    // what it is about to hit, so it out-sees the 18 of the spear picket that
+    // answers it. Still short of the Raider's 24: the Knight is the hammer,
+    // not the scout, and the light cavalry keeps its one remaining job.
+    (
+        kind: Knight,
+        name: "Knight",
+        description: "Requires a Castle. Heavy shock cavalry: 350 hp at speed 9.5, no type bonus, just the best raw stats on the field. Breaks Footman and Archer lines at equal gold. Counter it with Spearmen — the Knight is cavalry, so it takes 5x from a spear, and 270g of Knight loses to 270g of Spearmen. Melee: cannot touch air.",
+        requires: [Castle],
+        stats: (
+            cost_gold: 270, cost_lumber: 60, supply: 4, hp: 350.0, damage: 34.0,
+            range: 2.4, attack_cooldown: 1.15, speed: 9.5, train_time: 20.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 20.0,
+        ),
+    ),
+    // Tier 3, Castle-gated, Workshop-trained: the flyer capstone, and the
+    // first kind in the game with `flying: true`. It ignores the nav grid
+    // entirely, so no wall, forest, canyon or tower net is a door it has to
+    // use, and it hits both planes.
+    //
+    // The price of that is paid in raw numbers, deliberately: 280 gold and 120
+    // lumber buys 15.4 dps — barely more than the two Archers the same gold
+    // buys — because what a flyer is actually purchasing is that most of the
+    // enemy army cannot fight it at all. Every stat here is set against one
+    // target: 280 gold of Gryphon must LOSE to 270 gold of Archers. 200 hp is
+    // what makes that true, so massed ranged stays the answer to air and a
+    // flyer is a scalpel rather than an autowin.
+    //
+    // vision 26: altitude is the oldest observation post there is, and fog is
+    // XZ only (docs/FOG.md), so height costs a flyer nothing and buys it
+    // reach. 26 is the widest eye any unit has — equal to a TownHall's, which
+    // is the comparison worth making: a Gryphon is a hall's worth of vision
+    // that MOVES, and scouting one across the map is the single best
+    // information purchase in the game. It is also why the unit is
+    // Castle-gated and 280 gold: sight this good arrives late.
+    (
+        kind: GryphonRider,
+        name: "GryphonRider",
+        description: "Requires a Castle; trained at the Workshop. Flying: ignores walls, forests and chokepoints entirely, and attacks both ground and air. Melee units and Catapults CANNOT hit it at all — only Archers, the Priestess and Towers can. Counter it with massed Archers: 270g of Archers beats one Gryphon. Sees 26, the widest eye in the game.",
+        requires: [Castle],
+        stats: (
+            cost_gold: 280, cost_lumber: 120, supply: 5, hp: 200.0, damage: 20.0,
+            range: 6.0, attack_cooldown: 1.3, speed: 9.0, train_time: 28.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: true, can_hit_air: true, can_hit_ground: true,
+            vision: 26.0,
+        ),
+    ),
+]
