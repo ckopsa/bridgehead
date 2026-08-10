@@ -37,7 +37,8 @@ use serde::Deserialize;
 use std::sync::LazyLock;
 
 use crate::shared::{
-    normalize_name, status_probe_enabled, upgrade_root, AbilityDef, AbilityEffect, AbilityTarget,
+    is_hero_kind, kind_name, normalize_name, status_probe_enabled, upgrade_root, AbilityDef,
+    AbilityTarget, AbilityTargets, Effect, EffectAtom, EffectSchedule,
     BuildingKind,
     BuildingStats, ItemDef, ItemId, ResearchKind, ResearchStep, TechTier, UnitKind,
     UnitStats,
@@ -148,7 +149,10 @@ pub struct BuildingRow {
 #[serde(deny_unknown_fields)]
 struct AbilityDefRow {
     name: String,
-    effect: AbilityEffect,
+    /// **The sentence.** One or more `(atom: …, schedule: …)` clauses, applied
+    /// in order from one centre. `schedule` defaults to `Instant`, so the
+    /// common row reads `effects: [(atom: Damage(amount: 45.0))]`.
+    effects: Vec<Effect>,
     /// Where the effect is centred. DEFAULTED, unlike every other field here:
     /// `AbilityTarget::Caster` is what every row meant before geometry was a
     /// thing, so the caster-centred majority stays silent and only a thrown
@@ -159,8 +163,6 @@ struct AbilityDefRow {
     mana_cost: f32,
     cooldown: f32,
     radius: f32,
-    power: f32,
-    duration: f32,
     hits_air: bool,
     unlock: AbilityUnlock,
     description: String,
@@ -170,26 +172,25 @@ impl From<AbilityDefRow> for AbilityDef {
     fn from(row: AbilityDefRow) -> AbilityDef {
         let AbilityDefRow {
             name,
-            effect,
+            effects,
             target,
             mana_cost,
             cooldown,
             radius,
-            power,
-            duration,
             hits_air,
             unlock,
             description,
         } = row;
         AbilityDef {
             name: leak(name),
-            effect,
+            // Same trick as `leak`, one level up: the parsed atoms live as long
+            // as `TABLES` does, which is forever, so the slice may be
+            // `&'static` and `AbilityDef` may stay `Copy`.
+            effects: Box::leak(effects.into_boxed_slice()),
             target,
             mana_cost,
             cooldown,
             radius,
-            power,
-            duration,
             hits_air,
             unlock,
             description: leak(description),
@@ -632,8 +633,124 @@ fn check_values(t: &Tables, defs: &[AbilityDef]) -> Vec<String> {
             p.push(format!("{what}: cooldown must be >= 0"));
         }
         positive(&mut p, &what, "radius", def.radius);
-        if matches!(def.effect, AbilityEffect::ApplyStatus { .. }) {
-            positive(&mut p, &what, "duration", def.duration);
+
+        // --- the composition ----------------------------------------------
+        //
+        // v3 made an ability a LIST of atoms, which means a row can now be
+        // wrong in ways v2's closed enum made unrepresentable: an empty
+        // sentence, a summoned hero, a recall thrown across the map, a
+        // teleport that repeats every second. Each of those is refused here,
+        // by name, at startup — the same contract every other table has, and
+        // the reason a content author can compose freely without reading
+        // combat.rs.
+        if def.effects.is_empty() {
+            p.push(format!(
+                "{what}: `effects` is empty — an ability that does nothing is a \
+                 button that lies about being castable"
+            ));
+        }
+        let mut status_kinds: Vec<&str> = Vec::new();
+        for (i, effect) in def.effects.iter().enumerate() {
+            let clause = format!("{what}/effects[{i}]");
+
+            // Schedules that exist as schema but have no machinery behind
+            // them. Refused rather than ignored: a row that silently did
+            // nothing would be a worse lie than a startup panic.
+            if !effect.schedule.supported() {
+                p.push(format!(
+                    "{clause}: schedule `{}` is not yet supported — the damage \
+                     pipeline has no hook for it (see EffectSchedule)",
+                    effect.schedule.name()
+                ));
+            }
+            if let EffectSchedule::OverTime { interval, ticks } = effect.schedule {
+                positive(&mut p, &clause, "schedule interval", interval);
+                if ticks == 0 {
+                    p.push(format!("{clause}: schedule ticks must be > 0"));
+                }
+                // A recall repeated every second is not a mechanic, it is a
+                // unit that can never leave home; and a militia term that
+                // re-arms itself is a permanent militia written the hard way.
+                if matches!(
+                    effect.atom,
+                    EffectAtom::Teleport { .. } | EffectAtom::Militia { .. }
+                ) {
+                    p.push(format!(
+                        "{clause}: `{}` cannot be scheduled OverTime — it sets a \
+                         state rather than paying out a quantity",
+                        effect.atom.name()
+                    ));
+                }
+            }
+
+            match effect.atom {
+                EffectAtom::Damage { amount, .. } => {
+                    positive(&mut p, &clause, "damage amount", amount);
+                }
+                EffectAtom::Heal { amount, targets } => {
+                    positive(&mut p, &clause, "heal amount", amount);
+                    // The only reading of "heal the enemy" is a typo.
+                    if targets == AbilityTargets::Enemies {
+                        p.push(format!("{clause}: Heal at Enemies mends the people you are fighting"));
+                    }
+                }
+                EffectAtom::ApplyStatus { status, magnitude, duration, .. } => {
+                    positive(&mut p, &clause, "status magnitude", magnitude);
+                    positive(&mut p, &clause, "status duration", duration);
+                    // Two instances of one kind from one cast: the second only
+                    // refreshes or stacks onto the first, so the row means
+                    // something other than it says.
+                    if status_kinds.contains(&status.name()) {
+                        p.push(format!(
+                            "{clause}: applies {} twice in one cast",
+                            status.name()
+                        ));
+                    }
+                    status_kinds.push(status.name());
+                }
+                EffectAtom::Militia { duration, targets } => {
+                    positive(&mut p, &clause, "militia duration", duration);
+                    // Arming the ENEMY's workers for them, or handing a sword
+                    // to a Knight who has one: militia is a worker's answer.
+                    if targets != AbilityTargets::OwnWorkers {
+                        p.push(format!(
+                            "{clause}: Militia at {} — militia is what OWN WORKERS do",
+                            targets.name()
+                        ));
+                    }
+                }
+                EffectAtom::Summon { unit_kind, count, lifetime } => {
+                    if count == 0 {
+                        p.push(format!("{clause}: summon count must be > 0"));
+                    }
+                    // A hero is a progression, a revival cost and a record —
+                    // not a body. Summoning one would mint a second Champion
+                    // with the first one's level and no way to bury it.
+                    if is_hero_kind(unit_kind) {
+                        p.push(format!(
+                            "{clause}: cannot Summon {} — hero kinds carry progression \
+                             and a revival contract, so they are trained, never called",
+                            kind_name(unit_kind)
+                        ));
+                    }
+                    if let Some(lifetime) = lifetime {
+                        positive(&mut p, &clause, "summon lifetime", lifetime);
+                    }
+                }
+                EffectAtom::Teleport { .. } => {
+                    // The recall gathers everything around the CASTER and
+                    // moves it; there is no way to express "gather around a
+                    // point 9 away", so a thrown recall would quietly ignore
+                    // its own aim.
+                    if def.target.is_targeted() {
+                        p.push(format!(
+                            "{clause}: Teleport needs `target: Caster` — a recall \
+                             gathers around the caster, so a thrown one would ignore \
+                             where it was thrown"
+                        ));
+                    }
+                }
+            }
         }
         // Geometry. A targeted ability with no reach is a spell that can only
         // ever be cast on the caster's own feet — which is a `Caster` row
@@ -819,6 +936,7 @@ pub fn research_step(level: u32) -> Option<ResearchStep> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::{StatusKind, TeleportDestination};
 
     /// The built-in tables load and pass every check. This is the test the
     /// startup validator is a copy of: if it fails, the game will not boot.
@@ -970,9 +1088,14 @@ mod tests {
             .collect();
         assert_eq!(
             targeted,
-            vec![("Slow", AbilityTarget::Point { range: 9.0 })],
-            "Slow is the only row that should spell out a geometry; every other \
-             row must be riding the `Caster` default"
+            vec![
+                ("Slow", AbilityTarget::Point { range: 9.0 }),
+                // The v3 demo row, dev-gated and thrown for the same reason
+                // Slow is: a nuke you cannot aim is a nuke you stand inside.
+                (concat!("Frost", "Nova"), AbilityTarget::Point { range: 9.0 }),
+            ],
+            "only a genuinely THROWN row should spell out a geometry; every \
+             other row must be riding the `Caster` default"
         );
         // And the default really is Caster rather than merely absent.
         let slam = file.defs.iter().find(|d| d.name == "Slam").unwrap();
@@ -993,6 +1116,452 @@ mod tests {
             problems.iter().any(|m| m.contains("target range")),
             "{problems:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v3: the effect-atom vocabulary
+    // -----------------------------------------------------------------------
+
+    /// Every shipped ability's def, by name, straight out of the file (so a
+    /// probe-gated row is visible here even when the probe flag is not set).
+    fn shipped(name: &str) -> AbilityDef {
+        let file: AbilityFile = ron::from_str(&source("abilities.ron", ABILITIES_RON))
+            .expect("shipped abilities.ron parses");
+        let row = file
+            .defs
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("abilities.ron has no row named {name}"));
+        AbilityDef::from(row)
+    }
+
+    /// **The equivalence proof, row by row.** Every ability that shipped under
+    /// v2's closed `AbilityEffect` enum, re-expressed as atoms, must mean
+    /// EXACTLY what it meant before — same numbers, same targets, same
+    /// durations, and the same `power`/`duration` pair on the wire.
+    ///
+    /// This is the test that makes the refactor safe to believe: if the
+    /// vocabulary had quietly changed a magnitude, a duration or a side, one
+    /// of these lines would say so by name.
+    #[test]
+    fn every_shipped_ability_means_exactly_what_it_meant_under_v2() {
+        // (name, atoms, v2 `power`, v2 `duration`)
+        let expected: Vec<(&str, Vec<EffectAtom>, f32, f32)> = vec![
+            (
+                "Slam",
+                vec![EffectAtom::Damage { amount: 45.0, targets: AbilityTargets::Enemies }],
+                45.0,
+                0.0,
+            ),
+            (
+                "Heal",
+                vec![EffectAtom::Heal { amount: 60.0, targets: AbilityTargets::Allies }],
+                60.0,
+                0.0,
+            ),
+            (
+                // Militia's seconds lived in `power` under v2 and still do —
+                // the wire format is reproduced, oddity included.
+                "CallToArms",
+                vec![EffectAtom::Militia {
+                    duration: 40.0,
+                    targets: AbilityTargets::OwnWorkers,
+                }],
+                40.0,
+                0.0,
+            ),
+            (
+                "Warcry",
+                vec![EffectAtom::ApplyStatus {
+                    status: StatusKind::DamageBuff,
+                    magnitude: 0.30,
+                    duration: 8.0,
+                    targets: AbilityTargets::Allies,
+                }],
+                0.30,
+                8.0,
+            ),
+            (
+                // **`also` retired into a second atom.** Same two statuses,
+                // same shared duration, no bespoke field.
+                "Sanctuary",
+                vec![
+                    EffectAtom::ApplyStatus {
+                        status: StatusKind::HealOverTime,
+                        magnitude: 15.0,
+                        duration: 6.0,
+                        targets: AbilityTargets::Allies,
+                    },
+                    EffectAtom::ApplyStatus {
+                        status: StatusKind::ArmorBuff,
+                        magnitude: 0.25,
+                        duration: 6.0,
+                        targets: AbilityTargets::Allies,
+                    },
+                ],
+                15.0,
+                6.0,
+            ),
+            (
+                "Slow",
+                vec![EffectAtom::ApplyStatus {
+                    status: StatusKind::Slow,
+                    magnitude: 0.4,
+                    duration: 5.0,
+                    targets: AbilityTargets::Enemies,
+                }],
+                0.4,
+                5.0,
+            ),
+            (
+                "ProbeChill",
+                vec![EffectAtom::ApplyStatus {
+                    status: StatusKind::Slow,
+                    magnitude: 0.4,
+                    duration: 6.0,
+                    targets: AbilityTargets::Enemies,
+                }],
+                0.4,
+                6.0,
+            ),
+        ];
+        for (name, atoms, power, duration) in expected {
+            let def = shipped(name);
+            let got: Vec<EffectAtom> = def.effects.iter().map(|e| e.atom).collect();
+            assert_eq!(got, atoms, "{name}: composition changed");
+            // Every shipped row is instant; nothing acquired a schedule by
+            // accident on the way through the rewrite.
+            assert!(
+                def.effects.iter().all(|e| e.schedule == EffectSchedule::Instant),
+                "{name}: shipped rows are all instant"
+            );
+            assert_eq!(def.power(), power, "{name}: v2 `power` on the wire");
+            assert_eq!(def.duration(), duration, "{name}: v2 `duration` on the wire");
+        }
+        // And the two back-compat catalog fields Sanctuary is the only user of.
+        let sanctuary = shipped("Sanctuary");
+        assert_eq!(sanctuary.status(), Some(StatusKind::HealOverTime));
+        assert_eq!(sanctuary.extra_status(), Some((StatusKind::ArmorBuff, 0.25)));
+        assert_eq!(shipped("Slow").extra_status(), None);
+    }
+
+    /// **Every atom and every schedule survives a trip through RON**, spelled
+    /// the way a content author would spell it — including the defaults that
+    /// let a quiet row stay quiet (`targets` on Damage/Heal/Militia,
+    /// `schedule` everywhere, `lifetime` on a permanent summon).
+    #[test]
+    fn effect_atoms_round_trip_through_ron() {
+        let cases: Vec<(&str, Effect)> = vec![
+            (
+                "(atom: Damage(amount: 45.0))",
+                Effect {
+                    atom: EffectAtom::Damage { amount: 45.0, targets: AbilityTargets::Enemies },
+                    schedule: EffectSchedule::Instant,
+                },
+            ),
+            (
+                "(atom: Heal(amount: 12.0, targets: Allies), schedule: OverTime(interval: 1.0, ticks: 5))",
+                Effect {
+                    atom: EffectAtom::Heal { amount: 12.0, targets: AbilityTargets::Allies },
+                    schedule: EffectSchedule::OverTime { interval: 1.0, ticks: 5 },
+                },
+            ),
+            (
+                "(atom: ApplyStatus(status: Slow, magnitude: 0.4, duration: 5.0, targets: Enemies))",
+                Effect {
+                    atom: EffectAtom::ApplyStatus {
+                        status: StatusKind::Slow,
+                        magnitude: 0.4,
+                        duration: 5.0,
+                        targets: AbilityTargets::Enemies,
+                    },
+                    schedule: EffectSchedule::Instant,
+                },
+            ),
+            (
+                "(atom: Militia(duration: 40.0))",
+                Effect {
+                    atom: EffectAtom::Militia {
+                        duration: 40.0,
+                        targets: AbilityTargets::OwnWorkers,
+                    },
+                    schedule: EffectSchedule::Instant,
+                },
+            ),
+            (
+                "(atom: Summon(unit_kind: Footman, count: 2, lifetime: Some(30.0)))",
+                Effect {
+                    atom: EffectAtom::Summon {
+                        unit_kind: UnitKind::Footman,
+                        count: 2,
+                        lifetime: Some(30.0),
+                    },
+                    schedule: EffectSchedule::Instant,
+                },
+            ),
+            (
+                "(atom: Summon(unit_kind: Spearman, count: 1))",
+                Effect {
+                    atom: EffectAtom::Summon {
+                        unit_kind: UnitKind::Spearman,
+                        count: 1,
+                        lifetime: None,
+                    },
+                    schedule: EffectSchedule::Instant,
+                },
+            ),
+            (
+                "(atom: Teleport(destination: NearestHall, army_only: true))",
+                Effect {
+                    atom: EffectAtom::Teleport {
+                        destination: TeleportDestination::NearestHall,
+                        army_only: true,
+                    },
+                    schedule: EffectSchedule::Instant,
+                },
+            ),
+        ];
+        for (text, want) in cases {
+            let got: Effect = ron::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(got, want, "{text}");
+        }
+        // A misspelled field is a startup error, not a silent default: the
+        // atom types deny unknown fields exactly as the row types do.
+        assert!(ron::from_str::<Effect>("(atom: Damage(ammount: 45.0))").is_err());
+        assert!(ron::from_str::<Effect>("(atom: Damage(amount: 45.0), schedual: Instant)").is_err());
+    }
+
+    /// A row whose ability list is empty draws a button that does nothing.
+    #[test]
+    fn an_ability_with_no_effects_is_refused() {
+        let tables = load_for_test();
+        let mut broken = shipped("Slam");
+        broken.effects = &[];
+        let problems = check_values(&tables, &[broken]);
+        assert!(problems.iter().any(|m| m.contains("`effects` is empty")), "{problems:?}");
+    }
+
+    /// **The nonsense table.** Each of these is a combination the grammar can
+    /// express and the game cannot mean; the loader names the offender and
+    /// refuses to start rather than shipping a spell that silently does
+    /// nothing (or something surprising) in a live match.
+    #[test]
+    fn nonsense_atom_combinations_are_refused() {
+        let tables = load_for_test();
+        let instant = |atom| Effect { atom, schedule: EffectSchedule::Instant };
+        // (what it is, the effects, the phrase the report must contain)
+        let cases: Vec<(&str, Vec<Effect>, &str, AbilityTarget)> = vec![
+            (
+                "a summoned hero",
+                vec![instant(EffectAtom::Summon {
+                    unit_kind: UnitKind::Hero,
+                    count: 1,
+                    lifetime: None,
+                })],
+                "cannot Summon",
+                AbilityTarget::Caster,
+            ),
+            (
+                "a summon of nobody",
+                vec![instant(EffectAtom::Summon {
+                    unit_kind: UnitKind::Footman,
+                    count: 0,
+                    lifetime: None,
+                })],
+                "summon count must be > 0",
+                AbilityTarget::Caster,
+            ),
+            (
+                "a recall that repeats",
+                vec![Effect {
+                    atom: EffectAtom::Teleport {
+                        destination: TeleportDestination::NearestHall,
+                        army_only: false,
+                    },
+                    schedule: EffectSchedule::OverTime { interval: 1.0, ticks: 5 },
+                }],
+                "cannot be scheduled OverTime",
+                AbilityTarget::Caster,
+            ),
+            (
+                "a thrown recall",
+                vec![instant(EffectAtom::Teleport {
+                    destination: TeleportDestination::NearestHall,
+                    army_only: false,
+                })],
+                "Teleport needs `target: Caster`",
+                AbilityTarget::Point { range: 9.0 },
+            ),
+            (
+                "militia raised from the enemy's workers",
+                vec![instant(EffectAtom::Militia {
+                    duration: 40.0,
+                    targets: AbilityTargets::Enemies,
+                })],
+                "militia is what OWN WORKERS do",
+                AbilityTarget::Caster,
+            ),
+            (
+                "a heal aimed at the people you are fighting",
+                vec![instant(EffectAtom::Heal {
+                    amount: 60.0,
+                    targets: AbilityTargets::Enemies,
+                })],
+                "mends the people you are fighting",
+                AbilityTarget::Caster,
+            ),
+            (
+                "the same status applied twice by one cast",
+                vec![
+                    instant(EffectAtom::ApplyStatus {
+                        status: StatusKind::Slow,
+                        magnitude: 0.4,
+                        duration: 5.0,
+                        targets: AbilityTargets::Enemies,
+                    }),
+                    instant(EffectAtom::ApplyStatus {
+                        status: StatusKind::Slow,
+                        magnitude: 0.2,
+                        duration: 5.0,
+                        targets: AbilityTargets::Enemies,
+                    }),
+                ],
+                "applies Slow twice",
+                AbilityTarget::Caster,
+            ),
+            (
+                "a status with no magnitude",
+                vec![instant(EffectAtom::ApplyStatus {
+                    status: StatusKind::Slow,
+                    magnitude: 0.0,
+                    duration: 5.0,
+                    targets: AbilityTargets::Enemies,
+                })],
+                "status magnitude",
+                AbilityTarget::Caster,
+            ),
+            (
+                "a status that ends the instant it lands",
+                vec![instant(EffectAtom::ApplyStatus {
+                    status: StatusKind::Slow,
+                    magnitude: 0.4,
+                    duration: 0.0,
+                    targets: AbilityTargets::Enemies,
+                })],
+                "status duration",
+                AbilityTarget::Caster,
+            ),
+            (
+                "damage that deals nothing",
+                vec![instant(EffectAtom::Damage {
+                    amount: 0.0,
+                    targets: AbilityTargets::Enemies,
+                })],
+                "damage amount",
+                AbilityTarget::Caster,
+            ),
+            (
+                "an over-time effect with no ticks",
+                vec![Effect {
+                    atom: EffectAtom::Damage { amount: 5.0, targets: AbilityTargets::Enemies },
+                    schedule: EffectSchedule::OverTime { interval: 1.0, ticks: 0 },
+                }],
+                "schedule ticks must be > 0",
+                AbilityTarget::Caster,
+            ),
+            (
+                "an over-time effect with no interval",
+                vec![Effect {
+                    atom: EffectAtom::Damage { amount: 5.0, targets: AbilityTargets::Enemies },
+                    schedule: EffectSchedule::OverTime { interval: 0.0, ticks: 3 },
+                }],
+                "schedule interval",
+                AbilityTarget::Caster,
+            ),
+        ];
+        for (what, effects, phrase, target) in cases {
+            let mut broken = shipped("Slam");
+            broken.effects = Box::leak(effects.into_boxed_slice());
+            broken.target = target;
+            let problems = check_values(&tables, &[broken]);
+            assert!(
+                problems.iter().any(|m| m.contains(phrase)),
+                "{what}: expected a complaint containing {phrase:?}, got {problems:?}"
+            );
+        }
+    }
+
+    /// **The two schedules that are schema and nothing else.** They parse (so
+    /// the bead that wires them up starts from an agreed spelling) and the
+    /// loader refuses them by name, because a row that silently did nothing
+    /// would be a worse lie than a startup panic.
+    #[test]
+    fn unimplemented_schedules_are_refused_by_name() {
+        let tables = load_for_test();
+        for schedule in [EffectSchedule::OnHit { attacks: 3 }, EffectSchedule::OnDeath] {
+            let mut broken = shipped("Slam");
+            broken.effects = Box::leak(
+                vec![Effect {
+                    atom: EffectAtom::Damage { amount: 20.0, targets: AbilityTargets::Enemies },
+                    schedule,
+                }]
+                .into_boxed_slice(),
+            );
+            let problems = check_values(&tables, &[broken]);
+            assert!(
+                problems
+                    .iter()
+                    .any(|m| m.contains("not yet supported") && m.contains(schedule.name())),
+                "{schedule:?}: {problems:?}"
+            );
+        }
+    }
+
+    /// **The zero-Rust demonstration.** The demo row is a mechanic this
+    /// engine never had — a thrown nuke that damages AND chills — and it
+    /// exists only as a row. This test asserts both halves of that claim: the
+    /// row parses into the two atoms it promises, and its NAME appears in no
+    /// Rust source file in the crate.
+    ///
+    /// The needle is assembled from two halves so that this test's own source
+    /// cannot satisfy the search it is making.
+    #[test]
+    fn the_demo_ability_is_defined_purely_in_ron() {
+        let name = concat!("Frost", "Nova");
+        let def = shipped(name);
+        assert_eq!(
+            def.effects.iter().map(|e| e.atom).collect::<Vec<_>>(),
+            vec![
+                EffectAtom::Damage { amount: 60.0, targets: AbilityTargets::Enemies },
+                EffectAtom::ApplyStatus {
+                    status: StatusKind::Slow,
+                    magnitude: 0.35,
+                    duration: 4.0,
+                    targets: AbilityTargets::Enemies,
+                },
+            ],
+        );
+        assert_eq!(def.target, AbilityTarget::Point { range: 9.0 });
+        // Two clauses, one cast: the aim (and so the ring, and so doctrine's
+        // count) belongs to the damage.
+        assert!(matches!(def.aim(), EffectAtom::Damage { .. }));
+
+        for (file, text) in [
+            ("shared.rs", include_str!("shared.rs")),
+            ("combat.rs", include_str!("combat.rs")),
+            ("doctrine.rs", include_str!("doctrine.rs")),
+            ("data.rs", include_str!("data.rs")),
+            ("ui.rs", include_str!("ui.rs")),
+            ("ai.rs", include_str!("ai.rs")),
+            ("bridge.rs", include_str!("bridge.rs")),
+            ("units.rs", include_str!("units.rs")),
+        ] {
+            assert!(
+                !text.contains(name),
+                "src/{file} mentions {name} — the demonstration is that NO Rust \
+                 knows this ability's name"
+            );
+        }
     }
 
     /// A fresh parse of the shipped files, for tests that need to break one.

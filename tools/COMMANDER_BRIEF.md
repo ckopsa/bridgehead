@@ -49,6 +49,14 @@ Production:
   loosely — case, spaces, dashes and underscores are all noise, so `"Call to Arms"`,
   `"calltoarms"` and `"call_to_arms"` are one ability. The same holds for unit, building,
   item and research names, and for `priority` classes.
+- **What a cast does** is catalog `abilities[].effects` — a LIST of clauses, each with its own
+  `atom` (`damage` / `heal` / `status` / `militia` / `summon` / `teleport`), its own numbers
+  (`amount`, `status`+`magnitude`+`duration`, `count`, …), its own `targets`
+  (`enemies` / `allies` / `own_workers`) and its own `schedule` (`instant`, or `over_time` with
+  `interval`/`ticks`). One cast can do several things to different sides — Sanctuary is
+  `[status HealOverTime 15/6s allies, status ArmorBuff 0.25/6s allies]`. The **first** clause is
+  what the cast aims at. The old flat fields (`effect`, `status`, `status2`, `power`,
+  `duration`) still describe the headline clause and are unchanged.
 - **Aiming a cast.** Catalog `abilities[].target` says where an ability lands: `"caster"`
   (centred on the caster — every ability but one), `"point"` (send `"x"`/`"z"`), or `"unit"`
   (send `"target":id`), within `abilities[].target_range` of the caster. `{"type":"cast",
