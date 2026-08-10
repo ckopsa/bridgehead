@@ -74,7 +74,7 @@ player expressing anything, so it stays where it is.
 
 ## The vocabulary
 
-24 verbs, grouped by what they are for. The serde shape **is** the bridge's
+25 verbs, grouped by what they are for. The serde shape **is** the bridge's
 historical wire format — tag is `type`, entity ids are `Entity::to_bits`,
 positions are flat `x`/`z` — so `commands.json` parses straight into `Intent`
 with no translation layer. Backward compatibility is not an adapter here; it is
@@ -98,6 +98,7 @@ the schema.
 | `train` | `{building:id, unit:"Footman"}` |
 | `upgrade` | `{building:id}` — tier up in place (TownHall→Keep→Castle) |
 | `cancel` | `{building:id, index:n}` |
+| `research` | `{building:id, upgrade:"attack"\|"armor"}` — a team-wide ladder, one rung per command |
 | `rally` | `{building:id, x, z}` or `{building:id, target:id}` |
 
 ### Abilities & items
@@ -106,6 +107,18 @@ the schema.
 | `cast` | `{hero:id, ability?}` (alias `caster`) — hero or own ability building |
 | `buy` | `{shop:id, item:"HealingPotion"}` — buyer implied by team |
 | `use_item` | `{slot:0}` |
+
+The shop shelf is TIERED. `catalog.items[].tier` gives each item's required
+tech tier (1/2/3), and every own finished Shop reports the shelf with this
+team's tier already applied as `buildings[].sells[] = {id, cost_gold, tier,
+locked}`. Buying a locked rung is refused by the compiler with
+`cmd N: BannerOfCommand requires tier T2 (you are T1)`, and economy.rs
+re-checks on the frame it pays — so losing the Keep closes the rung again.
+
+Hero ultimates are ordinary second ability slots gated on
+`AbilityUnlock::HeroLevel(5)`: `{"type":"cast","hero":<id>,"ability":"Warcry"}`
+(Champion) or `"Sanctuary"` (Priestess). `units[].abilities[]` reports each
+slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
 
 ### Doctrine — standing policy the engine executes at machine speed
 | Verb | Shape | Clears when |
@@ -166,6 +179,22 @@ Compound gestures become *two sentences* rather than a special case: a
 right-click on a gold mine with a mixed selection submits a `harvest` for the
 workers and a `move` for everyone else, which is what it always meant.
 
+The doctrine card (`[I]`, added by docs/TEMPO.md's phase 0) is the same trick at
+the strategic layer. `Ctrl+1` is a `squad`; `[I][W]` then a ground click is a
+`posture`; `[I][F]` steps a retreat *threshold* rather than toggling one. A
+posture pressed on a selection that is not already one squad submits `squad`
+first and `posture` second — two sentences again — so the log reads:
+
+```
+  [ 91.6s] Human/ui: 3 units join squad 1
+  [100.2s] Human/ui: squad 1 pushes to (-59.4, -27.1)
+  [103.2s] Human/ui: 3 units fall back to (-70.0, -70.0) below 25% health
+  [104.1s] Human/ui: 3 units hold within 10 of (-61.0, -40.0)
+  [106.9s] Human/ui: squad 1 stands down (posture cleared)
+```
+
+Every one of those is a sentence only a bridge commander could produce before.
+
 ---
 
 ## Knowability: where fog validation lives
@@ -204,6 +233,31 @@ because there is one rule to compare the gestures against. Closing it is a UI
 job — let a right-click on a building ghost produce an `Intent::Attack` — and
 it is filed as follow-up rather than fixed here, because this bead is a
 refactor and that would be new behaviour.
+
+### Where `research` is actually enforced
+
+`research` is the one verb whose "is this legal?" answer the compiler cannot
+give on its own, and the reason is worth writing down because the next verb
+with a per-building lock will hit it too.
+
+The rule is *one job per forge*. The compiler checks it — it refuses a
+`research` at a Blacksmith that already carries a `Researching` component, with
+`cmd N: building X is already researching attack (24s left)`. But `Researching`
+is inserted through `Commands`, so it does not exist until the next flush. Two
+`research` commands **in the same batch** therefore both pass that check, and
+both reach economy.rs as `StartResearch` events.
+
+So the authority is economy.rs, where the money is: `start_research` keeps a
+frame-local set of forges it has already given work to and of `(team, ladder)`
+pairs it has already started, and drops the duplicates. Verified live —
+`tools/verify_research_bridge.py` sends `attack` and `armor` at one forge in a
+single batch and asserts that exactly one rung is bought.
+
+This is not a special case so much as the general shape: **the compiler's
+checks are a courtesy that produce a good error message; the system that spends
+the resource is what makes the rule true.** `build`, `train` and `upgrade` have
+the same division — intent.rs reports "cannot afford", economy.rs is what
+actually refuses to pay.
 
 ## The replay log
 
@@ -311,7 +365,7 @@ Verified end-to-end against a live `WC3_BRIDGE=1` seat driven by
   — the diff against master touches none of them.
 - Every historical command shape still parses, including the `caster` alias on
   `cast`, the `use_item` rename and the untagged ability selector
-  (`intent::tests::legacy_wire_commands_parse` covers all 24 verbs and their
+  (`intent::tests::legacy_wire_commands_parse` covers all 25 verbs and their
   optional-field forms).
 - `seq` gating, `last_seq`, the 4 Hz poll and the 1 Hz snapshot are untouched.
 - `tools/bridge_send.py`, `tools/bridge_view.py`, `tools/bridge_wait.py` and

@@ -709,7 +709,8 @@ fn spawn_units(
 // ---------------------------------------------------------------------------
 
 /// `TeleportRequest`: yank `center` and every same-team unit within `radius`
-/// (XZ, measured from the centre's PRE-teleport position) to `dest`.
+/// (XZ, measured from the centre's PRE-teleport position) to `dest` — minus
+/// workers, when the request says `army_only`.
 ///
 /// This module owns Transforms, so the whole thing happens here. Each unit
 /// keeps its own `unit_y` and its relative offset to the centre (clamped, so an
@@ -749,11 +750,23 @@ fn handle_teleports(
         // Snapshot the passenger list first (the query is borrowed mutably below).
         let riders: Vec<(Entity, Vec3)> = units
             .iter()
-            .filter(|(entity, _, unit_team, health, tf, _)| {
-                (**unit_team == team && health.current > 0.0
-                    && Vec2::new(tf.translation.x - origin.x, tf.translation.z - origin.z).length()
-                        <= ev.radius)
-                    || *entity == ev.center
+            .filter(|(entity, unit, unit_team, health, tf, _)| {
+                // The caster always rides its own teleport.
+                if *entity == ev.center {
+                    return true;
+                }
+                if **unit_team != team || health.current <= 0.0 {
+                    return false;
+                }
+                // `army_only` is what makes a MAP-WIDE recall (Scroll of Mass
+                // Teleport, radius > the map) an army move instead of an
+                // economy wipe: workers keep mining. A Town Portal sets it
+                // false and behaves exactly as it always has.
+                if ev.army_only && unit.kind == UnitKind::Worker {
+                    return false;
+                }
+                Vec2::new(tf.translation.x - origin.x, tf.translation.z - origin.z).length()
+                    <= ev.radius
             })
             .map(|(entity, _, _, _, tf, _)| {
                 let rel = Vec3::new(tf.translation.x - origin.x, 0.0, tf.translation.z - origin.z);
