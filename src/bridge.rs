@@ -1484,8 +1484,12 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: training queue full ({MAX_QUEUE})"));
                     continue;
                 }
-                // The Champion is priced by `hero_train_cost` (full, then revival).
-                let (cost_gold, cost_lumber) = if kind == UnitKind::Hero {
+                // Hero classes are priced by `hero_train_cost` (full, then
+                // revival) — every hero kind, not just the Champion: pricing
+                // the Priestess off her raw stats let a seat buy a revival at
+                // full price (or worse, a first hero cheaply) depending on the
+                // record. `is_hero_kind` is the same test economy.rs charges by.
+                let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
                     let (g, l, _) = hero_train_cost(records, me);
                     (g, l)
                 } else {
