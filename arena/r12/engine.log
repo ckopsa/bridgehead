@@ -1,0 +1,261 @@
+[2m2026-08-10T19:57:42.807676Z[0m [32m INFO[0m [2mbevy_diagnostic::system_information_diagnostics_plugin::internal[0m[2m:[0m SystemInfo { os: "Linux (Arch Linux rolling)", kernel: "7.0.10-arch1-1", cpu: "11th Gen Intel(R) Core(TM) i7-1185G7 @ 3.00GHz", core_count: "4", memory: "31.1 GiB" }
+[2m2026-08-10T19:57:42.814505Z[0m [33m WARN[0m [2mwinit::platform_impl::linux::x11::xdisplay[0m[2m:[0m error setting XSETTINGS; Xft options won't reload automatically
+[2m2026-08-10T19:57:43.205413Z[0m [32m INFO[0m [2mbevy_render::renderer[0m[2m:[0m AdapterInfo { name: "Intel(R) Iris(R) Xe Graphics (TGL GT2)", vendor: 32902, device: 39497, device_type: IntegratedGpu, driver: "Intel open-source Mesa driver", driver_info: "Mesa 26.1.1-arch1.2", backend: Vulkan }
+[2m2026-08-10T19:57:43.302883Z[0m [32m INFO[0m [2mbevy_render::batching::gpu_preprocessing[0m[2m:[0m GPU preprocessing is fully supported on this device.
+[2m2026-08-10T19:57:43.322706Z[0m [32m INFO[0m [2mbevy_winit::system[0m[2m:[0m Creating new window WC3 Clone — Human vs Claude (0v1)
+[2m2026-08-10T19:57:43.322736Z[0m [32m INFO[0m [2mwinit::platform_impl::linux::x11::window[0m[2m:[0m Guessed window scale factor: 2.25
+[2m2026-08-10T19:57:43.323419Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m WC3_SPEED: game speed set to 1x
+[2m2026-08-10T19:57:43.323448Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m fog of war: ON (WC3_FOG=0 to disable)
+[2m2026-08-10T19:57:43.323966Z[0m [32m INFO[0m [2mwc3clone::bridge[0m[2m:[0m WC3_BRIDGE: wrote content catalog bridge/red/catalog.json
+[2m2026-08-10T19:57:43.323990Z[0m [32m INFO[0m [2mwc3clone::bridge[0m[2m:[0m WC3_BRIDGE: live bridge seat 'red' active — Claude is under external control (snapshot bridge/red/state.json, commands bridge/red/commands.json)
+[2m2026-08-10T19:57:43.324251Z[0m [32m INFO[0m [2mwc3clone::bridge[0m[2m:[0m WC3_BRIDGE: wrote content catalog bridge/blue/catalog.json
+[2m2026-08-10T19:57:43.324273Z[0m [32m INFO[0m [2mwc3clone::bridge[0m[2m:[0m WC3_BRIDGE: live bridge seat 'blue' active — Human is under external control (snapshot bridge/blue/state.json, commands bridge/blue/commands.json)
+[2m2026-08-10T19:57:43.325849Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": A canyon river runs corner to corner between the bases. It is impassable: every army, worker and expansion must use one of three fords, and the two flank fords are the neutral gold mines. Ground held at a ford is ground the enemy cannot walk around.
+[2m2026-08-10T19:57:43.325855Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": northwest ford at (-60,60), 30 wide
+[2m2026-08-10T19:57:43.325859Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": center ford at (0,0), 16 wide
+[2m2026-08-10T19:57:43.325860Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": southeast ford at (60,-60), 30 wide
+[2m2026-08-10T19:57:43.325874Z[0m [32m INFO[0m [2mwc3clone::terrain[0m[2m:[0m map "crossings": 502 nav cells are impassable terrain
+[2m2026-08-10T19:57:43.385577Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %88 = OpAtomicIAdd %uint %89 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.397922Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicLoad: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %382 = OpAtomicLoad %uint %381 %int_1 %uint_64
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.401267Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-None-10684 (0xb210f7c2)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Invalid explicit layout decorations on type for operand '28[%28]', the Workgroup storage class has a explicit layout from the ArrayStride decoration.
+  %intermediate_memory = OpVariable %_ptr_Workgroup__arr__arr_float_uint_16_uint_16 Workgroup
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: All variables must have valid explicit layout decorations as described in Shader Interfaces (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-None-10684)
+[2m2026-08-10T19:57:43.402107Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %87 = OpAtomicIAdd %uint %88 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.408106Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %88 = OpAtomicIAdd %uint %89 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.412652Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %318 = OpAtomicIAdd %uint %319 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.416927Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-None-10684 (0xb210f7c2)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Invalid explicit layout decorations on type for operand '30[%30]', the Workgroup storage class has a explicit layout from the ArrayStride decoration.
+  %intermediate_memory = OpVariable %_ptr_Workgroup__arr__arr_float_uint_16_uint_16 Workgroup
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: All variables must have valid explicit layout decorations as described in Shader Interfaces (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-None-10684)
+[2m2026-08-10T19:57:43.417865Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-None-10684 (0xb210f7c2)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Invalid explicit layout decorations on type for operand '39[%39]', the Workgroup storage class has a explicit layout from the ArrayStride decoration.
+  %previous_mip_depth = OpVariable %_ptr_Workgroup__arr__arr_float_uint_8_uint_8 Workgroup
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: All variables must have valid explicit layout decorations as described in Shader Interfaces (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-None-10684)
+[2m2026-08-10T19:57:43.475738Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-None-10684 (0xb210f7c2)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Invalid explicit layout decorations on type for operand '29[%29]', the Workgroup storage class has a explicit layout from the ArrayStride decoration.
+  %intermediate_memory = OpVariable %_ptr_Workgroup__arr__arr_float_uint_16_uint_16 Workgroup
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: All variables must have valid explicit layout decorations as described in Shader Interfaces (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-None-10684)
+[2m2026-08-10T19:57:43.477381Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %87 = OpAtomicIAdd %uint %88 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.478604Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %87 = OpAtomicIAdd %uint %88 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.483618Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %88 = OpAtomicIAdd %uint %89 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.483659Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %521 = OpAtomicIAdd %uint %522 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.485711Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-None-10684 (0xb210f7c2)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Invalid explicit layout decorations on type for operand '29[%29]', the Workgroup storage class has a explicit layout from the ArrayStride decoration.
+  %intermediate_memory = OpVariable %_ptr_Workgroup__arr__arr_float_uint_16_uint_16 Workgroup
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: All variables must have valid explicit layout decorations as described in Shader Interfaces (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-None-10684)
+[2m2026-08-10T19:57:43.487724Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	(Warning - This VUID has now been reported 10 times, which is the duplicate_message_limit value, this will be the last time reporting it).
+vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %87 = OpAtomicIAdd %uint %88 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-08-10T19:57:43.491982Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-None-10684 (0xb210f7c2)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Invalid explicit layout decorations on type for operand '57[%57]', the Workgroup storage class has a explicit layout from the ArrayStride decoration.
+  %multi_scat_shared_mem = OpVariable %_ptr_Workgroup__arr_v3float_uint_64 Workgroup
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: All variables must have valid explicit layout decorations as described in Shader Interfaces (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-None-10684)
+[2m2026-08-10T19:57:58.422752Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  15.1s] Human: gold 500 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-10T19:57:58.422850Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  15.1s] Claude: gold 500 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-10T19:58:13.419408Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  30.1s] Human: gold 500 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-10T19:58:13.419462Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  30.1s] Claude: gold 500 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-10T19:58:28.431733Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  45.1s] Human: gold 500 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-10T19:58:28.431779Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  45.1s] Claude: gold 500 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-10T19:58:43.437786Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  60.1s] Human: gold 500 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-10T19:58:43.437809Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  60.1s] Claude: gold 500 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-10T19:58:46.339767Z[0m [32m INFO[0m [2mwc3clone::intent[0m[2m:[0m intent log: bridge/intent_log.jsonl
+[2m2026-08-10T19:58:58.450958Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  75.1s] Human: gold 215 lumber 70 supply 5/10 | 5 units, 3 buildings | 5 Worker
+[2m2026-08-10T19:58:58.450974Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  75.1s] Claude: gold 280 lumber 100 supply 6/10 | 6 units, 2 buildings | 6 Worker
+[2m2026-08-10T19:59:13.520704Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  90.2s] Human: gold 185 lumber 70 supply 7/16 | 7 units, 3 buildings | 7 Worker
+[2m2026-08-10T19:59:13.520807Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [  90.2s] Claude: gold 170 lumber 110 supply 8/10 | 8 units, 3 buildings | 8 Worker
+[2m2026-08-10T19:59:28.552554Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 105.2s] Human: gold 155 lumber 150 supply 9/16 | 9 units, 3 buildings | 9 Worker
+[2m2026-08-10T19:59:28.552625Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 105.2s] Claude: gold 195 lumber 170 supply 10/16 | 10 units, 3 buildings | 10 Worker
+[2m2026-08-10T19:59:43.552835Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 120.2s] Human: gold 90 lumber 230 supply 10/16 | 10 units, 3 buildings | 10 Worker
+[2m2026-08-10T19:59:43.552883Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 120.2s] Claude: gold 220 lumber 260 supply 10/16 | 10 units, 3 buildings | 10 Worker
+[2m2026-08-10T19:59:58.577333Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 135.2s] Human: gold 205 lumber 330 supply 14/16 | 13 units, 3 buildings | 12 Worker, 1 Spearman
+[2m2026-08-10T19:59:58.577401Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 135.2s] Claude: gold 120 lumber 360 supply 14/16 | 12 units, 3 buildings | 10 Worker, 2 Footman
+[2m2026-08-10T20:00:13.346999Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 225g at (11,-35)
+[2m2026-08-10T20:00:13.577137Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 150.2s] Human: gold 170 lumber 400 supply 14/16 | 13 units, 4 buildings | 12 Worker, 1 Spearman
+[2m2026-08-10T20:00:13.577218Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 150.2s] Claude: gold 350 lumber 460 supply 16/16 | 13 units, 3 buildings | 10 Worker, 3 Footman
+[2m2026-08-10T20:00:28.589233Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 165.3s] Human: gold 430 lumber 480 supply 17/22 | 15 units, 4 buildings | 13 Worker, 2 Spearman
+[2m2026-08-10T20:00:28.589251Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 165.3s] Claude: gold 580 lumber 550 supply 16/16 | 13 units, 3 buildings | 10 Worker, 3 Footman
+[2m2026-08-10T20:00:32.360258Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] TownHall -> Keep upgrade started at (-70,-70) — 320g 160l, 40s (training paused)
+[2m2026-08-10T20:00:43.601348Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 180.3s] Human: gold 260 lumber 310 supply 17/22 | 15 units, 5 buildings | 13 Worker, 2 Spearman
+[2m2026-08-10T20:00:43.601383Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 180.3s] Claude: gold 570 lumber 610 supply 16/16 | 13 units, 5 buildings | 10 Worker, 3 Footman
+[2m2026-08-10T20:00:58.810126Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 195.4s] Human: gold 560 lumber 390 supply 17/22 | 15 units, 5 buildings | 13 Worker, 2 Spearman
+[2m2026-08-10T20:00:58.810300Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 195.4s] Claude: gold 115 lumber 570 supply 18/28 | 14 units, 5 buildings | 10 Worker, 4 Footman
+[2m2026-08-10T20:01:12.360527Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] Keep upgrade complete at (-70,-70) — tier 2, 1700 HP
+[2m2026-08-10T20:01:13.768665Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 210.4s] Human: gold 610 lumber 320 supply 17/22 | 15 units, 6 buildings | 13 Worker, 2 Spearman
+[2m2026-08-10T20:01:13.768743Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 210.4s] Claude: gold 245 lumber 590 supply 20/28 | 15 units, 5 buildings | 10 Worker, 4 Footman, 1 Archer
+[2m2026-08-10T20:01:28.818229Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 225.5s] Human: gold 725 lumber 370 supply 19/22 | 16 units, 6 buildings | 13 Worker, 1 Archer, 2 Spearman
+[2m2026-08-10T20:01:28.818300Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 225.5s] Claude: gold 495 lumber 650 supply 27/28 | 17 units, 5 buildings | 10 Worker, 4 Footman, 2 Archer, 1 Hero
+[2m2026-08-10T20:01:43.378033Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 270g at (-3,11)
+[2m2026-08-10T20:01:43.876032Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 240.5s] Human: gold 270 lumber 170 supply 24/22 | 19 units, 10 buildings | 14 Worker, 2 Archer, 3 Spearman
+[2m2026-08-10T20:01:43.876113Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 240.5s] Claude: gold 725 lumber 710 supply 27/28 | 17 units, 5 buildings | 10 Worker, 4 Footman, 2 Archer, 1 Hero
+[2m2026-08-10T20:01:48.740590Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Claude] TownHall -> Keep upgrade started at (70,70) — 320g 160l, 40s (training paused)
+[2m2026-08-10T20:01:58.905609Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 255.6s] Human: gold 330 lumber 280 supply 25/34 | 20 units, 10 buildings | 15 Worker, 2 Archer, 3 Spearman
+[2m2026-08-10T20:01:58.905683Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 255.6s] Claude: gold 545 lumber 600 supply 27/28 | 17 units, 6 buildings | 10 Worker, 4 Footman, 2 Archer, 1 Hero
+[2m2026-08-10T20:02:10.128538Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] research started: Weapon Smithing 1 at (-64,-80) — 100g 50l, 40s
+[2m2026-08-10T20:02:13.917465Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 270.6s] Human: gold 130 lumber 245 supply 27/34 | 21 units, 10 buildings | 15 Worker, 2 Archer, 4 Spearman
+[2m2026-08-10T20:02:13.917492Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 270.6s] Claude: gold 680 lumber 670 supply 27/34 | 17 units, 6 buildings | 10 Worker, 4 Footman, 2 Archer, 1 Hero
+[2m2026-08-10T20:02:28.637834Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Claude] Keep upgrade complete at (70,70) — tier 2, 1700 HP
+[2m2026-08-10T20:02:28.920839Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 285.6s] Human: gold 370 lumber 365 supply 32/34 | 23 units, 10 buildings | 15 Worker, 2 Archer, 1 Raider, 4 Spearman, 1 Sorcerer
+[2m2026-08-10T20:02:28.920854Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 285.6s] Claude: gold 450 lumber 620 supply 31/34 | 19 units, 7 buildings | 10 Worker, 5 Footman, 3 Archer, 1 Hero
+[2m2026-08-10T20:02:43.946537Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 300.6s] Human: gold 480 lumber 475 supply 32/34 | 23 units, 11 buildings | 15 Worker, 2 Archer, 1 Raider, 4 Spearman, 1 Sorcerer
+[2m2026-08-10T20:02:43.946629Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 300.6s] Claude: gold 545 lumber 630 supply 34/34 | 21 units, 7 buildings | 11 Worker, 6 Footman, 3 Archer, 1 Hero
+[2m2026-08-10T20:02:50.141488Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] research complete: Weapon Smithing level 1 (+1) — applies to every unit, now and forever
+[2m2026-08-10T20:02:58.245408Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] Keep -> Castle upgrade started at (-70,-70) — 480g 240l, 50s (training paused)
+[2m2026-08-10T20:02:58.246061Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] research started: Armor Plating 1 at (-64,-80) — 100g 50l, 40s
+[2m2026-08-10T20:02:59.026263Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 315.6s] Human: gold 90 lumber 285 supply 29/40 | 22 units, 11 buildings | 15 Worker, 2 Archer, 4 Spearman, 1 Sorcerer
+[2m2026-08-10T20:02:59.026345Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 315.6s] Claude: gold 400 lumber 530 supply 37/40 | 23 units, 9 buildings | 12 Worker, 6 Footman, 4 Archer, 1 Hero
+[2m2026-08-10T20:03:13.978679Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 315g at (7,11)
+[2m2026-08-10T20:03:14.617825Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 330.7s] Human: gold 260 lumber 385 supply 29/40 | 22 units, 11 buildings | 15 Worker, 2 Archer, 4 Spearman, 1 Sorcerer
+[2m2026-08-10T20:03:14.617949Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 330.7s] Claude: gold 405 lumber 530 supply 39/40 | 24 units, 10 buildings | 12 Worker, 7 Footman, 4 Archer, 1 Hero
+[2m2026-08-10T20:03:22.813554Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty claimed: Claude +315g at (7,11)
+[2m2026-08-10T20:03:29.647116Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 345.7s] Human: gold 430 lumber 495 supply 29/40 | 22 units, 11 buildings | 15 Worker, 2 Archer, 4 Spearman, 1 Sorcerer
+[2m2026-08-10T20:03:29.647224Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 345.7s] Claude: gold 746 lumber 510 supply 45/46 | 27 units, 10 buildings | 12 Worker, 8 Footman, 6 Archer, 1 Hero
+[2m2026-08-10T20:03:38.794788Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] research complete: Armor Plating level 1 (+1) — applies to every unit, now and forever
+[2m2026-08-10T20:03:44.644978Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 360.7s] Human: gold 260 lumber 390 supply 29/40 | 22 units, 13 buildings | 15 Worker, 2 Archer, 4 Spearman, 1 Sorcerer
+[2m2026-08-10T20:03:44.645002Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 360.7s] Claude: gold 970 lumber 550 supply 47/46 | 28 units, 10 buildings | 12 Worker, 8 Footman, 7 Archer, 1 Hero
+[2m2026-08-10T20:03:48.765102Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] Castle upgrade complete at (-70,-70) — tier 3, 2200 HP
+[2m2026-08-10T20:03:50.112570Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] research started: Weapon Smithing 2 at (-64,-80) — 175g 100l, 55s
+[2m2026-08-10T20:03:55.628714Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Claude] Keep -> Castle upgrade started at (70,70) — 480g 240l, 50s (training paused)
+[2m2026-08-10T20:03:59.655631Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 375.7s] Human: gold 135 lumber 335 supply 31/40 | 23 units, 13 buildings | 15 Worker, 2 Archer, 4 Spearman, 2 Sorcerer
+[2m2026-08-10T20:03:59.655663Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 375.7s] Claude: gold 148 lumber 105 supply 47/46 | 28 units, 13 buildings | 12 Worker, 8 Footman, 7 Archer, 1 Hero
+[2m2026-08-10T20:04:14.742768Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 390.7s] Human: gold 265 lumber 425 supply 33/40 | 24 units, 13 buildings | 15 Worker, 2 Archer, 4 Spearman, 3 Sorcerer
+[2m2026-08-10T20:04:14.742877Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 390.7s] Claude: gold 84 lumber 115 supply 47/58 | 28 units, 13 buildings | 12 Worker, 8 Footman, 7 Archer, 1 Hero
+[2m2026-08-10T20:04:29.794818Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 405.8s] Human: gold 135 lumber 465 supply 17/40 | 16 units, 13 buildings | 15 Worker, 1 Archer
+[2m2026-08-10T20:04:29.794925Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 405.8s] Claude: gold 128 lumber 140 supply 43/58 | 26 units, 13 buildings | 12 Worker, 5 Footman, 8 Archer, 1 Hero
+[2m2026-08-10T20:04:44.077891Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 360g at (23,-3)
+[2m2026-08-10T20:04:44.846410Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 420.8s] Human: gold 265 lumber 555 supply 16/40 | 15 units, 13 buildings | 14 Worker, 1 Archer
+[2m2026-08-10T20:04:44.846525Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 420.8s] Claude: gold 25 lumber 165 supply 43/68 | 26 units, 13 buildings | 12 Worker, 4 Footman, 8 Archer, 1 Hero, 1 Sorcerer
+[2m2026-08-10T20:04:45.269263Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Human] research complete: Weapon Smithing level 2 (+2) — applies to every unit, now and forever
+[2m2026-08-10T20:04:45.700284Z[0m [32m INFO[0m [2mwc3clone::economy[0m[2m:[0m [Claude] Castle upgrade complete at (70,70) — tier 3, 2200 HP
+[2m2026-08-10T20:04:59.862844Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 435.9s] Human: gold 325 lumber 645 supply 20/40 | 16 units, 13 buildings | 14 Worker, 1 Spearman, 1 Knight
+[2m2026-08-10T20:04:59.862924Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 435.9s] Claude: gold 368 lumber 235 supply 45/68 | 27 units, 13 buildings | 12 Worker, 4 Footman, 8 Archer, 1 Hero, 2 Sorcerer
+[2m2026-08-10T20:05:10.953890Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty claimed: Claude +360g at (23,-3)
+[2m2026-08-10T20:05:14.873489Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 450.9s] Human: gold 265 lumber 650 supply 20/40 | 16 units, 13 buildings | 14 Worker, 1 Spearman, 1 Knight
+[2m2026-08-10T20:05:14.873513Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 450.9s] Claude: gold 836 lumber 215 supply 45/68 | 27 units, 13 buildings | 12 Worker, 4 Footman, 8 Archer, 1 Hero, 2 Sorcerer
+[2m2026-08-10T20:05:29.885557Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 465.9s] Human: gold 425 lumber 720 supply 24/40 | 18 units, 13 buildings | 14 Worker, 1 Archer, 1 Spearman, 1 Sorcerer, 1 Knight
+[2m2026-08-10T20:05:29.885583Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 465.9s] Claude: gold 839 lumber 95 supply 49/68 | 28 units, 14 buildings | 12 Worker, 4 Footman, 8 Archer, 1 Hero, 2 Sorcerer, 1 Knight
+[2m2026-08-10T20:05:44.918884Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 480.9s] Human: gold 575 lumber 790 supply 23/40 | 17 units, 13 buildings | 13 Worker, 1 Archer, 1 Spearman, 1 Sorcerer, 1 Knight
+[2m2026-08-10T20:05:44.919079Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 480.9s] Claude: gold 884 lumber 75 supply 53/68 | 29 units, 14 buildings | 12 Worker, 4 Footman, 8 Archer, 1 Hero, 2 Sorcerer, 2 Knight
+[2m2026-08-10T20:05:59.947508Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 495.9s] Human: gold 635 lumber 860 supply 21/40 | 15 units, 13 buildings | 11 Worker, 1 Archer, 1 Spearman, 1 Sorcerer, 1 Knight
+[2m2026-08-10T20:05:59.947636Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 495.9s] Claude: gold 635 lumber 65 supply 54/68 | 30 units, 14 buildings | 13 Worker, 4 Footman, 8 Archer, 1 Hero, 2 Sorcerer, 2 Knight
+[2m2026-08-10T20:06:14.121576Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty: 405g at (-3,13)
+[2m2026-08-10T20:06:14.929639Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 510.9s] Human: gold 545 lumber 890 supply 21/40 | 15 units, 13 buildings | 11 Worker, 1 Archer, 1 Spearman, 1 Sorcerer, 1 Knight
+[2m2026-08-10T20:06:14.929759Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 510.9s] Claude: gold 479 lumber 65 supply 64/68 | 33 units, 14 buildings | 14 Worker, 4 Footman, 8 Archer, 1 Hero, 1 Priestess, 2 Sorcerer, 3 Knight
+[2m2026-08-10T20:06:16.075438Z[0m [32m INFO[0m [2mwc3clone::bounty[0m[2m:[0m bounty claimed: Claude +405g at (-3,13)
+[2m2026-08-10T20:06:30.013689Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 526.0s] Human: gold 465 lumber 930 supply 23/40 | 16 units, 13 buildings | 11 Worker, 2 Archer, 1 Spearman, 1 Sorcerer, 1 Knight
+[2m2026-08-10T20:06:30.013805Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 526.0s] Claude: gold 998 lumber 195 supply 69/68 | 35 units, 14 buildings | 15 Worker, 4 Footman, 8 Archer, 1 Hero, 1 Priestess, 2 Sorcerer, 4 Knight
+[2m2026-08-10T20:06:45.082595Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 541.1s] Human: gold 465 lumber 980 supply 25/40 | 17 units, 13 buildings | 11 Worker, 3 Archer, 1 Spearman, 1 Sorcerer, 1 Knight
+[2m2026-08-10T20:06:45.082721Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 541.1s] Claude: gold 1278 lumber 285 supply 70/68 | 36 units, 14 buildings | 16 Worker, 4 Footman, 8 Archer, 1 Hero, 1 Priestess, 2 Sorcerer, 4 Knight
+[2m2026-08-10T20:07:00.084225Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 556.1s] Human: gold 465 lumber 1040 supply 18/40 | 10 units, 9 buildings | 4 Worker, 3 Archer, 1 Spearman, 1 Sorcerer, 1 Knight
+[2m2026-08-10T20:07:00.084262Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m [ 556.1s] Claude: gold 1485 lumber 415 supply 70/68 | 36 units, 15 buildings | 16 Worker, 4 Footman, 8 Archer, 1 Hero, 1 Priestess, 2 Sorcerer, 4 Knight
+[2m2026-08-10T20:07:10.338187Z[0m [32m INFO[0m [2mwc3clone::intent[0m[2m:[0m bridge: Human seat surrenders
+[2m2026-08-10T20:07:10.355133Z[0m [32m INFO[0m [2mwc3clone::shared[0m[2m:[0m Human surrenders at t=566s — Claude wins
