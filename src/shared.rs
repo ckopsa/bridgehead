@@ -597,6 +597,95 @@ pub fn requirements_met(
         .all(|r| completed.clone().any(|b| building_satisfies(b, *r)))
 }
 
+// ---------------------------------------------------------------------------
+// Tech tier: how far up the tree a team has climbed
+// ---------------------------------------------------------------------------
+
+/// A team's tech tier. Today every team is `T1` from the first frame to the
+/// last; the tier exists now because ability unlocks (`AbilityUnlock::TeamTier`)
+/// and future upgrades need ONE thing to ask, and a predicate that reads a
+/// stub is a predicate that never has to be rewritten.
+/// A team's position on the tech ladder, as `AbilityUnlock::TeamTier` and any
+/// future tier-gated content name it. Ordered, so "at least T2" is a `>=`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum TechTier {
+    #[default]
+    T1,
+    T2,
+    T3,
+}
+
+impl TechTier {
+    pub fn name(self) -> &'static str {
+        match self {
+            TechTier::T1 => "T1",
+            TechTier::T2 => "T2",
+            TechTier::T3 => "T3",
+        }
+    }
+    /// Numeric rung, for HUD captions and snapshot fields. `building_tier`
+    /// answers the same question about a single building.
+    #[allow(dead_code)]
+    pub fn level(self) -> u32 {
+        match self {
+            TechTier::T1 => 1,
+            TechTier::T2 => 2,
+            TechTier::T3 => 3,
+        }
+    }
+    /// The inverse: `building_tier` speaks in numbers, unlock predicates speak
+    /// in tiers. Anything above the ladder's top clamps to T3.
+    pub fn from_level(level: u32) -> TechTier {
+        match level {
+            0 | 1 => TechTier::T1,
+            2 => TechTier::T2,
+            _ => TechTier::T3,
+        }
+    }
+}
+
+/// The single function that decides a team's tier from its COMPLETED
+/// buildings: the highest rung it holds on the town-hall ladder. A Keep makes
+/// a team T2, a Castle T3, and losing the Keep drops it back — tier is a
+/// property of what is standing, never a latch.
+///
+/// Derived, not enumerated: `is_hall` + `building_tier` mean a fourth rung, or
+/// a second ladder promoted to count, changes this by changing the ladder data
+/// and nothing here. `recount_tech_tiers` feeds the `TechTiers` resource from
+/// here every frame, and every unlock predicate in the game reads that
+/// resource — so this is the only place tier is decided.
+pub fn tech_tier_for(completed: impl Iterator<Item = BuildingKind>) -> TechTier {
+    let best = completed
+        .filter(|kind| is_hall(*kind))
+        .map(building_tier)
+        .max()
+        .unwrap_or(1);
+    TechTier::from_level(best)
+}
+
+/// Per-team tech tier, recomputed from the world every frame (like supply) so
+/// no module has to track a building finishing or dying.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct TechTiers {
+    pub human: TechTier,
+    pub claude: TechTier,
+}
+
+impl TechTiers {
+    pub fn get(&self, team: Team) -> TechTier {
+        match team {
+            Team::Human => self.human,
+            Team::Claude => self.claude,
+        }
+    }
+    pub fn set(&mut self, team: Team, tier: TechTier) {
+        match team {
+            Team::Human => self.human = tier,
+            Team::Claude => self.claude = tier,
+        }
+    }
+}
+
 /// What each building can train.
 pub fn trainable(kind: BuildingKind) -> &'static [UnitKind] {
     match kind {
@@ -770,12 +859,41 @@ pub struct CatalogBuilding {
 pub struct CatalogAbility {
     pub id: &'static str,
     pub caster: &'static str,
+    /// Slot in the caster's ability list — what a `cast` command's `ability`
+    /// field accepts as an integer, and the order the hotkeys follow.
+    pub index: usize,
     pub effect: &'static str,
+    /// Status kind applied, for `effect == "status"`.
+    pub status: Option<&'static str>,
     pub mana_cost: f32,
     pub cooldown: f32,
     pub radius: f32,
     pub power: f32,
+    /// Seconds the applied status lasts (0 for instant effects).
+    pub duration: f32,
     pub hits_air: bool,
+    /// Human-readable unlock condition: "always", "hero level N", "tier TN".
+    pub unlock: String,
+    pub description: &'static str,
+}
+
+/// Wire text for an unlock predicate — catalog and snapshot share it.
+pub fn unlock_label(unlock: AbilityUnlock) -> String {
+    match unlock {
+        AbilityUnlock::Always => "always".to_string(),
+        AbilityUnlock::HeroLevel(n) => format!("hero level {n}"),
+        AbilityUnlock::TeamTier(t) => format!("tier {}", t.name()),
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogStatus {
+    pub id: &'static str,
+    /// "refresh" (strongest wins, no compounding) or "stack" (magnitudes add).
+    pub stacking: &'static str,
+    /// Ceiling on the summed magnitude.
+    pub cap: f32,
+    pub debuff: bool,
     pub description: &'static str,
 }
 
@@ -793,6 +911,9 @@ pub struct Catalog {
     pub buildings: Vec<CatalogBuilding>,
     pub abilities: Vec<CatalogAbility>,
     pub items: Vec<CatalogItem>,
+    /// The status-effect vocabulary: what a buff/debuff means and how it
+    /// stacks, so a commander can reason about them without reading the source.
+    pub statuses: Vec<CatalogStatus>,
 }
 
 /// Assemble the full content catalog from the stat/requirement tables.
@@ -866,40 +987,30 @@ pub fn game_catalog() -> Catalog {
             })
             .collect(),
         abilities: {
-            let effect_name = |e: AbilityEffect| match e {
-                AbilityEffect::Damage => "damage",
-                AbilityEffect::Heal => "heal",
-                AbilityEffect::Militia => "militia",
+            let entry = |a: &AbilityDef, caster: &'static str, index: usize| CatalogAbility {
+                id: a.name,
+                caster,
+                index,
+                effect: a.effect.name(),
+                status: a.effect.status().map(|s| s.name()),
+                mana_cost: a.mana_cost,
+                cooldown: a.cooldown,
+                radius: a.radius,
+                power: a.power,
+                duration: a.duration,
+                hits_air: a.hits_air,
+                unlock: unlock_label(a.unlock),
+                description: a.description,
             };
             let mut out = Vec::new();
             for &k in &ALL_UNIT_KINDS {
-                if let Some(a) = ability_of_unit(k) {
-                    out.push(CatalogAbility {
-                        id: a.name,
-                        caster: kind_name(k),
-                        effect: effect_name(a.effect),
-                        mana_cost: a.mana_cost,
-                        cooldown: a.cooldown,
-                        radius: a.radius,
-                        power: a.power,
-                        hits_air: a.hits_air,
-                        description: a.description,
-                    });
+                for (i, a) in abilities_of_unit(k).iter().enumerate() {
+                    out.push(entry(a, kind_name(k), i));
                 }
             }
             for &k in &ALL_BUILDING_KINDS {
-                if let Some(a) = ability_of_building(k) {
-                    out.push(CatalogAbility {
-                        id: a.name,
-                        caster: building_name(k),
-                        effect: effect_name(a.effect),
-                        mana_cost: a.mana_cost,
-                        cooldown: a.cooldown,
-                        radius: a.radius,
-                        power: a.power,
-                        hits_air: a.hits_air,
-                        description: a.description,
-                    });
+                for (i, a) in abilities_of_building(k).iter().enumerate() {
+                    out.push(entry(a, building_name(k), i));
                 }
             }
             out
@@ -914,6 +1025,19 @@ pub fn game_catalog() -> Catalog {
                     sold_at: building_name(BuildingKind::Shop),
                     description: d.description,
                 }
+            })
+            .collect(),
+        statuses: ALL_STATUS_KINDS
+            .iter()
+            .map(|&k| CatalogStatus {
+                id: k.name(),
+                stacking: match k.stacking() {
+                    StackPolicy::Refresh => "refresh",
+                    StackPolicy::Stack => "stack",
+                },
+                cap: k.cap(),
+                debuff: k.is_debuff(),
+                description: k.description(),
             })
             .collect(),
     }
@@ -1045,6 +1169,316 @@ pub struct LastDamaged {
     pub at: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Status effects: timed stat modifiers (buffs & debuffs)
+// ---------------------------------------------------------------------------
+//
+// A status effect is a magnitude plus a deadline living on an entity. Nothing
+// in the simulation is allowed to read a modified stat off the raw tables —
+// `effective_stats` below is the ONE place base numbers turn into the numbers
+// the game actually runs on, and units.rs / combat.rs both go through it.
+//
+// The lifecycle is central, exactly like `Militia` and `LastDamaged`: content
+// (abilities, items, auras) only ever calls `StatusEffects::apply`, and
+// `tick_status_effects` here expires everything and pays out heal-over-time.
+// A content bead therefore never writes an expiry system of its own, and can
+// never leave a buff stuck on a unit.
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum StatusKind {
+    /// Move AND attack speed down (magnitude = fraction removed, 0.35 = -35%).
+    Slow,
+    /// Move speed up (magnitude = fraction added).
+    Haste,
+    /// Incoming damage down (magnitude = fraction removed).
+    ArmorBuff,
+    /// Outgoing damage up (magnitude = fraction added).
+    DamageBuff,
+    /// HP per second while it lasts (magnitude = HP/s).
+    HealOverTime,
+}
+
+pub const ALL_STATUS_KINDS: [StatusKind; 5] = [
+    StatusKind::Slow,
+    StatusKind::Haste,
+    StatusKind::ArmorBuff,
+    StatusKind::DamageBuff,
+    StatusKind::HealOverTime,
+];
+
+/// What happens when the same kind lands on a unit twice.
+///
+/// The rule is one line and it is deliberate: **debuffs refresh, buffs stack**.
+/// Two sorcerers slowing the same footman must not stop it dead (that is a
+/// stun, and a stun is a different design decision), so `Slow` takes the
+/// strongest magnitude and the latest deadline and compounds with nothing.
+/// Buffs are things a team *paid* for — a second banner, a second potion — so
+/// they add, bounded by the kind's cap so the ceiling is data, not an accident.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StackPolicy {
+    /// One instance per kind: magnitude = max of the two, expiry = later of the
+    /// two. A weaker or shorter re-application is silently absorbed.
+    Refresh,
+    /// Instances coexist; `magnitude` sums them, capped by `StatusKind::cap`.
+    Stack,
+}
+
+/// Where an effect came from. Purely descriptive today (the HUD and the bridge
+/// report it), but it is what lets a future dispel say "remove ability
+/// debuffs, leave item buffs alone" without inventing a parallel tag.
+// Item/Aura have no producer until the shop-items and banner beads land.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusSource {
+    Ability,
+    Item,
+    Aura,
+    /// Dev probes and tests.
+    Debug,
+}
+
+impl StatusKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            StatusKind::Slow => "Slow",
+            StatusKind::Haste => "Haste",
+            StatusKind::ArmorBuff => "ArmorBuff",
+            StatusKind::DamageBuff => "DamageBuff",
+            StatusKind::HealOverTime => "HealOverTime",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            StatusKind::Slow => "Move and attack speed reduced.",
+            StatusKind::Haste => "Move speed increased.",
+            StatusKind::ArmorBuff => "Incoming damage reduced.",
+            StatusKind::DamageBuff => "Outgoing damage increased.",
+            StatusKind::HealOverTime => "Regenerates HP every second.",
+        }
+    }
+    /// Debuffs are the effects an ENEMY put on you.
+    pub fn is_debuff(self) -> bool {
+        matches!(self, StatusKind::Slow)
+    }
+    pub fn stacking(self) -> StackPolicy {
+        if self.is_debuff() {
+            StackPolicy::Refresh
+        } else {
+            StackPolicy::Stack
+        }
+    }
+    /// Ceiling on the summed magnitude. Fractions stay strictly below 1.0 so no
+    /// amount of stacking can zero a stat out or invert a sign.
+    pub fn cap(self) -> f32 {
+        match self {
+            StatusKind::Slow => 0.75,
+            StatusKind::Haste => 1.0,
+            StatusKind::ArmorBuff => 0.8,
+            StatusKind::DamageBuff => 2.0,
+            StatusKind::HealOverTime => 60.0,
+        }
+    }
+    /// Colour of the ground ring combat.rs draws under an affected unit. One
+    /// ring per unit, so a unit carrying several effects shows the one with the
+    /// lowest `ring_rank` — the bad news first.
+    pub fn tint(self) -> Color {
+        match self {
+            StatusKind::Slow => Color::srgb(0.45, 0.35, 0.95),
+            StatusKind::Haste => Color::srgb(0.35, 0.95, 0.95),
+            StatusKind::ArmorBuff => Color::srgb(0.85, 0.85, 0.35),
+            StatusKind::DamageBuff => Color::srgb(1.0, 0.45, 0.2),
+            StatusKind::HealOverTime => Color::srgb(0.35, 1.0, 0.5),
+        }
+    }
+    fn ring_rank(self) -> u8 {
+        match self {
+            StatusKind::Slow => 0,
+            StatusKind::HealOverTime => 1,
+            StatusKind::ArmorBuff => 2,
+            StatusKind::DamageBuff => 3,
+            StatusKind::Haste => 4,
+        }
+    }
+}
+
+/// One live modifier on one entity.
+#[derive(Clone, Copy, Debug)]
+pub struct StatusEffect {
+    pub kind: StatusKind,
+    /// Meaning depends on the kind — see `StatusKind`.
+    pub magnitude: f32,
+    /// Game time (`Time::elapsed_secs`) at which this instance dies.
+    pub expires_at: f32,
+    pub source: StatusSource,
+}
+
+impl StatusEffect {
+    /// Build an instance that lasts `duration` seconds from `now`.
+    pub fn new(
+        kind: StatusKind,
+        magnitude: f32,
+        now: f32,
+        duration: f32,
+        source: StatusSource,
+    ) -> Self {
+        StatusEffect {
+            kind,
+            magnitude: magnitude.max(0.0),
+            expires_at: now + duration.max(0.0),
+            source,
+        }
+    }
+}
+
+/// Every live effect on one entity. Absent component == no effects, which is
+/// the common case, so nothing pays for the framework until it is used.
+/// Inserted by whoever applies the first effect; REMOVED centrally by
+/// `tick_status_effects` once the last one expires.
+#[derive(Component, Clone, Debug, Default)]
+pub struct StatusEffects {
+    active: Vec<StatusEffect>,
+}
+
+// The full framework surface, several of whose readers are the content beads
+// consuming this one.
+#[allow(dead_code)]
+impl StatusEffects {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// The only way effects get on a unit. Honours the kind's `StackPolicy`.
+    pub fn apply(&mut self, effect: StatusEffect) {
+        if effect.kind.stacking() == StackPolicy::Refresh {
+            if let Some(existing) = self.active.iter_mut().find(|e| e.kind == effect.kind) {
+                existing.magnitude = existing.magnitude.max(effect.magnitude);
+                existing.expires_at = existing.expires_at.max(effect.expires_at);
+                existing.source = effect.source;
+                return;
+            }
+        }
+        self.active.push(effect);
+    }
+    /// Summed (capped) magnitude of one kind. This is what `effective_stats`
+    /// reads; nothing else should be doing arithmetic on instances.
+    pub fn magnitude(&self, kind: StatusKind) -> f32 {
+        let total: f32 = self
+            .active
+            .iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.magnitude)
+            .sum();
+        total.min(kind.cap())
+    }
+    pub fn has(&self, kind: StatusKind) -> bool {
+        self.active.iter().any(|e| e.kind == kind)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &StatusEffect> + '_ {
+        self.active.iter()
+    }
+    /// Seconds until the last instance of `kind` runs out (0 = not present).
+    pub fn remaining(&self, kind: StatusKind, now: f32) -> f32 {
+        self.active
+            .iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.expires_at - now)
+            .fold(0.0f32, f32::max)
+            .max(0.0)
+    }
+    /// Drop everything past its deadline. Returns true if anything was removed.
+    pub fn expire(&mut self, now: f32) -> bool {
+        let before = self.active.len();
+        self.active.retain(|e| e.expires_at > now);
+        self.active.len() != before
+    }
+    /// The kind that gets to colour this unit's ring.
+    pub fn dominant(&self) -> Option<StatusKind> {
+        self.active
+            .iter()
+            .map(|e| e.kind)
+            .min_by_key(|k| k.ring_rank())
+    }
+}
+
+/// Raw numbers a modifier is applied TO. Comes from `unit_stats` for units and
+/// from `BuildingAttack` for towers; `BaseStats::STATIC` is the "no weapon, no
+/// legs" case used when all that is being asked is a damage multiplier.
+#[derive(Clone, Copy, Debug)]
+pub struct BaseStats {
+    pub speed: f32,
+    pub attack_cooldown: f32,
+}
+
+impl BaseStats {
+    /// Nothing moves, nothing swings — for buildings taking a hit.
+    pub const STATIC: BaseStats = BaseStats { speed: 0.0, attack_cooldown: 0.0 };
+    pub fn of_unit(kind: UnitKind) -> Self {
+        let s = unit_stats(kind);
+        BaseStats { speed: s.speed, attack_cooldown: s.attack_cooldown }
+    }
+    pub fn of_building_attack(attack: &BuildingAttack) -> Self {
+        BaseStats { speed: 0.0, attack_cooldown: attack.cooldown }
+    }
+}
+
+/// What the simulation must actually use.
+#[derive(Clone, Copy, Debug)]
+pub struct EffectiveStats {
+    /// World units per second.
+    pub speed: f32,
+    /// Seconds between attacks.
+    pub attack_cooldown: f32,
+    /// Multiplier on damage this entity DEALS.
+    pub damage_mult: f32,
+    /// Multiplier on damage this entity TAKES.
+    pub damage_taken_mult: f32,
+    /// HP per second this entity regains from HealOverTime.
+    pub heal_per_second: f32,
+}
+
+/// **THE modifier function.** One law, one place. `units.rs` asks it for move
+/// speed, `combat.rs` asks it for attack cooldown, outgoing damage and incoming
+/// damage — none of them read `unit_stats(kind).speed` (or `.attack_cooldown`)
+/// straight any more, because a stat that can be buffed has to be asked for,
+/// not looked up.
+///
+/// Slow eats move speed and attack speed together (an attack "cooldown" is the
+/// reciprocal of attack speed, so it is divided, not multiplied — that is the
+/// whole reason this arithmetic lives in one function instead of five call
+/// sites). Haste is legs only.
+pub fn effective_stats(base: BaseStats, status: Option<&StatusEffects>) -> EffectiveStats {
+    let mut out = EffectiveStats {
+        speed: base.speed,
+        attack_cooldown: base.attack_cooldown,
+        damage_mult: 1.0,
+        damage_taken_mult: 1.0,
+        heal_per_second: 0.0,
+    };
+    let Some(status) = status else {
+        return out;
+    };
+    let slow = status.magnitude(StatusKind::Slow);
+    let haste = status.magnitude(StatusKind::Haste);
+    let armor = status.magnitude(StatusKind::ArmorBuff);
+    let power = status.magnitude(StatusKind::DamageBuff);
+
+    // (1 - slow) can never reach 0: `StatusKind::cap` keeps Slow below 1.
+    let slow_mult = (1.0 - slow).max(1.0 - StatusKind::Slow.cap());
+    out.speed = base.speed * slow_mult * (1.0 + haste);
+    out.attack_cooldown = base.attack_cooldown / slow_mult;
+    out.damage_mult = 1.0 + power;
+    out.damage_taken_mult = (1.0 - armor).max(1.0 - StatusKind::ArmorBuff.cap());
+    out.heal_per_second = status.magnitude(StatusKind::HealOverTime);
+    out
+}
+
+/// Convenience wrapper for the common "a unit of kind K with these effects".
+pub fn effective_unit_stats(kind: UnitKind, status: Option<&StatusEffects>) -> EffectiveStats {
+    effective_stats(BaseStats::of_unit(kind), status)
+}
+
 /// Units (heroes included) heal this fraction of max HP per second once out
 /// of combat for UNIT_REGEN_DELAY seconds.
 pub const UNIT_REGEN_DELAY: f32 = 12.0;
@@ -1074,21 +1508,23 @@ pub const HERO_REVIVE_TIME: f32 = 15.0;
 
 /// Per-entity hero state. Lives on `UnitKind::Hero` units (units.rs inserts it
 /// at spawn, restoring level/xp from `HeroRecords`). shared.rs owns mana
-/// regen, cooldown ticking, XP awarding, and level-ups; combat.rs reads
-/// `damage_mult` and spends mana/cooldown when executing `CastAbility`.
+/// regen, XP awarding, and level-ups; combat.rs reads `damage_mult` and spends
+/// mana when executing `CastAbility`.
+///
+/// Cooldowns are NOT here: a hero has a list of abilities now, so they live in
+/// the per-entity, per-ability `AbilityCooldowns` component that heroes and
+/// building casters share.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Hero {
     pub level: u32,
     pub xp: f32,
     pub mana: f32,
-    /// Seconds until the ability may be cast again (0 = ready).
-    pub ability_cooldown: f32,
 }
 
 impl Hero {
     pub fn from_record(record: Option<HeroRecord>) -> Self {
         let (level, xp) = record.map_or((1, 0.0), |r| (r.level, r.xp));
-        Hero { level, xp, mana: Self::max_mana(level), ability_cooldown: 0.0 }
+        Hero { level, xp, mana: Self::max_mana(level) }
     }
     pub fn max_mana(level: u32) -> f32 {
         80.0 + 20.0 * (level.saturating_sub(1)) as f32
@@ -1109,18 +1545,43 @@ impl Hero {
     pub fn max_hp_for(kind: UnitKind, level: u32) -> f32 {
         unit_stats(kind).hp + Self::bonus_hp(level)
     }
-    pub fn ability_ready(&self) -> bool {
-        self.ability_cooldown <= 0.0 && self.mana >= HERO_ABILITY_COST
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Abilities: one active ability per caster kind, described as data. The
-// catalog exports these; combat.rs executes casts; doctrine.rs auto-casts.
-// `CastAbility { caster }` stays unchanged — the ability is inferred from the
-// caster's kind (heroes use `Hero.ability_cooldown` + mana; building casters
-// use the `AbilityCooldown` component, no mana).
+// Abilities v2: a LIST per caster kind, described as data, with per-ability
+// unlock conditions and per-ability cooldowns.
 // ---------------------------------------------------------------------------
+//
+// v1 was "one ability per caster, inferred from the caster's kind". That made
+// the caster the identity of the ability, so a second Champion spell, a shop
+// item that grants one, or a tier-3 upgrade all had nowhere to go. v2 keeps
+// everything data:
+//
+//   * `abilities_of_unit` / `abilities_of_building` return a `&'static` LIST;
+//     an ability's INDEX in that list is its handle everywhere (hotkey slot,
+//     cooldown slot, autocast rule, bridge selector).
+//   * each entry carries an `AbilityUnlock` predicate — always, hero level, or
+//     team tech tier — evaluated against an `UnlockCtx`.
+//   * `CastAbility` carries an optional `AbilitySelector`; `None` means "first
+//     unlocked", which is exactly v1's behaviour, so every old call site and
+//     the old bridge `cast` command keep working untouched.
+//   * cooldowns live in `AbilityCooldowns`, one slot per index, shared by hero
+//     and building casters (heroes additionally pay mana).
+//
+// Content beads add abilities by adding table rows. No system changes.
+
+/// Who an AoE effect looks for. Damage and Heal have this baked in
+/// historically; `ApplyStatus` has to be told, because a Slow and a Warcry are
+/// the same machinery pointed at different people.
+// Allies/OwnWorkers wait on the buff-ability content beads.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AbilityTargets {
+    Enemies,
+    /// Own units (buildings are never "allies" for buff purposes).
+    Allies,
+    OwnWorkers,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AbilityEffect {
@@ -1130,77 +1591,299 @@ pub enum AbilityEffect {
     Heal,
     /// Own workers in radius become Militia for `power` seconds.
     Militia,
+    /// AoE timed status effect: `power` is the magnitude, `duration` the
+    /// seconds. This is the variant that makes the whole status framework
+    /// reachable from pure data — Sorcerer's Slow, Boots of Speed, Warcry and
+    /// Sanctuary are all table rows, not code.
+    ApplyStatus {
+        status: StatusKind,
+        targets: AbilityTargets,
+    },
+}
+
+impl AbilityEffect {
+    /// Wire name used by the catalog and the bridge snapshot.
+    pub fn name(self) -> &'static str {
+        match self {
+            AbilityEffect::Damage => "damage",
+            AbilityEffect::Heal => "heal",
+            AbilityEffect::Militia => "militia",
+            AbilityEffect::ApplyStatus { .. } => "status",
+        }
+    }
+    /// The status kind this effect applies, when it applies one.
+    pub fn status(self) -> Option<StatusKind> {
+        match self {
+            AbilityEffect::ApplyStatus { status, .. } => Some(status),
+            _ => None,
+        }
+    }
+}
+
+/// When an ability becomes castable.
+// `HeroLevel` has no shipping ability behind it yet — the hero ultimates bead
+// is what fills it in; the predicate and its tests exist so that bead is data.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AbilityUnlock {
+    /// Available from the moment the caster exists.
+    Always,
+    /// Hero must have reached this level (non-hero casters never satisfy it).
+    HeroLevel(u32),
+    /// The caster's team must be at this tech tier or better.
+    TeamTier(TechTier),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct AbilityDef {
+    /// Stable id: the catalog key, the bridge selector, the button caption.
     pub name: &'static str,
     pub effect: AbilityEffect,
     pub mana_cost: f32,
     pub cooldown: f32,
     pub radius: f32,
-    /// Damage / heal amount, or duration seconds for Militia.
+    /// Damage / heal amount, duration seconds for Militia, or the status
+    /// MAGNITUDE for `ApplyStatus`.
     pub power: f32,
+    /// Seconds a status effect lasts. `ApplyStatus` only; 0.0 elsewhere.
+    pub duration: f32,
     /// Does the effect reach AIRBORNE units in its radius? A shockwave that
     /// travels along the ground does not; healing light does. combat.rs
     /// filters by this, and doctrine.rs will not auto-cast at targets the
     /// ability cannot affect.
     pub hits_air: bool,
+    pub unlock: AbilityUnlock,
     pub description: &'static str,
 }
 
-pub fn ability_of_unit(kind: UnitKind) -> Option<AbilityDef> {
+const SLAM: AbilityDef = AbilityDef {
+    name: "Slam",
+    effect: AbilityEffect::Damage,
+    mana_cost: HERO_ABILITY_COST,
+    cooldown: HERO_ABILITY_COOLDOWN,
+    radius: HERO_ABILITY_RADIUS,
+    power: HERO_ABILITY_DAMAGE,
+    duration: 0.0,
+    // The Champion slams the ground. Flyers overhead feel nothing — the melee
+    // hero's air answer is his archers, not his ability.
+    hits_air: false,
+    unlock: AbilityUnlock::Always,
+    description: "AoE damage around the Champion (ground only), scales with level.",
+};
+
+const HEAL: AbilityDef = AbilityDef {
+    name: "Heal",
+    effect: AbilityEffect::Heal,
+    mana_cost: 45.0,
+    cooldown: 12.0,
+    radius: 8.0,
+    power: 60.0,
+    duration: 0.0,
+    // Healing light reaches up: air allies are still your allies.
+    hits_air: true,
+    unlock: AbilityUnlock::Always,
+    description: "Restores HP to all allies around the Priestess, air included, scales with level.",
+};
+
+const CALL_TO_ARMS: AbilityDef = AbilityDef {
+    name: "CallToArms",
+    effect: AbilityEffect::Militia,
+    mana_cost: 0.0,
+    cooldown: 90.0,
+    radius: 16.0,
+    power: 40.0,
+    duration: 0.0,
+    // Workers are ground units, so this never had an air question.
+    hits_air: false,
+    unlock: AbilityUnlock::Always,
+    description: "Own workers near the TownHall become fighters for 40s.",
+};
+
+/// Dev-only second Champion ability, present only under `WC3_STATUS_PROBE=1`.
+/// It exists so a real match can exercise the v2 path end to end — a second
+/// ability on a caster, a level-gated unlock, its own cooldown slot, an
+/// explicit selector, and an `ApplyStatus` effect feeding the status framework
+/// — without shipping balance content the content beads have not designed yet.
+const PROBE_CHILL: AbilityDef = AbilityDef {
+    name: "ProbeChill",
+    effect: AbilityEffect::ApplyStatus {
+        status: StatusKind::Slow,
+        targets: AbilityTargets::Enemies,
+    },
+    mana_cost: 10.0,
+    cooldown: 8.0,
+    radius: 9.0,
+    power: 0.4,
+    duration: 6.0,
+    hits_air: false,
+    // Gated on the TEAM TIER on purpose: this is the live test of the join
+    // between the ability framework and the hall ladder. It is locked while a
+    // team has only a TownHall and opens the moment its Keep finishes.
+    unlock: AbilityUnlock::TeamTier(TechTier::T2),
+    description: "Dev probe: slows enemies around the Champion by 40% for 6s. Requires tier 2.",
+};
+
+const NO_ABILITIES: [AbilityDef; 0] = [];
+const HERO_ABILITIES: [AbilityDef; 1] = [SLAM];
+const HERO_ABILITIES_PROBE: [AbilityDef; 2] = [SLAM, PROBE_CHILL];
+const PRIESTESS_ABILITIES: [AbilityDef; 1] = [HEAL];
+const TOWNHALL_ABILITIES: [AbilityDef; 1] = [CALL_TO_ARMS];
+
+/// `WC3_STATUS_PROBE=1`: dev instrumentation for the status + ability-v2
+/// frameworks. Read once per process so the ability tables stay constant for
+/// the whole run.
+pub fn status_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WC3_STATUS_PROBE").is_ok_and(|v| v != "0"))
+}
+
+/// Every ability this unit kind can ever cast, unlocked or not, in slot order.
+pub fn abilities_of_unit(kind: UnitKind) -> &'static [AbilityDef] {
     match kind {
-        UnitKind::Hero => Some(AbilityDef {
-            name: "Slam",
-            effect: AbilityEffect::Damage,
-            mana_cost: HERO_ABILITY_COST,
-            cooldown: HERO_ABILITY_COOLDOWN,
-            radius: HERO_ABILITY_RADIUS,
-            power: HERO_ABILITY_DAMAGE,
-            // The Champion slams the ground. Flyers overhead feel nothing —
-            // the melee hero's air answer is his archers, not his ability.
-            hits_air: false,
-            description: "AoE damage around the Champion (ground only), scales with level.",
-        }),
-        UnitKind::Priestess => Some(AbilityDef {
-            name: "Heal",
-            effect: AbilityEffect::Heal,
-            mana_cost: 45.0,
-            cooldown: 12.0,
-            radius: 8.0,
-            power: 60.0,
-            // Healing light reaches up: air allies are still your allies.
-            hits_air: true,
-            description: "Restores HP to all allies around the Priestess, air included, scales with level.",
-        }),
-        _ => None,
+        UnitKind::Hero => {
+            if status_probe_enabled() {
+                &HERO_ABILITIES_PROBE
+            } else {
+                &HERO_ABILITIES
+            }
+        }
+        UnitKind::Priestess => &PRIESTESS_ABILITIES,
+        _ => &NO_ABILITIES,
     }
 }
 
-pub fn ability_of_building(kind: BuildingKind) -> Option<AbilityDef> {
-    match kind {
-        // The whole hall ladder keeps Call to Arms: an upgrade must never take
-        // an ability away from the player who paid for it.
-        BuildingKind::TownHall | BuildingKind::Keep | BuildingKind::Castle => Some(AbilityDef {
-            name: "CallToArms",
-            effect: AbilityEffect::Militia,
-            mana_cost: 0.0,
-            cooldown: 90.0,
-            radius: 16.0,
-            power: 40.0,
-            // Workers are ground units, so this never had an air question.
-            hits_air: false,
-            description: "Own workers near the TownHall become fighters for 40s.",
-        }),
-        _ => None,
+/// Every ability this building kind can ever cast, in slot order.
+pub fn abilities_of_building(kind: BuildingKind) -> &'static [AbilityDef] {
+    // The whole hall ladder keeps Call to Arms: an upgrade must never take an
+    // ability away from the player who paid for it. Asked as `is_hall` rather
+    // than by naming the three kinds, so a fourth rung inherits it for free.
+    if is_hall(kind) {
+        &TOWNHALL_ABILITIES
+    } else {
+        &NO_ABILITIES
     }
 }
 
-/// Cooldown state for building casters (heroes track theirs in `Hero`).
-/// Ticked centrally by shared.rs; combat.rs checks/sets it on cast.
-#[derive(Component, Clone, Copy, Debug, Default)]
-pub struct AbilityCooldown(pub f32);
+/// Everything an unlock predicate needs to know about a caster.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnlockCtx {
+    /// 0 for a caster that is not a hero.
+    pub hero_level: u32,
+    pub tier: TechTier,
+}
+
+impl UnlockCtx {
+    pub fn new(hero_level: u32, tier: TechTier) -> Self {
+        UnlockCtx { hero_level, tier }
+    }
+    /// A building caster: no level, just the team's tier.
+    pub fn building(tier: TechTier) -> Self {
+        UnlockCtx { hero_level: 0, tier }
+    }
+}
+
+pub fn ability_unlocked(def: &AbilityDef, ctx: UnlockCtx) -> bool {
+    match def.unlock {
+        AbilityUnlock::Always => true,
+        AbilityUnlock::HeroLevel(n) => ctx.hero_level >= n,
+        AbilityUnlock::TeamTier(t) => ctx.tier >= t,
+    }
+}
+
+/// Slot indices of the abilities this caster may use right now, in slot order.
+pub fn unlocked_abilities(list: &[AbilityDef], ctx: UnlockCtx) -> Vec<usize> {
+    list.iter()
+        .enumerate()
+        .filter(|(_, def)| ability_unlocked(def, ctx))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The default target of a selector-less `CastAbility` — v1's behaviour.
+pub fn first_unlocked_ability(list: &[AbilityDef], ctx: UnlockCtx) -> Option<usize> {
+    list.iter().position(|def| ability_unlocked(def, ctx))
+}
+
+/// Slot of the ability with this id (case-insensitive), unlocked or not.
+pub fn ability_index_by_id(list: &[AbilityDef], id: &str) -> Option<usize> {
+    list.iter().position(|def| def.name.eq_ignore_ascii_case(id))
+}
+
+/// Which ability of `list` a cast request means. `None` selector = the first
+/// unlocked one; an explicit selector that names a locked or missing ability
+/// resolves to `None` and the cast is refused by the caller.
+pub fn resolve_ability(
+    list: &[AbilityDef],
+    selector: Option<&AbilitySelector>,
+    ctx: UnlockCtx,
+) -> Option<usize> {
+    let index = match selector {
+        None => return first_unlocked_ability(list, ctx),
+        Some(AbilitySelector::Index(i)) => *i,
+        Some(AbilitySelector::Id(id)) => ability_index_by_id(list, id)?,
+    };
+    let def = list.get(index)?;
+    ability_unlocked(def, ctx).then_some(index)
+}
+
+/// May this caster fire ability `def` in slot `index` right now? The one gate:
+/// cooldown, plus mana for heroes. combat.rs, ui.rs, doctrine.rs and ai.rs all
+/// ask here, so the button, the auto-cast and the executor can never disagree.
+pub fn ability_ready(
+    def: &AbilityDef,
+    hero: Option<&Hero>,
+    cooldowns: Option<&AbilityCooldowns>,
+    index: usize,
+) -> bool {
+    cooldowns.is_none_or(|c| c.ready(index)) && hero.is_none_or(|h| h.mana >= def.mana_cost)
+}
+
+/// Which ability a `CastAbility` means. Omit it for "the first one I can use".
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AbilitySelector {
+    /// Slot in the caster's `abilities_of_*` list.
+    Index(usize),
+    /// `AbilityDef::name`, case-insensitive — what the bridge speaks.
+    Id(String),
+}
+
+/// Per-entity, per-ability cooldown store, indexed by ability slot. Used by
+/// hero AND building casters (v1 had two mechanisms; this is the one).
+/// Inserted lazily on the first cast, ticked centrally by shared.rs, and
+/// treated as "everything ready" while absent.
+#[derive(Component, Clone, Debug, Default)]
+pub struct AbilityCooldowns(Vec<f32>);
+
+#[allow(dead_code)]
+impl AbilityCooldowns {
+    /// Seconds left on a slot (0 = ready). Unknown slots are ready.
+    pub fn remaining(&self, index: usize) -> f32 {
+        self.0.get(index).copied().unwrap_or(0.0)
+    }
+    pub fn ready(&self, index: usize) -> bool {
+        self.remaining(index) <= 0.0
+    }
+    /// Put a slot on cooldown, growing the store as needed.
+    pub fn start(&mut self, index: usize, secs: f32) {
+        if self.0.len() <= index {
+            self.0.resize(index + 1, 0.0);
+        }
+        self.0[index] = secs.max(0.0);
+    }
+    pub fn tick(&mut self, dt: f32) {
+        for slot in &mut self.0 {
+            *slot = (*slot - dt).max(0.0);
+        }
+    }
+    /// Every slot ready — the component can be dropped.
+    pub fn is_idle(&self) -> bool {
+        self.0.iter().all(|s| *s <= 0.0)
+    }
+    /// Raw slots, for snapshots and HUD readouts.
+    pub fn slots(&self) -> &[f32] {
+        &self.0
+    }
+}
 
 /// A worker under Call to Arms: fights like a soldier until the deadline
 /// (game seconds). combat.rs boosts damage/aggro; shared.rs expires it.
@@ -1453,11 +2136,49 @@ pub struct LeashPolicy {
     pub radius: f32,
 }
 
-/// Hero auto-cast doctrine: cast the ability whenever it is ready and at
-/// least `min_enemies` enemy units are inside the ability radius.
-#[derive(Component, Clone, Copy, Debug)]
+/// Hero auto-cast doctrine, PER ABILITY: cast slot `index` whenever it is
+/// ready and at least `min_enemies` valid targets are inside its radius.
+///
+/// A hero with two spells has two independent opinions about when to use them,
+/// so the policy is a list of `(ability slot, min targets)` rules rather than
+/// one number. An ability with no rule is never auto-cast — silence is off.
+#[derive(Component, Clone, Debug, Default, PartialEq, Eq)]
 pub struct AutoCastPolicy {
-    pub min_enemies: u32,
+    pub rules: Vec<(usize, u32)>,
+}
+
+impl AutoCastPolicy {
+    /// The v1 shape: auto-cast the caster's first ability. Every existing call
+    /// site (`T` on the command card, the bridge `autocast` command with no
+    /// ability, `DoctrineTemplate`) lands here.
+    pub fn first(min_enemies: u32) -> Self {
+        AutoCastPolicy { rules: vec![(0, min_enemies)] }
+    }
+    pub fn min_enemies_for(&self, index: usize) -> Option<u32> {
+        self.rules
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, n)| *n)
+    }
+    /// One number for one-line summaries (HUD tally, snapshot field): the rule
+    /// on slot 0 if there is one, else whatever rule exists.
+    pub fn primary(&self) -> Option<u32> {
+        self.min_enemies_for(0)
+            .or_else(|| self.rules.first().map(|(_, n)| *n))
+    }
+    pub fn set(&mut self, index: usize, min_enemies: u32) {
+        match self.rules.iter_mut().find(|(i, _)| *i == index) {
+            Some(rule) => rule.1 = min_enemies,
+            None => self.rules.push((index, min_enemies)),
+        }
+        self.rules.sort_unstable();
+    }
+    pub fn clear_ability(&mut self, index: usize) {
+        self.rules.retain(|(i, _)| *i != index);
+    }
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
 }
 
 /// Standing doctrine stamped onto every unit a production building trains.
@@ -1702,11 +2423,33 @@ pub struct Surrender {
     pub team: Team,
 }
 
-/// Ask a hero to cast its ability. Written by ui.rs (hotkey/button) and ai.rs;
-/// combat.rs validates (alive, mana, cooldown) and executes the AoE.
-#[derive(Event, Debug)]
+/// Ask a caster (hero or ability building) to cast. Written by ui.rs
+/// (hotkey/button), ai.rs, doctrine.rs and bridge.rs; combat.rs validates
+/// (alive, unlocked, mana, cooldown) and executes the AoE.
+///
+/// `ability: None` means "the first ability this caster has unlocked" — the v1
+/// meaning of the event — so nothing that only knows about one ability per
+/// caster had to change.
+#[derive(Event, Clone, Debug)]
 pub struct CastAbility {
     pub caster: Entity,
+    pub ability: Option<AbilitySelector>,
+}
+
+#[allow(dead_code)]
+impl CastAbility {
+    /// Backward-compatible cast: the caster's first unlocked ability.
+    pub fn new(caster: Entity) -> Self {
+        CastAbility { caster, ability: None }
+    }
+    /// Cast a specific slot of the caster's ability list.
+    pub fn index(caster: Entity, index: usize) -> Self {
+        CastAbility { caster, ability: Some(AbilitySelector::Index(index)) }
+    }
+    /// Cast an ability by `AbilityDef::name` (what the bridge sends).
+    pub fn id(caster: Entity, id: impl Into<String>) -> Self {
+        CastAbility { caster, ability: Some(AbilitySelector::Id(id.into())) }
+    }
 }
 
 /// Internal to shared.rs: a death dropping XP for nearby enemy heroes.
@@ -1840,6 +2583,7 @@ impl Plugin for CorePlugin {
             .init_resource::<AiControlled>()
             .init_resource::<ExternallyCommanded>()
             .init_resource::<SquadOrders>()
+            .init_resource::<TechTiers>()
             .init_resource::<GameEvents>()
             .add_event::<SpawnUnitEvent>()
             .add_event::<SpawnBuildingEvent>()
@@ -1861,9 +2605,12 @@ impl Plugin for CorePlugin {
                     hero_progression,
                     regen_health,
                     tick_militia_and_cooldowns,
+                    tick_status_effects,
                     recount_supply,
+                    recount_tech_tiers,
                     check_game_over,
                     debug_log,
+                    status_probe,
                     speed_hotkeys,
                     // After `apply_death`, so a unit that died this frame is
                     // already gone from the picture the diff walks — the feed
@@ -1977,7 +2724,6 @@ fn hero_progression(
 ) {
     let dt = time.delta_secs();
     for (mut hero, mut health, team, unit) in &mut heroes {
-        hero.ability_cooldown = (hero.ability_cooldown - dt).max(0.0);
         hero.mana = (hero.mana + HERO_MANA_REGEN * dt).min(Hero::max_mana(hero.level));
 
         while hero.level < HERO_MAX_LEVEL && hero.xp >= Hero::xp_to_next(hero.level) {
@@ -2018,12 +2764,14 @@ fn regen_health(
     }
 }
 
-/// Expire Call-to-Arms militia and tick building ability cooldowns.
+/// Expire Call-to-Arms militia and tick every caster's per-ability cooldowns.
+/// One system for heroes and buildings alike — `AbilityCooldowns` is the only
+/// cooldown store there is.
 fn tick_militia_and_cooldowns(
     time: Res<Time>,
     mut commands: Commands,
     militia: Query<(Entity, &Militia)>,
-    mut cooldowns: Query<&mut AbilityCooldown>,
+    mut cooldowns: Query<(Entity, &mut AbilityCooldowns)>,
 ) {
     let now = time.elapsed_secs();
     for (entity, m) in &militia {
@@ -2032,8 +2780,189 @@ fn tick_militia_and_cooldowns(
         }
     }
     let dt = time.delta_secs();
-    for mut cd in &mut cooldowns {
-        cd.0 = (cd.0 - dt).max(0.0);
+    for (entity, mut cd) in &mut cooldowns {
+        cd.tick(dt);
+        // Everything ready again: drop the component so an idle caster costs
+        // nothing, exactly like a unit with no status effects.
+        if cd.is_idle() {
+            commands.entity(entity).try_remove::<AbilityCooldowns>();
+        }
+    }
+}
+
+/// The status framework's central clock: pay out heal-over-time, drop expired
+/// instances, and remove the component once an entity is clean again.
+///
+/// This is the counterpart of `StatusEffects::apply`: content applies, shared
+/// expires. No content bead ever schedules its own removal, so a buff can
+/// never outlive its duration because somebody forgot a system.
+fn tick_status_effects(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut StatusEffects, Option<&mut Health>)>,
+) {
+    let now = time.elapsed_secs();
+    let dt = time.delta_secs();
+    for (entity, mut status, health) in &mut query {
+        // Heal-over-time is paid BEFORE expiry, so the final partial second of
+        // a regeneration buff still lands.
+        let heal = status.magnitude(StatusKind::HealOverTime);
+        if heal > 0.0 {
+            if let Some(mut health) = health {
+                if health.current > 0.0 {
+                    health.current = (health.current + heal * dt).min(health.max);
+                }
+            }
+        }
+        status.expire(now);
+        if status.is_empty() {
+            commands.entity(entity).try_remove::<StatusEffects>();
+        }
+    }
+}
+
+/// Recompute each team's tech tier from its completed buildings, every frame,
+/// through the one `tech_tier_for` gate.
+fn recount_tech_tiers(
+    mut tiers: ResMut<TechTiers>,
+    buildings: Query<(&Building, &Team), Without<UnderConstruction>>,
+) {
+    for team in [Team::Human, Team::Claude] {
+        let tier = tech_tier_for(
+            buildings
+                .iter()
+                .filter(|(_, t)| **t == team)
+                .map(|(b, _)| b.kind),
+        );
+        tiers.set(team, tier);
+    }
+}
+
+/// `WC3_STATUS_PROBE=1`: dev instrumentation, off in every normal run.
+///
+/// Once the match is under way it applies a Slow to one live unit per team
+/// through the public `StatusEffects::apply` path and logs the unit's
+/// effective move speed as the debuff lands, while it holds, and after the
+/// central expiry has cleared it. Combined with the Champion's probe-only
+/// second ability (`ProbeChill`, gated on tier 2), one headless run
+/// demonstrates the whole chain: hall ladder → `tech_tier_for` → unlock
+/// predicate → ability list → selector → per-ability cooldown → `ApplyStatus`
+/// → `effective_stats` → central expiry.
+fn status_probe(
+    time: Res<Time>,
+    mut commands: Commands,
+    tiers: Res<TechTiers>,
+    mut stage: Local<u32>,
+    mut subject: Local<Option<Entity>>,
+    mut casts: EventWriter<CastAbility>,
+    mut next_cast: Local<f32>,
+    mut seen_tier: Local<Option<TechTier>>,
+    units: Query<(Entity, &Unit, &Team, Option<&StatusEffects>)>,
+    heroes: Query<(Entity, &Unit, &Team, &Hero)>,
+) {
+    if !status_probe_enabled() {
+        return;
+    }
+    let now = time.elapsed_secs();
+
+    // Report every tier change, and what it did to the gated ability. This is
+    // the integration under test: nothing here knows about Keeps, only that
+    // the team's tier moved and an unlock predicate changed its mind.
+    let human_tier = tiers.get(Team::Human);
+    if *seen_tier != Some(human_tier) {
+        *seen_tier = Some(human_tier);
+        let ctx = UnlockCtx::new(1, human_tier);
+        let gated = abilities_of_unit(UnitKind::Hero)
+            .iter()
+            .map(|def| format!("{}={}", def.name, ability_unlocked(def, ctx)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        info!(
+            "[{now:>6.1}s] STATUS PROBE: Human tier -> {} | unlocked {gated}",
+            human_tier.name()
+        );
+    }
+
+    // Keep asking the Champion for its SECOND ability by explicit index. The
+    // executor refuses while it is locked, on cooldown, or short of mana; every
+    // cast that does land slows whatever is standing around it.
+    if now >= *next_cast {
+        *next_cast = now + 5.0;
+        for (entity, unit, team, hero) in &heroes {
+            if unit.kind != UnitKind::Hero {
+                continue;
+            }
+            let list = abilities_of_unit(unit.kind);
+            if list.len() > 1 {
+                let ctx = UnlockCtx::new(hero.level, tiers.get(*team));
+                if ability_unlocked(&list[1], ctx) {
+                    casts.write(CastAbility::index(entity, 1));
+                }
+            }
+        }
+    }
+
+    // The direct-application probe: one unit, one Slow, three log lines.
+    match *stage {
+        0 if now >= 20.0 => {
+            let Some((entity, unit, _, _)) = units
+                .iter()
+                .find(|(_, u, t, _)| u.kind == UnitKind::Worker && **t == Team::Human)
+            else {
+                return;
+            };
+            let base = effective_unit_stats(unit.kind, None).speed;
+            let mut effects = StatusEffects::new();
+            effects.apply(StatusEffect::new(
+                StatusKind::Slow,
+                0.5,
+                now,
+                10.0,
+                StatusSource::Debug,
+            ));
+            let slowed = effective_unit_stats(unit.kind, Some(&effects)).speed;
+            commands.entity(entity).try_insert(effects);
+            *subject = Some(entity);
+            *stage = 1;
+            info!(
+                "[{now:>6.1}s] STATUS PROBE: applied Slow 0.5/10s to {:?} — speed {base:.2} -> {slowed:.2}",
+                unit.kind
+            );
+        }
+        1 if now >= 25.0 => {
+            let Some(entity) = *subject else {
+                *stage = 3;
+                return;
+            };
+            let Ok((_, unit, _, status)) = units.get(entity) else {
+                // Probe subject died; nothing more to say.
+                *stage = 3;
+                return;
+            };
+            let speed = effective_unit_stats(unit.kind, status).speed;
+            info!(
+                "[{now:>6.1}s] STATUS PROBE: still slowed — effective speed {speed:.2}, active {}",
+                status.map_or(0, |s| s.iter().count())
+            );
+            *stage = 2;
+        }
+        2 if now >= 33.0 => {
+            let Some(entity) = *subject else {
+                *stage = 3;
+                return;
+            };
+            let Ok((_, unit, _, status)) = units.get(entity) else {
+                *stage = 3;
+                return;
+            };
+            let speed = effective_unit_stats(unit.kind, status).speed;
+            info!(
+                "[{now:>6.1}s] STATUS PROBE: expired — effective speed {speed:.2}, active {}",
+                status.map_or(0, |s| s.iter().count())
+            );
+            *stage = 3;
+        }
+        _ => {}
     }
 }
 
@@ -2760,10 +3689,10 @@ fn diff_team(
 }
 
 // ---------------------------------------------------------------------------
-// Tests: the upgrade ladder's invariants
+// Tests: the two frameworks' laws, and the upgrade ladder's invariants
 // ---------------------------------------------------------------------------
 //
-// These are the properties four content beads are about to build on, so they
+// These are the properties the content beads are about to build on, so they
 // are pinned here rather than left to a sim to notice. Every one is written
 // against the derived helpers, not against `Keep`/`Castle` literals where it
 // can be avoided — a second ladder should inherit the guarantees.
@@ -2771,6 +3700,312 @@ fn diff_team(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slow(magnitude: f32, now: f32, duration: f32) -> StatusEffect {
+        StatusEffect::new(StatusKind::Slow, magnitude, now, duration, StatusSource::Debug)
+    }
+
+    /// The end-to-end shape of a debuff: apply, read a reduced effective stat
+    /// through the ONE modifier function, expire centrally, read the base stat
+    /// back. Everything else in the framework is a variation on this.
+    #[test]
+    fn slow_drops_effective_speed_and_recovers_after_expiry() {
+        let kind = UnitKind::Footman;
+        let base = effective_unit_stats(kind, None);
+        assert_eq!(base.speed, unit_stats(kind).speed);
+
+        let mut effects = StatusEffects::new();
+        effects.apply(slow(0.4, 0.0, 5.0));
+
+        let slowed = effective_unit_stats(kind, Some(&effects));
+        assert!(
+            slowed.speed < base.speed,
+            "Slow must reduce move speed: {} !< {}",
+            slowed.speed,
+            base.speed
+        );
+        assert!((slowed.speed - base.speed * 0.6).abs() < 1e-4);
+        // Attack speed falls with move speed: the cooldown gets LONGER.
+        assert!(slowed.attack_cooldown > base.attack_cooldown);
+        assert!((slowed.attack_cooldown - base.attack_cooldown / 0.6).abs() < 1e-4);
+
+        // Still live one tick before the deadline...
+        assert!(!effects.expire(4.9));
+        assert!(effects.has(StatusKind::Slow));
+        // ...and gone one tick after it.
+        assert!(effects.expire(5.1));
+        assert!(effects.is_empty());
+        assert_eq!(effective_unit_stats(kind, Some(&effects)).speed, base.speed);
+    }
+
+    #[test]
+    fn debuffs_refresh_and_buffs_stack() {
+        // Slow refreshes: strongest magnitude, latest deadline, no compounding.
+        let mut effects = StatusEffects::new();
+        effects.apply(slow(0.3, 0.0, 4.0));
+        effects.apply(slow(0.5, 0.0, 2.0));
+        assert_eq!(effects.iter().count(), 1);
+        assert!((effects.magnitude(StatusKind::Slow) - 0.5).abs() < 1e-6);
+        assert!((effects.remaining(StatusKind::Slow, 0.0) - 4.0).abs() < 1e-6);
+
+        // Haste stacks: two sources add up.
+        let mut buffs = StatusEffects::new();
+        buffs.apply(StatusEffect::new(StatusKind::Haste, 0.2, 0.0, 5.0, StatusSource::Item));
+        buffs.apply(StatusEffect::new(StatusKind::Haste, 0.3, 0.0, 5.0, StatusSource::Aura));
+        assert_eq!(buffs.iter().count(), 2);
+        assert!((buffs.magnitude(StatusKind::Haste) - 0.5).abs() < 1e-6);
+        let hasted = effective_unit_stats(UnitKind::Footman, Some(&buffs));
+        assert!((hasted.speed - unit_stats(UnitKind::Footman).speed * 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn magnitudes_are_capped_so_no_stat_can_be_zeroed_or_inverted() {
+        let mut effects = StatusEffects::new();
+        for _ in 0..10 {
+            effects.apply(StatusEffect::new(
+                StatusKind::ArmorBuff,
+                0.5,
+                0.0,
+                5.0,
+                StatusSource::Ability,
+            ));
+        }
+        assert!(
+            (effects.magnitude(StatusKind::ArmorBuff) - StatusKind::ArmorBuff.cap()).abs() < 1e-6
+        );
+        let eff = effective_stats(BaseStats::STATIC, Some(&effects));
+        assert!(eff.damage_taken_mult > 0.0);
+
+        // Slow is Refresh, so one instance — but even at its cap it must not
+        // stop a unit dead.
+        let mut hard = StatusEffects::new();
+        hard.apply(slow(5.0, 0.0, 5.0));
+        let crawling = effective_unit_stats(UnitKind::Footman, Some(&hard));
+        assert!(crawling.speed > 0.0);
+        assert!(crawling.attack_cooldown.is_finite());
+    }
+
+    #[test]
+    fn damage_buff_scales_dealt_and_armor_scales_taken() {
+        let mut effects = StatusEffects::new();
+        effects.apply(StatusEffect::new(
+            StatusKind::DamageBuff,
+            0.25,
+            0.0,
+            5.0,
+            StatusSource::Ability,
+        ));
+        effects.apply(StatusEffect::new(
+            StatusKind::ArmorBuff,
+            0.25,
+            0.0,
+            5.0,
+            StatusSource::Ability,
+        ));
+        let eff = effective_stats(BaseStats::STATIC, Some(&effects));
+        assert!((eff.damage_mult - 1.25).abs() < 1e-6);
+        assert!((eff.damage_taken_mult - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn heal_over_time_reports_a_rate_and_nothing_else_changes() {
+        let mut effects = StatusEffects::new();
+        effects.apply(StatusEffect::new(
+            StatusKind::HealOverTime,
+            8.0,
+            0.0,
+            5.0,
+            StatusSource::Ability,
+        ));
+        let eff = effective_unit_stats(UnitKind::Footman, Some(&effects));
+        assert!((eff.heal_per_second - 8.0).abs() < 1e-6);
+        assert_eq!(eff.speed, unit_stats(UnitKind::Footman).speed);
+    }
+
+    // --- ability framework v2 ------------------------------------------------
+
+    #[test]
+    fn existing_abilities_are_slot_zero_and_unchanged() {
+        let champion = abilities_of_unit(UnitKind::Hero);
+        assert_eq!(champion[0].name, "Slam");
+        assert_eq!(champion[0].effect, AbilityEffect::Damage);
+        assert!(!champion[0].hits_air);
+        assert_eq!(champion[0].mana_cost, HERO_ABILITY_COST);
+
+        let priestess = abilities_of_unit(UnitKind::Priestess);
+        assert_eq!(priestess[0].name, "Heal");
+        assert!(priestess[0].hits_air);
+
+        let hall = abilities_of_building(BuildingKind::TownHall);
+        assert_eq!(hall[0].name, "CallToArms");
+        assert!(abilities_of_unit(UnitKind::Footman).is_empty());
+        assert!(abilities_of_building(BuildingKind::Barracks).is_empty());
+    }
+
+    /// A synthetic two-ability caster: the shape every content bead will use.
+    fn two_ability_list() -> [AbilityDef; 2] {
+        [
+            SLAM,
+            AbilityDef {
+                name: "TestWarcry",
+                effect: AbilityEffect::ApplyStatus {
+                    status: StatusKind::DamageBuff,
+                    targets: AbilityTargets::Allies,
+                },
+                mana_cost: 50.0,
+                cooldown: 30.0,
+                radius: 10.0,
+                power: 0.3,
+                duration: 12.0,
+                hits_air: true,
+                unlock: AbilityUnlock::HeroLevel(4),
+                description: "test",
+            },
+        ]
+    }
+
+    #[test]
+    fn unlock_predicates_gate_by_hero_level_and_team_tier() {
+        let list = two_ability_list();
+        let low = UnlockCtx::new(1, TechTier::T1);
+        let high = UnlockCtx::new(4, TechTier::T1);
+        assert_eq!(unlocked_abilities(&list, low), vec![0]);
+        assert_eq!(unlocked_abilities(&list, high), vec![0, 1]);
+
+        let tiered = [AbilityDef { unlock: AbilityUnlock::TeamTier(TechTier::T2), ..SLAM }];
+        assert!(unlocked_abilities(&tiered, UnlockCtx::building(TechTier::T1)).is_empty());
+        assert_eq!(
+            unlocked_abilities(&tiered, UnlockCtx::building(TechTier::T2)),
+            vec![0]
+        );
+    }
+
+    /// The join between the two beads: the hall ladder decides the tier, and
+    /// the tier opens a `TeamTier` ability. A team that upgrades its TownHall
+    /// into a Keep gains the spell without anything else changing.
+    #[test]
+    fn upgrading_the_hall_raises_the_tier_and_unlocks_a_tier_gated_ability() {
+        use BuildingKind::*;
+        // Tier is the highest hall rung STANDING, and nothing else counts.
+        assert_eq!(tech_tier_for(std::iter::empty()), TechTier::T1);
+        assert_eq!(tech_tier_for([TownHall, Barracks, Farm].into_iter()), TechTier::T1);
+        assert_eq!(tech_tier_for([Barracks, Workshop, Tower].into_iter()), TechTier::T1);
+        assert_eq!(tech_tier_for([TownHall, Keep].into_iter()), TechTier::T2);
+        assert_eq!(tech_tier_for([Keep, Castle].into_iter()), TechTier::T3);
+        // Losing the Keep drops the team back: tier is a fact, not a latch.
+        assert_eq!(tech_tier_for([TownHall].into_iter()), TechTier::T1);
+
+        let gated = [AbilityDef { unlock: AbilityUnlock::TeamTier(TechTier::T2), ..SLAM }];
+        let before = UnlockCtx::new(1, tech_tier_for([TownHall].into_iter()));
+        let after = UnlockCtx::new(1, tech_tier_for([Keep].into_iter()));
+        assert_eq!(resolve_ability(&gated, None, before), None, "locked at T1");
+        assert_eq!(resolve_ability(&gated, None, after), Some(0), "open once a Keep stands");
+        // A Castle is strictly better, never a regression.
+        let castle = UnlockCtx::new(1, tech_tier_for([Castle].into_iter()));
+        assert_eq!(resolve_ability(&gated, None, castle), Some(0));
+    }
+
+    #[test]
+    fn selectorless_cast_resolves_to_the_first_unlocked_ability() {
+        let list = two_ability_list();
+        let low = UnlockCtx::new(1, TechTier::T1);
+        let high = UnlockCtx::new(9, TechTier::T1);
+
+        // v1 behaviour: no selector -> slot 0.
+        assert_eq!(resolve_ability(&list, None, low), Some(0));
+        // Explicit index and id both work once unlocked...
+        assert_eq!(resolve_ability(&list, Some(&AbilitySelector::Index(1)), high), Some(1));
+        assert_eq!(
+            resolve_ability(&list, Some(&AbilitySelector::Id("testwarcry".into())), high),
+            Some(1)
+        );
+        // ...and are refused while locked or out of range.
+        assert_eq!(resolve_ability(&list, Some(&AbilitySelector::Index(1)), low), None);
+        assert_eq!(resolve_ability(&list, Some(&AbilitySelector::Index(7)), high), None);
+        assert_eq!(
+            resolve_ability(&list, Some(&AbilitySelector::Id("nope".into())), high),
+            None
+        );
+
+        // A caster whose whole list is locked has nothing to default to.
+        let locked = [AbilityDef { unlock: AbilityUnlock::HeroLevel(5), ..SLAM }];
+        assert_eq!(resolve_ability(&locked, None, low), None);
+    }
+
+    #[test]
+    fn cooldowns_are_per_ability() {
+        let mut cds = AbilityCooldowns::default();
+        assert!(cds.ready(0) && cds.ready(1) && cds.is_idle());
+
+        cds.start(1, 8.0);
+        assert!(cds.ready(0), "slot 0 must be unaffected by slot 1");
+        assert!(!cds.ready(1));
+        assert!(!cds.is_idle());
+
+        cds.tick(3.0);
+        assert!((cds.remaining(1) - 5.0).abs() < 1e-6);
+        cds.tick(10.0);
+        assert!(cds.ready(1));
+        assert!(cds.is_idle());
+    }
+
+    #[test]
+    fn ability_ready_gates_on_cooldown_and_mana() {
+        let def = &abilities_of_unit(UnitKind::Priestess)[0];
+        let mut broke = Hero::from_record(None);
+        broke.mana = 1.0;
+        let rich = Hero::from_record(None);
+
+        assert!(ability_ready(def, Some(&rich), None, 0));
+        assert!(!ability_ready(def, Some(&broke), None, 0));
+
+        let mut cds = AbilityCooldowns::default();
+        cds.start(0, 4.0);
+        assert!(!ability_ready(def, Some(&rich), Some(&cds), 0));
+        // A building caster pays no mana, only cooldown.
+        assert!(ability_ready(&CALL_TO_ARMS, None, Some(&cds), 1));
+    }
+
+    #[test]
+    fn autocast_policy_is_per_ability() {
+        let mut policy = AutoCastPolicy::first(3);
+        assert_eq!(policy.min_enemies_for(0), Some(3));
+        assert_eq!(policy.min_enemies_for(1), None);
+        assert_eq!(policy.primary(), Some(3));
+
+        policy.set(1, 5);
+        assert_eq!(policy.min_enemies_for(1), Some(5));
+        assert_eq!(policy.primary(), Some(3));
+
+        policy.clear_ability(0);
+        assert_eq!(policy.min_enemies_for(0), None);
+        assert_eq!(policy.primary(), Some(5));
+        policy.clear_ability(1);
+        assert!(policy.is_empty());
+    }
+
+    #[test]
+    fn catalog_exports_every_ability_slot_and_the_status_vocabulary() {
+        let catalog = game_catalog();
+        for name in ["Slam", "Heal", "CallToArms"] {
+            assert!(
+                catalog.abilities.iter().any(|a| a.id == name),
+                "catalog lost {name}"
+            );
+        }
+        assert!(catalog.abilities.iter().all(|a| !a.unlock.is_empty()));
+        assert_eq!(catalog.statuses.len(), ALL_STATUS_KINDS.len());
+        assert!(catalog
+            .statuses
+            .iter()
+            .any(|s| s.id == "Slow" && s.stacking == "refresh"));
+        assert!(catalog
+            .statuses
+            .iter()
+            .any(|s| s.id == "Haste" && s.stacking == "stack"));
+    }
+
+    // --- the upgrade ladder --------------------------------------------------
 
     #[test]
     fn the_hall_ladder_is_three_rungs_and_agrees_with_itself() {
@@ -2818,8 +4053,12 @@ mod tests {
             );
             // Hero training/revival lives on the hall card.
             assert!(trainable(kind).contains(&UnitKind::Hero));
-            // Call to Arms must survive the upgrade.
-            assert!(ability_of_building(kind).is_some());
+            // Call to Arms must survive the upgrade — and keep its slot, since
+            // an ability's index is its handle for hotkeys, cooldowns and the
+            // bridge selector alike.
+            let abilities = abilities_of_building(kind);
+            assert_eq!(abilities.len(), 1);
+            assert_eq!(abilities[0].name, "CallToArms");
         }
     }
 

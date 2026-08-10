@@ -340,6 +340,7 @@ type UnitQuery<'w, 's> = Query<
         Option<&'static MoveTo>,
         Option<&'static Carrying>,
         Option<&'static Hero>,
+        Option<&'static AbilityCooldowns>,
     ),
 >;
 
@@ -439,7 +440,7 @@ fn think(
     // Own living heroes: (entity, position, ability ready).
     let mut own_heroes: Vec<(Entity, Vec3, bool)> = Vec::new();
 
-    for (entity, unit, team, tf, order, move_to, carrying, hero) in units.iter() {
+    for (entity, unit, team, tf, order, move_to, carrying, hero, cooldowns) in units.iter() {
         let info = UnitInfo {
             entity,
             // Flattened to the ground plane. Every comparison below is a
@@ -458,7 +459,13 @@ fn think(
         };
         if *team == me {
             if let Some(hero) = hero {
-                own_heroes.push((entity, info.pos, hero.ability_ready()));
+                // "Can the Champion slam right now" is asked of the ability
+                // table, not of a hard-coded mana number: slot 0 is whatever
+                // this hero class's first ability is.
+                let ready = abilities_of_unit(unit.kind)
+                    .first()
+                    .is_some_and(|def| ability_ready(def, Some(hero), cooldowns, 0));
+                own_heroes.push((entity, info.pos, ready));
             }
             // Everything that isn't a Worker is army: heroes, Archers,
             // Catapults and Raiders all join waves with no extra wiring.
@@ -1020,7 +1027,7 @@ fn think(
             .filter(|e| e.distance(*pos) <= slam_radius)
             .count();
         if nearby >= SLAM_MIN_TARGETS {
-            casts.write(CastAbility { caster: *hero });
+            casts.write(CastAbility::new(*hero));
         }
     }
 

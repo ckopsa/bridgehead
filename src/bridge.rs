@@ -473,6 +473,58 @@ struct UnitOut {
     /// case is "no doctrine", and an empty object per unit is pure noise.
     #[serde(skip_serializing_if = "Option::is_none")]
     policies: Option<PoliciesOut>,
+    /// Own casters only: every ability this unit HAS, with its slot index, its
+    /// own cooldown and whether it is unlocked yet. This is what a `cast`
+    /// command's optional `ability` field selects from. Absent for units with
+    /// no abilities and for the opponent's army.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    abilities: Vec<AbilityOut>,
+}
+
+/// One ability slot of one caster, as the commander sees it. The catalog says
+/// what an ability DOES; this says whether this caster can use it right now.
+#[derive(Serialize)]
+struct AbilityOut {
+    /// `AbilityDef::name` — accepted as the `ability` field of a `cast`.
+    id: &'static str,
+    /// Slot index — also accepted as the `ability` field of a `cast`.
+    index: usize,
+    /// Seconds until this slot may be cast again (0 = ready).
+    cd: f32,
+    /// Has this caster met the unlock condition?
+    unlocked: bool,
+    /// Unlocked, off cooldown, and affordable (heroes pay mana).
+    ready: bool,
+    mana_cost: f32,
+    /// The unlock condition, verbatim, when it is not yet met.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires: Option<String>,
+}
+
+/// Build the per-caster ability view. One function for heroes and buildings —
+/// the readiness rule is shared.rs's, so the snapshot can never promise a cast
+/// combat.rs would refuse.
+fn abilities_out(
+    list: &'static [AbilityDef],
+    ctx: UnlockCtx,
+    hero: Option<&Hero>,
+    cooldowns: Option<&AbilityCooldowns>,
+) -> Vec<AbilityOut> {
+    list.iter()
+        .enumerate()
+        .map(|(index, def)| {
+            let unlocked = ability_unlocked(def, ctx);
+            AbilityOut {
+                id: def.name,
+                index,
+                cd: r1(cooldowns.map_or(0.0, |c| c.remaining(index))),
+                unlocked,
+                ready: unlocked && ability_ready(def, hero, cooldowns, index),
+                mana_cost: r1(def.mana_cost),
+                requires: (!unlocked).then(|| unlock_label(def.unlock)),
+            }
+        })
+        .collect()
 }
 
 /// Mirror of the doctrine components, in the same shape the `priority` /
@@ -505,6 +557,9 @@ struct HeroOut {
     xp_next: f32,
     mana: f32,
     max_mana: f32,
+    /// Cooldown of the hero's FIRST ability. Kept as a scalar for readers
+    /// written against the one-ability world; `UnitOut::abilities` carries the
+    /// full per-slot picture.
     cd: f32,
 }
 
@@ -519,10 +574,14 @@ struct BuildingOut {
     done: bool,
     queue: Vec<&'static str>,
     progress: f32,
-    /// Own buildings with an active ability only: seconds until it may be cast
-    /// again (0 = ready). Absent for buildings that have no ability.
+    /// Own buildings with an active ability only: seconds until the FIRST one
+    /// may be cast again (0 = ready). Absent for buildings that have no
+    /// ability. `abilities` below is the per-slot version.
     #[serde(skip_serializing_if = "Option::is_none")]
     ability_cd: Option<f32>,
+    /// Own ability buildings only: every slot, with unlock and cooldown state.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    abilities: Vec<AbilityOut>,
     /// Own production buildings only, and only when a `template` command has
     /// installed a `DoctrineTemplate`: a flag, not the contents — the
     /// commander that set the template already knows what is in it.
@@ -607,8 +666,13 @@ type SnapshotUnits<'w, 's> = Query<
             Option<&'static LeashPolicy>,
             Option<&'static AutoCastPolicy>,
         ),
-        // Hero kit & Call-to-Arms state, nested for the same reason.
-        (Option<&'static Inventory>, Has<Militia>),
+        // Hero kit, Call-to-Arms state and per-ability cooldowns, nested for
+        // the same reason.
+        (
+            Option<&'static Inventory>,
+            Has<Militia>,
+            Option<&'static AbilityCooldowns>,
+        ),
     ),
 >;
 
@@ -624,7 +688,7 @@ type SnapshotBuildings<'w, 's> = Query<
         Option<&'static UnderConstruction>,
         Option<&'static TrainingQueue>,
         Option<&'static DoctrineTemplate>,
-        Option<&'static AbilityCooldown>,
+        Option<&'static AbilityCooldowns>,
         Option<&'static Upgrading>,
     ),
 >;
@@ -644,6 +708,7 @@ fn write_snapshot(
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     squad_orders: Res<SquadOrders>,
+    tiers: Res<TechTiers>,
     feed: Res<GameEvents>,
     units: SnapshotUnits,
     buildings: SnapshotBuildings,
@@ -665,6 +730,7 @@ fn write_snapshot(
             &records,
             &game_over,
             &squad_orders,
+            &tiers,
             &feed,
             &units,
             &buildings,
@@ -684,6 +750,7 @@ fn write_seat_snapshot(
     records: &HeroRecords,
     game_over: &GameOver,
     squad_orders: &SquadOrders,
+    tiers: &TechTiers,
     feed: &GameEvents,
     units: &SnapshotUnits,
     buildings: &SnapshotBuildings,
@@ -697,7 +764,7 @@ fn write_seat_snapshot(
         .iter()
         .map(|(e, unit, team, tf, health, order, move_to, carrying, hero, doctrine, kit)| {
             let (squad, prio, retreat, leash, autocast) = doctrine;
-            let (inventory, militia) = kit;
+            let (inventory, militia, cooldowns) = kit;
             let mine = *team == me;
             let has_policy =
                 prio.is_some() || retreat.is_some() || leash.is_some() || autocast.is_some();
@@ -717,7 +784,7 @@ fn write_seat_snapshot(
                     xp_next: r1(Hero::xp_to_next(h.level)),
                     mana: r1(h.mana),
                     max_mana: r1(Hero::max_mana(h.level)),
-                    cd: r1(h.ability_cooldown),
+                    cd: r1(cooldowns.map_or(0.0, |c| c.remaining(0))),
                 }),
                 items: inventory.map(|inv| {
                     inv.0
@@ -733,8 +800,19 @@ fn write_seat_snapshot(
                     retreat: retreat
                         .map(|r| [r1(r.below_frac), r1(r.rally.x), r1(r.rally.z)]),
                     leash: leash.map(|l| [r1(l.anchor.x), r1(l.anchor.z), r1(l.radius)]),
-                    autocast: autocast.map(|a| a.min_enemies),
+                    autocast: autocast.and_then(|a| a.primary()),
                 }),
+                // Our own casters only: abilities we can actually order.
+                abilities: if mine {
+                    abilities_out(
+                        abilities_of_unit(unit.kind),
+                        UnlockCtx::new(hero.map_or(0, |h| h.level), tiers.get(me)),
+                        hero,
+                        cooldowns,
+                    )
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect();
@@ -756,8 +834,18 @@ fn write_seat_snapshot(
                 .unwrap_or_default(),
             progress: r1(queue.map(|q| q.progress).unwrap_or(0.0)),
             // Our own casters only: an ability we can actually order.
-            ability_cd: (*team == me && ability_of_building(building.kind).is_some())
-                .then(|| r1(cooldown.map(|c| c.0).unwrap_or(0.0))),
+            ability_cd: (*team == me && !abilities_of_building(building.kind).is_empty())
+                .then(|| r1(cooldown.map_or(0.0, |c| c.remaining(0)))),
+            abilities: if *team == me {
+                abilities_out(
+                    abilities_of_building(building.kind),
+                    UnlockCtx::building(tiers.get(me)),
+                    None,
+                    cooldown,
+                )
+            } else {
+                Vec::new()
+            },
             // Never for the opponent: a template is command structure.
             template: *team == me && template.is_some(),
             tier: building_tier(building.kind),
@@ -1081,13 +1169,21 @@ enum Cmd {
         z: Option<f32>,
         target: Option<u64>,
     },
-    /// Cast the caster's one ability. The caster is a hero (`ability_of_unit`)
-    /// or one of our own finished buildings (`ability_of_building`, today only
-    /// the TownHall's Call to Arms). `hero` is the historical field name;
-    /// `caster` says what it really means now.
+    /// Cast one of the caster's abilities. The caster is a hero
+    /// (`abilities_of_unit`) or one of our own finished buildings
+    /// (`abilities_of_building`, today only the TownHall's Call to Arms).
+    /// `hero` is the historical field name; `caster` says what it really means.
+    ///
+    /// `ability` picks a slot — either the integer index or the ability id
+    /// (`"Slam"`, case-insensitive) as listed in `units[].abilities` /
+    /// `buildings[].abilities` in the snapshot and in the catalog. OMIT IT for
+    /// the caster's first unlocked ability: `{"cmd":"cast","hero":123}` means
+    /// exactly what it always meant.
     Cast {
         #[serde(alias = "caster")]
         hero: u64,
+        #[serde(default)]
+        ability: Option<AbilityRef>,
     },
     /// Buy a consumable at one of our own finished Shops. The buyer is implied:
     /// a team has at most one living hero, and only heroes carry an inventory.
@@ -1133,11 +1229,15 @@ enum Cmd {
         #[serde(default)]
         radius: Option<f32>,
     },
-    /// Champion-only. `min_enemies` omitted, null, or 0 clears the policy.
+    /// Heroes only. `min_enemies` omitted, null, or 0 clears the rule.
+    /// `ability` names the slot the rule governs (index or id); omitted, it
+    /// means the first slot, which is what it always meant.
     Autocast {
         units: Vec<u64>,
         #[serde(default)]
         min_enemies: Option<u32>,
+        #[serde(default)]
+        ability: Option<AbilityRef>,
     },
     /// Squad membership. `id` omitted or null removes the units from any squad.
     Squad {
@@ -1169,6 +1269,33 @@ enum Cmd {
     },
 }
 
+/// How a command names one of a caster's abilities: `2` (slot index) or
+/// `"Slam"` (id, case-insensitive). Untagged, so the wire form is just the
+/// bare number or string a commander already reads out of the snapshot.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+enum AbilityRef {
+    Index(usize),
+    Id(String),
+}
+
+impl AbilityRef {
+    fn selector(&self) -> AbilitySelector {
+        match self {
+            AbilityRef::Index(i) => AbilitySelector::Index(*i),
+            AbilityRef::Id(id) => AbilitySelector::Id(id.clone()),
+        }
+    }
+    /// Resolve to a slot of `list`, unlocked or not — `autocast` writes rules
+    /// for abilities a hero has not levelled into yet, and that is fine.
+    fn slot(&self, list: &[AbilityDef]) -> Option<usize> {
+        match self {
+            AbilityRef::Index(i) => (*i < list.len()).then_some(*i),
+            AbilityRef::Id(id) => ability_index_by_id(list, id),
+        }
+    }
+}
+
 /// The `retreat` piece of a `template` command: break off below `below` (a
 /// fraction in the open range 0..1) and fall back to x/z.
 #[derive(Deserialize)]
@@ -1191,8 +1318,19 @@ enum PostureIn {
 
 /// Entity first so the seat's own hero can be *found*, not just checked — the
 /// `buy` and `use_item` commands name no unit and infer it from the team.
-type CmdUnits<'w, 's> =
-    Query<'w, 's, (Entity, &'static Unit, &'static Team, &'static Transform)>;
+type CmdUnits<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Unit,
+        &'static Team,
+        &'static Transform,
+        // Read-only: `autocast` edits ONE rule of a policy that may already
+        // hold others, so the applier has to see the current one.
+        Option<&'static AutoCastPolicy>,
+    ),
+>;
 
 type CmdBuildings<'w, 's> = Query<
     'w,
@@ -1428,7 +1566,7 @@ fn apply_batch(
             Cmd::Follow { units: ids, target } => {
                 let leader = match entity_of(target) {
                     Some(e) => match units.get(e) {
-                        Ok((_, _, team, _)) if *team == me => e,
+                        Ok((_, _, team, _, _)) if *team == me => e,
                         _ => {
                             errors.push(format!("cmd {i}: unit {target} not found/not yours"));
                             continue;
@@ -1675,7 +1813,7 @@ fn apply_batch(
                         // own units makes new units follow it.
                         Some(e) if nodes.get(e).is_ok() => Some(RallyTarget::Node(e)),
                         Some(e) => match units.get(e) {
-                            Ok((_, _, team, _)) if *team == me => Some(RallyTarget::Unit(e)),
+                            Ok((_, _, team, _, _)) if *team == me => Some(RallyTarget::Unit(e)),
                             _ => None,
                         },
                         None => None,
@@ -1691,21 +1829,23 @@ fn apply_batch(
                     )),
                 }
             }
-            Cmd::Cast { hero } => {
+            Cmd::Cast { hero, ability } => {
                 let Some(entity) = entity_of(hero) else {
                     errors.push(format!("cmd {i}: caster {hero} not found/not yours"));
                     continue;
                 };
                 // A caster is either one of our heroes (any class — the Hero
-                // component and `ability_of_unit` agree on which kinds have an
-                // ability) or one of our finished buildings with an ability.
-                // combat.rs owns the mana/cooldown verdict either way, exactly
-                // as it does for the R and C hotkeys.
-                let unit_caster = matches!(
-                    units.get(entity),
-                    Ok((_, u, team, _)) if *team == me && ability_of_unit(u.kind).is_some()
-                );
-                if !unit_caster {
+                // component and the unit ability table agree on which kinds
+                // have one) or one of our finished buildings with an ability.
+                // combat.rs owns the unlock/mana/cooldown verdict either way,
+                // exactly as it does for the R and C hotkeys.
+                let unit_list = match units.get(entity) {
+                    Ok((_, u, team, _, _)) if *team == me => abilities_of_unit(u.kind),
+                    _ => &[][..],
+                };
+                let list = if !unit_list.is_empty() {
+                    unit_list
+                } else {
                     match buildings.get(entity) {
                         Ok((b, team, under, _, _)) if *team == me => {
                             if under.is_some() {
@@ -1714,13 +1854,15 @@ fn apply_batch(
                                 ));
                                 continue;
                             }
-                            if ability_of_building(b.kind).is_none() {
+                            let list = abilities_of_building(b.kind);
+                            if list.is_empty() {
                                 errors.push(format!(
                                     "cmd {i}: {} has no ability",
                                     building_name(b.kind)
                                 ));
                                 continue;
                             }
+                            list
                         }
                         _ => {
                             errors.push(format!(
@@ -1729,8 +1871,27 @@ fn apply_batch(
                             continue;
                         }
                     }
-                }
-                events.casts.write(CastAbility { caster: entity });
+                };
+                // A named slot is checked for EXISTENCE here so a typo is an
+                // error instead of a silent no-op; whether it is unlocked and
+                // off cooldown stays combat.rs's call.
+                let selector = match &ability {
+                    None => None,
+                    Some(reference) => {
+                        if reference.slot(list).is_none() {
+                            errors.push(format!(
+                                "cmd {i}: caster {hero} has no ability {reference:?} (has {})",
+                                list.iter()
+                                    .map(|d| d.name)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                            continue;
+                        }
+                        Some(reference.selector())
+                    }
+                };
+                events.casts.write(CastAbility { caster: entity, ability: selector });
             }
             Cmd::Buy { shop, item } => {
                 let Some(item) = parse_item(&item) else {
@@ -1890,22 +2051,48 @@ fn apply_batch(
             Cmd::Autocast {
                 units: ids,
                 min_enemies,
+                ability,
             } => {
                 let min_enemies = min_enemies.unwrap_or(0);
                 for (entity, _) in own_units(&ids, units, me, i, errors) {
                     // Any hero class can auto-cast; nothing else has an ability.
-                    if !matches!(units.get(entity), Ok((_, u, _, _)) if is_hero_kind(u.kind)) {
+                    let Ok((_, unit, _, _, policy)) = units.get(entity) else {
+                        continue;
+                    };
+                    if !is_hero_kind(unit.kind) {
                         errors.push(format!(
                             "cmd {i}: unit {} is not a hero",
                             entity.to_bits()
                         ));
                         continue;
                     }
-                    let mut ec = commands.entity(entity);
+                    let list = abilities_of_unit(unit.kind);
+                    let slot = match &ability {
+                        None => 0,
+                        Some(reference) => match reference.slot(list) {
+                            Some(slot) => slot,
+                            None => {
+                                errors.push(format!(
+                                    "cmd {i}: unit {} has no ability {reference:?}",
+                                    entity.to_bits()
+                                ));
+                                continue;
+                            }
+                        },
+                    };
+                    // Edit ONE rule and keep the rest: a hero told to auto-heal
+                    // does not thereby stop auto-slamming.
+                    let mut next = policy.cloned().unwrap_or_default();
                     if min_enemies == 0 {
+                        next.clear_ability(slot);
+                    } else {
+                        next.set(slot, min_enemies);
+                    }
+                    let mut ec = commands.entity(entity);
+                    if next.is_empty() {
                         ec.try_remove::<AutoCastPolicy>();
                     } else {
-                        ec.try_insert(AutoCastPolicy { min_enemies });
+                        ec.try_insert(next);
                     }
                 }
             }
@@ -2060,7 +2247,7 @@ fn entity_of(id: u64) -> Option<Entity> {
 fn own_unit(id: u64, units: &CmdUnits, me: Team) -> Option<(Entity, Vec3)> {
     let entity = entity_of(id)?;
     match units.get(entity) {
-        Ok((_, _, team, tf)) if *team == me => Some((entity, tf.translation)),
+        Ok((_, _, team, tf, _)) if *team == me => Some((entity, tf.translation)),
         _ => None,
     }
 }
@@ -2070,7 +2257,7 @@ fn own_unit(id: u64, units: &CmdUnits, me: Team) -> Option<(Entity, Vec3)> {
 fn own_hero(units: &CmdUnits, me: Team) -> Option<Entity> {
     units
         .iter()
-        .find(|(_, u, team, _)| **team == me && is_hero_kind(u.kind))
+        .find(|(_, u, team, _, _)| **team == me && is_hero_kind(u.kind))
         .map(|(entity, ..)| entity)
 }
 
@@ -2108,7 +2295,7 @@ fn completed_kinds(buildings: &CmdBuildings, me: Team) -> Vec<BuildingKind> {
 }
 
 fn is_worker(units: &CmdUnits, entity: Entity) -> bool {
-    matches!(units.get(entity), Ok((_, u, _, _)) if u.kind == UnitKind::Worker)
+    matches!(units.get(entity), Ok((_, u, _, _, _)) if u.kind == UnitKind::Worker)
 }
 
 /// Move / AttackMove for a group, spread over the UI's formation grid.

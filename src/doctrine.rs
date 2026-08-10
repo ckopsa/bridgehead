@@ -274,57 +274,86 @@ fn enforce_leash(
 // 3. Hero auto-cast (~2 Hz)
 // ---------------------------------------------------------------------------
 
-/// Cast whenever the ability is up and enough bodies are inside its radius.
+/// Cast whenever an ability is up and enough bodies are inside its radius.
 ///
-/// "Enough bodies" depends on what the ability DOES (`ability_of_unit`):
-///   * Damage — enemy units in the blast (the Champion's slam);
+/// The policy is per-ability now (`AutoCastPolicy::rules`), so a hero with two
+/// spells auto-casts each on its own trigger count, in slot order. Every rule
+/// naming a locked or non-existent slot is simply skipped.
+///
+/// "Enough bodies" depends on what the ability DOES:
+///   * Damage / ApplyStatus at enemies — enemy units in the radius;
 ///   * Heal — OWN units in the radius that are actually hurt (< 70% HP), so a
-///     Priestess doesn't burn mana topping up scratches.
+///     Priestess doesn't burn mana topping up scratches;
+///   * ApplyStatus at allies — own units in the radius.
 /// Building casters have no policy component, so they are never auto-cast.
 fn auto_cast_abilities(
+    tiers: Res<TechTiers>,
     mut casts: EventWriter<CastAbility>,
-    heroes: Query<(Entity, &AutoCastPolicy, &Hero, &Unit, &Team, &Transform)>,
+    heroes: Query<(
+        Entity,
+        &AutoCastPolicy,
+        &Hero,
+        &Unit,
+        &Team,
+        &Transform,
+        Option<&AbilityCooldowns>,
+    )>,
     others: Query<(&Team, &Transform, &Health, &Unit)>,
 ) {
     /// A hurt ally is one below this fraction of max HP.
     const HEAL_FRAC: f32 = 0.7;
 
-    for (entity, policy, hero, unit, team, tf) in &heroes {
-        let Some(def) = ability_of_unit(unit.kind) else {
-            continue;
-        };
-        // Same gate combat.rs applies when it executes the cast.
-        if hero.ability_cooldown > 0.0 || hero.mana < def.mana_cost {
-            continue;
-        }
-        let count = others
-            .iter()
-            .filter(|(other_team, other_tf, health, other_unit)| {
-                if health.current <= 0.0 || xz_dist(tf.translation, other_tf.translation) > def.radius
-                {
-                    return false;
-                }
-                // Only count what the ability can actually affect. Three
-                // flyers overhead must not trip a Champion's auto-slam: the
-                // shockwave would miss and the mana would be gone.
-                if !def.hits_air && is_flying_kind(other_unit.kind) {
-                    return false;
-                }
-                match def.effect {
-                    AbilityEffect::Damage => *other_team != team,
-                    AbilityEffect::Heal => {
-                        *other_team == team
-                            && health.max > 0.0
-                            && health.current < health.max * HEAL_FRAC
+    for (entity, policy, hero, unit, team, tf, cooldowns) in &heroes {
+        let list = abilities_of_unit(unit.kind);
+        let ctx = UnlockCtx::new(hero.level, tiers.get(*team));
+        for (index, min_targets) in policy.rules.iter().copied() {
+            let Some(def) = list.get(index) else {
+                continue;
+            };
+            if !ability_unlocked(def, ctx) {
+                continue;
+            }
+            // Same gate combat.rs applies when it executes the cast.
+            if !ability_ready(def, Some(hero), cooldowns, index) {
+                continue;
+            }
+            let count = others
+                .iter()
+                .filter(|(other_team, other_tf, health, other_unit)| {
+                    if health.current <= 0.0
+                        || xz_dist(tf.translation, other_tf.translation) > def.radius
+                    {
+                        return false;
                     }
-                    // No auto-cast path for militia (buildings cast it).
-                    AbilityEffect::Militia => false,
-                }
-            })
-            .count() as u32;
-        // `min_enemies` of 0 still needs someone to affect — never cast at air.
-        if count >= policy.min_enemies.max(1) {
-            casts.write(CastAbility { caster: entity });
+                    // Only count what the ability can actually affect. Three
+                    // flyers overhead must not trip a Champion's auto-slam: the
+                    // shockwave would miss and the mana would be gone.
+                    if !def.hits_air && is_flying_kind(other_unit.kind) {
+                        return false;
+                    }
+                    match def.effect {
+                        AbilityEffect::Damage => *other_team != team,
+                        AbilityEffect::Heal => {
+                            *other_team == team
+                                && health.max > 0.0
+                                && health.current < health.max * HEAL_FRAC
+                        }
+                        // No auto-cast path for militia (buildings cast it).
+                        AbilityEffect::Militia => false,
+                        AbilityEffect::ApplyStatus { targets, .. } => match targets {
+                            AbilityTargets::Enemies => *other_team != team,
+                            AbilityTargets::Allies => *other_team == team,
+                            AbilityTargets::OwnWorkers => {
+                                *other_team == team && other_unit.kind == UnitKind::Worker
+                            }
+                        },
+                    }
+                })
+                .count() as u32;
+            // A trigger of 0 still needs someone to affect — never cast at air.
+            if count >= min_targets.max(1) {
+                casts.write(CastAbility::index(entity, index));
+            }
         }
     }
 }
