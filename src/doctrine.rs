@@ -232,6 +232,15 @@ fn threat_point(
 
 /// Wounded units with a `RetreatPolicy` break off and fall back to their rally.
 /// The `Retreating` marker keeps this from re-firing every tick.
+///
+/// **No `PendingOrder` guard, deliberately** (docs/TEMPO.md follow-up 5): a
+/// unit bleeding out is not "busy waiting", and a retreat threshold is the
+/// commander's own standing order — the fast path this whole mechanism exists
+/// to reward. It also never cancels what is in transit, so the order still
+/// lands; `rearm_retreat` un-latches on arrival, and if the unit is still under
+/// its threshold the policy simply fires again on the next 250ms tick. The net
+/// effect is C4 in miniature: a stale order bought at range loses the argument
+/// with a policy set in advance, and loses it within a quarter of a second.
 fn trigger_retreat(
     mut commands: Commands,
     time: Res<Time>,
@@ -286,6 +295,14 @@ fn rearm_retreat(
 /// Nothing player-facing writes `Order::Idle` — the compiler's `stop` re-issues
 /// a Move to the unit's own spot — so this only ever overwrites a reason that
 /// has genuinely lapsed, never a live directive.
+///
+/// **No `PendingOrder` guard, deliberately** (docs/TEMPO.md follow-up 5): a
+/// unit whose last order finished while a new one is still travelling has
+/// genuinely stopped doing anything, and "idle" is the true answer for those
+/// seconds. Suppressing it would make the unit claim it was still obeying an
+/// order it had already completed, to hide a latency window — the exact
+/// dishonesty the `at`-on-arrival convention was chosen to avoid. The pending
+/// order carries its own `Provenance` and stamps it when it lands.
 fn idle_instinct(
     mut commands: Commands,
     time: Res<Time>,
@@ -370,6 +387,14 @@ fn enforce_leash(
 ///     Priestess doesn't burn mana topping up scratches;
 ///   * ApplyStatus at allies — own units in the radius.
 /// Building casters have no policy component, so they are never auto-cast.
+///
+/// **No `PendingCast` guard, deliberately** (docs/TEMPO.md follow-up 5). The
+/// tempting guard — "don't auto-cast a caster whose hand-fired cast is still
+/// travelling" — is backwards: it would let a player *suppress* the fast path
+/// by reaching for the slow one, which is C4 upside down. Left alone, the
+/// standing policy fires now and the hand-fired copy arrives to find the
+/// ability on cooldown and fizzles, which is exactly the honest-fizzle rule
+/// `PendingCast` was built around. Doctrine wins the race; that is the point.
 fn auto_cast_abilities(
     tiers: Res<TechTiers>,
     mut casts: EventWriter<CastAbility>,
@@ -498,6 +523,13 @@ fn auto_cast_abilities(
 /// 2. Seeding: each team's `DEFAULT_SQUAD` gets a `Defend` at its own base if —
 ///    and only if — it currently has no posture at all. Commanders overwrite
 ///    freely and their posture sticks; this is a floor, not a leash.
+///
+/// **No `PendingOrder` guard, deliberately** (docs/TEMPO.md follow-up 5):
+/// enrolment writes a `SquadId`, never an `Order`, so it cannot clobber
+/// anything in transit — it only decides which squad may re-task the unit
+/// *later*, and `run_squad_postures` skips it for as long as the order is
+/// travelling anyway. The same reasoning the existing `Provenance` carve-out
+/// already makes: enrolment changes who owns the unit, not what it is doing.
 fn default_squad_autonomy(
     mut commands: Commands,
     time: Res<Time>,
@@ -563,16 +595,43 @@ fn run_squad_postures(
     mut commands: Commands,
     time: Res<Time>,
     mut squad_orders: ResMut<SquadOrders>,
-    // `Without<PendingOrder>`: `re_taskable` reads a unit awaiting a delayed
-    // direct order as idle (it IS idle — its order has not arrived yet), so
-    // the squad executor would fold it back into the posture and the direct
-    // order would be clobbered before it ever landed. docs/TEMPO.md §4 calls
-    // this the single most likely source of a "my orders vanish" report. The
-    // guard also states the design: doctrine owns a unit until a player
+    // `Option<&PendingOrder>` rather than `Without<PendingOrder>`, and the
+    // distinction is the whole of docs/TEMPO.md follow-up 5's second half.
+    //
+    // The guard itself is not optional: `re_taskable` reads a unit awaiting a
+    // delayed direct order as idle (it IS idle — its order has not arrived
+    // yet), so the squad executor would fold it back into the posture and the
+    // direct order would be clobbered before it ever landed. docs/TEMPO.md §4
+    // calls this the single most likely source of a "my orders vanish" report.
+    // The guard also states the design: doctrine owns a unit until a player
     // reaches past it, and reaching past it takes time.
+    //
+    // But a query *filter* would have applied that guard twice over, and the
+    // second application was wrong. This query is read for two different
+    // questions: "who may I re-task?" and "where is this squad standing?"
+    // (`squad_positions`, below). An in-transit member is still a body in the
+    // formation — it has not moved, it is still going to get shot, and
+    // cohesion measures physical spread. Filtering it out made a squad's
+    // centre of mass jump the moment a player spoke to half of it, so the
+    // free half would regroup on a point that ignored the squadmates standing
+    // right next to them. So: in-transit members COUNT for cohesion and are
+    // SKIPPED for re-tasking, which is one `continue` in the member loop.
+    //
+    // Retreaters stay filtered out entirely, and that asymmetry is deliberate:
+    // a retreater is deliberately *leaving* the formation under a policy the
+    // commander set, so the squad must not gather around a unit running for
+    // home. An in-transit unit is going nowhere yet.
     members: Query<
-        (Entity, &SquadId, &Team, &Transform, &Order, Option<&MoveTo>),
-        (With<Unit>, Without<Retreating>, Without<PendingOrder>),
+        (
+            Entity,
+            &SquadId,
+            &Team,
+            &Transform,
+            &Order,
+            Option<&MoveTo>,
+            Option<&PendingOrder>,
+        ),
+        (With<Unit>, Without<Retreating>),
     >,
     // Read-only, so it may freely overlap `members` (defenders can themselves
     // be somebody else's threat).
@@ -672,10 +731,12 @@ fn run_squad_postures(
         // (leaders hold, stragglers close) instead of trickling into a defended
         // position in packets. Defend/Escort are exempt — defense is urgent and
         // short-ranged, escorts follow one unit anyway.
+        // Every body in the formation, including the ones with an order still
+        // travelling — see the `members` query. They have not moved yet.
         let squad_positions: Vec<Vec3> = members
             .iter()
             .filter(|(_, ms, mt, ..)| **mt == team && ms.0 == squad)
-            .map(|(_, _, _, tf, _, _)| tf.translation)
+            .map(|(_, _, _, tf, ..)| tf.translation)
             .collect();
         let regroup = match posture {
             SquadPosture::Push { pos } => cohesion_point(&squad_positions, pos),
@@ -700,8 +761,17 @@ fn run_squad_postures(
             now,
         );
 
-        for (entity, member_squad, member_team, tf, order, move_to) in &members {
+        for (entity, member_squad, member_team, tf, order, move_to, pending) in &members {
             if *member_team != team || member_squad.0 != squad {
+                continue;
+            }
+
+            // The guard, applied where it belongs: this member counted toward
+            // the cohesion point above, and is untouchable until the order a
+            // player spoke to it actually arrives. Placed ahead of the
+            // reactive-defense branch deliberately — answering a trespasser is
+            // still a re-task, and it would clobber the order just the same.
+            if pending.is_some() {
                 continue;
             }
 
@@ -784,6 +854,12 @@ fn run_squad_postures(
 /// flap at the boundary), the marker clears and squad postures re-task it.
 /// Playtest round 7: a latched retreat froze an entire army for five minutes
 /// because postures skip `Retreating` members and nothing ever released them.
+///
+/// **No `PendingOrder` guard, deliberately** (docs/TEMPO.md follow-up 5): this
+/// only removes a marker, and removing it hands the unit back to the posture
+/// executor — which then declines to touch it while an order is in transit. The
+/// two guards compose, so a healed unit awaiting a delayed order stops being a
+/// retreater and still is not re-tasked.
 fn recover_retreaters(
     mut commands: Commands,
     query: Query<(Entity, &RetreatPolicy, &Health), With<Retreating>>,
@@ -1188,6 +1264,241 @@ mod tests {
         assert!(
             matches!(order_of(&app, stray), Order::Move(_)),
             "the guard leaked and the leash stopped working"
+        );
+    }
+
+    /// An order a player spoke, still travelling. The provenance is the "idle"
+    /// one a unit genuinely answers with during a latency window — see
+    /// `a_unit_waiting_on_a_delayed_order_still_answers_idle`.
+    fn in_transit(order: Order) -> PendingOrder {
+        PendingOrder {
+            order,
+            provenance: Provenance::instinct("idle", 97.0),
+            ready_at: 99.0,
+            issued_at: 97.0,
+        }
+    }
+
+    /// **In-transit members still count as bodies in the formation.**
+    ///
+    /// The `Without<PendingOrder>` guard shipped as a query filter, which
+    /// applied it to two different questions at once: "who may I re-task?"
+    /// (right) and "where is this squad standing?" (wrong). A unit awaiting a
+    /// delayed order has not moved an inch — it is standing in the blob, in
+    /// range of whatever the blob is in range of — so dropping it from the
+    /// centroid made the squad's centre of mass lurch the moment a player spoke
+    /// to part of it, and the rest would then regroup on a point that ignored
+    /// the squadmates standing right beside them.
+    ///
+    /// Here the straggler is the one with an order in transit. Counted, the
+    /// squad is strung out and gathers; uncounted, the two survivors look
+    /// perfectly cohesive and march on the objective without it.
+    #[test]
+    fn an_in_transit_member_still_counts_toward_squad_cohesion() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+
+        let objective = Vec3::new(60.0, 0.0, 60.0);
+        let a = Vec3::new(-60.0, 0.0, -60.0);
+        let b = Vec3::new(-58.0, 0.0, -60.0);
+        let c = Vec3::new(-20.0, 0.0, -20.0);
+
+        // The discriminator, stated before the fact: these two alone are
+        // cohesive, so if the third body is dropped there is nothing to gather
+        // and this test cannot tell the two implementations apart.
+        assert!(
+            cohesion_point(&[a, b], objective).is_none(),
+            "the two free members must be cohesive on their own, or this test \
+             proves nothing"
+        );
+
+        let free_a = spawn_footman(&mut app, Team::Human, a);
+        let free_b = spawn_footman(&mut app, Team::Human, b);
+        let waiting = spawn_footman(&mut app, Team::Human, c);
+        for unit in [free_a, free_b, waiting] {
+            app.world_mut().entity_mut(unit).insert(SquadId(1));
+        }
+        app.world_mut()
+            .entity_mut(waiting)
+            .insert(in_transit(Order::Move(Vec3::new(-70.0, 0.0, 0.0))));
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+
+        app.update();
+
+        let expected = cohesion_point(&[a, b, c], objective)
+            .expect("all three bodies together are strung out");
+        for unit in [free_a, free_b] {
+            match order_of(&app, unit) {
+                Order::AttackMove(p) => {
+                    assert!(
+                        xz_dist(p, expected) <= 0.01,
+                        "a free member advanced to {p:?}; with the in-transit \
+                         squadmate counted the squad should gather at {expected:?}"
+                    );
+                    assert!(
+                        xz_dist(p, objective) > SQUAD_ARRIVE,
+                        "the squad pressed on to the objective and left its \
+                         in-transit member behind"
+                    );
+                }
+                other => panic!("a free member was not commanded at all: {other:?}"),
+            }
+        }
+        // And the guard it was split out of still holds: the waiting member is
+        // untouched and its order is still on its way.
+        assert!(matches!(order_of(&app, waiting), Order::Idle));
+        assert!(app.world().entity(waiting).get::<PendingOrder>().is_some());
+    }
+
+    /// A **retreat threshold fires for a unit with an order in transit**, and
+    /// does not cancel it.
+    ///
+    /// The guard question asked of every doctrine consumer in turn
+    /// (docs/TEMPO.md follow-up 5), answered "no guard" here: a unit bleeding
+    /// out is not busy waiting, and the threshold is a standing order the
+    /// commander set in advance — the fast path. Cancelling the traveller
+    /// instead would silently eat an order the player really did give.
+    #[test]
+    fn a_retreat_threshold_fires_for_a_unit_with_an_order_in_transit() {
+        let mut app = world();
+        app.add_systems(Update, trigger_retreat);
+
+        let rally = Vec3::new(-70.0, 0.0, -70.0);
+        let unit = spawn_footman(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(unit)
+            .insert(RetreatPolicy { below_frac: 0.5, rally });
+        app.world_mut()
+            .entity_mut(unit)
+            .insert(in_transit(Order::AttackMove(Vec3::new(60.0, 0.0, 60.0))));
+        app.world_mut().entity_mut(unit).get_mut::<Health>().unwrap().current = 20.0;
+
+        app.update();
+
+        match order_of(&app, unit) {
+            Order::Move(p) => assert!(xz_dist(p, rally) <= ORDER_EPS),
+            other => panic!("a wounded unit did not run because it was waiting: {other:?}"),
+        }
+        assert_eq!(why_of(&app, unit), "policy:retreat t=0");
+        assert!(
+            app.world().entity(unit).get::<PendingOrder>().is_some(),
+            "the retreat swallowed an order the player had already spoken"
+        );
+    }
+
+    /// The other end of that decision, and the reason it is safe: when the
+    /// stale order finally lands it un-latches the retreat (`rearm_retreat`, at
+    /// dispatch time — docs/TEMPO.md §4's "assert this deliberately"), the unit
+    /// is still under its threshold, and the policy simply fires again on the
+    /// next tick.
+    ///
+    /// C4 in miniature: an order bought at range loses the argument with a
+    /// policy set in advance, and loses it in a quarter of a second.
+    #[test]
+    fn a_landed_order_unlatches_the_retreat_and_the_policy_wins_anyway() {
+        let mut app = world();
+        app.add_systems(Update, (rearm_retreat, trigger_retreat).chain());
+
+        let rally = Vec3::new(-70.0, 0.0, -70.0);
+        let unit = spawn_footman(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(unit)
+            .insert(RetreatPolicy { below_frac: 0.5, rally });
+        app.world_mut().entity_mut(unit).get_mut::<Health>().unwrap().current = 20.0;
+
+        app.update();
+        assert!(app.world().entity(unit).get::<Retreating>().is_some());
+
+        // The delayed order arrives — exactly what `command::dispatch_pending`
+        // does when `ready_at` comes due: it writes the Order and drops the
+        // PendingOrder.
+        let front = Vec3::new(60.0, 0.0, 60.0);
+        app.world_mut().entity_mut(unit).insert(Order::AttackMove(front));
+
+        app.update();
+        app.update();
+
+        match order_of(&app, unit) {
+            Order::Move(p) => assert!(
+                xz_dist(p, rally) <= ORDER_EPS,
+                "the unit is running to {p:?}, not to its rally {rally:?}"
+            ),
+            // If `rearm_retreat` had failed to un-latch, `trigger_retreat`
+            // (Without<Retreating>) could never have re-fired and this would
+            // still read AttackMove.
+            other => panic!(
+                "a still-wounded unit kept obeying an order that reached it \
+                 after it broke: {other:?}"
+            ),
+        }
+        assert!(app.world().entity(unit).get::<Retreating>().is_some());
+    }
+
+    /// **A unit waiting on a delayed order answers "idle", and says so.**
+    ///
+    /// docs/TEMPO.md records this as a live capture from the `why`-layer
+    /// reconciliation — "while the order was in transit the unit answered
+    /// `why: idle`" — and calls it the two layers agreeing rather than merely
+    /// coexisting. It was never pinned. It is now, because the tempting
+    /// "fix" (suppress `idle_instinct` while something is in transit) would
+    /// make the unit claim it was still obeying an order it had finished, to
+    /// paper over a latency window.
+    #[test]
+    fn a_unit_waiting_on_a_delayed_order_still_answers_idle() {
+        let mut app = world();
+        app.add_systems(Update, idle_instinct);
+
+        let unit = spawn_footman(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().entity_mut(unit).insert(Provenance::new(
+            Cause::Order { verb: "attackmove", source: IntentSource::Ui },
+            12.0,
+        ));
+        app.world_mut()
+            .entity_mut(unit)
+            .insert(in_transit(Order::AttackMove(Vec3::new(60.0, 0.0, 60.0))));
+
+        app.update();
+
+        assert_eq!(
+            why_of(&app, unit),
+            "idle",
+            "a unit whose last order finished must not claim to be obeying one \
+             that has not reached it yet"
+        );
+    }
+
+    /// Auto-enrolment writes a `SquadId`, never an `Order`, so it needs no
+    /// guard: it decides who may re-task the unit *later*, and the posture
+    /// executor then declines to while the order is travelling. The two
+    /// compose, which is the whole reason the floor can stay unguarded.
+    #[test]
+    fn auto_enrolment_leaves_an_order_in_transit_alone() {
+        let mut app = world();
+        app.insert_resource(AiControlled { human: false, claude: true });
+        app.add_systems(Update, (default_squad_autonomy, run_squad_postures).chain());
+
+        let unit = spawn_footman(&mut app, Team::Claude, Vec3::new(60.0, 0.0, 60.0));
+        app.world_mut()
+            .entity_mut(unit)
+            .insert(in_transit(Order::Move(Vec3::new(0.0, 0.0, 0.0))));
+
+        app.update();
+
+        assert_eq!(
+            app.world().entity(unit).get::<SquadId>().map(|s| s.0),
+            Some(DEFAULT_SQUAD),
+            "an in-transit unit should still be enrolled — enrolment is not an order"
+        );
+        assert!(
+            app.world().entity(unit).get::<PendingOrder>().is_some(),
+            "the anti-idle floor ate an order that was still travelling"
+        );
+        assert!(
+            matches!(order_of(&app, unit), Order::Idle),
+            "the seeded posture re-tasked a unit whose order had not arrived"
         );
     }
 

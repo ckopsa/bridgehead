@@ -5050,6 +5050,53 @@ impl IntentErrors {
     }
 }
 
+/// One command that was applied, and what reaching the units it named actually
+/// cost — the realised worst link across everything the sentence moved, in
+/// seconds (`OrderIssuer::max_delay`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppliedCommand {
+    /// The submitting seat's own name for the command — `"cmd 3"` for the
+    /// fourth command of a bridge batch. The same string the error channel
+    /// prefixes its messages with, so the two join without a second identity
+    /// scheme: `errors: ["cmd 3: ..."]` and `applied: [{cmd: "cmd 3", ...}]`
+    /// are the negative and positive halves of one acknowledgement.
+    pub cmd: String,
+    pub delay: f32,
+}
+
+/// **The acknowledgement channel** (docs/TEMPO.md §4, issue 6): what the last
+/// batch each team submitted actually cost in link latency.
+///
+/// The sibling of [`IntentErrors`], and deliberately shaped like it — same
+/// per-team split, same "cleared when a batch is accepted, appended to by the
+/// compiler, copied into the next snapshot" lifecycle. Errors tell a commander
+/// what it may not do; this tells it what its orders cost, which is the other
+/// half of learning a mechanic instead of inferring it from failure.
+///
+/// Only commands that actually **paid** are recorded. A command that landed in
+/// the frame it was spoken says nothing here, so with `WC3_COMMAND_LATENCY` off
+/// this resource is permanently empty and the wire is byte-identical to v1.
+#[derive(Resource, Default)]
+pub struct IntentApplied {
+    pub human: Vec<AppliedCommand>,
+    pub claude: Vec<AppliedCommand>,
+}
+
+impl IntentApplied {
+    pub fn get(&self, team: Team) -> &Vec<AppliedCommand> {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+    pub fn get_mut(&mut self, team: Team) -> &mut Vec<AppliedCommand> {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
