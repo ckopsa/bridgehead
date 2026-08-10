@@ -224,7 +224,11 @@ next to them. Your snapshot's top-level `copilot` block confirms it:
 ```json
 "copilot": {"trust":"split",
             "direct":["priority","retreat","leash","autocast","squad","posture","template"],
-            "propose_ttl":20.0,"max_pending":4}
+            "propose_ttl":20.0,"max_pending":4,
+            "severities":["routine","urgent"],
+            "veto_reasons":{"not_now":"re-propose when conditions change",
+                            "never":"do not re-propose this match",
+                            "wrong_target":"re-propose with a different target"}}
 ```
 
 **Read `direct` before you send anything.** Those verbs go through
@@ -251,6 +255,15 @@ python3 tools/bridge_send.py --seat bridge/copilot '[
 Send a bare `train` and it is refused with a message that shows you the
 wrapper. Nothing is lost; re-send it wrapped.
 
+**`"severity":"urgent"` jumps the queue.** Optional, `"routine"` by default. An
+urgent proposal sorts ahead of every routine one already waiting, wears the
+warning colour on your partner's screen, and is what their `[Enter]` takes
+next. It does **not** raise the cap of four and does not let you propose
+anything you otherwise could not — urgency buys attention, not trust. Spend it
+on windows that close (`their siege is unescorted for ~15s`), not on plans
+(`we should expand`). Mark everything urgent and you have marked nothing
+urgent, and your partner will notice within a minute.
+
 ### Propose-first etiquette
 
 1. **The `note` is the whole point.** The sentences say what would happen — the
@@ -265,13 +278,24 @@ wrapper. Nothing is lost; re-send it wrapped.
    it means your partner was busy. Check `events` for
    `proposal #N expired unanswered` and decide whether it is still true before
    re-sending; a directive about a fight that is over is noise.
-4. **Read `proposals` in your snapshot.** It is your outstanding queue with
-   `expires_in`. `events` reports every outcome:
+4. **Read `proposals` in your snapshot.** It is your outstanding queue, in the
+   order your partner will answer it — urgent first, then oldest — each with
+   its `severity` and `expires_in`. `events` reports every outcome:
    `copilot proposes #1`, `proposal #1 approved (2 order(s))`,
-   `proposal #1 vetoed`, `proposal #1 expired unanswered`.
-5. **Take the veto at face value.** Do not re-send a vetoed batch unchanged. If
-   you still believe it, change the note — the argument was what failed, not
-   the JSON.
+   `proposal #1 vetoed (wrong target - re-propose with a different target)`,
+   `proposal #1 expired unanswered`.
+5. **A veto tells you WHY. Obey the reason.** Your partner picks one of three
+   in the same keystroke, and they mean opposite things. Read it from
+   `recent_resolutions` (or off the `events` line) and act on it:
+
+   | `reason` | what happened | what you do next |
+   |---|---|---|
+   | `not_now` | good idea, wrong moment | **wait and re-propose when conditions change.** Not immediately — something has to have changed first, and your note must say what. |
+   | `never` | drop it | **do not re-propose this idea this match.** Nothing in the engine stops you; this is etiquette, and re-sending it is how you become the thing nobody approves. |
+   | `wrong_target` | the idea is right, the aim is wrong | **re-propose with a different target.** This is the one veto that is really a request — keep the plan, change the units, the ground or the objective. |
+
+   Never re-send a vetoed batch unchanged. If you still believe a `not_now`,
+   what failed was the argument, not the JSON — change the note.
 6. **Watch the conflict tags.** When your batch touches units under your
    partner's squad, posture or a recent order, your partner sees a line like
    `re-tasks squad 1 (defend)` or `overrides your move on 4 unit(s), 6s ago`.
@@ -281,6 +305,31 @@ wrapper. Nothing is lost; re-send it wrapped.
    and a squad posture early and your army fights well while your partner is
    answering something else. This is the single biggest difference between a
    helpful co-commander and a chatty one.
+
+### What became of what you asked: `recent_resolutions`
+
+`proposals` is only what is still open. The last eight that CLOSED are in
+`recent_resolutions`, oldest first, each with your own note echoed back so you
+can recognise the idea without having remembered its number:
+
+```json
+"recent_resolutions":[
+  {"id":4,"t":81.2,"note":"expand to the north mine","severity":"routine",
+   "outcome":"expired"},
+  {"id":5,"t":94.0,"note":"hit their siege now","severity":"urgent",
+   "outcome":"vetoed","reason":"wrong_target",
+   "advice":"re-propose with a different target"}]
+```
+
+`outcome` is `approved`, `vetoed` or `expired` — there is no `pending`, because
+being in `proposals` is what pending means. `reason` and `advice` appear on
+vetoes only. Read this every cycle: it is the only place the *argument* your
+partner made back to you survives, and re-proposing into a `never` is the
+fastest way to stop being read.
+
+If `copilot.auto_approve_after` is present, the thing answering you is a
+**script**, not a person — a sim harness approving everything after that many
+seconds. Nothing you read about vetoes will happen. Do not tune your play to it.
 
 ### Read your partner: `partner_log`
 

@@ -39,7 +39,7 @@ use bevy::winit::cursor::CursorIcon;
 use std::collections::{HashMap, VecDeque};
 
 use crate::command::{CommandLink, PendingOrder};
-use crate::copilot::{Copilot, CopilotSet, ProposalVerdict, PROPOSAL_TTL};
+use crate::copilot::{Copilot, CopilotSet, ProposalVerdict, VetoReason, PROPOSAL_TTL};
 use crate::intent::IntentApply;
 use crate::shared::*;
 
@@ -262,16 +262,26 @@ const PROP_MAX_SENTENCES: usize = 4;
 /// Height budgeted per card when hit-testing. Generous for the same reason
 /// `NOTIF_ROW_HIT_H` is: a card's real height depends on how much of the note
 /// wraps, no analytic guess can know, and swallowing a click just under the
-/// panel is far better than leaking one through as a stray order.
-const PROP_CARD_HIT_H: f32 = 132.0;
-/// Approve / veto the OLDEST pending proposal — the one closest to lapsing,
-/// and the top card. Both keys are free: every letter is a command hotkey,
-/// Space focuses alerts, `.` cycles workers.
+/// panel is far better than leaking one through as a stray order. Raised by
+/// one line's worth when the veto legend became its own line on the top card.
+const PROP_CARD_HIT_H: f32 = 148.0;
+/// Approve / veto the TOP pending proposal — index 0 of `Copilot::pending`,
+/// which copilot.rs keeps in answer order (urgent first, then oldest). Both
+/// keys are free: every letter is a command hotkey, Space focuses alerts, `.`
+/// cycles workers.
 const PROP_APPROVE_KEY: KeyCode = KeyCode::Enter;
 const PROP_VETO_KEY: KeyCode = KeyCode::Backspace;
 /// The co-commander's colour. Deliberately NOT one of the three severity
 /// colours: "my partner said this" must never read as "the game says this".
 const PROP_ACCENT: Color = Color::srgb(0.68, 0.63, 1.0);
+/// An urgent proposal's spine and headline. The alert stack's Warning amber —
+/// the one exception to the rule above, and it earns it: urgency is a claim
+/// about the GAME ("this window closes"), not about who is speaking, so it is
+/// the one part of a card that should read in the HUD's own vocabulary.
+/// `severity_color(EventSeverity::Warning)` is not const-callable, so the
+/// value is written once here and checked against it by
+/// `an_urgent_card_wears_the_warning_tint`.
+const PROP_URGENT: Color = Color::srgb(1.0, 0.86, 0.35);
 
 // ---------------------------------------------------------------------------
 // Plugin
@@ -7345,6 +7355,37 @@ fn update_notifications(
 // card, the one whose clock is shortest. A player mid-fight can answer without
 // aiming a mouse; a player with a moment can click the card they mean.
 
+/// Which of the three answers a veto is, read off the modifiers HELD when the
+/// veto is given.
+///
+/// A held modifier rather than a follow-up key, and that is the whole input
+/// decision. Surrender's "F12 twice within 3 seconds" is the right shape for
+/// an irreversible act — it buys a moment of doubt. A veto is the *safe*
+/// answer, the one given under pressure, and charging two keystrokes for it
+/// would push the player toward the cheaper button, which is approval. So the
+/// reason rides along with the same press:
+///
+/// * `[Bksp]` — **not now**. The bare key stays one key, and the softest of
+///   the three is the right thing to mean when you had no time to modify.
+/// * `[Shift]+[Bksp]` — **wrong target**. Shift already means "same gesture,
+///   different scope" in this HUD (shift-click adds to a selection): keep the
+///   thing, change what it covers.
+/// * `[Ctrl]+[Bksp]` — **never**. Ctrl is how this HUD makes something
+///   standing (ctrl-digit binds a control group), and `never` is the standing
+///   answer: do not raise it again this match.
+///
+/// Ctrl wins a Ctrl+Shift press, because the stronger refusal is the one you
+/// meant if you managed to hold both.
+fn veto_reason(keys: &ButtonInput<KeyCode>) -> VetoReason {
+    if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+        VetoReason::Never
+    } else if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+        VetoReason::WrongTarget
+    } else {
+        VetoReason::NotNow
+    }
+}
+
 /// Turn the two keys and the per-card buttons into `ProposalVerdict`s.
 /// copilot.rs is the only thing that acts on them — this system knows nothing
 /// about what a proposal contains, which is what keeps the rendering side out
@@ -7359,32 +7400,29 @@ fn proposal_input(
     if game_over.0.is_some() || copilot.seat.is_none() {
         return;
     }
-    // A click names its proposal exactly.
+    // A click names its proposal exactly — and reads the same modifiers, so
+    // the mouse and the keyboard can say all three things.
     for (interaction, btn) in &pressed {
         if *interaction != Interaction::Pressed {
             continue;
         }
         if let Some(proposal) = copilot.pending.get(btn.card) {
-            verdicts.write(ProposalVerdict {
-                id: proposal.id,
-                approve: btn.approve,
+            verdicts.write(if btn.approve {
+                ProposalVerdict::approve(proposal.id)
+            } else {
+                ProposalVerdict::veto(proposal.id, veto_reason(&keys))
             });
         }
     }
-    // The keys always mean the top card.
+    // The keys always mean the top card — index 0, which copilot.rs keeps as
+    // the most-urgent-oldest rather than the plain oldest.
     let Some(top) = copilot.pending.first() else {
         return;
     };
     if keys.just_pressed(PROP_APPROVE_KEY) {
-        verdicts.write(ProposalVerdict {
-            id: top.id,
-            approve: true,
-        });
+        verdicts.write(ProposalVerdict::approve(top.id));
     } else if keys.just_pressed(PROP_VETO_KEY) {
-        verdicts.write(ProposalVerdict {
-            id: top.id,
-            approve: false,
-        });
+        verdicts.write(ProposalVerdict::veto(top.id, veto_reason(&keys)));
     }
 }
 
@@ -7394,8 +7432,8 @@ fn update_proposals(
     time: Res<Time>,
     copilot: Res<Copilot>,
     mut ui: ResMut<UiState>,
-    mut cards: Query<(&PropCard, &mut Node, &mut BackgroundColor)>,
-    mut texts: Query<(&PropText, &mut Text)>,
+    mut cards: Query<(&PropCard, &mut Node, &mut BackgroundColor, &mut BorderColor)>,
+    mut texts: Query<(&PropText, &mut Text, &mut TextColor)>,
     mut buttons: Query<(&PropBtn, &mut Node), Without<PropCard>>,
 ) {
     let now = time.elapsed_secs();
@@ -7404,7 +7442,7 @@ fn update_proposals(
     // click on the battlefield behind it.
     ui.prop_cards = pending.len();
 
-    for (card, mut node, mut bg) in &mut cards {
+    for (card, mut node, mut bg, mut border) in &mut cards {
         let Some(proposal) = pending.get(card.0) else {
             node.display = Display::None;
             continue;
@@ -7417,7 +7455,11 @@ fn update_proposals(
         } else {
             PANEL_BG
         };
-        let _ = proposal;
+        // The spine is the card's severity, exactly as it is in the alert
+        // stack. Since urgent proposals sort to the front, the amber spines
+        // are always the top of the panel — the block of colour IS the
+        // "answer these first" instruction, with nothing to read.
+        border.0 = accent_of(proposal);
     }
 
     for (btn, mut node) in &mut buttons {
@@ -7428,7 +7470,7 @@ fn update_proposals(
         };
     }
 
-    for (slot, mut text) in &mut texts {
+    for (slot, mut text, mut color) in &mut texts {
         let wanted = match pending.get(slot.card) {
             None => String::new(),
             Some(proposal) => match slot.part {
@@ -7437,18 +7479,26 @@ fn update_proposals(
                     // The age is the honest way to show a clock in a game with
                     // `WC3_SPEED`: game seconds, the same unit the co-commander
                     // read off its snapshot when it wrote this.
+                    //
+                    // The key legend is on its own line and only on the top
+                    // card, because it is three answers now and one line of
+                    // header cannot hold both a clock and a menu. Only the
+                    // card the keys act on needs it, which is also the only
+                    // card that would have room.
                     let keys = if slot.card == 0 {
-                        "   [Enter] approve   [Bksp] veto"
+                        "\n[Enter] approve   [Bksp] not now   \
+                         +Shift wrong target   +Ctrl never"
                     } else {
                         ""
                     };
+                    let urgent = if proposal.is_urgent() { "  URGENT" } else { "" };
                     // ASCII only, here and in `proposal_body`. Bevy's default
                     // font has no glyph for `·`, and a HUD that renders its
                     // own bullet points as tofu boxes is a HUD nobody reads
                     // twice — caught by looking at the screenshot, which is
                     // the only way this class of bug is ever caught.
                     format!(
-                        "#{}  copilot   {left:.0}s left   ({}/{}){keys}",
+                        "#{}  copilot{urgent}   {left:.0}s left   ({}/{}){keys}",
                         proposal.id,
                         (now - proposal.proposed_at).min(PROPOSAL_TTL).round(),
                         PROPOSAL_TTL.round(),
@@ -7461,6 +7511,25 @@ fn update_proposals(
         if text.0 != wanted {
             text.0 = wanted;
         }
+        // Only the headline changes colour with severity. The note is the
+        // partner's own words and the body is compiled English; tinting those
+        // would say the SENTENCES are urgent, which is not the claim.
+        if slot.part == PropPart::Head {
+            let wanted = pending.get(slot.card).map_or(PROP_ACCENT, accent_of);
+            if color.0 != wanted {
+                color.0 = wanted;
+            }
+        }
+    }
+}
+
+/// A card's colour: the co-commander's violet, or the HUD's Warning amber when
+/// the proposal claims a closing window.
+fn accent_of(proposal: &crate::copilot::Proposal) -> Color {
+    if proposal.is_urgent() {
+        PROP_URGENT
+    } else {
+        PROP_ACCENT
     }
 }
 
@@ -7496,6 +7565,9 @@ fn proposal_body(proposal: &crate::copilot::Proposal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the co-command tests need the negotiation's own types; the panel
+    // itself is written against `Copilot` and knows no more than it must.
+    use crate::copilot::{ProposalSeverity, Verdict};
 
     /// Every intent the interface submitted, in order. Standing in for
     /// `bridge/intent_log.jsonl`, which is fed from exactly this event.
@@ -7625,10 +7697,16 @@ mod tests {
             intents: vec![Intent::Stop { units: vec![1] }],
             sentences: sentences.iter().map(|s| s.to_string()).collect(),
             conflicts: conflicts.iter().map(|s| s.to_string()).collect(),
+            severity: ProposalSeverity::Routine,
             proposed_at: 0.0,
             expires_at: PROPOSAL_TTL,
             pos: None,
         }
+    }
+
+    fn urgent(mut proposal: crate::copilot::Proposal) -> crate::copilot::Proposal {
+        proposal.severity = ProposalSeverity::Urgent;
+        proposal
     }
 
     /// The panel and its two keys, with no window and no renderer — the same
@@ -7670,16 +7748,290 @@ mod tests {
         press(&mut app, &[PROP_APPROVE_KEY]);
         let said = verdicts(&mut app);
         assert_eq!(said.len(), 1, "one key, one verdict");
-        // The OLDEST — the top card, the one whose clock is shortest. Not the
-        // newest, which is what a stack would have given.
+        // The TOP card — index 0 of the queue copilot.rs keeps in answer
+        // order. Not the newest, which is what a stack would have given.
         assert_eq!(said[0].id, 7);
-        assert!(said[0].approve);
+        assert_eq!(said[0].verdict, Verdict::Approve);
 
         let mut app = proposal_app(vec![a_proposal(7, "spend it all", &["x"], &[])]);
         press(&mut app, &[PROP_VETO_KEY]);
         let said = verdicts(&mut app);
         assert_eq!(said.len(), 1);
-        assert_eq!((said[0].id, said[0].approve), (7, false));
+        // A bare Backspace is still one key, and it means the softest of the
+        // three answers — the fast path must not get slower for the reasons.
+        assert_eq!(
+            (said[0].id, said[0].verdict),
+            (7, Verdict::Veto(VetoReason::NotNow))
+        );
+    }
+
+    /// **The two-sided veto, at the keyboard.** Which of the three answers a
+    /// veto is comes from the modifiers HELD during the same press, so the
+    /// reason costs nothing on top of the refusal. A follow-up key would have
+    /// charged two keystrokes for the safe answer and one for approval, which
+    /// is exactly the wrong incentive to build into a consent loop.
+    #[test]
+    fn the_held_modifier_picks_which_no_the_veto_is() {
+        let cases = [
+            (vec![PROP_VETO_KEY], VetoReason::NotNow),
+            (vec![KeyCode::ShiftLeft, PROP_VETO_KEY], VetoReason::WrongTarget),
+            (vec![KeyCode::ControlLeft, PROP_VETO_KEY], VetoReason::Never),
+            // Both held: the stronger refusal is the one you managed to mean.
+            (
+                vec![KeyCode::ControlLeft, KeyCode::ShiftLeft, PROP_VETO_KEY],
+                VetoReason::Never,
+            ),
+            (vec![KeyCode::ShiftRight, PROP_VETO_KEY], VetoReason::WrongTarget),
+            (vec![KeyCode::ControlRight, PROP_VETO_KEY], VetoReason::Never),
+        ];
+        for (keys, want) in cases {
+            let mut app = proposal_app(vec![a_proposal(7, "hit their siege", &["x"], &[])]);
+            press(&mut app, &keys);
+            let said = verdicts(&mut app);
+            assert_eq!(said.len(), 1, "{keys:?}");
+            assert_eq!(said[0].verdict, Verdict::Veto(want), "{keys:?}");
+        }
+
+        // Approval is unmodified by any of it: a held Ctrl must never turn a
+        // yes into a no.
+        let mut app = proposal_app(vec![a_proposal(7, "x", &["x"], &[])]);
+        press(&mut app, &[KeyCode::ControlLeft, PROP_APPROVE_KEY]);
+        assert_eq!(verdicts(&mut app)[0].verdict, Verdict::Approve);
+    }
+
+    /// The top card has to TEACH the three answers, or two of them may as well
+    /// not exist. `[Bksp]` is labelled by what it means, not by "veto".
+    #[test]
+    fn the_top_card_names_all_three_answers() {
+        let mut app = proposal_app(vec![
+            a_proposal(3, "counter now", &["x"], &[]),
+            a_proposal(4, "and expand", &["y"], &[]),
+        ]);
+        app.update();
+        let world = app.world_mut();
+        let mut q = world.query::<(&PropText, &Text)>();
+        let heads: Vec<(usize, String)> = q
+            .iter(world)
+            .filter(|(slot, _)| slot.part == PropPart::Head)
+            .map(|(slot, text)| (slot.card, text.0.clone()))
+            .collect();
+        let top = &heads.iter().find(|(card, _)| *card == 0).unwrap().1;
+        for word in ["[Enter] approve", "[Bksp] not now", "+Shift wrong target", "+Ctrl never"] {
+            assert!(top.contains(word), "top card must say {word:?}: {top:?}");
+        }
+        // Only the card the keys act on carries the legend — the others have
+        // no room and the keys do not reach them anyway.
+        let second = &heads.iter().find(|(card, _)| *card == 1).unwrap().1;
+        assert!(!second.contains("[Enter]"), "got {second:?}");
+        assert!(second.starts_with("#4  copilot"), "got {second:?}");
+    }
+
+    /// Urgency is legible before it is read: the spine and the headline take
+    /// the HUD's own Warning amber, and the word `URGENT` is in the header.
+    #[test]
+    fn an_urgent_card_wears_the_warning_tint() {
+        assert_eq!(
+            PROP_URGENT,
+            severity_color(EventSeverity::Warning),
+            "the urgent tint IS the HUD's warning colour, not a lookalike"
+        );
+        let mut app = proposal_app(vec![
+            urgent(a_proposal(9, "they are flanking", &["x"], &[])),
+            a_proposal(10, "expand north", &["y"], &[]),
+        ]);
+        app.update();
+
+        let world = app.world_mut();
+        let mut cards = world.query::<(&PropCard, &BorderColor)>();
+        let spines: Vec<(usize, Color)> = cards
+            .iter(world)
+            .map(|(card, border)| (card.0, border.0))
+            .collect();
+        assert_eq!(
+            spines.iter().find(|(i, _)| *i == 0).unwrap().1,
+            PROP_URGENT
+        );
+        assert_eq!(
+            spines.iter().find(|(i, _)| *i == 1).unwrap().1,
+            PROP_ACCENT,
+            "a routine card keeps the partner's own violet"
+        );
+
+        let mut texts = world.query::<(&PropText, &Text, &TextColor)>();
+        for (slot, text, color) in texts.iter(world) {
+            if slot.part != PropPart::Head {
+                continue;
+            }
+            match slot.card {
+                0 => {
+                    assert!(text.0.contains("URGENT"), "got {:?}", text.0);
+                    assert_eq!(color.0, PROP_URGENT);
+                }
+                1 => {
+                    assert!(!text.0.contains("URGENT"), "got {:?}", text.0);
+                    assert_eq!(color.0, PROP_ACCENT);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// **The whole negotiation over one App, with nothing stubbed between the
+    /// keystroke and the wire.**
+    ///
+    /// The tests above each hold one end of the loop: copilot.rs proves a
+    /// reason reaches the feed and the tail, this module proves a modifier
+    /// picks the reason. Neither on its own rules out the two halves having
+    /// been wired to different things. This one runs the real `CopilotPlugin`
+    /// beside the real panel systems, delivers a proposal down the real wire,
+    /// and answers it with a real `[Ctrl]+[Bksp]` — so the sentence the
+    /// co-commander will read is produced by the key the human actually
+    /// pressed.
+    #[test]
+    fn ctrl_backspace_on_a_wired_proposal_tells_the_partner_never() {
+        use crate::copilot::{CopilotPlugin, CopilotWire};
+        use crate::intent::{IntentLog, IntentPlugin};
+
+        let mut app = App::new();
+        app.init_resource::<UiState>()
+            .init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Economies>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<TechTiers>()
+            .init_resource::<NavGrid>()
+            .init_resource::<TeamResearch>()
+            .init_resource::<SquadOrders>()
+            .init_resource::<AiControlled>()
+            .init_resource::<GameEvents>()
+            .init_resource::<GameOver>()
+            .init_resource::<FogGrids>()
+            .init_resource::<crate::command::CommandNodes>()
+            .init_resource::<crate::command::CommandLatency>()
+            .add_event::<CastAbility>()
+            .add_event::<BuyItem>()
+            .add_event::<UseItem>()
+            .add_event::<UpgradeBuilding>()
+            .add_event::<StartResearch>()
+            .add_plugins((IntentPlugin, CopilotPlugin))
+            .insert_resource(IntentLog::disabled())
+            .add_systems(Startup, |mut commands: Commands| {
+                spawn_proposals(&mut commands)
+            })
+            .add_systems(
+                Update,
+                (
+                    proposal_input.before(CopilotSet),
+                    update_proposals.after(CopilotSet),
+                ),
+            );
+        app.world_mut().resource_mut::<Copilot>().seat(Team::Human);
+        let unit = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::default(),
+                Health::new(100.0),
+                Order::Idle,
+            ))
+            .id();
+
+        // A routine proposal, then an urgent one down the same wire.
+        for (note, severity) in [
+            ("expand north later", "routine"),
+            ("their siege is unescorted RIGHT NOW", "urgent"),
+        ] {
+            let raw: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"type":"propose","note":"{note}","severity":"{severity}",
+                     "commands":[{{"type":"move","units":[{}],"x":9.0,"z":9.0}}]}}"#,
+                intent_id(unit)
+            ))
+            .expect("test json");
+            app.world_mut().send_event(CopilotWire {
+                team: Team::Human,
+                tag: "cmd 0".to_string(),
+                raw,
+            });
+            app.update();
+        }
+
+        // The urgent one jumped: it is the top card, so it is what the keys
+        // answer even though the routine one was asked first.
+        {
+            let copilot = app.world().resource::<Copilot>();
+            assert_eq!(copilot.pending.len(), 2);
+            assert_eq!(copilot.pending[0].id, 2, "urgent is answered first");
+            assert!(copilot.pending[0].is_urgent());
+        }
+
+        // The human says: never. One press, Ctrl held.
+        press(&mut app, &[KeyCode::ControlLeft, PROP_VETO_KEY]);
+
+        let copilot = app.world().resource::<Copilot>();
+        assert_eq!(
+            copilot.pending.len(),
+            1,
+            "only the card the keys act on was answered"
+        );
+        assert_eq!(copilot.pending[0].id, 1, "the routine one still waits");
+        let resolution = copilot.resolved.back().expect("it left a resolution");
+        assert_eq!(resolution.id, 2);
+        assert_eq!(
+            resolution.outcome,
+            crate::copilot::Outcome::Vetoed(VetoReason::Never)
+        );
+        assert_eq!(resolution.severity, ProposalSeverity::Urgent);
+        // And the sentence the co-commander will actually read.
+        let line = app
+            .world()
+            .resource::<GameEvents>()
+            .feed(Team::Human)
+            .iter()
+            .map(|e| e.message.clone())
+            .find(|m| m.contains("vetoed"))
+            .expect("announced");
+        assert!(
+            line.contains("never") && line.contains("do not re-propose this match"),
+            "got {line}"
+        );
+        // Nothing was submitted: a veto is not a delay, whatever its reason.
+        assert!(
+            app.world()
+                .entity(unit)
+                .get::<Provenance>()
+                .is_none(),
+            "the unit was never touched"
+        );
+    }
+
+    /// The veto BUTTON reads the same modifiers as the key, so the mouse can
+    /// say all three things too — a player who is clicking cards rather than
+    /// hammering keys is exactly the one with time to be specific.
+    #[test]
+    fn the_veto_button_reads_the_modifiers_too() {
+        let mut app = proposal_app(vec![a_proposal(7, "x", &["x"], &[])]);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ShiftLeft);
+        let world = app.world_mut();
+        let mut q = world.query::<(Entity, &PropBtn)>();
+        let veto = q
+            .iter(world)
+            .find(|(_, btn)| !btn.approve && btn.card == 0)
+            .map(|(e, _)| e)
+            .expect("card 0 has a veto button");
+        world.entity_mut(veto).insert(Interaction::Pressed);
+        app.update();
+
+        let said = verdicts(&mut app);
+        assert_eq!(said.len(), 1);
+        assert_eq!(
+            said[0].verdict,
+            Verdict::Veto(VetoReason::WrongTarget),
+            "a shift-click on veto is the same sentence as shift-Backspace"
+        );
     }
 
     /// Nothing pending, nothing to answer — a stray Enter must not become a

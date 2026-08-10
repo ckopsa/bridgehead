@@ -740,6 +740,136 @@ is arguing about.
 A partner who re-tasks your push is a partner. A partner who re-tasks your push
 *invisibly* is a bug you spend the next minute misdiagnosing.
 
+#### Answering back: a veto has a reason
+
+*`wc3clone-3f7`.* The first cut of this loop was one-sided in a way that is
+easy to miss: the co-commander proposed **with an argument**, and got back a
+bare "no". Three completely different things hide behind that no — bad timing,
+bad idea, bad aim — and they call for opposite next moves. A partner that has
+to guess between them guesses wrong, re-proposes into a wall, and becomes the
+thing nobody approves.
+
+So a veto carries one of three reasons, and the human picks it **in the same
+keystroke that gives it**:
+
+| key | reason | what it asks of the proposer |
+|---|---|---|
+| `[Bksp]` | `not_now` | the idea is fine, the moment is not — re-propose when conditions change |
+| `[Shift]+[Bksp]` | `wrong_target` | the idea is right, the aim is wrong — re-propose elsewhere |
+| `[Ctrl]+[Bksp]` | `never` | drop it; do not raise it again this match |
+
+**A held modifier, not a follow-up key**, and that is the whole input decision.
+Surrender's "F12 twice within 3 seconds" is the right shape for an irreversible
+act: it buys a moment of doubt. A veto is the *safe* answer, the one given
+under pressure, and charging two keystrokes for it while approval stays one
+builds exactly the wrong incentive into a consent loop. Plain `[Bksp]` is
+therefore still one key and means `not_now` — the softest of the three, which
+is the right thing to mean when you had no time to modify. Shift and Ctrl were
+already this HUD's two modifiers and already meant something close: shift-click
+*adds to a selection* (keep the thing, change what it covers → `wrong_target`),
+ctrl-digit *binds a control group* (make it standing → `never`). The veto
+buttons read the same modifiers, so the mouse can say all three things too.
+
+`never` is **etiquette, not enforcement**. Nothing refuses a re-proposal. That
+is the same rule the rest of co-command follows — *source is descriptive, never
+authoritative* — and a partner able to silently ban its partner's ideas would
+be arbitration by the back door, which this design spent its whole budget
+avoiding.
+
+The reason reaches the proposer twice: on the `events` line it reads anyway
+(`proposal #5 vetoed (wrong target - re-propose with a different target): hit
+their siege`) and in the snapshot's `recent_resolutions` — the last eight
+proposals that *left* the queue:
+
+```json
+{"id":5,"t":94.0,"note":"hit their siege now","severity":"urgent",
+ "outcome":"vetoed","reason":"wrong_target",
+ "advice":"re-propose with a different target"}
+```
+
+**A tail, not a terminal `status` left on `proposals` for one cycle.** Two
+reasons. A one-write status is missed entirely by a seat polling slower than
+the snapshot ticks, and "did my partner ever answer #3?" is exactly the
+question you ask when you have *not* kept up. And `proposals` keeps meaning one
+thing — the queue you can still act on — rather than becoming a mixed list
+every reader has to filter. That is also why there is no `pending` outcome:
+membership in `proposals` *is* pending, and a status field that restates a list
+membership is a second source of truth waiting to disagree with the first.
+
+The `advice` clause is duplicated out of this document deliberately, for the
+same reason the refusal above prints the wrapper: a model acting on a veto
+mid-match should not need a second file to know whether it may try again.
+
+#### Urgency: the queue is answered in the order that matters
+
+*`wc3clone-3f7`.* `severity: "urgent"` on the wrapper (default `"routine"`)
+puts a proposal at the **front** of the queue rather than the back. Oldest-first
+was right when four proposals were about the same fight and wrong the moment
+they were not: "they are flanking, pull back" and "we should expand" are not
+equally answerable at second 40 of a battle.
+
+It changes nothing else. Not what may be proposed — urgency buys attention, not
+trust. Not the cap: four is still four, because the cap is about how many
+questions a human can hold and marking one urgent does not add attention. The
+whole implementation is one insertion index, `copilot::insert_index`, which
+places an urgent proposal ahead of every routine one and behind every urgent
+one already waiting (urgent-then-oldest: a second urgent proposal did not
+become more important by being later).
+
+Keeping `pending` permanently in **answer order** is what made this nearly
+free. Index 0 is still "the card `[Enter]` takes" for ui.rs, still the
+brightened top card, and still the first entry of the snapshot's `proposals` —
+three readers that between them had to learn nothing about severity. `[Enter]`
+answering the most-urgent-oldest instead of the plain oldest is not a rule
+anywhere; it is what "take index 0" now happens to mean.
+
+The HUD says it twice: the card's spine and headline take the alert stack's
+Warning amber, and the header reads `URGENT`. That amber is the one place a
+proposal card wears a severity colour rather than the co-commander's violet,
+and it earns the exception — urgency is a claim about the *game* ("this window
+closes"), not about who is speaking. Because urgent cards sort to the top, the
+block of amber at the head of the panel *is* the "answer these first"
+instruction, with nothing to read.
+
+A misspelt severity refuses the whole proposal, naming both accepted words.
+Silently downgrading to routine would be the worse failure: the proposer
+believes it jumped a queue it never jumped, the human never sees it jump, and
+nothing anywhere says why.
+
+#### Making the loop measurable: `WC3_COPILOT_AUTOAPPROVE`
+
+*`wc3clone-3f7`, closing the "headless has no approver" follow-up below.*
+Approval is a human act, so a headless sim has nobody to give it and every
+proposal lapses. That is *correct* — and it means the one part of co-command
+that is genuinely new was the one part no sim could measure.
+
+Two knobs make it observable without a person:
+
+- **`WC3_COPILOT_TRUST=full`** — the control case. No loop at all: every verb
+  goes direct, so a sim measures a co-commander *without* the negotiation cost.
+  (It already existed as a policy toggle; it works headless because
+  `CopilotPlugin` is registered in both branches of `main.rs` and the seat is
+  opened by `WC3_BRIDGE=copilot` either way.)
+- **`WC3_COPILOT_AUTOAPPROVE=1`** — a scripted approver that says yes to each
+  proposal `WC3_COPILOT_APPROVE_DELAY` seconds after it arrives (default 3s).
+
+**The delay is the entire point.** A zero-delay approver would measure a
+co-commander with a rubber stamp. What a human's presence reliably costs the
+loop is *seconds between the idea and the act*, and whether the board still
+rewards the plan after those seconds is the question the proposal loop actually
+raises. It approves rather than judges, which is a stated limitation: an
+approver that vetoed on some heuristic would be measuring the heuristic.
+
+It is a stand-in for the keystroke, not a new author — the batch goes through
+the ordinary compiler and lands stamped `by copilot`, exactly as a human's
+`[Enter]` would, so a replay of a scripted sim reads like a replay of a played
+one. Queue order is honoured for free, since `pending` is already
+urgent-then-oldest. The seat is told: `copilot.auto_approve_after` appears in
+the snapshot only when a script is answering, so a co-commander can tell
+whether the thing approving it is a person, and the seat's startup line says
+`SCRIPTED APPROVER: auto-approving after 3s` — a sim log that does not say
+"nobody human answered these" is a result somebody will misread later.
+
 #### Legibility runs both ways: `partner_log`
 
 The human sees the co-commander's directives — they arrive as proposals with a
@@ -777,8 +907,11 @@ stops proposing around a plan you never actually issued.
   partner who can see that your click bounced off a stale ghost is a partner
   who can stop proposing around it.
 - **Ordinary seats' wire format is byte-shape identical.** `copilot`,
-  `proposals` and `partner_log` are `Option` and skipped when absent; `red` and
-  `blue` snapshots keep exactly the keys they had (16, verified live).
+  `proposals`, `recent_resolutions` and `partner_log` are `Option` and skipped
+  when absent; `red` and `blue` snapshots keep exactly the keys they had (16,
+  verified live). Every addition since has been additive on the copilot side
+  only, and the four keys appear together or not at all — including as empty
+  lists — so the shape a co-commander parses never changes under it.
 
 ### It inherited Chain of Command for free
 
@@ -803,17 +936,30 @@ both go through the one place an order becomes real.
   are the batch), and approval re-validates everything against the live world,
   so the cost is a tag that over- or under-states — never an order that lands
   differently than it read. Recomputing per frame is the fix if it ever bites.
-- **The queue is not prioritised.** Four pending proposals answer oldest-first,
-  which is right when they are about the same fight and wrong when one is
-  urgent. A `severity` on the wrapper is the obvious next rung.
-- **A veto tells the partner nothing but "no".** The human has no way to reply
-  *why*, so a co-commander can only guess whether to re-propose. A one-key
-  "not now" vs "never" distinction, or a canned reason list, is the smallest
-  thing that would make the negotiation two-sided in both directions.
-- **Headless has no approver.** `WC3_BRIDGE=copilot` under `WC3_HEADLESS=1`
-  queues proposals nobody can answer, so they all lapse. That is *correct* —
-  approval is a human act and headless has no human — but it means an
-  AI-vs-(AI+AI) sim needs either full-trust mode or a scripted approver seat.
+- ~~**The queue is not prioritised.**~~ **Done** (`wc3clone-3f7`) — see
+  "Urgency" above. `severity: "urgent"` was indeed the obvious next rung, and
+  it cost one insertion index because `pending` was already the queue every
+  reader took index 0 of.
+- ~~**A veto tells the partner nothing but "no".**~~ **Done**
+  (`wc3clone-3f7`) — see "Answering back" above. The canned reason list won
+  over the one-key "not now vs never": three answers, chosen by held modifier
+  so the refusal never costs more keystrokes than the approval.
+- ~~**Headless has no approver.**~~ **Done** (`wc3clone-3f7`) — see "Making the
+  loop measurable" above. Both options the bullet named now exist:
+  `WC3_COPILOT_TRUST=full` as the no-loop control, and
+  `WC3_COPILOT_AUTOAPPROVE=1` as a scripted approver with a deliberate delay.
+- **The scripted approver never says no.** It measures *delay*, which is the
+  part of a human's presence that generalises; it cannot measure how a
+  co-commander recovers from a veto, which is now the more interesting
+  question given the reasons above. An approver that vetoed on a heuristic
+  would mostly measure the heuristic — a replay-driven one, answering the way a
+  recorded human did, is the honest version and needs a recording first.
+- **`never` is not remembered.** The engine files it in `recent_resolutions`
+  and forgets it after eight more answers; nothing refuses a re-proposal of an
+  idea already refused forever. That is deliberate (enforcement would be
+  arbitration), but a *tag* on the proposal — "you were told never about this
+  once already" — would keep it etiquette while making the lapse visible to
+  both authors.
 
 ---
 

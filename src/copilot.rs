@@ -76,11 +76,67 @@
 //! proposal whose units have since died is refused exactly as any stale
 //! command is, with the same strings, into the same `errors` array. There is
 //! no second execution path, and therefore no second set of rules to drift.
+//!
+//! ## Answering back: the veto has a reason
+//!
+//! A veto that says only "no" makes the negotiation one-sided. The
+//! co-commander proposed *with an argument*; it gets back a bare refusal and
+//! has to guess which of three completely different things happened — bad
+//! timing, bad idea, or bad aim — and the three call for opposite next moves.
+//! Guessing wrong is how a partner becomes a nag.
+//!
+//! So a veto carries one of three [`VetoReason`]s, and the human picks it in
+//! the same keystroke that gives it:
+//!
+//! | key | reason | what it asks of the proposer |
+//! |---|---|---|
+//! | `[Bksp]` | `NotNow` | the idea is fine, the moment is not — re-propose when conditions change |
+//! | `[Shift]+[Bksp]` | `WrongTarget` | the idea is right, the aim is wrong — re-propose elsewhere |
+//! | `[Ctrl]+[Bksp]` | `Never` | drop it; do not raise it again this match |
+//!
+//! Plain `[Bksp]` is `NotNow` because the fast path must stay one key, and
+//! because the softest of the three is the right thing to mean when the human
+//! was too busy to modify. `Never` is **etiquette, not enforcement**: nothing
+//! here refuses a re-proposal. That is the same rule the rest of co-command
+//! follows — *source is descriptive, never authoritative* — and a partner that
+//! could silently ban its partner's ideas would be arbitration by the back
+//! door.
+//!
+//! ## Urgency: the queue is answered in the order that matters
+//!
+//! `severity: "urgent"` on the wrapper puts a proposal at the FRONT of the
+//! queue rather than the back. It changes nothing about what may be proposed
+//! and nothing about the cap — four is still four, because the cap is about
+//! how many questions a human can hold, and urgency does not add attention.
+//! It changes only *which question is asked first*, which is exactly the thing
+//! oldest-first got wrong: "they are flanking, pull back" and "we should
+//! expand" are not equally answerable at second 40 of a fight.
+//!
+//! Because insertion keeps `pending` in **answer order**, index 0 is still
+//! "the card `[Enter]` takes" for ui.rs and still "#1 in the queue" for the
+//! snapshot. Neither had to learn what urgency is.
+//!
+//! ## Measuring any of this
+//!
+//! Approval is a human act, so a headless sim has nobody to give it and every
+//! proposal lapses — correct, and useless for measurement. Two knobs make the
+//! loop observable without a person:
+//!
+//! * `WC3_COPILOT_TRUST=full` — no loop at all, the control case.
+//! * `WC3_COPILOT_AUTOAPPROVE=1` — a scripted stand-in that approves each
+//!   proposal `WC3_COPILOT_APPROVE_DELAY` seconds after it arrives (default
+//!   [`DEFAULT_APPROVE_DELAY`]), modelling an attentive human's reading time.
+//!
+//! The delay is the point. Zero-delay approval would measure a co-commander
+//! with a rubber stamp; a real partner costs *seconds between the idea and the
+//! act*, and whether the plan still fits the board after those seconds is the
+//! question the proposal loop actually raises.
 
 use crate::intent::IntentApply;
 use crate::shared::*;
 use bevy::prelude::*;
 use serde::Deserialize;
+use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
 // Tuning knobs
@@ -104,6 +160,25 @@ pub const MAX_PENDING: usize = 4;
 /// right now" when a proposal would overwrite it.
 const CONFLICT_RECENT_S: f32 = 30.0;
 
+/// Turn on the scripted approver that stands in for a human in sims.
+const AUTOAPPROVE_ENV: &str = "WC3_COPILOT_AUTOAPPROVE";
+/// Game seconds the scripted approver waits before saying yes.
+const APPROVE_DELAY_ENV: &str = "WC3_COPILOT_APPROVE_DELAY";
+
+/// The scripted approver's default reading time. Chosen to be a plausible
+/// *attentive* human — long enough that a proposal is a real commitment of
+/// tempo, short enough to sit well inside [`PROPOSAL_TTL`] so a sim measures
+/// the approval path rather than the expiry path.
+pub const DEFAULT_APPROVE_DELAY: f32 = 3.0;
+
+/// How many answered proposals a co-commander can still read about.
+///
+/// A tail rather than a one-cycle grace period on `pending`: a seat that polls
+/// slower than the snapshot ticks would miss a status that lives for exactly
+/// one write, and "did my partner ever answer #3?" is precisely the question
+/// you ask when you have *not* been keeping up.
+pub const RESOLUTION_TAIL: usize = 8;
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -124,7 +199,12 @@ impl Plugin for CopilotPlugin {
             .add_event::<ProposalVerdict>()
             .add_systems(
                 Update,
-                (ingest_wire, resolve_proposals)
+                // `auto_approve` sits between the two for the same reason
+                // ui.rs's `proposal_input` runs before `CopilotSet`: a verdict
+                // is only useful in the frame it can still be acted on. A
+                // proposal that came of age this frame is approved, compiled
+                // and snapshot in that one frame.
+                (ingest_wire, auto_approve, resolve_proposals)
                     .chain()
                     .in_set(CopilotSet)
                     .after(crate::bridge::BridgePoll)
@@ -180,6 +260,149 @@ impl TrustPolicy {
     }
 }
 
+/// How badly this wants answering first.
+///
+/// Deliberately two values, not five. A scale a proposer can game is a scale
+/// that becomes all-urgent within a match; two values make the choice a real
+/// one, because marking everything urgent marks nothing urgent and the human
+/// finds out immediately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ProposalSeverity {
+    /// The default and the overwhelming majority: answer it when you can.
+    #[default]
+    Routine,
+    /// Jumps the queue and wears the Warning tint. For the window that closes.
+    Urgent,
+}
+
+impl ProposalSeverity {
+    /// The two values the wrapper accepts, in the order the snapshot lists
+    /// them — advertised so a co-commander learns the vocabulary by reading.
+    pub const NAMES: [&'static str; 2] = ["routine", "urgent"];
+
+    fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "routine" | "normal" => Some(ProposalSeverity::Routine),
+            "urgent" => Some(ProposalSeverity::Urgent),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ProposalSeverity::Routine => "routine",
+            ProposalSeverity::Urgent => "urgent",
+        }
+    }
+}
+
+/// The human's half of the argument: *why* the answer was no.
+///
+/// Three, because three is how many genuinely different next moves there are.
+/// A fourth would have to be a shade of one of these, and a co-commander that
+/// has to distinguish shades is back to guessing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VetoReason {
+    /// Good idea, wrong moment. The default, and what a plain `[Bksp]` means —
+    /// the softest answer belongs on the key pressed under pressure.
+    #[default]
+    NotNow,
+    /// Drop it. Etiquette only: nothing in this file refuses a re-proposal,
+    /// because a partner who could ban ideas would be a referee.
+    Never,
+    /// The idea is right and the aim is wrong. The one veto that is really a
+    /// request: send it again, pointed somewhere else.
+    WrongTarget,
+}
+
+impl VetoReason {
+    /// What the snapshot calls it. `snake_case` like every other wire enum
+    /// here, so a co-commander matches on it rather than parsing prose.
+    pub fn wire(self) -> &'static str {
+        match self {
+            VetoReason::NotNow => "not_now",
+            VetoReason::Never => "never",
+            VetoReason::WrongTarget => "wrong_target",
+        }
+    }
+
+    /// What the human's alert stack calls it.
+    pub fn phrase(self) -> &'static str {
+        match self {
+            VetoReason::NotNow => "not now",
+            VetoReason::Never => "never",
+            VetoReason::WrongTarget => "wrong target",
+        }
+    }
+
+    /// The etiquette in one clause, carried in the event line AND the wire.
+    ///
+    /// Duplicating the brief here is on purpose: a model reading `events`
+    /// mid-match should not need a second document to know whether it may try
+    /// again. Same reason `needs_proposal_error` prints the wrapper.
+    pub fn advice(self) -> &'static str {
+        match self {
+            VetoReason::NotNow => "re-propose when conditions change",
+            VetoReason::Never => "do not re-propose this match",
+            VetoReason::WrongTarget => "re-propose with a different target",
+        }
+    }
+
+    /// Every reason and its advice, for the snapshot to teach the vocabulary.
+    pub fn all() -> [VetoReason; 3] {
+        [
+            VetoReason::NotNow,
+            VetoReason::Never,
+            VetoReason::WrongTarget,
+        ]
+    }
+}
+
+/// How a proposal left the queue.
+///
+/// There is no `Pending` variant, and that absence is the wire design: being
+/// in `Copilot::pending` *is* pending. A status field that restates a list
+/// membership is a second source of truth, and the two disagree the first time
+/// somebody forgets to update one of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    Approved,
+    Vetoed(VetoReason),
+    /// Nobody answered inside [`PROPOSAL_TTL`]. Distinct from `Vetoed` because
+    /// silence and refusal call for opposite responses.
+    Expired,
+}
+
+impl Outcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            Outcome::Approved => "approved",
+            Outcome::Vetoed(_) => "vetoed",
+            Outcome::Expired => "expired",
+        }
+    }
+
+    pub fn reason(self) -> Option<VetoReason> {
+        match self {
+            Outcome::Vetoed(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// One answered proposal, kept just long enough for its proposer to read it.
+pub struct Resolution {
+    pub id: u32,
+    /// Game seconds at which it was answered.
+    pub at: f32,
+    /// The proposer's own note, echoed back — so a resolution identifies the
+    /// idea by what it was FOR, not just by a number the model has to have
+    /// remembered.
+    pub note: String,
+    pub severity: ProposalSeverity,
+    pub outcome: Outcome,
+}
+
 /// One directive awaiting the human's verdict.
 pub struct Proposal {
     /// Small, monotonic, and what the human's hotkeys and the co-commander's
@@ -197,6 +420,9 @@ pub struct Proposal {
     /// What this batch would disturb, in the human's terms: their squads,
     /// their recent orders. See `conflict_tags`.
     pub conflicts: Vec<String>,
+    /// Where it sits in the queue, and how the card is tinted. Never affects
+    /// what the batch is allowed to do — urgency buys attention, not trust.
+    pub severity: ProposalSeverity,
     pub proposed_at: f32,
     pub expires_at: f32,
     /// Somewhere on the map this is about, for `[Space]` to focus.
@@ -206,6 +432,32 @@ pub struct Proposal {
 impl Proposal {
     pub fn expires_in(&self, now: f32) -> f32 {
         (self.expires_at - now).max(0.0)
+    }
+
+    pub fn is_urgent(&self) -> bool {
+        self.severity == ProposalSeverity::Urgent
+    }
+}
+
+/// Where a newly arrived proposal goes: ahead of every routine one, behind
+/// every urgent one already waiting.
+///
+/// This is the whole of "urgent jumps the queue", and it is deliberately here
+/// rather than a sort at read time. Keeping `pending` permanently in ANSWER
+/// order means index 0 is the card `[Enter]` takes, the card the panel
+/// brightens, and the first entry of the snapshot's `proposals` — three
+/// readers that between them needed to learn nothing about severity.
+///
+/// Urgent-then-oldest, not urgent-only: two urgent proposals still answer in
+/// the order they were asked, because the second one did not become more
+/// important by being later.
+fn insert_index(pending: &[Proposal], severity: ProposalSeverity) -> usize {
+    match severity {
+        ProposalSeverity::Routine => pending.len(),
+        ProposalSeverity::Urgent => pending
+            .iter()
+            .position(|p| !p.is_urgent())
+            .unwrap_or(pending.len()),
     }
 }
 
@@ -217,9 +469,17 @@ pub struct Copilot {
     /// anything.
     pub seat: Option<Team>,
     pub policy: TrustPolicy,
-    /// Oldest first: index 0 is the one closest to lapsing, and the one the
-    /// human's approve/veto keys act on.
+    /// **Answer order**, which is urgent-then-oldest: index 0 is the one the
+    /// human's approve/veto keys act on, the one the panel brightens, and the
+    /// first entry of the snapshot's `proposals`. See `insert_index`.
     pub pending: Vec<Proposal>,
+    /// The last [`RESOLUTION_TAIL`] answered proposals, oldest first — the
+    /// only place a co-commander can read *why* a veto was a veto.
+    pub resolved: VecDeque<Resolution>,
+    /// `Some(delay)` when a scripted approver is standing in for the human
+    /// (`WC3_COPILOT_AUTOAPPROVE`). `None` in every real match, which is what
+    /// keeps this inert outside sims.
+    pub auto_approve: Option<f32>,
     next_id: u32,
 }
 
@@ -229,6 +489,8 @@ impl Copilot {
             seat: None,
             policy: TrustPolicy::from_env(),
             pending: Vec::new(),
+            resolved: VecDeque::new(),
+            auto_approve: auto_approve_from_env(),
             next_id: 1,
         }
     }
@@ -236,6 +498,14 @@ impl Copilot {
     /// Called by bridge.rs when it opens a copilot seat.
     pub fn seat(&mut self, team: Team) {
         self.seat = Some(team);
+    }
+
+    /// File an answered proposal in the tail, evicting the oldest.
+    fn resolve(&mut self, resolution: Resolution) {
+        if self.resolved.len() == RESOLUTION_TAIL {
+            self.resolved.pop_front();
+        }
+        self.resolved.push_back(resolution);
     }
 
     /// A seated co-command state holding `pending`, for tests in the modules
@@ -248,9 +518,31 @@ impl Copilot {
             seat: Some(team),
             policy: TrustPolicy::Split,
             pending,
+            resolved: VecDeque::new(),
+            auto_approve: None,
             next_id: 1,
         }
     }
+}
+
+/// Read the scripted approver's configuration once, at startup.
+///
+/// Off unless asked for, and a delay that cannot be negative — a "delay" of
+/// `-1` would be a rubber stamp wearing a stopwatch, which is the one thing
+/// this knob exists to avoid measuring.
+fn auto_approve_from_env() -> Option<f32> {
+    let on = std::env::var(AUTOAPPROVE_ENV)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if !on {
+        return None;
+    }
+    let delay = std::env::var(APPROVE_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .unwrap_or(DEFAULT_APPROVE_DELAY);
+    Some(delay)
 }
 
 /// One raw command off a copilot seat's `commands.json`, still JSON.
@@ -268,12 +560,39 @@ pub struct CopilotWire {
     pub raw: serde_json::Value,
 }
 
-/// The human's answer to a proposal. Written by ui.rs (hotkey or click); this
-/// file is the only reader.
+/// Yes, or no-and-here-is-why.
+///
+/// An enum rather than a `bool` plus an `Option<VetoReason>`, because "an
+/// approval that carries a veto reason" is not a state anything should have to
+/// decide what to do with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    Approve,
+    Veto(VetoReason),
+}
+
+/// The human's answer to a proposal. Written by ui.rs (hotkey or click) and by
+/// the scripted approver; this file is the only reader.
 #[derive(Event, Clone, Copy, Debug)]
 pub struct ProposalVerdict {
     pub id: u32,
-    pub approve: bool,
+    pub verdict: Verdict,
+}
+
+impl ProposalVerdict {
+    pub fn approve(id: u32) -> Self {
+        ProposalVerdict {
+            id,
+            verdict: Verdict::Approve,
+        }
+    }
+
+    pub fn veto(id: u32, reason: VetoReason) -> Self {
+        ProposalVerdict {
+            id,
+            verdict: Verdict::Veto(reason),
+        }
+    }
 }
 
 /// The `propose` wrapper, on the wire.
@@ -289,6 +608,12 @@ struct ProposeWire {
     commands: Vec<serde_json::Value>,
     #[serde(default)]
     note: String,
+    /// `"routine"` (default) or `"urgent"`. A `String` rather than a typed
+    /// enum so an unknown value produces an error naming both accepted words
+    /// instead of serde's "unknown variant" — the same reason every other
+    /// refusal here teaches the shape it wanted.
+    #[serde(default)]
+    severity: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +756,25 @@ fn ingest_wire(
                 .push(format!("{tag}: proposal carries no commands"));
             continue;
         }
+        // A misspelt severity sinks the whole proposal rather than quietly
+        // downgrading to routine. Silent downgrade is the worse failure: the
+        // proposer believes it jumped the queue, the human never sees it jump,
+        // and nothing anywhere says why.
+        let severity = match wrapper.severity.as_deref() {
+            None => ProposalSeverity::Routine,
+            Some(word) if word.trim().is_empty() => ProposalSeverity::Routine,
+            Some(word) => match ProposalSeverity::parse(word) {
+                Some(severity) => severity,
+                None => {
+                    errors.get_mut(team).push(format!(
+                        "{tag}: unknown severity '{}' — use \"routine\" (the \
+                         default) or \"urgent\" (jumps the queue)",
+                        word.trim()
+                    ));
+                    continue;
+                }
+            },
+        };
         if copilot.pending.len() >= MAX_PENDING {
             errors.get_mut(team).push(format!(
                 "{tag}: proposal queue full ({MAX_PENDING} pending) — \
@@ -467,24 +811,34 @@ fn ingest_wire(
         };
         // The arrival is news, on the channel the human already watches — and
         // the same push lands in the co-commander's own `events`, which is how
-        // it learns the proposal was received rather than dropped.
-        feed.push(
-            team,
-            now,
-            format!("copilot proposes #{id}: {note}"),
-            EventSeverity::Info,
-            pos,
+        // it learns the proposal was received rather than dropped. An urgent
+        // one arrives in the alert stack's Warning colour, so it is the louder
+        // line before the human's eye ever reaches the panel.
+        let (headline, loudness) = match severity {
+            ProposalSeverity::Routine => {
+                (format!("copilot proposes #{id}: {note}"), EventSeverity::Info)
+            }
+            ProposalSeverity::Urgent => (
+                format!("copilot proposes #{id} (urgent): {note}"),
+                EventSeverity::Warning,
+            ),
+        };
+        feed.push(team, now, headline, loudness, pos);
+        let at = insert_index(&copilot.pending, severity);
+        copilot.pending.insert(
+            at,
+            Proposal {
+                id,
+                note,
+                intents,
+                sentences,
+                conflicts,
+                severity,
+                proposed_at: now,
+                expires_at: now + PROPOSAL_TTL,
+                pos,
+            },
         );
-        copilot.pending.push(Proposal {
-            id,
-            note,
-            intents,
-            sentences,
-            conflicts,
-            proposed_at: now,
-            expires_at: now + PROPOSAL_TTL,
-            pos,
-        });
     }
 }
 
@@ -724,16 +1078,39 @@ fn resolve_proposals(
             continue;
         };
         let proposal = copilot.pending.remove(i);
-        if !verdict.approve {
+        if let Verdict::Veto(reason) = verdict.verdict {
+            // The reason AND what it asks for, on the line the co-commander
+            // reads anyway. A partner told only "vetoed" has to guess between
+            // three opposite next moves; this is the whole point of the bead.
             feed.push(
                 team,
                 now,
-                format!("proposal #{} vetoed: {}", proposal.id, proposal.note),
+                format!(
+                    "proposal #{} vetoed ({} - {}): {}",
+                    proposal.id,
+                    reason.phrase(),
+                    reason.advice(),
+                    proposal.note
+                ),
                 EventSeverity::Info,
                 None,
             );
+            copilot.resolve(Resolution {
+                id: proposal.id,
+                at: now,
+                note: proposal.note,
+                severity: proposal.severity,
+                outcome: Outcome::Vetoed(reason),
+            });
             continue;
         }
+        copilot.resolve(Resolution {
+            id: proposal.id,
+            at: now,
+            note: proposal.note.clone(),
+            severity: proposal.severity,
+            outcome: Outcome::Approved,
+        });
         for (j, intent) in proposal.intents.into_iter().enumerate() {
             submissions.write(SubmitIntent {
                 team,
@@ -762,15 +1139,15 @@ fn resolve_proposals(
     // Lapsing is a real answer, and it is the *safe* one: silence never spends
     // gold. It is reported rather than silent, because a co-commander that
     // cannot tell "vetoed" from "not seen" will either nag or give up.
-    let mut lapsed: Vec<(u32, String)> = Vec::new();
+    let mut lapsed: Vec<(u32, String, ProposalSeverity)> = Vec::new();
     copilot.pending.retain(|p| {
         if p.expires_at > now {
             return true;
         }
-        lapsed.push((p.id, p.note.clone()));
+        lapsed.push((p.id, p.note.clone(), p.severity));
         false
     });
-    for (id, note) in lapsed {
+    for (id, note, severity) in lapsed {
         feed.push(
             team,
             now,
@@ -778,6 +1155,46 @@ fn resolve_proposals(
             EventSeverity::Warning,
             None,
         );
+        copilot.resolve(Resolution {
+            id,
+            at: now,
+            note,
+            severity,
+            outcome: Outcome::Expired,
+        });
+    }
+}
+
+/// The scripted approver: a stand-in for an attentive human, for sims.
+///
+/// It exists because the proposal loop is the one part of co-command a
+/// headless run cannot exercise — approval is a human act, and headless has no
+/// human, so every proposal lapses and the measurement is of nothing. With
+/// this, an AI-vs-(AI+AI) match runs the *real* path: the same queue, the same
+/// compiler, the same errors, just with the verdict arriving on a timer
+/// instead of a keystroke.
+///
+/// It approves rather than judges, and that is a stated limitation, not an
+/// oversight. A scripted approver that vetoed on some heuristic would be
+/// measuring the heuristic. This one measures the only thing a human's
+/// presence reliably adds to the loop: **delay** — the seconds between a good
+/// idea and its execution, and whether the board still rewards it afterwards.
+///
+/// Queue order is honoured for free: `pending` is already urgent-then-oldest,
+/// so an urgent proposal is approved before a routine one that arrived first.
+fn auto_approve(
+    time: Res<Time>,
+    copilot: Res<Copilot>,
+    mut verdicts: EventWriter<ProposalVerdict>,
+) {
+    let Some(delay) = copilot.auto_approve else {
+        return;
+    };
+    let now = time.elapsed_secs();
+    for proposal in &copilot.pending {
+        if now - proposal.proposed_at >= delay {
+            verdicts.write(ProposalVerdict::approve(proposal.id));
+        }
     }
 }
 
@@ -917,7 +1334,7 @@ mod tests {
         );
 
         // The human says yes.
-        app.world_mut().send_event(ProposalVerdict { id: 1, approve: true });
+        app.world_mut().send_event(ProposalVerdict::approve(1));
         app.update();
 
         assert!(pending(&app).is_empty(), "answered proposals leave the queue");
@@ -945,7 +1362,8 @@ mod tests {
                 intent_id(unit)
             ),
         );
-        app.world_mut().send_event(ProposalVerdict { id: 1, approve: false });
+        app.world_mut()
+            .send_event(ProposalVerdict::veto(1, VetoReason::NotNow));
         app.update();
 
         assert!(pending(&app).is_empty());
@@ -956,6 +1374,137 @@ mod tests {
             .feed(Team::Human)
             .iter()
             .any(|e| e.message.contains("proposal #1 vetoed")));
+    }
+
+    /// **The negotiation, made two-sided.** A veto carries which of three
+    /// answers it was, and both channels a co-commander reads say so: the
+    /// event line it sees mid-match, and the resolution tail its snapshot
+    /// carries. Each reason is paired with what it asks for next, because the
+    /// three call for opposite moves and a partner that has to guess between
+    /// them will pick wrong and become a nag.
+    #[test]
+    fn a_veto_reason_reaches_both_the_feed_and_the_tail() {
+        let cases = [
+            (VetoReason::NotNow, "not now", "re-propose when conditions change"),
+            (VetoReason::Never, "never", "do not re-propose this match"),
+            (
+                VetoReason::WrongTarget,
+                "wrong target",
+                "re-propose with a different target",
+            ),
+        ];
+        for (reason, phrase, advice) in cases {
+            let mut app = co_app();
+            let unit = footman(&mut app, Vec3::ZERO);
+            wire(
+                &mut app,
+                &format!(
+                    r#"{{"type":"propose","note":"hit their siege","commands":[
+                         {{"type":"move","units":[{}],"x":5.0,"z":5.0}}]}}"#,
+                    intent_id(unit)
+                ),
+            );
+            app.world_mut().send_event(ProposalVerdict::veto(1, reason));
+            app.update();
+
+            let line = app
+                .world()
+                .resource::<GameEvents>()
+                .feed(Team::Human)
+                .iter()
+                .map(|e| e.message.clone())
+                .find(|m| m.contains("vetoed"))
+                .expect("the veto is announced");
+            assert!(
+                line.contains(phrase) && line.contains(advice),
+                "the feed must say which no it was AND what it asks for: {line}"
+            );
+
+            let copilot = app.world().resource::<Copilot>();
+            let resolution = copilot.resolved.back().expect("it left a resolution");
+            assert_eq!(resolution.id, 1);
+            assert_eq!(resolution.outcome, Outcome::Vetoed(reason));
+            assert_eq!(resolution.outcome.reason(), Some(reason));
+            assert_eq!(
+                resolution.note, "hit their siege",
+                "a resolution names the idea, not just its number"
+            );
+            assert!(copilot.pending.is_empty(), "it still left the queue");
+        }
+    }
+
+    /// The three terminal states are distinguishable in the tail, and only the
+    /// veto carries a reason — an approval with a veto reason is a state the
+    /// enum makes unrepresentable, and this is the wire half of that.
+    #[test]
+    fn every_terminal_state_lands_in_the_tail_and_only_vetoes_have_reasons() {
+        let mut app = co_app();
+        let unit = footman(&mut app, Vec3::ZERO);
+        let one = format!(
+            r#"{{"type":"propose","note":"n","commands":[
+                 {{"type":"move","units":[{}],"x":5.0,"z":5.0}}]}}"#,
+            intent_id(unit)
+        );
+        wire(&mut app, &one);
+        wire(&mut app, &one);
+        wire(&mut app, &one);
+        app.world_mut().send_event(ProposalVerdict::approve(1));
+        app.world_mut()
+            .send_event(ProposalVerdict::veto(2, VetoReason::Never));
+        app.update();
+        // #3 is left to the clock.
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(PROPOSAL_TTL + 1.0));
+        app.update();
+
+        let outcomes: Vec<Outcome> = app
+            .world()
+            .resource::<Copilot>()
+            .resolved
+            .iter()
+            .map(|r| r.outcome)
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                Outcome::Approved,
+                Outcome::Vetoed(VetoReason::Never),
+                Outcome::Expired
+            ],
+            "oldest first, one entry per answered proposal"
+        );
+        assert_eq!(outcomes[0].reason(), None, "an approval has no reason");
+        assert_eq!(outcomes[2].reason(), None, "nor does a lapse");
+    }
+
+    /// The tail is a tail: it forgets, so a long match cannot grow a snapshot
+    /// field without bound.
+    #[test]
+    fn the_resolution_tail_forgets_the_oldest() {
+        let mut app = co_app();
+        let unit = footman(&mut app, Vec3::ZERO);
+        let one = format!(
+            r#"{{"type":"propose","note":"n","commands":[
+                 {{"type":"move","units":[{}],"x":5.0,"z":5.0}}]}}"#,
+            intent_id(unit)
+        );
+        // MAX_PENDING at a time, answered immediately, until the tail overflows.
+        let mut id = 1;
+        while id <= RESOLUTION_TAIL as u32 + 2 {
+            wire(&mut app, &one);
+            app.world_mut()
+                .send_event(ProposalVerdict::veto(id, VetoReason::NotNow));
+            app.update();
+            id += 1;
+        }
+        let resolved = &app.world().resource::<Copilot>().resolved;
+        assert_eq!(resolved.len(), RESOLUTION_TAIL);
+        assert_eq!(
+            resolved.front().map(|r| r.id),
+            Some(3),
+            "the two oldest were evicted"
+        );
     }
 
     /// Silence is the safe answer, and it is still an answer: a proposal that
@@ -1295,5 +1844,223 @@ mod tests {
             }),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Severity
+    // -----------------------------------------------------------------------
+
+    fn propose(app: &mut App, unit: Entity, note: &str, severity: Option<&str>) {
+        let sev = severity
+            .map(|s| format!(r#","severity":"{s}""#))
+            .unwrap_or_default();
+        wire(
+            app,
+            &format!(
+                r#"{{"type":"propose","note":"{note}"{sev},"commands":[
+                     {{"type":"move","units":[{}],"x":5.0,"z":5.0}}]}}"#,
+                intent_id(unit)
+            ),
+        );
+    }
+
+    fn queue_ids(app: &App) -> Vec<u32> {
+        pending(app).iter().map(|p| p.id).collect()
+    }
+
+    /// **Urgency buys position, nothing else.** An urgent proposal lands ahead
+    /// of every routine one already waiting and behind every urgent one — so
+    /// the queue is permanently in ANSWER order and `[Enter]`, which still
+    /// just takes index 0, answers the most-urgent-oldest without ui.rs
+    /// knowing severity exists.
+    #[test]
+    fn urgent_proposals_jump_the_queue_and_keep_their_own_order() {
+        let mut app = co_app();
+        let unit = footman(&mut app, Vec3::ZERO);
+
+        propose(&mut app, unit, "expand north", None); // #1 routine
+        propose(&mut app, unit, "tech up", Some("routine")); // #2 routine
+        propose(&mut app, unit, "they are flanking", Some("urgent")); // #3 urgent
+        propose(&mut app, unit, "and the hero is low", Some("urgent")); // #4 urgent
+
+        assert_eq!(
+            queue_ids(&app),
+            vec![3, 4, 1, 2],
+            "urgent first, and among equals still oldest first"
+        );
+        assert!(pending(&app)[0].is_urgent());
+        assert_eq!(pending(&app)[2].severity, ProposalSeverity::Routine);
+
+        // What `[Enter]` takes is index 0 — the urgent one, not the oldest.
+        let top = pending(&app)[0].id;
+        assert_eq!(top, 3);
+        app.world_mut().send_event(ProposalVerdict::approve(top));
+        app.update();
+        assert_eq!(queue_ids(&app), vec![4, 1, 2]);
+    }
+
+    /// Urgency does not buy trust and does not buy room: the cap is about how
+    /// many questions a human can hold, and an urgent fifth is still a fifth.
+    #[test]
+    fn urgency_does_not_raise_the_cap() {
+        let mut app = co_app();
+        let unit = footman(&mut app, Vec3::ZERO);
+        for _ in 0..MAX_PENDING {
+            propose(&mut app, unit, "routine", None);
+        }
+        propose(&mut app, unit, "urgent", Some("urgent"));
+        assert_eq!(pending(&app).len(), MAX_PENDING);
+        assert!(errors(&app).iter().any(|e| e.contains("proposal queue full")));
+    }
+
+    /// Absent severity is routine; a misspelt one is refused with both words,
+    /// because a silent downgrade would leave the proposer believing it jumped
+    /// a queue it never jumped.
+    #[test]
+    fn severity_defaults_to_routine_and_a_typo_is_taught() {
+        let mut app = co_app();
+        let unit = footman(&mut app, Vec3::ZERO);
+
+        propose(&mut app, unit, "no severity given", None);
+        assert_eq!(pending(&app)[0].severity, ProposalSeverity::Routine);
+
+        propose(&mut app, unit, "typo", Some("urgnet"));
+        assert_eq!(pending(&app).len(), 1, "the typo did not queue");
+        let err = errors(&app).join(" | ");
+        assert!(
+            err.contains("unknown severity 'urgnet'")
+                && err.contains("routine")
+                && err.contains("urgent"),
+            "got {err}"
+        );
+        assert_eq!(ProposalSeverity::NAMES, ["routine", "urgent"]);
+    }
+
+    /// An urgent arrival is the louder line in the alert stack, so it is seen
+    /// before the human's eye ever reaches the panel.
+    #[test]
+    fn an_urgent_arrival_is_announced_loudly() {
+        let mut app = co_app();
+        let unit = footman(&mut app, Vec3::ZERO);
+        propose(&mut app, unit, "they are flanking", Some("urgent"));
+        let event = app
+            .world()
+            .resource::<GameEvents>()
+            .feed(Team::Human)
+            .iter()
+            .find(|e| e.message.contains("copilot proposes #1"))
+            .cloned()
+            .expect("announced");
+        assert!(event.message.contains("(urgent)"), "got {}", event.message);
+        assert_eq!(event.severity, EventSeverity::Warning);
+    }
+
+    // -----------------------------------------------------------------------
+    // The scripted approver
+    // -----------------------------------------------------------------------
+
+    /// **What makes co-command measurable.** Headless has no human, so without
+    /// this every proposal in a sim lapses and the loop is unobservable. The
+    /// approver waits its delay — that wait is the thing being modelled, since
+    /// delay is what a human's presence actually costs the loop — and then the
+    /// batch goes through the ordinary compiler onto a real unit, stamped by
+    /// the partner exactly as a keystroke approval would be.
+    #[test]
+    fn the_scripted_approver_waits_its_delay_then_approves() {
+        let mut app = co_app();
+        app.world_mut().resource_mut::<Copilot>().auto_approve = Some(3.0);
+        let unit = footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        propose(&mut app, unit, "take the ford", None);
+        assert_eq!(pending(&app).len(), 1);
+
+        // Just short of the delay: still waiting. A rubber stamp would have
+        // fired here, and a rubber stamp measures nothing.
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(2.5));
+        app.update();
+        assert_eq!(pending(&app).len(), 1, "not yet — the delay is the point");
+        assert_eq!(why_of(&app, unit), NO_PROVENANCE);
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.5));
+        app.update();
+        assert!(pending(&app).is_empty(), "answered once it came of age");
+        assert!(
+            matches!(app.world().entity(unit).get::<Order>(), Some(Order::Move(_))),
+            "and it went through the ordinary compiler"
+        );
+        // Stamped by the PARTNER, not by some third author — a scripted
+        // approver stands in for the human's keystroke, it does not become a
+        // new source, so the provenance a replay shows is the ordinary one.
+        assert_eq!(why_of(&app, unit), "order:move by copilot t=4");
+        assert_eq!(
+            app.world().resource::<Copilot>().resolved.back().map(|r| r.outcome),
+            Some(Outcome::Approved),
+            "a scripted verdict is a verdict, and lands in the same tail"
+        );
+    }
+
+    /// The approver honours the queue's answer order, so a sim measuring
+    /// urgency measures the same ordering a human would have answered in.
+    #[test]
+    fn the_scripted_approver_takes_the_urgent_one_first() {
+        let mut app = co_app();
+        app.world_mut().resource_mut::<Copilot>().auto_approve = Some(5.0);
+        let unit = footman(&mut app, Vec3::ZERO);
+
+        propose(&mut app, unit, "routine, asked first", None); // #1
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(4.0));
+        app.update();
+        propose(&mut app, unit, "urgent, asked second", Some("urgent")); // #2
+        assert_eq!(queue_ids(&app), vec![2, 1]);
+
+        // At t=5+ the routine one is of age and the urgent one is not, so the
+        // approver takes only what is ripe — and when both are, order holds.
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(1.5));
+        app.update();
+        assert_eq!(queue_ids(&app), vec![2], "#1 came of age and was answered");
+    }
+
+    /// Off unless asked for. A real match must never have a robot answering
+    /// for the human, so the default is the absence of this system's effect.
+    #[test]
+    fn the_scripted_approver_is_off_by_default() {
+        let mut app = co_app();
+        assert_eq!(
+            app.world().resource::<Copilot>().auto_approve,
+            None,
+            "co_app() builds the resource the way a real match does"
+        );
+        let unit = footman(&mut app, Vec3::ZERO);
+        propose(&mut app, unit, "spend it all", None);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(10.0));
+        app.update();
+        assert_eq!(pending(&app).len(), 1, "nobody answered, and nobody should");
+        assert_eq!(why_of(&app, unit), NO_PROVENANCE);
+    }
+
+    /// The wire vocabulary is a contract: the snapshot advertises these words
+    /// and a co-commander matches on them. Renaming one silently is the bug
+    /// this catches.
+    #[test]
+    fn the_reason_vocabulary_is_stable() {
+        let wire: Vec<&str> = VetoReason::all().iter().map(|r| r.wire()).collect();
+        assert_eq!(wire, vec!["not_now", "never", "wrong_target"]);
+        for reason in VetoReason::all() {
+            assert!(!reason.advice().is_empty(), "{reason:?} must ask for something");
+            assert!(!reason.phrase().is_empty());
+        }
+        assert_eq!(VetoReason::default(), VetoReason::NotNow);
+        assert_eq!(Outcome::Approved.name(), "approved");
+        assert_eq!(Outcome::Vetoed(VetoReason::Never).name(), "vetoed");
+        assert_eq!(Outcome::Expired.name(), "expired");
     }
 }
