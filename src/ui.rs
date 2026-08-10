@@ -707,12 +707,14 @@ fn build_cards() -> Vec<(u8, BuildingKind, KeyCode, &'static str)> {
     cards
 }
 
-/// Production hotkeys, by index into `trainable()`: Q, W, E. A Shop trains
-/// nothing, so its buy buttons reuse the same letters without colliding.
-const TRAIN_KEYS: [(KeyCode, &str); 3] = [
+/// Production hotkeys, by index into `trainable()`: Q, W, E, R. A Shop trains
+/// nothing, so its buy buttons reuse the same letters without colliding, and
+/// the hero's [R] lives on a unit selection, never a building one.
+const TRAIN_KEYS: [(KeyCode, &str); 4] = [
     (KeyCode::KeyQ, "Q"),
     (KeyCode::KeyW, "W"),
     (KeyCode::KeyE, "E"),
+    (KeyCode::KeyR, "R"),
 ];
 
 /// Inventory-slot hotkeys, by slot index.
@@ -745,7 +747,7 @@ fn hero_ability_ready(hero: &Hero, def: &AbilityDef) -> bool {
 ///   fighters             A S | G V P                       (5)
 ///   hero                 A S R | Z X (carried items) | G V P T   (<=9)
 ///   town hall            Q(Worker) W/E(hero class) C(CallToArms)
-///   barracks             Q(Footman) W(Archer) E(Raider)    (3)
+///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman)  (4)
 ///   workshop             Q(Catapult)                       (1)
 ///   shop                 Q(Potion) W(Portal)               (2)
 ///
@@ -962,6 +964,7 @@ fn unit_name(kind: UnitKind) -> &'static str {
         UnitKind::Catapult => "Catapult",
         UnitKind::Raider => "Raider",
         UnitKind::Priestess => "Priestess",
+        UnitKind::Spearman => "Spearman",
     }
 }
 

@@ -1484,8 +1484,12 @@ fn apply_batch(
                     errors.push(format!("cmd {i}: training queue full ({MAX_QUEUE})"));
                     continue;
                 }
-                // The Champion is priced by `hero_train_cost` (full, then revival).
-                let (cost_gold, cost_lumber) = if kind == UnitKind::Hero {
+                // Hero classes are priced by `hero_train_cost` (full, then
+                // revival) — every hero kind, not just the Champion: pricing
+                // the Priestess off her raw stats let a seat buy a revival at
+                // full price (or worse, a first hero cheaply) depending on the
+                // record. `is_hero_kind` is the same test economy.rs charges by.
+                let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
                     let (g, l, _) = hero_train_cost(records, me);
                     (g, l)
                 } else {
@@ -2156,4 +2160,42 @@ fn parse_item(name: &str) -> Option<ItemId> {
     ALL_ITEMS
         .into_iter()
         .find(|id| normalize_name(item_def(*id).name) == wanted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seat-facing surface is a projection of the catalog, not a list
+    /// maintained alongside it: a kind added to `ALL_UNIT_KINDS` and
+    /// `trainable()` becomes orderable over the bridge with no bridge change
+    /// at all. This is the property that lets both kinds of player — the one
+    /// reading a command card and the one reading `state.json` — discover new
+    /// content the same way, so it is worth a test rather than a comment.
+    #[test]
+    fn every_unit_kind_is_orderable_by_name() {
+        for kind in ALL_UNIT_KINDS {
+            assert_eq!(
+                parse_unit_kind(kind_name(kind)),
+                Some(kind),
+                "{} is in the catalog but not orderable",
+                kind_name(kind)
+            );
+        }
+        // Seats type what they like; names are normalized, not matched raw.
+        assert_eq!(parse_unit_kind("spearman"), Some(UnitKind::Spearman));
+        assert_eq!(parse_unit_kind("Spear Man"), Some(UnitKind::Spearman));
+        assert_eq!(parse_unit_kind("pikeman"), None);
+    }
+
+    /// ...and the Barracks really does offer it, so the order has somewhere
+    /// to land.
+    #[test]
+    fn barracks_trains_the_spearman() {
+        assert!(trainable(BuildingKind::Barracks).contains(&UnitKind::Spearman));
+        assert!(
+            unit_requires(UnitKind::Spearman).is_empty(),
+            "the tier-1 answer to cavalry must not itself be tech-gated"
+        );
+    }
 }

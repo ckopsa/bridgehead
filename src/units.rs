@@ -129,6 +129,9 @@ struct UnitAssets {
     raider_mount: Handle<Mesh>,
     raider_leg: Handle<Mesh>,
     raider_rider: Handle<Mesh>,
+    spearman_body: Handle<Mesh>,
+    spearman_shaft: Handle<Mesh>,
+    spearman_head: Handle<Mesh>,
     priestess_body: Handle<Mesh>,
     priestess_hood: Handle<Mesh>,
     priestess_staff: Handle<Mesh>,
@@ -213,6 +216,14 @@ fn setup_unit_assets(
         // their centre at -0.58 without punching through it.
         raider_leg: meshes.add(Cylinder::new(0.09, 0.34)),
         raider_rider: meshes.add(Capsule3d::new(0.19, 0.30)),
+        // Spearman: the tallest infantry silhouette and the thinnest — a
+        // narrow capsule under a spear that stands a full body-length above
+        // the head. At RTS camera distance the vertical line is the whole
+        // read: if you can see spears over the front rank, that rank is a
+        // wall, and you do not ride into it.
+        spearman_body: meshes.add(Capsule3d::new(0.25, 1.06)),
+        spearman_shaft: meshes.add(Cylinder::new(0.045, 1.75)),
+        spearman_head: meshes.add(Cone::new(0.10, 0.26)),
         // Priestess: slim robe, oversized hood, tall staff with a lit tip.
         // Total 1.60 = the kind's height, so she stands on the ground plane.
         priestess_body: meshes.add(Capsule3d::new(0.27, 1.06)),
@@ -244,6 +255,9 @@ fn unit_height(kind: UnitKind) -> f32 {
         // Mounted: long and low, rider's head about where a footman's is.
         UnitKind::Raider => 1.50,
         UnitKind::Priestess => 1.60,
+        // Taller than a Footman and much narrower — before the spear is even
+        // drawn, the silhouette says "reach, not shoulders".
+        UnitKind::Spearman => 1.56,
     }
 }
 
@@ -315,6 +329,7 @@ fn spawn_units(
             // faces where the unit faces); the dark mount is a child below it.
             UnitKind::Raider => assets.raider_rider.clone(),
             UnitKind::Priestess => assets.priestess_body.clone(),
+            UnitKind::Spearman => assets.spearman_body.clone(),
         };
         // Everyone wears their team's colour; the catapult is a wooden machine
         // that merely carries a painted panel (spawned as a child below).
@@ -400,6 +415,7 @@ fn spawn_units(
                 UnitKind::Catapult => "Catapult",
                 UnitKind::Raider => "Raider",
                 UnitKind::Priestess => "Priestess",
+                UnitKind::Spearman => "Spearman",
             }),
         ));
 
@@ -536,6 +552,24 @@ fn spawn_units(
                         ));
                     }
                 }
+                UnitKind::Spearman => {
+                    // The spear itself: a thin shaft held upright at the right
+                    // shoulder, deliberately overlong so a block of them reads
+                    // as a hedge from the RTS camera.
+                    parent.spawn((
+                        Mesh3d(assets.spearman_shaft.clone()),
+                        MeshMaterial3d(assets.wood_mat.clone()),
+                        Transform::from_xyz(0.30, 0.52, -0.04),
+                        UnitAccent,
+                    ));
+                    // Leaf-blade point on top of the shaft.
+                    parent.spawn((
+                        Mesh3d(assets.spearman_head.clone()),
+                        MeshMaterial3d(assets.metal_mat.clone()),
+                        Transform::from_xyz(0.30, 1.52, -0.04),
+                        UnitAccent,
+                    ));
+                }
                 UnitKind::Priestess => {
                     // Hood: a pale sphere pulled over the head.
                     parent.spawn((
@@ -579,14 +613,21 @@ fn handle_teleports(
     mut commands: Commands,
     mut events: EventReader<TeleportRequest>,
     nav: Res<NavGrid>,
-    mut units: Query<(Entity, &Unit, &Team, &Health, &mut Transform)>,
+    mut units: Query<(
+        Entity,
+        &Unit,
+        &Team,
+        &Health,
+        &mut Transform,
+        &mut GlobalTransform,
+    )>,
 ) {
     /// How far from the destination a passenger may be placed.
     const SPREAD: f32 = 3.0;
 
     for ev in events.read() {
         // The caster may have died between the request and now.
-        let Ok((_, _, center_team, center_health, center_tf)) = units.get(ev.center) else {
+        let Ok((_, _, center_team, center_health, center_tf, _)) = units.get(ev.center) else {
             continue;
         };
         if center_health.current <= 0.0 {
@@ -602,13 +643,13 @@ fn handle_teleports(
         // Snapshot the passenger list first (the query is borrowed mutably below).
         let riders: Vec<(Entity, Vec3)> = units
             .iter()
-            .filter(|(entity, _, unit_team, health, tf)| {
+            .filter(|(entity, _, unit_team, health, tf, _)| {
                 (**unit_team == team && health.current > 0.0
                     && Vec2::new(tf.translation.x - origin.x, tf.translation.z - origin.z).length()
                         <= ev.radius)
                     || *entity == ev.center
             })
-            .map(|(entity, _, _, _, tf)| {
+            .map(|(entity, _, _, _, tf, _)| {
                 let rel = Vec3::new(tf.translation.x - origin.x, 0.0, tf.translation.z - origin.z);
                 let len = rel.length();
                 let offset = if len > SPREAD { rel * (SPREAD / len) } else { rel };
@@ -633,8 +674,17 @@ fn handle_teleports(
                     }
                 }
             }
-            if let Ok((_, unit, _, _, mut tf)) = units.get_mut(entity) {
+            if let Ok((_, unit, _, _, mut tf, mut gt)) = units.get_mut(entity) {
                 tf.translation = Vec3::new(spot.x, unit_y(unit.kind), spot.z);
+                // Same hole as a fresh spawn, in reverse: Bevy only propagates
+                // Transform -> GlobalTransform in PostUpdate, so for the rest
+                // of THIS frame combat.rs (which reads positions through
+                // GlobalTransform) would still see the passenger standing
+                // where it used to be — a hero town-portalling out of a fight
+                // could be struck once at the position it had already left.
+                // A unit is a root entity, so its GlobalTransform simply IS
+                // its Transform; write it here and the hole never opens.
+                *gt = GlobalTransform::from(*tf);
             }
             // Whatever they were walking toward is on the other side of the map.
             commands
