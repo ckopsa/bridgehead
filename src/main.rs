@@ -9,6 +9,7 @@ mod copilot;
 mod data;
 mod doctrine;
 mod economy;
+mod hotkeys;
 mod intent;
 mod shared;
 mod terrain;

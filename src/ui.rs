@@ -42,6 +42,12 @@ use std::path::PathBuf;
 
 use crate::command::{CommandLink, PendingOrder};
 use crate::copilot::{Copilot, CopilotSet, ProposalVerdict, VetoReason, PROPOSAL_TTL};
+// The hotkey registry (hotkeys.rs) is the single table every binding on this
+// file's cards comes from. Nothing here writes a `KeyCode` literal for a card
+// button any more: `hotkeys::key(Hk::Whatever)` yields the key and
+// `hotkeys::key_caption` yields the tile caption, so a caption cannot drift
+// from the key that fires it.
+use crate::hotkeys::{self, Action as Hk};
 use crate::intent::IntentApply;
 use crate::shared::*;
 
@@ -71,14 +77,11 @@ const AUTOCAST_MIN_ENEMIES: u32 = 3;
 /// probe-only third), and three is exactly what the card has room for once the
 /// postures, the parameterised pair and the page toggle have taken their slots.
 const MAX_AUTOCAST_SLOTS: usize = 3;
-/// Hotkeys for those per-ability toggles, doctrine page only. Z/X/C are the
-/// item and Blacksmith keys on page ONE; a hotkey is per-card, and page two
-/// spends none of them.
-const AUTOCAST_KEYS: [(KeyCode, &str); MAX_AUTOCAST_SLOTS] = [
-    (KeyCode::KeyZ, "Z"),
-    (KeyCode::KeyX, "X"),
-    (KeyCode::KeyC, "C"),
-];
+// The keys for those per-ability toggles live in the registry as
+// `Hk::AutoCastSlot(n)` — Z/X/C, which are the item and Blacksmith letters on
+// the ORDERS card. Legal because the orders card and the doctrine card are
+// different contexts (see `hotkeys::Ctx`), and now checked there rather than
+// argued for here.
 
 /// Retreat thresholds the doctrine card's [F] steps through, in order. The
 /// coarse [V] toggle writes `FALLBACK_FRAC` and nothing else; this is the
@@ -231,7 +234,7 @@ const NOTIF_MAX_FRAC: f32 = 0.9;
 const NOTIF_ROW_HIT_H: f32 = NOTIF_ROW_H + NOTIF_FONT + NOTIF_GAP;
 /// Jump the camera to the newest alert, then the one before it, and so on.
 /// Space is free: letters are command hotkeys, arrows pan, `.` cycles workers.
-const NOTIF_FOCUS_KEY: KeyCode = KeyCode::Space;
+const NOTIF_FOCUS_KEY: KeyCode = hotkeys::FOCUS_ALERT;
 
 // --- Co-command: the proposal panel ----------------------------------------
 //
@@ -271,8 +274,8 @@ const PROP_CARD_HIT_H: f32 = 148.0;
 /// which copilot.rs keeps in answer order (urgent first, then oldest). Both
 /// keys are free: every letter is a command hotkey, Space focuses alerts, `.`
 /// cycles workers.
-const PROP_APPROVE_KEY: KeyCode = KeyCode::Enter;
-const PROP_VETO_KEY: KeyCode = KeyCode::Backspace;
+const PROP_APPROVE_KEY: KeyCode = hotkeys::APPROVE_PROPOSAL;
+const PROP_VETO_KEY: KeyCode = hotkeys::VETO_PROPOSAL;
 /// The co-commander's colour. Deliberately NOT one of the three severity
 /// colours: "my partner said this" must never read as "the game says this".
 const PROP_ACCENT: Color = Color::srgb(0.68, 0.63, 1.0);
@@ -293,6 +296,15 @@ pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
+        // The hotkey table is checked before a single system is registered: a
+        // debug build refuses to start a match whose command card has two
+        // buttons on one letter. Release builds skip it — the same table is
+        // proved by `hotkeys::the_registry_has_no_collision_in_any_card_context`
+        // in CI, and a shipped binary should not pay for the walk.
+        if let Err(clash) = hotkeys::validate() {
+            debug_assert!(false, "hotkey registry: {clash}");
+            error!("hotkey registry: {clash}");
+        }
         app.init_resource::<UiState>()
             .init_resource::<Notifications>()
             // `setup_fog` after `setup_ui`: it parents the minimap's fog layer
@@ -401,8 +413,15 @@ struct UiState {
     /// Control groups 1..3 — and, since `control_groups` submits the `squad`
     /// verb, the same sets doctrine.rs executes postures for.
     groups: HashMap<u8, Vec<Entity>>,
-    /// Which page of the command card is showing ([I] toggles).
+    /// Which MODE of the command card is showing ([I] toggles).
     page: CardPage,
+    /// Which OVERFLOW page within that mode is showing ([Tab] walks them).
+    ///
+    /// Separate from `page` because the two mean different things: `page` picks
+    /// a vocabulary, this picks a slice of one. Clamped by `paginate` every
+    /// frame, so a selection that shrinks under the player cannot leave the card
+    /// showing nothing.
+    card_page: usize,
     /// A posture waiting for the player to click its point on the ground.
     /// Same shape as `placement`: an armed mode the next left-click consumes.
     posture_place: Option<PostureArm>,
@@ -640,6 +659,8 @@ enum Slot {
     CmdKey(usize),
     CmdLabel(usize),
     CmdCost(usize),
+    /// The overflow-page indicator under the command card.
+    CmdPage,
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,8 +1296,10 @@ impl TemplateView {
 
 struct CmdEntry {
     action: CmdAction,
+    /// The key that fires this tile, from `hotkeys::REGISTRY` and nowhere else.
+    /// The tile's caption is derived from it at draw time by
+    /// `hotkeys::key_caption`, so there is no second copy to drift.
     key: KeyCode,
-    hotkey: &'static str,
     label: String,
     /// Small cost caption under the label ("135g", "40mp", ...).
     cost: String,
@@ -1294,11 +1317,10 @@ struct CmdEntry {
 }
 
 impl CmdEntry {
-    fn plain(action: CmdAction, key: KeyCode, hotkey: &'static str, label: &str) -> Self {
+    fn plain(action: CmdAction, key: KeyCode, label: &str) -> Self {
         CmdEntry {
             action,
             key,
-            hotkey,
             label: label.to_string(),
             cost: String::new(),
             afford: None,
@@ -1515,144 +1537,22 @@ struct ShopState {
     tier: TechTier,
 }
 
-/// Where a building sits on the worker's build card: `(slot, key, caption)`,
-/// or `None` for a kind the player may not place directly. This exhaustive
-/// match is the ONLY thing a new `BuildingKind` has to declare here — cost,
-/// name and tech gating all come from the shared tables via `build_cards`.
+/// Every placeable building, in card order, with the key that places it.
 ///
-/// Free letters only — but "free" is a question about THIS CARD, not about the
-/// file. Every letter A-Z is now spoken for somewhere in ui.rs, so the test a
-/// new build card has to pass is narrower and more useful: no collision with
-/// anything that can appear on a card that also has build buttons.
+/// Both facts come from `hotkeys::REGISTRY`: the `Hk::Build(kind)` rows ARE the
+/// card's left-to-right order, and the key beside each one is the binding. A new
+/// `BuildingKind` therefore declares its position and its letter once, in one
+/// table, and everything else — cost, name, tech gating — still comes from the
+/// shared tables.
 ///
-/// A build card is only ever drawn for a selection containing a WORKER, and
-/// such a selection can also carry a hero. So the occupied set here is:
-///   A S (orders) · B F H O L K N (the other builds) · G V P (doctrine quick
-///   toggles) · I (the doctrine page toggle) · R Y D (hero abilities) ·
-///   Z X (carried items) · T (auto-cast)
-/// plus Esc / '.' / Ctrl+1-3; shared.rs owns F1-F4, ai.rs F9, the surrender
-/// hotkey F12, and terrain.rs the arrow keys.
-///
-/// What that leaves is C E J M Q U W — every one of them a letter that only
-/// ever appears on a card for a selection of exactly ONE BUILDING (production
-/// hotkeys Q W E, building abilities C J M, the tier-up U). A worker selection
-/// and a single-building selection are mutually exclusive by construction, so
-/// reusing one costs nothing. `SHOP_KEYS` already relies on the same disjointness
-/// in the other direction — it puts the production letters on a Shop, which
-/// trains nothing.
-///
-/// The Arcane Sanctum spent [M] out of that pool on the same argument the
-/// Blacksmith spent [C]: both are building-ability letters, and a building's
-/// ability buttons never share a card with build buttons. That takes the pool
-/// down to E J Q U W, and the card to nine build entries — which is the whole
-/// twelve-slot budget once `[A] [S]` and the page toggle are counted, so a
-/// worker card no longer keeps even one doctrine quick toggle. That is the
-/// documented order of sacrifice (see `command_entries`) and it costs nothing
-/// the player cannot reach: every toggle lives on page two behind [I], while a
-/// building missing from the card has no route in at all.
-fn build_card_slot(kind: BuildingKind) -> Option<(u8, KeyCode, &'static str)> {
-    match kind {
-        BuildingKind::Barracks => Some((0, KeyCode::KeyB, "B")),
-        BuildingKind::Farm => Some((1, KeyCode::KeyF, "F")),
-        BuildingKind::TownHall => Some((2, KeyCode::KeyH, "H")),
-        BuildingKind::Tower => Some((3, KeyCode::KeyO, "O")),
-        BuildingKind::Wall => Some((4, KeyCode::KeyL, "L")),
-        BuildingKind::Workshop => Some((5, KeyCode::KeyK, "K")),
-        BuildingKind::Shop => Some((6, KeyCode::KeyN, "N")),
-        // [C], for bla(C)ksmith — a building-ability letter, and building
-        // abilities never share a card with build buttons (see above).
-        //
-        // It was [I] until the doctrine-page bead claimed that letter for the
-        // page toggle, which IS on a worker card. Two things wanting [I] on the
-        // same selection is the one collision this table exists to prevent, and
-        // the page toggle wins it: a build card has seven siblings the player
-        // can learn the pattern from, while [I] is the only route to postures
-        // and templates at all.
-        //
-        // Slot 7 is separately what pushed the command card from 3x3 to 4x3
-        // (see `CMD_SLOTS`): eight placeable kinds plus `[A] [S]` is ten
-        // entries before doctrine gets a look in, and at nine slots the
-        // truncation at the end of `command_entries` ate the last build card.
-        BuildingKind::Blacksmith => Some((7, KeyCode::KeyC, "C")),
-        // [M], for Magic — a building-ability letter, and building abilities
-        // never share a card with build buttons (see above). It was [I] on this
-        // bead's branch until the doctrine-page toggle claimed that letter on
-        // the very card a build button lives on; [M] is the same trade the
-        // Blacksmith made one slot earlier.
-        BuildingKind::Sanctum => Some((8, KeyCode::KeyM, "M")),
-        // Reached by upgrading a hall, never by placing one — no build card,
-        // and `build_cards` filters on `building_placeable` besides.
-        BuildingKind::Keep | BuildingKind::Castle => None,
-    }
+/// The old version of this function carried a thirty-line proof that [C] and
+/// [M] were free on a worker's card because building-ability letters never
+/// share a card with build buttons. The proof was right; it is now
+/// `hotkeys::validate()`, which checks it for every card rather than for the
+/// two the author thought of.
+fn build_cards() -> Vec<(BuildingKind, KeyCode)> {
+    hotkeys::build_order()
 }
-
-/// Every placeable building, in card order — walked from the shared kind table
-/// so new content appears on the card as soon as it has a slot.
-fn build_cards() -> Vec<(u8, BuildingKind, KeyCode, &'static str)> {
-    let mut cards: Vec<(u8, BuildingKind, KeyCode, &'static str)> = ALL_BUILDING_KINDS
-        .into_iter()
-        .filter(|kind| building_placeable(*kind))
-        .filter_map(|kind| {
-            build_card_slot(kind).map(|(slot, key, hotkey)| (slot, kind, key, hotkey))
-        })
-        .collect();
-    cards.sort_by_key(|(slot, ..)| *slot);
-    cards
-}
-
-/// Production hotkeys, by index into `trainable()`: Q, W, E, R, T. A Shop trains
-/// nothing, so its buy buttons reuse the same letters without colliding, and
-/// the hero's [R] lives on a unit selection, never a building one.
-///
-/// [T] joined when the Castle-gated Knight took the Barracks' fifth slot. It is
-/// the next key along the same keyboard row, which keeps the row unbroken, and
-/// the only other [T] in the game is the hero's Auto-Slam toggle — a toggle
-/// that only exists on a UNIT selection, where no train button is ever drawn.
-/// Same reasoning as the Shop's buy buttons: production hotkeys collide with
-/// nothing because a building selection and a unit selection are disjoint
-/// cards.
-const TRAIN_KEYS: [(KeyCode, &str); 5] = [
-    (KeyCode::KeyQ, "Q"),
-    (KeyCode::KeyW, "W"),
-    (KeyCode::KeyE, "E"),
-    (KeyCode::KeyR, "R"),
-    (KeyCode::KeyT, "T"),
-];
-
-/// Inventory-slot hotkeys, by slot index.
-const ITEM_KEYS: [(KeyCode, &str); 2] = [(KeyCode::KeyZ, "Z"), (KeyCode::KeyX, "X")];
-
-/// Shop-shelf hotkeys, by index into `ALL_ITEMS`. Q W E R are the production
-/// letters (a Shop trains nothing, so they never collide), and [I] — the one
-/// letter `build_card_slot`'s roster left unclaimed — takes the fifth rung.
-const SHOP_KEYS: [(KeyCode, &str); 5] = [
-    (KeyCode::KeyQ, "Q"),
-    (KeyCode::KeyW, "W"),
-    (KeyCode::KeyE, "E"),
-    (KeyCode::KeyR, "R"),
-    (KeyCode::KeyI, "I"),
-];
-
-/// Hero ability hotkeys, by ability slot. [R] is where the one hero ability
-/// has always lived, so a Champion or Priestess with a single spell is
-/// unchanged; a second and third spell get [Y] and [U].
-const HERO_ABILITY_KEYS: [(KeyCode, &str); 3] = [
-    (KeyCode::KeyR, "R"),
-    (KeyCode::KeyY, "Y"),
-    // Slot 3 was [U] until the upgrade bead claimed U for the tier-up button.
-    // A building's tier-up and a hero's third spell are never on the same card
-    // (one needs a building selected, the other a hero), but a hotkey the
-    // player has to think about is already broken — so this moved to [D].
-    (KeyCode::KeyD, "D"),
-];
-
-/// Building ability hotkeys, by ability slot: [C] (Call to Arms today), then
-/// [J] and [M].
-const BUILDING_ABILITY_KEYS: [(KeyCode, &str); 3] = [
-    (KeyCode::KeyC, "C"),
-    (KeyCode::KeyJ, "J"),
-    (KeyCode::KeyM, "M"),
-];
 
 /// Ability button caption: the ability's own name, plus the countdown while it
 /// is cooling down. Works for hero and building casters alike.
@@ -1709,41 +1609,38 @@ fn ability_slots(
         .collect()
 }
 
-/// The contextual command set for the current selection. Both the keyboard and
-/// the command card drive off this list, so a click and a key press run the
-/// exact same code path.
+/// The contextual command set for the current selection — the WHOLE of it, in
+/// priority order and of any length. Both the keyboard and the command card
+/// drive off this list, so a click and a key press run the exact same code path.
 ///
-/// Slot budget (the card is 4x3 = `CMD_SLOTS`). Layout per selection type:
-///   worker(s)            A S | B F H O L K N C | (1 toggle) I   (12)
-///   worker(s) + hero     A S | B F H O L K N C | (1 toggle) I   (12, [R Z X] dropped)
+/// Layout per selection type (the card shows `CMD_SLOTS` = 4x3 at a time; see
+/// `paginate` for what happens past that):
+///   worker(s)            A S | B F H O L K N C M | I ‖ G V P
+///   worker(s) + hero     ...the same, then R Y D, Z X, T on the overflow page
 ///   fighters             A S | G V P | I                    (6)
 ///   hero                 A S R | Z X (carried items) | G V P T | I  (<=12)
 ///   town hall            Q(Worker) W/E(hero class) C(CallToArms) U | I
 ///   barracks             Q(Footman) W(Archer) E(Raider) R(Spearman) T(Knight) | I  (6)
 ///   workshop             Q(Catapult) W(Gryphon Rider) | I     (3)
-///   shop                 Q W E R I — the shelf, five rungs (see `SHOP_KEYS`)
+///   shop                 Q W E R T — the shelf, five rungs (`Hk::ShopSlot`)
 ///   blacksmith           Q(Attack) W(Armor)                  (2)
 ///
-/// The card was 3x3 until the Blacksmith became the EIGHTH placeable kind.
-/// `[A] [S]` plus eight build cards is ten entries before doctrine is even
-/// considered, so at nine slots the `truncate` below silently ate the last
-/// build card — which is the worst possible way for a building to become
-/// unbuildable. It grew a fourth COLUMN rather than a fourth row because the
-/// console is height-bound (`CONSOLE_H` 200px against three 52px rows plus gaps
-/// and margins), while the selection panel next to it is `flex_grow` and has
-/// 52px of width to give.
+/// **Nothing is dropped any more.** This function used to end in a `truncate` to
+/// `CMD_SLOTS` with a hand-written order of sacrifice — [P Priority] yields
+/// first, then [V Fallback], then [G Guard] — because the card physically could
+/// not show more than twelve tiles. That truncate once silently ate the eighth
+/// build card, which is the worst possible way for a building to become
+/// unbuildable, and the ninth building spent the last of the budget: a worker
+/// card kept no quick toggle at all. Paging replaces the whole mechanism. The
+/// list comes back complete and in priority order, `paginate` decides which
+/// slice is on screen, and the overflow is one [Tab] away instead of gone.
 ///
-/// Build commands never yield — a greyed [K Workshop] is how the player learns
-/// what unlocks it, and it is the only route to a building at all. The doctrine
-/// toggles give way first, in the order [P Priority] (a preference),
-/// [V Fallback], [G Guard]; [T Auto-Cast] is kept longest because it is the
-/// only caster-specific toggle with no other route in. One slot is always held
-/// back for [I], the page toggle, since postures and templates have no other
-/// route in either. With NINE buildable kinds a worker card spends its whole
-/// twelve-slot budget on the classic build layout plus [I], so the quick
-/// toggles drop off it entirely — they all live on page two behind [I], while
-/// a building missing from the card has no route in at all. A worker+hero
-/// selection still loses the hero's [R] and item buttons, one deselect away.
+/// The old priority order survives as ORDER, which is all it ever really was:
+/// orders, then builds (never yield — a greyed [K Workshop] is how the player
+/// learns what unlocks it, and it is the only route to a building at all), then
+/// the hero's own buttons, then the quick doctrine toggles, which are the things
+/// that land on page two when something has to. The page toggle is last and is
+/// pinned to every page by `paginate`.
 ///
 /// Abilities and items are generic: the hero button reads `ability_of_unit`, so
 /// a Champion shows [R Slam 40mp] and a Priestess [R Heal 45mp] with no code
@@ -1769,20 +1666,18 @@ fn command_entries(
     if own_units > 0 {
         out.push(CmdEntry::plain(
             CmdAction::AttackMove,
-            KeyCode::KeyA,
-            "A",
+            bind(Hk::AttackMove),
             "Attack",
         ));
-        out.push(CmdEntry::plain(CmdAction::Stop, KeyCode::KeyS, "S", "Stop"));
+        out.push(CmdEntry::plain(CmdAction::Stop, bind(Hk::Stop), "Stop"));
     }
 
-    // Builds first: they never yield (see above), so with a full seven kinds a
-    // worker selection always shows the classic layout even when a hero got
-    // caught in the drag box.
+    // Builds first: they never yield (see above), so a worker selection always
+    // shows the classic layout even when a hero got caught in the drag box.
     if has_worker {
-        for (_, kind, key, hotkey) in build_cards() {
+        for (kind, key) in build_cards() {
             out.push(
-                CmdEntry::plain(CmdAction::Place(kind), key, hotkey, building_name(kind))
+                CmdEntry::plain(CmdAction::Place(kind), key, building_name(kind))
                     // ...after `priced`: an unmet requirement takes the cost line.
                     .priced_as_building(kind)
                     .requires(building_requires(kind), completed),
@@ -1791,15 +1686,14 @@ fn command_entries(
     }
 
     // The hero's abilities, whichever class it is and however many it has
-    // unlocked: one button per slot, in slot order, on [R] [Y] [U].
+    // unlocked: one button per slot, in slot order, on [R] [Y] [D].
     for slot in &hero.abilities {
-        let Some((key, hotkey)) = HERO_ABILITY_KEYS.get(slot.index).copied() else {
+        let Some(key) = hotkeys::key(Hk::HeroAbility(slot.index)) else {
             continue;
         };
         let mut entry = CmdEntry::plain(
             CmdAction::CastHero(slot.index),
             key,
-            hotkey,
             &ability_label(&slot.def, slot.cooldown),
         );
         // A mana-less caster (the Sorcerer pays only a cooldown) would
@@ -1814,14 +1708,16 @@ fn command_entries(
 
     // Carried consumables: one button per filled slot, so an empty inventory
     // costs the card nothing.
-    for (slot, (key, hotkey)) in ITEM_KEYS.iter().copied().enumerate() {
-        let Some(Some(item)) = hero.items.get(slot).copied() else {
+    for slot in 0..hero.items.len() {
+        let (Some(key), Some(Some(item))) = (
+            hotkeys::key(Hk::ItemSlot(slot)),
+            hero.items.get(slot).copied(),
+        ) else {
             continue;
         };
         out.push(CmdEntry::plain(
             CmdAction::UseSlot(slot),
             key,
-            hotkey,
             item_name(item),
         ));
     }
@@ -1829,7 +1725,7 @@ fn command_entries(
     if own_units == 0 {
         if let Some((kind, true)) = single_building {
             for (i, unit) in trainable(kind).iter().enumerate() {
-                let Some((key, hotkey)) = TRAIN_KEYS.get(i).copied() else {
+                let Some(key) = hotkeys::key(Hk::TrainSlot(i)) else {
                     continue;
                 };
                 if is_hero_kind(*unit) {
@@ -1842,9 +1738,8 @@ fn command_entries(
                     let Some((gold, lumber, label, enabled)) = train.offer(*unit) else {
                         continue;
                     };
-                    let mut entry =
-                        CmdEntry::plain(CmdAction::Train(*unit), key, hotkey, label)
-                            .priced(gold, lumber);
+                    let mut entry = CmdEntry::plain(CmdAction::Train(*unit), key, label)
+                        .priced(gold, lumber);
                     if !enabled {
                         entry.enabled = false;
                         entry.cost = format!("slots {}/{}", train.used, train.slots);
@@ -1853,13 +1748,8 @@ fn command_entries(
                 } else {
                     let s = unit_stats(*unit);
                     out.push(
-                        CmdEntry::plain(
-                            CmdAction::Train(*unit),
-                            key,
-                            hotkey,
-                            unit_name(*unit),
-                        )
-                        .priced(s.cost_gold, s.cost_lumber)
+                        CmdEntry::plain(CmdAction::Train(*unit), key, unit_name(*unit))
+                            .priced(s.cost_gold, s.cost_lumber)
                         // No unit has a tech requirement today; wiring it here
                         // means the first one that does is gated for free.
                         .requires(unit_requires(*unit), completed),
@@ -1869,13 +1759,12 @@ fn command_entries(
 
             // The building's own active abilities (TownHall: Call to Arms).
             for slot in &hero.building_abilities {
-                let Some((key, hotkey)) = BUILDING_ABILITY_KEYS.get(slot.index).copied() else {
+                let Some(key) = hotkeys::key(Hk::BuildingAbility(slot.index)) else {
                     continue;
                 };
                 let mut entry = CmdEntry::plain(
                     CmdAction::CastBuilding(slot.index),
                     key,
-                    hotkey,
                     &ability_label(&slot.def, slot.cooldown),
                 );
                 entry.enabled = slot.ready;
@@ -1893,13 +1782,12 @@ fn command_entries(
             // cost caption is what distinguishes them, because a player who
             // pressed [Q] and got nothing deserves to be told why.
             for (i, r) in hero.research.iter().enumerate() {
-                let Some((key, hotkey)) = TRAIN_KEYS.get(i).copied() else {
+                let Some(key) = hotkeys::key(Hk::TrainSlot(i)) else {
                     continue;
                 };
                 let mut entry = CmdEntry::plain(
                     CmdAction::Research(r.kind),
                     key,
-                    hotkey,
                     // The level shown is the one this button BUYS, so the card
                     // reads as a purchase rather than as a status line.
                     &match (r.in_progress, r.next) {
@@ -1932,15 +1820,14 @@ fn command_entries(
                 out.push(entry);
             }
 
-            // Tier up in place. [U] because it is the last free letter that
-            // says what it does; the card has room here because a hall spends
-            // at most four slots on training and Call to Arms.
+            // Tier up in place, on [U] (`Hk::TierUp`) because it is the letter
+            // that says what it does; the card has room here because a hall
+            // spends at most four slots on training and Call to Arms.
             if let Some((to, gold, lumber)) = hero.upgrade {
                 out.push(
                     CmdEntry::plain(
                         CmdAction::Upgrade(to),
-                        KeyCode::KeyU,
-                        "U",
+                        bind(Hk::TierUp),
                         &format!("Upgrade: {}", building_name(to)),
                     )
                     .priced(gold, lumber),
@@ -1951,7 +1838,7 @@ fn command_entries(
             // full inventory, or with an empty purse.
             if let Some(shop) = hero.shop {
                 for (i, item) in ALL_ITEMS.iter().enumerate() {
-                    let Some((key, hotkey)) = SHOP_KEYS.get(i).copied() else {
+                    let Some(key) = hotkeys::key(Hk::ShopSlot(i)) else {
                         continue;
                     };
                     let def = item_def(*item);
@@ -1964,7 +1851,7 @@ fn command_entries(
                     } else {
                         format!("{} {}", item_name(*item), def.tier.name())
                     };
-                    let mut entry = CmdEntry::plain(CmdAction::Buy(*item), key, hotkey, &caption)
+                    let mut entry = CmdEntry::plain(CmdAction::Buy(*item), key, &caption)
                         .priced(def.cost_gold, 0);
                     entry.enabled = shop.hero && shop.room && unlocked;
                     out.push(entry);
@@ -1973,65 +1860,157 @@ fn command_entries(
         }
     }
 
-    // --- doctrine toggles (appended: the classic layout keeps its slots) ---
+    // --- doctrine toggles (appended last, so they are what pages) ----------
+    //
+    // They used to be DROPPED here, in a documented order of sacrifice, because
+    // the card could not grow. Appending them last preserves the same priority —
+    // a worker card still opens on the classic build layout, and the toggles are
+    // what lands on the overflow page — without the part where a control
+    // vanished. Every one of them also has a page-two equivalent behind [I],
+    // which is why they were the right things to push down in the first place.
     if own_units > 0 {
-        let mut doctrine = vec![
-            CmdEntry::plain(CmdAction::ToggleGuard, KeyCode::KeyG, "G", "Guard")
+        out.push(
+            CmdEntry::plain(CmdAction::ToggleGuard, bind(Hk::QuickGuard), "Guard")
                 .active(doc.guard_active()),
-            CmdEntry::plain(CmdAction::ToggleFallback, KeyCode::KeyV, "V", "Fallback")
-                .active(doc.fallback_active()),
+        );
+        out.push(
+            CmdEntry::plain(
+                CmdAction::ToggleFallback,
+                bind(Hk::QuickFallback),
+                "Fallback",
+            )
+            .active(doc.fallback_active()),
+        );
+        out.push(
             CmdEntry::plain(
                 CmdAction::CyclePriority,
-                KeyCode::KeyP,
-                "P",
+                bind(Hk::QuickPriority),
                 doc.prio.label(),
             )
             .active(doc.prio != PrioPreset::None),
-        ];
+        );
         if doc.heroes > 0 {
-            doctrine.push(
-                CmdEntry::plain(CmdAction::ToggleAutoCast, KeyCode::KeyT, "T", "Auto-Cast")
-                    .active(doc.autocast_active()),
+            out.push(
+                CmdEntry::plain(
+                    CmdAction::ToggleAutoCast,
+                    bind(Hk::QuickAutoCast),
+                    "Auto-Cast",
+                )
+                .active(doc.autocast_active()),
             );
         }
-        // Worker selections push past the 3x3 card (A S + B F H O L = 7, or 8
-        // with a hero's [R Slam]), so the toggles yield in the documented
-        // order until what is left fits. See the layout table above.
-        const YIELD_ORDER: [CmdAction; 3] = [
-            CmdAction::CyclePriority,
-            CmdAction::ToggleFallback,
-            CmdAction::ToggleGuard,
-        ];
-        // One slot is held back for [I]: it is the only route to postures,
-        // templates and the parameterised controls, so it outranks every
-        // quick preset that has a page-two equivalent anyway.
-        let room = CMD_SLOTS.saturating_sub(out.len()).saturating_sub(1);
-        for dropped in YIELD_ORDER {
-            if doctrine.len() <= room {
-                break;
-            }
-            if let Some(i) = doctrine.iter().position(|e| e.action == dropped) {
-                doctrine.remove(i);
-            }
-        }
-        doctrine.truncate(room);
-        out.extend(doctrine);
     }
 
-    // The page toggle, last on the card and last to yield. A worker selection
-    // spends all nine slots on the classic build layout and therefore loses it
-    // — one deselect away, exactly like the toggles it sits with.
-    if (own_units > 0 || card.tmpl.capable) && out.len() < CMD_SLOTS {
+    // The mode toggle, always last and never dropped: `paginate` pins it to the
+    // final slot of EVERY page, so [I] is in the same place whatever the card is
+    // showing. It is the only route to postures and templates.
+    if own_units > 0 || card.tmpl.capable {
         out.push(CmdEntry::plain(
             CmdAction::TogglePage,
-            KeyCode::KeyI,
-            "I",
+            bind(Hk::ModeToggle),
             "Doctrine",
         ));
     }
-
-    out.truncate(CMD_SLOTS);
     out
+}
+
+/// The key bound to an action that MUST be bound.
+///
+/// Every call site here names a fixed action ("attack-move", "the mode
+/// toggle"), not an indexed slot, so a missing binding is a broken registry
+/// rather than a card that ran out of rungs — `hotkeys::validate` and
+/// `no_action_is_registered_twice` both fail loudly first. The fallback keeps a
+/// release build drawing a card instead of panicking mid-match; it is
+/// unreachable in any tested configuration.
+fn bind(action: Hk) -> KeyCode {
+    match hotkeys::key(action) {
+        Some(key) => key,
+        None => {
+            debug_assert!(false, "{action:?} has no binding in hotkeys::REGISTRY");
+            KeyCode::Escape
+        }
+    }
+}
+
+/// One page of the command card: the tiles to draw, and how many pages there
+/// are in total.
+struct CardPageView<'a> {
+    tiles: Vec<&'a CmdEntry>,
+    /// Zero-based, already clamped into range.
+    page: usize,
+    /// Always at least 1.
+    pages: usize,
+}
+
+/// Slice a card's entries into the `CMD_SLOTS` tiles that page `page` shows.
+///
+/// # Paging semantics
+///
+/// The card pages in two different senses, and they get deliberately different
+/// rules. Both are validated (`hotkeys::validate`, and the systematic card test
+/// in this file).
+///
+/// **Modes** — the orders card and the doctrine card, flipped with [I]. These
+/// are different vocabularies for the same selection, so the MODE IS PART OF THE
+/// CONTEXT and keys repeat across it on purpose: [G] is Guard on the orders card
+/// and the leash radius on the doctrine card, [T] is Auto-Cast and Stand Down.
+/// The mode toggle is pinned to the last slot of every page and the hint line
+/// names the mode you are on, which is what makes the repeat legible.
+///
+/// **Overflow pages** — one vocabulary that ran out of tiles, walked with [Tab].
+/// These are the SAME context, so every key across them is unique, and because
+/// they are, *a hotkey stays live on every overflow page*: `command_input`
+/// dispatches against the whole entry list, not against the visible slice. Only
+/// the tiles move; the keyboard never does. That is the whole reason to prefer
+/// overflow paging to the old order-of-sacrifice truncation — a player who has
+/// learned [K Workshop] never has to know which page it is on.
+///
+/// The pinned mode toggle costs one slot per page, leaving eleven for content:
+/// exactly the budget a nine-building worker card already spent (`A S` + nine
+/// builds), so today's cards page identically to how they looked before.
+fn paginate(entries: &[CmdEntry], page: usize) -> CardPageView<'_> {
+    // The trailing mode toggle is pinned rather than paged. It is emitted last
+    // by `command_entries`/`doctrine_entries` precisely so it can be peeled off
+    // here without a second list.
+    let pinned = entries
+        .last()
+        .filter(|e| e.action == CmdAction::TogglePage)
+        .is_some();
+    let content = &entries[..entries.len() - usize::from(pinned)];
+    let per_page = CMD_SLOTS - usize::from(pinned);
+    let pages = content.len().div_ceil(per_page).max(1);
+    let page = page.min(pages - 1);
+    let mut tiles: Vec<&CmdEntry> = content
+        .iter()
+        .skip(page * per_page)
+        .take(per_page)
+        .collect();
+    if pinned {
+        tiles.extend(entries.last());
+    }
+    CardPageView { tiles, page, pages }
+}
+
+/// The page indicator drawn under the card: empty while everything fits, so the
+/// HUD says nothing about a mechanism the player is not currently using.
+///
+/// It names the MODE as well as the page number, because the mode is part of the
+/// context (see `paginate`) and a player looking at [Q Defend] should be able to
+/// see, without pressing anything, that they are on the doctrine card.
+fn card_page_label(mode: CardPage, page: usize, pages: usize) -> String {
+    if pages <= 1 {
+        return String::new();
+    }
+    let name = match mode {
+        CardPage::Orders => "Orders",
+        CardPage::Doctrine => "Doctrine",
+    };
+    format!(
+        "{name} {}/{}   [{}] more",
+        page + 1,
+        pages,
+        hotkeys::key_caption(hotkeys::NEXT_CARD_PAGE)
+    )
 }
 
 /// Everything page two draws itself from. Bundled so `command_entries` keeps
@@ -2066,14 +2045,15 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
     let mut out: Vec<CmdEntry> = Vec::new();
 
     if own_units > 0 {
-        for (kind, key, hotkey) in [
-            (PostureKind::Defend, KeyCode::KeyQ, "Q"),
-            (PostureKind::Push, KeyCode::KeyW, "W"),
-            (PostureKind::Forage, KeyCode::KeyE, "E"),
-            (PostureKind::Escort, KeyCode::KeyR, "R"),
+        for (kind, action) in [
+            (PostureKind::Defend, Hk::PostureDefend),
+            (PostureKind::Push, Hk::PosturePush),
+            (PostureKind::Forage, Hk::PostureForage),
+            (PostureKind::Escort, Hk::PostureEscort),
         ] {
-            let mut entry = CmdEntry::plain(CmdAction::SetPosture(kind), key, hotkey, kind.label())
-                .active(card.posture == Some(kind));
+            let mut entry =
+                CmdEntry::plain(CmdAction::SetPosture(kind), bind(action), kind.label())
+                    .active(card.posture == Some(kind));
             entry.cost = if kind.needs_unit() {
                 "click a unit".to_string()
             } else {
@@ -2082,7 +2062,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
             out.push(entry);
         }
         let mut stand_down =
-            CmdEntry::plain(CmdAction::ClearPosture, KeyCode::KeyT, "T", "Stand Down");
+            CmdEntry::plain(CmdAction::ClearPosture, bind(Hk::StandDown), "Stand Down");
         stand_down.enabled = card.posture.is_some();
         out.push(stand_down);
 
@@ -2093,8 +2073,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         let fallback = doc.fallback_value();
         let mut fallback_entry = CmdEntry::plain(
             CmdAction::CycleFallback,
-            KeyCode::KeyF,
-            "F",
+            bind(Hk::CycleFallback),
             &match fallback {
                 // One decimal, not zero: `[-]`/`[=]` move in 5-point steps but
                 // a commander can send 37.5, and a caption that rounded it
@@ -2110,8 +2089,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         let leash = doc.leash_value();
         let mut leash_entry = CmdEntry::plain(
             CmdAction::CycleLeash,
-            KeyCode::KeyG,
-            "G",
+            bind(Hk::CycleLeash),
             &match leash {
                 Some(r) => format!("Guard r{}", trim_num(r)),
                 None => "Guard".to_string(),
@@ -2123,8 +2101,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         out.push(
             CmdEntry::plain(
                 CmdAction::CyclePriority,
-                KeyCode::KeyP,
-                "P",
+                bind(Hk::CyclePriority),
                 doc.prio.label(),
             )
             .active(doc.prio != PrioPreset::None),
@@ -2140,11 +2117,12 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
                 .enumerate()
                 .take(MAX_AUTOCAST_SLOTS)
             {
-                let (key, hotkey) = AUTOCAST_KEYS[slot];
+                let Some(key) = hotkeys::key(Hk::AutoCastSlot(slot)) else {
+                    continue;
+                };
                 let mut entry = CmdEntry::plain(
                     CmdAction::ToggleAutoCastSlot(slot),
                     key,
-                    hotkey,
                     &format!("Auto {}", def.name),
                 )
                 .active(doc.autocast_slot_active(slot));
@@ -2160,8 +2138,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         out.push(
             CmdEntry::plain(
                 CmdAction::TemplateSquad,
-                KeyCode::KeyQ,
-                "Q",
+                bind(Hk::TemplateSquad),
                 &match t.squad {
                     Some(id) => format!("Squad {id}"),
                     None => "Squad".to_string(),
@@ -2172,8 +2149,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         out.push(
             CmdEntry::plain(
                 CmdAction::TemplateFallback,
-                KeyCode::KeyW,
-                "W",
+                bind(Hk::TemplateFallback),
                 &match t.retreat {
                     Some(frac) => format!("Fall back {:.0}%", frac * 100.0),
                     None => "Fall back".to_string(),
@@ -2184,8 +2160,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         out.push(
             CmdEntry::plain(
                 CmdAction::TemplatePriority,
-                KeyCode::KeyE,
-                "E",
+                bind(Hk::TemplatePriority),
                 t.prio.label(),
             )
             .active(t.prio != PrioPreset::None),
@@ -2193,23 +2168,26 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         out.push(
             CmdEntry::plain(
                 CmdAction::TemplateAutoCast,
-                KeyCode::KeyR,
-                "R",
+                bind(Hk::TemplateAutoCast),
                 "Auto-cast",
             )
             .active(t.autocast),
         );
-        let mut clear =
-            CmdEntry::plain(CmdAction::TemplateClear, KeyCode::KeyT, "T", "Clear Doctrine");
+        let mut clear = CmdEntry::plain(
+            CmdAction::TemplateClear,
+            bind(Hk::TemplateClear),
+            "Clear Doctrine",
+        );
         clear.enabled = !t.is_empty();
         out.push(clear);
     }
 
-    out.truncate(CMD_SLOTS.saturating_sub(1));
+    // Pinned last, like the orders card's — `paginate` puts it in the final
+    // slot of every page, so [I] is always the way back however deep the
+    // doctrine card gets.
     out.push(CmdEntry::plain(
         CmdAction::TogglePage,
-        KeyCode::KeyI,
-        "I",
+        bind(Hk::ModeToggle),
         "Orders",
     ));
     out
@@ -3316,16 +3294,42 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
 }
 
 fn spawn_command_card(console: &mut ChildSpawnerCommands) {
+    // A column: the 4x3 grid, then the overflow-page indicator under it. The
+    // indicator is a text line rather than a thirteenth tile because a tile
+    // would cost a slot on every card, including the eleven-in-twelve that never
+    // page — and the whole reason paging exists is that slots are the scarce
+    // thing. Three 52px rows plus gaps and the two PAD margins spend 184 of
+    // `CONSOLE_H`'s 200px; an 11px line fits in what is left.
     console
         .spawn(Node {
             width: Val::Px(CMD_COLS * CMD_PX + (CMD_COLS - 1.0) * CMD_GAP),
             flex_shrink: 0.0,
+            flex_direction: FlexDirection::Column,
+            margin: UiRect::all(Val::Px(PAD)),
+            ..default()
+        })
+        .with_children(|col| {
+            spawn_command_grid(col);
+            col.spawn(text_bundle(
+                "",
+                11.0,
+                // The doctrine blue: paging is a fact about the card, in the
+                // same voice the card's other state lines use.
+                Color::srgb(0.62, 0.80, 1.0),
+                Slot::CmdPage,
+            ));
+        });
+}
+
+fn spawn_command_grid(parent: &mut ChildSpawnerCommands) {
+    parent
+        .spawn(Node {
+            width: Val::Px(CMD_COLS * CMD_PX + (CMD_COLS - 1.0) * CMD_GAP),
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::Wrap,
             align_content: AlignContent::FlexStart,
             column_gap: Val::Px(CMD_GAP),
             row_gap: Val::Px(CMD_GAP),
-            margin: UiRect::all(Val::Px(PAD)),
             ..default()
         })
         .with_children(|g| {
@@ -3441,7 +3445,7 @@ fn command_input(
 
     // Escape cancels every transient mode, innermost first, and finally backs
     // out of the doctrine page — so Escape always means "one step out".
-    if keys.just_pressed(KeyCode::Escape) {
+    if keys.just_pressed(hotkeys::CANCEL) {
         if ui.placement.is_some() {
             ui.placement = None;
             ui.wall_chain.clear();
@@ -3451,6 +3455,10 @@ fn command_input(
             ui.attack_move_armed = false;
         } else {
             ui.page = CardPage::Orders;
+            // ...and back to the first page of it: "one step out" should not
+            // leave the player looking at an overflow page of a card they just
+            // asked to leave.
+            ui.card_page = 0;
         }
         ui.dragging = false;
         ui.drag_start = None;
@@ -3460,7 +3468,7 @@ fn command_input(
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
 
     // --- idle worker cycling (not a command-card entry) -------------------
-    if !ctrl && keys.just_pressed(KeyCode::Period) {
+    if !ctrl && keys.just_pressed(hotkeys::IDLE_WORKER) {
         let idle: Vec<(Entity, Vec3)> = all_units
             .iter()
             .filter(|(_, u, t, o, _, _, _)| {
@@ -3668,6 +3676,12 @@ fn command_input(
     );
 
     // --- collect this frame's commands ------------------------------------
+    //
+    // Dispatched against the WHOLE entry list, not the visible page. Overflow
+    // pages are one vocabulary split across two screens (see `paginate`), so a
+    // key means the same thing on every one of them and works from any of them:
+    // a player who has learned [K Workshop] never has to know which page the
+    // tile is on. Only the tiles page; the keyboard does not.
     let mut actions: Vec<CmdAction> = Vec::new();
     if !ctrl {
         for entry in &entries {
@@ -3679,13 +3693,21 @@ fn command_input(
             }
         }
     }
-    // [I] is a raw hotkey as well as a button. A worker selection spends all
-    // nine slots on the classic build layout, so the button is not always on
-    // the card — but the doctrine page is the only route to postures and
-    // templates, and a route that a stray worker in the drag box can close is
-    // not a route. The button stays for discoverability; the key always works.
+    // [Tab] walks the overflow pages of the current mode. A raw key with no
+    // tile, for the same reason the nudges are: it navigates the menu rather
+    // than being an item on it, and the indicator under the card names it.
+    if !ctrl && keys.just_pressed(hotkeys::NEXT_CARD_PAGE) {
+        let pages = paginate(&entries, 0).pages;
+        if pages > 1 {
+            ui.card_page = (ui.card_page + 1) % pages;
+        }
+    }
+    // [I] is a raw hotkey as well as a button, and stays one: the mode toggle
+    // is now pinned to every page so the tile is always there, but the doctrine
+    // page is the only route to postures and templates and a route that depends
+    // on a tile being drawn is one a future card can close.
     if !ctrl
-        && keys.just_pressed(KeyCode::KeyI)
+        && keys.just_pressed(bind(Hk::ModeToggle))
         && !actions.contains(&CmdAction::TogglePage)
         && (!own_units.is_empty() || single_template.capable)
     {
@@ -3698,10 +3720,10 @@ fn command_input(
     // pushed the card past `CMD_SLOTS` and silently dropped the page toggle.
     if !ctrl && ui.page == CardPage::Doctrine && !own_units.is_empty() {
         for (key, action) in [
-            (KeyCode::Minus, CmdAction::NudgeFallback(false)),
-            (KeyCode::Equal, CmdAction::NudgeFallback(true)),
-            (KeyCode::BracketLeft, CmdAction::NudgeLeash(false)),
-            (KeyCode::BracketRight, CmdAction::NudgeLeash(true)),
+            (bind(Hk::NudgeFallbackDown), CmdAction::NudgeFallback(false)),
+            (bind(Hk::NudgeFallbackUp), CmdAction::NudgeFallback(true)),
+            (bind(Hk::NudgeLeashDown), CmdAction::NudgeLeash(false)),
+            (bind(Hk::NudgeLeashUp), CmdAction::NudgeLeash(true)),
         ] {
             if keys.just_pressed(key) {
                 actions.push(action);
@@ -4038,6 +4060,10 @@ fn command_input(
                     CardPage::Orders => CardPage::Doctrine,
                     CardPage::Doctrine => CardPage::Orders,
                 };
+                // A new vocabulary starts at its first page. Carrying the
+                // overflow index across a mode flip would land the player on
+                // page two of a card they have not seen page one of.
+                ui.card_page = 0;
                 // Flipping the card cancels whatever the other page armed.
                 ui.attack_move_armed = false;
                 ui.placement = None;
@@ -4363,11 +4389,7 @@ fn panel_clicks(
 /// matching `UiState::groups` and the hint line; `DEFAULT_SQUAD` (0) is
 /// deliberately not among them — that id is doctrine.rs's machine-only
 /// anti-idle floor, not a group a player can claim.
-const GROUP_DIGITS: [(KeyCode, u8); 3] = [
-    (KeyCode::Digit1, 1),
-    (KeyCode::Digit2, 2),
-    (KeyCode::Digit3, 3),
-];
+const GROUP_DIGITS: [(KeyCode, u8); 3] = hotkeys::GROUP_DIGIT_KEYS;
 
 /// Control groups, and the highest-leverage line in docs/TEMPO.md: `Ctrl+N`
 /// does not just remember a selection, it submits the `squad` verb — the same
@@ -6656,7 +6678,7 @@ fn update_hud(
         .filter(|(_, t, under, _)| **t == Team::Human && !under)
         .map(|(b, _, _, _)| b.kind)
         .collect();
-    let entries = command_entries(
+    let all_entries = command_entries(
         ui.page,
         own_units,
         has_worker,
@@ -6669,6 +6691,13 @@ fn update_hud(
         },
         &completed,
     );
+    // What the twelve tiles actually show. `paginate` clamps the stored page,
+    // so a selection that shrank under the player snaps back to a page that
+    // exists rather than drawing an empty card.
+    let view = paginate(&all_entries, ui.card_page);
+    let page_label = card_page_label(ui.page, view.page, view.pages);
+    ui.card_page = view.page;
+    let entries = view.tiles;
 
     // Right-click sets the rally only when the selection is purely own
     // production buildings — the hint has to say the same thing.
@@ -6728,7 +6757,7 @@ fn update_hud(
                 .to_string(),
         }
     } else if total == 0 {
-        "Left-click / drag to select.   Ctrl+1-3 set squad, Shift+1-3 add, 1-3 recall.   [I] doctrine   '.' idle worker   F9: AI plays Blue   F12 x2: surrender"
+        "Left-click / drag to select.   Ctrl+1-3 set squad, Shift+1-3 add, 1-3 recall.   [I] doctrine   [Tab] more commands   '.' idle worker   F9: AI plays Blue   F12 x2: surrender"
             .to_string()
     } else if rally_capable {
         "Right-click: set rally (ground, resource node or own unit).   Shift-click adds to selection."
@@ -6807,9 +6836,16 @@ fn update_hud(
             Slot::QueueLetter(i) => {
                 text.0 = queue_letters.get(i).cloned().unwrap_or_default();
             }
+            // The tile's letter, derived from the key that fires it. There is no
+            // stored caption to drift: rebinding an action in `hotkeys::REGISTRY`
+            // moves the letter on the tile in the same edit.
             Slot::CmdKey(i) => {
-                text.0 = entries.get(i).map(|e| e.hotkey.to_string()).unwrap_or_default();
+                text.0 = entries
+                    .get(i)
+                    .map(|e| hotkeys::key_caption(e.key).to_string())
+                    .unwrap_or_default();
             }
+            Slot::CmdPage => text.0 = page_label.clone(),
             Slot::CmdLabel(i) => {
                 text.0 = entries.get(i).map(|e| e.label.clone()).unwrap_or_default();
             }
@@ -7163,7 +7199,7 @@ fn surrender_hotkey(
     mut armed_at: Local<Option<f32>>,
     mut submissions: EventWriter<SubmitIntent>,
 ) {
-    if game_over.winner.is_some() || !keys.just_pressed(KeyCode::F12) {
+    if game_over.winner.is_some() || !keys.just_pressed(hotkeys::SURRENDER) {
         return;
     }
     let now = time.elapsed_secs();
@@ -8538,9 +8574,10 @@ mod tests {
             ),
         ] {
             let entries = doctrine_entries(units, card);
-            assert!(
-                entries.len() <= CMD_SLOTS,
-                "the doctrine card overflowed at {} entries",
+            assert_eq!(
+                paginate(&entries, 0).pages,
+                1,
+                "the doctrine card still fits on one page at {} entries",
                 entries.len()
             );
             let mut keys: Vec<KeyCode> = entries.iter().map(|e| e.key).collect();
@@ -8639,7 +8676,7 @@ mod tests {
         );
         let doctrine =
             command_entries(CardPage::Doctrine, 2, false, None, HeroCmds::default(), card, &[]);
-        assert!(doctrine.len() <= CMD_SLOTS);
+        assert!(paginate(&doctrine, 0).tiles.len() <= CMD_SLOTS);
         assert_eq!(
             doctrine.last().map(|e| e.action),
             Some(CmdAction::TogglePage),
@@ -8650,18 +8687,19 @@ mod tests {
             .any(|e| e.action == CmdAction::SetPosture(PostureKind::Defend)));
     }
 
-    /// A card too full for the [I] BUTTON must still take the [I] KEY, or one
-    /// stray worker in the drag box takes doctrine away from the player.
+    /// The most crowded card in the game — worker + hero, three spells, two
+    /// carried items — and doctrine is still one keystroke away.
     ///
-    /// The scenario used to be a plain worker selection: at 3x3 the seven build
-    /// cards plus [A] [S] spent all nine slots. The Blacksmith bead grew the
-    /// card to 4x3 (see `CMD_SLOTS`), and a worker card now has room for the
-    /// build layout, a quick toggle AND the page button — which is the point of
-    /// having grown it, and is asserted separately below. So the overflow case
-    /// moved up to worker + hero, where the hero's spells and carried items
-    /// push past twelve. The property under test is unchanged.
+    /// This test has outlived two mechanisms. At 3x3 the premise was that the
+    /// [I] BUTTON got truncated away and only the raw [I] KEY saved the player;
+    /// growing the card to 4x3 moved the overflow case up to worker+hero but
+    /// kept the same shape. Paging retires the premise entirely: the mode toggle
+    /// is PINNED to every page, so the button cannot yield any more, and the
+    /// content it used to displace is on an overflow page instead of gone. Both
+    /// routes are asserted here, because "the key always works" is the promise
+    /// that survives whatever the layout does next.
     #[test]
-    fn the_doctrine_page_is_reachable_even_when_its_button_is_not() {
+    fn the_doctrine_page_is_reachable_however_full_the_card() {
         // The Champion's real first spell, so the fixture cannot drift from
         // whatever the ability tables actually say.
         let def = abilities_of_unit(UnitKind::Hero)[0];
@@ -8685,11 +8723,26 @@ mod tests {
             DoctrineCard::default(),
             &[],
         );
-        assert_eq!(entries.len(), CMD_SLOTS, "a worker+hero card is full");
         assert!(
-            !entries.iter().any(|e| e.action == CmdAction::TogglePage),
-            "the page button is expected to yield here — that is the premise"
+            entries.len() > CMD_SLOTS,
+            "a worker+hero card is the overflow case — that is the premise"
         );
+        let view = paginate(&entries, 0);
+        assert!(view.pages > 1, "and it must therefore page");
+        assert_eq!(view.tiles.len(), CMD_SLOTS, "page one is full");
+        assert_eq!(
+            view.tiles.last().map(|e| e.action),
+            Some(CmdAction::TogglePage),
+            "the mode toggle is pinned to the last slot of page one"
+        );
+        // ...and of every other page: the way to doctrine is never a page away.
+        for page in 0..view.pages {
+            assert_eq!(
+                paginate(&entries, page).tiles.last().map(|e| e.action),
+                Some(CmdAction::TogglePage),
+                "page {page} lost the mode toggle",
+            );
+        }
 
         let mut app = ui_app();
         app.world_mut().spawn((
@@ -8704,10 +8757,15 @@ mod tests {
         assert_eq!(app.world().resource::<UiState>().page, CardPage::Doctrine);
     }
 
-    /// What growing the card to 4x3 actually bought: a plain worker selection
-    /// now keeps every build button INCLUDING the eighth (the Blacksmith), and
-    /// still has room for the page toggle. At 3x3 the eighth build card was
-    /// silently eaten by the truncate at the end of `command_entries`.
+    /// A plain worker selection keeps every build button — including the eighth
+    /// (the Blacksmith) and the ninth (the Sanctum) — **on page one**, and still
+    /// has the page toggle. At 3x3 the eighth build card was silently eaten by a
+    /// `truncate`; the fix then was a fourth column, which bought exactly one
+    /// building's worth of room and was spent immediately.
+    ///
+    /// Paging is the version of that fix which does not run out: the assertion
+    /// below is about the visible page, and the systematic test further down
+    /// proves the same for a tenth building, and an eleventh.
     #[test]
     fn a_worker_card_holds_every_build_button_and_the_page_toggle() {
         let entries = command_entries(
@@ -8719,30 +8777,33 @@ mod tests {
             DoctrineCard::default(),
             &[],
         );
-        assert!(entries.len() <= CMD_SLOTS, "the card never overflows");
-        for (_, kind, _, _) in build_cards() {
+        let view = paginate(&entries, 0);
+        assert_eq!(view.tiles.len(), CMD_SLOTS, "page one fills the card");
+        for (kind, _) in build_cards() {
             assert!(
-                entries.iter().any(|e| e.action == CmdAction::Place(kind)),
-                "{kind:?} must have a button — a building the player cannot see \
-                 on the card has no other route in"
+                view.tiles.iter().any(|e| e.action == CmdAction::Place(kind)),
+                "{kind:?} must have a button on page one — a building the player \
+                 cannot see on the card has no other route in"
             );
         }
         assert!(
-            entries.iter().any(|e| e.action == CmdAction::Place(BuildingKind::Blacksmith)),
+            view.tiles
+                .iter()
+                .any(|e| e.action == CmdAction::Place(BuildingKind::Blacksmith)),
             "the eighth build card is the one 3x3 used to drop"
         );
         assert!(
-            entries.iter().any(|e| e.action == CmdAction::TogglePage),
+            view.tiles.iter().any(|e| e.action == CmdAction::TogglePage),
             "and there is still room for the way to page two"
         );
-        // Every hotkey on one card must be unique, which is the invariant the
-        // Blacksmith's [C] had to be chosen against once [I] became the page
-        // toggle.
-        let mut keys: Vec<KeyCode> = entries.iter().map(|e| e.key).collect();
-        keys.sort_by_key(|k| format!("{k:?}"));
-        let before = keys.len();
-        keys.dedup();
-        assert_eq!(before, keys.len(), "no two buttons share a hotkey");
+        // The quick toggles are what pages now — they used to be DELETED by a
+        // hand-written order of sacrifice, and this is the difference paging
+        // makes: [G Guard] is one [Tab] away instead of unreachable.
+        assert!(
+            entries.iter().any(|e| e.action == CmdAction::ToggleGuard),
+            "the quick toggles survive on an overflow page"
+        );
+        assert!(view.pages > 1, "...which means the card pages");
     }
 
     /// The same invariant, carried onto the cards the test above never
@@ -8832,7 +8893,7 @@ mod tests {
     /// a building card is train slots plus that building's abilities, its
     /// tier-up and the page toggle, and those letters are chosen from a
     /// different pool. The Barracks is the pressing case — it now offers five
-    /// units, so `TRAIN_KEYS` had to grow a fifth letter, and [T] is only safe
+    /// units, so `Hk::TrainSlot` had to grow a fifth rung, and [T] is only safe
     /// because the other [T] in the game (Auto-Slam) lives on a unit
     /// selection and [T Stand Down] on the doctrine page, both disjoint from
     /// this card.
@@ -8858,9 +8919,10 @@ mod tests {
                 DoctrineCard::default(),
                 &completed,
             );
-            assert!(
-                entries.len() <= CMD_SLOTS,
-                "{kind:?}'s card overflows: {} entries",
+            assert_eq!(
+                paginate(&entries, 0).pages,
+                1,
+                "{kind:?}'s card should still fit on one page: {} entries",
                 entries.len(),
             );
             let mut keys: Vec<KeyCode> = entries.iter().map(|e| e.key).collect();
@@ -8908,6 +8970,382 @@ mod tests {
             .expect("the Workshop must offer the Gryphon Rider at T3");
         assert_eq!(gryphon.key, KeyCode::KeyW, "the Gryphon sits on [W]");
         assert!(gryphon.enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // The systematic hotkey invariant
+    // -----------------------------------------------------------------------
+
+    /// Every card the game can draw, with everything on it at once.
+    ///
+    /// The two hand-written invariant tests above cover the two cards their
+    /// authors were worried about at the time — a worker's and a production
+    /// building's, each with a default `HeroCmds`. This walks the whole cross
+    /// product of selection type and mode, with a MAXIMAL `HeroCmds` (three
+    /// spells, a full inventory, a stocked shelf, a tier-up, both research
+    /// ladders) so that buttons which only appear in rare combinations are on
+    /// the card when it is checked. The Shop's shelf in particular was never
+    /// exercised by any test before this one — and it is the card whose fifth
+    /// rung had quietly landed on the mode toggle's letter.
+    ///
+    /// `hotkeys::validate` proves the same thing one level up, over the table
+    /// rather than over rendered cards. Both are worth having: the registry
+    /// check catches a bad binding before any card is built, this one catches a
+    /// card that draws buttons the registry did not expect it to.
+    fn every_card_fixture() -> Vec<(String, Vec<CmdEntry>)> {
+        let completed = [
+            BuildingKind::TownHall,
+            BuildingKind::Castle,
+            BuildingKind::Barracks,
+            BuildingKind::Workshop,
+            BuildingKind::Blacksmith,
+            BuildingKind::Shop,
+            BuildingKind::Sanctum,
+        ];
+        let def = abilities_of_unit(UnitKind::Hero)[0];
+        let slot = |index: usize| AbilitySlot {
+            index,
+            def,
+            ready: true,
+            cooldown: 0.0,
+        };
+        let caster = DoctrineState::of(&[UnitDoctrine::read(
+            None,
+            None,
+            None,
+            None,
+            UnitKind::Hero,
+            None,
+        )]);
+        let mut out: Vec<(String, Vec<CmdEntry>)> = Vec::new();
+
+        // --- unit selections, orders page ---------------------------------
+        for worker in [false, true] {
+            for hero in [false, true] {
+                let cmds = if hero {
+                    HeroCmds {
+                        abilities: vec![slot(0), slot(1), slot(2)],
+                        items: [Some(ItemId::HealingPotion), Some(ItemId::TownPortal)],
+                        ..HeroCmds::default()
+                    }
+                } else {
+                    HeroCmds::default()
+                };
+                let doc = if hero {
+                    DoctrineCard { doc: caster, ..default() }
+                } else {
+                    DoctrineCard::default()
+                };
+                out.push((
+                    format!("units (worker: {worker}, hero: {hero}), orders"),
+                    command_entries(CardPage::Orders, 3, worker, None, cmds, doc, &completed),
+                ));
+            }
+        }
+
+        // --- unit selection, doctrine page --------------------------------
+        out.push((
+            "units, doctrine".to_string(),
+            command_entries(
+                CardPage::Doctrine,
+                3,
+                false,
+                None,
+                HeroCmds::default(),
+                DoctrineCard { doc: caster, ..default() },
+                &completed,
+            ),
+        ));
+
+        // --- one building of every kind, orders page ----------------------
+        for kind in ALL_BUILDING_KINDS {
+            let cmds = HeroCmds {
+                train: None,
+                abilities: Vec::new(),
+                building_abilities: abilities_of_building(kind)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| slot(i))
+                    .collect(),
+                // Every kind is offered the shelf, not just the Shop: if a
+                // second building ever sells, its card is already covered.
+                shop: Some(ShopState {
+                    hero: true,
+                    room: true,
+                    tier: TechTier::T3,
+                })
+                .filter(|_| hotkeys::sells_items(kind)),
+                upgrade: building_upgrades_to(kind).map(|to| (to, 100, 0)),
+                items: [None, None],
+                research: building_researches(kind)
+                    .iter()
+                    .map(|k| ResearchCmd {
+                        kind: *k,
+                        level: 0,
+                        next: None,
+                        in_progress: None,
+                        blocked: false,
+                    })
+                    .collect(),
+            };
+            out.push((
+                format!("{kind:?}, orders"),
+                command_entries(
+                    CardPage::Orders,
+                    0,
+                    false,
+                    Some((kind, true)),
+                    cmds,
+                    DoctrineCard::default(),
+                    &completed,
+                ),
+            ));
+        }
+
+        // --- one production building, doctrine page (the template card) ---
+        out.push((
+            "production building, doctrine".to_string(),
+            command_entries(
+                CardPage::Doctrine,
+                0,
+                false,
+                Some((BuildingKind::Barracks, true)),
+                HeroCmds::default(),
+                DoctrineCard {
+                    tmpl: TemplateView { capable: true, ..default() },
+                    ..default()
+                },
+                &completed,
+            ),
+        ));
+        out
+    }
+
+    #[test]
+    fn no_card_the_game_can_draw_has_two_buttons_on_one_key() {
+        for (name, entries) in every_card_fixture() {
+            for (i, entry) in entries.iter().enumerate() {
+                if let Some(clash) = entries[..i].iter().find(|p| p.key == entry.key) {
+                    panic!(
+                        "{name}: [{}] is both {:?} and {:?}",
+                        hotkeys::key_caption(entry.key),
+                        clash.action,
+                        entry.action,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The raw keys — the four nudges and the [Tab] pager — have no tile, so
+    /// they are invisible to the check above and would silently double-fire
+    /// alongside a button that shared their key.
+    #[test]
+    fn no_raw_key_collides_with_a_button_on_any_card() {
+        let raw = [
+            hotkeys::NEXT_CARD_PAGE,
+            bind(Hk::NudgeFallbackDown),
+            bind(Hk::NudgeFallbackUp),
+            bind(Hk::NudgeLeashDown),
+            bind(Hk::NudgeLeashUp),
+        ];
+        for (name, entries) in every_card_fixture() {
+            for key in raw {
+                assert!(
+                    !entries.iter().any(|e| e.key == key),
+                    "{name}: [{}] is both a raw key and a card button",
+                    hotkeys::key_caption(key),
+                );
+            }
+        }
+    }
+
+    /// Nothing is ever silently dropped again. Every card, every mode: the
+    /// entries the input system dispatches against are exactly the entries the
+    /// player can reach by tiles, once the pages are walked.
+    #[test]
+    fn every_entry_is_reachable_on_some_page() {
+        for (name, entries) in every_card_fixture() {
+            let pages = paginate(&entries, 0).pages;
+            let mut seen: Vec<CmdAction> = Vec::new();
+            for page in 0..pages {
+                let view = paginate(&entries, page);
+                assert!(
+                    view.tiles.len() <= CMD_SLOTS,
+                    "{name}: page {page} draws {} tiles into {CMD_SLOTS} slots",
+                    view.tiles.len(),
+                );
+                seen.extend(view.tiles.iter().map(|e| e.action));
+            }
+            for entry in &entries {
+                assert!(
+                    seen.contains(&entry.action),
+                    "{name}: {:?} is on no page — the failure mode the old \
+                     `truncate` had",
+                    entry.action,
+                );
+            }
+        }
+    }
+
+    /// A key means one thing across every overflow page of a card. That is the
+    /// paging semantics this bead chose (modes may repeat keys, overflow pages
+    /// may not), and it is what lets `command_input` dispatch hotkeys against
+    /// the whole list rather than the visible slice.
+    #[test]
+    fn a_key_means_the_same_thing_on_every_overflow_page_of_a_card() {
+        for (name, entries) in every_card_fixture() {
+            let pages = paginate(&entries, 0).pages;
+            let mut bound: Vec<(KeyCode, CmdAction)> = Vec::new();
+            for page in 0..pages {
+                for tile in paginate(&entries, page).tiles {
+                    if let Some((_, other)) = bound.iter().find(|(k, _)| *k == tile.key) {
+                        assert_eq!(
+                            *other, tile.action,
+                            "{name}: [{}] means two things across pages",
+                            hotkeys::key_caption(tile.key),
+                        );
+                    } else {
+                        bound.push((tile.key, tile.action));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pager itself: pages are full, in order, lossless, and the mode
+    /// toggle is pinned to the last slot of each one. Walking off the end
+    /// clamps rather than blanking the card — a selection can shrink under a
+    /// player who is looking at page two.
+    #[test]
+    fn the_pager_slices_a_card_without_losing_or_repeating_a_tile() {
+        let entry = |n: u8| CmdEntry::plain(CmdAction::Train(UnitKind::Footman), KeyCode::KeyQ, &n.to_string());
+        // No pinned toggle: the full twelve slots are content.
+        let flat: Vec<CmdEntry> = (0..12).map(entry).collect();
+        assert_eq!(paginate(&flat, 0).pages, 1);
+        assert_eq!(paginate(&flat, 0).tiles.len(), 12);
+
+        let mut pinned: Vec<CmdEntry> = (0..11).map(entry).collect();
+        pinned.push(CmdEntry::plain(CmdAction::TogglePage, KeyCode::KeyI, "Doctrine"));
+        let view = paginate(&pinned, 0);
+        assert_eq!(view.pages, 1, "eleven content + the toggle is exactly a card");
+        assert_eq!(view.tiles.len(), CMD_SLOTS);
+
+        // One more content entry, and it pages rather than falling off.
+        let mut over: Vec<CmdEntry> = (0..12).map(entry).collect();
+        over.push(CmdEntry::plain(CmdAction::TogglePage, KeyCode::KeyI, "Doctrine"));
+        let first = paginate(&over, 0);
+        assert_eq!(first.pages, 2);
+        assert_eq!(first.tiles.len(), CMD_SLOTS);
+        assert_eq!(first.tiles[0].label, "0");
+        assert_eq!(first.tiles[10].label, "10");
+        let second = paginate(&over, 1);
+        assert_eq!(second.tiles.len(), 2, "one leftover plus the pinned toggle");
+        assert_eq!(second.tiles[0].label, "11");
+        assert_eq!(second.tiles[1].action, CmdAction::TogglePage);
+        // Off the end clamps back onto the last real page.
+        assert_eq!(paginate(&over, 9).page, 1);
+        assert_eq!(paginate(&over, 9).tiles[0].label, "11");
+        // An empty card is one page, not zero.
+        assert_eq!(paginate(&[], 0).pages, 1);
+    }
+
+    /// The indicator says nothing while everything fits, and names both the
+    /// mode and the key when it does not. A page number with no way to turn the
+    /// page is a worse HUD than no page number at all.
+    #[test]
+    fn the_page_indicator_appears_only_when_there_is_a_page_to_turn() {
+        assert_eq!(card_page_label(CardPage::Orders, 0, 1), "");
+        assert_eq!(
+            card_page_label(CardPage::Orders, 0, 2),
+            "Orders 1/2   [Tab] more"
+        );
+        assert_eq!(
+            card_page_label(CardPage::Doctrine, 1, 2),
+            "Doctrine 2/2   [Tab] more"
+        );
+    }
+
+    /// [Tab] walks the overflow pages of the card the player is looking at, and
+    /// wraps. Driven through the real system, so this covers the input path and
+    /// not just the pager.
+    #[test]
+    fn tab_walks_the_overflow_pages_and_wraps() {
+        let mut app = ui_app();
+        // A worker: nine build buttons plus [A][S] fill page one exactly, and
+        // the quick toggles spill onto page two.
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Worker },
+            Team::Human,
+            Transform::from_translation(Vec3::new(-60.0, 0.0, -60.0)),
+            Health::new(100.0),
+            Order::Idle,
+            Selected,
+        ));
+        app.update();
+        assert_eq!(app.world().resource::<UiState>().card_page, 0);
+        press(&mut app, &[hotkeys::NEXT_CARD_PAGE]);
+        assert_eq!(
+            app.world().resource::<UiState>().card_page,
+            1,
+            "[Tab] turns the page"
+        );
+        press(&mut app, &[hotkeys::NEXT_CARD_PAGE]);
+        assert_eq!(
+            app.world().resource::<UiState>().card_page,
+            0,
+            "...and wraps back to the first"
+        );
+    }
+
+    /// A hotkey works from any overflow page of its own card. This is the
+    /// player-facing half of the paging decision: only the tiles move.
+    #[test]
+    fn a_hotkey_on_page_two_still_fires_from_page_one() {
+        let entries = command_entries(
+            CardPage::Orders,
+            3,
+            true,
+            None,
+            HeroCmds::default(),
+            DoctrineCard::default(),
+            &[],
+        );
+        let guard = entries
+            .iter()
+            .find(|e| e.action == CmdAction::ToggleGuard)
+            .expect("a unit selection always offers [G Guard]");
+        assert!(
+            !paginate(&entries, 0)
+                .tiles
+                .iter()
+                .any(|e| e.action == CmdAction::ToggleGuard),
+            "the premise: [G] has been pushed onto an overflow page"
+        );
+
+        let mut app = ui_app();
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Worker },
+            Team::Human,
+            Transform::from_translation(Vec3::new(-60.0, 0.0, -60.0)),
+            Health::new(100.0),
+            Order::Idle,
+            Selected,
+        ));
+        app.update();
+        assert_eq!(
+            app.world().resource::<UiState>().card_page,
+            0,
+            "still looking at page one"
+        );
+        press(&mut app, &[guard.key]);
+        assert!(
+            said(&app)
+                .iter()
+                .any(|i| matches!(i, Intent::Leash { .. })),
+            "[G] must fire from a page its tile is not on; said: {:?}",
+            said(&app),
+        );
     }
 
     // -----------------------------------------------------------------------
