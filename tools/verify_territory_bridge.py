@@ -138,6 +138,20 @@ def main():
     try:
         state = read_state()
 
+        # A bridged seat now gates the start (docs/INTENT.md, "The ready
+        # handshake"): the world is spawned and photographed, but the clock
+        # does not move until every seat says the word. This script's checks
+        # are about vocabulary rather than elapsed time, but `wait_applied`
+        # still needs the engine to be compiling batches, so say it. Harmless
+        # against an engine built before the handshake — `ready` is then an
+        # unrecognized verb that the next batch clears.
+        if "waiting_for" in state:
+            print(f"held at t=0, waiting for {state['waiting_for']} — sending ready")
+            send([{"type": "ready"}])
+            state, started = wait_for(lambda s: "waiting_for" not in s)
+            check("the ready handshake starts the match", started,
+                  f"still waiting for {(state or {}).get('waiting_for')}")
+
         # --- 1. the map's own vocabulary, before anything is armed --------
         places = {p["name"]: p for p in state.get("map", {}).get("places", [])}
         check("map.places carries the map's vocabulary",

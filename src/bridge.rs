@@ -250,7 +250,13 @@ impl Plugin for BridgePlugin {
             // Declared once, so anything later tagged only `.in_set(BridgePoll)`
             // inherits the frame order rather than floating outside it.
             .configure_sets(Update, BridgePoll.in_set(SimSet::Input))
-            .add_systems(Startup, bridge_startup)
+            // Before `ReadyGateHold`: that system stops the clock, and it can
+            // only know which seats to wait for after this one has opened
+            // them. Both are `Startup`, so without the edge the order is
+            // whatever the executor felt like — and getting it wrong means a
+            // match that is never held rather than one that is held wrongly,
+            // which is the failure mode that would go unnoticed longest.
+            .add_systems(Startup, bridge_startup.before(ReadyGateHold))
             .add_systems(
                 Update,
                 // Poll, compile, snapshot — in that order, so a batch read
@@ -393,6 +399,7 @@ fn bridge_startup(
     mut ai_controlled: ResMut<AiControlled>,
     mut external: ResMut<ExternallyCommanded>,
     mut copilot: ResMut<Copilot>,
+    mut gate: ResMut<ReadyGate>,
 ) {
     let Ok(raw) = std::env::var(BRIDGE_ENV) else {
         return;
@@ -400,6 +407,8 @@ fn bridge_startup(
     let Some(teams) = seats_from_env(&raw) else {
         return;
     };
+    // Read once, here, so every seat in this run agrees about the regime.
+    let handshake = ready_handshake_enabled();
 
     // One catalog for the whole session: content is static, so both seats get
     // byte-identical files and nothing has to be re-serialized per snapshot.
@@ -494,7 +503,28 @@ fn bridge_startup(
                 );
             }
         }
+        // Every seat that actually opened gates the start — commander AND
+        // copilot, on the argument in `ReadyGate`'s docs. A seat whose
+        // directory could not be created `continue`d above and is therefore
+        // absent here as well as from `bridge.seats`: a seat that does not
+        // exist must not be able to hold the match forever.
+        if handshake {
+            gate.seats.push(ReadySeat {
+                name: seat_dir(team, role),
+                team,
+                ready: false,
+            });
+        }
         bridge.seats.push(seat);
+    }
+
+    if !gate.seats.is_empty() {
+        gate.timeout = ready_timeout_from_env();
+    } else if !handshake {
+        info!(
+            "{READY_ENV}=0: ready handshake OFF — the clock runs from process start, \
+             as it did before the handshake existed"
+        );
     }
 }
 
@@ -543,6 +573,33 @@ struct StateOut {
     /// does not exist at all when `WC3_COMMAND_LATENCY` is off.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     applied: Vec<AppliedOut>,
+    /// **The seats that have not yet said `{"type":"ready"}`**, by name —
+    /// `["red","blue"]`. Present ONLY while the match is held at t=0; the
+    /// moment the clock starts this key and `match_started` both disappear and
+    /// the snapshot's historical key set is exactly what it always was. See
+    /// `shared::ReadyGate`.
+    ///
+    /// Your own name in this list means the engine is waiting on YOU. Another
+    /// seat's name means you have been heard and the hold is not yours. Either
+    /// way `t` stays 0 and nothing in the world moves — reading the map and
+    /// writing your opening now is the intended use of the time, and it is
+    /// time both sides get.
+    ///
+    /// `skip_serializing_if` on the same reasoning the `game_over_reason` note
+    /// below spells out: a key that exists only in a regime the historical
+    /// tooling never saw must be absent outside that regime, or every
+    /// exact-key-set assertion in tools/ breaks the moment it ships.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting_for: Option<Vec<&'static str>>,
+    /// **Has the match clock started?** `false` while held, and then absent —
+    /// not `true` — forever after. An always-present boolean would be the
+    /// friendlier shape in isolation, but it would also be a permanent
+    /// addition to every snapshot of every run, which is precisely the key-set
+    /// change this pair is written to avoid. The transition is legible without
+    /// it: `waiting_for` vanishes, a `match start` line appears in `events`,
+    /// and `t` begins to move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_started: Option<bool>,
     game_over: Option<&'static str>,
     /// **Which win it was**: `"razed"` (the loser has no production buildings
     /// left) or `"surrender"`. Round-9's winner could not tell the two apart —
@@ -1521,6 +1578,18 @@ struct SeatVerdicts<'w> {
     applied: Res<'w, IntentApplied>,
 }
 
+/// Where the match is in its own life: has it started, and has it ended. The
+/// two questions bracket everything else in the snapshot, and they travel
+/// together for the reason `TeamTech` does — `write_snapshot` sits exactly on
+/// Bevy's 16-parameter ceiling, and the ready handshake needed a slot that did
+/// not exist. `GameOver` used to be its own parameter; pairing it with
+/// `ReadyGate` costs nothing and reads better than either alone.
+#[derive(SystemParam)]
+struct MatchState<'w> {
+    over: Res<'w, GameOver>,
+    ready: Res<'w, ReadyGate>,
+}
+
 /// The standing policy a team has set and the engine executes for it: squad
 /// postures (continuous) and armed triggers (contingent). Bundled for the same
 /// reason `TeamTech` is — `write_snapshot` sits exactly on Bevy's 16-parameter
@@ -1557,7 +1626,7 @@ fn write_snapshot(
     mut bridge: ResMut<Bridge>,
     economies: Res<Economies>,
     records: Res<HeroRecords>,
-    game_over: Res<GameOver>,
+    match_state: MatchState,
     standing: StandingOrders,
     tech: TeamTech,
     feed: Res<GameEvents>,
@@ -1607,7 +1676,8 @@ fn write_snapshot(
             now,
             &economies,
             &records,
-            &game_over,
+            &match_state.over,
+            &match_state.ready,
             &standing.squads,
             standing.triggers.get(seat.team),
             standing.regions.get(seat.team),
@@ -1638,6 +1708,9 @@ fn write_seat_snapshot(
     economies: &Economies,
     records: &HeroRecords,
     game_over: &GameOver,
+    // Whether the match has started, and who it is still waiting for. Read for
+    // the two optional keys at the top of `StateOut`; see `shared::ReadyGate`.
+    ready: &ReadyGate,
     squad_orders: &SquadOrders,
     // This seat's own armed triggers. Passed pre-sliced by team rather than as
     // the whole resource, so this function cannot read the opponent's plans
@@ -2096,6 +2169,11 @@ fn write_seat_snapshot(
                 delay: r1(a.delay),
             })
             .collect(),
+        // Both keys live and die together: while held they are `Some`, and the
+        // instant the clock starts they are `None` and the snapshot is shaped
+        // exactly as it has always been.
+        waiting_for: ready.holding().then(|| ready.waiting_for()),
+        match_started: ready.holding().then_some(false),
         game_over: game_over.winner.map(team_name),
         game_over_reason: game_over.reason.map(GameOverReason::name),
         me: MeOut {
@@ -2470,6 +2548,24 @@ fn poll_commands(
                 // The historical error prefix, so a commander that greps for
                 // `cmd 3` still finds its third command — both roles.
                 let tag = format!("cmd {i}");
+                // `ready` is the one verb that goes straight through on EVERY
+                // seat, copilot included. It is a statement about the match,
+                // not an order to the human's army, so routing it into the
+                // proposal queue would ask a player to approve their partner's
+                // willingness to start — and would hold the match until they
+                // did. Handled ahead of the copilot branch rather than inside
+                // copilot.rs so the gate has exactly one door.
+                if raw.get("type").and_then(|v| v.as_str()) == Some("ready") {
+                    submissions.write(SubmitIntent {
+                        team: seat.team,
+                        source: IntentSource::Bridge,
+                        tag,
+                        intent: Intent::Ready,
+                        trigger: None,
+                        plan: None,
+                    });
+                    continue;
+                }
                 if seat.role == SeatRole::Copilot {
                     // Transport stops here. A co-commander's wire carries one
                     // shape an ordinary seat's does not (`propose`), and what

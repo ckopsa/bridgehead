@@ -648,7 +648,7 @@ a substitution inside `compile_intent`'s order arms and nothing else. The
 | `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt — doctrine IS the fast path |
 | `trigger_set`, `trigger_clear` | exempt — arming a rule is doctrine, and the rule's own firing is too (below) |
 | `plan_set`, `plan_clear` | exempt — writing a sequence down is doctrine, and the plan's own steps are too (below) |
-| `autopilot`, `surrender` | exempt — match level |
+| `autopilot`, `surrender`, `ready` | exempt — match level |
 
 The `cast` row was originally not a carve-out but an identity: every caster in
 the game either *was* a command node (a hero) or *sat on* one, so a computed

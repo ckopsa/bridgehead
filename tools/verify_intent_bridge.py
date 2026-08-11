@@ -28,6 +28,14 @@ EXPECTED_TOP_KEYS = {
     # claims ("this build has no ledger" vs "you have seen nothing"), and a
     # commander that cannot tell them apart will read silence as safety.
     "intel",
+    # `my_race` is always present too — it is the key that turns the shared
+    # two-race catalog into THIS seat's build tree, and it reads "kingdom" for
+    # both seats in a match nobody opted a second race into. It shipped with
+    # the race work and this set was never updated, so this script has been
+    # failing on `snapshot gained keys {'my_race'}` since then, independently
+    # of the ready handshake. Listed here rather than left broken: a contract
+    # check that nobody can run is not a contract check.
+    "my_race",
 }
 
 # Keys that appear only in states this check does not run in, so the assertion
@@ -42,7 +50,18 @@ EXPECTED_TOP_KEYS = {
 #     Same `skip_serializing_if` rule and the same reason: the v3 vocabulary is
 #     additive, and a commander that never says the word must not be able to
 #     tell it exists from the shape of its snapshot.
-OPTIONAL_TOP_KEYS = {"applied", "game_over_reason", "triggers", "plans"}
+#   * waiting_for / match_started exist ONLY while the ready handshake is
+#     holding the match at t=0 (docs/INTENT.md, "The ready handshake"). This
+#     script sends `ready` below and then waits for the hold to lift, so by the
+#     time the exact-set assertion runs they are gone again — they are listed
+#     here for the honest reason that a slow engine could still be writing the
+#     held snapshot when we first look, not because the check tolerates them
+#     mid-match. `the_handshake_keys_are_gone_once_the_match_starts` (step 2b)
+#     is the assertion that actually pins their disappearance.
+OPTIONAL_TOP_KEYS = {
+    "applied", "game_over_reason", "triggers", "plans",
+    "waiting_for", "match_started",
+}
 
 
 def upgrade_price(st):
@@ -85,11 +104,43 @@ def send(cmds):
     return int(out.stdout.split("seq=")[1].split()[0])
 
 
+def start_match(st):
+    """Clear the ready handshake, if this engine is holding at t=0.
+
+    A bridged seat now gates the start (docs/INTENT.md, "The ready handshake"),
+    so a script that attaches to one and never says the word would sit in front
+    of a frozen world until the timeout rescued it — every assertion below
+    presumes a clock that runs. Sending `ready` unconditionally is correct on
+    both sides of the change: against an engine without the handshake it is an
+    unrecognized verb, which lands in `errors` and is cleared by the next batch
+    rather than failing anything.
+    """
+    if "waiting_for" not in st:
+        return st
+    print(f"[0] match held at t=0, waiting for {st['waiting_for']} — sending ready")
+    send([{"type": "ready"}])
+    deadline = time.time() + 90.0
+    while time.time() < deadline:
+        st = read_state()
+        if "waiting_for" not in st:
+            print("[0] match started")
+            return st
+        time.sleep(0.5)
+    raise SystemExit(f"FAIL: match never started, still waiting for {st.get('waiting_for')}")
+
+
 def main():
-    st = read_state()
+    st = start_match(read_state())
     print(f"[1] snapshot present at t={st['t']}s, my_team={st['my_team']}")
 
     # --- contract: the snapshot key set is unchanged ------------------------
+    # 2b, and the reason the two handshake keys can be optional without
+    # weakening this: once the match is running they must be ABSENT, not merely
+    # tolerated. An always-present `match_started: true` would be a permanent
+    # addition to every snapshot of every run, which is exactly what the
+    # skip_serializing_if convention exists to prevent.
+    assert "waiting_for" not in st, "FAIL: waiting_for outlived the hold"
+    assert "match_started" not in st, "FAIL: match_started outlived the hold"
     keys = set(st.keys())
     missing, extra = EXPECTED_TOP_KEYS - keys, keys - EXPECTED_TOP_KEYS - OPTIONAL_TOP_KEYS
     assert not missing, f"FAIL: snapshot lost keys {missing}"

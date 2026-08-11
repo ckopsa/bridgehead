@@ -287,6 +287,52 @@ def test_a_round_with_no_verdict_still_produces_a_valid_record():
     assert "result.winner" in rec["unknown"]
 
 
+def test_the_handshake_credits_each_seat_when_it_leaves_the_waiting_list():
+    """docs/INTENT.md, "The ready handshake". `record_readies` is the whole of
+    what reaches the ledger, so it is the whole of what needs pinning."""
+    red = arena_run.parse_seat("red=commander:rusher")
+    blue = arena_run.parse_seat("blue=commander:boomer")
+    by_side = {"red": red, "blue": blue}
+
+    # First observation: both still owed. Nobody is credited, because `last`
+    # is None and we have not seen anyone leave.
+    arena_run.record_readies(["red", "blue"], None, by_side, 3.0)
+    assert "ready_wait_s" not in red and "ready_wait_s" not in blue
+
+    # Red speaks at wall 12.4s.
+    arena_run.record_readies(["blue"], ["red", "blue"], by_side, 12.44)
+    assert red["ready_wait_s"] == 12.4
+    assert "ready_wait_s" not in blue
+
+    # Blue speaks at 41s and the hold lifts.
+    arena_run.record_readies([], ["blue"], by_side, 41.0)
+    assert blue["ready_wait_s"] == 41.0
+    # Red is not re-credited by a later observation.
+    assert red["ready_wait_s"] == 12.4
+
+
+def test_a_seat_that_never_readied_carries_no_ready_wait_into_the_ledger():
+    """A timeout start leaves the silent seat with no key at all — absence, not
+    a null, so the round's `unknown` list stays a claim about things there were
+    to know."""
+    seats = [
+        arena_run.parse_seat("red=commander:rusher"),
+        arena_run.parse_seat("blue=commander:boomer"),
+    ]
+    by_side = {s["side"]: s for s in seats}
+    arena_run.record_readies(["red", "blue"], None, by_side, 1.0)
+    arena_run.record_readies(["blue"], ["red", "blue"], by_side, 9.0)
+    # ...and then the timeout fires; blue is never observed leaving the list.
+
+    args = Args(notes="", commit=None, hypothesis="does a dead seat sink it?", id="r99")
+    env = arena_run.derive_env(seats, args)
+    rec = arena_run.build_record(args, seats, env, arena_run.read_log(DECISIVE_LOG))
+    assert arena.validate(rec) == [], arena.validate(rec)
+    assert rec["seats"][0]["ready_wait_s"] == 9.0
+    assert "ready_wait_s" not in rec["seats"][1]
+    assert not any("ready_wait_s" in u for u in rec["unknown"])
+
+
 def _run():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

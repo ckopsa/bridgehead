@@ -129,6 +129,42 @@ def test_null_paths_names_the_exact_seat():
     assert arena.validate(rec) == []
 
 
+def test_a_seat_may_record_how_long_it_took_to_ready():
+    """`ready_wait_s` is additive and optional (docs/INTENT.md, "The ready
+    handshake"): present on a seat that waited, absent on one that did not, and
+    absent on every round recorded before the handshake existed."""
+    rec = good()
+    rec["seats"][0]["ready_wait_s"] = 41.0
+    assert arena.validate(rec) == []
+    # The seat that never waited omits it, and that is not a null — nothing
+    # lands in `unknown`, so the honesty rule stays quiet.
+    assert "seats.1.ready_wait_s" not in arena.null_paths(rec)
+    assert arena.validate(rec) == []
+    # Zero is a real answer (a seat that readied instantly), not a missing one.
+    rec["seats"][1]["ready_wait_s"] = 0
+    assert arena.validate(rec) == []
+
+
+def test_a_ready_wait_that_is_not_a_duration_is_caught():
+    rec = good()
+    rec["seats"][0]["ready_wait_s"] = "41s"
+    assert any("ready_wait_s" in m for m in arena.validate(rec))
+    rec["seats"][0]["ready_wait_s"] = -1
+    assert any("ready_wait_s" in m for m in arena.validate(rec))
+    # `True` is an int in Python and would otherwise sail through.
+    rec["seats"][0]["ready_wait_s"] = True
+    assert any("ready_wait_s" in m for m in arena.validate(rec))
+
+
+def test_a_null_ready_wait_must_still_be_declared():
+    """The one way to get it wrong: emitting `null` instead of omitting the key
+    puts a claim in the record that the honesty rule then insists you own."""
+    rec = good()
+    rec["seats"][0]["ready_wait_s"] = None
+    assert "seats.0.ready_wait_s" in arena.null_paths(rec)
+    assert any("not listed in `unknown`" in m for m in arena.validate(rec))
+
+
 def test_the_unknown_list_cannot_itself_be_unknown():
     """`unknown` is excluded from the scan, or a null inside it would demand
     that it list itself."""

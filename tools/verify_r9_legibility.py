@@ -69,7 +69,26 @@ def errors_after(cmds, what, timeout=30.0):
     return st.get("errors", [])
 
 
+def start_match():
+    """Clear the ready handshake if the engine is holding the match at t=0.
+
+    A bridged seat now gates the start (docs/INTENT.md, "The ready handshake"):
+    the world is spawned and photographed, but the clock does not move until
+    every seat says the word. This script waits on a real verdict, so it needs
+    a clock that runs. Harmless against an engine built before the handshake —
+    `ready` is then an unrecognized verb that lands in `errors` and is cleared
+    by the next batch, and `waiting_for` is never there to begin with.
+    """
+    st = read_state()
+    if "waiting_for" not in st:
+        return st
+    print(f"[0] held at t=0, waiting for {st['waiting_for']} — sending ready")
+    send([{"type": "ready"}])
+    return wait_for(lambda s: "waiting_for" not in s, "the match to start")
+
+
 def run_checks():
+    start_match()
     st = wait_for(lambda s: s.get("units"), "the opening snapshot")
     print(f"[0] seat live at t={st['t']}s, my_team={st['my_team']}")
 

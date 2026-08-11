@@ -183,6 +183,21 @@ def validate(rec: dict) -> list[str]:
         want(seat.get("team") in TEAMS, f"{where}.team {seat.get('team')!r} not in {TEAMS}")
         want(seat.get("kind") in SEAT_KINDS, f"{where}.kind {seat.get('kind')!r} not in {SEAT_KINDS}")
         want("persona" in seat, f"{where} has no persona field")
+        # `ready_wait_s` — wall seconds this seat took to send `ready` before
+        # the match clock started (docs/INTENT.md, "The ready handshake").
+        # Additive and OPTIONAL: rounds recorded before the handshake existed
+        # do not have it and are not wrong, and a seat that never waited omits
+        # it rather than nulling it, so the `unknown[]` honesty rule below has
+        # nothing to say about it either way. Typed when present, because a
+        # duration that arrived as a string would go unnoticed until somebody
+        # tried to average the series.
+        want(
+            "ready_wait_s" not in seat
+            or (isinstance(seat["ready_wait_s"], (int, float))
+                and not isinstance(seat["ready_wait_s"], bool)
+                and seat["ready_wait_s"] >= 0),
+            f"{where}.ready_wait_s must be a non-negative number when present",
+        )
 
     res = rec["result"]
     want(isinstance(res, dict), "result must be an object")

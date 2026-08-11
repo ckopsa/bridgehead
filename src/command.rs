@@ -52,7 +52,7 @@
 //! | **anything a trigger fires** | exempt | Whatever verb it carries. A trigger is standing policy whose condition came true, so its author paid the reach when they ARMED it and charging the link again would price one reach twice. Selected by `SubmitIntent::trigger` through [`CommandLink::exempt_issuer`], which is a named constructor rather than a boolean precisely so this row has somewhere to point. It extends C4 one rung: pre-arming a rule is strictly better than hand-answering an alarm at range. |
 //! | `plan_set`, `plan_clear` | exempt | Writing a sequence down is doctrine. |
 //! | **anything a plan step submits** | exempt | Identical argument to the row above, one rung along: a plan is standing policy the engine executes unattended, and its author paid the reach when they wrote the sequence. It also has to be exempt or a five-step plan would cost five links and be strictly worse than typing the same five commands by hand — C4 inverted at the layer where the tempo argument is strongest. Selected by `SubmitIntent::plan` through the same [`CommandLink::exempt_issuer`]. |
-//! | `autopilot`, `surrender` | exempt | Match level, not a unit order. |
+//! | `autopilot`, `surrender`, `ready` | exempt | Match level, not a unit order. `ready` is the strongest case in the table: it is spoken while the match is HELD, before any unit exists to reach, and charging a link for it would price the handshake it exists to make free — and price it differently for each side, which is the one thing a simultaneous start cannot survive. |
 //!
 //! ## The curve
 //!
