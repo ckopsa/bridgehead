@@ -145,9 +145,11 @@ impl Plugin for IntentPlugin {
             // read by trigger.rs, bridge.rs and ui.rs, and written by exactly
             // two verbs in this file. The writer owns the registration.
             .init_resource::<Triggers>()
-            // And a fifth, on identical reasoning: `Plans` is read by plan.rs,
-            // bridge.rs and ui.rs, and written by exactly two verbs here.
+            // And a fifth and sixth, on identical reasoning. `Plans` is read
+            // by plan.rs, bridge.rs and ui.rs; `Regions` by trigger.rs,
+            // bridge.rs and ui.rs. Each is written by exactly two verbs here.
             .init_resource::<Plans>()
+            .init_resource::<Regions>()
             .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
             // `IntentApply` lives INSIDE `SimSet::Intent`, declared once here
@@ -254,6 +256,10 @@ pub struct IntentTables<'w> {
 pub struct DeferredPolicy<'w> {
     triggers: ResMut<'w, Triggers>,
     plans: ResMut<'w, Plans>,
+    /// The third store on the same one-writer rule, and the one the other two
+    /// READ: a trigger's `enemy_in` and a plan step's advance condition both
+    /// resolve place names out of here, so it has to travel with them.
+    regions: ResMut<'w, Regions>,
 }
 
 /// The events an intent can emit. ui.rs and bridge.rs each used to carry an
@@ -446,6 +452,7 @@ fn apply_intents(
             &mut squad_orders,
             &mut deferred.triggers,
             &mut deferred.plans,
+            &mut deferred.regions,
             &mut commands,
             &mut events,
             &mut world,
@@ -579,6 +586,207 @@ fn apply_intents(
 /// bridge always did. `tag` prefixes them — `"cmd 3"` for a bridge batch,
 /// `"ui"` for a gesture — which is what keeps the bridge's historical error
 /// strings byte-identical.
+// ---------------------------------------------------------------------------
+// Territory: the one place a name becomes a coordinate
+// ---------------------------------------------------------------------------
+
+/// Turn every `"region":"<name>"` in a submitted intent into the coordinates it
+/// stands for, or refuse with the list of names this seat may speak.
+///
+/// **This is the single resolution point, and that is the whole design.** The
+/// alternative — every verb resolving its own place — is how you end up with
+/// `defend` accepting a name that `push` does not, and with two spellings of
+/// the unknown-name error. Here there is one function, one refusal, and every
+/// arm below it sees plain floats exactly as it did before regions existed.
+///
+/// Three things it deliberately does NOT do:
+///
+///  * **It does not recurse into a trigger's `then`.** compile_intent's
+///    `trigger_set` arm says why in full: the action is validated when it
+///    FIRES, against the world that fired it. A region is on the same footing.
+///    That means an armed rule keeps naming *the perimeter* rather than the
+///    coordinates the perimeter had at arm time — so moving a region re-aims
+///    every rule that names it, and clearing one makes those rules refuse, out
+///    loud, into the arming seat's own error channel. Both are the behaviour a
+///    commander wants from a name.
+///  * **It does not clamp or validate the geometry** — `clamp_to_map` and the
+///    per-verb checks below still own that. A region's centre is already on the
+///    map by construction, so there is nothing to add.
+///  * **It does not keep a resolved coordinate anywhere.** Resolution happens
+///    per submission, so a region moved between two sentences moves both.
+fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent, String> {
+    /// `(x, z, radius_from_region)`. A region always supplies a radius; only
+    /// the two verbs that have a radius to give away actually use it.
+    fn shape(
+        regions: &Regions,
+        me: Team,
+        x: Option<f32>,
+        z: Option<f32>,
+        region: &Option<String>,
+    ) -> Result<(Option<f32>, Option<f32>, Option<f32>), String> {
+        let Some(name) = region else {
+            return Ok((x, z, None));
+        };
+        let found = regions
+            .find(me, name)
+            .ok_or_else(|| regions.unknown(me, name))?;
+        Ok((
+            Some(found.center.x),
+            Some(found.center.z),
+            Some(found.radius),
+        ))
+    }
+    /// The refusal a place-taking verb earns when it named no ground at all.
+    /// One wording, so `move` and `defend` teach the same lesson.
+    fn needs(verb: &str) -> String {
+        format!("{verb} needs x/z or a region name")
+    }
+    fn both(verb: &str, x: Option<f32>, z: Option<f32>) -> Result<(f32, f32), String> {
+        match (x, z) {
+            (Some(x), Some(z)) => Ok((x, z)),
+            _ => Err(needs(verb)),
+        }
+    }
+
+    Ok(match intent {
+        Intent::Move { units, x, z, region } => {
+            let (x, z, _) = shape(regions, me, x, z, &region)?;
+            let (px, pz) = both("move", x, z)?;
+            Intent::Move {
+                units,
+                x: Some(px),
+                z: Some(pz),
+                region,
+            }
+        }
+        Intent::AttackMove { units, x, z, region } => {
+            let (x, z, _) = shape(regions, me, x, z, &region)?;
+            let (px, pz) = both("attackmove", x, z)?;
+            Intent::AttackMove {
+                units,
+                x: Some(px),
+                z: Some(pz),
+                region,
+            }
+        }
+        Intent::Build {
+            worker,
+            kind,
+            x,
+            z,
+            region,
+        } => {
+            let (x, z, _) = shape(regions, me, x, z, &region)?;
+            let (px, pz) = both("build", x, z)?;
+            Intent::Build {
+                worker,
+                kind,
+                x: Some(px),
+                z: Some(pz),
+                region,
+            }
+        }
+        // Rally, retreat and leash each have a legal placeless form (a rally
+        // onto a unit; the two doctrine verbs' CLEAR spelling), so an absent
+        // place is not an error here — only an unresolvable name is.
+        Intent::Rally {
+            building,
+            x,
+            z,
+            region,
+            target,
+        } => {
+            let (x, z, _) = shape(regions, me, x, z, &region)?;
+            Intent::Rally {
+                building,
+                x,
+                z,
+                region,
+                target,
+            }
+        }
+        Intent::Retreat {
+            units,
+            below,
+            x,
+            z,
+            region,
+        } => {
+            let (x, z, _) = shape(regions, me, x, z, &region)?;
+            Intent::Retreat {
+                units,
+                below,
+                x,
+                z,
+                region,
+            }
+        }
+        Intent::Leash {
+            units,
+            x,
+            z,
+            region,
+            radius,
+        } => {
+            let (x, z, from_region) = shape(regions, me, x, z, &region)?;
+            Intent::Leash {
+                units,
+                x,
+                z,
+                region,
+                // An explicit radius still wins: naming a circle is a
+                // convenience, never a ceiling on what you may say.
+                radius: radius.or(from_region),
+            }
+        }
+        Intent::Posture { id, posture } => {
+            let posture = match posture {
+                Some(PostureIntent::Defend { x, z, region, radius }) => {
+                    let (x, z, from_region) = shape(regions, me, x, z, &region)?;
+                    let (px, pz) = both("defend", x, z)?;
+                    let radius = radius.or(from_region);
+                    // The one place a missing radius is fatal: `defend` is a
+                    // ring, and a ring with no size is not a posture.
+                    let Some(radius) = radius else {
+                        return Err(
+                            "defend needs a radius, or a region whose own radius \
+                             can be the ring"
+                                .to_string(),
+                        );
+                    };
+                    Some(PostureIntent::Defend {
+                        x: Some(px),
+                        z: Some(pz),
+                        region,
+                        radius: Some(radius),
+                    })
+                }
+                Some(PostureIntent::Push { x, z, region }) => {
+                    let (x, z, _) = shape(regions, me, x, z, &region)?;
+                    let (px, pz) = both("push", x, z)?;
+                    Some(PostureIntent::Push {
+                        x: Some(px),
+                        z: Some(pz),
+                        region,
+                    })
+                }
+                Some(PostureIntent::Forage { x, z, region }) => {
+                    let (x, z, _) = shape(regions, me, x, z, &region)?;
+                    let (px, pz) = both("forage", x, z)?;
+                    Some(PostureIntent::Forage {
+                        x: Some(px),
+                        z: Some(pz),
+                        region,
+                    })
+                }
+                other => other,
+            };
+            Intent::Posture { id, posture }
+        }
+        other => other,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_intent(
     intent: Intent,
@@ -602,6 +810,11 @@ fn compile_intent(
     // two verbs here write them, plan.rs's evaluator and the two renderers
     // read them.
     plans: &mut Plans,
+    // The named geography, third on the same rule. Written by the two
+    // `region_*` verbs here; read by `resolve_places` at the top of this
+    // function, by trigger.rs's `enemy_in`, by the plan-step validation below,
+    // by bridge.rs's snapshot and by ui.rs's map.
+    regions: &mut Regions,
     commands: &mut Commands,
     events: &mut IntentEvents,
     world: &mut IntentWorld,
@@ -635,8 +848,31 @@ fn compile_intent(
         nodes,
         researching,
     } = world;
+    // Names become coordinates here and nowhere else. Everything below this
+    // line sees the language it has always seen.
+    let intent = match resolve_places(intent, me, regions) {
+        Ok(intent) => intent,
+        Err(err) => {
+            errors.push(format!("{tag}: {err}"));
+            return;
+        }
+    };
+    /// The ground a resolved intent names. `resolve_places` has already refused
+    /// the placeless form of every verb that calls this, so `None` is
+    /// unreachable — the re-check is defence against a future arm forgetting to
+    /// go through the resolver, and it refuses rather than panicking.
+    fn resolved_point(x: Option<f32>, z: Option<f32>) -> Option<Vec3> {
+        match (x, z) {
+            (Some(x), Some(z)) => Some(Vec3::new(x, 0.0, z)),
+            _ => None,
+        }
+    }
     match intent {
-        Intent::Move { units: ids, x, z } => {
+        Intent::Move { units: ids, x, z, .. } => {
+            let Some(target) = resolved_point(x, z) else {
+                errors.push(format!("{tag}: move needs x/z or a region name"));
+                return;
+            };
             ground_order(
                 commands,
                 errors,
@@ -645,13 +881,17 @@ fn compile_intent(
                 &ids,
                 units,
                 me,
-                Vec3::new(x, 0.0, z),
+                target,
                 false,
                 issuer,
                 reached,
             );
         }
-        Intent::AttackMove { units: ids, x, z } => {
+        Intent::AttackMove { units: ids, x, z, .. } => {
+            let Some(target) = resolved_point(x, z) else {
+                errors.push(format!("{tag}: attackmove needs x/z or a region name"));
+                return;
+            };
             ground_order(
                 commands,
                 errors,
@@ -660,7 +900,7 @@ fn compile_intent(
                 &ids,
                 units,
                 me,
-                Vec3::new(x, 0.0, z),
+                target,
                 true,
                 issuer,
                 reached,
@@ -802,7 +1042,12 @@ fn compile_intent(
             kind,
             x,
             z,
+            ..
         } => {
+            let Some(site) = resolved_point(x, z) else {
+                errors.push(format!("{tag}: build needs x/z or a region name"));
+                return;
+            };
             let Some(building_kind) = parse_building_kind(&kind) else {
                 errors.push(format!("{tag}: unknown building kind '{kind}'"));
                 return;
@@ -829,7 +1074,7 @@ fn compile_intent(
             }
             let stats = building_stats(building_kind);
             // Snap to nav-cell boundaries exactly like the placement ghost.
-            let pos = snap_footprint(clamp_to_map(Vec3::new(x, 0.0, z)), stats.size);
+            let pos = snap_footprint(clamp_to_map(site), stats.size);
             if !nav.rect_is_free(pos, stats.size) {
                 errors.push(format!(
                     "{tag}: {}",
@@ -1120,6 +1365,7 @@ fn compile_intent(
             x,
             z,
             target,
+            ..
         } => {
             let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
@@ -1561,6 +1807,7 @@ fn compile_intent(
             below,
             x,
             z,
+            ..
         } => {
             let below_frac = below.unwrap_or(0.0);
             let clear = below_frac == 0.0;
@@ -1595,6 +1842,7 @@ fn compile_intent(
             x,
             z,
             radius,
+            ..
         } => {
             let radius = radius.unwrap_or(0.0);
             let clear = !(radius > 0.0);
@@ -1698,24 +1946,45 @@ fn compile_intent(
                     squad_orders.0.remove(&(me, id));
                     return;
                 }
-                Some(PostureIntent::Defend { x, z, radius }) => {
+                // `resolve_places` has already turned any region into these
+                // three numbers — a named region's own radius becoming the
+                // ring is a mapping stated on `PostureIntent`, applied there,
+                // and invisible here on purpose.
+                Some(PostureIntent::Defend { x, z, radius, .. }) => {
+                    let radius = radius.unwrap_or(0.0);
                     if !(radius > 0.0) {
                         errors.push(format!(
                             "{tag}: defend radius must be > 0, got {radius}"
                         ));
                         return;
                     }
+                    let Some(pos) = resolved_point(x, z) else {
+                        errors.push(format!("{tag}: defend needs x/z or a region name"));
+                        return;
+                    };
                     SquadPosture::Defend {
-                        pos: clamp_to_map(Vec3::new(x, 0.0, z)),
+                        pos: clamp_to_map(pos),
                         radius,
                     }
                 }
-                Some(PostureIntent::Push { x, z }) => SquadPosture::Push {
-                    pos: clamp_to_map(Vec3::new(x, 0.0, z)),
-                },
-                Some(PostureIntent::Forage { x, z }) => SquadPosture::Forage {
-                    muster: clamp_to_map(Vec3::new(x, 0.0, z)),
-                },
+                Some(PostureIntent::Push { x, z, .. }) => {
+                    let Some(pos) = resolved_point(x, z) else {
+                        errors.push(format!("{tag}: push needs x/z or a region name"));
+                        return;
+                    };
+                    SquadPosture::Push {
+                        pos: clamp_to_map(pos),
+                    }
+                }
+                Some(PostureIntent::Forage { x, z, .. }) => {
+                    let Some(muster) = resolved_point(x, z) else {
+                        errors.push(format!("{tag}: forage needs x/z or a region name"));
+                        return;
+                    };
+                    SquadPosture::Forage {
+                        muster: clamp_to_map(muster),
+                    }
+                }
                 Some(PostureIntent::Escort { unit }) => {
                     let Some((target, _)) = own_unit(unit, units, me) else {
                         errors
@@ -1829,23 +2098,34 @@ fn compile_intent(
             // doctrine and programming, and it is also what makes
             // MAX_TRIGGERS_PER_TEAM an actual bound rather than a starting
             // balance.
-            // The same refusal now covers plans, and it has to: a trigger whose
-            // `then` set a plan whose step armed a trigger would be a cycle, and
-            // the two caps would stop bounding anything. The rule the whole
-            // v3 vocabulary keeps is one sentence — *a deferred action may not
-            // defer another action* — with the single, bounded exception that a
-            // plan STEP may arm a trigger, because a trigger cannot defer
-            // anything further.
+            // The same refusal now covers plans AND the place vocabulary, and
+            // it has to. A trigger whose `then` set a plan whose step armed a
+            // trigger would be a cycle, and the two caps would stop bounding
+            // anything. The rule the whole v3 vocabulary keeps is one sentence
+            // — *a deferred action may not defer another action* — with the
+            // single, bounded exception that a plan STEP may arm a trigger,
+            // because a trigger cannot defer anything further.
+            //
+            // `region_set` is on the list for a related but distinct reason,
+            // one step further out: it is not deferral, it is EDITING THE
+            // VOCABULARY the other rules are written in. A rule that renamed
+            // ground while the match ran would make every other rule's meaning
+            // depend on firing order, and "what does north-pass mean right
+            // now?" would stop being answerable by reading the snapshot.
+            // Territory is something a commander says, not something a rule
+            // does.
             if matches!(
                 *then,
                 Intent::TriggerSet { .. }
                     | Intent::TriggerClear { .. }
                     | Intent::PlanSet { .. }
                     | Intent::PlanClear { .. }
+                    | Intent::RegionSet { .. }
+                    | Intent::RegionClear { .. }
             ) {
                 errors.push(format!(
-                    "{tag}: a trigger cannot arm or clear another trigger or a plan — \
-                     triggers are doctrine, not a scripting language"
+                    "{tag}: a trigger cannot arm or clear another trigger or a plan, or \
+                     name or forget ground — triggers are doctrine, not a scripting language"
                 ));
                 return;
             }
@@ -1858,7 +2138,13 @@ fn compile_intent(
                     return;
                 }
             }
-            if let Err(err) = validate_predicate(&when) {
+            // The predicate's parameters are constants the commander typed, so
+            // they CAN be judged now — including `enemy_in`'s region, which is
+            // vocabulary this seat either has or does not. Refusing a
+            // misspelled place at arm time is the difference between learning
+            // it immediately and learning it at 3 a.m. when the rule failed to
+            // fire.
+            if let Err(err) = validate_predicate(&when, me, regions) {
                 errors.push(format!("{tag}: trigger {name}: {err}"));
                 return;
             }
@@ -1935,7 +2221,12 @@ fn compile_intent(
                 match &step.advance {
                     PlanAdvance::OnApplied => {}
                     PlanAdvance::When { when } => {
-                        if let Err(err) = validate_predicate(when) {
+                        // The same arm-time judgement a trigger gets, for the
+                        // same reason and now including territory: a plan step
+                        // that advances on `enemy_in` names a PLACE, and a
+                        // misspelled place should be refused with the menu here
+                        // rather than silently stall the sequence at step k.
+                        if let Err(err) = validate_predicate(when, me, regions) {
                             errors.push(format!("{tag}: plan {name} step {k}: {err}"));
                             return;
                         }
@@ -1998,13 +2289,86 @@ fn compile_intent(
                 triggers.clear_all(me);
             }
         },
+
+        // --- territory ---
+        Intent::RegionSet {
+            name,
+            x,
+            z,
+            radius,
+        } => {
+            let name = match validate_region_name(&name) {
+                Ok(name) => name,
+                Err(err) => {
+                    errors.push(format!("{tag}: {err}"));
+                    return;
+                }
+            };
+            if !(REGION_RADIUS_MIN..=REGION_RADIUS_MAX).contains(&radius) {
+                errors.push(format!(
+                    "{tag}: region '{name}' radius must be between \
+                     {REGION_RADIUS_MIN:.0} and {REGION_RADIUS_MAX:.0}, got {radius}"
+                ));
+                return;
+            }
+            // Clamped like every other coordinate this compiler accepts: a
+            // region centred off the board would name ground nothing can stand
+            // on, and silently is how `move` has always treated the same
+            // mistake.
+            let center = clamp_to_map(Vec3::new(x, 0.0, z));
+            if let Err(err) = regions.set(me, Region::new(name, center, radius)) {
+                errors.push(format!("{tag}: {err}"));
+            }
+        }
+        Intent::RegionClear { name } => match name {
+            Some(name) => {
+                // Named rather than silent, exactly as `trigger_clear` is: "I
+                // forgot it" and "you never named that" call for opposite next
+                // moves. A built-in gets its own answer, because "you have no
+                // region called our base" would be a lie — you do, the map
+                // gave it to you, and it is not yours to forget.
+                if !regions.clear(me, &name) {
+                    if builtin_places(me)
+                        .iter()
+                        .any(|b| normalize_place(&b.name) == normalize_place(&name))
+                    {
+                        errors.push(format!(
+                            "{tag}: '{name}' is a built-in place on this map — \
+                             it cannot be cleared"
+                        ));
+                    } else {
+                        errors.push(format!("{tag}: you have no region named '{name}'"));
+                    }
+                }
+            }
+            None => {
+                regions.clear_all(me);
+            }
+        },
     }
 }
 
 /// Is this predicate expressible? Checked at arm time, because a predicate is
 /// the one half of a trigger that CAN be judged before the world moves — every
 /// parameter in it is a constant the commander typed.
-fn validate_predicate(when: &TriggerWhen) -> Result<(), String> {
+fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result<(), String> {
+    /// The class check `enemy_sighted` and `enemy_in` share. One matcher, one
+    /// wording — the two predicates ask the same question about the same word.
+    fn class_ok(class: &Option<String>) -> Result<(), String> {
+        match class {
+            // The same words `priority` takes, matched by the same
+            // function — there is one name matcher in this language.
+            Some(name) if parse_target_class(name).is_none() => Err(format!(
+                "unknown target class '{name}' (one of {})",
+                ALL_TARGET_CLASSES
+                    .iter()
+                    .map(|c| c.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            _ => Ok(()),
+        }
+    }
     fn frac(label: &str, value: f32) -> Result<(), String> {
         if value > 0.0 && value <= 1.0 {
             Ok(())
@@ -2021,19 +2385,20 @@ fn validate_predicate(when: &TriggerWhen) -> Result<(), String> {
             if *count == 0 {
                 return Err("enemy_sighted count must be at least 1".to_string());
             }
-            match class {
-                // The same words `priority` takes, matched by the same
-                // function — there is one name matcher in this language.
-                Some(name) if parse_target_class(name).is_none() => Err(format!(
-                    "unknown target class '{name}' (one of {})",
-                    ALL_TARGET_CLASSES
-                        .iter()
-                        .map(|c| c.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-                _ => Ok(()),
+            class_ok(class)
+        }
+        TriggerWhen::EnemyIn {
+            region,
+            class,
+            count,
+        } => {
+            if *count == 0 {
+                return Err("enemy_in count must be at least 1".to_string());
             }
+            if regions.find(me, region).is_none() {
+                return Err(regions.unknown(me, region));
+            }
+            class_ok(class)
         }
         TriggerWhen::TierReached { tier } => {
             if (1..=3).contains(tier) {
@@ -2803,14 +3168,14 @@ mod tests {
             team: Team::Human,
             source: IntentSource::Bridge,
             tag: "cmd 3".to_string(),
-            intent: Intent::Move { units: vec![commanded.to_bits()], x: 0.0, z: 0.0 },
+            intent: Intent::Move { units: vec![commanded.to_bits()], x: Some(0.0), z: Some(0.0), region: None },
             trigger: None,
             plan: None,
         });
         // The same sentence, from the seat with a screen.
         app.world_mut().send_event(SubmitIntent::ui(
             Team::Human,
-            Intent::Move { units: vec![clicked.to_bits()], x: 0.0, z: 0.0 },
+            Intent::Move { units: vec![clicked.to_bits()], x: Some(0.0), z: Some(0.0), region: None },
         ));
         app.update();
 
@@ -2851,7 +3216,7 @@ mod tests {
             team: Team::Human,
             source: IntentSource::Bridge,
             tag: "cmd 0".to_string(),
-            intent: Intent::Move { units: vec![inside.to_bits()], x: 61.0, z: 61.0 },
+            intent: Intent::Move { units: vec![inside.to_bits()], x: Some(61.0), z: Some(61.0), region: None },
             trigger: None,
             plan: None,
         });
@@ -2897,8 +3262,9 @@ mod tests {
             Team::Human,
             Intent::Move {
                 units: vec![soldier.to_bits()],
-                x: 12.0,
-                z: -4.0,
+                x: Some(12.0),
+                z: Some(-4.0),
+                region: None,
             },
         ));
         app.world_mut().send_event(SubmitIntent {
@@ -2942,8 +3308,9 @@ mod tests {
                 Team::Human,
                 Intent::Move {
                     units: vec![i as u64],
-                    x: 0.0,
-                    z: 0.0,
+                    x: Some(0.0),
+                    z: Some(0.0),
+                    region: None,
                 },
             ));
         }
@@ -3171,8 +3538,9 @@ mod tests {
             Intent::Build {
                 worker: soldier.to_bits(),
                 kind: "Nonsense".to_string(),
-                x: 0.0,
-                z: 0.0,
+                x: Some(0.0),
+                z: Some(0.0),
+                region: None,
             },
         ));
         app.update();
@@ -3832,8 +4200,9 @@ mod tests {
             Team::Human,
             Intent::Move {
                 units: vec![by_hand.to_bits()],
-                x: -70.0,
-                z: -70.0,
+                x: Some(-70.0),
+                z: Some(-70.0),
+                region: None,
             },
         ));
         app.update();
@@ -3857,8 +4226,9 @@ mod tests {
             },
             Intent::Move {
                 units: vec![by_plan.to_bits()],
-                x: -70.0,
-                z: -70.0,
+                x: Some(-70.0),
+                z: Some(-70.0),
+                region: None,
             },
         ));
         app.update();
@@ -3946,8 +4316,9 @@ mod tests {
             .id();
         let go = Intent::Move {
             units: vec![soldier.to_bits()],
-            x: 40.0,
-            z: 40.0,
+            x: Some(40.0),
+            z: Some(40.0),
+            region: None,
         };
 
         // Spoken now: it travels.
@@ -3999,8 +4370,9 @@ mod tests {
             name,
             Intent::Move {
                 units: vec![soldier.to_bits()],
-                x: 1.0,
-                z: 2.0,
+                x: Some(1.0),
+                z: Some(2.0),
+                region: None,
             },
         ));
         app.update();
@@ -4042,9 +4414,10 @@ mod tests {
             Intent::Posture {
                 id: 1,
                 posture: Some(PostureIntent::Defend {
-                    x: -70.0,
-                    z: -70.0,
-                    radius: 26.0,
+                    x: Some(-70.0),
+                    z: Some(-70.0),
+                    region: None,
+                    radius: Some(26.0),
                 }),
             },
         ));
@@ -4093,8 +4466,9 @@ mod tests {
             name,
             Intent::Move {
                 units: vec![999_999],
-                x: 1.0,
-                z: 2.0,
+                x: Some(1.0),
+                z: Some(2.0),
+                region: None,
             },
         ));
         app.update();
@@ -4285,8 +4659,9 @@ mod tests {
             intent: Intent::Build {
                 worker: worker.to_bits(),
                 kind: "TownHall".to_string(),
-                x: mine.x,
-                z: mine.z,
+                x: Some(mine.x),
+                z: Some(mine.z),
+                region: None,
             },
             trigger: None,
             plan: None,
@@ -4327,8 +4702,9 @@ mod tests {
             intent: Intent::Build {
                 worker: worker.to_bits(),
                 kind: "TownHall".to_string(),
-                x: hx,
-                z: hz,
+                x: Some(hx),
+                z: Some(hz),
+                region: None,
             },
             trigger: None,
             plan: None,
@@ -4589,8 +4965,9 @@ mod tests {
     fn intents_round_trip() {
         let original = Intent::AttackMove {
             units: vec![7, 8, 9],
-            x: 12.5,
-            z: -30.5,
+            x: Some(12.5),
+            z: Some(-30.5),
+            region: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: Intent = serde_json::from_str(&json).unwrap();
@@ -4813,6 +5190,7 @@ mod tests {
             units: vec![41, 42],
             x: Some(12.0),
             z: Some(-8.0),
+            region: None,
             radius: Some(18.0),
         };
         let typed: Intent = serde_json::from_str(
@@ -5147,5 +5525,791 @@ mod tests {
             app.world().resource::<IntentApplied>().get(Team::Human).is_empty(),
             "an exempt verb reports no cost, however its destination is spelled"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Territory: named places and regions
+    // -----------------------------------------------------------------------
+
+    /// Every helper below speaks through the wire, never through `Regions`
+    /// directly — a test that reached into the resource would be testing a
+    /// setter rather than the language.
+    fn region_set(app: &mut App, team: Team, name: &str, x: f32, z: f32, radius: f32) {
+        app.world_mut().send_event(SubmitIntent::ui(
+            team,
+            Intent::RegionSet {
+                name: name.to_string(),
+                x,
+                z,
+                radius,
+            },
+        ));
+        app.update();
+    }
+
+    fn errors_of(app: &App, team: Team) -> Vec<String> {
+        app.world().resource::<IntentErrors>().get(team).to_vec()
+    }
+
+    fn drain_errors(app: &mut App, team: Team) -> Vec<String> {
+        let out = errors_of(app, team);
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(team).clear();
+        out
+    }
+
+    fn region_named(app: &App, team: Team, name: &str) -> Option<Region> {
+        app.world().resource::<Regions>().find(team, name)
+    }
+
+    // -- CRUD, caps and refusals -------------------------------------------
+
+    #[test]
+    fn a_region_is_named_replaced_by_name_and_forgotten() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "north-pass", -60.0, 60.0, 18.0);
+        let first = region_named(&app, Team::Human, "north-pass").expect("named");
+        assert_eq!(first.center, Vec3::new(-60.0, 0.0, 60.0));
+        assert_eq!(first.radius, 18.0);
+        assert!(errors_of(&app, Team::Human).is_empty());
+
+        // Re-stating the name MOVES the circle rather than minting a second
+        // one — the trigger rule, applied to geography, and the reason a
+        // commander can re-aim a region without spending a slot.
+        region_set(&mut app, Team::Human, "north-pass", -40.0, 40.0, 24.0);
+        assert_eq!(
+            app.world().resource::<Regions>().get(Team::Human).len(),
+            1,
+            "replace by name, in place"
+        );
+        let moved = region_named(&app, Team::Human, "north-pass").expect("still named");
+        assert_eq!(moved.center, Vec3::new(-40.0, 0.0, 40.0));
+        assert_eq!(moved.radius, 24.0);
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::RegionClear {
+                name: Some("north-pass".to_string()),
+            },
+        ));
+        app.update();
+        assert!(region_named(&app, Team::Human, "north-pass").is_none());
+    }
+
+    /// Case, dashes and underscores are noise; a possessive is not.
+    #[test]
+    fn a_region_name_folds_punctuation_but_not_meaning() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "The Perimeter", 0.0, 0.0, 20.0);
+        for spelling in ["the perimeter", "THE-PERIMETER", "the_perimeter", "  The   Perimeter "] {
+            assert!(
+                region_named(&app, Team::Human, spelling).is_some(),
+                "'{spelling}' must find the same circle"
+            );
+        }
+        // ...and the label keeps the capitals the commander typed.
+        assert_eq!(
+            region_named(&app, Team::Human, "the perimeter").unwrap().name,
+            "The Perimeter"
+        );
+        // The two built-in aliases differ by a possessive and must NOT fold
+        // together — this is the case a naive stop-word list gets wrong.
+        let ours = region_named(&app, Team::Human, "our base").expect("built-in");
+        let theirs = region_named(&app, Team::Human, "their base").expect("built-in");
+        assert_ne!(ours.center, theirs.center);
+    }
+
+    #[test]
+    fn the_region_cap_is_eight_and_says_which_eight() {
+        let mut app = compiler_app();
+        for i in 0..MAX_REGIONS_PER_TEAM {
+            region_set(&mut app, Team::Human, &format!("r{i}"), i as f32, 0.0, 10.0);
+        }
+        assert!(drain_errors(&mut app, Team::Human).is_empty(), "eight is legal");
+
+        region_set(&mut app, Team::Human, "one-too-many", 50.0, 50.0, 10.0);
+        let errs = drain_errors(&mut app, Team::Human);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("8 regions"), "names the cap: {}", errs[0]);
+        assert!(errs[0].contains("r0, r1"), "lists them so one can be picked: {}", errs[0]);
+        assert!(region_named(&app, Team::Human, "one-too-many").is_none());
+
+        // Replacing by name is free even at the cap — otherwise the cap would
+        // punish tuning a rule rather than owning too many.
+        region_set(&mut app, Team::Human, "r3", -80.0, -80.0, 12.0);
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert_eq!(
+            region_named(&app, Team::Human, "r3").unwrap().center,
+            Vec3::new(-80.0, 0.0, -80.0)
+        );
+    }
+
+    #[test]
+    fn a_region_may_not_steal_a_built_in_name() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "mid", 80.0, 80.0, 10.0);
+        let errs = drain_errors(&mut app, Team::Human);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("built-in"), "{}", errs[0]);
+        // And `mid` still means the middle of the map for BOTH seats, which is
+        // the whole property the refusal protects.
+        assert_eq!(
+            region_named(&app, Team::Human, "mid").unwrap().center,
+            Vec3::ZERO
+        );
+        assert_eq!(
+            region_named(&app, Team::Claude, "mid").unwrap().center,
+            Vec3::ZERO
+        );
+
+        // Clearing one is refused in its own words rather than with "you have
+        // no region called that", which would be a lie.
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::RegionClear {
+                name: Some("our base".to_string()),
+            },
+        ));
+        app.update();
+        let errs = drain_errors(&mut app, Team::Human);
+        assert!(errs[0].contains("cannot be cleared"), "{}", errs[0]);
+    }
+
+    #[test]
+    fn a_region_radius_is_bounded_at_both_ends() {
+        let mut app = compiler_app();
+        for bad in [0.0, REGION_RADIUS_MIN - 0.1, REGION_RADIUS_MAX + 0.1, 500.0] {
+            region_set(&mut app, Team::Human, "too", 0.0, 0.0, bad);
+            let errs = drain_errors(&mut app, Team::Human);
+            assert_eq!(errs.len(), 1, "radius {bad} must be refused");
+            assert!(errs[0].contains("radius must be between"), "{}", errs[0]);
+        }
+        assert!(region_named(&app, Team::Human, "too").is_none());
+    }
+
+    /// A region is DOCTRINE. The two teams' lists are independent, and one
+    /// seat's name is unspeakable at the other.
+    #[test]
+    fn regions_are_per_team_and_invisible_across_the_line() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "my-secret", -50.0, -50.0, 20.0);
+        assert!(region_named(&app, Team::Human, "my-secret").is_some());
+        assert!(
+            region_named(&app, Team::Claude, "my-secret").is_none(),
+            "naming ground tells the enemy nothing"
+        );
+        assert!(
+            !app.world()
+                .resource::<Regions>()
+                .known_names(Team::Claude)
+                .iter()
+                .any(|n| n == "my-secret")
+        );
+        // Both seats may hold the SAME name for different ground.
+        region_set(&mut app, Team::Claude, "my-secret", 50.0, 50.0, 20.0);
+        assert_eq!(
+            region_named(&app, Team::Human, "my-secret").unwrap().center,
+            Vec3::new(-50.0, 0.0, -50.0)
+        );
+        assert_eq!(
+            region_named(&app, Team::Claude, "my-secret").unwrap().center,
+            Vec3::new(50.0, 0.0, 50.0)
+        );
+    }
+
+    // -- built-in derivation -----------------------------------------------
+
+    /// The map's own vocabulary exists before anybody arms anything, is the
+    /// same for both seats except the two per-seat aliases, and names the
+    /// mines the way intent_compile.py's `pick_mine` already does.
+    #[test]
+    fn the_built_in_places_are_map_facts_available_from_second_zero() {
+        let names: Vec<String> = builtin_places(Team::Human)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        for want in [
+            "our base",
+            "their base",
+            "mid",
+            "southwest mine",
+            "northeast mine",
+            "northwest mine",
+            "southeast mine",
+        ] {
+            assert!(names.iter().any(|n| n == want), "missing built-in '{want}' in {names:?}");
+        }
+        // Every name is unique — a vocabulary with two `north mine`s in it
+        // would make `region` resolution a coin flip.
+        let mut folded: Vec<String> = names.iter().map(|n| normalize_place(n)).collect();
+        let before = folded.len();
+        folded.sort();
+        folded.dedup();
+        assert_eq!(before, folded.len(), "built-in names must be distinct");
+    }
+
+    /// The mine names are the INVERSE of the tool that resolves them: the mine
+    /// this calls `northwest mine` is the mine nearest intent_compile.py's
+    /// `northwest` compass anchor, so the two vocabularies cannot drift.
+    #[test]
+    fn each_mine_is_named_for_the_compass_anchor_it_is_nearest() {
+        let places = builtin_places(Team::Human);
+        let anchors = [
+            ("northwest mine", Vec3::new(-60.0, 0.0, 60.0)),
+            ("northeast mine", Vec3::new(60.0, 0.0, 60.0)),
+            ("southwest mine", Vec3::new(-60.0, 0.0, -60.0)),
+            ("southeast mine", Vec3::new(60.0, 0.0, -60.0)),
+        ];
+        for (name, anchor) in anchors {
+            let region = places.iter().find(|r| r.name == name).expect(name);
+            // The mine this name resolves to must be the one closest to the
+            // anchor the same word means in the compass table.
+            let nearest = GOLD_MINE_POSITIONS
+                .iter()
+                .min_by(|a, b| a.distance(anchor).total_cmp(&b.distance(anchor)))
+                .unwrap();
+            assert_eq!(
+                region.center, *nearest,
+                "'{name}' must be the mine at the {name} anchor"
+            );
+        }
+    }
+
+    /// The two per-seat aliases resolve to the RIGHT corner for each seat, and
+    /// everything else is identical between them.
+    #[test]
+    fn our_base_and_their_base_are_the_only_seat_relative_names() {
+        let human = builtin_places(Team::Human);
+        let claude = builtin_places(Team::Claude);
+        assert_eq!(human.len(), claude.len());
+        for (h, c) in human.iter().zip(claude.iter()) {
+            assert_eq!(h.name, c.name, "both seats speak the same words");
+            if h.name == "our base" || h.name == "their base" {
+                assert_ne!(h.center, c.center, "'{}' must be seat-relative", h.name);
+            } else {
+                assert_eq!(h.center, c.center, "'{}' is neutral ground", h.name);
+            }
+        }
+        let ours = human.iter().find(|r| r.name == "our base").unwrap();
+        assert_eq!(ours.center, HUMAN_BASE);
+        let theirs = human.iter().find(|r| r.name == "their base").unwrap();
+        assert_eq!(theirs.center, CLAUDE_BASE);
+        // ...and the Claude seat reads the identical two words the other way.
+        assert_eq!(
+            claude.iter().find(|r| r.name == "our base").unwrap().center,
+            CLAUDE_BASE
+        );
+    }
+
+    /// Every ford the map declares is a place you can name, at the ford's own
+    /// opening width. `open` declares none and therefore offers none — the
+    /// list is derived from the map rather than hardcoded per map.
+    #[test]
+    fn every_chokepoint_the_map_declares_becomes_a_named_place() {
+        let places = builtin_places(Team::Human);
+        let chokes = crate::terrain::active_map().chokepoints();
+        for choke in &chokes {
+            let region = places
+                .iter()
+                .find(|r| r.name == choke.name)
+                .unwrap_or_else(|| panic!("ford '{}' must be nameable", choke.name));
+            assert_eq!(region.center, choke.pos);
+            assert_eq!(
+                region.radius,
+                (choke.width * 0.5).max(REGION_RADIUS_MIN),
+                "a ford's region is its own opening"
+            );
+        }
+        assert_eq!(
+            places.len(),
+            3 + GOLD_MINE_POSITIONS.len() + chokes.len(),
+            "the built-in list is exactly bases + mid + mines + fords"
+        );
+    }
+
+    // -- compiler resolution ------------------------------------------------
+
+    /// The headline: a name in place of coordinates, resolved once, at submit
+    /// time, for every verb that takes ground.
+    #[test]
+    fn a_region_name_stands_in_for_coordinates_anywhere_ground_is_named() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "the-perimeter", -40.0, 30.0, 26.0);
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Order::Idle,
+            ))
+            .id();
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Move {
+                units: vec![soldier.to_bits()],
+                x: None,
+                z: None,
+                region: Some("the-perimeter".to_string()),
+            },
+        ));
+        app.update();
+        assert!(errors_of(&app, Team::Human).is_empty(), "{:?}", errors_of(&app, Team::Human));
+        assert!(
+            matches!(
+                app.world().entity(soldier).get::<Order>(),
+                Some(Order::Move(p)) if (p.x + 40.0).abs() < 1e-3 && (p.z - 30.0).abs() < 1e-3
+            ),
+            "the order landed on the region's centre, got {:?}",
+            app.world().entity(soldier).get::<Order>()
+        );
+    }
+
+    /// Explicit coordinates still work, and a region WINS over them when both
+    /// are given — one precedence, stated once, so no verb can disagree.
+    #[test]
+    fn a_region_outranks_coordinates_given_alongside_it() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "here", 10.0, -10.0, 12.0);
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Order::Idle,
+            ))
+            .id();
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Move {
+                units: vec![soldier.to_bits()],
+                x: Some(90.0),
+                z: Some(90.0),
+                region: Some("here".to_string()),
+            },
+        ));
+        app.update();
+        assert!(
+            matches!(
+                app.world().entity(soldier).get::<Order>(),
+                Some(Order::Move(p)) if (p.x - 10.0).abs() < 1e-3
+            ),
+            "the name is the decision; the numbers alongside it are not"
+        );
+    }
+
+    /// An unknown name is refused **with the menu attached**. This is the
+    /// teaching error: a commander that mistyped gets the vocabulary back, not
+    /// a "no".
+    #[test]
+    fn an_unknown_region_name_is_refused_with_the_list_of_known_places() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "the-perimeter", -40.0, 30.0, 26.0);
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Order::Idle,
+            ))
+            .id();
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Move {
+                units: vec![soldier.to_bits()],
+                x: None,
+                z: None,
+                region: Some("the-perimiter".to_string()),
+            },
+        ));
+        app.update();
+        let errs = drain_errors(&mut app, Team::Human);
+        assert_eq!(errs.len(), 1, "one refusal, not one per unit");
+        assert!(errs[0].contains("no region named 'the-perimiter'"), "{}", errs[0]);
+        assert!(errs[0].contains("the-perimeter"), "offers the near miss: {}", errs[0]);
+        assert!(errs[0].contains("center ford") || errs[0].contains("mid"), "offers the map's own: {}", errs[0]);
+        assert!(
+            matches!(app.world().entity(soldier).get::<Order>(), Some(Order::Idle)),
+            "a refused sentence moves nothing"
+        );
+    }
+
+    /// A sentence that names no ground at all earns one wording, whichever
+    /// verb said it — that is what "one resolution point" buys.
+    #[test]
+    fn a_place_taking_verb_with_no_place_is_refused_in_one_voice() {
+        let mut app = compiler_app();
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Order::Idle,
+            ))
+            .id();
+        let cases: Vec<(Intent, &str)> = vec![
+            (
+                Intent::Move {
+                    units: vec![soldier.to_bits()],
+                    x: None,
+                    z: None,
+                    region: None,
+                },
+                "move needs x/z or a region name",
+            ),
+            (
+                Intent::AttackMove {
+                    units: vec![soldier.to_bits()],
+                    x: None,
+                    z: None,
+                    region: None,
+                },
+                "attackmove needs x/z or a region name",
+            ),
+            (
+                Intent::Posture {
+                    id: 1,
+                    posture: Some(PostureIntent::Push {
+                        x: None,
+                        z: None,
+                        region: None,
+                    }),
+                },
+                "push needs x/z or a region name",
+            ),
+        ];
+        for (intent, want) in cases {
+            app.world_mut().send_event(SubmitIntent::ui(Team::Human, intent));
+            app.update();
+            let errs = drain_errors(&mut app, Team::Human);
+            assert_eq!(errs.len(), 1, "expected exactly one refusal for {want}");
+            assert!(errs[0].ends_with(want), "got {}", errs[0]);
+        }
+    }
+
+    // -- posture-by-region mappings ----------------------------------------
+
+    /// `defend` takes the region's own radius as its ring, `push` takes only
+    /// the centre, `forage` musters at the centre. Each mapping asserted
+    /// against the posture doctrine.rs will actually execute.
+    #[test]
+    fn each_posture_maps_a_region_onto_its_own_shape() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "north-pass", -60.0, 60.0, 19.0);
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Posture {
+                id: 1,
+                posture: Some(PostureIntent::Defend {
+                    x: None,
+                    z: None,
+                    region: Some("north-pass".to_string()),
+                    radius: None,
+                }),
+            },
+        ));
+        app.update();
+        assert!(errors_of(&app, Team::Human).is_empty(), "{:?}", errors_of(&app, Team::Human));
+        match app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1)) {
+            Some(SquadPosture::Defend { pos, radius }) => {
+                assert_eq!(*pos, Vec3::new(-60.0, 0.0, 60.0));
+                assert_eq!(*radius, 19.0, "the region IS the ring");
+            }
+            other => panic!("expected a defend posture, got {other:?}"),
+        }
+
+        // An explicit radius still wins: naming a circle is a convenience,
+        // never a ceiling on what may be said.
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Posture {
+                id: 1,
+                posture: Some(PostureIntent::Defend {
+                    x: None,
+                    z: None,
+                    region: Some("north-pass".to_string()),
+                    radius: Some(30.0),
+                }),
+            },
+        ));
+        app.update();
+        assert!(matches!(
+            app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1)),
+            Some(SquadPosture::Defend { radius, .. }) if *radius == 30.0
+        ));
+
+        // Push: centre only, radius deliberately dropped.
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Posture {
+                id: 2,
+                posture: Some(PostureIntent::Push {
+                    x: None,
+                    z: None,
+                    region: Some("north-pass".to_string()),
+                }),
+            },
+        ));
+        app.update();
+        assert!(matches!(
+            app.world().resource::<SquadOrders>().0.get(&(Team::Human, 2)),
+            Some(SquadPosture::Push { pos }) if *pos == Vec3::new(-60.0, 0.0, 60.0)
+        ));
+
+        // Forage: the centre is the muster point.
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Posture {
+                id: 3,
+                posture: Some(PostureIntent::Forage {
+                    x: None,
+                    z: None,
+                    region: Some("north-pass".to_string()),
+                }),
+            },
+        ));
+        app.update();
+        assert!(matches!(
+            app.world().resource::<SquadOrders>().0.get(&(Team::Human, 3)),
+            Some(SquadPosture::Forage { muster }) if *muster == Vec3::new(-60.0, 0.0, 60.0)
+        ));
+    }
+
+    /// A built-in needs no arming: "defend the center ford" is a legal
+    /// sentence in the first second of a match on a map that has one.
+    #[test]
+    fn a_posture_may_name_a_built_in_place_with_nothing_armed() {
+        let mut app = compiler_app();
+        let place = builtin_places(Team::Human)
+            .into_iter()
+            .find(|r| r.name == "mid")
+            .expect("every map has a middle");
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Posture {
+                id: 1,
+                posture: Some(PostureIntent::Defend {
+                    x: None,
+                    z: None,
+                    region: Some("mid".to_string()),
+                    radius: None,
+                }),
+            },
+        ));
+        app.update();
+        assert!(errors_of(&app, Team::Human).is_empty());
+        assert!(matches!(
+            app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1)),
+            Some(SquadPosture::Defend { pos, radius })
+                if *pos == place.center && *radius == place.radius
+        ));
+    }
+
+    /// `leash` borrows the region's radius the same way `defend` does — the
+    /// two are the same shape, so they had better agree.
+    #[test]
+    fn a_leash_named_by_region_borrows_the_regions_radius() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "the-ring", 20.0, -20.0, 16.0);
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Order::Idle,
+            ))
+            .id();
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Leash {
+                units: vec![soldier.to_bits()],
+                x: None,
+                z: None,
+                region: Some("the-ring".to_string()),
+                radius: None,
+            },
+        ));
+        app.update();
+        let policy = app
+            .world()
+            .entity(soldier)
+            .get::<LeashPolicy>()
+            .expect("leashed");
+        assert_eq!(policy.anchor, Vec3::new(20.0, 0.0, -20.0));
+        assert_eq!(policy.radius, 16.0);
+    }
+
+    // -- sentences ----------------------------------------------------------
+
+    /// A named place is SPOKEN as its name. This is most of why regions exist:
+    /// the replay line for a defended ford reads "defends north-pass", not
+    /// "defends (-60.0, 60.0)".
+    #[test]
+    fn a_sentence_naming_a_region_reads_as_the_name() {
+        assert_eq!(
+            Intent::Posture {
+                id: 2,
+                posture: Some(PostureIntent::Defend {
+                    x: Some(-60.0),
+                    z: Some(60.0),
+                    region: Some("north-pass".to_string()),
+                    radius: None,
+                }),
+            }
+            .sentence(),
+            "squad 2 defends north-pass"
+        );
+        assert_eq!(
+            Intent::Move {
+                units: vec![7],
+                x: None,
+                z: None,
+                region: Some("the-perimeter".to_string()),
+            }
+            .sentence(),
+            "move unit 7 to the-perimeter"
+        );
+        // Without a name, nothing changed: the old sentence, byte for byte.
+        assert_eq!(
+            Intent::Move {
+                units: vec![7],
+                x: Some(1.0),
+                z: Some(2.0),
+                region: None,
+            }
+            .sentence(),
+            "move unit 7 to (1.0, 2.0)"
+        );
+        assert_eq!(
+            Intent::RegionSet {
+                name: "north-pass".to_string(),
+                x: -60.0,
+                z: 60.0,
+                radius: 18.0,
+            }
+            .sentence(),
+            "'north-pass' is the ground within 18 of (-60.0, 60.0)"
+        );
+    }
+
+    // -- triggers -----------------------------------------------------------
+
+    /// `enemy_in`'s region is a constant the commander typed, so it is judged
+    /// at ARM time — with the menu attached, like every other unknown name.
+    #[test]
+    fn arming_enemy_in_with_an_unknown_region_is_refused_immediately() {
+        let mut app = compiler_app();
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::TriggerSet {
+                name: "pass-watch".to_string(),
+                when: TriggerWhen::EnemyIn {
+                    region: "nowhere".to_string(),
+                    class: None,
+                    count: 5,
+                },
+                then: Box::new(Intent::Stop { units: vec![] }),
+                repeat: None,
+            },
+        ));
+        app.update();
+        let errs = drain_errors(&mut app, Team::Human);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("no region named 'nowhere'"), "{}", errs[0]);
+        assert!(
+            app.world().resource::<Triggers>().get(Team::Human).is_empty(),
+            "a rule whose predicate cannot be spelled must not be armed"
+        );
+
+        // The same rule against a BUILT-IN arms with nothing named first.
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::TriggerSet {
+                name: "pass-watch".to_string(),
+                when: TriggerWhen::EnemyIn {
+                    region: "mid".to_string(),
+                    class: None,
+                    count: 5,
+                },
+                then: Box::new(Intent::Stop { units: vec![] }),
+                repeat: None,
+            },
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert_eq!(app.world().resource::<Triggers>().get(Team::Human).len(), 1);
+    }
+
+    /// A trigger's ACTION is not resolved at arm time — the codebase's existing
+    /// rule, extended to territory rather than excepted from it. The rule keeps
+    /// naming *the perimeter*, so moving the region re-aims the rule.
+    #[test]
+    fn an_armed_rule_keeps_the_name_rather_than_the_coordinates() {
+        let mut app = compiler_app();
+        region_set(&mut app, Team::Human, "the-perimeter", -40.0, 30.0, 20.0);
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::TriggerSet {
+                name: "hold".to_string(),
+                when: TriggerWhen::GameTime { at: 1.0 },
+                then: Box::new(Intent::Posture {
+                    id: 1,
+                    posture: Some(PostureIntent::Defend {
+                        x: None,
+                        z: None,
+                        region: Some("the-perimeter".to_string()),
+                        radius: None,
+                    }),
+                }),
+                repeat: None,
+            },
+        ));
+        app.update();
+        let stored = app.world().resource::<Triggers>().get(Team::Human)[0].then.clone();
+        assert!(
+            matches!(
+                &stored,
+                Intent::Posture {
+                    posture: Some(PostureIntent::Defend { x: None, region: Some(name), .. }),
+                    ..
+                } if name == "the-perimeter"
+            ),
+            "the stored action must still be a NAME, got {stored:?}"
+        );
+        assert_eq!(stored.sentence(), "squad 1 defends the-perimeter");
+    }
+
+    #[test]
+    fn a_trigger_cannot_name_or_forget_ground() {
+        let mut app = compiler_app();
+        for then in [
+            Intent::RegionSet {
+                name: "sneaky".to_string(),
+                x: 0.0,
+                z: 0.0,
+                radius: 10.0,
+            },
+            Intent::RegionClear { name: None },
+        ] {
+            app.world_mut().send_event(SubmitIntent::ui(
+                Team::Human,
+                Intent::TriggerSet {
+                    name: "t".to_string(),
+                    when: TriggerWhen::GameTime { at: 0.0 },
+                    then: Box::new(then),
+                    repeat: None,
+                },
+            ));
+            app.update();
+            let errs = drain_errors(&mut app, Team::Human);
+            assert_eq!(errs.len(), 1);
+            assert!(errs[0].contains("doctrine, not a scripting language"), "{}", errs[0]);
+        }
+        assert!(app.world().resource::<Triggers>().get(Team::Human).is_empty());
     }
 }

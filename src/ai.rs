@@ -1281,8 +1281,9 @@ fn think(
             // scatter every second.
             voice.say(Intent::Move {
                 units: vec![intent_id(w.entity)],
-                x: safe.x,
-                z: safe.z,
+                x: Some(safe.x),
+                z: Some(safe.z),
+                region: None,
             });
         }
     }
@@ -1514,8 +1515,9 @@ fn think(
                         voice.say(Intent::Build {
                             worker: intent_id(builder),
                             kind: building_name(kind).to_string(),
-                            x: site.x,
-                            z: site.z,
+                            x: Some(site.x),
+                            z: Some(site.z),
+                            region: None,
                         });
                         // Optimistic, and safe to be: if the compiler refuses
                         // the placement the worker never picks up an
@@ -2234,8 +2236,9 @@ fn think(
         // Defense overrides everything, wave or not.
         voice.say_each(all, |units| Intent::AttackMove {
             units,
-            x: threat_pos.x,
-            z: threat_pos.z,
+            x: Some(threat_pos.x),
+            z: Some(threat_pos.z),
+            region: None,
         });
         return;
     }
@@ -2251,8 +2254,9 @@ fn think(
             let target = brain.wave_target;
             voice.say_each(all, |units| Intent::AttackMove {
                 units,
-                x: target.x,
-                z: target.z,
+                x: Some(target.x),
+                z: Some(target.z),
+                region: None,
             });
         } else {
             // Stragglers rejoin the push. Only the free ones, so a wave in
@@ -2261,8 +2265,9 @@ fn think(
             let target = brain.wave_target;
             voice.say_each(free_units(&army), |units| Intent::AttackMove {
                 units,
-                x: target.x,
-                z: target.z,
+                x: Some(target.x),
+                z: Some(target.z),
+                region: None,
             });
         }
     } else if army.len() >= brain.next_wave_size {
@@ -2273,8 +2278,9 @@ fn think(
         let target = brain.wave_target;
         voice.say_each(all, |units| Intent::AttackMove {
             units,
-            x: target.x,
-            z: target.z,
+            x: Some(target.x),
+            z: Some(target.z),
+            region: None,
         });
     } else {
         // Gather at the rally point while the army builds up. Whoever is free
@@ -2287,8 +2293,9 @@ fn think(
             .collect();
         voice.say_each(waiting, |units| Intent::AttackMove {
             units,
-            x: rally.x,
-            z: rally.z,
+            x: Some(rally.x),
+            z: Some(rally.z),
+            region: None,
         });
     }
 }

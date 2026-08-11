@@ -29,7 +29,10 @@ says command 3 was accepted but took 1.8s to reach the units it named — see
 
 ## Command reference
 Unit orders (ids from state):
-- `{"type":"move"|"attackmove","units":[ids],"x":..,"z":..}`
+- `{"type":"move"|"attackmove","units":[ids],"x":..,"z":..}` — or
+  `{"type":"move","units":[ids],"region":"north-pass"}`. **Every verb below that
+  takes `x`/`z` also takes `"region":"<name>"` instead**; see *Territory*.
+
 - `{"type":"attack","units":[ids],"target":enemy_id}`
 - `{"type":"harvest","units":[worker_ids],"target":node_id}` (mines AND trees — tree ids in `trees_near`)
 - `{"type":"return","units":[worker_ids]}`  `{"type":"stop","units":[ids]}`  `{"type":"follow","units":[ids],"target":own_id}`
@@ -118,6 +121,57 @@ Plans (SEQUENCED standing orders — see the section below; this is the shape):
 - `{"type":"surrender"}` — concede the match (opponent wins immediately). The honorable end to a
   hopeless position — no income, no army, no path back. Preferable to dragging out a decided game.
 
+## Territory: name the ground once, then speak in names
+
+Your snapshot hands you two vocabularies of named circles. Anywhere a verb takes
+`x`/`z`, send `"region":"<name>"` instead and the engine resolves it when the
+command arrives.
+
+**`map.places`** — the map's own names. Read-only, public (your opponent reads
+the same list), and live from second zero with nothing armed:
+
+| name | what |
+|---|---|
+| `our base` / `their base` | the two starting halls. Seat-relative: same words in both snapshots, different coordinates |
+| `mid` | the map centre, where bounties spawn |
+| `northwest mine`, `southeast mine`, … | one per gold mine, named for its compass corner |
+| `northwest ford`, `center ford`, … | one per chokepoint. Empty on `open`; three on `crossings` |
+
+**`regions`** — circles YOU named, up to **8**. These are doctrine, not
+information: they appear in your snapshot only, and naming ground tells your
+opponent nothing.
+
+```json
+{"type":"region_set","name":"north-pass","x":-60.0,"z":60.0,"radius":20.0}
+{"type":"region_clear","name":"north-pass"}      // or {} for all of them
+```
+
+Re-using a name **moves** that circle rather than spending a slot. Radius must
+be 4..60. You may not take a name `map.places` already owns.
+
+**What each verb does with a region:**
+
+| verb | region means |
+|---|---|
+| `move` / `attackmove` / `build` / `rally` | go to / build at the centre |
+| `posture` `defend` | centre is the anchor **and the region's own radius is the ring** — omit `radius` and stop carrying the number around |
+| `posture` `push` | push to the centre (a push has no radius) |
+| `posture` `forage` | the centre is the muster point |
+| `leash` | anchor at the centre; omit `radius` and the region's own is the leash |
+| `retreat` | fall back to the centre |
+
+**Why bother.** Two reasons, and the second is the one that wins matches:
+
+1. Your log becomes readable. `squad 2 defends north-pass` instead of
+   `squad 2 defends (-60.0, 60.0) within 20`.
+2. **The engine resolves the name, not you.** A standing order or an armed rule
+   that says `north-pass` keeps meaning *the pass* — so one `region_set` moving
+   the circle re-aims every posture and every trigger that mentions it. That is
+   one command instead of five, at zero polls.
+
+A name you have not defined is refused with the list of names you do have, so a
+typo costs you one error line rather than a silent order to the map's centre.
+
 ## Triggers: make the engine react for you
 
 **This is the single biggest thing you can do about your own latency.** You poll
@@ -139,7 +193,7 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 
     trigger home-guard fired: squad 1 defends (-70.0, -70.0) within 26
 
-### The eleven predicates
+### The twelve predicates
 
 | `when` | means |
 |---|---|
@@ -147,6 +201,7 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 | `{"type":"hero_below","frac":0.35}` | any of your living heroes under that fraction |
 | `{"type":"squad_below","id":1,"frac":0.5}` | squad 1's POOLED health under that (false if the squad is empty) |
 | `{"type":"enemy_sighted","class":"Siege","count":3}` | you can SEE that many enemies now (`class` optional; fog-honest) |
+| `{"type":"enemy_in","region":"north-pass","count":5}` | you can see that many enemies **inside a named place** (`class` optional; fog-honest both ways — see *Territory*) |
 | `{"type":"enemy_army_seen","size":6}` | your **intel ledger** holds 6+ enemy troops seen as one force. Optional `"within_s":30` demands a fresh sighting rather than a remembered one. Workers never count |
 | `{"type":"enemy_hero_down"}` | an enemy hero you **watched die** and have not seen alive since. Optional `"class":"Hero"` / `"Priestess"` for just one |
 | `{"type":"bounty_spawned"}` | a cache you can see is on the map |
@@ -174,7 +229,7 @@ hero, so no number about one has ever been on anybody's screen — so no
 predicate can read them. That their hero *died in front of you* is a different
 matter, and that one you may have.
 
-### Three recipes worth arming in your first batch
+### Six recipes worth arming in your first batch
 
 **1. Home guard** — the army comes home when the base burns. Repeating, because
 a base is raided more than once.
@@ -231,8 +286,29 @@ see. Repeating, because an army that is answered comes back.
          "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}
 ```
 
-A caution that applies to all three: `then` is frozen when you arm it, so ids in
-it are ids that may die. Prefer `posture` on a **squad** over a list of unit ids
+**6. Hold the pass** — the territorial rule, and the one that most repays a
+region. It answers a question you would otherwise have to ask every poll ("is
+anything at my ford yet?") and it answers it four times a second.
+
+```json
+{"type":"region_set","name":"north-pass","x":-60.0,"z":60.0,"radius":20.0}
+{"type":"trigger_set","name":"pass-watch","repeat":30,
+ "when":{"type":"enemy_in","region":"north-pass","count":5},
+ "then":{"type":"posture","id":2,
+         "posture":{"type":"defend","region":"north-pass"}}}
+```
+
+Read that action: no coordinates and no radius. The squad defends the circle at
+the circle's own size, and if you later decide the pass is somewhere else, ONE
+`region_set` moves both the rule and the posture it fires.
+
+`enemy_in` is fog-honest in both directions: it counts only enemies you can see
+AND that are inside the shape. A region is ground you are *watching*, not a
+sensor — so keep something with vision near a pass you are counting on. If you
+`region_clear` a region a rule names, that rule goes quiet rather than firing on
+the whole map.
+
+A caution that applies to all six: `then` is frozen when you arm it, so ids init are ids that may die. Prefer `posture` on a **squad** over a list of unit ids
 where you can — a squad survives its members. And a trigger whose action is
 refused when it fires reports that in your `errors` array tagged
 `trigger:<name>`, so check there if a rule seems to do nothing.

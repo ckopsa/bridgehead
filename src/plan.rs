@@ -321,6 +321,9 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<Time>()
             .init_resource::<Plans>()
+            // `TriggerWorld` reads it: a plan step may advance on `enemy_in`,
+            // which asks about a named place.
+            .init_resource::<Regions>()
             .init_resource::<TechTiers>()
             .init_resource::<GameEvents>()
             .add_event::<SubmitIntent>()
@@ -336,6 +339,7 @@ mod tests {
         app.init_resource::<Time>()
             .init_resource::<Triggers>()
             .init_resource::<Plans>()
+            .init_resource::<Regions>()
             .init_resource::<Economies>()
             .init_resource::<HeroRecords>()
             .init_resource::<TechTiers>()
@@ -584,6 +588,146 @@ mod tests {
         app.update();
         assert_eq!(at(&app), 1, "and moves the moment the belief changes");
         assert_eq!(sent(&mut app).len(), 1, "step 2 went out");
+    }
+
+    /// **The territory seam.** A plan step advancing on `enemy_in` — a
+    /// predicate a sibling bead added, over a vocabulary of PLACES a sibling
+    /// bead added — with nothing in this file changed to allow it.
+    ///
+    /// That is the property worth a test rather than the feature: `PlanAdvance`
+    /// carries a whole `TriggerWhen`, so every arm the predicate vocabulary
+    /// grows becomes a way to sequence, for free and permanently. Here it buys
+    /// something a commander actually wants and could not previously say:
+    /// *hold, and when five of them are in the pass, commit* — one plan, no
+    /// polling, and the pass named rather than spelled in floats.
+    #[test]
+    fn a_plan_advances_on_enemies_reaching_a_named_place() {
+        let mut app = plan_app();
+        // The place, named the way a commander names it.
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .set(
+                Team::Human,
+                Region::new("north-pass", Vec3::new(-60.0, 0.0, 60.0), 20.0),
+            )
+            .expect("the test's own region is legal");
+        app.world_mut()
+            .resource_mut::<Plans>()
+            .get_mut(Team::Human)
+            .push(plan(vec![
+                step(
+                    stop(),
+                    PlanAdvance::When {
+                        when: TriggerWhen::EnemyIn {
+                            region: "north-pass".to_string(),
+                            class: None,
+                            count: 3,
+                        },
+                    },
+                ),
+                step(stop(), PlanAdvance::OnApplied),
+            ]));
+
+        app.update();
+        accept(&mut app);
+        sent(&mut app);
+
+        // Two of them in the pass, and the map lit: fewer than the plan asked
+        // for, so it holds. This also pins that the COUNT is doing work rather
+        // than the region alone.
+        app.insert_resource(FogGrids::test_revealed());
+        for i in 0..2 {
+            app.world_mut().spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Claude,
+                Transform::from_xyz(-60.0 + i as f32, 0.0, 60.0),
+                Health::new(100.0),
+            ));
+        }
+        for _ in 0..3 {
+            advance_clock(&mut app, 5.0);
+            app.update();
+            assert_eq!(at(&app), 0, "two in the pass is not the three it waits on");
+            assert!(sent(&mut app).is_empty());
+        }
+
+        // An enemy elsewhere on a fully-lit map must not count either — the
+        // circle is the question, not the map.
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Footman },
+            Team::Claude,
+            Transform::from_xyz(60.0, 0.0, -60.0),
+            Health::new(100.0),
+        ));
+        advance_clock(&mut app, 5.0);
+        app.update();
+        assert_eq!(at(&app), 0, "seen, but not in the pass");
+        assert!(sent(&mut app).is_empty());
+
+        // The third one arrives IN the pass.
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Footman },
+            Team::Claude,
+            Transform::from_xyz(-58.0, 0.0, 62.0),
+            Health::new(100.0),
+        ));
+        advance_clock(&mut app, 5.0);
+        app.update();
+        assert_eq!(at(&app), 1, "and the plan moves the moment the pass is threatened");
+        assert_eq!(sent(&mut app).len(), 1, "step 2 went out");
+    }
+
+    /// Fog honesty survives the seam. A plan waiting on `enemy_in` must not
+    /// advance on an army its owner cannot see — otherwise sequencing would be
+    /// a way to launder knowledge the predicate itself refuses to give.
+    #[test]
+    fn a_plan_waiting_on_a_place_is_as_fog_honest_as_the_predicate() {
+        let mut app = plan_app();
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .set(
+                Team::Human,
+                Region::new("north-pass", Vec3::new(-60.0, 0.0, 60.0), 20.0),
+            )
+            .expect("legal");
+        app.world_mut()
+            .resource_mut::<Plans>()
+            .get_mut(Team::Human)
+            .push(plan(vec![
+                step(
+                    stop(),
+                    PlanAdvance::When {
+                        when: TriggerWhen::EnemyIn {
+                            region: "north-pass".to_string(),
+                            class: None,
+                            count: 1,
+                        },
+                    },
+                ),
+                step(stop(), PlanAdvance::OnApplied),
+            ]));
+        app.update();
+        accept(&mut app);
+        sent(&mut app);
+
+        // Standing right there, in the dark (`plan_app` pins `test_dark`).
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Footman },
+            Team::Claude,
+            Transform::from_xyz(-60.0, 0.0, 60.0),
+            Health::new(100.0),
+        ));
+        for _ in 0..3 {
+            advance_clock(&mut app, 5.0);
+            app.update();
+            assert_eq!(at(&app), 0, "unseen is unknown, for a plan as for a rule");
+        }
+
+        // Light the map and the IDENTICAL world moves it on.
+        app.insert_resource(FogGrids::test_revealed());
+        advance_clock(&mut app, 5.0);
+        app.update();
+        assert_eq!(at(&app), 1, "seen is known");
     }
 
     /// The other half of the same seam, so both new arms are covered rather

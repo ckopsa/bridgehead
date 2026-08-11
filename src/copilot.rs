@@ -713,6 +713,9 @@ fn ingest_wire(
     mut feed: ResMut<GameEvents>,
     mut submissions: EventWriter<SubmitIntent>,
     squad_orders: Res<SquadOrders>,
+    // The team's own named geography, so a proposal that says "push to
+    // north-pass" still has somewhere for `[Space]` to fly to.
+    regions: Res<Regions>,
     units: CopilotUnits,
 ) {
     let now = time.elapsed_secs();
@@ -808,7 +811,9 @@ fn ingest_wire(
         copilot.next_id += 1;
         let sentences: Vec<String> = intents.iter().map(Intent::sentence).collect();
         let conflicts = conflict_tags(team, &intents, &squad_orders, &units, now);
-        let pos = intents.iter().find_map(intent_pos);
+        let pos = intents
+            .iter()
+            .find_map(|i| intent_pos(i, team, &regions));
         let note = if wrapper.note.trim().is_empty() {
             "(no reason given)".to_string()
         } else {
@@ -879,28 +884,45 @@ fn scope_of(intent: &Intent) -> Scope {
 }
 
 /// Somewhere on the map a proposal is about, so `[Space]` can go look at it.
-fn intent_pos(intent: &Intent) -> Option<Vec3> {
-    let (x, z) = match intent {
-        Intent::Move { x, z, .. }
-        | Intent::AttackMove { x, z, .. }
-        | Intent::Build { x, z, .. }
-        | Intent::Leash {
-            x: Some(x),
-            z: Some(z),
-            ..
+///
+/// A proposal is held UNRESOLVED — it has not been through the compiler and may
+/// never be — so a partner that proposed "push to north-pass" carries a name
+/// here rather than coordinates. `regions` is the reviewing seat's own
+/// vocabulary, which is the right one to look the name up in: the two
+/// co-commanders share a team, and therefore share its regions.
+fn intent_pos(intent: &Intent, team: Team, regions: &Regions) -> Option<Vec3> {
+    /// Coordinates if given, else the named region's centre. Same precedence
+    /// the compiler's `resolve_places` uses — region wins — so the camera flies
+    /// to the ground the order would actually act on.
+    fn spot(
+        x: &Option<f32>,
+        z: &Option<f32>,
+        region: &Option<String>,
+        team: Team,
+        regions: &Regions,
+    ) -> Option<(f32, f32)> {
+        if let Some(name) = region {
+            let found = regions.find(team, name)?;
+            return Some((found.center.x, found.center.z));
         }
-        | Intent::Retreat {
-            x: Some(x),
-            z: Some(z),
-            ..
-        } => (*x, *z),
+        match (x, z) {
+            (Some(x), Some(z)) => Some((*x, *z)),
+            _ => None,
+        }
+    }
+    let (x, z) = match intent {
+        Intent::Move { x, z, region, .. }
+        | Intent::AttackMove { x, z, region, .. }
+        | Intent::Build { x, z, region, .. }
+        | Intent::Leash { x, z, region, .. }
+        | Intent::Retreat { x, z, region, .. } => spot(x, z, region, team, regions)?,
         Intent::Posture {
             posture: Some(posture),
             ..
         } => match posture {
-            PostureIntent::Defend { x, z, .. }
-            | PostureIntent::Push { x, z }
-            | PostureIntent::Forage { x, z } => (*x, *z),
+            PostureIntent::Defend { x, z, region, .. }
+            | PostureIntent::Push { x, z, region }
+            | PostureIntent::Forage { x, z, region } => spot(x, z, region, team, regions)?,
             PostureIntent::Escort { .. } => return None,
         },
         _ => return None,
@@ -1762,13 +1784,14 @@ mod tests {
     fn doctrine_is_direct_and_spending_is_not() {
         let posture = Intent::Posture {
             id: 1,
-            posture: Some(PostureIntent::Push { x: 0.0, z: 0.0 }),
+            posture: Some(PostureIntent::Push { x: Some(0.0), z: Some(0.0), region: None }),
         };
         let retreat = Intent::Retreat {
             units: vec![1],
             below: Some(0.35),
             x: Some(0.0),
             z: Some(0.0),
+            region: None,
         };
         let train = Intent::Train {
             building: 1,
@@ -1807,8 +1830,8 @@ mod tests {
     fn the_advertised_direct_verbs_are_the_ones_that_pass() {
         let samples: Vec<Intent> = vec![
             Intent::Priority { units: vec![1], classes: Vec::new() },
-            Intent::Retreat { units: vec![1], below: None, x: None, z: None },
-            Intent::Leash { units: vec![1], x: None, z: None, radius: None },
+            Intent::Retreat { units: vec![1], below: None, x: None, z: None, region: None },
+            Intent::Leash { units: vec![1], x: None, z: None, region: None, radius: None },
             Intent::Autocast { units: vec![1], min_enemies: None, ability: None },
             Intent::Squad { units: vec![1], id: None },
             Intent::Posture { id: 1, posture: None },
@@ -1890,8 +1913,9 @@ mod tests {
             (
                 Intent::Move {
                     units: vec![7, 8],
-                    x: 1.0,
-                    z: 2.0,
+                    x: Some(1.0),
+                    z: Some(2.0),
+                    region: None,
                 },
                 2,
             ),
@@ -1906,8 +1930,9 @@ mod tests {
                 Intent::Build {
                     worker: 7,
                     kind: "Farm".to_string(),
-                    x: 0.0,
-                    z: 0.0,
+                    x: Some(0.0),
+                    z: Some(0.0),
+                    region: None,
                 },
                 1,
             ),
@@ -1935,14 +1960,21 @@ mod tests {
     fn a_proposal_about_ground_carries_that_ground() {
         let push = Intent::Posture {
             id: 1,
-            posture: Some(PostureIntent::Push { x: 12.0, z: -34.0 }),
+            posture: Some(PostureIntent::Push { x: Some(12.0), z: Some(-34.0), region: None }),
         };
-        assert_eq!(intent_pos(&push), Some(Vec3::new(12.0, 0.0, -34.0)));
         assert_eq!(
-            intent_pos(&Intent::Train {
-                building: 1,
-                unit: "Footman".to_string()
-            }),
+            intent_pos(&push, Team::Human, &Regions::default()),
+            Some(Vec3::new(12.0, 0.0, -34.0))
+        );
+        assert_eq!(
+            intent_pos(
+                &Intent::Train {
+                    building: 1,
+                    unit: "Footman".to_string()
+                },
+                Team::Human,
+                &Regions::default()
+            ),
             None
         );
     }

@@ -262,6 +262,41 @@ class Snapshot:
         self.bounties = self.data.get("bounties", [])
         self.map = self.data.get("map", {}) or {}
         self.chokes = self.map.get("chokes", []) or []
+        # The two halves of the named geography (docs/INTENT.md, Territory).
+        # `places` is the map's own vocabulary — bases, mid, the mines, each
+        # ford — public and identical for both seats. `regions` is what THIS
+        # seat named, private doctrine, absent from a snapshot that has none.
+        self.places = self.map.get("places", []) or []
+        self.regions = self.data.get("regions", []) or []
+
+    def named_places(self):
+        """Every circle this seat may speak, own regions first.
+
+        Own first because the engine refuses to let a region shadow a built-in,
+        so the order cannot change an answer — it is stated to match the
+        engine's own `Regions::find`, which is the thing this has to agree with.
+        """
+        return [(r, True) for r in self.regions] + [(r, False) for r in self.places]
+
+    def find_place(self, text):
+        """A phrase -> the named circle it spells exactly, or `None`.
+
+        Folds case, dashes and underscores exactly as `shared::normalize_place`
+        does, and additionally tolerates a leading article, because a commander
+        writes "hold THE north-pass" and the engine's stored name is
+        "north-pass". The engine cannot make that allowance — it must not guess
+        at a name it will act on — but a front end reading English can, and
+        then hands the engine the exact stored spelling.
+        """
+        want = normalize_place(text)
+        if not want:
+            return None
+        for region, mine in self.named_places():
+            name = region.get("name", "")
+            folded = normalize_place(name)
+            if want == folded or want == "the " + folded:
+                return region, mine
+        return None
 
     @classmethod
     def load(cls, path, catalog=None):
@@ -406,6 +441,27 @@ NOISE = {"the", "a", "an", "at", "on", "in", "our", "my", "their", "his", "her",
          "its", "of", "to"}
 
 
+def normalize_place(text):
+    """Fold a place name to its comparison form.
+
+    A transcription of `shared::normalize_place`: lowercase, `-`/`_` become
+    spaces, whitespace collapses, and NOTHING else is dropped. Articles and
+    possessives survive on purpose — "our base" and "their base" differ only by
+    a possessive, and a normalizer that threw those away would fold the map's
+    two seat-relative names into one.
+    """
+    if not text:
+        return ""
+    out = []
+    for ch in str(text).strip():
+        if ch in "-_" or ch.isspace():
+            if out and out[-1] != " ":
+                out.append(" ")
+        else:
+            out.append(ch.lower())
+    return "".join(out).strip()
+
+
 def _words(text):
     return [w for w in re.split(r"[^a-z0-9.+-]+", text.lower()) if w]
 
@@ -441,10 +497,35 @@ def resolve_place(text, snap):
     if m and not re.search(r"[a-z]", raw[: m.start()].replace("at", "").strip()):
         return clamp((float(m.group(1)), float(m.group(2))))
 
+    # 1b. WHERE THE ARMY IS. "here" and "this spot" exist for one verb —
+    #     naming ground you have already walked to — and the honest centre is
+    #     the fighting units' centroid, not the workers' and not the camera's
+    #     (which this tool cannot see). Falls back to the base when there is no
+    #     army, because a commander with nothing on the field saying "here"
+    #     means home.
+    if raw.strip(".") in ("here", "this spot", "this ground", "my position",
+                          "where i am", "this place"):
+        army = [u for u in snap.own_units() if u.get("kind") != WORKER_KIND]
+        if army:
+            xs = [float(u["pos"][0]) for u in army]
+            zs = [float(u["pos"][1]) for u in army]
+            return clamp((sum(xs) / len(xs), sum(zs) / len(zs)))
+        return clamp(snap.my_base())
+
+    # 2. A NAMED PLACE, spelled exactly: one this seat armed with `region_set`,
+    #    or one the map named. Above every heuristic below it, because a name is
+    #    a decision and the heuristics are guesses — a commander who called some
+    #    ground "the perimeter" must not have that word re-interpreted as a
+    #    compass direction because it happens to contain one.
+    named = snap.find_place(raw)
+    if named is not None:
+        pos = named[0].get("pos") or [0.0, 0.0]
+        return clamp((float(pos[0]), float(pos[1])))
+
     tokens = [w for w in _words(raw) if w not in NOISE]
     joined = " ".join(tokens)
 
-    # 2. The contested middle — where the bounties spawn.
+    # 3. The contested middle — where the bounties spawn.
     if raw.strip() in MID_WORDS or joined in {"mid", "middle", "centre", "center", "midfield"}:
         return (0.0, 0.0)
 
@@ -489,6 +570,38 @@ def resolve_place(text, snap):
         if token in COMPASS:
             return COMPASS[token]
     return None
+
+
+def place_fields(text, snap):
+    """The `x`/`z` (or `region`) fields naming this ground, or `None`.
+
+    **A USER region is passed through by NAME, unresolved.** That is the whole
+    difference between the two vocabularies and it is worth the extra branch:
+    a region can be MOVED mid-match with a second `region_set`, so a directive
+    that says "hold the-perimeter" should mean the perimeter wherever it ends
+    up, and the engine's compiler is the one place that should decide where
+    that is. A built-in cannot move — `mid` is the middle of the map for the
+    whole match — so resolving it here costs nothing and keeps every existing
+    sentence, and every test pinning one, byte-identical.
+
+    The engine accepts both spellings at every verb that takes ground, so this
+    is a choice about legibility rather than about capability: the replay line
+    reads `squad 2 defends the-perimeter`.
+    """
+    named = snap.find_place(text)
+    if named is not None and named[1]:
+        return {"region": named[0].get("name")}
+    pos = resolve_place(text, snap)
+    if pos is None:
+        return None
+    return {"x": round(pos[0], 1), "z": round(pos[1], 1)}
+
+
+def place_english(fields):
+    """How a `place_fields` result reads in the tool's own confirmation line."""
+    if "region" in fields:
+        return fields["region"]
+    return f"({fields['x']:.1f}, {fields['z']:.1f})"
 
 
 def match_choke(tokens, snap):
@@ -688,8 +801,14 @@ def posture_clause(ctx, clause, word, place_text, who_text, extra=None, radius=N
     that is not already one squad (docs/INTENT.md).
     """
     snap = ctx.snap
+    # TWO readings of the same phrase, and both are needed. `pos` is the
+    # coordinate, used only for the squad-reuse heuristic below — "is squad 2
+    # already doing this job over there?" is a question about ground, and a
+    # name cannot answer it without being resolved anyway. `place` is what goes
+    # ON THE WIRE, which for a named region is the name.
     pos = resolve_place(place_text, snap)
-    if pos is None:
+    place = place_fields(place_text, snap)
+    if pos is None or place is None:
         ctx.result.fail(clause, f"cannot resolve place {place_text!r}")
         return []
     ids = resolve_units(who_text, snap)
@@ -709,13 +828,18 @@ def posture_clause(ctx, clause, word, place_text, who_text, extra=None, radius=N
         out.append({"type": "squad", "units": ids, "id": sid})
     posture = dict(extra or {})
     posture["type"] = word
-    posture["x"], posture["z"] = round(pos[0], 1), round(pos[1], 1)
+    posture.update(place)
     if word == "defend":
-        posture["radius"] = float(radius if radius is not None else DEFAULT_DEFEND_RADIUS)
+        if radius is not None:
+            posture["radius"] = float(radius)
+        elif "region" not in place:
+            posture["radius"] = float(DEFAULT_DEFEND_RADIUS)
+        # A named region with no radius said keeps none: the circle's own
+        # radius becomes the ring, engine-side, at the one resolution point.
     out.append({"type": "posture", "id": sid, "posture": posture})
     ctx.result.ok(
         clause,
-        f"squad {sid} {word}s ({pos[0]:.1f}, {pos[1]:.1f}) with {len(ids)} unit(s)",
+        f"squad {sid} {word}s {place_english(place)} with {len(ids)} unit(s)",
     )
     return out
 
@@ -766,17 +890,120 @@ def _squad_posture(m, ctx, clause):
             "strike": "push", "strikes": "push",
             "forage": "forage", "forages": "forage",
             "hunt": "forage", "hunts": "forage"}[m.group("verb").lower()]
+    place = place_fields(m.group("place"), ctx.snap)
+    if place is None:
+        ctx.result.fail(clause, f"cannot resolve place {m.group('place')!r}")
+        return []
+    sid = int(m.group("sid"))
+    posture = {"type": word, **place}
+    if word == "defend":
+        radius = m.group("radius")
+        if radius:
+            posture["radius"] = float(radius)
+        elif "region" not in place:
+            posture["radius"] = float(DEFAULT_DEFEND_RADIUS)
+        # ...and a named region with no radius said is left WITHOUT one, so the
+        # engine uses the circle's own. "squad 1 defends the-perimeter" is then
+        # a sentence with no numbers in it at either end of the wire.
+    ctx.result.ok(clause, f"squad {sid} {word}s {place_english(place)}")
+    return [{"type": "posture", "id": sid, "posture": posture}]
+
+
+DEFAULT_REGION_RADIUS = 22.0
+# The engine's own bounds (`shared::REGION_RADIUS_MIN`/`MAX`). Checked here so a
+# radius the compiler would refuse is refused with the phrase that produced it
+# still in hand, rather than three layers later against a JSON number.
+REGION_RADIUS_MIN = 4.0
+REGION_RADIUS_MAX = 60.0
+
+
+@rule("region-name",
+      r"^(?:name|call|mark)\s+(?P<place>.+?)\s+"
+      r"(?:\"(?P<qname>[^\"]+)\"|as\s+(?P<name>[A-Za-z0-9][A-Za-z0-9 _-]*?))"
+      r"(?:\s+(?:with\s+)?radius\s+(?P<radius>\d+(?:\.\d+)?))?$")
+def _region_name(m, ctx, clause):
+    """"name the northwest ford "north-pass" radius 20" — authoring a region.
+
+    **Deliberately the deterministic form only.** The tempting spelling is
+    `call this the perimeter`, and it is a trap: `the perimeter` is both a name
+    and a phrase this very file resolves as a place, so the parse is ambiguous
+    in exactly the sentences a commander would write. Requiring either quotes
+    or the word `as` removes the ambiguity without removing the sentence — and
+    a commander who wants the loose form still has one, because the LLM writing
+    these directives can spell the deterministic one for them.
+
+    The PLACE half is the ordinary place vocabulary, so a region can be named
+    at a ford, at a mine, at the centroid of the army (`here`), or at literal
+    coordinates. That is what keeps this one verb rather than five.
+    """
+    name = m.group("qname") or m.group("name")
+    name = (name or "").strip()
+    if not name:
+        ctx.result.fail(clause, "a region needs a name")
+        return []
+    # A name that IS a place word would shadow the vocabulary it is written in,
+    # and the engine refuses it anyway — refused here so the commander learns
+    # from the sentence rather than from an error two hops away.
+    existing = ctx.snap.find_place(name)
+    if existing is not None and not existing[1]:
+        ctx.result.fail(clause, f"{name!r} is a built-in place on this map")
+        return []
     pos = resolve_place(m.group("place"), ctx.snap)
     if pos is None:
         ctx.result.fail(clause, f"cannot resolve place {m.group('place')!r}")
         return []
-    sid = int(m.group("sid"))
-    posture = {"type": word, "x": round(pos[0], 1), "z": round(pos[1], 1)}
-    if word == "defend":
-        radius = m.group("radius")
-        posture["radius"] = float(radius) if radius else float(DEFAULT_DEFEND_RADIUS)
-    ctx.result.ok(clause, f"squad {sid} {word}s ({pos[0]:.1f}, {pos[1]:.1f})")
-    return [{"type": "posture", "id": sid, "posture": posture}]
+    radius = float(m.group("radius")) if m.group("radius") else DEFAULT_REGION_RADIUS
+    if not (REGION_RADIUS_MIN <= radius <= REGION_RADIUS_MAX):
+        ctx.result.fail(
+            clause,
+            f"radius {radius:g} is outside {REGION_RADIUS_MIN:g}..{REGION_RADIUS_MAX:g}",
+        )
+        return []
+    ctx.result.ok(
+        clause,
+        f"region {name!r} at ({pos[0]:.1f}, {pos[1]:.1f}) radius {radius:g}",
+    )
+    # Visible to the REST OF THIS DIRECTIVE. The engine applies a batch in the
+    # order it was written, so by the time clause three says "hold north-pass"
+    # clause one has already named it — and a compiler that refused the later
+    # clause would be disagreeing with the machine it is writing for. Replaces
+    # by name, exactly as `Regions::set` does.
+    ctx.snap.regions = [
+        r for r in ctx.snap.regions
+        if normalize_place(r.get("name", "")) != normalize_place(name)
+    ]
+    ctx.snap.regions.append(
+        {"name": name, "pos": [round(pos[0], 1), round(pos[1], 1)], "radius": radius}
+    )
+    return [{
+        "type": "region_set",
+        "name": name,
+        "x": round(pos[0], 1),
+        "z": round(pos[1], 1),
+        "radius": radius,
+    }]
+
+
+@rule("region-clear",
+      r"^(?:forget|unname|clear|drop)\s+(?:the\s+)?"
+      r"(?:region\s+(?P<name>[A-Za-z0-9][A-Za-z0-9 _-]*)|"
+      r"(?P<all>all\s+regions|every\s+region|regions|my\s+regions))$")
+def _region_clear(m, ctx, clause):
+    """Forget one named circle, or the whole slate. Mirrors `trigger-clear`."""
+    if m.group("name"):
+        name = m.group("name").strip()
+        # Out of the rest of this directive's vocabulary too — the batch is
+        # applied in order, so a later clause naming it would be refused by the
+        # engine and should be refused here.
+        ctx.snap.regions = [
+            r for r in ctx.snap.regions
+            if normalize_place(r.get("name", "")) != normalize_place(name)
+        ]
+        ctx.result.ok(clause, f"forget region {name!r}")
+        return [{"type": "region_clear", "name": name}]
+    ctx.snap.regions = []
+    ctx.result.ok(clause, "forget every region")
+    return [{"type": "region_clear"}]
 
 
 @rule("trigger-clear",
@@ -1271,7 +1498,7 @@ def _seconds(n, unit):
     return n * 60.0 if unit and unit.lower().startswith("m") else n
 
 
-def parse_when(text):
+def parse_when(text, snap=None):
     """A condition phrase -> a `TriggerWhen` dict, or None if it is outside the
     predicate vocabulary.
 
@@ -1345,6 +1572,39 @@ def parse_when(text):
     if re.search(r"\b(bounty|bounties|cache|caches|treasure|chest)\b", t):
         return {"type": "bounty_spawned"}
 
+    # --- eyes on a PLACE --------------------------------------------------
+    # Above the general sighting branch, because "5 enemies enter north-pass"
+    # is also a sighting and the narrower reading is the one the commander
+    # meant. Requires a resolvable place NAME, so a phrase that merely contains
+    # the word "in" falls through to the general branch untouched.
+    if snap is not None and theirs:
+        m = re.search(
+            r"^(?:.*?\b)?(?P<n>\d+)?\s*(?:\+|or\s+more\s+)?\s*"
+            r"(?P<what>[a-z]*(?:\s+[a-z]+)?)\s+"
+            r"(?:enters?|entering|arrives?\s+in|are\s+in|is\s+in|get\s+in(?:to)?|"
+            r"reach(?:es)?|cross(?:es)?\s+into|move[sd]?\s+into|show\s+up\s+in|"
+            r"appears?\s+in|sit\s+in|stand\s+in)\s+"
+            r"(?P<place>.+)$", t)
+        if m:
+            named = snap.find_place(m.group("place"))
+            if named is not None:
+                what = re.sub(r"^(?:their|the|a|an|any|some|enemy|enemies|hostile)\s+",
+                              "", (m.group("what") or "").strip()).strip()
+                what = re.sub(r"^(?:their|enemy|hostile)\s+", "", what).strip()
+                out = {"type": "enemy_in", "region": named[0].get("name")}
+                if m.group("n"):
+                    out["count"] = int(m.group("n"))
+                cls = CLASS_WORDS.get(what) or CLASS_WORDS.get(what.rstrip("s"))
+                if cls:
+                    out["class"] = cls
+                elif what not in ("", "units", "unit", "them", "anything",
+                                  "enemies", "enemy", "troops", "army",
+                                  "something", "forces", "men"):
+                    # A word we cannot map to a class is not a class we may
+                    # silently drop — "5 catapults in north-pass" and "5 of
+                    # anything in north-pass" are different rules.
+                    return None
+                return out
     # --- a body of their troops, from the ledger --------------------------
     # Above the sighting branch because "army" is a noun the sighting branch
     # cannot resolve to a class — it would return None and defer a sentence
@@ -1456,6 +1716,10 @@ def name_for(when):
         what = when.get("class", "enemy").lower()
         n = when.get("count", 1)
         return f"{what}-seen" if n <= 1 else f"{n}-{what}-seen"
+    if kind == "enemy_in":
+        n = when.get("count", 1)
+        where = normalize_place(when.get("region", "")).replace(" ", "-")
+        return f"{where}-watch" if n <= 1 else f"{n}-in-{where}"
     if kind == "enemy_army_seen":
         return f"army-{when.get('size', 1)}"
     if kind == "enemy_hero_down":
@@ -1507,7 +1771,7 @@ def compile_conditional(conn, cond_text, action_text, clause, ctx):
     if m:
         action_text, name = m.group("rest").strip(), m.group("name").strip()
 
-    when = parse_when(cond_text)
+    when = parse_when(cond_text, ctx.snap)
 
     # Compile the action against a throwaway context first: if the condition
     # turns out to be inexpressible we must not have spent a squad id or a build
@@ -1627,7 +1891,14 @@ def compile_plan(parts, directive, ctx):
         else:
             m = WHEN_STEP.match(part)
             if m:
-                when = parse_when(m.group("cond"))
+                # The snapshot goes in for the same reason it does at the
+                # trigger call site: `enemy_in` names a PLACE, and a plan step
+                # that advances on one has to be able to resolve it. Without
+                # this a sequence could say "when their hero falls" but not
+                # "when 5 of them are in north-pass", which would make the
+                # predicate vocabulary mean two different things depending on
+                # which construct asked.
+                when = parse_when(m.group("cond"), ctx.snap)
                 if when is None:
                     ctx.result.fail(directive,
                                     f"step {i + 1}: {m.group('cond').strip()!r} is not a "
@@ -1832,11 +2103,36 @@ WHAT THE PATTERN LAYER UNDERSTANDS
           "the champion" or "the priestess" rather than guess.
   PLACES: mid | our base | their base | <choke name, e.g. "the west ford">
           the west/east/north/south | the north mine | the contested mine
-          the nearest bounty | our expansion | explicit "(-40, 20)"
+          the nearest bounty | our expansion | explicit "(-40, 20)" | here
+          ...and ANY NAME in `map.places` or your own `regions` (see below).
   CLASSES (focus): Hero Archer Footman Worker Building Siege Cavalry
 
   Clauses split on commas, semicolons and newlines — not on "and".
 
+TERRITORY — the ground, given names
+  Every verb that takes x/z also takes `"region": "<name>"`, and the engine
+  resolves the name at submit time. Two kinds of name, both usable anywhere:
+
+  MAP PLACES (`map.places` in your snapshot) — read-only, shared with your
+  opponent, and available from second zero with nothing armed:
+      our base | their base | mid | <compass> mine | <name> ford
+    "our base"/"their base" are seat-relative: the words are the same in both
+    snapshots, the coordinates are not.
+
+  YOUR REGIONS (`regions` in your snapshot) — circles you named. PRIVATE: they
+  never appear in the enemy's snapshot, so naming ground tells them nothing.
+    name <place> "<name>" [radius N]        -> region_set  (or: name <place> as <name>)
+    forget region <name> / forget all regions -> region_clear
+  Max 8 regions; re-using a name MOVES that circle rather than spending a slot.
+  Radius 4..60. A name may not shadow a map place.
+
+  Naming pays off twice. The log reads "squad 2 defends north-pass" instead of
+  "defends (-60.0, 60.0)" — and because the ENGINE resolves the name, moving a
+  region re-aims every standing order and armed rule that mentions it.
+    name the northwest ford "north-pass" radius 20
+    squad 2 defends north-pass         (no radius: the region's own is the ring)
+    hold north-pass with the cavalry
+    when 5 or more enemies enter north-pass, squad 2 defends north-pass
 PLANS — "X, then Y, then Z" (the engine walks the sequence for you)
   A ", then"-joined directive becomes ONE plan_set: a named sequence the engine
   steps through, submitting each step when its turn comes. Once through, never
@@ -1875,11 +2171,16 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
   whenever / every time / each time       -> REPEATS (45s cooldown by default)
   "... as <name>"   names it;   "... every 90s"   sets the cooldown.
 
-  THE ELEVEN PREDICATES (this is the whole list — `shared::TriggerWhen`):
+  THE TWELVE PREDICATES (this is the whole list — `shared::TriggerWhen`):
     my base is attacked                 any of your buildings damaged (last 8s)
     my hero drops below 40%             any living hero of yours under that
     squad 2 drops below 50%             that squad's POOLED health under that
     I see 3 or more siege               enemy units you can SEE right now
+    5 or more enemies in north-pass     enemy units you can see INSIDE a named
+                                        place ("... enter north-pass" also
+                                        works; the wire name is `enemy_in`).
+                                        Fog-honest: an army you have no eyes on
+                                        does not trip it.
     an enemy army of 6 is spotted       6+ enemy troops in your INTEL ledger,
                                         which outlives the scout that found
                                         them; add "within 30s" to require a
@@ -1909,7 +2210,7 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
 
 IF A PHRASE IS NOT HERE (the escape hatch)
   You are a language model with the snapshot in front of you. Write the intents
-  yourself and send them with tools/bridge_send.py. The full 25-verb schema is
+  yourself and send them with tools/bridge_send.py. The full 27-verb schema is
   docs/INTENT.md; every verb's shape is in COMMANDER_BRIEF.md's command
   reference. This tool is a convenience over that schema, never a gate in front
   of it — anything it can express you can also write by hand, and anything it
