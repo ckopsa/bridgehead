@@ -5,7 +5,7 @@
 //! rock spawned here is decoration only and never touches the `NavGrid`.
 //! Gold mines block a 6x6 footprint, trees block their single 2x2 nav cell.
 //!
-//! **Map layouts.** `WC3_MAP` picks one (`open`, the historical layout, is the
+//! **Map layouts.** `BH_MAP` picks one (`open`, the historical layout, is the
 //! default; `crossings` adds a real barrier). The layout is not a secret
 //! setting: every bridge snapshot carries the map's name, one-line summary and
 //! the exact position/width of every chokepoint, and the same facts are logged
@@ -59,7 +59,7 @@ const EDGE_PAN_MARGIN: f32 = 15.0;
 
 /// Which layout the world is generated from.
 ///
-/// Selected once per process by `WC3_MAP` (unset or unknown -> `Open`, so every
+/// Selected once per process by `BH_MAP` (unset or unknown -> `Open`, so every
 /// existing script, sim and replay keeps the map it was tuned on).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MapKind {
@@ -75,10 +75,10 @@ pub enum MapKind {
 
 impl MapKind {
     /// Every layout, in the order they are offered — this is the list a player
-    /// (of either kind) can choose from with `WC3_MAP`.
+    /// (of either kind) can choose from with `BH_MAP`.
     pub const ALL: [MapKind; 2] = [MapKind::Open, MapKind::Crossings];
 
-    /// The `WC3_MAP` value that selects this map, and its snapshot name.
+    /// The `BH_MAP` value that selects this map, and its snapshot name.
     pub fn id(self) -> &'static str {
         match self {
             MapKind::Open => "open",
@@ -135,14 +135,14 @@ pub struct ChokePoint {
     pub width: f32,
 }
 
-/// The map this process is playing on. Read from `WC3_MAP` exactly once.
+/// The map this process is playing on. Read from `BH_MAP` exactly once.
 pub fn active_map() -> MapKind {
     static ACTIVE: OnceLock<MapKind> = OnceLock::new();
-    *ACTIVE.get_or_init(|| match std::env::var("WC3_MAP") {
+    *ACTIVE.get_or_init(|| match std::env::var("BH_MAP") {
         Ok(raw) if !raw.is_empty() => MapKind::from_id(raw.trim()).unwrap_or_else(|| {
             let known: Vec<&str> = MapKind::ALL.iter().map(|m| m.id()).collect();
             warn!(
-                "WC3_MAP=\"{raw}\" is not a map (known: {}) — using \"open\"",
+                "BH_MAP=\"{raw}\" is not a map (known: {}) — using \"open\"",
                 known.join(", ")
             );
             MapKind::Open

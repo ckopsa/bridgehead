@@ -29,7 +29,7 @@ equally, which is the entire point: the engine used to start the clock at
 process start, so whichever commander connected second simply forfeited the
 opening (arena round 9: Red's first order landed at t=41s). Now nobody does.
 Dawdling is not an advantage either — you are only holding up a match that
-starts for both of you at once, and `WC3_READY_TIMEOUT` (default 120s wall)
+starts for both of you at once, and `BH_READY_TIMEOUT` (default 120s wall)
 starts it without you if you go quiet. Say `ready` once you have a plan.
 `ready` is idempotent, never refused, and costs no chain-of-command latency.
 
@@ -857,7 +857,7 @@ answering two different ways is a squad that has been re-tasked mid-move.
 
 Your `errors` array carries both authors' refusals for the same reason.
 
-`WC3_COPILOT_TRUST=full` (everything direct) and `=strict` (everything
+`BH_COPILOT_TRUST=full` (everything direct) and `=strict` (everything
 proposed) exist for experiments; the `copilot.trust` field tells you which one
 you are in, so never assume — read it.
 

@@ -1,4 +1,4 @@
-# WC3 Clone — Module Contract
+# Bridgehead — Module Contract
 
 A Warcraft-3-style 3D RTS in Rust + **Bevy 0.16** (pinned — do not change Cargo.toml).
 Two factions: **Human** (blue, the player, base SW) vs **Claude** (red, AI, base NE).
@@ -92,7 +92,7 @@ Win by destroying all enemy buildings.
 - `terrain.rs`: ground, doodads, resource nodes (gold mines at
   `GOLD_MINE_POSITIONS`, tree clusters), lighting, **RTS camera** (spawns the
   `MainCamera`), blocks trees/mines in `NavGrid`, and owns the **map layout**:
-  `WC3_MAP=open|crossings` (default `open`) picks one, `crossings` blocking a
+  `BH_MAP=open|crossings` (default `open`) picks one, `crossings` blocking a
   canyon with three fords in the `NavGrid`. Both players learn the layout the
   same way — bridge.rs ships `map` (name, summary, chokepoints) in every
   snapshot, ui.rs paints the barrier on the minimap.
@@ -211,7 +211,7 @@ missing and names the variant.
 ## Races (v3)
 
 A **race** is a per-team choice of which ROWS of those tables a team may use.
-`WC3_RACE_BLUE` / `WC3_RACE_RED` = `kingdom|horde`, defaulting to `kingdom` on
+`BH_RACE_BLUE` / `BH_RACE_RED` = `kingdom|horde`, defaulting to `kingdom` on
 both sides — with neither set, the game is byte-for-byte the one that shipped
 before races existed.
 
@@ -282,16 +282,16 @@ entirely and plans against `role`, which means the same thing on both sides.
 
 **Load mechanism.** Each table is compiled in with `include_str!` and is the
 default, so `cargo run` works from any working directory and a shipped binary
-carries its own content. `WC3_DATA_DIR=<dir>` makes the loader prefer
+carries its own content. `BH_DATA_DIR=<dir>` makes the loader prefer
 `<dir>/<file>.ron` for any file present there and fall back to the built-in copy
 for the rest, so a modder or a balance pass ships only the files they changed:
 
 ```bash
-WC3_DATA_DIR=assets/data cargo run          # edits to assets/data/*.ron take
+BH_DATA_DIR=assets/data cargo run          # edits to assets/data/*.ron take
                                             # effect on the next launch, no rebuild
 ```
 
-Without `WC3_DATA_DIR` the built-in copy wins, and editing a `.ron` triggers a
+Without `BH_DATA_DIR` the built-in copy wins, and editing a `.ron` triggers a
 recompile of the crate (cargo tracks `include_str!` inputs) — correct, but a
 rebuild. The override path is the one to use while tuning.
 
@@ -388,7 +388,7 @@ quietly landing outside it.
 ### 2. One seeded RNG
 
 `shared::SimRng` is the only source of gameplay randomness in a running match.
-`WC3_SEED=<u64>` sets it; the default is a fresh random seed **logged at
+`BH_SEED=<u64>` sets it; the default is a fresh random seed **logged at
 startup**, so a normal match stays unpredictable and any match can be replayed
 from its own log. Terrain was already deterministic (`terrain.rs` seeds
 `StdRng` from the fixed `MAP_SEED`); bounty placement was not, and now is.
@@ -401,17 +401,17 @@ order in every run.
 
 ### 3. One fixed tick
 
-`WC3_FIXED_DT=0.05` (headless only) installs Bevy's
+`BH_FIXED_DT=0.05` (headless only) installs Bevy's
 `TimeUpdateStrategy::ManualDuration`, so each frame advances the clock by a
 constant instead of by however long the frame took. Without it every
 accumulator in the sim — attack cooldowns, construction, projectile flight,
 every `on_timer` gate — integrates a wall-clock delta and no two runs agree.
 It drives `Time<Real>` too, so bridge.rs's poll/snapshot cadence stops being a
-property of the host. `WC3_SPEED` is ignored while it is set.
+property of the host. `BH_SPEED` is ignored while it is set.
 
 ### Proving it
 
-`WC3_FINGERPRINT=<seconds>` logs a hash of the entire world (raw IEEE bits of
+`BH_FINGERPRINT=<seconds>` logs a hash of the entire world (raw IEEE bits of
 every unit's and building's position and health, entity ids, both economies) at
 fixed game-time intervals. `tools/determinism_check.sh` runs two headless
 AI-vs-AI matches with one seed and diffs those lines; it exits 0 only if every
@@ -465,7 +465,7 @@ is the definition of done as one executable, in four cumulative tiers.
 | `identity [ref]` | builds `ref` (default: merge-base with master) and HEAD, fingerprints both maps with each binary, byte-compares | for "this changes no behavior" claims |
 
 It runs the binary it built (never `cargo run`, whose rebuilds make the verdict
-unattributable), treats a sim that hits `WC3_MAX_GAME_SECS` as a failure rather
+unattributable), treats a sim that hits `BH_MAX_GAME_SECS` as a failure rather
 than a pass, kills every engine it starts by saved PID, and names the failing
 stage. `tools/verify.sh --list` prints the tiers; the script's own header is its
 documentation.

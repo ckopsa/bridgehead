@@ -149,7 +149,7 @@ impl Team {
 // the third by `race_can_build`, the fourth by `race_unit(race, role)` — all
 // four derived from the tables, none of them a match on a kind.
 
-/// The two playable rosters. `WC3_RACE_BLUE` / `WC3_RACE_RED` pick one per
+/// The two playable rosters. `BH_RACE_BLUE` / `BH_RACE_RED` pick one per
 /// team; the default is `Kingdom` for both, which is exactly the game that
 /// shipped before this existed.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Deserialize)]
@@ -184,9 +184,9 @@ impl Race {
 }
 
 /// Env var naming the BLUE team's race (`Team::Human`, the player, base SW).
-pub const RACE_BLUE_ENV: &str = "WC3_RACE_BLUE";
+pub const RACE_BLUE_ENV: &str = "BH_RACE_BLUE";
 /// Env var naming the RED team's race (`Team::Claude`, base NE).
-pub const RACE_RED_ENV: &str = "WC3_RACE_RED";
+pub const RACE_RED_ENV: &str = "BH_RACE_RED";
 
 /// Which race each team is playing. Written once at startup from the
 /// environment and never again — a race is a property of the match, not a
@@ -3321,12 +3321,12 @@ impl AbilityDef {
 // AbilityDef` literals plus five hand-maintained `[AbilityDef; N]` arrays is
 // now one file the loader assembles into per-caster slot lists.
 
-/// `WC3_STATUS_PROBE=1`: dev instrumentation for the status + ability-v2
+/// `BH_STATUS_PROBE=1`: dev instrumentation for the status + ability-v2
 /// frameworks. Read once per process so the ability tables stay constant for
 /// the whole run.
 pub fn status_probe_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WC3_STATUS_PROBE").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("BH_STATUS_PROBE").is_ok_and(|v| v != "0"))
 }
 
 /// Every ability this unit kind can ever cast, unlocked or not, in slot order.
@@ -4397,17 +4397,17 @@ impl NavGrid {
 // gold mine positions ship in every snapshot and paint on every minimap. Fog
 // hides what the enemy is DOING, not where the map's furniture is.
 
-/// `WC3_FOG=0` restores the pre-v2 omniscient baseline: every cell permanently
+/// `BH_FOG=0` restores the pre-v2 omniscient baseline: every cell permanently
 /// `Visible`, no memory, nothing filtered anywhere. It exists so old AARs and
 /// balance tooling have something to compare against — not as a gameplay
 /// option. Default is on.
-pub const FOG_ENV: &str = "WC3_FOG";
+pub const FOG_ENV: &str = "BH_FOG";
 
 /// Game-seconds between recomputes (~4 Hz). Deliberately GAME time and not
 /// real time, unlike the event feed's cadence: the feed keeps a *watcher*
 /// current and a watcher's attention runs at one second per second, but fog is
 /// a gameplay input that the scripted AI and the doctrine layer both read, so
-/// a `WC3_SPEED=16` run has to resolve the same number of fog updates per
+/// a `BH_SPEED=16` run has to resolve the same number of fog updates per
 /// game-second as a 1x run or the two are not the same match.
 const FOG_INTERVAL: f32 = 0.25;
 
@@ -4890,7 +4890,7 @@ impl FogGrid {
         }
     }
 
-    /// The `WC3_FOG=0` grid: permanently and entirely lit. Every reader works
+    /// The `BH_FOG=0` grid: permanently and entirely lit. Every reader works
     /// unchanged against it, which is why the escape hatch needs no `if` at
     /// any call site.
     fn revealed() -> Self {
@@ -4899,7 +4899,7 @@ impl FogGrid {
             cells: vec![CellVis::Visible; n],
             ghosts: std::collections::BTreeMap::new(),
             // Empty, and stays empty: `update_fog` returns before it writes
-            // anything under `WC3_FOG=0`, exactly as it already does for
+            // anything under `BH_FOG=0`, exactly as it already does for
             // `ghosts`. Under the omniscient baseline live sight supersedes
             // memory entirely — every enemy is in `units[]` every tick — so an
             // intel section would be a second, staler copy of the same board.
@@ -5126,7 +5126,7 @@ impl Default for FogGrids {
 }
 
 impl FogGrids {
-    /// False under `WC3_FOG=0`. Readers do not need this to be *correct* — the
+    /// False under `BH_FOG=0`. Readers do not need this to be *correct* — the
     /// revealed grid makes every query answer "yes" — but renderers use it to
     /// skip painting an overlay that would be entirely transparent.
     pub fn enabled(&self) -> bool {
@@ -5134,7 +5134,7 @@ impl FogGrids {
     }
 
     /// Test-only: a fully dark, fog-enabled pair, so a test in another module
-    /// can pin the mode instead of inheriting whatever `WC3_FOG` happens to
+    /// can pin the mode instead of inheriting whatever `BH_FOG` happens to
     /// say. Deliberately `#[cfg(test)]` rather than a widened public API —
     /// nothing outside a test may seed a team's knowledge, and the compiler
     /// should be the thing enforcing that rather than a comment.
@@ -5151,7 +5151,7 @@ impl FogGrids {
     /// Test-only twin of `test_dark`: both grids fully lit, fog still nominally
     /// ON. For a test whose subject is what a team DOES about something it can
     /// see, rather than whether it can see it — a scripted-AI reaction, say.
-    /// Pinning it here keeps the ambient `WC3_FOG` out of the outcome in both
+    /// Pinning it here keeps the ambient `BH_FOG` out of the outcome in both
     /// directions.
     #[cfg(test)]
     pub fn test_revealed() -> Self {
@@ -5440,7 +5440,7 @@ fn update_fog(
 /// under without anyone having to guess from the environment.
 fn log_fog_mode(fog: Res<FogGrids>) {
     if fog.enabled {
-        info!("fog of war: ON (WC3_FOG=0 to disable)");
+        info!("fog of war: ON (BH_FOG=0 to disable)");
     } else {
         info!("fog of war: OFF ({FOG_ENV}=0) — omniscient baseline");
     }
@@ -5513,7 +5513,7 @@ mod fog_tests {
         assert!(grid.sees(Vec3::new(4.0, 0.0, 4.0)));
     }
 
-    /// `WC3_FOG=0` must make every question answer "yes" so that no consumer
+    /// `BH_FOG=0` must make every question answer "yes" so that no consumer
     /// needs a special case for it.
     #[test]
     fn the_revealed_grid_hides_nothing() {
@@ -5583,7 +5583,7 @@ mod fog_tests {
         app.init_resource::<Races>();
         app.init_resource::<Time>();
         let mut grids = FogGrids::default();
-        // Pin the mode: the ambient WC3_FOG must not decide a test's outcome.
+        // Pin the mode: the ambient BH_FOG must not decide a test's outcome.
         grids.enabled = true;
         grids.human = FogGrid::dark();
         grids.claude = FogGrid::dark();
@@ -5779,7 +5779,7 @@ mod fog_tests {
     // -- intel: the sightings ledger --------------------------------------
     //
     // The subject of every test below is KNOWABILITY, so each one pins the fog
-    // mode rather than inheriting `WC3_FOG` — same discipline as the ghost
+    // mode rather than inheriting `BH_FOG` — same discipline as the ghost
     // tests above, and for a sharper reason: a ledger tested under an
     // omniscient grid would pass while proving nothing.
 
@@ -8448,7 +8448,7 @@ pub enum IntentSource {
     /// faction — the opponent model in an LLM-vs-LLM or human-vs-LLM match.
     Bridge,
     /// The CO-COMMANDER seat: a second author on the *same* team as the human
-    /// at the keyboard (`WC3_BRIDGE=copilot`, copilot.rs).
+    /// at the keyboard (`BH_BRIDGE=copilot`, copilot.rs).
     ///
     /// A seat, not a script — which is why it gets its own rung here rather
     /// than borrowing `Cause::Script`'s. Everything a co-commander mints is
@@ -8868,7 +8868,7 @@ pub struct AppliedCommand {
 /// half of learning a mechanic instead of inferring it from failure.
 ///
 /// Only commands that actually **paid** are recorded. A command that landed in
-/// the frame it was spoken says nothing here, so with `WC3_COMMAND_LATENCY` off
+/// the frame it was spoken says nothing here, so with `BH_COMMAND_LATENCY` off
 /// this resource is permanently empty and the wire is byte-identical to v1.
 #[derive(Resource, Default)]
 pub struct IntentApplied {
@@ -9105,7 +9105,7 @@ impl GameOver {
 }
 
 /// Which teams the scripted AI drives. Claude is always AI; the Human side
-/// can be AI too (AI-vs-AI spectating): `WC3_AI_BOTH=1` at launch or F9 at
+/// can be AI too (AI-vs-AI spectating): `BH_AI_BOTH=1` at launch or F9 at
 /// runtime. ai.rs owns the env/hotkey wiring; ui.rs reads it so the game-over
 /// banner says "Blue/Red wins" instead of VICTORY/DEFEAT while spectating.
 #[derive(Resource)]
@@ -9152,12 +9152,12 @@ pub fn machine_driven(ai: &AiControlled, external: &ExternallyCommanded, team: T
 // The ready handshake — bridged seats start simultaneously
 // ---------------------------------------------------------------------------
 
-/// `WC3_READY=0` turns the handshake off entirely and restores the pre-t0d
+/// `BH_READY=0` turns the handshake off entirely and restores the pre-t0d
 /// behaviour: the clock runs from process start and a commander plays whatever
 /// is left of the opening by the time it connects.
-pub const READY_ENV: &str = "WC3_READY";
+pub const READY_ENV: &str = "BH_READY";
 
-/// `WC3_READY_TIMEOUT=180` — how long, in WALL seconds, the engine will hold
+/// `BH_READY_TIMEOUT=180` — how long, in WALL seconds, the engine will hold
 /// the match waiting for a seat that may never speak.
 ///
 /// Measured on `Time<Real>`, which is the same clock bridge.rs paces its
@@ -9165,14 +9165,14 @@ pub const READY_ENV: &str = "WC3_READY";
 /// timeout runs on the clock the commander's own experience runs on, so "two
 /// minutes" means two minutes' worth of the snapshots it is actually reading.
 ///
-/// **Under `WC3_FIXED_DT` that is not the wall clock.** The fixed tick drives
+/// **Under `BH_FIXED_DT` that is not the wall clock.** The fixed tick drives
 /// `Time<Real>` as well as `Time<Virtual>` (see [`fixed_time_strategy`]), so a
 /// headless run stepping as fast as it can burns "real" seconds far faster
 /// than a person does, and a bridged fixed-dt run will time out long before a
 /// human-scale agent could answer. Set the timeout in TICKS' worth of seconds
 /// there, or leave the fixed tick to the determinism harness, which has no
 /// bridge seat and so never holds at all.
-pub const READY_TIMEOUT_ENV: &str = "WC3_READY_TIMEOUT";
+pub const READY_TIMEOUT_ENV: &str = "BH_READY_TIMEOUT";
 
 /// Two minutes: long enough to spawn a commander agent and let it read the map
 /// and the brief, short enough that a dead seat costs one coffee rather than
@@ -9180,7 +9180,7 @@ pub const READY_TIMEOUT_ENV: &str = "WC3_READY_TIMEOUT";
 pub const READY_TIMEOUT_DEFAULT: f32 = 120.0;
 
 /// Is the handshake mechanic switched on at all? Off only for an explicit
-/// `WC3_READY=0`/`false`. Note this is *not* the same question as "is the match
+/// `BH_READY=0`/`false`. Note this is *not* the same question as "is the match
 /// being held" — a run with no bridge seat has the mechanic enabled and nothing
 /// to gate on, which is exactly why pure-scripted sims are byte-untouched.
 pub fn ready_handshake_enabled() -> bool {
@@ -9210,7 +9210,7 @@ pub fn ready_timeout_from_env() -> f32 {
 pub struct ReadySeat {
     /// The seat's directory name — `red`, `blue`, `copilot`. This is the name
     /// that appears in the snapshot's `waiting_for` and in the log, because it
-    /// is the name the operator typed into `WC3_BRIDGE` and the name on the
+    /// is the name the operator typed into `BH_BRIDGE` and the name on the
     /// commander's own seat directory. Teams are an engine-side noun.
     pub name: &'static str,
     pub team: Team,
@@ -9228,11 +9228,11 @@ pub struct ReadySeat {
 /// writing snapshots (both sides get to read the map and plan), and starts the
 /// clock for everyone at the same instant.
 ///
-/// **Which seats gate.** Every seat in `WC3_BRIDGE`, including a `copilot`
+/// **Which seats gate.** Every seat in `BH_BRIDGE`, including a `copilot`
 /// seat. A copilot is a commanding seat — it writes orders that reach units,
 /// its trust policy only decides whether they go direct or via a proposal — so
 /// starting the match before it has read the map reproduces the exact unfairness
-/// this mechanism removes, one rung down. Seats that are NOT in `WC3_BRIDGE`
+/// this mechanism removes, one rung down. Seats that are NOT in `BH_BRIDGE`
 /// are not in this list at all, which is what "scripted AI seats are born
 /// ready" means concretely: a scripted opponent has nothing to wait for.
 ///
@@ -9256,7 +9256,7 @@ pub struct ReadySeat {
 /// symmetric because the hold is.
 #[derive(Resource, Default)]
 pub struct ReadyGate {
-    /// The gating seats, in `WC3_BRIDGE` order. Empty means nothing gates and
+    /// The gating seats, in `BH_BRIDGE` order. Empty means nothing gates and
     /// the match runs exactly as it always did.
     pub seats: Vec<ReadySeat>,
     /// Has the clock been started? Once true this resource is inert and the
@@ -9556,7 +9556,7 @@ pub const SIM_ORDER: [SimSet; 14] = [
 // ---------------------------------------------------------------------------
 
 /// Environment override for the match seed.
-pub const SEED_ENV: &str = "WC3_SEED";
+pub const SEED_ENV: &str = "BH_SEED";
 
 /// The one source of gameplay randomness in the running sim.
 ///
@@ -9567,7 +9567,7 @@ pub const SEED_ENV: &str = "WC3_SEED";
 /// the seed alone.
 ///
 /// Default is a fresh random seed, logged at startup, so a normal match is
-/// still unpredictable; set `WC3_SEED` to replay one.
+/// still unpredictable; set `BH_SEED` to replay one.
 #[derive(Resource)]
 pub struct SimRng {
     /// The seed this match was started with. Logged at startup, which is the
@@ -10000,7 +10000,7 @@ fn recount_tech_tiers(
     }
 }
 
-/// `WC3_STATUS_PROBE=1`: dev instrumentation, off in every normal run.
+/// `BH_STATUS_PROBE=1`: dev instrumentation, off in every normal run.
 ///
 /// Once the match is under way it applies a Slow to one live unit per team
 /// through the public `StatusEffects::apply` path and logs the unit's
@@ -10181,7 +10181,7 @@ fn status_probe(
 // Determinism fingerprint
 // ---------------------------------------------------------------------------
 
-/// `WC3_FINGERPRINT=<game seconds>`: log a hash of the whole simulation state
+/// `BH_FINGERPRINT=<game seconds>`: log a hash of the whole simulation state
 /// at fixed game-time intervals. Off by default and pure output — it never
 /// touches game state, which is why it sits in `SimSet::Feed`.
 ///
@@ -10191,7 +10191,7 @@ fn status_probe(
 /// id that owns them and both economies. Two runs that agree on this line at
 /// every interval agree on the match; the first interval where they differ is
 /// the first sample after they diverged.
-pub const FINGERPRINT_ENV: &str = "WC3_FINGERPRINT";
+pub const FINGERPRINT_ENV: &str = "BH_FINGERPRINT";
 
 fn fingerprint_interval() -> Option<f32> {
     std::env::var(FINGERPRINT_ENV)
@@ -10250,7 +10250,7 @@ fn fingerprint_log(
     economies: Res<Economies>,
     units: Query<(Entity, &Unit, &Team, &Health, &Transform)>,
     buildings: Query<(Entity, &Building, &Team, &Health, &Transform)>,
-    // Caches are in here because they are the ONE thing `WC3_SEED` actually
+    // Caches are in here because they are the ONE thing `BH_SEED` actually
     // steers. A fingerprint that skipped them could not tell two seeds apart
     // until an army happened to walk onto one, which is a check that passes
     // for the wrong reason.
@@ -10367,21 +10367,21 @@ fn speed_hotkeys(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>
     }
 }
 
-/// `WC3_SPEED=4 cargo run` — accelerated headless-ish testing.
+/// `BH_SPEED=4 cargo run` — accelerated headless-ish testing.
 ///
-/// Ignored under `WC3_FIXED_DT`: there the step size IS the tick, and
+/// Ignored under `BH_FIXED_DT`: there the step size IS the tick, and
 /// multiplying the two would silently turn a 0.05s tick into a 0.4s one, which
 /// is not "the same match faster" but a different, coarser match.
 fn apply_env_speed(mut time: ResMut<Time<Virtual>>) {
-    if let Ok(raw) = std::env::var("WC3_SPEED") {
+    if let Ok(raw) = std::env::var("BH_SPEED") {
         if let Ok(speed) = raw.parse::<f32>() {
             if let Some(dt) = fixed_step_from_env() {
-                info!("WC3_SPEED={raw} ignored: {FIXED_DT_ENV}={dt} sets the tick");
+                info!("BH_SPEED={raw} ignored: {FIXED_DT_ENV}={dt} sets the tick");
                 return;
             }
             let speed = speed.clamp(0.1, 16.0);
             time.set_relative_speed(speed);
-            info!("WC3_SPEED: game speed set to {speed}x");
+            info!("BH_SPEED: game speed set to {speed}x");
         }
     }
 }
@@ -10390,9 +10390,9 @@ fn apply_env_speed(mut time: ResMut<Time<Virtual>>) {
 // Fixed-tick clock
 // ---------------------------------------------------------------------------
 
-/// `WC3_FIXED_DT=0.05`: advance the clock by exactly this many seconds per
+/// `BH_FIXED_DT=0.05`: advance the clock by exactly this many seconds per
 /// frame instead of by however long the frame took.
-pub const FIXED_DT_ENV: &str = "WC3_FIXED_DT";
+pub const FIXED_DT_ENV: &str = "BH_FIXED_DT";
 
 /// The smallest step worth allowing, and the largest. A tick below a
 /// millisecond makes a match take forever to simulate; a tick above a quarter
@@ -10401,7 +10401,7 @@ pub const FIXED_DT_ENV: &str = "WC3_FIXED_DT";
 const FIXED_DT_MIN: f64 = 0.001;
 const FIXED_DT_MAX: f64 = 0.25;
 
-/// The configured tick, in seconds, if `WC3_FIXED_DT` names a sane one.
+/// The configured tick, in seconds, if `BH_FIXED_DT` names a sane one.
 pub fn fixed_step_from_env() -> Option<f64> {
     std::env::var(FIXED_DT_ENV)
         .ok()
@@ -10561,7 +10561,7 @@ const LOSS_AGGREGATE: usize = 3;
 const ARMY_EVENT_MIN: usize = 4;
 /// How recently a group must have been observed to be "spotted" rather than
 /// merely remembered. Generous in GAME seconds because the feed's cadence is
-/// REAL seconds: at `WC3_SPEED=16` a whole diff interval is sixteen game
+/// REAL seconds: at `BH_SPEED=16` a whole diff interval is sixteen game
 /// seconds, and a window narrower than that would silently stop announcing
 /// armies at speed — the exact class of bug the two clocks invite.
 const ARMY_EVENT_FRESH_S: f32 = 20.0;
@@ -10587,7 +10587,7 @@ pub const MAX_GAME_EVENTS: usize = 40;
 
 /// Wall-clock seconds between diffs. Deliberately real time, not game time:
 /// the feed exists to keep a *watcher* current, and a watcher's attention runs
-/// at one second per second no matter what `WC3_SPEED` is doing.
+/// at one second per second no matter what `BH_SPEED` is doing.
 const EVENT_INTERVAL: f32 = 1.0;
 
 /// How loud an event is. The bridge ignores this — its reader has the message
@@ -11306,7 +11306,7 @@ fn diff_team(
 mod determinism_tests {
     use super::*;
 
-    /// The claim `WC3_SEED` makes: a seed IS the match's randomness. If two
+    /// The claim `BH_SEED` makes: a seed IS the match's randomness. If two
     /// generators built from one seed ever disagree, replay is a fiction and
     /// every downstream guarantee in DESIGN.md § Determinism goes with it.
     #[test]
@@ -11436,7 +11436,7 @@ mod determinism_tests {
     /// the fingerprints in one run's log can be compared against another's.
     #[test]
     fn the_hash_is_the_same_number_in_every_process() {
-        assert_eq!(fnv1a(b"wc3clone", FNV_OFFSET), 0x581d_75bc_381f_f889);
+        assert_eq!(fnv1a(b"bridgehead", FNV_OFFSET), 0x104d_3b9f_fb8d_ced2);
     }
 }
 

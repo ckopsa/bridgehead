@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end proof that TERRITORY works over the live bridge.
 
-    python3 tools/verify_territory_bridge.py [--bin target/debug/wc3clone]
+    python3 tools/verify_territory_bridge.py [--bin target/debug/bridgehead]
 
 Boots a real game with a bridge seat, then drives the whole feature through the
 wire exactly as a commander would — no test harness, no direct resource pokes:
@@ -110,7 +110,7 @@ def wait_for(predicate, timeout=40.0):
 
 
 def main():
-    binary = os.path.join(ROOT, "target", "debug", "wc3clone")
+    binary = os.path.join(ROOT, "target", "debug", "bridgehead")
     args = sys.argv[1:]
     if args and args[0] == "--bin":
         binary = args[1]
@@ -122,15 +122,15 @@ def main():
 
     env = dict(os.environ)
     env.update({
-        "WC3_MAP": "crossings",
-        "WC3_BRIDGE": "red",
-        "WC3_HEADLESS": "1",
-        "WC3_SPEED": "4",
-        "WC3_FOG": "0",           # the fog rules are unit-tested; this run is
+        "BH_MAP": "crossings",
+        "BH_BRIDGE": "red",
+        "BH_HEADLESS": "1",
+        "BH_SPEED": "4",
+        "BH_FOG": "0",           # the fog rules are unit-tested; this run is
                                    # about the vocabulary, and a scout hunt
                                    # would make it flaky rather than honest.
-        "WC3_MAX_GAME_SECS": "1800",
-        "WC3_SEED": "7",
+        "BH_MAX_GAME_SECS": "1800",
+        "BH_SEED": "7",
     })
     print(f"launching {binary} (crossings, headless, bridge/red)")
     game = subprocess.Popen([binary], cwd=ROOT, env=env,

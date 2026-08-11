@@ -20,7 +20,7 @@ memory file. Every one of those steps is a place a round can be recorded wrong,
 and the ledger is only worth having if the rounds in it were not.
 
 So this owns the mechanical half: it derives the environment from the seats
-rather than trusting a hand-typed `WC3_BRIDGE`, refuses to start on top of a
+rather than trusting a hand-typed `BH_BRIDGE`, refuses to start on top of a
 running match, prepares seat directories, waits for a real game over, reads the
 duration and the ending out of the engine's own log, and appends a validated
 record.
@@ -123,11 +123,11 @@ def parse_seat(spec: str) -> dict:
 def derive_env(seats: list[dict], args) -> dict[str, str]:
     """The launch environment implied by the seats.
 
-    `WC3_BRIDGE` and `WC3_AI_BOTH` are computed, never passed in, because they
+    `BH_BRIDGE` and `BH_AI_BOTH` are computed, never passed in, because they
     are two spellings of one fact — who is playing which side — and the two
     rounds that went wrong in this series both went wrong by disagreeing with
     each other about it. Claude's side is scripted-driven by default; the Human
-    side needs `WC3_AI_BOTH` to be, and a bridge seat takes its team off the
+    side needs `BH_AI_BOTH` to be, and a bridge seat takes its team off the
     scripted AI either way (bridge.rs `bridge_startup`).
     """
     by_side = {s["side"]: s for s in seats}
@@ -140,21 +140,21 @@ def derive_env(seats: list[dict], args) -> dict[str, str]:
     }[tuple(sorted(commanders))]
 
     env = {
-        "WC3_MAP": args.map,
-        "WC3_SPEED": f"{args.speed:g}",
-        "WC3_BRIDGE": bridge,
+        "BH_MAP": args.map,
+        "BH_SPEED": f"{args.speed:g}",
+        "BH_BRIDGE": bridge,
         # Only the Human side needs telling; Claude's is always machine-driven
         # unless a seat takes it over.
-        "WC3_AI_BOTH": "1" if by_side.get("blue", {}).get("kind") == "scripted" else "0",
+        "BH_AI_BOTH": "1" if by_side.get("blue", {}).get("kind") == "scripted" else "0",
     }
     if not args.windowed:
-        env["WC3_HEADLESS"] = "1"
+        env["BH_HEADLESS"] = "1"
     if args.cap:
-        env["WC3_MAX_GAME_SECS"] = f"{args.cap:g}"
+        env["BH_MAX_GAME_SECS"] = f"{args.cap:g}"
     # Screenshots file themselves with the round they belong to. Kept
     # repo-relative — this string is copied verbatim into a record that lives in
     # git, and an absolute path there is one machine's private detail.
-    env["WC3_SHOT_DIR"] = os.path.join(args.out, args.id, "shots")
+    env["BH_SHOT_DIR"] = os.path.join(args.out, args.id, "shots")
     for pair in args.env:
         if "=" not in pair:
             raise ValueError(f"--env {pair!r} must look like KEY=VALUE")
@@ -403,7 +403,7 @@ def build_record(args, seats: list[dict], env: dict, verdict: dict) -> dict:
     rec["kind"] = kinds.pop() if len(kinds) == 1 else "mixed"
     rec["provenance"] = "recorded"
     rec["ruleset"] = {
-        "map": env.get("WC3_MAP"),
+        "map": env.get("BH_MAP"),
         "env": dict(env),
         "constants": {},
         "commit": args.commit,
@@ -453,13 +453,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="red|blue = scripted|commander, e.g. red=commander:rusher")
     p.add_argument("--map", default="open", choices=list(arena.MAPS))
     p.add_argument("--speed", type=float, default=1.0)
-    p.add_argument("--cap", type=float, default=1800.0, help="WC3_MAX_GAME_SECS; 0 for none")
+    p.add_argument("--cap", type=float, default=1800.0, help="BH_MAX_GAME_SECS; 0 for none")
     p.add_argument("--windowed", action="store_true", help="run with a window (default headless)")
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                    help="extra environment; overrides the derived value")
     p.add_argument("--notes", default="", help="what changed in the ruleset this round")
     p.add_argument("--commit", default=None, help="the commit the round was played at")
-    p.add_argument("--bin", type=Path, default=REPO / "target" / "debug" / "wc3clone")
+    p.add_argument("--bin", type=Path, default=REPO / "target" / "debug" / "bridgehead")
     p.add_argument("--out", default="arena", help="where round evidence goes (repo-relative)")
     p.add_argument("--bridge-root", type=Path, default=REPO / "bridge")
     p.add_argument("--ledger", type=Path, default=arena.LEDGER)
@@ -549,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
 
     launch = dict(os.environ)
     launch.update(env)
-    launch.pop("WC3_INTENT_LOG", None)
+    launch.pop("BH_INTENT_LOG", None)
     timeout = (args.cap / max(args.speed, 0.01) + 180) if args.cap else 3600
     # The handshake budget, on top. The engine holds at t=0 until every bridged
     # seat readies, and that hold is wall time the game cap knows nothing about
@@ -557,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
     # commanders take their full thinking time gets killed for "outliving its
     # wall timeout" while it is still doing exactly what it was told to.
     if commander_seats:
-        timeout += float(launch.get("WC3_READY_TIMEOUT", 120.0))
+        timeout += float(launch.get("BH_READY_TIMEOUT", 120.0))
     started = time.monotonic()
     print(f"\nlaunching (wall timeout {timeout:.0f}s)...", flush=True)
 
@@ -614,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
     rec = build_record(args, seats, env, verdict)
     rec["evidence"]["logs"] = [str(log_path.relative_to(REPO)) if log_path.is_relative_to(REPO) else str(log_path)]
     rec["evidence"]["logs"] += collect_snapshots(seats, out_dir)
-    shots = Path(env["WC3_SHOT_DIR"])
+    shots = Path(env["BH_SHOT_DIR"])
     if not shots.is_absolute():
         shots = REPO / shots
     if shots.is_dir():

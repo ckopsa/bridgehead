@@ -1430,6 +1430,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridgehead"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "rand",
+ "ron",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4484,17 +4495,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "wc3clone"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "rand",
- "ron",
- "serde",
- "serde_json",
 ]
 
 [[package]]

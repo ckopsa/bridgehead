@@ -2,7 +2,7 @@
 //! two external agents (Claude in a terminal) play a faction, either against the
 //! human at the keyboard or against each other.
 //!
-//! Activation is opt-in through `WC3_BRIDGE` (case-insensitive). Each accepted
+//! Activation is opt-in through `BH_BRIDGE` (case-insensitive). Each accepted
 //! value opens one *seat* per faction it names:
 //!   * `1` / `red` / `claude` — the Claude (red) faction, in `bridge/red/`,
 //!   * `blue` / `human` — the Human (blue) faction, in `bridge/blue/`,
@@ -15,7 +15,7 @@
 //!     docs/INTENT.md § co-command.
 //!
 //! NOTE (breaking change): a seat's files live in `bridge/<seat>/`, not directly
-//! in `bridge/` as they did when there was only one seat. `WC3_BRIDGE=1` now
+//! in `bridge/` as they did when there was only one seat. `BH_BRIDGE=1` now
 //! writes `bridge/red/state.json`, not `bridge/state.json`.
 //!
 //! For every active seat the bridge
@@ -81,7 +81,7 @@
 //!   * `bounties` only while visible (see below).
 //!   * `mines`, `trees_near`, `map` are unfiltered map GEOGRAPHY (see below).
 //!
-//! `WC3_FOG=0` restores the old omniscient snapshot with no other change.
+//! `BH_FOG=0` restores the old omniscient snapshot with no other change.
 //! The top-level `fog` object reports which mode is in force plus this seat's
 //! explored/visible fraction of the map.
 //!
@@ -211,7 +211,7 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 /// Set to `1`/`red`/`claude`, `blue`/`human`, or `both`/`2` to open seats.
-const BRIDGE_ENV: &str = "WC3_BRIDGE";
+const BRIDGE_ENV: &str = "BH_BRIDGE";
 
 /// Root of every seat's directory; each seat gets its own subdirectory.
 const BRIDGE_DIR: &str = "bridge";
@@ -223,7 +223,7 @@ const COMMANDS_NAME: &str = "commands.json";
 const CATALOG_NAME: &str = "catalog.json";
 const CATALOG_TMP_NAME: &str = "catalog.tmp";
 
-/// Wall-clock seconds between snapshots (independent of `WC3_SPEED`).
+/// Wall-clock seconds between snapshots (independent of `BH_SPEED`).
 const SNAPSHOT_INTERVAL: f32 = 1.0;
 /// Wall-clock seconds between `commands.json` polls.
 const POLL_INTERVAL: f32 = 0.25;
@@ -367,7 +367,7 @@ fn bridge_enabled(bridge: Res<Bridge>) -> bool {
     !bridge.seats.is_empty()
 }
 
-/// Which factions `WC3_BRIDGE` asks for, and in what role. `None` means "leave
+/// Which factions `BH_BRIDGE` asks for, and in what role. `None` means "leave
 /// the bridge off".
 fn seats_from_env(raw: &str) -> Option<Vec<(Team, SeatRole)>> {
     use SeatRole::{Commander, Copilot};
@@ -570,7 +570,7 @@ struct StateOut {
     /// The positive half of the acknowledgement: `errors` says what was
     /// refused, this says what the rest cost. Commands that landed in the frame
     /// they were spoken are simply absent — silence means instant — so this key
-    /// does not exist at all when `WC3_COMMAND_LATENCY` is off.
+    /// does not exist at all when `BH_COMMAND_LATENCY` is off.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     applied: Vec<AppliedOut>,
     /// **The seats that have not yet said `{"type":"ready"}`**, by name —
@@ -650,7 +650,7 @@ struct StateOut {
     /// these circles arrive instantly; everything else pays for the distance.
     /// Own team only, symmetric with what the HUD shows the human — and the
     /// enemy's chain of command is something you learn by razing it, not by
-    /// reading it. Absent entirely when `WC3_COMMAND_LATENCY` is off.
+    /// reading it. Absent entirely when `BH_COMMAND_LATENCY` is off.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     command_nodes: Vec<CommandNodeOut>,
     /// **Your armed triggers** (`trigger_set`), in the order you set them —
@@ -735,7 +735,7 @@ struct StateOut {
 /// The co-command contract, as this seat sees it.
 #[derive(Serialize)]
 struct CopilotOut {
-    /// `"split"` (default), `"full"` or `"strict"` — `WC3_COPILOT_TRUST`.
+    /// `"split"` (default), `"full"` or `"strict"` — `BH_COPILOT_TRUST`.
     trust: &'static str,
     /// Verbs this seat may send WITHOUT a `propose` wrapper. `["*"]` under
     /// full trust, empty under strict. Anything not here is refused with an
@@ -756,7 +756,7 @@ struct CopilotOut {
     /// being told out of band.
     veto_reasons: BTreeMap<&'static str, &'static str>,
     /// Present only when a SCRIPTED approver is standing in for the human
-    /// (`WC3_COPILOT_AUTOAPPROVE`, sims only): the seconds it waits before
+    /// (`BH_COPILOT_AUTOAPPROVE`, sims only): the seconds it waits before
     /// approving. Absent in every real match — so a seat can tell whether the
     /// thing answering it is a person.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -841,12 +841,12 @@ struct CommandNodeOut {
 /// snapshots, because both players are looking at the same ground.
 #[derive(Serialize)]
 struct MapOut {
-    /// The `WC3_MAP` value that produced this world: `"open"`, `"crossings"`.
+    /// The `BH_MAP` value that produced this world: `"open"`, `"crossings"`.
     name: &'static str,
     /// What the layout means for a plan, in one sentence.
     summary: &'static str,
     /// Every layout this build offers, so a commander can see what else exists
-    /// without being told (the human reads the same list from `WC3_MAP`).
+    /// without being told (the human reads the same list from `BH_MAP`).
     available: Vec<&'static str>,
     /// Gaps in the impassable terrain — empty on a map that has none. Armies,
     /// workers and expansions can only cross here.
@@ -1066,7 +1066,7 @@ struct UnitOut {
     /// order to THIS unit would take to arrive, given where it is standing
     /// relative to your nearest hall or your hero. `0.0` means it is inside a
     /// command node's radius and your hands reach it instantly. Absent
-    /// entirely when `WC3_COMMAND_LATENCY` is off, which is also when it is
+    /// entirely when `BH_COMMAND_LATENCY` is off, which is also when it is
     /// meaningless.
     #[serde(skip_serializing_if = "Option::is_none")]
     link: Option<f32>,
@@ -1533,7 +1533,7 @@ type SnapshotUnits<'w, 's> = Query<
             Has<Militia>,
             Option<&'static AbilityCooldowns>,
             // docs/TEMPO.md §3: an order this unit has been given that has not
-            // reached it yet. Always `None` with WC3_COMMAND_LATENCY off.
+            // reached it yet. Always `None` with BH_COMMAND_LATENCY off.
             Option<&'static PendingOrder>,
         ),
     ),

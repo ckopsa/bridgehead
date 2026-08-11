@@ -423,7 +423,7 @@ const NOTIF_W: f32 = 322.0;
 const NOTIF_ROW_H: f32 = 24.0;
 const NOTIF_GAP: f32 = 4.0;
 /// Real seconds a notification stays on screen, and how much of that tail it
-/// spends fading. Real, not game, time: `WC3_SPEED` accelerates the war, not
+/// spends fading. Real, not game, time: `BH_SPEED` accelerates the war, not
 /// the eye reading about it.
 const NOTIF_LIFETIME: f32 = 9.0;
 const NOTIF_FADE: f32 = 2.5;
@@ -836,7 +836,7 @@ struct HoverRing;
 struct RallyFlag;
 
 /// One pooled ring showing the free radius of an own command node
-/// (docs/TEMPO.md §3). Drawn only while `WC3_COMMAND_LATENCY` is on, so with
+/// (docs/TEMPO.md §3). Drawn only while `BH_COMMAND_LATENCY` is on, so with
 /// the feature off not one of these entities is ever spawned.
 #[derive(Component)]
 struct LinkRing;
@@ -6500,7 +6500,7 @@ fn update_rally_flag(
 // ---------------------------------------------------------------------------
 // Chain of Command feedback (docs/TEMPO.md §4, follow-up 7)
 //
-// Three readouts, one rule: with `WC3_COMMAND_LATENCY` off the HUD is
+// Three readouts, one rule: with `BH_COMMAND_LATENCY` off the HUD is
 // pixel-identical to v1. Two of the three get that for free rather than by a
 // check — no `PendingOrder` can exist with the feature off, and the node cache
 // is never built — and the third asks `latency.on` once.
@@ -7108,7 +7108,7 @@ fn apply_fog_tint(
         &mut MeshMaterial3d<StandardMaterial>,
     )>,
 ) {
-    // `WC3_FOG=0` hands back a fully-lit grid, so this resolves to the
+    // `BH_FOG=0` hands back a fully-lit grid, so this resolves to the
     // `Visible` shade everywhere — the same "no branch at the call site"
     // discipline the rest of the fog code keeps.
     let grid = fog.get(Team::Human);
@@ -7133,7 +7133,7 @@ fn update_fog_overlay(
     mut plane: Query<&mut Visibility, With<FogPlane>>,
     mut minimap_fog: Query<&mut Node, With<MinimapFog>>,
 ) {
-    // `WC3_FOG=0`: take the overlay off the screen entirely rather than
+    // `BH_FOG=0`: take the overlay off the screen entirely rather than
     // painting a fully transparent one every frame.
     if !fog.enabled() {
         for mut vis in &mut plane {
@@ -8843,7 +8843,7 @@ fn surrender_hotkey(
 // The fix is not a better capture tool. The only process that reliably knows
 // what this frame looks like is the one that drew it, so the engine takes its
 // own pictures: F10 asks the renderer for the primary window's contents at the
-// end of this frame and writes a PNG to `shots/` (or `$WC3_SHOT_DIR`).
+// end of this frame and writes a PNG to `shots/` (or `$BH_SHOT_DIR`).
 //
 // Registered by `UiPlugin`, which main.rs adds only when there is a window —
 // so a headless run has no key to press and no renderer to ask, and simply
@@ -8853,7 +8853,7 @@ fn surrender_hotkey(
 const SCREENSHOT_KEY: KeyCode = KeyCode::F10;
 /// Overrides the output directory — the arena runner points it at the round's
 /// own evidence directory so shots file themselves with the match.
-const SHOT_DIR_ENV: &str = "WC3_SHOT_DIR";
+const SHOT_DIR_ENV: &str = "BH_SHOT_DIR";
 const DEFAULT_SHOT_DIR: &str = "shots";
 
 /// Where screenshots go, given the raw environment value. Split from
@@ -8878,11 +8878,11 @@ pub fn shot_dir() -> PathBuf {
 /// the only number an after-action report can use, because "the push at t=324"
 /// is a thing you can look up and `screenshot_3.png` is not.
 fn shot_name(stamp: u64, game_secs: f32, nth: u32) -> String {
-    format!("wc3-{stamp}-t{:04}-{nth:02}.png", game_secs.max(0.0) as u32)
+    format!("bh-{stamp}-t{:04}-{nth:02}.png", game_secs.max(0.0) as u32)
 }
 
 /// Game-time seconds at which the engine photographs itself unattended, comma
-/// separated: `WC3_SHOT_AT=20,90,240`.
+/// separated: `BH_SHOT_AT=20,90,240`.
 ///
 /// The same reasoning that produced F10, taken one step further. F10 solved
 /// "the capture tool photographs a stale frame"; it did not solve "an agent
@@ -8892,7 +8892,7 @@ fn shot_name(stamp: u64, game_secs: f32, nth: u32) -> String {
 /// through the identical code path — a scheduled shot and a pressed one are
 /// the same function, so evidence gathered without a human at the keyboard is
 /// the same evidence.
-const SHOT_AT_ENV: &str = "WC3_SHOT_AT";
+const SHOT_AT_ENV: &str = "BH_SHOT_AT";
 
 /// Parse the schedule, sorted and with the unparseable dropped. Split out so
 /// the policy is testable without touching the process environment.
@@ -8941,7 +8941,7 @@ fn screenshot_hotkey(
     take_shot(&mut commands, time.elapsed_secs(), &mut taken);
 }
 
-/// Fire the `WC3_SHOT_AT` schedule. Shares `taken` with nothing — the two
+/// Fire the `BH_SHOT_AT` schedule. Shares `taken` with nothing — the two
 /// counters are independent, and the wall-clock stamp in the file name is what
 /// keeps a scheduled shot and a pressed one from landing on the same path.
 fn scheduled_screenshots(
@@ -8956,7 +8956,7 @@ fn scheduled_screenshots(
             .collect()
     });
     let now = time.elapsed_secs();
-    // A `while`, not an `if`: at `WC3_SPEED=8` one frame can step past several
+    // A `while`, not an `if`: at `BH_SPEED=8` one frame can step past several
     // scheduled moments, and silently dropping the ones it skipped would make
     // the evidence depend on the frame rate.
     while queue.front().is_some_and(|t| *t <= now) {
@@ -9004,7 +9004,7 @@ struct Notice {
     message: String,
     severity: EventSeverity,
     pos: Option<Vec3>,
-    /// `Time<Real>` seconds. Real time on purpose: at `WC3_SPEED=8` a
+    /// `Time<Real>` seconds. Real time on purpose: at `BH_SPEED=8` a
     /// game-time lifetime would blink out before it could be read.
     born: f32,
 }
@@ -9046,7 +9046,7 @@ const PING_STROKE: f32 = 2.0;
 /// Silences the alert cues. A game whose *sound* cannot be turned off without
 /// turning the game off is a game people mute at the OS, and then never hear
 /// again — including the parts they wanted.
-const MUTE_ENV: &str = "WC3_MUTE";
+const MUTE_ENV: &str = "BH_MUTE";
 
 /// Which severity wins when several arrive in one frame.
 fn severity_rank(severity: EventSeverity) -> u8 {
@@ -9062,7 +9062,7 @@ struct AlertPing {
     pos: Vec3,
     severity: EventSeverity,
     /// `Time<Real>` seconds, like `Notice::born` and for the same reason: at
-    /// `WC3_SPEED=8` a game-time ring would be gone before it was seen.
+    /// `BH_SPEED=8` a game-time ring would be gone before it was seen.
     born: f32,
 }
 
@@ -9247,8 +9247,8 @@ struct AlertCues {
     info: Handle<AudioSource>,
     warning: Handle<AudioSource>,
     critical: Handle<AudioSource>,
-    /// `WC3_MUTE`. Read once at setup so no system can observe a different
-    /// answer than another, the same discipline `WC3_FOG` is read with.
+    /// `BH_MUTE`. Read once at setup so no system can observe a different
+    /// answer than another, the same discipline `BH_FOG` is read with.
     muted: bool,
 }
 
@@ -9628,7 +9628,7 @@ fn update_proposals(
                 PropPart::Head => {
                     let left = proposal.expires_in(now);
                     // The age is the honest way to show a clock in a game with
-                    // `WC3_SPEED`: game seconds, the same unit the co-commander
+                    // `BH_SPEED`: game seconds, the same unit the co-commander
                     // read off its snapshot when it wrote this.
                     //
                     // The key legend is on its own line and only on the top
@@ -11274,7 +11274,7 @@ mod tests {
     /// **The HUD's answer to "is my order lost?"** (docs/TEMPO.md follow-up 7).
     ///
     /// Without a readout the mechanic is indistinguishable from input lag —
-    /// which is the stated reason `WC3_COMMAND_LATENCY` still defaults off — so
+    /// which is the stated reason `BH_COMMAND_LATENCY` still defaults off — so
     /// what these two lines say is part of the feature, not decoration on it.
     ///
     /// Worst-first is the load-bearing choice: a player deciding whether to
@@ -11307,7 +11307,7 @@ mod tests {
     }
 
     /// **Flag off, HUD unchanged.** The promise the whole feature ships on: a
-    /// match played without `WC3_COMMAND_LATENCY` must look exactly like v1.
+    /// match played without `BH_COMMAND_LATENCY` must look exactly like v1.
     /// Both readouts collapse to the empty string, and an empty `Text` in a
     /// left-packed bar and a column of panel lines occupies nothing.
     ///
@@ -12313,8 +12313,8 @@ mod tests {
     fn a_shot_is_named_for_the_moment_it_shows() {
         // Zero-padded game seconds so a directory listing sorts into match
         // order, and the counter breaks ties inside one second.
-        assert_eq!(shot_name(1754870400, 324.6, 1), "wc3-1754870400-t0324-01.png");
-        assert_eq!(shot_name(1754870400, 324.9, 2), "wc3-1754870400-t0324-02.png");
+        assert_eq!(shot_name(1754870400, 324.6, 1), "bh-1754870400-t0324-01.png");
+        assert_eq!(shot_name(1754870400, 324.9, 2), "bh-1754870400-t0324-02.png");
         // Two runs sharing one directory cannot collide: the wall clock differs.
         assert_ne!(
             shot_name(1754870400, 12.0, 1),
@@ -12322,14 +12322,14 @@ mod tests {
             "the wall-clock stamp is what keeps two runs apart"
         );
         // A match can outlive four digits; the name must not wrap or truncate.
-        assert_eq!(shot_name(7, 12345.0, 3), "wc3-7-t12345-03.png");
+        assert_eq!(shot_name(7, 12345.0, 3), "bh-7-t12345-03.png");
     }
 
     #[test]
     fn an_unset_or_blank_shot_dir_falls_back() {
         assert_eq!(shot_dir_from(Some("arena/r11/shots")), PathBuf::from("arena/r11/shots"));
         assert_eq!(shot_dir_from(None), PathBuf::from(DEFAULT_SHOT_DIR));
-        // `WC3_SHOT_DIR= cargo run` sets the variable to nothing at all. Taking
+        // `BH_SHOT_DIR= cargo run` sets the variable to nothing at all. Taking
         // that literally would write PNGs into the process's own directory.
         assert_eq!(shot_dir_from(Some("")), PathBuf::from(DEFAULT_SHOT_DIR));
         assert_eq!(shot_dir_from(Some("   ")), PathBuf::from(DEFAULT_SHOT_DIR));

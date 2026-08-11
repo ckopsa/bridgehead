@@ -70,7 +70,7 @@
 //!
 //! ## Default OFF
 //!
-//! `WC3_COMMAND_LATENCY` defaults off, and with it off this module is inert:
+//! `BH_COMMAND_LATENCY` defaults off, and with it off this module is inert:
 //! the node cache is never built, `OrderIssuer::issue` is literally the
 //! `try_insert(order)` it replaced, and no `PendingOrder` can exist. v1
 //! behaviour is unchanged, which is what lets the whole thing ship before it is
@@ -87,21 +87,21 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// The master switch. Default off; v1 behaviour until the sweep justifies a
-/// default. Same idiom as `WC3_SPEED` / `WC3_AI_BOTH` / `WC3_BRIDGE`.
-pub const LATENCY_ENV: &str = "WC3_COMMAND_LATENCY";
+/// default. Same idiom as `BH_SPEED` / `BH_AI_BOTH` / `BH_BRIDGE`.
+pub const LATENCY_ENV: &str = "BH_COMMAND_LATENCY";
 /// Free radius around a hall — your base is where your hands work.
-pub const HALL_RADIUS_ENV: &str = "WC3_LINK_HALL_RADIUS";
+pub const HALL_RADIUS_ENV: &str = "BH_LINK_HALL_RADIUS";
 /// Free radius around a living hero. Smaller than a hall's on purpose: the
 /// hero is the *mobile* node, and where you put it is the judgment call
 /// docs/TEMPO.md §C5 wants to preserve. Buying fast hands at the front means
 /// putting your most valuable unit in the most dangerous place.
-pub const HERO_RADIUS_ENV: &str = "WC3_LINK_HERO_RADIUS";
+pub const HERO_RADIUS_ENV: &str = "BH_LINK_HERO_RADIUS";
 /// The step: what an order costs the moment it has to leave a node's radius.
-pub const STEP_ENV: &str = "WC3_LINK_STEP";
+pub const STEP_ENV: &str = "BH_LINK_STEP";
 /// The ramp: seconds added per world unit beyond the radius.
-pub const PER_UNIT_ENV: &str = "WC3_LINK_PER_UNIT";
+pub const PER_UNIT_ENV: &str = "BH_LINK_PER_UNIT";
 /// The clamp. Also the delay charged to a team with no command nodes at all.
-pub const MAX_ENV: &str = "WC3_LINK_MAX";
+pub const MAX_ENV: &str = "BH_LINK_MAX";
 
 pub const DEFAULT_HALL_RADIUS: f32 = 30.0;
 pub const DEFAULT_HERO_RADIUS: f32 = 18.0;

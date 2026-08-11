@@ -47,11 +47,11 @@
 # * Dev profile, always. Determinism is a property of the schedule and the
 #   seed, not of the optimisation level, and a release detour is minutes of
 #   compile for no extra evidence.
-# * The BUILT BINARY is what runs the sims — target/debug/wc3clone by path,
+# * The BUILT BINARY is what runs the sims — target/debug/bridgehead by path,
 #   never `cargo run`. `cargo run` can rebuild between your test and your sim
 #   and leave you unable to say which code produced the verdict. The build
 #   stage prints the binary's mtime so a stale binary is visible, not implied.
-# * Decisive-or-fail. A sim that hits WC3_MAX_GAME_SECS is a FAILURE here, not
+# * Decisive-or-fail. A sim that hits BH_MAX_GAME_SECS is a FAILURE here, not
 #   a pass with a caveat, and the `headless: game over` line is echoed so the
 #   verdict is in the transcript rather than in a log nobody opens.
 # * Every engine this script starts is tracked by PID and dies with the script,
@@ -67,12 +67,12 @@
 # ---------------------------------------------------------------------------
 #
 #   SIM_DT=0.05        fixed tick for sims; the determinism harness's tick
-#   SIM_CAP=900        WC3_MAX_GAME_SECS safety cap, in GAME seconds
+#   SIM_CAP=900        BH_MAX_GAME_SECS safety cap, in GAME seconds
 #   SIM_SEEDS="42 7"   seeds for full's matrix
 #   IDENT_SEED=42      seed for identity's fingerprint sims
-#   FP_INTERVAL=10     WC3_FINGERPRINT sampling interval, in game seconds
-#   BRIDGE_SPEED=4     WC3_SPEED for the engine verify_intent_bridge.py drives
-#   BRIDGE_CAP=20000   that engine's WC3_MAX_GAME_SECS — high on purpose, so the
+#   FP_INTERVAL=10     BH_FINGERPRINT sampling interval, in game seconds
+#   BRIDGE_SPEED=4     BH_SPEED for the engine verify_intent_bridge.py drives
+#   BRIDGE_CAP=20000   that engine's BH_MAX_GAME_SECS — high on purpose, so the
 #                      match cannot time-cap out from under the verifier; the
 #                      engine is stopped by PID when the verifier returns
 #   KEEP_LOGS=1        keep the log directory, and identity's target/verify-identity
@@ -88,12 +88,12 @@
 # not pretend they do:
 #
 #   verify_intent_bridge.py     needs an engine ALREADY RUNNING. This script
-#                               launches it (WC3_BRIDGE=1), waits for the
+#                               launches it (BH_BRIDGE=1), waits for the
 #                               script to finish, then stops it by saved PID.
 #                               The verifier performs the t0d ready handshake
 #                               itself — it sees `waiting_for` in the snapshot
 #                               and sends {"type":"ready"} — so the engine gets
-#                               a GENEROUS WC3_READY_TIMEOUT, not a low one:
+#                               a GENEROUS BH_READY_TIMEOUT, not a low one:
 #                               the point is to let the handshake happen, not
 #                               to time it out before the verifier can test it.
 #   verify_territory_bridge.py  launches its own engine; takes `--bin PATH`, so
@@ -114,7 +114,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
-BIN="$ROOT/target/debug/wc3clone"
+BIN="$ROOT/target/debug/bridgehead"
 
 SIM_DT="${SIM_DT:-0.05}"
 SIM_CAP="${SIM_CAP:-900}"
@@ -130,7 +130,7 @@ BRIDGE_CAP="${BRIDGE_CAP:-20000}"
 BRIDGE_READY_TIMEOUT="${BRIDGE_READY_TIMEOUT:-600}"
 KEEP_LOGS="${KEEP_LOGS:-0}"
 
-LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/wc3verify.XXXXXX")"
+LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/bhverify.XXXXXX")"
 
 # ---------------------------------------------------------------------------
 # Engine lifecycle: nothing we start outlives us
@@ -312,9 +312,9 @@ st_py_suites() {
 sim() {
     local map="$1" seed="$2"
     local log="$LOGDIR/sim-$map-$seed.log"
-    env WC3_HEADLESS=1 WC3_AI_BOTH=1 \
-        WC3_MAP="$map" WC3_SEED="$seed" \
-        WC3_FIXED_DT="$SIM_DT" WC3_MAX_GAME_SECS="$SIM_CAP" \
+    env BH_HEADLESS=1 BH_AI_BOTH=1 \
+        BH_MAP="$map" BH_SEED="$seed" \
+        BH_FIXED_DT="$SIM_DT" BH_MAX_GAME_SECS="$SIM_CAP" \
         "$BIN" >"$log" 2>&1 &
     local pid=$!
     track_engine "$pid"
@@ -361,7 +361,7 @@ st_determinism() {
     # produce nothing, and it reports a divergence that never happened.
     mkdir -p "$LOGDIR/determinism" || return 1
     BIN="$BIN" SEED=42 DT="$SIM_DT" INTERVAL="$FP_INTERVAL" CAP="$SIM_CAP" \
-    WC3_MAP=open OUT="$LOGDIR/determinism" \
+    BH_MAP=open OUT="$LOGDIR/determinism" \
         "$ROOT/tools/determinism_check.sh" >"$LOGDIR/determinism.log" 2>&1
     local rc=$?
     tail -n 8 "$LOGDIR/determinism.log" | sed 's/^/  /'
@@ -379,9 +379,9 @@ st_bridge_intent() {
     clean_bridge
     mkdir -p "$ROOT/bridge/red"
     local log="$LOGDIR/engine-intent.log"
-    env WC3_HEADLESS=1 WC3_BRIDGE=1 WC3_MAP=open \
-        WC3_SPEED="$BRIDGE_SPEED" WC3_MAX_GAME_SECS="$BRIDGE_CAP" \
-        WC3_READY_TIMEOUT="$BRIDGE_READY_TIMEOUT" \
+    env BH_HEADLESS=1 BH_BRIDGE=1 BH_MAP=open \
+        BH_SPEED="$BRIDGE_SPEED" BH_MAX_GAME_SECS="$BRIDGE_CAP" \
+        BH_READY_TIMEOUT="$BRIDGE_READY_TIMEOUT" \
         "$BIN" >"$log" 2>&1 &
     local pid=$!
     track_engine "$pid"
@@ -417,10 +417,10 @@ fingerprints() {
     local bin="$1" cwd="$2" map="$3" seed="$4" out="$5"
     local log="$out.log" prev="$PWD"
     cd "$cwd" || return 1
-    env WC3_HEADLESS=1 WC3_AI_BOTH=1 \
-        WC3_MAP="$map" WC3_SEED="$seed" \
-        WC3_FIXED_DT="$SIM_DT" WC3_FINGERPRINT="$FP_INTERVAL" \
-        WC3_MAX_GAME_SECS="$SIM_CAP" \
+    env BH_HEADLESS=1 BH_AI_BOTH=1 \
+        BH_MAP="$map" BH_SEED="$seed" \
+        BH_FIXED_DT="$SIM_DT" BH_FINGERPRINT="$FP_INTERVAL" \
+        BH_MAX_GAME_SECS="$SIM_CAP" \
         "$bin" >"$log" 2>&1 &
     local pid=$!
     cd "$prev" || return 1
@@ -515,7 +515,7 @@ st_identity() {
         fi
     done
 
-    # The ref build left target/debug/wc3clone belonging to the ref. Put HEAD's
+    # The ref build left target/debug/bridgehead belonging to the ref. Put HEAD's
     # back so the next thing to use this checkout is not quietly running old code.
     cp "$IDENT_WORK/bin-head" "$BIN" 2>/dev/null
     return "$rc"

@@ -2,13 +2,13 @@
 #
 # determinism_check.sh — run the same match twice and prove it is the same match.
 #
-# Two headless AI-vs-AI runs with an identical WC3_SEED and an identical fixed
+# Two headless AI-vs-AI runs with an identical BH_SEED and an identical fixed
 # tick should produce byte-identical FINGERPRINT lines (a hash of every unit's
 # and building's position and health, plus both economies) and the same verdict.
 #
 # Usage:
 #   tools/determinism_check.sh                  # default: seed 42, 0.05s tick, open map
-#   WC3_MAP=crossings tools/determinism_check.sh
+#   BH_MAP=crossings tools/determinism_check.sh
 #   SEED=7 CAP=300 tools/determinism_check.sh
 #
 # Exit status is the result: 0 = the two runs are identical, 1 = they diverged
@@ -24,7 +24,7 @@ SEED="${SEED:-42}"
 DT="${DT:-0.05}"
 INTERVAL="${INTERVAL:-10}"
 CAP="${CAP:-600}"
-MAP="${WC3_MAP:-open}"
+MAP="${BH_MAP:-open}"
 OUT="${OUT:-$(mktemp -d)}"
 
 # Release if it is already built (a full match runs in seconds), otherwise
@@ -33,26 +33,26 @@ OUT="${OUT:-$(mktemp -d)}"
 # release binary is a speed convenience, never part of the claim.
 BIN="${BIN:-}"
 if [ -z "$BIN" ]; then
-  for cand in target/release/wc3clone target/debug/wc3clone; do
+  for cand in target/release/bridgehead target/debug/bridgehead; do
     [ -x "$cand" ] && BIN="$cand" && break
   done
 fi
 if [ -z "$BIN" ]; then
   echo "no binary found; building a debug one ..."
   cargo build --quiet || exit 1
-  BIN="target/debug/wc3clone"
+  BIN="target/debug/bridgehead"
 fi
 echo "binary: $BIN"
 
 run() {
   local n="$1"
-  WC3_HEADLESS=1 \
-  WC3_AI_BOTH=1 \
-  WC3_MAP="$MAP" \
-  WC3_SEED="$SEED" \
-  WC3_FIXED_DT="$DT" \
-  WC3_FINGERPRINT="$INTERVAL" \
-  WC3_MAX_GAME_SECS="$CAP" \
+  BH_HEADLESS=1 \
+  BH_AI_BOTH=1 \
+  BH_MAP="$MAP" \
+  BH_SEED="$SEED" \
+  BH_FIXED_DT="$DT" \
+  BH_FINGERPRINT="$INTERVAL" \
+  BH_MAX_GAME_SECS="$CAP" \
     "$BIN" >"$OUT/run$n.log" 2>&1
   # The fingerprints plus the verdict: the whole timeline and how it ended.
   grep -E 'FINGERPRINT|headless: (game over|time cap)' "$OUT/run$n.log" \

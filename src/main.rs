@@ -24,7 +24,7 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `WC3_WINDOW=800x600` opens the game at a given logical size.
+/// `BH_WINDOW=800x600` opens the game at a given logical size.
 ///
 /// It exists because the HUD has a *narrow* failure mode and no way to
 /// reproduce it: a tiling WM hands the game whatever the tile is, and "does
@@ -33,7 +33,7 @@ fn env_truthy(name: &str) -> bool {
 fn window_resolution() -> bevy::window::WindowResolution {
     use bevy::window::WindowResolution;
     let default = WindowResolution::default();
-    let Ok(raw) = std::env::var("WC3_WINDOW") else {
+    let Ok(raw) = std::env::var("BH_WINDOW") else {
         return default;
     };
     let parsed = raw.trim().split_once(['x', 'X']).and_then(|(w, h)| {
@@ -42,17 +42,17 @@ fn window_resolution() -> bevy::window::WindowResolution {
     match parsed {
         Some((w, h)) if w >= 320.0 && h >= 240.0 => WindowResolution::new(w, h),
         _ => {
-            eprintln!("WC3_WINDOW=\"{raw}\" is not a WxH of at least 320x240 — ignoring");
+            eprintln!("BH_WINDOW=\"{raw}\" is not a WxH of at least 320x240 — ignoring");
             default
         }
     }
 }
 
 fn main() {
-    // WC3_HEADLESS=1: full-fidelity simulation with no window, no renderer,
-    // no GPU — for agents, CI, and balance testing. Combine with WC3_SPEED,
-    // WC3_AI_BOTH, and WC3_BRIDGE; exits on game over or WC3_MAX_GAME_SECS.
-    let headless = env_truthy("WC3_HEADLESS");
+    // BH_HEADLESS=1: full-fidelity simulation with no window, no renderer,
+    // no GPU — for agents, CI, and balance testing. Combine with BH_SPEED,
+    // BH_AI_BOTH, and BH_BRIDGE; exits on game over or BH_MAX_GAME_SECS.
+    let headless = env_truthy("BH_HEADLESS");
 
     let mut app = App::new();
     if headless {
@@ -76,7 +76,7 @@ fn main() {
     } else {
         app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "WC3 Clone — Human vs Claude".into(),
+                title: "Bridgehead — Human vs Claude".into(),
                 resolution: window_resolution(),
                 ..default()
             }),
@@ -86,15 +86,15 @@ fn main() {
         // A windowed run normally ends when the player closes it. Setting the
         // cap opts a windowed run into the same self-termination headless has,
         // which is what lets an unattended session open a window, photograph
-        // itself (`WC3_SHOT_AT`) and get out of the way. Registered only when
+        // itself (`BH_SHOT_AT`) and get out of the way. Registered only when
         // the variable is set, so an ordinary game is untouched.
-        if std::env::var("WC3_MAX_GAME_SECS").is_ok() {
+        if std::env::var("BH_MAX_GAME_SECS").is_ok() {
             app.add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));
         }
     }
 
-    // WC3_FIXED_DT=0.05: every frame advances the clock by exactly 50ms rather
-    // than by however long the frame took. Together with WC3_SEED this is what
+    // BH_FIXED_DT=0.05: every frame advances the clock by exactly 50ms rather
+    // than by however long the frame took. Together with BH_SEED this is what
     // makes a run reproducible — without it the sim integrates a wall-clock
     // delta, and no two runs (let alone two machines) agree on it.
     //
@@ -110,7 +110,7 @@ fn main() {
         (Some(strategy), true) => {
             info!(
                 "{}: fixed tick — the clock advances a constant step per frame \
-                 (WC3_SPEED is ignored)",
+                 (BH_SPEED is ignored)",
                 shared::FIXED_DT_ENV
             );
             app.insert_resource(strategy);
@@ -129,7 +129,7 @@ fn main() {
         intent::IntentPlugin,
         // Chain of Command (docs/TEMPO.md §3): direct orders take time to
         // reach a unit far from your halls and your hero. Inert unless
-        // WC3_COMMAND_LATENCY is set, so v1 behaviour is the default.
+        // BH_COMMAND_LATENCY is set, so v1 behaviour is the default.
         command::CommandPlugin,
         terrain::TerrainPlugin { headless },
         units::UnitsPlugin,
@@ -138,7 +138,7 @@ fn main() {
         ai::AiPlugin,
         bridge::BridgePlugin,
         // Co-command: the negotiation layer between a co-commander's wire and
-        // the compiler. Inert unless `WC3_BRIDGE=copilot` seats one.
+        // the compiler. Inert unless `BH_BRIDGE=copilot` seats one.
         copilot::CopilotPlugin,
         doctrine::DoctrinePlugin,
         // Triggers: the CONTINGENT half of doctrine — a condition the engine
@@ -207,7 +207,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Seconds of `Time<Real>` each test frame advances. A hand-driven clock,
-    /// for the reason `WC3_FIXED_DT` exists: the whole claim below is about
+    /// for the reason `BH_FIXED_DT` exists: the whole claim below is about
     /// what the clock did, and a wall-clock delta would make the numbers a
     /// property of the CI box.
     const TEST_DT: f64 = 0.05;
@@ -215,7 +215,7 @@ mod tests {
     /// The real game, whole, on a hand-driven clock — the same composition
     /// `the_whole_game_schedules_without_a_cycle` builds, because an inertness
     /// claim is only worth as much as the number of systems it was tested
-    /// against. `WC3_BRIDGE` is never set in tests (env is process-global and
+    /// against. `BH_BRIDGE` is never set in tests (env is process-global and
     /// the suite runs in parallel), so `bridge_startup` early-returns and the
     /// `ReadyGate` handed in here is the only thing that gates.
     fn handshake_app(gate: shared::ReadyGate) -> App {
@@ -481,7 +481,7 @@ mod tests {
 
     /// **Scripted and autopilot seats are born ready.** A faction in the
     /// scripted AI's hands has no map to read, so it gates nothing — otherwise
-    /// `WC3_BRIDGE=red` (one commander against the scripted AI) could never
+    /// `BH_BRIDGE=red` (one commander against the scripted AI) could never
     /// start, and a commander could hang a match by autopiloting and walking
     /// away. Checked live rather than at startup, so the release works whenever
     /// the handback happens.
@@ -543,9 +543,9 @@ fn headless_exit(
 ) {
     use shared::Team;
     // No time limit by default — matches end when a base falls. Setting
-    // WC3_MAX_GAME_SECS opts an automated run into a safety cap (with a
+    // BH_MAX_GAME_SECS opts an automated run into a safety cap (with a
     // score-based verdict) so unattended sims can't spin forever.
-    let Some(cap) = std::env::var("WC3_MAX_GAME_SECS")
+    let Some(cap) = std::env::var("BH_MAX_GAME_SECS")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
     else {

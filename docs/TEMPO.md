@@ -290,7 +290,7 @@ Concretely and unambiguously:
   asymmetry is the whole mechanism: **standing orders are local; direct orders travel.**
 - Command nodes at launch: every completed TownHall, and your living hero. A forward
   Outpost building follows in phase 3.
-- Latency is a tunable curve behind `WC3_COMMAND_LATENCY`, defaulting **off** until the
+- Latency is a tunable curve behind `BH_COMMAND_LATENCY`, defaulting **off** until the
   headless sweep and a human-vs-Claude rematch justify a default.
 
 ### Answering Option A's best counterargument
@@ -473,10 +473,10 @@ asserted deliberately, not discovered.
 - **Phase 0 — doctrine parity.** Ships alone, changes no tempo. Re-run the human-vs-Claude
   duel. This alone may move the result, and if it does, that is a finding worth having
   before we build anything else.
-- **Phase 1 — latency core behind `WC3_COMMAND_LATENCY`, default off.** Same env-flag
-  precedent as `WC3_SPEED` / `WC3_AI_BOTH` / `WC3_BRIDGE`. Default-off means v1 behavior
+- **Phase 1 — latency core behind `BH_COMMAND_LATENCY`, default off.** Same env-flag
+  precedent as `BH_SPEED` / `BH_AI_BOTH` / `BH_BRIDGE`. Default-off means v1 behavior
   is bit-identical and no existing match setup breaks.
-- **Phase 2 — calibration.** Headless sweep (`WC3_HEADLESS=1 WC3_AI_BOTH=1 WC3_SPEED=16`)
+- **Phase 2 — calibration.** Headless sweep (`BH_HEADLESS=1 BH_AI_BOTH=1 BH_SPEED=16`)
   across the latency curve, checking that match length and the counter-triangle survive.
   Then the acceptance test, per thesis principle 4: **the mechanic must appear in a
   winning player's AAR.** Flip the default when it does.
@@ -522,7 +522,7 @@ asserted deliberately, not discovered.
    `CommandPlugin` with the two components, the `CommandNodes`/`CommandLatency`
    resources, and the `dispatch_pending` system; route all 23 player-command `Order`
    writes (`ui.rs` 8, `bridge.rs` 6, `ai.rs` 9) through one `shared::issue_order` helper.
-   Gate the whole behavior behind `WC3_COMMAND_LATENCY`, default off, so v1 behavior is
+   Gate the whole behavior behind `BH_COMMAND_LATENCY`, default off, so v1 behavior is
    bit-identical until phase 2 flips it.
 
 5. **Doctrine/latency integration: exempt in-transit units from re-tasking** — Add
@@ -545,10 +545,10 @@ asserted deliberately, not discovered.
    read as a game rule rather than a bug.
 
 8. **Calibration sweep and human-vs-Claude rematch acceptance** — Headless sweep
-   (`WC3_HEADLESS=1 WC3_AI_BOTH=1 WC3_SPEED=16`) over the latency curve checking match
+   (`BH_HEADLESS=1 BH_AI_BOTH=1 BH_SPEED=16`) over the latency curve checking match
    length, counter-triangle integrity, and that bounty contests still happen; then a
    human-vs-Claude rematch. Acceptance per thesis principle 4: flip
-   `WC3_COMMAND_LATENCY` on by default only once command nodes appear in a winning
+   `BH_COMMAND_LATENCY` on by default only once command nodes appear in a winning
    player's after-action report.
 
 ---
@@ -624,7 +624,7 @@ group, and there are three control groups.
 
 ## 7. Phase 1 as built (issue 4, shipped)
 
-The latency core landed behind `WC3_COMMAND_LATENCY`, default off. What differs
+The latency core landed behind `BH_COMMAND_LATENCY`, default off. What differs
 from §4's sketch is mostly *cheaper than planned*, plus one thing the sketch
 could not have known because only a sim could find it.
 
@@ -1070,8 +1070,8 @@ best: everything that takes input, then everything that draws the result.
 `tools/link_sweep.py` runs the grid headless and classifies what it finds.
 Thirty-nine runs on `open`: a flag-off baseline plus twelve curves — hall radius
 {30, 45, 60} × step {0.3, 0.6} × ramp {0.01, 0.02}, cap fixed at 3.0s, hero
-radius fixed at 18 — three replicates each, `WC3_HEADLESS=1 WC3_AI_BOTH=1
-WC3_SPEED=16`, 1800s game cap.
+radius fixed at 18 — three replicates each, `BH_HEADLESS=1 BH_AI_BOTH=1
+BH_SPEED=16`, 1800s game cap.
 
 | arm | n | decisive | median length (game s) | mean link | worst link | mean in transit | caps (classified) |
 |---|---|---|---|---|---|---|---|
@@ -1112,7 +1112,7 @@ around 2–3 — the armies are reaching past their chain of command constantly,
 still resolving their games.
 
 A methodological note that the script enforces rather than assumes: match length
-is inferred as `wall_seconds × WC3_SPEED`, because the engine logs no game
+is inferred as `wall_seconds × BH_SPEED`, because the engine logs no game
 clock. The inference is self-checking, and checked — capped runs landed on the
 1800s cap with **0.0% error**.
 
@@ -1155,7 +1155,7 @@ either map, at any point of this grid. That is a necessary result and not a
 sufficient one.
 
 The sufficient one is thesis principle 4, and §4's migration path already named
-it: **flip `WC3_COMMAND_LATENCY` on by default only once command nodes appear in
+it: **flip `BH_COMMAND_LATENCY` on by default only once command nodes appear in
 a winning player's after-action report.** That means a human-vs-Claude rematch,
 played with the flag on and the HUD from §8.3 in front of the human, whose AAR
 talks about where the halls and the hero were — not about input lag.

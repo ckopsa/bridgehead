@@ -1,6 +1,6 @@
 //! ai.rs — the scripted RTS brain. Always drives the Claude faction (red, NE
 //! base) and optionally the Human one too (blue, SW base) for AI-vs-AI
-//! spectating: launch with `WC3_AI_BOTH=1`, or press F9 at runtime.
+//! spectating: launch with `BH_AI_BOTH=1`, or press F9 at runtime.
 //!
 //! A macro-focused RTS AI that plays strictly through the same primitives the
 //! human UI uses — and, since wc3clone-jem, through the *identical* ones.
@@ -20,7 +20,7 @@
 //!   * **Validation.** The script is refused by the same rules a commander is
 //!     — fog, ownership, tech gates, affordability, hero slots, queue caps. It
 //!     cannot place a building on ground a player would be told is blocked.
-//!   * **The replay.** `WC3_INTENT_LOG` now records all three authors. A sim
+//!   * **The replay.** `BH_INTENT_LOG` now records all three authors. A sim
 //!     against the scripted baseline is readable as a match transcript rather
 //!     than as one commander talking into a silence.
 //!   * **Provenance.** Its units answer `order:attackmove by script t=…`,
@@ -276,14 +276,14 @@ const GRYPHON_BANK_GOLD: u32 = 700;
 ///
 /// So the two gates are env-tunable, and ONLY the two gates: unset, they read
 /// their constants and the script's behaviour is byte-identical to before.
-/// `WC3_AI_GRYPHON_BANK=0 WC3_AI_GRYPHON_NTH=1 WC3_HEADLESS=1 cargo run` puts
+/// `BH_AI_GRYPHON_BANK=0 BH_AI_GRYPHON_NTH=1 BH_HEADLESS=1 cargo run` puts
 /// flyers in the air as soon as a Castle and Workshop stand, which is how the
 /// path gets exercised in a real sim rather than only in a unit test.
 ///
 /// These are probe knobs, not balance knobs. A run with them set is not a
 /// baseline run and its timings mean nothing.
-const GRYPHON_BANK_ENV: &str = "WC3_AI_GRYPHON_BANK";
-const GRYPHON_NTH_ENV: &str = "WC3_AI_GRYPHON_NTH";
+const GRYPHON_BANK_ENV: &str = "BH_AI_GRYPHON_BANK";
+const GRYPHON_NTH_ENV: &str = "BH_AI_GRYPHON_NTH";
 
 /// Read a `u32` override once per process. Anything unparseable is ignored
 /// rather than fatal — a typo in a probe knob must not change a match.
@@ -294,13 +294,13 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// `GRYPHON_BANK_GOLD`, or the `WC3_AI_GRYPHON_BANK` override.
+/// `GRYPHON_BANK_GOLD`, or the `BH_AI_GRYPHON_BANK` override.
 fn gryphon_bank_gold() -> u32 {
     static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| env_u32(GRYPHON_BANK_ENV, GRYPHON_BANK_GOLD))
 }
 
-/// `GRYPHON_EVERY_NTH`, or the `WC3_AI_GRYPHON_NTH` override, floored at 1 —
+/// `GRYPHON_EVERY_NTH`, or the `BH_AI_GRYPHON_NTH` override, floored at 1 —
 /// the value is a modulus, and a zero here would panic the think tick rather
 /// than mis-plan it.
 fn gryphon_every_nth() -> u32 {
@@ -425,7 +425,7 @@ const SLAM_RADIUS_SLACK: f32 = 2.0;
 // ---------------------------------------------------------------------------
 
 /// Env var that puts the Human side under AI control from startup.
-const AI_BOTH_ENV: &str = "WC3_AI_BOTH";
+const AI_BOTH_ENV: &str = "BH_AI_BOTH";
 /// Runtime toggle for AI control of the Human side.
 const AI_TOGGLE_KEY: KeyCode = KeyCode::F9;
 
@@ -662,7 +662,7 @@ impl Default for AiState {
     }
 }
 
-/// `WC3_AI_BOTH=1 cargo run` — hand the Human side to the AI as well.
+/// `BH_AI_BOTH=1 cargo run` — hand the Human side to the AI as well.
 fn ai_apply_env(mut ai_controlled: ResMut<AiControlled>) {
     let enabled = std::env::var(AI_BOTH_ENV)
         .map(|raw| !raw.is_empty() && raw != "0")
@@ -1918,7 +1918,7 @@ fn think(
     //
     // `Vec` rather than a map, keyed by first appearance: the order sentences
     // come out in has to be a function of the world and nothing else, or
-    // `WC3_SEED` stops reproducing a match.
+    // `BH_SEED` stops reproducing a match.
     let mut haulers: Vec<IntentId> = Vec::new();
     let mut crews: Vec<(Entity, Vec<IntentId>)> = Vec::new();
     for w in &workers {
@@ -3372,7 +3372,7 @@ mod tests {
     // What follows is the missing half: one real `ai_think` tick, on a real
     // World, with a real enemy Gryphon in the fog, asserting the two things the
     // script is supposed to DO about it. The knobs added for the sim
-    // (`WC3_AI_GRYPHON_BANK` / `_NTH`) let a headless run reach the same place
+    // (`BH_AI_GRYPHON_BANK` / `_NTH`) let a headless run reach the same place
     // the slow way; this reaches it in a millisecond and on every CI run.
 
     /// A world with the scripted commander in it and nothing else: no fog to
@@ -3424,7 +3424,7 @@ mod tests {
             // (`SimSet::AiThink` sits four sets ahead of `SimSet::Intent`), so
             // pinning it here is a restatement, not a fixture.
             .add_systems(Update, ai_think.before(crate::intent::IntentApply));
-        // A unit test must depend on neither `WC3_INTENT_LOG` nor the
+        // A unit test must depend on neither `BH_INTENT_LOG` nor the
         // filesystem, and must leave no file behind.
         app.insert_resource(crate::intent::IntentLog::disabled());
         // Claude only, so the assertions below can name one brain.
@@ -3627,7 +3627,7 @@ mod tests {
     /// Workshop with room in its queue, the siege counter on its beat, and the
     /// bank fat after the reserve — and no scripted match has ever had all four
     /// at once, which is why nobody had seen this branch either. A headless run
-    /// with `WC3_AI_GRYPHON_BANK=0` still needs the match to LAST long enough to
+    /// with `BH_AI_GRYPHON_BANK=0` still needs the match to LAST long enough to
     /// reach tier 3, and the scripted matchup resolves at tier 2 (verified: both
     /// maps end 6-7 minutes with the loser collapsing before its Castle). So the
     /// board is built here instead of waited for.
@@ -3932,7 +3932,7 @@ mod tests {
         assert_eq!(gryphon_every_nth(), GRYPHON_EVERY_NTH);
         // Parsing is total: rubbish and empty strings fall back rather than
         // panicking mid-match, and the modulus can never reach zero.
-        assert_eq!(env_u32("WC3_AI_NO_SUCH_VAR_HOPEFULLY", 42), 42);
+        assert_eq!(env_u32("BH_AI_NO_SUCH_VAR_HOPEFULLY", 42), 42);
         assert_eq!(env_u32(GRYPHON_NTH_ENV, GRYPHON_EVERY_NTH).max(1).max(1), GRYPHON_EVERY_NTH);
     }
 
@@ -4250,7 +4250,7 @@ mod tests {
     /// It now tests something better: the script speaks through the compiler
     /// like everyone else, so an order it gives a unit on the far side of the
     /// map is held in transit *because there is no other path it could have
-    /// taken*. `WC3_COMMAND_LATENCY=1` reaches the third seat through the same
+    /// taken*. `BH_COMMAND_LATENCY=1` reaches the third seat through the same
     /// `ground_order` arm that prices the first two.
     #[test]
     fn the_scripted_ai_pays_latency_like_everybody_else() {
@@ -4302,7 +4302,7 @@ mod tests {
         assert_eq!(spoken.source, IntentSource::Script);
     }
 
-    /// The off-flag identity at the third seat: with `WC3_COMMAND_LATENCY`
+    /// The off-flag identity at the third seat: with `BH_COMMAND_LATENCY`
     /// unset the scripted AI writes `Order`s exactly where it always did, and
     /// no `PendingOrder` can exist anywhere.
     #[test]

@@ -65,7 +65,7 @@ compiling to the same doctrine the AI writes, every unit able to answer *"why ar
 doing that?"* with its chain of command — and ultimately co-command, where a human and an
 AI run one faction and negotiate strategy in a language both speak natively.
 
-Co-command is now real (`WC3_BRIDGE=copilot`), and the shape it took is the best
+Co-command is now real (`BH_BRIDGE=copilot`), and the shape it took is the best
 evidence the layers below it were built right. A second author on one faction turned out
 to be *one enum variant* — because there was already one vocabulary, one compiler, one
 fog rule, and a provenance stamp on every order, so "which of us moved this unit" was

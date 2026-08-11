@@ -87,49 +87,49 @@ def env_for(*specs, **kw):
 
 def test_two_scripted_seats_turn_the_bridge_off_and_the_ai_on():
     env = env_for("red=scripted", "blue=scripted")
-    assert env["WC3_BRIDGE"] == "0"
+    assert env["BH_BRIDGE"] == "0"
     # Claude is machine-driven anyway; the Human side is the one that needs it.
-    assert env["WC3_AI_BOTH"] == "1"
+    assert env["BH_AI_BOTH"] == "1"
 
 
 def test_two_commander_seats_open_both_sides_of_the_bridge():
     env = env_for("red=commander:rusher", "blue=commander:boomer")
-    assert env["WC3_BRIDGE"] == "both"
-    assert env["WC3_AI_BOTH"] == "0"
+    assert env["BH_BRIDGE"] == "both"
+    assert env["BH_AI_BOTH"] == "0"
 
 
 def test_one_commander_against_the_script():
     """The asymmetric cases are the ones a hand-typed launch line gets wrong."""
     red = env_for("red=commander:rusher", "blue=scripted")
-    assert red["WC3_BRIDGE"] == "red"
-    assert red["WC3_AI_BOTH"] == "1", "the scripted blue seat still needs driving"
+    assert red["BH_BRIDGE"] == "red"
+    assert red["BH_AI_BOTH"] == "1", "the scripted blue seat still needs driving"
 
     blue = env_for("red=scripted", "blue=commander:boomer")
-    assert blue["WC3_BRIDGE"] == "blue"
-    assert blue["WC3_AI_BOTH"] == "0", "Claude's side is scripted by default"
+    assert blue["BH_BRIDGE"] == "blue"
+    assert blue["BH_AI_BOTH"] == "0", "Claude's side is scripted by default"
 
 
 def test_headless_is_the_default_and_windowed_removes_it():
-    assert env_for("red=scripted", "blue=scripted")["WC3_HEADLESS"] == "1"
-    assert "WC3_HEADLESS" not in env_for("red=commander:a", "blue=commander:b", windowed=True)
+    assert env_for("red=scripted", "blue=scripted")["BH_HEADLESS"] == "1"
+    assert "BH_HEADLESS" not in env_for("red=commander:a", "blue=commander:b", windowed=True)
 
 
 def test_the_cap_is_optional():
-    assert env_for("red=scripted", "blue=scripted", cap=600)["WC3_MAX_GAME_SECS"] == "600"
-    assert "WC3_MAX_GAME_SECS" not in env_for("red=scripted", "blue=scripted", cap=0)
+    assert env_for("red=scripted", "blue=scripted", cap=600)["BH_MAX_GAME_SECS"] == "600"
+    assert "BH_MAX_GAME_SECS" not in env_for("red=scripted", "blue=scripted", cap=0)
 
 
 def test_an_explicit_override_beats_the_derived_value():
     """A probe knob has to be settable — and has to show up in the record, so a
     probe run can never be mistaken for a baseline."""
-    env = env_for("red=scripted", "blue=scripted", env=["WC3_FOG=0", "WC3_AI_BOTH=0"])
-    assert env["WC3_FOG"] == "0"
-    assert env["WC3_AI_BOTH"] == "0"
+    env = env_for("red=scripted", "blue=scripted", env=["BH_FOG=0", "BH_AI_BOTH=0"])
+    assert env["BH_FOG"] == "0"
+    assert env["BH_AI_BOTH"] == "0"
 
 
 def test_screenshots_are_filed_with_the_round():
     env = env_for("red=scripted", "blue=scripted", id="r42", out="arena")
-    assert env["WC3_SHOT_DIR"].endswith(os.path.join("arena", "r42", "shots"))
+    assert env["BH_SHOT_DIR"].endswith(os.path.join("arena", "r42", "shots"))
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +197,7 @@ def test_a_crashed_run_has_no_verdict_and_says_so():
 
 
 def test_the_process_check_never_finds_itself():
-    """`pgrep -f target/debug/wc3clone` would match this script's own command
+    """`pgrep -f target/debug/bridgehead` would match this script's own command
     line, which carries that path. The check matches the executable instead."""
     assert os.getpid() not in [pid for pid, _ in arena_run.running_engines(Path(sys.executable))]
     assert arena_run.running_engines(Path("/nonexistent/wc3clone-not-a-real-binary")) == []
@@ -205,7 +205,7 @@ def test_the_process_check_never_finds_itself():
 
 def test_the_process_check_does_find_a_live_engine():
     with tempfile.TemporaryDirectory() as tmp:
-        fake = Path(tmp) / "wc3clone"
+        fake = Path(tmp) / "bridgehead"
         shutil.copy(shutil.which("sleep"), fake)
         proc = subprocess.Popen([str(fake), "30"])
         try:
@@ -271,7 +271,7 @@ def test_the_recorded_round_validates_and_names_the_winning_creed():
     assert rec["kind"] == "mixed"
     assert rec["provenance"] == "recorded"
     # The environment the match actually ran under, not the one someone meant.
-    assert rec["ruleset"]["env"]["WC3_BRIDGE"] == "red"
+    assert rec["ruleset"]["env"]["BH_BRIDGE"] == "red"
 
 
 def test_a_round_with_no_verdict_still_produces_a_valid_record():

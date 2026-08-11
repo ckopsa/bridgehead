@@ -12,7 +12,7 @@
 //!
 //! ## The seat
 //!
-//! `WC3_BRIDGE=copilot` opens **one** bridge seat attached to `Team::Human` —
+//! `BH_BRIDGE=copilot` opens **one** bridge seat attached to `Team::Human` —
 //! not as the opponent, as a co-commander sitting next to the player. Its
 //! snapshot is a `Team::Human` snapshot: same fog, same knowability, same
 //! everything. There is no privileged view, because there is no second team to
@@ -66,7 +66,7 @@
 //! everything, and it cannot help during a fight) or a stranger with your
 //! wallet (do everything, and "co-command" means "handed over").
 //!
-//! `WC3_COPILOT_TRUST` moves the line for experiments: `full` (everything
+//! `BH_COPILOT_TRUST` moves the line for experiments: `full` (everything
 //! direct — the "I trust you, drive" mode) or `strict` (everything proposed,
 //! including doctrine — the "show me your reasoning" mode).
 //!
@@ -123,9 +123,9 @@
 //! proposal lapses — correct, and useless for measurement. Two knobs make the
 //! loop observable without a person:
 //!
-//! * `WC3_COPILOT_TRUST=full` — no loop at all, the control case.
-//! * `WC3_COPILOT_AUTOAPPROVE=1` — a scripted stand-in that approves each
-//!   proposal `WC3_COPILOT_APPROVE_DELAY` seconds after it arrives (default
+//! * `BH_COPILOT_TRUST=full` — no loop at all, the control case.
+//! * `BH_COPILOT_AUTOAPPROVE=1` — a scripted stand-in that approves each
+//!   proposal `BH_COPILOT_APPROVE_DELAY` seconds after it arrives (default
 //!   [`DEFAULT_APPROVE_DELAY`]), modelling an attentive human's reading time.
 //!
 //! The delay is the point. Zero-delay approval would measure a co-commander
@@ -144,7 +144,7 @@ use std::collections::VecDeque;
 // ---------------------------------------------------------------------------
 
 /// How the co-commander's direct (non-proposal) commands are treated.
-const TRUST_ENV: &str = "WC3_COPILOT_TRUST";
+const TRUST_ENV: &str = "BH_COPILOT_TRUST";
 
 /// Game seconds a proposal waits before lapsing. Long enough to read three
 /// sentences mid-fight, short enough that an approval is still about the
@@ -162,9 +162,9 @@ pub const MAX_PENDING: usize = 4;
 const CONFLICT_RECENT_S: f32 = 30.0;
 
 /// Turn on the scripted approver that stands in for a human in sims.
-const AUTOAPPROVE_ENV: &str = "WC3_COPILOT_AUTOAPPROVE";
+const AUTOAPPROVE_ENV: &str = "BH_COPILOT_AUTOAPPROVE";
 /// Game seconds the scripted approver waits before saying yes.
-const APPROVE_DELAY_ENV: &str = "WC3_COPILOT_APPROVE_DELAY";
+const APPROVE_DELAY_ENV: &str = "BH_COPILOT_APPROVE_DELAY";
 
 /// The scripted approver's default reading time. Chosen to be a plausible
 /// *attentive* human — long enough that a proposal is a real commitment of
@@ -481,7 +481,7 @@ pub struct Copilot {
     /// only place a co-commander can read *why* a veto was a veto.
     pub resolved: VecDeque<Resolution>,
     /// `Some(delay)` when a scripted approver is standing in for the human
-    /// (`WC3_COPILOT_AUTOAPPROVE`). `None` in every real match, which is what
+    /// (`BH_COPILOT_AUTOAPPROVE`). `None` in every real match, which is what
     /// keeps this inert outside sims.
     pub auto_approve: Option<f32>,
     next_id: u32,
@@ -1268,9 +1268,9 @@ mod tests {
             .init_resource::<CommandNodes>()
             .init_resource::<CommandLatency>()
             .add_plugins((IntentPlugin, CopilotPlugin));
-        // A unit test must not depend on `WC3_INTENT_LOG` or leave a file.
+        // A unit test must not depend on `BH_INTENT_LOG` or leave a file.
         app.insert_resource(IntentLog::disabled());
-        // Nor on `WC3_COPILOT_TRUST`: the policy under test is set per test.
+        // Nor on `BH_COPILOT_TRUST`: the policy under test is set per test.
         {
             let mut copilot = app.world_mut().resource_mut::<Copilot>();
             copilot.policy = TrustPolicy::Split;

@@ -526,7 +526,7 @@ mod tests {
             .init_resource::<GameEvents>()
             .add_event::<SubmitIntent>()
             .add_systems(Update, evaluate_triggers);
-        // Pin the fog mode rather than inheriting `WC3_FOG`: two predicates
+        // Pin the fog mode rather than inheriting `BH_FOG`: two predicates
         // here are ABOUT knowability, so the ambient env must not decide them.
         app.insert_resource(FogGrids::test_dark());
         app

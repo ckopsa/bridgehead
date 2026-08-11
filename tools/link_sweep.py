@@ -18,11 +18,11 @@ missing sample means "nothing was travelling at that instant" rather than "no
 data". That asymmetry is deliberate upstream and it is the signal this script
 leans on — see `classify` below.
 
-Match length in game seconds is inferred as `wall_seconds * WC3_SPEED`. The
+Match length in game seconds is inferred as `wall_seconds * BH_SPEED`. The
 engine logs no game clock, and Bevy's virtual clock advances by real delta times
 the speed multiplier, so the inference is exact up to process start-up and any
 frame that hit Bevy's 0.25s max-delta clamp. It is self-checking: a run that
-hits `WC3_MAX_GAME_SECS` must come out near the cap, and `--analyze` reports the
+hits `BH_MAX_GAME_SECS` must come out near the cap, and `--analyze` reports the
 error on exactly those runs as `cap_err`.
 
 THE CONFOUNDER
@@ -124,14 +124,14 @@ class Arm:
 
     def env(self) -> dict[str, str]:
         if not self.on:
-            return {"WC3_COMMAND_LATENCY": "0"}
+            return {"BH_COMMAND_LATENCY": "0"}
         return {
-            "WC3_COMMAND_LATENCY": "1",
-            "WC3_LINK_HALL_RADIUS": f"{self.hall:g}",
-            "WC3_LINK_HERO_RADIUS": f"{self.hero:g}",
-            "WC3_LINK_STEP": f"{self.step:g}",
-            "WC3_LINK_PER_UNIT": f"{self.per_unit:g}",
-            "WC3_LINK_MAX": f"{self.max:g}",
+            "BH_COMMAND_LATENCY": "1",
+            "BH_LINK_HALL_RADIUS": f"{self.hall:g}",
+            "BH_LINK_HERO_RADIUS": f"{self.hero:g}",
+            "BH_LINK_STEP": f"{self.step:g}",
+            "BH_LINK_PER_UNIT": f"{self.per_unit:g}",
+            "BH_LINK_MAX": f"{self.max:g}",
         }
 
 
@@ -215,16 +215,16 @@ def parse(log: str, wall: float, speed: float, cap_secs: float) -> dict:
 def run_one(arm: Arm, seed: int, args, log_dir: Path) -> Run:
     env = dict(os.environ)
     env.update(
-        WC3_HEADLESS="1",
-        WC3_AI_BOTH="1",
-        WC3_SPEED=str(args.speed),
-        WC3_MAP=args.map,
-        WC3_MAX_GAME_SECS=str(args.cap),
+        BH_HEADLESS="1",
+        BH_AI_BOTH="1",
+        BH_SPEED=str(args.speed),
+        BH_MAP=args.map,
+        BH_MAX_GAME_SECS=str(args.cap),
         # The sweep must not be perturbed by a stray bridge or replay log.
-        WC3_BRIDGE="0",
+        BH_BRIDGE="0",
     )
     env.update(arm.env())
-    env.pop("WC3_INTENT_LOG", None)
+    env.pop("BH_INTENT_LOG", None)
 
     started = time.monotonic()
     # Generous: the cap is in game seconds, so the wall ceiling is that over
@@ -352,11 +352,11 @@ def read_csv(path: Path) -> list[Run]:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     csvlist = lambda cast: (lambda s: [cast(x) for x in s.split(",") if x])  # noqa: E731
-    p.add_argument("--bin", default="./target/debug/wc3clone")
+    p.add_argument("--bin", default="./target/debug/bridgehead")
     p.add_argument("--out", default="sweep", help="output directory")
     p.add_argument("--map", default="open", choices=["open", "crossings"])
     p.add_argument("--speed", type=float, default=16.0)
-    p.add_argument("--cap", type=float, default=1800.0, help="WC3_MAX_GAME_SECS")
+    p.add_argument("--cap", type=float, default=1800.0, help="BH_MAX_GAME_SECS")
     p.add_argument("--seeds", type=int, default=3, help="replicate runs per arm")
     p.add_argument("--halls", type=csvlist(float), default=[30.0, 45.0, 60.0])
     p.add_argument("--steps", type=csvlist(float), default=[0.3, 0.6])

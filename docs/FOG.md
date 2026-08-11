@@ -326,7 +326,7 @@ the point. Enemy hero **health** is unknowable (you cannot select one); enemy he
 is the most public thing that can happen on a battlefield. Not *is this about the enemy*,
 but *could a human have seen it*.
 
-Under `WC3_FOG=0` the ledger stays **empty**, exactly as `ghosts` does and for the same
+Under `BH_FOG=0` the ledger stays **empty**, exactly as `ghosts` does and for the same
 reason: `update_fog` returns before it writes anything, live sight supersedes memory
 entirely, and an intel section would be a second staler copy of a board already fully
 reported.
@@ -475,7 +475,7 @@ be.
 
 ## The escape hatch
 
-`WC3_FOG=0` restores the pre-v2 omniscient baseline: every cell permanently `Visible`, no
+`BH_FOG=0` restores the pre-v2 omniscient baseline: every cell permanently `Visible`, no
 memory, nothing filtered anywhere. It exists so old AARs and balance tooling have
 something to compare against — **not as a gameplay option**. Default is on.
 
@@ -484,7 +484,7 @@ every reader works unchanged against it and the disabled path cannot drift from 
 enabled one. The one place the flag itself is consulted is `ui.rs`, which takes the
 overlay off the screen entirely rather than painting a transparent one every frame.
 
-The mode is logged once at startup (`fog of war: ON (WC3_FOG=0 to disable)`) so a log or
+The mode is logged once at startup (`fog of war: ON (BH_FOG=0 to disable)`) so a log or
 an after-action report always says which rules it was played under.
 
 ## Rendering notes and known limitations
@@ -517,7 +517,7 @@ Consequences of it being a flat quad rather than a shader:
 - **Enemy entities are hidden, not dimmed.** `Visibility::Hidden` on the root removes the
   whole entity, health bars included, since bars are children of their owner. This is the
   correct behaviour anyway — a dimmed enemy is still an enemy you can see.
-- The overlay is removed from the screen entirely under `WC3_FOG=0` rather than painted
+- The overlay is removed from the screen entirely under `BH_FOG=0` rather than painted
   transparent every frame.
 
 ### Scenery obeys the fog — the third renderer
@@ -578,7 +578,7 @@ limitation that is now closed.
 Recompute is **0.25 game-seconds (~4 Hz)** — deliberately *game* time, unlike the event
 feed's real-time cadence. The feed keeps a watcher current and a watcher's attention runs
 at one second per second; fog is a gameplay input that `ai.rs` and `doctrine.rs` both
-read, so a `WC3_SPEED=16` run must resolve the same number of fog updates per game-second
+read, so a `BH_SPEED=16` run must resolve the same number of fog updates per game-second
 as a 1× run or the two are not the same match.
 
 `update_fog` runs in the `FogSet` system set, after `apply_death` (the dead stop seeing on

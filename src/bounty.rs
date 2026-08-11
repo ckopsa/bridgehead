@@ -18,7 +18,7 @@
 //! turned out to be false: a cache is 100-600g of untaxed income and doctrine
 //! steers whole squads at one, so the draw decides matches. It now comes from
 //! the shared `SimRng`, which is seeded randomly by default (so a match is
-//! still unpredictable) and from `WC3_SEED` when you want to replay one.
+//! still unpredictable) and from `BH_SEED` when you want to replay one.
 
 use bevy::prelude::*;
 use rand::Rng;

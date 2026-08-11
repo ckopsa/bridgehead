@@ -1,7 +1,10 @@
 [package]
-name = "wc3clone"
+name = "bridgehead"
 version = "0.1.0"
 edition = "2021"
+description = "An RTS where a human and an AI play the same game as equals"
+license = "MIT"
+repository = "https://github.com/ckopsa/bridgehead"
 
 [dependencies]
 # `wav` is the one non-default Bevy feature this project turns on, and it buys

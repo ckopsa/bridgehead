@@ -94,7 +94,7 @@ diff shows what changed about a round rather than that a dict reordered itself.
   "provenance": "backfilled",     // recorded | backfilled
   "ruleset": {
     "map": "crossings",           // open | crossings
-    "env": {"WC3_BRIDGE": "both", "WC3_MAP": "crossings"},
+    "env": {"BH_BRIDGE": "both", "BH_MAP": "crossings"},
     "constants": {"mine_gold": 5000},
     "commit": "c8be188",
     "notes": "One lever changed from r9: MINE_GOLD 3500->5000."
@@ -116,7 +116,7 @@ diff shows what changed about a round rather than that a dict reordered itself.
   "evidence": {
     "aars":    [{"seat": "bridge/red", "path": "arena/r10/red-aar.md"}],
     "logs":    ["arena/r10/engine.log"],
-    "shots":   ["arena/r10/shots/wc3-1754870400-t0324-01.png"],
+    "shots":   ["arena/r10/shots/bh-1754870400-t0324-01.png"],
     "sources": ["commit c8be188", "bead wc3clone-2hs"],
     "metrics": {"red_gold_final": 1539}
   },
@@ -137,7 +137,7 @@ diff shows what changed about a round rather than that a dict reordered itself.
   quoted as one. **`none`** is a round that stopped without ending.
 - **A draw is an absent winner**, not a sentinel team. Round 2 is the reason.
 - **`duration_s` is game seconds.** Wall time is a property of the hardware and
-  `WC3_SPEED`; every AAR in the series is written in game seconds.
+  `BH_SPEED`; every AAR in the series is written in game seconds.
 - **`persona` on a scripted seat is the literal string `scripted`.** "This seat
   had no creed" and "we don't know what creed this seat had" are different
   facts, and only the second one is a `null`.
@@ -183,7 +183,7 @@ tools/arena_run.py --hypothesis "does the rush still win at 5000g?" \
     --map crossings --windowed --cap 3000
 ```
 
-It derives `WC3_BRIDGE` and `WC3_AI_BOTH` from the seats rather than trusting a
+It derives `BH_BRIDGE` and `BH_AI_BOTH` from the seats rather than trusting a
 hand-typed value — they are two spellings of one fact (who is playing which
 side), and a launch line where they disagree produces a match that isn't the
 one anybody meant. It waits for a real game over, reads the duration and ending
@@ -204,7 +204,7 @@ somebody was playing. Two rules follow, enforced rather than documented:
 
 - **If any engine process is already running, the runner refuses to start.** It
   does not ask and it does not kill anything. The check matches the *executable*,
-  not a command line mentioning it — a `pgrep -f target/debug/wc3clone` would
+  not a command line mentioning it — a `pgrep -f target/debug/bridgehead` would
   match the runner's own argv and refuse every run.
 - **It never deletes a bridge directory.** Directories it creates are its own;
   an existing one is reused only with `--reuse-seat`, and a pre-existing
@@ -213,9 +213,9 @@ somebody was playing. Two rules follow, enforced rather than documented:
 
 ## Screenshots
 
-`F10` writes a PNG of the window to `shots/`, or to `$WC3_SHOT_DIR` — which the
+`F10` writes a PNG of the window to `shots/`, or to `$BH_SHOT_DIR` — which the
 runner points at `arena/<round>/shots/`, so a screenshot files itself with the
-round it belongs to. Names carry both clocks: `wc3-<unix>-t<game seconds>-<n>.png`.
+round it belongs to. Names carry both clocks: `bh-<unix>-t<game seconds>-<n>.png`.
 
 This exists because external capture does not work here. Three agents in a row
 photographed the game with an outside tool and filed a **stale pixmap** as
@@ -232,7 +232,7 @@ registered by `UiPlugin`, which `main.rs` adds only when there is a window.
 ![A frame captured by F10 during a live match](arena-f10-shot.png)
 
 *Taken by pressing F10 during a windowed AI-vs-AI run, 45 game-seconds in:
-`wc3-1786388320-t0045-02.png`. The point of the picture is that it is the frame
+`bh-1786388320-t0045-02.png`. The point of the picture is that it is the frame
 that was actually on the screen — HUD, fog boundary, workers on the mine, all
 consistent with t=45 — which is exactly what the external tools failed to
 deliver.*
@@ -251,7 +251,7 @@ Recorded here so the gaps are a known quantity rather than a surprise:
   ending, so it is the one recorded, with the disagreement in `duration_note`.
 - **Rounds 3, 5, 8 lengths are prose-rounded** ("game-minute 13", "t≈1167") and
   carry `duration_approx: true`.
-- **Launch environments for rounds 1–8.** Only `WC3_BRIDGE=both` is attested.
+- **Launch environments for rounds 1–8.** Only `BH_BRIDGE=both` is attested.
   The map is inferable — `crossings` did not exist until commit `62d81b0` — so
   rounds 1–8 are recorded as `open`.
 - **AAR files for rounds 1–8.** They exist only inside subagent transcripts, not

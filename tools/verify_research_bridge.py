@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end check that the `research` verb works over the live bridge.
 
-Drives a WC3_BRIDGE=1 seat all the way from five workers to a completed
+Drives a BH_BRIDGE=1 seat all the way from five workers to a completed
 research level, asserting at every step that the protocol says what it should:
 
   * `catalog.json` exports the two ladders with escalating per-level costs;
@@ -109,12 +109,12 @@ def main():
 
     env = dict(os.environ)
     env.update(
-        WC3_BRIDGE="1",
-        WC3_HEADLESS="1",
-        WC3_SPEED="16",
-        WC3_MAX_GAME_SECS="4000",
-        WC3_MAP="open",
-        RUST_LOG="wc3clone=info",
+        BH_BRIDGE="1",
+        BH_HEADLESS="1",
+        BH_SPEED="16",
+        BH_MAX_GAME_SECS="4000",
+        BH_MAP="open",
+        RUST_LOG="bridgehead=info",
     )
     game = subprocess.Popen(
         ["cargo", "run"], env=env,

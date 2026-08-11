@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile a natural-language directive into a batch of wc3clone Intent objects.
+"""Compile a natural-language directive into a batch of bridgehead Intent objects.
 
     intent_compile.py --seat bridge/red "hold the west, forage mid with cavalry"
 
@@ -2065,7 +2065,7 @@ def compile_directives(directives, snap):
 # ---------------------------------------------------------------------------
 
 EXPLAIN = """\
-intent_compile.py — English -> wc3clone Intent objects
+intent_compile.py — English -> bridgehead Intent objects
 
 USAGE
   intent_compile.py --seat bridge/red "hold the west, forage mid with cavalry"

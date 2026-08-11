@@ -112,7 +112,7 @@ observe → name it → file it → decide → dispatch → verify → merge →
 | Lessons | ledger `lessons[]` → beads | The feedback edge of the loop |
 | Briefs | `tools/COMMANDER_BRIEF.md`, `tools/BUILDER_BRIEF.md` | The standing instructions for playing and building |
 | Verification | `tools/verify.sh` tiers | The definition of done, executable |
-| Fingerprints | `WC3_SEED` + `WC3_FIXED_DT` | Byte-level identity proofs for refactors |
+| Fingerprints | `BH_SEED` + `BH_FIXED_DT` | Byte-level identity proofs for refactors |
 | Design docs | `DESIGN.md`, `docs/*.md`, `THESIS.md` | The contracts and the why of the game itself |
 
 ## The vocabulary test

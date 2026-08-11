@@ -1,4 +1,4 @@
-# wc3clone — the short commands. Everything here delegates to the real tools;
+# bridgehead — the short commands. Everything here delegates to the real tools;
 # see CLAUDE.md (Build & Test) and tools/verify.sh for the full story.
 #
 #   make watch              spectate the scripted AIs fighting (windowed)
@@ -17,10 +17,10 @@ TIER  ?= standard
 
 # Windowed spectator needs no time cap (close the window to stop); headless
 # sims get the automation safety cap per the project rule.
-WATCH_ENV = WC3_AI_BOTH=1 WC3_MAP=$(MAP) WC3_SPEED=$(SPEED) $(if $(SEED),WC3_SEED=$(SEED))
-SIM_ENV   = WC3_HEADLESS=1 $(WATCH_ENV) WC3_MAX_GAME_SECS=2400
+WATCH_ENV = BH_AI_BOTH=1 BH_MAP=$(MAP) BH_SPEED=$(SPEED) $(if $(SEED),BH_SEED=$(SEED))
+SIM_ENV   = BH_HEADLESS=1 $(WATCH_ENV) BH_MAX_GAME_SECS=2400
 
-BIN = target/debug/wc3clone
+BIN = target/debug/bridgehead
 
 .PHONY: watch sim build test verify
 

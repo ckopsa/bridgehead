@@ -145,7 +145,7 @@ concurrently, and more parallelism buys lower wall time with *higher*
 CPU-seconds. The metric that answers "is the sim slower" is the clock.
 
 **What the sims say.** Headless AI-vs-AI matches across both maps, with
-`WC3_COMMAND_LATENCY` on and off, **all decisive**; `WC3_SEED` determinism
+`BH_COMMAND_LATENCY` on and off, **all decisive**; `BH_SEED` determinism
 verified on both maps (50 and 55 identical fingerprints across paired runs),
 which is the check that the script submits in a deterministic order. Five of
 six land in the documented 5–12min band, and on `open` the branch tracks the
@@ -314,10 +314,10 @@ the game, and a game whose opening one side simply misses is not a fair one.
 So: **when any bridged seat is configured, the engine holds the match at t=0**
 until every such seat has sent `{"type":"ready"}`.
 
-- **Which seats gate.** Every seat named by `WC3_BRIDGE`, `copilot` included —
+- **Which seats gate.** Every seat named by `BH_BRIDGE`, `copilot` included —
   a copilot writes orders that reach units, so starting before it has read the
   map reproduces the same unfairness one rung down. Seats that are *not* in
-  `WC3_BRIDGE` are not in the list: **scripted AI seats are born ready**, and
+  `BH_BRIDGE` are not in the list: **scripted AI seats are born ready**, and
   so is any seat whose faction is currently on `autopilot` (checked live, so a
   commander cannot hang a match by autopiloting and walking away).
 - **Nothing moves while held.** The hold is a paused `Time<Virtual>`, so every
@@ -335,15 +335,15 @@ until every such seat has sent `{"type":"ready"}`.
   what it always was for the whole live match.
 - **`ready` is idempotent** and never refused: saying it twice, or after the
   clock has started, is a no-op rather than an error.
-- **`WC3_READY_TIMEOUT`** (default 120 wall seconds) starts the match anyway if
+- **`BH_READY_TIMEOUT`** (default 120 wall seconds) starts the match anyway if
   a seat never speaks, so a crashed agent costs a round its opening rather than
   its existence. The start is announced as a timeout in the log and in the
   `match start` feed line both sides receive. It is measured on `Time<Real>` —
-  the same clock the bridge writes snapshots on — which under `WC3_FIXED_DT` is
+  the same clock the bridge writes snapshots on — which under `BH_FIXED_DT` is
   the fixed tick rather than the wall clock; a bridged fixed-dt run needs the
   timeout set in ticks' worth of seconds. The determinism harness has no bridge
   seat and never holds, so it is unaffected.
-- **`WC3_READY=0`** disables the mechanic entirely and restores the old
+- **`BH_READY=0`** disables the mechanic entirely and restores the old
   behaviour. Runs with no bridged seat are untouched either way — the
   determinism fingerprints for both maps are byte-identical across this change.
 
@@ -681,7 +681,7 @@ actually refuses to pay.
 ## The replay log
 
 Every submitted intent — applied or rejected — is appended to
-`bridge/intent_log.jsonl` (override with `WC3_INTENT_LOG`; set it to `0` or
+`bridge/intent_log.jsonl` (override with `BH_INTENT_LOG`; set it to `0` or
 empty to disable). The file is truncated at the first intent of a run, so it is
 one file per match. It is opened lazily, so a run in which nobody says anything
 leaves no file behind.
@@ -822,7 +822,7 @@ contents are identical.
 
 ## Backward compatibility
 
-Verified end-to-end against a live `WC3_BRIDGE=1` seat driven by
+Verified end-to-end against a live `BH_BRIDGE=1` seat driven by
 `tools/bridge_send.py`:
 
 - `state.json`'s top-level key set is unchanged (15 keys), as are `UnitOut`,
@@ -1142,7 +1142,7 @@ Two implementation notes worth keeping:
 human and an AI run one faction and negotiate strategy in a language both speak
 natively". Implemented in `copilot.rs`.*
 
-`WC3_BRIDGE=copilot` opens **one** seat on `Team::Human` — beside the player at
+`BH_BRIDGE=copilot` opens **one** seat on `Team::Human` — beside the player at
 the keyboard, not opposite them. Its directory is `bridge/copilot/`, its
 snapshot is a `Team::Human` snapshot (same fog, same knowability, same
 everything), and `tools/bridge_send.py --seat bridge/copilot` drives it with no
@@ -1240,7 +1240,7 @@ cmd 0: 'train' needs the human's approval — it spends or commits what your
 partner owns. Wrap it: {"type":"propose","commands":[…],"note":"why"}
 ```
 
-`WC3_COPILOT_TRUST` moves the line for experiments: `full` (everything direct)
+`BH_COPILOT_TRUST` moves the line for experiments: `full` (everything direct)
 or `strict` (everything proposed, doctrine included). The seat reads its own
 etiquette out of the snapshot rather than out of the environment — `copilot:
 {trust, direct:[…], propose_ttl, max_pending}` — the same principle that makes
@@ -1363,7 +1363,7 @@ Silently downgrading to routine would be the worse failure: the proposer
 believes it jumped a queue it never jumped, the human never sees it jump, and
 nothing anywhere says why.
 
-#### Making the loop measurable: `WC3_COPILOT_AUTOAPPROVE`
+#### Making the loop measurable: `BH_COPILOT_AUTOAPPROVE`
 
 *`wc3clone-3f7`, closing the "headless has no approver" follow-up below.*
 Approval is a human act, so a headless sim has nobody to give it and every
@@ -1372,13 +1372,13 @@ that is genuinely new was the one part no sim could measure.
 
 Two knobs make it observable without a person:
 
-- **`WC3_COPILOT_TRUST=full`** — the control case. No loop at all: every verb
+- **`BH_COPILOT_TRUST=full`** — the control case. No loop at all: every verb
   goes direct, so a sim measures a co-commander *without* the negotiation cost.
   (It already existed as a policy toggle; it works headless because
   `CopilotPlugin` is registered in both branches of `main.rs` and the seat is
-  opened by `WC3_BRIDGE=copilot` either way.)
-- **`WC3_COPILOT_AUTOAPPROVE=1`** — a scripted approver that says yes to each
-  proposal `WC3_COPILOT_APPROVE_DELAY` seconds after it arrives (default 3s).
+  opened by `BH_BRIDGE=copilot` either way.)
+- **`BH_COPILOT_AUTOAPPROVE=1`** — a scripted approver that says yes to each
+  proposal `BH_COPILOT_APPROVE_DELAY` seconds after it arrives (default 3s).
 
 **The delay is the entire point.** A zero-delay approver would measure a
 co-commander with a rubber stamp. What a human's presence reliably costs the
@@ -1445,7 +1445,7 @@ stops proposing around a plan you never actually issued.
 docs/TEMPO.md §3's order latency (`command.rs`) and co-command were built on
 separate branches and met at a merge. Nothing had to be done to make them agree:
 an approved proposal is submitted through the ordinary compiler, so under
-`WC3_COMMAND_LATENCY` a co-commander's orders travel exactly as the human's do,
+`BH_COMMAND_LATENCY` a co-commander's orders travel exactly as the human's do,
 priced by the same `OrderIssuer` against the same command nodes. There is no
 "approved orders arrive instantly" shortcut, because there is no second path
 that *could* have one.
@@ -1473,8 +1473,8 @@ both go through the one place an order becomes real.
   so the refusal never costs more keystrokes than the approval.
 - ~~**Headless has no approver.**~~ **Done** (`wc3clone-3f7`) — see "Making the
   loop measurable" above. Both options the bullet named now exist:
-  `WC3_COPILOT_TRUST=full` as the no-loop control, and
-  `WC3_COPILOT_AUTOAPPROVE=1` as a scripted approver with a deliberate delay.
+  `BH_COPILOT_TRUST=full` as the no-loop control, and
+  `BH_COPILOT_AUTOAPPROVE=1` as a scripted approver with a deliberate delay.
 - **The scripted approver never says no.** It measures *delay*, which is the
   part of a human's presence that generalises; it cannot measure how a
   co-commander recovers from a veto, which is now the more interesting

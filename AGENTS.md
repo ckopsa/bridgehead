@@ -76,8 +76,8 @@ Say which tier you ran. `identity` is the cheap proof for any
 A headless match by hand:
 
 ```bash
-cargo build && WC3_HEADLESS=1 WC3_AI_BOTH=1 WC3_SPEED=16 WC3_MAX_GAME_SECS=900 \
-  WC3_MAP=crossings ./target/debug/wc3clone
+cargo build && BH_HEADLESS=1 BH_AI_BOTH=1 BH_SPEED=16 BH_MAX_GAME_SECS=900 \
+  BH_MAP=crossings ./target/debug/bridgehead
 ```
 
 ## Architecture Overview
@@ -118,7 +118,7 @@ The four rules that must survive even a skim:
 1. **Your worktree is yours; the main checkout is not, and the process table is
    shared.** Never build, check out, or launch the game in the main repo — live
    matches run there. Kill only by exact owned PID (never `pkill -f`), and
-   bracket pgrep patterns (`'[t]arget/debug/wc3clone'`) so a waiter cannot match
+   bracket pgrep patterns (`'[t]arget/debug/bridgehead'`) so a waiter cannot match
    itself and livelock.
 2. **One choke point per rule — extend it, never bypass it.** Player mutation is
    `Intent` → `apply_intents` and nothing else; `effective_stats` is the one stat

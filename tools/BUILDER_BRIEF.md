@@ -58,17 +58,17 @@ running is not.
 ### The process table is NOT isolated
 
 This is the part that surprises people. A worktree isolates *files*. It does not
-isolate PIDs, and every agent's `wc3clone` binary has a command line that looks
+isolate PIDs, and every agent's `bridgehead` binary has a command line that looks
 like every other agent's.
 
-An agent once ran `pkill -f wc3clone` to tidy up after itself and killed a
+An agent once ran `pkill -f bridgehead` to tidy up after itself and killed a
 sibling's live arena round. The rules that followed:
 
 - **Kill by exact owned PID only.** Capture it when you launch
   (`cmd & PID=$!`), kill `$PID`. Never `pkill`, never `killall`, never
   `kill $(pgrep ...)` over a pattern you did not narrow to your own process.
 - **Bracket your pgrep patterns so they cannot match themselves.**
-  `pgrep -f '[t]arget/debug/wc3clone'` — the bracket is a character class that
+  `pgrep -f '[t]arget/debug/bridgehead'` — the bracket is a character class that
   matches `t` but is not literally the string `target`, so your own shell's argv
   (which contains the pattern) never matches. Without it, `until pgrep -f
   "cargo build"; do sleep 5; done` matches *itself*, waits forever on a
@@ -76,7 +76,7 @@ sibling's live arena round. The rules that followed:
   exact bug had to be found and killed by hand.
 - **Reap what you background before you finish.** Anything you launched with `&`
   or `run_in_background` is yours. Before you write your final report, kill your
-  own background jobs and confirm `pgrep -f '[w]c3clone'` shows nothing of
+  own background jobs and confirm `pgrep -f '[b]ridgehead'` shows nothing of
   yours. An agent that ends its turn with a live game process leaves a landmine
   for the next `arena_run.py`, which will then refuse to start.
 
@@ -133,11 +133,11 @@ compiled quickly. There is no custom `[profile.release]` at all. A release build
 recompiles all of Bevy from scratch into a second artifact directory, costs
 upward of half an hour, and buys you nothing the sim can tell you — the
 simulation is deterministic and headless runs are already time-compressed with
-`WC3_SPEED`. One agent spent forty minutes on a release build to "check
+`BH_SPEED`. One agent spent forty minutes on a release build to "check
 performance" and reported the same numbers.
 
 There is a second, sharper reason. `tools/determinism_check.sh` picks its binary
-by auto-detection: **`target/release/wc3clone` first**, `target/debug/wc3clone`
+by auto-detection: **`target/release/bridgehead` first**, `target/debug/bridgehead`
 only if that is absent. Leave a release binary lying around and every later
 determinism check silently verifies *it* — including after you have rebuilt
 debug twenty times. A stale artifact you forgot about is the worst kind.
@@ -145,7 +145,7 @@ debug twenty times. A stale artifact you forgot about is the worst kind.
 **`cargo build` before any live check.** This one has a body count.
 
 > `cargo test` and `cargo test --no-run` build the **test harness**. They do not
-> rebuild `target/debug/wc3clone`.
+> rebuild `target/debug/bridgehead`.
 
 An agent ran `cargo test`, launched a headless match, watched the fix "work",
 and reported it — against a binary two commits old that did not contain the fix.
@@ -155,7 +155,7 @@ So: if you are about to run the game, build it first, in the *same* shell call
 so there is no window between them:
 
 ```bash
-cargo build && WC3_HEADLESS=1 ... ./target/debug/wc3clone
+cargo build && BH_HEADLESS=1 ... ./target/debug/bridgehead
 ```
 
 **Expect to wait, and wait correctly.** Bevy links slowly. Background long
@@ -364,7 +364,7 @@ building), the hotkey row, and the data record. DESIGN.md §"How to add a row"
 has it in full. Put the balance rationale in a `//` comment next to the number
 it explains — that is where this project keeps its design commentary now.
 
-While tuning, use `WC3_DATA_DIR=assets/data` so `.ron` edits take effect on the
+While tuning, use `BH_DATA_DIR=assets/data` so `.ron` edits take effect on the
 next launch. Without it the built-in `include_str!` copy wins and editing a
 `.ron` triggers a crate recompile — correct, but a rebuild you did not need.
 
@@ -445,7 +445,7 @@ republished on repaint, so the ground wore frame one's fog while the minimap
 tracked the match perfectly. Nothing errored. Nothing was wrong. They just
 disagreed.
 
-Note also that under `WC3_FOG=0` the disabled path is a *fully lit grid*, not a
+Note also that under `BH_FOG=0` the disabled path is a *fully lit grid*, not a
 flag checked at every call site, so the off path cannot drift from the on path.
 If your feature needs a disable switch, build it that way.
 
@@ -555,9 +555,9 @@ which is what the tiers compose.
 
 ### Screenshots
 
-`F10` writes a PNG of the window to `shots/` (or `$WC3_SHOT_DIR`), named
-`wc3-<unix>-t<game secs>-<n>.png` so it carries both clocks.
-`WC3_SHOT_AT=20,90,240` — comma-separated **game** seconds — takes them
+`F10` writes a PNG of the window to `shots/` (or `$BH_SHOT_DIR`), named
+`bh-<unix>-t<game secs>-<n>.png` so it carries both clocks.
+`BH_SHOT_AT=20,90,240` — comma-separated **game** seconds — takes them
 automatically, through the same `take_shot` function the key press uses, so a
 scheduled shot and a pressed one cannot differ. Headless runs have no key to
 press and no renderer to ask: the hotkey is registered by `UiPlugin`, which
@@ -570,10 +570,10 @@ branch.
 > because a stale frame of an RTS looks exactly like a fresh one. The only
 > process that reliably knows what a frame looks like is the one that drew it.
 
-### `WC3_BRIDGE` belongs to your own worktree only
+### `BH_BRIDGE` belongs to your own worktree only
 
 The bridge is a live singleton: one directory per seat, overwritten in place.
-Set `WC3_BRIDGE` only for a game **you** launched from **your** worktree,
+Set `BH_BRIDGE` only for a game **you** launched from **your** worktree,
 writing into **your** seat directories. Never point a verification at a seat
 directory in the main checkout — that is the incident that produced the
 `arena_run.py` safety rules in the first place.
@@ -625,17 +625,17 @@ The engine plays itself, with no window, as fast as the CPU allows, and exits on
 game over:
 
 ```bash
-cargo build && WC3_HEADLESS=1 WC3_AI_BOTH=1 WC3_SPEED=16 WC3_MAX_GAME_SECS=900 \
-  ./target/debug/wc3clone
+cargo build && BH_HEADLESS=1 BH_AI_BOTH=1 BH_SPEED=16 BH_MAX_GAME_SECS=900 \
+  ./target/debug/bridgehead
 ```
 
 | Env | What it does |
 | --- | --- |
-| `WC3_HEADLESS=1` | `MinimalPlugins` only — no window, no renderer, no GPU. Registers `headless_exit` in `SimSet::Feed`. |
-| `WC3_AI_BOTH=1` | the scripted AI plays the Human side too, so the match needs no commander (also toggleable live with F9) |
-| `WC3_SPEED=16` | `Time<Virtual>` multiplier, **clamped to `0.1..=16.0`**. 16× is the workhorse. Ignored entirely when `WC3_FIXED_DT` is set. |
-| `WC3_MAX_GAME_SECS=<n>` | cap in *game* seconds, after which the run force-exits with a score-based verdict. **There is no default** — without it, a match only ends when a base falls, which for two scripted AIs can be a long time. Always set it in a verification run. |
-| `WC3_MAP=open\|crossings` | map layout (default `open`; an unrecognized non-empty value warns and falls back) |
+| `BH_HEADLESS=1` | `MinimalPlugins` only — no window, no renderer, no GPU. Registers `headless_exit` in `SimSet::Feed`. |
+| `BH_AI_BOTH=1` | the scripted AI plays the Human side too, so the match needs no commander (also toggleable live with F9) |
+| `BH_SPEED=16` | `Time<Virtual>` multiplier, **clamped to `0.1..=16.0`**. 16× is the workhorse. Ignored entirely when `BH_FIXED_DT` is set. |
+| `BH_MAX_GAME_SECS=<n>` | cap in *game* seconds, after which the run force-exits with a score-based verdict. **There is no default** — without it, a match only ends when a base falls, which for two scripted AIs can be a long time. Always set it in a verification run. |
+| `BH_MAP=open\|crossings` | map layout (default `open`; an unrecognized non-empty value warns and falls back) |
 
 **Run both maps.** `crossings` blocks a canyon with three fords in the
 `NavGrid`, so it exercises pathing, chokepoint holds and the AI's ford logic
@@ -643,31 +643,31 @@ that `open` does not touch. A change that works on `open` and deadlocks on
 `crossings` is a normal Tuesday.
 
 **Confirm it reached a real game over**, not just the cap. A run that hit
-`WC3_MAX_GAME_SECS` proves the sim did not crash; a run that ended in a raze
+`BH_MAX_GAME_SECS` proves the sim did not crash; a run that ended in a raze
 proves the game still works.
 
 ### A.3 Determinism fingerprints — the cheap proof
 
 ```bash
 tools/determinism_check.sh                    # seed 42, dt 0.05, map open, cap 600
-WC3_MAP=crossings tools/determinism_check.sh
+BH_MAP=crossings tools/determinism_check.sh
 SEED=7 CAP=300 tools/determinism_check.sh
 ```
 
-It runs the binary twice with identical `WC3_HEADLESS=1 WC3_AI_BOTH=1
-WC3_SEED=$SEED WC3_FIXED_DT=$DT WC3_FINGERPRINT=$INTERVAL
-WC3_MAX_GAME_SECS=$CAP`, extracts the `FINGERPRINT` lines from both logs and
+It runs the binary twice with identical `BH_HEADLESS=1 BH_AI_BOTH=1
+BH_SEED=$SEED BH_FIXED_DT=$DT BH_FINGERPRINT=$INTERVAL
+BH_MAX_GAME_SECS=$CAP`, extracts the `FINGERPRINT` lines from both logs and
 diffs them. **The exit code is the result**: `0` identical, `1` diverged (it
 prints the first differing sample). Knobs: `SEED` (42), `DT` (0.05), `INTERVAL`
-(10), `CAP` (600), `WC3_MAP` (open), `OUT`, `BIN`.
+(10), `CAP` (600), `BH_MAP` (open), `OUT`, `BIN`.
 
 Under the hood:
 
 | Env | What it does |
 | --- | --- |
-| `WC3_SEED=<u64>` | seeds `shared::SimRng`, the only source of gameplay randomness. Default is a fresh random seed **logged at startup**, so any match can be replayed from its own log. Terrain is separate and always fixed (`MAP_SEED`). |
-| `WC3_FIXED_DT=0.05` | headless only (windowed runs warn and ignore it); range `0.001..=0.25`. Installs `TimeUpdateStrategy::ManualDuration` so each frame advances the clock by a constant instead of by however long the frame took. Without it every accumulator in the sim integrates a wall-clock delta and no two runs agree. `WC3_SPEED` is ignored while it is set. |
-| `WC3_FINGERPRINT=<seconds>` | logs a hash of the whole world (raw IEEE bits of every position and health, entity ids, both economies) at fixed game-time intervals. |
+| `BH_SEED=<u64>` | seeds `shared::SimRng`, the only source of gameplay randomness. Default is a fresh random seed **logged at startup**, so any match can be replayed from its own log. Terrain is separate and always fixed (`MAP_SEED`). |
+| `BH_FIXED_DT=0.05` | headless only (windowed runs warn and ignore it); range `0.001..=0.25`. Installs `TimeUpdateStrategy::ManualDuration` so each frame advances the clock by a constant instead of by however long the frame took. Without it every accumulator in the sim integrates a wall-clock delta and no two runs agree. `BH_SPEED` is ignored while it is set. |
+| `BH_FINGERPRINT=<seconds>` | logs a hash of the whole world (raw IEEE bits of every position and health, entity ids, both economies) at fixed game-time intervals. |
 
 All three are opt-in; with none of them set, behaviour is exactly what it was.
 
@@ -687,10 +687,10 @@ They do **not** all work the same way, and the difference matters:
 
 | Script | Who launches the game | Notes |
 | --- | --- | --- |
-| `verify_intent_bridge.py` | **you do** | Expects a live `WC3_BRIDGE=1` seat (`bridge/red`) already running, and drives it with `bridge_send.py`. Asserts `state.json`'s exact historical top-level key set (`EXPECTED_TOP_KEYS` + `OPTIONAL_TOP_KEYS`), that refusals keep the `cmd <i>:` prefix, and that every intent reaches `bridge/intent_log.jsonl` as a sentence. Fast, if the seat is up. |
-| `verify_research_bridge.py` | itself, via `cargo run` | Headless, `WC3_SPEED=16`, cap 4000. Drives five workers to a completed research level over the wire. |
-| `verify_r9_legibility.py` | itself, via `cargo run` | Headless, `WC3_SPEED=2` **on purpose** (so the final snapshot survives `headless_exit`'s post-verdict window), cap 4000, waits for a real `game_over`. The slowest of the four. |
-| `verify_territory_bridge.py` | itself, from the **pre-built binary** | `python3 tools/verify_territory_bridge.py [--bin target/debug/wc3clone]`. Exits immediately if the binary is missing — it will not build one for you. Runs `crossings`, `WC3_FOG=0`, `WC3_SEED=7`. |
+| `verify_intent_bridge.py` | **you do** | Expects a live `BH_BRIDGE=1` seat (`bridge/red`) already running, and drives it with `bridge_send.py`. Asserts `state.json`'s exact historical top-level key set (`EXPECTED_TOP_KEYS` + `OPTIONAL_TOP_KEYS`), that refusals keep the `cmd <i>:` prefix, and that every intent reaches `bridge/intent_log.jsonl` as a sentence. Fast, if the seat is up. |
+| `verify_research_bridge.py` | itself, via `cargo run` | Headless, `BH_SPEED=16`, cap 4000. Drives five workers to a completed research level over the wire. |
+| `verify_r9_legibility.py` | itself, via `cargo run` | Headless, `BH_SPEED=2` **on purpose** (so the final snapshot survives `headless_exit`'s post-verdict window), cap 4000, waits for a real `game_over`. The slowest of the four. |
+| `verify_territory_bridge.py` | itself, from the **pre-built binary** | `python3 tools/verify_territory_bridge.py [--bin target/debug/bridgehead]`. Exits immediately if the binary is missing — it will not build one for you. Runs `crossings`, `BH_FOG=0`, `BH_SEED=7`. |
 
 So: `cargo build` first (§4) — the territory verifier demands it and the others
 merely benefit — and make sure nothing else of yours is running (§1), because
@@ -709,17 +709,17 @@ python3 -m pytest tools/            # or: for f in tools/test_*.py; do python3 "
 
 | Env | What it does |
 | --- | --- |
-| `WC3_BRIDGE=<seats>` | which seats are played through the file bridge. **Your worktree only.** |
-| `WC3_FOG=0` | restores the pre-fog omniscient baseline. A comparison baseline, not a gameplay option. |
-| `WC3_DATA_DIR=<dir>` | prefer `<dir>/<file>.ron` over the compiled-in copy — edit stats without a rebuild. |
-| `WC3_RACE_BLUE` / `WC3_RACE_RED` | `kingdom\|horde`, both defaulting to `kingdom`. With neither set the game is byte-for-byte the pre-races one. |
-| `WC3_SHOT_DIR` | where `F10` writes PNGs (default `shots/`). |
-| `WC3_SHOT_AT=<s,s,s>` | screenshot automatically at those game times (windowed only). |
-| `WC3_READY_TIMEOUT` | wall seconds before a match starts without a silent bridged seat (default 120). `WC3_READY=0` disables the handshake entirely. |
-| `WC3_COMMAND_LATENCY` | Chain of Command travel delay — **off by default**. The `WC3_LINK_*` vars tune it. If your bead touches ordering or doctrine, run once with it on. |
-| `WC3_COPILOT_TRUST` | `split` (default) / `full` / `strict` — what a co-commander may do directly vs must propose. |
-| `WC3_WINDOW=WxH` | window size, min 320x240. |
-| `WC3_INTENT_LOG` | path to the intent log (default `bridge/intent_log.jsonl`). |
+| `BH_BRIDGE=<seats>` | which seats are played through the file bridge. **Your worktree only.** |
+| `BH_FOG=0` | restores the pre-fog omniscient baseline. A comparison baseline, not a gameplay option. |
+| `BH_DATA_DIR=<dir>` | prefer `<dir>/<file>.ron` over the compiled-in copy — edit stats without a rebuild. |
+| `BH_RACE_BLUE` / `BH_RACE_RED` | `kingdom\|horde`, both defaulting to `kingdom`. With neither set the game is byte-for-byte the pre-races one. |
+| `BH_SHOT_DIR` | where `F10` writes PNGs (default `shots/`). |
+| `BH_SHOT_AT=<s,s,s>` | screenshot automatically at those game times (windowed only). |
+| `BH_READY_TIMEOUT` | wall seconds before a match starts without a silent bridged seat (default 120). `BH_READY=0` disables the handshake entirely. |
+| `BH_COMMAND_LATENCY` | Chain of Command travel delay — **off by default**. The `BH_LINK_*` vars tune it. If your bead touches ordering or doctrine, run once with it on. |
+| `BH_COPILOT_TRUST` | `split` (default) / `full` / `strict` — what a co-commander may do directly vs must propose. |
+| `BH_WINDOW=WxH` | window size, min 320x240. |
+| `BH_INTENT_LOG` | path to the intent log (default `bridge/intent_log.jsonl`). |
 
 ---
 

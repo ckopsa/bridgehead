@@ -3875,7 +3875,7 @@ mod tests {
     /// legitimately can be — assembled from halves at runtime.
     ///
     /// It lives in the Champion's `probe_abilities`, so it exists only under
-    /// `WC3_STATUS_PROBE=1` — and the ability tables read that flag ONCE, at
+    /// `BH_STATUS_PROBE=1` — and the ability tables read that flag ONCE, at
     /// first touch, which no test running beside others can arrange. So this
     /// test has two lives: the parent re-runs it as a child process with the
     /// flag set, and the child does the work and prints a marker the parent
@@ -3886,11 +3886,11 @@ mod tests {
         const TEST: &str =
             "combat::tests::frost_nova_a_pure_ron_ability_fires_through_the_real_executor";
 
-        if std::env::var("WC3_STATUS_PROBE").is_err() {
+        if std::env::var("BH_STATUS_PROBE").is_err() {
             let exe = std::env::current_exe().expect("this test binary");
             let out = std::process::Command::new(exe)
                 .args([TEST, "--exact", "--nocapture"])
-                .env("WC3_STATUS_PROBE", "1")
+                .env("BH_STATUS_PROBE", "1")
                 .output()
                 .expect("re-run this test with the probe flag set");
             let stdout = String::from_utf8_lossy(&out.stdout);

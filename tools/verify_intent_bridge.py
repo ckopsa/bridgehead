@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end check that bridge commands still flow, now via the intent path.
 
-Drives a live WC3_BRIDGE=1 seat with tools/bridge_send.py, then asserts:
+Drives a live BH_BRIDGE=1 seat with tools/bridge_send.py, then asserts:
   * the state.json snapshot keeps its exact historical key set,
   * valid commands take effect (orders/queues/policies change),
   * invalid commands come back in `errors` with the historical `cmd <i>:` prefix,

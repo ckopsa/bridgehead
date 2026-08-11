@@ -66,7 +66,7 @@
 //! ## The log
 //!
 //! Every submitted intent — applied or rejected — is appended to a JSONL file
-//! (`WC3_INTENT_LOG`, default `bridge/intent_log.jsonl`) as a human-readable
+//! (`BH_INTENT_LOG`, default `bridge/intent_log.jsonl`) as a human-readable
 //! sentence *and* its serialized form. The sentence does not record how the
 //! intent was spelled, which is the point: a replay reads identically whether
 //! the match was played with a mouse or with JSON.
@@ -84,7 +84,7 @@ use std::path::PathBuf;
 // ---------------------------------------------------------------------------
 
 /// Path of the per-match intent log. Empty or `0` turns logging off.
-const INTENT_LOG_ENV: &str = "WC3_INTENT_LOG";
+const INTENT_LOG_ENV: &str = "BH_INTENT_LOG";
 const DEFAULT_INTENT_LOG: &str = "bridge/intent_log.jsonl";
 
 /// Same formation grid both interfaces used before the merge.
@@ -384,7 +384,7 @@ fn apply_intents(
     mut world: IntentWorld,
     // Chain of Command (docs/TEMPO.md §3). Read-only: how far each unit is
     // from its team's nearest command node, and the curve that turns that into
-    // seconds. Inert with WC3_COMMAND_LATENCY unset.
+    // seconds. Inert with BH_COMMAND_LATENCY unset.
     link: CommandLink,
 ) {
     // Owned copies: the compiler needs `&mut` on resources the reader borrows
@@ -2558,7 +2558,7 @@ struct IntentRecord<'a> {
     /// spelled, so it belongs in the sentence rather than beside it.
     sentence: String,
     /// Worst link latency this intent paid, in seconds. Absent (rather than
-    /// `0.0`) whenever nothing was delayed, so a `WC3_COMMAND_LATENCY`-off log
+    /// `0.0`) whenever nothing was delayed, so a `BH_COMMAND_LATENCY`-off log
     /// line is character-for-character a v1 log line.
     #[serde(skip_serializing_if = "no_link")]
     link: f32,
@@ -2621,7 +2621,7 @@ impl IntentLog {
     }
 
     /// A log that writes nothing. Tests take this so they depend on neither
-    /// `WC3_INTENT_LOG` nor the filesystem, and leave no file behind.
+    /// `BH_INTENT_LOG` nor the filesystem, and leave no file behind.
     #[cfg(test)]
     pub fn disabled() -> Self {
         IntentLog {
@@ -2697,7 +2697,7 @@ impl IntentLog {
                 }
             }
             // Truncating gives one file per match, which is what a replay is.
-            // Point WC3_INTENT_LOG somewhere unique to keep a series.
+            // Point BH_INTENT_LOG somewhere unique to keep a series.
             let mut file = std::fs::File::create(&path)?;
             let header = SessionRecord {
                 wall_ms: wall_ms(),
@@ -2722,7 +2722,7 @@ impl IntentLog {
 /// [ 91.6s] Human/ui: 4 units attack-move to (12.0, -30.0) (+1.8s link)
 /// ```
 ///
-/// A replay of a match played with `WC3_COMMAND_LATENCY` off is unannotated
+/// A replay of a match played with `BH_COMMAND_LATENCY` off is unannotated
 /// and therefore identical to a v1 replay.
 fn link_sentence(intent: &Intent, link: f32) -> String {
     let sentence = intent.sentence();
@@ -3111,7 +3111,7 @@ mod tests {
     ///
     /// Everything `apply_intents` reads, defaulted, plus the five event
     /// channels it writes. `IntentLog` is replaced with a disabled one after
-    /// the plugin installs it: a unit test must not depend on `WC3_INTENT_LOG`
+    /// the plugin installs it: a unit test must not depend on `BH_INTENT_LOG`
     /// and must not leave a file behind.
     fn compiler_app() -> App {
         let mut app = App::new();
@@ -3143,7 +3143,7 @@ mod tests {
             .init_resource::<CommandLatency>()
             .add_plugins(IntentPlugin);
         app.insert_resource(IntentLog::disabled());
-        // Pin the fog mode: the ambient `WC3_FOG` must not decide an outcome.
+        // Pin the fog mode: the ambient `BH_FOG` must not decide an outcome.
         app.insert_resource(FogGrids::test_dark());
         app
     }

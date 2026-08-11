@@ -20,7 +20,7 @@
 //!
 //! Each table has a COMPILED-IN default (`include_str!`), so `cargo run` works
 //! from any working directory, a `cargo test` needs no fixture path, and a
-//! shipped binary carries its own content. Setting `WC3_DATA_DIR=<dir>` makes
+//! shipped binary carries its own content. Setting `BH_DATA_DIR=<dir>` makes
 //! the loader prefer `<dir>/<file>.ron` for any file that exists there — the
 //! modder / balance-tuner path, and the way to change a number without
 //! recompiling anything.
@@ -53,7 +53,7 @@ use crate::shared::{
 /// The environment variable that points the loader at a directory of override
 /// files. Any `<name>.ron` present there replaces the compiled-in default;
 /// anything absent falls back, so a modder ships only the files they changed.
-pub const DATA_DIR_ENV: &str = "WC3_DATA_DIR";
+pub const DATA_DIR_ENV: &str = "BH_DATA_DIR";
 
 const UNITS_RON: &str = include_str!("../assets/data/units.ron");
 const BUILDINGS_RON: &str = include_str!("../assets/data/buildings.ron");
@@ -61,7 +61,7 @@ const ABILITIES_RON: &str = include_str!("../assets/data/abilities.ron");
 const ITEMS_RON: &str = include_str!("../assets/data/items.ron");
 const RESEARCH_RON: &str = include_str!("../assets/data/research.ron");
 
-/// Read one table's text: the override file if `WC3_DATA_DIR` names a
+/// Read one table's text: the override file if `BH_DATA_DIR` names a
 /// directory containing it, otherwise the compiled-in copy.
 ///
 /// A file that is present but unreadable is a hard error rather than a silent
@@ -252,7 +252,7 @@ struct AbilityFile {
 struct UnitCasterRow {
     kind: UnitKind,
     abilities: Vec<String>,
-    /// Appended to `abilities` only under `WC3_STATUS_PROBE=1`.
+    /// Appended to `abilities` only under `BH_STATUS_PROBE=1`.
     #[serde(default)]
     probe_abilities: Vec<String>,
     #[serde(default)]
@@ -464,7 +464,7 @@ fn load() -> Tables {
             problems.push(format!("abilities.ron: duplicate caster row for {:?}", row.kind));
         }
         let mut list = resolve(&format!("{:?}", row.kind), &row.abilities, &mut problems);
-        // The `WC3_STATUS_PROBE` dev mutation, applied at LOAD time: the probe
+        // The `BH_STATUS_PROBE` dev mutation, applied at LOAD time: the probe
         // abilities are appended to the tail of the list, so every shipping
         // slot index is unchanged whether the probe is on or off.
         if status_probe_enabled() {

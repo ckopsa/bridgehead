@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end check of the round-9/10 legibility fixes over a live bridge seat.
 
-Drives a `WC3_BRIDGE=1` seat and asserts, against the real protocol rather than
+Drives a `BH_BRIDGE=1` seat and asserts, against the real protocol rather than
 against unit-test doubles, that four AAR findings are actually fixed:
 
   * `wc3clone-pbd` — `catalog.json` shows a trainer's gate ON the trainer
@@ -215,16 +215,16 @@ def main():
 
     env = dict(os.environ)
     env.update(
-        WC3_BRIDGE="1",
-        WC3_HEADLESS="1",
+        BH_BRIDGE="1",
+        BH_HEADLESS="1",
         # Deliberately slow. `headless_exit` quits ~5 GAME seconds after a
         # verdict, and at high speed that window can close before another
         # snapshot is written — so the final `game_over_reason` this script
         # exists to read would never reach disk.
-        WC3_SPEED="2",
-        WC3_MAX_GAME_SECS="4000",
-        WC3_MAP="open",
-        RUST_LOG="wc3clone=info",
+        BH_SPEED="2",
+        BH_MAX_GAME_SECS="4000",
+        BH_MAP="open",
+        RUST_LOG="bridgehead=info",
     )
     game = subprocess.Popen(
         ["cargo", "run", "--quiet"], env=env,

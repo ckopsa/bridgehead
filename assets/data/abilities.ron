@@ -53,7 +53,7 @@
 //                          autocast rule, bridge selector), so append, never
 //                          insert. A kind with no record here casts nothing.
 //   * `probe_abilities`  — appended to `abilities` only under
-//                          `WC3_STATUS_PROBE=1`. Dev instrumentation; never
+//                          `BH_STATUS_PROBE=1`. Dev instrumentation; never
 //                          present in a normal run.
 //   * `autocast`         — the standing doctrine a freshly trained unit of
 //                          this kind is BORN with, named by ability rather
@@ -219,7 +219,7 @@
             description: "Cast at a point up to 9 away: slows every enemy within 4.5 of it by 40% (move AND attack speed) for 5s. Refreshes rather than stacks; no mana, 9s cooldown. Omit the point and the Sorcerer aims at the biggest clump it can reach.",
         ),
         // Dev-only second Champion ability, present only under
-        // `WC3_STATUS_PROBE=1`. It exists so a real match can exercise the v2
+        // `BH_STATUS_PROBE=1`. It exists so a real match can exercise the v2
         // path end to end — a second ability on a caster, a level-gated
         // unlock, its own cooldown slot, an explicit selector, and an
         // `ApplyStatus` effect feeding the status framework — without shipping
@@ -263,7 +263,7 @@
         // ABOUT first.
         //
         // Dev-gated: listed only in the Champion's `probe_abilities`, so it
-        // exists under `WC3_STATUS_PROBE=1` and in no shipping match. The
+        // exists under `BH_STATUS_PROBE=1` and in no shipping match. The
         // numbers below are therefore a demonstration, not a balance
         // proposal — the content bead that ships a nuke will pick its own.
         (
