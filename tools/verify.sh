@@ -355,6 +355,11 @@ st_sim_matrix() {
 }
 
 st_determinism() {
+    # determinism_check.sh only mkdirs OUT when it invents one itself
+    # (`OUT="${OUT:-$(mktemp -d)}"`), so handing it a path means owning the
+    # directory too — otherwise its run logs fail to redirect, both runs
+    # produce nothing, and it reports a divergence that never happened.
+    mkdir -p "$LOGDIR/determinism" || return 1
     BIN="$BIN" SEED=42 DT="$SIM_DT" INTERVAL="$FP_INTERVAL" CAP="$SIM_CAP" \
     WC3_MAP=open OUT="$LOGDIR/determinism" \
         "$ROOT/tools/determinism_check.sh" >"$LOGDIR/determinism.log" 2>&1
