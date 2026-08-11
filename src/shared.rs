@@ -3888,6 +3888,327 @@ pub struct RememberedBuilding {
     pub last_seen: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Intel — a sighting as durable, queryable knowledge
+// ---------------------------------------------------------------------------
+//
+// The memory model above stops at structures, and `CellVis::Explored` gives
+// the reason: an army is not furniture, and a remembered army is a lie that
+// gets people killed. That is still true of `units`, which reports what a team
+// can see THIS INSTANT and is left exactly as it was.
+//
+// What it was never an argument for is throwing the observation away. A player
+// who watches six footmen cross the centre ford does not forget it a quarter
+// of a second later. They remember a stale fact *as* a stale fact and discount
+// it accordingly — and the discount is the whole skill. The lie was never the
+// memory; it was reporting a memory in the same shape as a sighting, so that
+// nothing downstream could tell them apart.
+//
+// So intel is a SEPARATE section with a timestamp welded to every entry.
+// Nothing in it can be mistaken for something standing on the board right now,
+// because there is no field-compatible way to read it as one: `units[]` has no
+// `t_seen` and every sighting has nothing else.
+//
+// FOG-HONEST BY CONSTRUCTION, and in the same way everything else here is: the
+// ledger is written by `update_fog`, in the same pass, off the same cells that
+// decide what the snapshot and the screen show. The only line that inserts a
+// sighting is guarded by the identical `vis_at(..).sees()` the building ghosts
+// are guarded by. A unit that has never stood in a visible cell cannot appear
+// in this ledger, and there is no second code path that could put it there.
+
+/// How long an unrefreshed unit sighting survives before it is dropped.
+///
+/// Buildings are remembered forever because they do not move; a unit's
+/// position decays into fiction at walking pace. Ninety seconds is about the
+/// time it takes an army to cross this map twice, so a sighting that old has
+/// no remaining power to say where anything *is* — only that it existed and
+/// once passed through. Past the horizon it is a rumour, and the ledger drops
+/// it rather than let a commander plan against it.
+///
+/// This is the one place unit intel and building ghosts genuinely differ, and
+/// the difference is exactly the thing that moves.
+pub const SIGHTING_TTL_S: f32 = 90.0;
+
+/// How close two concurrent sightings must be to read as one body of troops.
+pub const GROUP_RADIUS: f32 = 18.0;
+
+/// ...and how close in observation time. See `FogGrid::army_groups`.
+const GROUP_WINDOW_S: f32 = 10.0;
+
+/// Below this much observed movement between two consecutive fog ticks, a unit
+/// is standing still and HAS no heading. Well above float jitter, well below
+/// what the slowest unit in the game covers in one `FOG_INTERVAL`.
+const HEADING_MIN_MOVE: f32 = 0.2;
+
+/// Two observations further apart than this in game time are not a track.
+/// Re-sighting a raider a minute later on the other side of the map says
+/// nothing about which way it is walking now, and the straight line between
+/// the two observations is a line nobody watched it travel.
+const HEADING_GAP_S: f32 = 1.0;
+
+/// A coarse eight-point heading, as an observer reads it off a moving body of
+/// troops. Eight and not sixty-four because "they are heading northeast" is
+/// the whole of what somebody watching from across a valley can honestly
+/// claim, and a finer number would be precision the observation does not have.
+///
+/// `N` is `+Z`, which is the minimap's up (`ui::world_to_minimap`), so the word
+/// in the snapshot and the arrow on the screen point the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Heading8 {
+    N,
+    NE,
+    E,
+    SE,
+    S,
+    SW,
+    W,
+    NW,
+}
+
+impl Heading8 {
+    /// The heading implied by observed movement, or `None` if the body did not
+    /// visibly move. `None` is a real answer here, not a failure: a unit
+    /// standing still has no heading, and inventing one from float noise would
+    /// be the smallest possible lie told the most often.
+    pub fn of(delta: Vec3) -> Option<Heading8> {
+        if Vec2::new(delta.x, delta.z).length() < HEADING_MIN_MOVE {
+            return None;
+        }
+        // atan2(x, z): zero is +Z (north), increasing toward +X (east).
+        let deg = delta.x.atan2(delta.z).to_degrees();
+        Some(match ((deg / 45.0).round() as i32).rem_euclid(8) {
+            0 => Heading8::N,
+            1 => Heading8::NE,
+            2 => Heading8::E,
+            3 => Heading8::SE,
+            4 => Heading8::S,
+            5 => Heading8::SW,
+            6 => Heading8::W,
+            _ => Heading8::NW,
+        })
+    }
+
+    /// The wire word. Short because it rides on every sighting in the
+    /// snapshot and reads next to a coordinate pair.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Heading8::N => "N",
+            Heading8::NE => "NE",
+            Heading8::E => "E",
+            Heading8::SE => "SE",
+            Heading8::S => "S",
+            Heading8::SW => "SW",
+            Heading8::W => "W",
+            Heading8::NW => "NW",
+        }
+    }
+}
+
+/// An enemy unit as this team last observed it.
+///
+/// Every field is something a human at the keyboard could have read off the
+/// screen while that unit stood in their vision, and **nothing else**:
+///
+/// | field | how a human knows it |
+/// |---|---|
+/// | `kind` | the model is on screen |
+/// | `pos` | it is standing there |
+/// | `hp_frac` | health bars are children of their owner, so an enemy that renders renders its bar (`ui::apply_fog_visibility`) |
+/// | `heading` | they watched it move, across two consecutive fog ticks |
+/// | `t_seen` | the clock |
+///
+/// Deliberately **absent**: level, xp, mana, inventory, squad, orders,
+/// abilities. ui.rs's pickers select own-team entities only — both the
+/// rubber-band and the plain click `continue` on `*team != Team::Human` — so
+/// no enemy is ever loaded into the panel that prints `Lv 4`. A commander
+/// given a level here would hold an information right no human has a gesture
+/// to exercise, which is the exact asymmetry docs/FOG.md exists to close.
+#[derive(Clone, Copy, Debug)]
+pub struct Sighting {
+    /// The real entity's `to_bits()` — the same identity `RememberedBuilding`
+    /// uses, so a renderer can match a marker against the live unit and
+    /// suppress one when the other is on screen.
+    pub id: u64,
+    /// The observed unit's team. Always the ledger owner's enemy: the only
+    /// insert is guarded on `*t != team`.
+    pub team: Team,
+    pub kind: UnitKind,
+    pub pos: Vec3,
+    /// Health fraction when last observed, `0..=1`.
+    pub hp_frac: f32,
+    /// Which way it was walking when last observed. `None` when it was
+    /// standing still, and `None` on a first glimpse — a single glance carries
+    /// no heading, because a heading is a difference between two of them.
+    pub heading: Option<Heading8>,
+    /// Game time of the observation. The field that makes this a memory rather
+    /// than a report.
+    pub t_seen: f32,
+}
+
+impl Sighting {
+    /// Game-seconds since the observation.
+    pub fn age(&self, now: f32) -> f32 {
+        (now - self.t_seen).max(0.0)
+    }
+}
+
+/// What one team believes about one enemy hero class.
+///
+/// Three states, and there is no fourth, because there is no fourth thing an
+/// observer can honestly be in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeroStatus {
+    /// Never laid eyes on it. **Not** "they have no hero": those are the same
+    /// empty observation, and conflating them is precisely the mistake the
+    /// `fog` block exists to prevent for terrain — "I have no information" and
+    /// "there is nothing there" must not be the same answer.
+    Unknown,
+    /// Seen alive, and nothing observed since has said otherwise. The honest
+    /// reading is *alive as far as you know*: it may have died two minutes ago
+    /// somewhere nobody was looking, and this will go on saying `Alive`. That
+    /// is not a bug in the belief, it is the belief.
+    Alive,
+    /// We **watched it die** — it stood in our vision on the previous fog tick
+    /// and is not in the world on this one. Witnessed, not inferred from an
+    /// absence.
+    SeenDying,
+}
+
+impl HeroStatus {
+    /// The wire word, and the same word the HUD line uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeroStatus::Unknown => "unknown",
+            HeroStatus::Alive => "alive",
+            HeroStatus::SeenDying => "seen-dying",
+        }
+    }
+}
+
+/// One team's belief about one enemy hero class.
+///
+/// Keyed by *class* rather than by entity, because a class is what survives a
+/// death: heroes revive through `HeroRecords`, and the question a commander
+/// asks is "is their Champion on the field", not "is entity 4294968150 alive".
+/// A revive is observed the ordinary way — see the hero again and `status`
+/// goes back to `Alive`, so the belief is revocable rather than sticky.
+#[derive(Clone, Copy, Debug)]
+pub struct HeroIntel {
+    pub kind: UnitKind,
+    pub status: HeroStatus,
+    /// Where it was when last observed. `None` iff `status` is `Unknown`.
+    pub pos: Option<Vec3>,
+    /// Game time of that observation. `None` iff `status` is `Unknown`.
+    pub t_seen: Option<f32>,
+    /// Health fraction when last observed — the bar the watcher could see.
+    /// `0.0` alongside `SeenDying`, which is what they watched happen.
+    pub hp_frac: Option<f32>,
+}
+
+/// The hero classes, in one canonical order.
+///
+/// The ledger keeps one entry per class in this order — a fixed `Vec` rather
+/// than a map — so hero intel iterates deterministically without `UnitKind`
+/// having to grow an `Ord` that nothing else in the codebase wants.
+pub const HERO_CLASSES: [UnitKind; 2] = [UnitKind::Hero, UnitKind::Priestess];
+
+fn blank_hero_intel() -> Vec<HeroIntel> {
+    HERO_CLASSES
+        .iter()
+        .map(|kind| HeroIntel {
+            kind: *kind,
+            status: HeroStatus::Unknown,
+            pos: None,
+            t_seen: None,
+            hp_frac: None,
+        })
+        .collect()
+}
+
+/// Write one class's entry. A no-op for a non-hero kind, which cannot happen —
+/// every caller is already behind `is_hero_kind`.
+fn set_hero_intel(
+    heroes: &mut [HeroIntel],
+    kind: UnitKind,
+    status: HeroStatus,
+    pos: Vec3,
+    t: f32,
+    hp_frac: f32,
+) {
+    if let Some(h) = heroes.iter_mut().find(|h| h.kind == kind) {
+        h.status = status;
+        h.pos = Some(pos);
+        h.t_seen = Some(t);
+        h.hp_frac = Some(hp_frac);
+    }
+}
+
+/// Concurrent sightings read as one body of troops.
+///
+/// The aggregate view exists because the ledger's grain is wrong for the
+/// question actually being asked. Nobody wants eleven rows; they want "there
+/// is an army of eleven at the ford". Clustering is done where it is *read*
+/// rather than stored, so the ledger keeps one truth and the summary is always
+/// derived from the current one.
+#[derive(Clone, Debug)]
+pub struct ArmyGroup {
+    pub size: usize,
+    /// `(kind, count)`, most numerous first, ties broken by the kind's name so
+    /// the summary string is byte-identical on every run.
+    pub composition: Vec<(UnitKind, usize)>,
+    pub centroid: Vec3,
+    /// The **freshest** observation in the group — "the group was seen at
+    /// least this recently". Individual members may be up to `GROUP_WINDOW_S`
+    /// older, which is what makes them one concurrent picture at all.
+    pub t_seen: f32,
+}
+
+impl ArmyGroup {
+    /// `"5 Footman, 3 Archer"` — the composition as the event feed, the
+    /// snapshot and the HUD all say it. One producer, so the three cannot
+    /// drift into three different descriptions of one army.
+    pub fn summary(&self) -> String {
+        self.composition
+            .iter()
+            .map(|(kind, n)| format!("{n} {}", kind_name(*kind)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// How near a named chokepoint a spot must be to be called by its name.
+const PLACE_CHOKE_RADIUS: f32 = 30.0;
+/// ...and how near a base to be called "our"/"their" ground.
+const PLACE_BASE_RADIUS: f32 = 50.0;
+
+/// Name a spot the way a player would say it out loud.
+///
+/// The nearest named chokepoint wins, then whose base it is near, then the
+/// bare coordinate. All three are **public geography** — chokepoint names and
+/// positions ship in every snapshot's `map` block and both bases are known to
+/// everyone from the first frame — so naming a place reveals nothing about who
+/// is standing in it. What the event says about the army is fog-gated; where
+/// the ground is was never secret.
+pub fn place_name(pos: Vec3, me: Team) -> String {
+    let mut best: Option<(f32, &'static str)> = None;
+    for choke in crate::terrain::active_map().chokepoints() {
+        let d = Vec2::new(pos.x - choke.pos.x, pos.z - choke.pos.z).length();
+        if d <= PLACE_CHOKE_RADIUS && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, choke.name));
+        }
+    }
+    if let Some((_, name)) = best {
+        return format!("near the {name}");
+    }
+    for (team, label) in [(me, "our base"), (me.enemy(), "their base")] {
+        let home = team.base_pos();
+        if Vec2::new(pos.x - home.x, pos.z - home.z).length() <= PLACE_BASE_RADIUS {
+            return format!("near {label}");
+        }
+    }
+    format!("at ({:.0}, {:.0})", pos.x, pos.z)
+}
+
 /// One team's knowledge of the map: what it can see now, what it has ever
 /// seen, and what it remembers standing there.
 pub struct FogGrid {
@@ -3900,6 +4221,17 @@ pub struct FogGrid {
     /// `min_by`. Under a `HashMap` two equidistant ghosts would pick a
     /// different target in every process.
     ghosts: std::collections::BTreeMap<u64, RememberedBuilding>,
+    /// Enemy **units** this team has seen, keyed by entity id. `BTreeMap` for
+    /// the same reason `ghosts` is one, and with a second reason on top: this
+    /// is the input to `army_groups`, whose cluster order and float centroids
+    /// would both differ per process under std's hash order.
+    sightings: std::collections::BTreeMap<u64, Sighting>,
+    /// One entry per hero class, in `HERO_CLASSES` order. Never empty.
+    heroes: Vec<HeroIntel>,
+    /// Game time of the previous recompute. A unit counts as *watched dying*
+    /// only if it was visible at that instant and is gone at this one — see
+    /// `update_fog`, which is the only writer.
+    last_update: f32,
     explored: usize,
     visible: usize,
 }
@@ -3909,6 +4241,9 @@ impl FogGrid {
         FogGrid {
             cells: vec![CellVis::Unexplored; GRID_DIM * GRID_DIM],
             ghosts: std::collections::BTreeMap::new(),
+            sightings: std::collections::BTreeMap::new(),
+            heroes: blank_hero_intel(),
+            last_update: 0.0,
             explored: 0,
             visible: 0,
         }
@@ -3922,6 +4257,14 @@ impl FogGrid {
         FogGrid {
             cells: vec![CellVis::Visible; n],
             ghosts: std::collections::BTreeMap::new(),
+            // Empty, and stays empty: `update_fog` returns before it writes
+            // anything under `WC3_FOG=0`, exactly as it already does for
+            // `ghosts`. Under the omniscient baseline live sight supersedes
+            // memory entirely — every enemy is in `units[]` every tick — so an
+            // intel section would be a second, staler copy of the same board.
+            sightings: std::collections::BTreeMap::new(),
+            heroes: blank_hero_intel(),
+            last_update: 0.0,
             explored: n,
             visible: n,
         }
@@ -3973,6 +4316,127 @@ impl FogGrid {
     /// reject orders against things a seat should not know exist.
     pub fn knows_entity(&self, id: u64, pos: Vec3) -> bool {
         self.sees(pos) || self.ghosts.contains_key(&id)
+    }
+
+    /// Enemy units this team remembers seeing, in id order.
+    ///
+    /// Unlike `ghosts()` there is **no visible-now filter**, and the asymmetry
+    /// is deliberate. A ghost stands in for a building that is still there, so
+    /// showing one beside the live article would draw the same base twice. A
+    /// sighting is a record of an *instant* — "here at T" — and the live unit
+    /// that refreshed it is somewhere else by definition of having moved.
+    /// Renderers that want to suppress the marker under a live unit have the
+    /// `id` to do it with; see `ui::sync_intel_markers`, which does exactly
+    /// that for the one tick where they coincide.
+    pub fn sightings(&self) -> impl Iterator<Item = &Sighting> + '_ {
+        self.sightings.values()
+    }
+
+    /// This team's belief about each enemy hero class, in `HERO_CLASSES`
+    /// order. Always `HERO_CLASSES.len()` entries — a class never observed
+    /// reports `HeroStatus::Unknown` rather than going missing, because a
+    /// missing row and a row saying "no idea" are different claims and only
+    /// one of them is true.
+    pub fn hero_intel(&self) -> &[HeroIntel] {
+        &self.heroes
+    }
+
+    /// This team's belief about one enemy hero class.
+    pub fn hero_intel_of(&self, kind: UnitKind) -> Option<&HeroIntel> {
+        self.heroes.iter().find(|h| h.kind == kind)
+    }
+
+    /// Cluster concurrent sightings into bodies of troops.
+    ///
+    /// Single-link agglomeration: two sightings join the same group when they
+    /// are within `GROUP_RADIUS` of each other **and** were observed within
+    /// `GROUP_WINDOW_S` of each other. Both halves are load-bearing. Without
+    /// the distance test the whole map is one army. Without the **time** test
+    /// a footman glimpsed at the ford eighty seconds ago merges with an archer
+    /// standing there now, and the ledger reports a two-unit force that
+    /// existed at no instant — an aggregate that is a lie assembled out of
+    /// two honest facts, which is the failure mode this whole section is
+    /// arranged to avoid.
+    ///
+    /// **Workers are excluded.** A mining crew is not an army, and
+    /// `enemy_army_seen` firing on one would be the same false alarm
+    /// `base_under_attack` refuses to raise for a skirmish in midfield. They
+    /// stay in the ledger — seeing five workers on a hillside is exactly how
+    /// you find an expansion — they just do not constitute a force.
+    ///
+    /// Deliberately not clever: O(n²) over a ledger bounded by how many enemy
+    /// units a team has recently seen, recomputed where it is read rather than
+    /// cached anywhere it could go stale.
+    pub fn army_groups(&self) -> Vec<ArmyGroup> {
+        // `sightings` is a BTreeMap, so this vector is in id order and every
+        // tie broken below resolves the same way on every run.
+        let seen: Vec<&Sighting> = self
+            .sightings
+            .values()
+            .filter(|s| s.kind != UnitKind::Worker)
+            .collect();
+        let n = seen.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        fn root(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        let mut parent: Vec<usize> = (0..n).collect();
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let d = seen[a].pos - seen[b].pos;
+                let close = Vec2::new(d.x, d.z).length() <= GROUP_RADIUS;
+                let concurrent = (seen[a].t_seen - seen[b].t_seen).abs() <= GROUP_WINDOW_S;
+                if close && concurrent {
+                    let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+                    if ra != rb {
+                        parent[ra] = rb;
+                    }
+                }
+            }
+        }
+
+        let mut buckets: std::collections::BTreeMap<usize, Vec<&Sighting>> =
+            std::collections::BTreeMap::new();
+        for i in 0..n {
+            let r = root(&mut parent, i);
+            buckets.entry(r).or_default().push(seen[i]);
+        }
+
+        buckets
+            .into_values()
+            .map(|members| {
+                // Count by NAME so the ordering key and the printed word are
+                // the same string — a composition that sorts by one and prints
+                // the other is a summary that can reorder without changing.
+                let mut counts: std::collections::BTreeMap<&'static str, (UnitKind, usize)> =
+                    std::collections::BTreeMap::new();
+                let (mut sx, mut sz) = (0.0f32, 0.0f32);
+                let mut t_seen = f32::MIN;
+                for s in &members {
+                    counts.entry(kind_name(s.kind)).or_insert((s.kind, 0)).1 += 1;
+                    sx += s.pos.x;
+                    sz += s.pos.z;
+                    t_seen = t_seen.max(s.t_seen);
+                }
+                let mut composition: Vec<(UnitKind, usize)> = counts.into_values().collect();
+                composition
+                    .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| kind_name(a.0).cmp(kind_name(b.0))));
+                let k = members.len() as f32;
+                ArmyGroup {
+                    size: members.len(),
+                    composition,
+                    centroid: Vec3::new(ev_r1(sx / k), 0.0, ev_r1(sz / k)),
+                    t_seen,
+                }
+            })
+            .collect()
     }
 
     pub fn explored_frac(&self) -> f32 {
@@ -4080,6 +4544,23 @@ impl FogGrids {
         grid.ghosts.insert(record.id, record);
     }
 
+    /// Test-only: plant a unit sighting in `team`'s ledger, exactly as
+    /// `update_fog` does when the unit is in sight. Same `#[cfg(test)]`
+    /// reasoning as `test_remember` — nothing outside a test may seed a team's
+    /// knowledge, and the compiler rather than a comment should be what says
+    /// so.
+    #[cfg(test)]
+    pub fn test_sight(&mut self, team: Team, record: Sighting) {
+        self.get_mut(team).sightings.insert(record.id, record);
+    }
+
+    /// Test-only: set one team's belief about one enemy hero class directly,
+    /// so a trigger test can assert on the predicate without staging a death.
+    #[cfg(test)]
+    pub fn test_hero_intel(&mut self, team: Team, kind: UnitKind, status: HeroStatus, pos: Vec3) {
+        set_hero_intel(&mut self.get_mut(team).heroes, kind, status, pos, 0.0, 0.0);
+    }
+
     pub fn get(&self, team: Team) -> &FogGrid {
         match team {
             Team::Human => &self.human,
@@ -4127,7 +4608,13 @@ fn fog_stamp(cells: &mut [CellVis], pos: Vec3, radius: f32) {
 fn update_fog(
     time: Res<Time>,
     mut fog: ResMut<FogGrids>,
-    units: Query<(&Unit, &Team, &Transform)>,
+    // `Health` is OPTIONAL, and deliberately so. It is read only to stamp a
+    // sighting's `hp_frac`; requiring it would make a unit's ability to SEE
+    // conditional on it having a health bar, which is a coupling nothing in
+    // the fog rule wants and which would fail silently — the unit would simply
+    // stop lighting cells, and the map would go dark for no stated reason.
+    // Vision comes from the stat table and the transform, full stop.
+    units: Query<(Entity, &Unit, &Team, &Transform, Option<&Health>)>,
     buildings: Query<(Entity, &Building, &Team, &Transform, &Health, Has<UnderConstruction>)>,
 ) {
     if !fog.enabled {
@@ -4151,7 +4638,7 @@ fn update_fog(
                 *c = CellVis::Explored;
             }
         }
-        for (unit, t, tf) in &units {
+        for (_, unit, t, tf, _) in &units {
             if *t == team {
                 fog_stamp(&mut grid.cells, tf.translation, unit_stats(unit.kind).vision);
             }
@@ -4170,7 +4657,14 @@ fn update_fog(
         // --- building memory ------------------------------------------------
         // Split the borrow so the retain below can read cells while writing
         // ghosts.
-        let FogGrid { cells, ghosts, .. } = grid;
+        let FogGrid {
+            cells,
+            ghosts,
+            sightings,
+            heroes,
+            last_update,
+            ..
+        } = grid;
         let vis_at = |p: Vec3| match NavGrid::world_to_cell(p) {
             Some((cx, cz)) => cells[NavGrid::idx(cx, cz)],
             None => CellVis::Visible,
@@ -4203,6 +4697,101 @@ fn update_fog(
         // keep believing the barracks is still standing, which is precisely
         // the mistake fog of war is supposed to let you make.
         ghosts.retain(|id, g| live.contains(id) || !vis_at(g.pos).sees());
+
+        // --- unit sightings (intel) -----------------------------------------
+        // Written from the identical cells the ghosts above are written from.
+        // Two rules of knowability would be two rules, and this is the same
+        // one.
+        let mut live_units: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (e, unit, t, tf, health) in &units {
+            if *t == team {
+                continue;
+            }
+            let id = e.to_bits();
+            live_units.insert(id);
+            let pos = tf.translation;
+            if !vis_at(pos).sees() {
+                continue;
+            }
+            // A heading is a TRACK, not a glance: it needs a previous
+            // observation close enough in time that we actually watched the
+            // ground get covered. Re-acquiring the same raider a minute later
+            // yields `None`, which is the honest answer.
+            let heading = sightings.get(&id).and_then(|prev| {
+                if now - prev.t_seen <= HEADING_GAP_S {
+                    Heading8::of(pos - prev.pos)
+                } else {
+                    None
+                }
+            });
+            // No bar to read means nothing to report; full is the honest
+            // default for a unit that has no health to be missing.
+            let frac = health.map_or(1.0, |h| {
+                if h.max > 0.0 {
+                    (h.current / h.max).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            });
+            sightings.insert(
+                id,
+                Sighting {
+                    id,
+                    team: *t,
+                    kind: unit.kind,
+                    pos,
+                    hp_frac: frac,
+                    heading,
+                    t_seen: now,
+                },
+            );
+            if is_hero_kind(unit.kind) {
+                // Seeing it alive OVERWRITES a `SeenDying` belief, which is
+                // how a revive is learned: heroes come back through
+                // `HeroRecords`, so the belief has to be revocable by the
+                // ordinary act of looking rather than latched forever.
+                set_hero_intel(heroes, unit.kind, HeroStatus::Alive, pos, now, frac);
+            }
+        }
+
+        // A unit is "seen dying" only if it stood in our vision at the
+        // PREVIOUS recompute and is absent from the world at this one.
+        //
+        // The weaker test the building ghosts use — "gone, and we can see the
+        // spot where it was" — is *wrong* for something that moves. A hero
+        // that walked out of our sight and died half a map away would be
+        // reported as watched-dying by a scout still staring at the empty
+        // grass it left behind, which is intelligence nobody observed.
+        // Requiring that it was visible one tick ago closes that: a quarter of
+        // a second is not enough to leave our vision AND die somewhere we
+        // cannot see. Entities are despawned centrally by `apply_death` and by
+        // nothing else, so "absent from the world" means dead and not
+        // bookkeeping.
+        let witnessed: Vec<Sighting> = sightings
+            .values()
+            .filter(|s| s.t_seen >= *last_update && !live_units.contains(&s.id))
+            .copied()
+            .collect();
+        for dead in &witnessed {
+            if is_hero_kind(dead.kind) {
+                set_hero_intel(heroes, dead.kind, HeroStatus::SeenDying, dead.pos, now, 0.0);
+            }
+            sightings.remove(&dead.id);
+        }
+
+        // The rumour horizon, and the ONLY other way a sighting leaves.
+        //
+        // Note what is deliberately absent: there is no "we looked at the spot
+        // and it was empty" removal. That rule is right for a building, whose
+        // record claims the thing is standing there; a sighting claims only
+        // that a unit was there AT `t_seen`, and walking onto the spot
+        // confirms nothing the timestamp had not already said. Watching an
+        // army march off is not amnesia — the marker stays where you last saw
+        // it, wearing the heading you watched it leave on, which is precisely
+        // the fact worth keeping.
+        sightings.retain(|_, s| s.age(now) <= SIGHTING_TTL_S);
+
+        *last_update = now;
     }
 }
 
@@ -4536,6 +5125,399 @@ mod fog_tests {
         // did — the tier-up reward, applied from the live kind every tick
         // rather than cached at spawn.
         assert!(building_stats(BuildingKind::Keep).vision > building_stats(BuildingKind::TownHall).vision);
+    }
+
+    // -- intel: the sightings ledger --------------------------------------
+    //
+    // The subject of every test below is KNOWABILITY, so each one pins the fog
+    // mode rather than inheriting `WC3_FOG` — same discipline as the ghost
+    // tests above, and for a sharper reason: a ledger tested under an
+    // omniscient grid would pass while proving nothing.
+
+    /// A scouting app: one Human unit whose position the test drives, and the
+    /// real `update_fog` on a hand-driven clock.
+    fn intel_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        let mut grids = FogGrids::default();
+        grids.enabled = true;
+        grids.human = FogGrid::dark();
+        grids.claude = FogGrid::dark();
+        app.insert_resource(grids);
+        app.add_systems(Update, update_fog);
+        app
+    }
+
+    fn tick(app: &mut App, secs: f32) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f32(secs));
+        app.update();
+    }
+
+    fn human_grid(app: &App) -> &FogGrid {
+        app.world().resource::<FogGrids>().get(Team::Human)
+    }
+
+    fn spawn_scout(app: &mut App, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(at),
+                Health::new(100.0),
+            ))
+            .id()
+    }
+
+    fn spawn_enemy(app: &mut App, kind: UnitKind, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind },
+                Team::Claude,
+                Transform::from_translation(at),
+                Health::new(100.0),
+            ))
+            .id()
+    }
+
+    /// **The headline honesty property.** An enemy that has never stood in a
+    /// visible cell is absent from the ledger, and no amount of time passing
+    /// puts it there. If this ever fails, `intel` has become the omniscient
+    /// snapshot docs/FOG.md was written to delete.
+    #[test]
+    fn a_unit_never_seen_never_enters_the_ledger() {
+        let mut app = intel_app();
+        spawn_scout(&mut app, Vec3::new(-90.0, 0.0, -90.0));
+        spawn_enemy(&mut app, UnitKind::Footman, Vec3::new(80.0, 0.0, 80.0));
+
+        for _ in 0..8 {
+            tick(&mut app, 0.3);
+        }
+        let grid = human_grid(&app);
+        assert_eq!(
+            grid.sightings().count(),
+            0,
+            "an army nobody looked at is an army nobody knows about"
+        );
+        assert!(grid.army_groups().is_empty());
+        // And the enemy's OWN ledger is equally empty of our scout's kind —
+        // the rule is symmetric, which is the whole point of one producer.
+        let claude = app.world().resource::<FogGrids>().get(Team::Claude);
+        assert_eq!(claude.sightings().count(), 0);
+    }
+
+    /// Seen, then left: the record persists at the place and time it was
+    /// observed, which is the entire difference between this and `units[]`.
+    #[test]
+    fn a_unit_seen_then_left_is_remembered_where_it_was() {
+        let mut app = intel_app();
+        let spot = Vec3::new(6.0, 0.0, 0.0);
+        let scout = spawn_scout(&mut app, Vec3::ZERO);
+        let enemy = spawn_enemy(&mut app, UnitKind::Raider, spot);
+        tick(&mut app, 0.3);
+        assert_eq!(human_grid(&app).sightings().count(), 1, "eyes on it");
+
+        // The scout leaves; the enemy stays put and is now unobserved.
+        app.world_mut()
+            .entity_mut(scout)
+            .insert(Transform::from_translation(Vec3::new(-90.0, 0.0, -90.0)));
+        tick(&mut app, 0.3);
+        let grid = human_grid(&app);
+        let seen: Vec<&Sighting> = grid.sightings().collect();
+        assert_eq!(seen.len(), 1, "memory outlives sight");
+        assert_eq!(seen[0].id, enemy.to_bits());
+        assert_eq!(seen[0].pos, spot, "recorded where it was, not where it is");
+        assert!(!grid.sees(spot), "and we can no longer see that ground");
+    }
+
+    /// The rumour horizon. A sighting older than `SIGHTING_TTL_S` is dropped
+    /// rather than reported, because a ninety-second-old unit position is not
+    /// a stale fact, it is a wrong one.
+    #[test]
+    fn a_sighting_expires_at_the_staleness_horizon() {
+        let mut app = intel_app();
+        let spot = Vec3::new(6.0, 0.0, 0.0);
+        let scout = spawn_scout(&mut app, Vec3::ZERO);
+        spawn_enemy(&mut app, UnitKind::Footman, spot);
+        tick(&mut app, 0.3);
+        assert_eq!(human_grid(&app).sightings().count(), 1);
+
+        app.world_mut()
+            .entity_mut(scout)
+            .insert(Transform::from_translation(Vec3::new(-90.0, 0.0, -90.0)));
+
+        // Just inside the horizon: still believed.
+        tick(&mut app, SIGHTING_TTL_S - 1.0);
+        assert_eq!(
+            human_grid(&app).sightings().count(),
+            1,
+            "a stale sighting is still a sighting, right up to the horizon"
+        );
+        // Past it: dropped, silently. We did not witness anything; we simply
+        // stopped being entitled to the claim.
+        tick(&mut app, 2.0);
+        assert_eq!(
+            human_grid(&app).sightings().count(),
+            0,
+            "past the horizon it is a rumour, and the ledger does not keep rumours"
+        );
+    }
+
+    /// Watched dying: the record goes immediately, because we saw it happen.
+    #[test]
+    fn a_unit_that_dies_while_watched_is_removed_at_once() {
+        let mut app = intel_app();
+        let spot = Vec3::new(6.0, 0.0, 0.0);
+        spawn_scout(&mut app, Vec3::ZERO);
+        let enemy = spawn_enemy(&mut app, UnitKind::Footman, spot);
+        tick(&mut app, 0.3);
+        assert_eq!(human_grid(&app).sightings().count(), 1);
+
+        // `apply_death` despawns centrally; from fog's point of view the unit
+        // is simply no longer in the world while we are looking at its cell.
+        app.world_mut().entity_mut(enemy).despawn();
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).sightings().count(),
+            0,
+            "we watched it die; there is nothing left to remember"
+        );
+    }
+
+    /// The honesty case that the building rule would have got wrong.
+    ///
+    /// A unit walks out of our vision and dies somewhere we cannot see. The
+    /// ghost rule — "gone, and we can see the spot it was" — would call that
+    /// witnessed, because our scout is still staring at the grass it left.
+    /// It was not witnessed, and the sighting must survive as the stale fact
+    /// it is.
+    #[test]
+    fn a_unit_that_leaves_our_sight_and_dies_elsewhere_is_not_seen_dying() {
+        let mut app = intel_app();
+        let watched = Vec3::new(6.0, 0.0, 0.0);
+        let away = Vec3::new(80.0, 0.0, 80.0);
+        spawn_scout(&mut app, Vec3::ZERO);
+        let enemy = spawn_enemy(&mut app, UnitKind::Hero, watched);
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap().status,
+            HeroStatus::Alive
+        );
+
+        // It walks far away — out of our vision, while we go on watching the
+        // ground it stood on.
+        app.world_mut()
+            .entity_mut(enemy)
+            .insert(Transform::from_translation(away));
+        tick(&mut app, 0.3);
+        tick(&mut app, 0.3);
+        assert!(human_grid(&app).sees(watched), "we ARE still watching that spot");
+
+        // And now it dies, unobserved.
+        app.world_mut().entity_mut(enemy).despawn();
+        tick(&mut app, 0.3);
+        let grid = human_grid(&app);
+        assert_eq!(
+            grid.hero_intel_of(UnitKind::Hero).unwrap().status,
+            HeroStatus::Alive,
+            "a death nobody watched must not be reported as watched"
+        );
+        assert_eq!(
+            grid.sightings().count(),
+            1,
+            "and the last honest observation survives as the stale fact it is"
+        );
+    }
+
+    /// The full hero belief cycle: unknown -> alive -> seen-dying -> alive
+    /// again on a revive. The last leg is what keeps the belief a belief.
+    #[test]
+    fn hero_intel_moves_unknown_to_alive_to_seen_dying_and_back() {
+        let mut app = intel_app();
+        let spot = Vec3::new(6.0, 0.0, 0.0);
+        spawn_scout(&mut app, Vec3::ZERO);
+
+        // Unknown: never met. Note the entry EXISTS and says so, rather than
+        // being absent — "no idea" is a claim.
+        tick(&mut app, 0.3);
+        let intel = *human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap();
+        assert_eq!(intel.status, HeroStatus::Unknown);
+        assert!(intel.pos.is_none() && intel.t_seen.is_none());
+        assert_eq!(
+            human_grid(&app).hero_intel().len(),
+            HERO_CLASSES.len(),
+            "every class is listed, met or not"
+        );
+
+        // Alive.
+        let hero = spawn_enemy(&mut app, UnitKind::Hero, spot);
+        tick(&mut app, 0.3);
+        let intel = *human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap();
+        assert_eq!(intel.status, HeroStatus::Alive);
+        assert_eq!(intel.pos, Some(spot));
+        assert!(intel.hp_frac.is_some(), "a watcher can read the health bar");
+
+        // Seen dying, while we are looking at it.
+        app.world_mut().entity_mut(hero).despawn();
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap().status,
+            HeroStatus::SeenDying
+        );
+        // The OTHER class is untouched — beliefs are per class, not per team.
+        assert_eq!(
+            human_grid(&app)
+                .hero_intel_of(UnitKind::Priestess)
+                .unwrap()
+                .status,
+            HeroStatus::Unknown
+        );
+
+        // Revived and seen again: the belief is revocable by the ordinary act
+        // of looking. Heroes come back through `HeroRecords`, so a latched
+        // "dead forever" would be the interface lying on the enemy's behalf.
+        spawn_enemy(&mut app, UnitKind::Hero, spot);
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).hero_intel_of(UnitKind::Hero).unwrap().status,
+            HeroStatus::Alive,
+            "seeing it alive again corrects the belief"
+        );
+    }
+
+    /// A heading is a difference between two observations, so the first glance
+    /// has none and a stationary unit has none.
+    #[test]
+    fn heading_needs_two_observations_and_actual_movement() {
+        let mut app = intel_app();
+        spawn_scout(&mut app, Vec3::ZERO);
+        let enemy = spawn_enemy(&mut app, UnitKind::Raider, Vec3::new(4.0, 0.0, 0.0));
+
+        tick(&mut app, 0.3);
+        assert!(
+            human_grid(&app).sightings().next().unwrap().heading.is_none(),
+            "a single glance carries no heading"
+        );
+
+        // Standing still through a second observation: still none.
+        tick(&mut app, 0.3);
+        assert!(
+            human_grid(&app).sightings().next().unwrap().heading.is_none(),
+            "a unit that has not moved is not going anywhere"
+        );
+
+        // Now it walks north (+Z is north, matching the minimap's up).
+        app.world_mut()
+            .entity_mut(enemy)
+            .insert(Transform::from_translation(Vec3::new(4.0, 0.0, 6.0)));
+        tick(&mut app, 0.3);
+        assert_eq!(
+            human_grid(&app).sightings().next().unwrap().heading,
+            Some(Heading8::N)
+        );
+    }
+
+    #[test]
+    fn the_eight_headings_point_where_they_say() {
+        for (delta, want) in [
+            (Vec3::new(0.0, 0.0, 5.0), Heading8::N),
+            (Vec3::new(5.0, 0.0, 5.0), Heading8::NE),
+            (Vec3::new(5.0, 0.0, 0.0), Heading8::E),
+            (Vec3::new(5.0, 0.0, -5.0), Heading8::SE),
+            (Vec3::new(0.0, 0.0, -5.0), Heading8::S),
+            (Vec3::new(-5.0, 0.0, -5.0), Heading8::SW),
+            (Vec3::new(-5.0, 0.0, 0.0), Heading8::W),
+            (Vec3::new(-5.0, 0.0, 5.0), Heading8::NW),
+        ] {
+            assert_eq!(Heading8::of(delta), Some(want), "delta {delta:?}");
+        }
+        // Altitude is not a direction: fog is XZ only, so a flyer climbing
+        // straight up is standing still as far as any observer is concerned.
+        assert_eq!(Heading8::of(Vec3::new(0.0, 99.0, 0.0)), None);
+    }
+
+    /// Clustering needs BOTH tests. Two units close in space but far apart in
+    /// observation time are not one force, and reporting them as one would be
+    /// an aggregate assembled out of two honest facts into a lie.
+    #[test]
+    fn army_groups_cluster_by_distance_and_by_concurrency() {
+        let mut grids = FogGrids::test_dark();
+        let sighting = |id: u64, kind: UnitKind, x: f32, t: f32| Sighting {
+            id,
+            team: Team::Claude,
+            kind,
+            pos: Vec3::new(x, 0.0, 0.0),
+            hp_frac: 1.0,
+            heading: None,
+            t_seen: t,
+        };
+        // Three together at the same instant...
+        grids.test_sight(Team::Human, sighting(1, UnitKind::Footman, 0.0, 100.0));
+        grids.test_sight(Team::Human, sighting(2, UnitKind::Footman, 5.0, 100.0));
+        grids.test_sight(Team::Human, sighting(3, UnitKind::Archer, 9.0, 100.0));
+        // ...one far away at the same instant...
+        grids.test_sight(Team::Human, sighting(4, UnitKind::Footman, 90.0, 100.0));
+        // ...and one standing where the first three are, but seen a minute
+        // earlier. Close in space, not concurrent.
+        grids.test_sight(Team::Human, sighting(5, UnitKind::Knight, 4.0, 40.0));
+
+        let groups = grids.get(Team::Human).army_groups();
+        assert_eq!(groups.len(), 3, "two forces and one straggler in time");
+        let big = groups.iter().find(|g| g.size == 3).expect("the body of three");
+        assert_eq!(big.summary(), "2 Footman, 1 Archer", "most numerous first");
+        assert_eq!(big.t_seen, 100.0);
+        assert!(
+            groups.iter().any(|g| g.size == 1 && g.composition[0].0 == UnitKind::Knight),
+            "the stale knight is its own group, not a fourth member of theirs"
+        );
+    }
+
+    /// Workers are in the ledger and out of the armies. Finding five workers
+    /// on a hillside is how you find an expansion; it is not a force, and a
+    /// rule that fired on one would be an alarm nobody can act on.
+    #[test]
+    fn workers_are_remembered_but_are_not_an_army() {
+        let mut grids = FogGrids::test_dark();
+        for id in 0..5u64 {
+            grids.test_sight(
+                Team::Human,
+                Sighting {
+                    id,
+                    team: Team::Claude,
+                    kind: UnitKind::Worker,
+                    pos: Vec3::new(id as f32, 0.0, 0.0),
+                    hp_frac: 1.0,
+                    heading: None,
+                    t_seen: 10.0,
+                },
+            );
+        }
+        let grid = grids.get(Team::Human);
+        assert_eq!(grid.sightings().count(), 5, "you did see them");
+        assert!(grid.army_groups().is_empty(), "a mining crew is not an army");
+    }
+
+    /// The omniscient baseline keeps its old shape: live sight supersedes
+    /// memory entirely, so the ledger stays empty exactly as `ghosts` does.
+    #[test]
+    fn the_disabled_fog_baseline_keeps_an_empty_ledger() {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        let mut grids = FogGrids::default();
+        grids.enabled = false;
+        grids.human = FogGrid::revealed();
+        grids.claude = FogGrid::revealed();
+        app.insert_resource(grids);
+        app.add_systems(Update, update_fog);
+        spawn_scout(&mut app, Vec3::ZERO);
+        spawn_enemy(&mut app, UnitKind::Footman, Vec3::new(6.0, 0.0, 0.0));
+        tick(&mut app, 0.3);
+
+        let grid = human_grid(&app);
+        assert_eq!(grid.sightings().count(), 0);
+        assert_eq!(grid.ghosts().count(), 0);
+        assert!(grid.sees(Vec3::new(6.0, 0.0, 0.0)), "and everything is visible");
     }
 
     #[test]
@@ -5124,6 +6106,11 @@ pub enum TriggerWhen {
     /// is a place you are watching, not a place you are told about, and a
     /// region nobody has eyes on stays quiet no matter what walks into it.
     ///
+    /// The **live** half of the pair it forms with [`TriggerWhen::EnemyArmySeen`]:
+    /// this one asks "is there an enemy in that place *now*", the other asks
+    /// "do we know of an army at all". Eyes-on versus remembered, and a
+    /// commander wants both words.
+    ///
     /// An unknown region name is refused **at arm time** by the compiler, so
     /// this predicate never has to have an opinion about a name that is not a
     /// place. If its region is cleared after arming, it goes quiet rather than
@@ -5135,6 +6122,59 @@ pub enum TriggerWhen {
         /// Defaults to 1.
         #[serde(default = "one_u32")]
         count: u32,
+    },
+    /// Our intel ledger holds a body of at least `size` enemy units that was
+    /// observed as one concurrent force (`FogGrid::army_groups`).
+    ///
+    /// Unlike `enemy_sighted` this reads MEMORY, and that is the whole point:
+    /// an army does not stop existing because your scout died, and a rule that
+    /// only fires while eyes are on the enemy is a rule that disarms itself at
+    /// exactly the moment the enemy wants it to. Workers do not count toward
+    /// the size — a mining crew is not a force.
+    ///
+    /// `within_s` bounds how stale the observation may be. Absent, any
+    /// surviving sighting counts, which means up to `SIGHTING_TTL_S` old; set
+    /// it when the rule wants a *current* army rather than a known one.
+    ///
+    /// Deliberately carries no region, and that stayed true when territory
+    /// landed: [`TriggerWhen::EnemyIn`] is the arm that asks *where*, against
+    /// the one vocabulary of places this game has. Growing a second notion of
+    /// "where" in here — one that answered from memory rather than from sight
+    /// — would be the second implementation this project keeps refusing to
+    /// write, and it would also be a lie about knowability, because a
+    /// remembered position is not a position.
+    EnemyArmySeen {
+        /// Defaults to 1.
+        #[serde(default = "one_u32")]
+        size: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within_s: Option<f32>,
+    },
+    /// An enemy hero class is **currently believed dead** — we watched one die
+    /// and have not seen it alive since (`HeroStatus::SeenDying`). `class`
+    /// names a hero kind (`Hero`, `Priestess`); absent means any of them.
+    ///
+    /// This is a **level** predicate, like every other arm here, and the
+    /// wording above is exact: it is not "a hero died this tick" but "as far
+    /// as we know, their hero is down". That distinction decides how it
+    /// behaves.
+    ///
+    /// * A **once** trigger — the normal case, and the one the recipes use —
+    ///   fires on the first sweep where the belief holds, then disarms. That
+    ///   is the edge behaviour a commander wants from "when their hero falls,
+    ///   strike", and they get it without the engine having to keep an
+    ///   edge-detection latch nobody can inspect.
+    /// * A **repeating** trigger re-fires every cooldown for as long as the
+    ///   belief stands. That is a coherent thing to want — "keep pressing
+    ///   while they have no hero" — and it is why the level form was kept
+    ///   rather than special-cased into an edge.
+    ///
+    /// The belief is revocable: see the hero alive again after a revive and
+    /// the status returns to `Alive`, so a re-armed once-trigger will fire
+    /// again on the next death actually witnessed.
+    EnemyHeroDown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
     },
     /// At least one neutral bounty cache is on the map AND visible to us. Also
     /// fog-honest — the snapshot's `bounties` array is filtered the same way,
@@ -5213,6 +6253,17 @@ impl TriggerWhen {
                     format!("{count} or more {what} are seen in {region}")
                 }
             }
+            TriggerWhen::EnemyArmySeen { size, within_s } => {
+                let fresh = match within_s {
+                    Some(w) => format!(" seen in the last {w:.0}s"),
+                    None => String::new(),
+                };
+                format!("we know of {size} or more enemy troops together{fresh}")
+            }
+            TriggerWhen::EnemyHeroDown { class } => match class {
+                Some(class) => format!("their {class} is believed dead"),
+                None => "an enemy hero is believed dead".to_string(),
+            },
             TriggerWhen::BountySpawned => "a bounty cache is sighted".to_string(),
             TriggerWhen::MineDry => "a mine at our base runs dry".to_string(),
             TriggerWhen::TierReached { tier } => format!("we reach tier {tier}"),
@@ -5344,6 +6395,428 @@ impl Triggers {
         let n = list.len();
         list.clear();
         n
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plans: 'then' as a first-class word
+// ---------------------------------------------------------------------------
+//
+// Doctrine is CONTINUOUS standing policy; a trigger is the CONTINGENT half.
+// Neither of them can say ORDER. "Build the barracks, then when we hit tier 2
+// put up the sanctum, then train sorcerers" is the single most common thing a
+// commander thinks, and until now it could only be spelled by *remembering* to
+// send the next command — which for a language model is one ten-to-fifteen
+// second poll per step of a build order, spent on a sequence that was fully
+// decided before the match started.
+//
+// A plan is that sequence, handed to the engine: named ordered steps, each an
+// ordinary `Intent`, each with a condition for moving on to the next one. The
+// engine walks it at the same 4 Hz the trigger evaluator uses and submits each
+// step through the same compiler.
+//
+// ## Why plans are not compiled into triggers
+//
+// The obvious implementation is "a plan is N chained triggers". It is wrong for
+// a reason worth writing down: `MAX_TRIGGERS_PER_TEAM` is 8 and it is doctrine,
+// not a budget — it is the number of rules a commander can hold in their head.
+// A five-step plan that ate five of those slots would make the two features
+// compete for the same scarce thing while being about different halves of the
+// same sentence. Plans get their own storage, their own (smaller) cap and their
+// own evaluator, so arming a plan never costs a trigger and reading your
+// triggers never means reading a plan's internals.
+//
+// ## What a plan deliberately cannot do
+//
+// **Loop.** A plan runs once through and stops. Repetition is the trigger's
+// job (`repeat`), and a construct with both sequencing *and* iteration is a
+// programming language with no debugger — the exact thing `MAX_TRIGGERS_PER_TEAM`
+// exists to refuse.
+//
+// **Name units it does not have yet.** A step's intent is frozen at plan_set
+// time, exactly like a trigger's `then`, so a step cannot say "the eight
+// footmen I will have by then" — there is no id to write. The idiom, and it is
+// the same one triggers already use, is the LATE-BINDING SELECTOR the language
+// already has: **squads and doctrine templates**. `template` stamps every unit
+// a building trains into squad 2; `posture` addresses squad 2 by number and
+// resolves its membership at execution time. So a plan says "the barracks
+// stamps squad 2" as step 1 and "squad 2 pushes their base" as step 4, and the
+// units that obey step 4 are whoever exists when it runs. See docs/INTENT.md
+// § "Plans" for the worked example.
+
+/// A plan's name. The same scalar a trigger's name is, and for the same reason:
+/// it rides inside [`Cause`], which is `Copy` and allocation-free.
+///
+/// An alias rather than a second type because the constraint, the parser and
+/// the failure mode are identical — two structurally identical names would be
+/// two chances to fix a bug in one of them.
+pub type PlanName = TriggerName;
+
+/// The most plans one team may run at once.
+///
+/// **Two is doctrine, not programming**, the same argument as
+/// [`MAX_TRIGGERS_PER_TEAM`] one notch tighter. A plan is a *sequence* running
+/// unattended, and the failure it can produce — two plans stepping over each
+/// other's build sites and squad ids — is much harder to read out of a snapshot
+/// than two triggers that each fire once. Two is also what commanders actually
+/// want: an economic opening and a military follow-up. A third would be the
+/// point where "what is my base doing" stops being answerable.
+///
+/// Replacing a plan by name is free and restarts it from step 1, so iterating
+/// on an opening never costs a slot.
+pub const MAX_PLANS_PER_TEAM: usize = 2;
+
+/// The most steps one plan may have.
+///
+/// Eight, matching the trigger cap, and for the identical reason: it is the
+/// length of a sequence a person can recite. A build order longer than eight
+/// steps is two plans, or a plan and some triggers.
+pub const MAX_PLAN_STEPS: usize = 8;
+
+/// **When the engine moves off a step and onto the next one.**
+///
+/// Three arms, deliberately, and the middle one is the whole seam: it is a
+/// [`TriggerWhen`], the *same* predicate vocabulary triggers use. That is not
+/// code reuse for its own sake — it means a plan and a trigger agree on what
+/// "we reached tier 2" means, one evaluator answers both, and any predicate a
+/// later bead adds (territory held, intel gathered) becomes a plan
+/// advance-condition the moment it becomes a trigger condition, with no work in
+/// this file.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PlanAdvance {
+    /// The instant the step's intent is ACCEPTED by the compiler. The default,
+    /// and what a bare "X, then Y" means: do this, then do that.
+    ///
+    /// Accepted, not *completed* — the engine does not wait for the barracks to
+    /// finish, it waits for the order to be legal and taken. Waiting on
+    /// completion is what the `when` form is for (`unit_count`, `tier_reached`),
+    /// and conflating the two would make "then" mean something different for
+    /// every verb.
+    #[default]
+    OnApplied,
+    /// When a predicate holds. Level-triggered, exactly like a trigger: the
+    /// engine checks whether it is true *now*, not whether it became true.
+    When { when: TriggerWhen },
+    /// After a fixed wait, measured from the moment the step's intent was
+    /// accepted. The one arm about nothing in the world, present for the same
+    /// reason `game_time` is a trigger predicate: "give it thirty seconds" is a
+    /// thing commanders really say.
+    #[serde(rename = "after")]
+    AfterSeconds { secs: f32 },
+}
+
+impl PlanAdvance {
+    /// The clause that introduces the NEXT step, read after "then". Empty for
+    /// the default, because "then" already says it.
+    pub fn phrase(&self) -> String {
+        match self {
+            PlanAdvance::OnApplied => String::new(),
+            PlanAdvance::When { when } => format!("when {}: ", when.phrase()),
+            PlanAdvance::AfterSeconds { secs } => format!("after {secs:.0}s: "),
+        }
+    }
+
+    /// The same condition read as a trailing clause — what the LAST step's
+    /// advance means, since it introduces no next step and instead decides when
+    /// the plan is finished. `None` for the default, which needs no words.
+    pub fn trailing_phrase(&self) -> Option<String> {
+        match self {
+            PlanAdvance::OnApplied => None,
+            PlanAdvance::When { when } => Some(format!("when {}", when.phrase())),
+            PlanAdvance::AfterSeconds { secs } => Some(format!("{secs:.0}s later")),
+        }
+    }
+}
+
+/// One step of a plan: something to do, and how to know it is time for the
+/// next thing.
+///
+/// `advance` defaults to [`PlanAdvance::OnApplied`], so the terse form
+/// `{"intent":{…}}` is a legal step and a plan of nothing but terse steps is a
+/// straight-through build order.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlanStep {
+    pub intent: Intent,
+    #[serde(default)]
+    pub advance: PlanAdvance,
+}
+
+/// Where a plan is, as one word plus (when it is bad news) the reason.
+///
+/// `Blocked` and `Halted` carry the compiler's own error string verbatim. A
+/// status of "blocked" with no reason would send its owner to the error channel
+/// to go looking, and the whole point of a plan is that nobody is watching.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanState {
+    /// Walking its steps.
+    Running,
+    /// The current step's intent was REFUSED. The plan is retrying it at
+    /// [`PLAN_RETRY_S`]; it will halt if it is still refused after
+    /// [`PLAN_BLOCK_GRACE_S`].
+    Blocked(String),
+    /// The current step was still refused after the grace window. The plan
+    /// stops here, on this step, forever — it never skips ahead.
+    Halted(String),
+    /// Every step ran and the last one's advance-condition came true.
+    Done,
+}
+
+/// How long a blocked plan keeps retrying its refused step before giving up.
+///
+/// **A minute, and the number was raised from ten seconds by watching a plan
+/// die.** The canonical opening in tools/COMMANDER_BRIEF.md reached its
+/// `upgrade` step with 180 of the 320 gold a Keep costs, blocked correctly,
+/// and then *halted* — while the income that would have paid for it was
+/// twenty seconds away. Ten seconds is the right window for the reason it was
+/// picked (a worker mid-walk, a building one tick from done) and the wrong one
+/// for the reason plans actually exist: **economic sequencing, where the
+/// dominant refusal is "not yet affordable" and money arrives on a scale of
+/// tens of seconds.**
+///
+/// Halting late costs nothing, which is what makes the long window safe. The
+/// owner is told at the *first* bounce — the status becomes
+/// `blocked: <why>` within a tick and an event line goes out — so this constant
+/// governs only how long the engine keeps *trying* before it stops. A commander
+/// who wants it dead sooner sends `plan_clear`.
+pub const PLAN_BLOCK_GRACE_S: f32 = 60.0;
+
+/// How often a blocked plan re-submits its refused step.
+///
+/// Not every sweep: retrying at 4 Hz would put 240 copies of the same refusal
+/// into the error channel and the replay log inside the grace window, and a
+/// channel that floods is a channel nobody reads. Five seconds gives twelve
+/// attempts across the window — enough that a step waiting on income retries
+/// several times per mining trip, few enough to read.
+pub const PLAN_RETRY_S: f32 = 5.0;
+
+/// One plan, as the engine holds it.
+///
+/// Everything above `state` is what the commander said; everything from `state`
+/// down is runtime. A finished plan stays in the list, `Done`, for the same
+/// reason a spent trigger does: "did my opening actually run?" has to be
+/// answerable from the snapshot, and an absence cannot answer it.
+#[derive(Clone, Debug)]
+pub struct PlanRun {
+    pub name: PlanName,
+    pub steps: Vec<PlanStep>,
+    /// The seat that set it. The AUTHOR — the engine only executes.
+    pub source: IntentSource,
+    pub state: PlanState,
+    /// Index of the step being worked. Stays pinned at the last index when the
+    /// plan is `Done` or `Halted`, so `step k/n` always names a real step.
+    pub at: usize,
+    /// Has the current step's intent been submitted yet this visit?
+    pub submitted: bool,
+    /// Has the current step's intent been ACCEPTED? Gates
+    /// [`PlanAdvance::OnApplied`] and starts the `after` clock.
+    pub applied: bool,
+    /// Game time the current step's intent was accepted.
+    pub applied_at: f32,
+    /// Game time of the last submit attempt, so a blocked step retries on
+    /// [`PLAN_RETRY_S`] rather than every sweep.
+    pub last_try: f32,
+    /// Game time the current step first bounced, `None` if it has not.
+    pub blocked_since: Option<f32>,
+    /// Has the owner been told about the current block? One notice per block,
+    /// not one per retry: the human's alert stack is six rows and five copies
+    /// of "not enough gold" would push the match's actual news off it.
+    pub told_blocked: bool,
+}
+
+impl PlanRun {
+    /// `k` of `step k/n`, one-based, as a person counts.
+    pub fn step_no(&self) -> usize {
+        (self.at + 1).min(self.steps.len())
+    }
+
+    /// The step the plan is on, or the last one once it is finished.
+    pub fn current(&self) -> Option<&PlanStep> {
+        self.steps.get(self.at.min(self.steps.len().saturating_sub(1)))
+    }
+
+    /// What the snapshot and the HUD call this plan's state. Blocked and halted
+    /// carry their reason — the word alone would be a status you have to go
+    /// research.
+    pub fn status(&self) -> String {
+        match &self.state {
+            PlanState::Running => "running".to_string(),
+            PlanState::Blocked(why) => format!("blocked: {why}"),
+            PlanState::Halted(why) => format!("halted: {why}"),
+            PlanState::Done => "done".to_string(),
+        }
+    }
+
+    /// Is this plan still going to do anything?
+    pub fn live(&self) -> bool {
+        matches!(self.state, PlanState::Running | PlanState::Blocked(_))
+    }
+}
+
+/// Every team's plans, in the order they were set.
+///
+/// A `Vec` for the same determinism reason [`Triggers`] is one: two plans can
+/// step on the same tick and the order they submit in has to be the order they
+/// were written, on every run.
+#[derive(Resource, Default)]
+pub struct Plans {
+    human: Vec<PlanRun>,
+    claude: Vec<PlanRun>,
+}
+
+impl Plans {
+    pub fn get(&self, team: Team) -> &Vec<PlanRun> {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+
+    pub fn get_mut(&mut self, team: Team) -> &mut Vec<PlanRun> {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+
+    /// Create or replace by name. Replacing restarts from step 1 — a re-stated
+    /// plan is a new plan with the same label, which is what "set" means
+    /// everywhere else in this language and is how a commander iterates on an
+    /// opening without spending the other slot.
+    ///
+    /// The cap counts plans that are still LIVE. A `done` or `halted` plan is
+    /// history rather than policy, and holding a slot open for a sequence that
+    /// finished four minutes ago would make the cap about bookkeeping instead
+    /// of about how much is running unattended. Finished plans stay readable in
+    /// the list; the oldest one is evicted to make room.
+    pub fn set(&mut self, team: Team, plan: PlanRun) -> Result<(), String> {
+        // A plan with no steps can never finish — nothing to submit, nothing to
+        // advance — so it would sit `running` and hold one of the two slots for
+        // the rest of the match. The compiler refuses this with a better
+        // message; this is the same refusal at the door of the store, so no
+        // caller can install one by construction.
+        if plan.steps.is_empty() {
+            return Err("a plan needs at least one step".to_string());
+        }
+        let list = self.get_mut(team);
+        if let Some(slot) = list.iter_mut().find(|p| p.name == plan.name) {
+            *slot = plan;
+            return Ok(());
+        }
+        if list.iter().filter(|p| p.live()).count() >= MAX_PLANS_PER_TEAM {
+            return Err(format!(
+                "you already have {MAX_PLANS_PER_TEAM} plans running ({}) — \
+                 clear one first, or re-use its name to replace it",
+                list.iter()
+                    .filter(|p| p.live())
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // Room for the new one; drop the oldest finished plan if the list has
+        // grown past what a reader can hold.
+        while list.len() >= MAX_PLANS_PER_TEAM * 2 {
+            let Some(oldest) = list.iter().position(|p| !p.live()) else {
+                break;
+            };
+            list.remove(oldest);
+        }
+        list.push(plan);
+        Ok(())
+    }
+
+    /// **The compiler's verdict on a step it just compiled**, routed back to
+    /// the plan that submitted it.
+    ///
+    /// This is the whole of plans' failure semantics and it is why
+    /// [`SubmitIntent::plan`] exists rather than plan.rs scraping the error
+    /// channel for its own tag. A plan that could not tell "accepted" from
+    /// "refused" would have exactly two options, and both are bad: advance
+    /// anyway (silently skipping the step, which is the failure mode this whole
+    /// design is here to refuse) or never advance (wedging on the first hiccup).
+    ///
+    /// `error` is the compiler's own first message for that step, `None` if it
+    /// was accepted. Verdicts for a step the plan has already moved off are
+    /// ignored — a plan replaced mid-flight must not inherit the old one's news.
+    pub fn report(&mut self, team: Team, stamp: PlanStamp, error: Option<String>, now: f32) {
+        let Some(plan) = self
+            .get_mut(team)
+            .iter_mut()
+            .find(|p| p.name == stamp.name)
+        else {
+            return;
+        };
+        // Three conditions, and the third is the one that makes "replaced
+        // mid-flight" safe. `plan_set` is compiled in `SimSet::Intent`, the
+        // same set as this verdict and ahead of it in the batch whenever the
+        // replacement came from a seat — so a fresh `PlanRun` can be sitting
+        // under the old one's name when the old step's verdict arrives. Name
+        // and step number do NOT tell them apart (both are "opening", both are
+        // on step 1). `submitted` does, and unconditionally: a plan that has
+        // sent nothing cannot be the addressee of a verdict, and `Plans::set`
+        // always installs a replacement with `submitted: false`.
+        if !plan.submitted || plan.step_no() != stamp.step as usize || !plan.live() {
+            return;
+        }
+        match error {
+            None => {
+                plan.applied = true;
+                plan.applied_at = now;
+                plan.blocked_since = None;
+                plan.told_blocked = false;
+                plan.state = PlanState::Running;
+            }
+            Some(why) => {
+                // The clock starts at the FIRST bounce, not this one, so the
+                // grace window measures how long the step has been impossible
+                // rather than how long since the last retry.
+                plan.blocked_since.get_or_insert(now);
+                plan.applied = false;
+                // A refusal that CHANGES is news. "cannot afford it" becoming
+                // "the site is blocked" is a different problem with a different
+                // answer, and staying quiet about the second would leave the
+                // owner acting on the first right up until the plan halted on
+                // the other one.
+                if plan.state != PlanState::Blocked(why.clone()) {
+                    plan.told_blocked = false;
+                }
+                plan.state = PlanState::Blocked(why);
+            }
+        }
+    }
+
+    /// Remove one by name; `true` if anything was there.
+    pub fn clear(&mut self, team: Team, name: &str) -> bool {
+        let list = self.get_mut(team);
+        let before = list.len();
+        list.retain(|p| p.name.as_str() != name);
+        list.len() != before
+    }
+
+    /// Remove every plan of a team. Returns how many went.
+    pub fn clear_all(&mut self, team: Team) -> usize {
+        let list = self.get_mut(team);
+        let n = list.len();
+        list.clear();
+        n
+    }
+}
+
+/// Which plan and which step an intent came from, as a `Copy` scalar so it can
+/// ride in [`Cause`] and in [`SubmitIntent`] without an allocation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlanStamp {
+    pub name: PlanName,
+    /// One-based, as `step k/n` reads.
+    pub step: u8,
+    pub of: u8,
+}
+
+impl std::fmt::Display for PlanStamp {
+    /// `opening step 2/5` — the phrase every channel uses, defined once.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} step {}/{}", self.name, self.step, self.of)
     }
 }
 
@@ -5676,6 +7149,42 @@ pub enum Intent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    // --- plans: sequenced standing policy ---
+    /// **Set a plan.** Named ordered steps the engine walks for you, one at a
+    /// time, submitting each step's intent through this same compiler when its
+    /// turn comes. Create it, or replace an existing one of the same name —
+    /// which restarts it from step 1.
+    ///
+    /// Each step is `{"intent": <any intent>, "advance": <how to move on>}`,
+    /// and `advance` may be omitted for the ordinary meaning of "then": as soon
+    /// as this step is accepted, do the next one. The other two forms are
+    /// `{"type":"when","when":{…}}` — any [`TriggerWhen`] predicate — and
+    /// `{"type":"after","secs":30}`.
+    ///
+    /// Bounded at [`MAX_PLANS_PER_TEAM`] live plans of [`MAX_PLAN_STEPS`] steps
+    /// each, on the same argument as the trigger cap: a sequence running
+    /// unattended has to be one its owner can recite.
+    ///
+    /// **Once through, never looping.** Repetition is what a trigger's `repeat`
+    /// is for. A step may arm a `trigger_set` — that is a real idiom ("build
+    /// the barracks, then arm the home guard") and stays bounded because
+    /// `trigger_set` still cannot arm anything — but a step may not be a
+    /// `plan_set` or `plan_clear`, and neither may a trigger's `then`. Those
+    /// two refusals are what make the caps actual bounds rather than starting
+    /// balances.
+    ///
+    /// Every step's intent is frozen at set time, exactly like a trigger's
+    /// `then`. To act on units that do not exist yet, name a SQUAD: see the
+    /// module comment above [`PlanAdvance`] and docs/INTENT.md § "Plans".
+    #[serde(rename = "plan_set")]
+    PlanSet { name: String, steps: Vec<PlanStep> },
+    /// **Drop a plan.** `name` omitted drops every plan this team has, finished
+    /// ones included.
+    #[serde(rename = "plan_clear")]
+    PlanClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 
     // --- match level ---
     /// Hand this faction to the scripted AI (or take it back).
@@ -5780,6 +7289,8 @@ impl Intent {
             Intent::TriggerClear { .. } => "trigger_clear",
             Intent::RegionSet { .. } => "region_set",
             Intent::RegionClear { .. } => "region_clear",
+            Intent::PlanSet { .. } => "plan_set",
+            Intent::PlanClear { .. } => "plan_clear",
             Intent::Autopilot { .. } => "autopilot",
             Intent::Surrender => "surrender",
         }
@@ -6085,6 +7596,43 @@ impl Intent {
                 Some(name) => format!("forget the region {name}"),
                 None => "forget every region".to_string(),
             },
+            // A plan's sentence carries EVERY step, joined by the word the verb
+            // is named after. That is deliberate and it is what makes a plan
+            // reviewable: a co-commander proposing an opening is proposing ONE
+            // thing, and the human answering it needs the whole sequence on the
+            // line they are answering — not a step count they would have to go
+            // expand. Bounded by `MAX_PLAN_STEPS`, so "the whole thing" is at
+            // most eight clauses.
+            //
+            // The advance-condition of step k introduces step k+1, because that
+            // is what it governs: `A, then when we reach tier 2: B`. The last
+            // step's advance decides when the plan reports itself finished, so
+            // it is rendered as a trailing clause when it is not the plain
+            // "as soon as it lands" default.
+            Intent::PlanSet { name, steps } => {
+                if steps.is_empty() {
+                    return format!("plan {name}: no steps");
+                }
+                let mut out = format!("plan {name} ({} steps): ", steps.len());
+                for (i, step) in steps.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", then ");
+                        out.push_str(&steps[i - 1].advance.phrase());
+                    }
+                    out.push_str(&step.intent.sentence());
+                }
+                if let Some(clause) = steps
+                    .last()
+                    .and_then(|last| last.advance.trailing_phrase())
+                {
+                    out.push_str(&format!(" (done {clause})"));
+                }
+                out
+            }
+            Intent::PlanClear { name } => match name {
+                Some(name) => format!("clear plan {name}"),
+                None => "clear every plan".to_string(),
+            },
             Intent::Autopilot { on } => {
                 if *on {
                     "hand the faction to the scripted AI".to_string()
@@ -6130,6 +7678,25 @@ pub enum IntentSource {
     /// upstream of submission, and is a matter of etiquette rather than of
     /// legality (see docs/INTENT.md § co-command).
     Copilot,
+    /// The SCRIPTED COMMANDER (ai.rs), which drives the Claude faction always
+    /// and either faction under `autopilot`.
+    ///
+    /// It used to be the last thing in the game that changed state without
+    /// saying anything: it wrote `Order`s, pushed `TrainingQueue`s and sent
+    /// `UpgradeBuilding` straight through, which meant the fairness invariant
+    /// had to be stated with a footnote. It is a seat now. Every action it
+    /// takes is a `SubmitIntent` like anybody else's — validated by the same
+    /// compiler, refused by the same rules, priced by the same link, and
+    /// written to the same replay log, so a replay finally names all three
+    /// authors instead of two and a silence.
+    ///
+    /// Descriptive, never authoritative, exactly like the three above: the
+    /// compiler reaches its verdict without consulting this field. What the
+    /// variant *does* decide is where a refusal is delivered — a script has no
+    /// snapshot and no alert stack, so its errors go to the debug log (see
+    /// `apply_intents`) rather than into a seat's error channel it does not
+    /// read and a human never caused.
+    Script,
 }
 
 impl IntentSource {
@@ -6138,6 +7705,7 @@ impl IntentSource {
             IntentSource::Ui => "ui",
             IntentSource::Bridge => "bridge",
             IntentSource::Copilot => "copilot",
+            IntentSource::Script => "script",
         }
     }
 }
@@ -6188,6 +7756,17 @@ pub enum Cause {
         verb: &'static str,
         source: IntentSource,
     },
+    /// A **plan** the player set reached this step, and the engine submitted
+    /// its intent. Its own rung beside `Trigger` and for the same reason: the
+    /// honest answer to "why are you doing that" is not "somebody said so just
+    /// now", it is "you wrote this down as step 4 of five", and the step number
+    /// is the part that makes the answer usable — it tells the reader where in
+    /// the sequence they are without opening the plan.
+    Plan {
+        plan: PlanStamp,
+        verb: &'static str,
+        source: IntentSource,
+    },
     /// The unit's squad has a standing posture and the engine is executing it.
     Posture { squad: u8, posture: &'static str },
     /// A standing policy fired: a retreat threshold, a leash snapping back.
@@ -6200,9 +7779,12 @@ pub enum Cause {
         kind: &'static str,
         building: Entity,
     },
-    /// The scripted `ai.rs` baseline. Not a seat (see docs/INTENT.md), so it
-    /// gets its own rung rather than borrowing `Order`'s.
-    Script { what: &'static str },
+    // NOTE: there used to be a `Script { what }` rung here, for the scripted
+    // `ai.rs` baseline, "not a seat, so it gets its own rung rather than
+    // borrowing `Order`'s". ai.rs is a seat now (`IntentSource::Script`), and
+    // its orders come out of the compiler stamped `order:<verb> by script`
+    // like everybody else's — which is the whole of the answer, and one rung
+    // fewer to explain.
     /// Engine default: nothing above applies. `"idle"` renders bare.
     Instinct { what: &'static str },
 }
@@ -6227,7 +7809,7 @@ impl Provenance {
     /// posture:push sq1               squad 1's standing posture
     /// policy:retreat t=210           a retreat threshold fired
     /// template:Barracks#4294968163   stamped at spawn by that building
-    /// script:wave                    the scripted AI baseline
+    /// order:attackmove by script t=5 the scripted AI, speaking as a seat
     /// instinct:flee                  an engine reflex
     /// idle                           nothing to do
     /// ```
@@ -6245,6 +7827,11 @@ impl Provenance {
                 source.name(),
                 self.at
             ),
+            Cause::Plan {
+                plan,
+                verb,
+                source,
+            } => format!("plan:{plan} {verb} by {} t={:.0}", source.name(), self.at),
             Cause::Posture { squad, posture } => format!("posture:{posture} sq{squad}"),
             Cause::Policy { policy } => format!("policy:{policy} t={:.0}", self.at),
             Cause::Stamp {
@@ -6252,7 +7839,6 @@ impl Provenance {
                 kind,
                 building,
             } => format!("{how}:{kind}#{}", building.to_bits()),
-            Cause::Script { what } => format!("script:{what}"),
             // The one bare word: "idle" is the absence of a reason, and
             // dressing it up as `instinct:idle` would imply there was one.
             Cause::Instinct { what } if what == "idle" => "idle".to_string(),
@@ -6306,18 +7892,28 @@ pub struct IntentMark {
     /// speaking it now. Carried here rather than checked at each of the eight
     /// order arms so that the rung a unit ends up on is decided in one place.
     pub trigger: Option<TriggerName>,
+    /// Set when a **plan step** submitted this intent. Same role as `trigger`
+    /// one rung along: the two are mutually exclusive by construction (a plan
+    /// step's intent is submitted by plan.rs, a trigger's by trigger.rs) and
+    /// `order` prefers the trigger arm if both are somehow set.
+    pub plan: Option<PlanStamp>,
 }
 
 impl IntentMark {
     /// The provenance a direct order of `verb` stamps on its targets.
     pub fn order(&self, verb: &'static str) -> Provenance {
-        let cause = match self.trigger {
-            Some(name) => Cause::Trigger {
+        let cause = match (self.trigger, self.plan) {
+            (Some(name), _) => Cause::Trigger {
                 name,
                 verb,
                 source: self.source,
             },
-            None => Cause::Order {
+            (None, Some(plan)) => Cause::Plan {
+                plan,
+                verb,
+                source: self.source,
+            },
+            (None, None) => Cause::Order {
                 verb,
                 source: self.source,
             },
@@ -6349,6 +7945,13 @@ pub struct SubmitIntent {
     /// * the human's refusal notice, which names the rule that failed rather
     ///   than a gesture the player never made.
     pub trigger: Option<TriggerName>,
+    /// Set when a **plan step** submitted this intent. Read by the same three
+    /// consumers as `trigger`, for the same three reasons — the link exemption
+    /// (a plan is standing policy the engine executes), [`Provenance`], and the
+    /// human's refusal notice — plus a fourth that is plans' own: the compiler
+    /// reports the verdict back to `Plans` through it, which is how a plan
+    /// learns that its step bounced instead of silently walking past it.
+    pub plan: Option<PlanStamp>,
 }
 
 impl SubmitIntent {
@@ -6360,6 +7963,7 @@ impl SubmitIntent {
             tag: "ui".to_string(),
             intent,
             trigger: None,
+            plan: None,
         }
     }
 
@@ -6376,6 +7980,56 @@ impl SubmitIntent {
             tag: format!("trigger:{name}"),
             intent,
             trigger: Some(name),
+            plan: None,
+        }
+    }
+
+    /// An intent a **plan step** submitted, on behalf of the seat that set it.
+    ///
+    /// The tag names the plan AND the step (`plan:opening#2`), so every channel
+    /// that already prefixes by tag says which step spoke. The `#k` is what a
+    /// commander needs that a trigger never did: with eight steps a bare plan
+    /// name would not say which of them bounced.
+    pub fn plan_step(team: Team, source: IntentSource, plan: PlanStamp, intent: Intent) -> Self {
+        SubmitIntent {
+            team,
+            source,
+            tag: format!("plan:{}#{}", plan.name, plan.step),
+            intent,
+            trigger: None,
+            plan: Some(plan),
+        }
+    }
+
+    /// A decision from the scripted commander (ai.rs).
+    ///
+    /// One flat tag rather than the bridge's `cmd 3`: a batch is a document
+    /// whose commands need distinguishing, a think tick is a stream of
+    /// independent sentences and nobody is going to look one of them up by
+    /// number. What the tag does buy is a debug line that says *who* was
+    /// refused without having to read the verb.
+    pub fn script(team: Team, intent: Intent) -> Self {
+        SubmitIntent {
+            team,
+            source: IntentSource::Script,
+            tag: "script".to_string(),
+            intent,
+            // **The script pays.** `None` is load-bearing here, not a default
+            // filled in to satisfy the compiler: `apply_intents` hands a
+            // trigger-fired intent the `exempt_issuer`, and a scripted think
+            // tick is not a trigger firing — it is a commander deciding, at
+            // the moment of deciding, which is the thing the link prices.
+            // docs/TEMPO.md §3's "the scripted AI pays latency too, or
+            // autopilot becomes a cheat at the third seat" is enforced by this
+            // field being what it is.
+            trigger: None,
+            // And `plan` is `None` on the identical argument, which is the same
+            // sentence one verb further along: a plan step is *also* handed the
+            // `exempt_issuer`, so a script that could stamp this field could
+            // claim the exemption without ever having written a plan down. The
+            // scripted seat decides at the moment of deciding; it never defers,
+            // so it never earns the discount for having deferred.
+            plan: None,
         }
     }
 }
@@ -7807,6 +9461,23 @@ const HERO_LOW_FRAC: f32 = 0.35;
 pub const BUILDING_HURT_FRAC: f32 = 0.5;
 /// A tick that loses this many units of one kind is reported as one line.
 const LOSS_AGGREGATE: usize = 3;
+/// Smallest body of enemy troops worth an event line. Below this it is a
+/// patrol, and the feed's job is attention rather than transcription.
+const ARMY_EVENT_MIN: usize = 4;
+/// How recently a group must have been observed to be "spotted" rather than
+/// merely remembered. Generous in GAME seconds because the feed's cadence is
+/// REAL seconds: at `WC3_SPEED=16` a whole diff interval is sixteen game
+/// seconds, and a window narrower than that would silently stop announcing
+/// armies at speed — the exact class of bug the two clocks invite.
+const ARMY_EVENT_FRESH_S: f32 = 20.0;
+/// Same ground, same news: an army near a place already reported stays quiet
+/// this long. Rate-limiting re-sightings is not politeness, it is the
+/// difference between a feed and a stream.
+const ARMY_REANNOUNCE_S: f32 = 60.0;
+/// How near counts as the same place for that suppression. Wider than
+/// `GROUP_RADIUS` so an army that shuffles across its own frontage does not
+/// re-announce itself as a second army.
+const ARMY_SAME_PLACE: f32 = GROUP_RADIUS * 1.5;
 /// Sudden growth in the base-threat count that re-raises the event.
 const THREAT_SPIKE: usize = 3;
 /// Slack on a vanished bounty's deadline before we call its disappearance
@@ -7979,6 +9650,19 @@ struct EventMemo {
     /// bounty entity id -> (position, gold, expiry deadline). Bounties are the
     /// one thing in this memo that isn't own-team: treasure is neutral.
     bounties: std::collections::BTreeMap<u64, ([f32; 2], u32, f32)>,
+    /// `(centroid, game time)` of each enemy army already announced.
+    ///
+    /// Keyed by PLACE rather than by group identity, and that is the whole
+    /// trick. A group has no stable id — it is re-clustered from scratch every
+    /// time anyone asks, and one casualty or one straggler renumbers it — so
+    /// suppressing repeats by identity would suppress nothing. What a reader
+    /// actually means by "I already know about that army" is "I already know
+    /// about an army *there*", and ground holds still.
+    ///
+    /// A `Vec` and not a map: it is pruned to the last `ARMY_REANNOUNCE_S` and
+    /// bounded by how many distinct places an army can be at once, and it must
+    /// iterate in insertion order for the event lines to be reproducible.
+    announced_armies: Vec<([f32; 2], f32)>,
 }
 
 /// One decimal place — event text stays terse and diffs cleanly.
@@ -8457,6 +10141,49 @@ fn diff_team(
         }
     }
 
+    // --- enemy armies spotted --------------------------------------------
+    // The aggregate view, pushed rather than polled. Both renderers get the
+    // same line for the same reason the rest of the feed exists: a commander
+    // that has to notice an army by diffing two intel sections is paying the
+    // polling latency trigger.rs was written to delete, and a human who has to
+    // spot one by watching the minimap is paying it too.
+    //
+    // Fog-honest for free — `army_groups()` clusters THIS team's ledger, which
+    // cannot contain a unit this team never saw.
+    memo.announced_armies
+        .retain(|(_, t)| now - *t <= ARMY_REANNOUNCE_S);
+    for group in fog.army_groups() {
+        if group.size < ARMY_EVENT_MIN {
+            continue;
+        }
+        // Remembered is not spotted. Without this gate a ninety-second-old
+        // rumour would be announced as news the moment the suppression window
+        // on its patch of ground expired, and the feed would report armies
+        // that were reported an hour ago.
+        if now - group.t_seen > ARMY_EVENT_FRESH_S {
+            continue;
+        }
+        let here = [group.centroid.x, group.centroid.z];
+        if memo
+            .announced_armies
+            .iter()
+            .any(|(p, _)| (p[0] - here[0]).hypot(p[1] - here[1]) <= ARMY_SAME_PLACE)
+        {
+            continue;
+        }
+        memo.announced_armies.push((here, now));
+        out.push((
+            format!(
+                "enemy army spotted: ~{} ({}) {}",
+                group.size,
+                group.summary(),
+                place_name(group.centroid, me)
+            ),
+            EventSeverity::Warning,
+            Some(group.centroid),
+        ));
+    }
+
     // --- remember --------------------------------------------------------
     memo.units = cur_units;
     memo.buildings = cur_buildings;
@@ -8667,7 +10394,15 @@ mod tests {
                 12.0,
                 stamped,
             ),
-            (Cause::Script { what: "wave" }, 5.0, "script:wave".to_string()),
+            (
+                // The third seat, since wc3clone-jem: the scripted commander
+                // submits intents like the other two, so its wave reads as an
+                // ORDER by `script` rather than as a rung of its own. Nothing
+                // in the format is special-cased for it — that IS the claim.
+                Cause::Order { verb: "attackmove", source: IntentSource::Script },
+                5.0,
+                "order:attackmove by script t=5".to_string(),
+            ),
             (
                 Cause::Instinct { what: "auto-enroll" },
                 5.0,
@@ -8742,7 +10477,7 @@ mod tests {
     fn the_log_tag_and_the_units_answer_are_the_same_string() {
         let intent: Intent =
             serde_json::from_str(r#"{"type":"move","units":[1,2],"x":40.0,"z":40.0}"#).unwrap();
-        let mark = IntentMark { source: IntentSource::Bridge, at: 21.5, trigger: None };
+        let mark = IntentMark { source: IntentSource::Bridge, at: 21.5, trigger: None, plan: None };
         let logged = mark.order(intent.provenance_verb().unwrap()).why();
         let on_the_unit = Provenance::new(
             Cause::Order { verb: "move", source: IntentSource::Bridge },
@@ -10270,6 +12005,96 @@ mod tests {
         // And the id is filed for the diff, so the claimer is not ALSO shown
         // the anonymous `bounty gone` line for its own cache a second later.
         assert_eq!(feed.claims, vec![(7, Team::Claude)]);
+    }
+
+    /// A newly sighted army announces itself, in the aggregate shape a human
+    /// would use out loud — and then stops, because a feed that repeated it
+    /// every second would be a stream.
+    #[test]
+    fn a_newly_sighted_enemy_army_is_announced_once_per_place() {
+        let mut memo = EventMemo::default();
+        // Skip the seeding tick: this test is about the army block, not about
+        // the diff's first-frame behaviour.
+        memo.seeded = true;
+        let mut grids = FogGrids::test_dark();
+        for i in 0..5u64 {
+            grids.test_sight(
+                Team::Human,
+                Sighting {
+                    id: i,
+                    team: Team::Claude,
+                    kind: if i < 3 {
+                        UnitKind::Footman
+                    } else {
+                        UnitKind::Archer
+                    },
+                    pos: Vec3::new(i as f32, 0.0, 0.0),
+                    hp_frac: 1.0,
+                    heading: None,
+                    t_seen: 100.0,
+                },
+            );
+        }
+        let orders = SquadOrders::default();
+        let mut run = |now: f32, memo: &mut EventMemo| {
+            diff_team(
+                Team::Human,
+                now,
+                memo,
+                &[],
+                &[],
+                &[],
+                &orders,
+                grids.get(Team::Human),
+                &[],
+            )
+        };
+
+        let out = run(100.0, &mut memo);
+        assert_eq!(out.len(), 1, "one line for one army");
+        assert!(
+            out[0].0.starts_with("enemy army spotted: ~5 (3 Footman, 2 Archer)"),
+            "unexpected wording: {}",
+            out[0].0
+        );
+        assert_eq!(out[0].1, EventSeverity::Warning);
+        assert!(out[0].2.is_some(), "and somewhere for the camera to look");
+
+        // Same army, same ground, one second later: silence.
+        assert!(
+            run(101.0, &mut memo).is_empty(),
+            "re-sightings are rate-limited — this is news, not telemetry"
+        );
+
+        // Long enough later that the suppression lapses, but the sighting is
+        // now far too stale to be called a spotting. Still silence, and for
+        // the OTHER reason: remembered is not spotted.
+        assert!(
+            run(100.0 + ARMY_REANNOUNCE_S + 1.0, &mut memo).is_empty(),
+            "a ninety-second-old rumour must never be re-announced as news"
+        );
+    }
+
+    /// The feed obeys the same ledger the snapshot does: no sightings, no
+    /// army line, however many enemies are actually standing there.
+    #[test]
+    fn an_unseen_army_raises_no_event() {
+        let mut memo = EventMemo::default();
+        memo.seeded = true;
+        let grids = FogGrids::test_dark();
+        let orders = SquadOrders::default();
+        let out = diff_team(
+            Team::Human,
+            100.0,
+            &mut memo,
+            &[],
+            &[],
+            &[],
+            &orders,
+            grids.get(Team::Human),
+            &[],
+        );
+        assert!(out.is_empty());
     }
 
     /// The Sanctum's whole content wiring, asked of the derived tables rather

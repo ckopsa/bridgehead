@@ -63,10 +63,16 @@
 //! ## Determinism inside the set
 //!
 //! `SimSet::Think` also holds doctrine.rs's seven systems, and Bevy leaves two
-//! systems in one set unordered unless something forces an edge. Nothing does
-//! here, and nothing needs to: this system's only writes are `ResMut<Triggers>`
-//! (nobody else touches it), `ResMut<GameEvents>` (no other writer lives in
-//! `Think`) and `EventWriter<SubmitIntent>` (same). Everything it reads is
+//! systems in one set unordered unless something forces an edge. One thing
+//! does: plan.rs's evaluator writes the same two things this system does, and
+//! it declares itself `.before` this one so that a trigger's answer to the
+//! situation at hand lands AFTER a plan's answer to the general case, and
+//! therefore wins. That edge is argued in plan.rs's module docs.
+//!
+//! Against doctrine, nothing forces an edge and nothing needs to: this system's
+//! only writes are `ResMut<Triggers>` (nobody else touches it),
+//! `ResMut<GameEvents>` and `EventWriter<SubmitIntent>` (whose only other
+//! `Think` writer is plan.rs, ordered explicitly). Everything it reads is
 //! read-only, and doctrine's `Order` writes go through `Commands`, which flush
 //! after the set either way. So the two are genuinely commutative rather than
 //! merely usually-fine.
@@ -178,11 +184,17 @@ fn xz_dist(a: Vec3, b: Vec3) -> f32 {
 
 /// Does `when` hold for `me`, right now?
 ///
+/// `pub` because plan.rs asks the same question about the same vocabulary: a
+/// plan step's `advance` condition IS a [`TriggerWhen`], and two evaluators
+/// with two readings of "we reached tier 2" would be two languages. One
+/// definition, two callers — and any predicate a later bead adds here is a plan
+/// advance-condition the moment it lands, with no work in plan.rs.
+///
 /// Every arm is a fold over state the frame already has. Nothing here writes,
 /// remembers, or subscribes: a predicate that needed its own bookkeeping would
 /// be a predicate whose truth could drift from the world, and the whole value
 /// of firing at machine speed is that the world is what fired it.
-fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
+pub fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
     match when {
         // Our own BUILDINGS, damaged inside the window. Buildings only: a
         // skirmish in midfield is not the base being attacked, and a predicate
@@ -289,6 +301,41 @@ fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
             seen as u32 >= (*count).max(1)
         }
 
+        // INTEL, not sight. The only two predicates in this file that read the
+        // ledger rather than the world, and they are fog-honest a step further
+        // out than the rest: the ledger itself cannot contain anything this
+        // team did not observe, so a predicate over it inherits the property
+        // instead of re-deriving it. There is no `world.units` access in
+        // either arm, which is the structural version of that claim.
+        TriggerWhen::EnemyArmySeen { size, within_s } => {
+            let fog = world.fog.get(me);
+            fog.army_groups().iter().any(|g| {
+                g.size as u32 >= (*size).max(1)
+                    && within_s.is_none_or(|w| (now - g.t_seen).max(0.0) <= w)
+            })
+        }
+
+        // A LEVEL predicate: "their hero is currently believed dead". See the
+        // doc on `TriggerWhen::EnemyHeroDown` for why it is not an edge, and
+        // what a once vs. a repeating rule does with it.
+        TriggerWhen::EnemyHeroDown { class } => {
+            let want = class.as_deref().and_then(parse_unit_kind);
+            // An unparseable or non-hero class is refused by the compiler at
+            // set time, so reaching here with one is impossible; believing
+            // nothing is the safe answer if it ever happens.
+            if class.is_some() && !want.is_some_and(is_hero_kind) {
+                return false;
+            }
+            let fog = world.fog.get(me);
+            let down = |h: &HeroIntel| h.status == HeroStatus::SeenDying;
+            match want {
+                // A named class asks about exactly one belief, so ask for it
+                // rather than scanning and filtering.
+                Some(kind) => fog.hero_intel_of(kind).is_some_and(down),
+                None => fog.hero_intel().iter().any(down),
+            }
+        }
+
         // Fog-honest for the same reason and through the same call the
         // snapshot's `bounties` array uses.
         TriggerWhen::BountySpawned => {
@@ -352,7 +399,11 @@ fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
 /// "did my rule ever go off?" is answerable from the snapshot rather than from
 /// an absence. A repeating one stamps `last_fired` and goes quiet for its
 /// cooldown.
-fn evaluate_triggers(
+/// `pub` so plan.rs can declare a hard ordering edge against it. Both systems
+/// live in `SimSet::Think` and both write `SubmitIntent` and `GameEvents`, and
+/// Bevy would otherwise leave them unordered — see plan.rs's module docs for
+/// why plans go first and a trigger therefore wins a same-tick tie.
+pub fn evaluate_triggers(
     time: Res<Time>,
     mut triggers: ResMut<Triggers>,
     mut submissions: EventWriter<SubmitIntent>,
@@ -720,6 +771,253 @@ mod tests {
         assert_eq!(fired(&mut app).len(), 1);
     }
 
+    // -- intel: predicates that read MEMORY rather than sight --------------
+
+    fn sighting(id: u64, kind: UnitKind, x: f32, t_seen: f32) -> Sighting {
+        Sighting {
+            id,
+            team: Team::Claude,
+            kind,
+            pos: Vec3::new(x, 0.0, 0.0),
+            hp_frac: 1.0,
+            heading: None,
+            t_seen,
+        }
+    }
+
+    /// The difference between `enemy_sighted` and `enemy_army_seen` in one
+    /// test: an army standing in the dark fires NEITHER, and an army recorded
+    /// in the ledger fires only the second — which is what makes it survive
+    /// the death of the scout that found it.
+    #[test]
+    fn enemy_army_seen_reads_the_ledger_not_the_board() {
+        let mut app = trigger_app();
+        // Four enemies really standing there, and no vision of them at all.
+        for i in 0..4 {
+            app.world_mut().spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Claude,
+                Transform::from_translation(Vec3::new(20.0 + i as f32, 0.0, 20.0)),
+                Health::new(100.0),
+            ));
+        }
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyArmySeen {
+                    size: 3,
+                    within_s: None,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "an army nobody has ever seen is an army no rule may react to"
+        );
+
+        // Now the same four are in this team's ledger — scouted at t=0 by a
+        // rider that is long since dead. The board has not changed.
+        let mut grids = FogGrids::test_dark();
+        for i in 0..4u64 {
+            grids.test_sight(Team::Human, sighting(i, UnitKind::Footman, i as f32, 0.0));
+        }
+        app.insert_resource(grids);
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(
+            fired(&mut app).len(),
+            1,
+            "what we know outlives what we can see — that is the whole feature"
+        );
+    }
+
+    #[test]
+    fn enemy_army_seen_counts_the_group_and_honours_a_staleness_bound() {
+        let mut app = trigger_app();
+        let mut grids = FogGrids::test_dark();
+        // Three together, seen at t=0.
+        for i in 0..3u64 {
+            grids.test_sight(Team::Human, sighting(i, UnitKind::Footman, i as f32, 0.0));
+        }
+        // A fourth, far away — a separate group, so no group reaches four.
+        grids.test_sight(Team::Human, sighting(9, UnitKind::Footman, 90.0, 0.0));
+        app.insert_resource(grids);
+
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyArmySeen {
+                    size: 4,
+                    within_s: None,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "four scattered units are not a force of four"
+        );
+
+        // Three IS enough, and the sighting is 30s old.
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)[0]
+            .when = TriggerWhen::EnemyArmySeen {
+            size: 3,
+            within_s: None,
+        };
+        advance(&mut app, 30.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1, "a known army, however old");
+
+        // The same rule, now demanding a sighting from the last ten seconds.
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)[0]
+            .when = TriggerWhen::EnemyArmySeen {
+            size: 3,
+            within_s: Some(10.0),
+        };
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "35s of memory is not a current army; `within_s` is how you say so"
+        );
+    }
+
+    /// `enemy_hero_down` is a LEVEL predicate over a belief, not an edge over
+    /// an event. `Unknown` and `Alive` are both "not down", and only a death
+    /// this team WATCHED sets the belief.
+    #[test]
+    fn enemy_hero_down_fires_on_the_belief_and_only_on_the_belief() {
+        let mut app = trigger_app();
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyHeroDown { class: None },
+                stop_intent(),
+                Some(1.0),
+            ));
+
+        // Unknown: never met. NOT the same as dead, and the commonest way to
+        // get this wrong would be to treat an empty belief as a true one.
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "never having seen their hero is not knowing it is dead"
+        );
+
+        // Alive.
+        let mut grids = FogGrids::test_dark();
+        grids.test_hero_intel(Team::Human, UnitKind::Hero, HeroStatus::Alive, Vec3::ZERO);
+        app.insert_resource(grids);
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(fired(&mut app).is_empty(), "alive is not down");
+
+        // Watched it die.
+        let mut grids = FogGrids::test_dark();
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::SeenDying,
+            Vec3::ZERO,
+        );
+        app.insert_resource(grids);
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1, "we watched it fall");
+    }
+
+    #[test]
+    fn enemy_hero_down_can_name_one_class() {
+        let mut app = trigger_app();
+        let mut grids = FogGrids::test_dark();
+        // Their Champion is down; their Priestess is alive and well.
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::SeenDying,
+            Vec3::ZERO,
+        );
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Priestess,
+            HeroStatus::Alive,
+            Vec3::ZERO,
+        );
+        app.insert_resource(grids);
+
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyHeroDown {
+                    class: Some("Priestess".to_string()),
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "a rule about their Priestess must not fire on their Champion"
+        );
+
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)[0]
+            .when = TriggerWhen::EnemyHeroDown {
+            class: Some("Hero".to_string()),
+        };
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1);
+    }
+
+    /// The documented once-vs-repeating interaction, pinned. The predicate
+    /// stays TRUE for as long as the belief stands, so a `once` rule fires
+    /// exactly one time (the edge a commander means by "when their hero
+    /// falls") and a repeating one keeps going while they have no hero.
+    #[test]
+    fn a_once_rule_on_a_standing_belief_still_fires_exactly_once() {
+        let mut app = trigger_app();
+        let mut grids = FogGrids::test_dark();
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::SeenDying,
+            Vec3::ZERO,
+        );
+        app.insert_resource(grids);
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyHeroDown { class: None },
+                stop_intent(),
+                None,
+            ));
+
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1);
+        for _ in 0..4 {
+            advance(&mut app, 30.0);
+            app.update();
+            assert!(
+                fired(&mut app).is_empty(),
+                "the belief still holds, but the rule is spent"
+            );
+        }
+    }
+
     // -- the other predicates ---------------------------------------------
 
     #[test]
@@ -1035,6 +1333,7 @@ mod tests {
             )
             .expect("the recipe in COMMANDER_BRIEF.md parses"),
             trigger: None,
+            plan: None,
         });
         app.update();
         assert_eq!(
@@ -1376,6 +1675,7 @@ mod tests {
             )
             .expect("the recipe parses"),
             trigger: None,
+            plan: None,
         });
         app.world_mut().send_event(SubmitIntent {
             team: Team::Human,
@@ -1390,6 +1690,7 @@ mod tests {
             )
             .expect("the recipe in COMMANDER_BRIEF.md parses"),
             trigger: None,
+            plan: None,
         });
         app.update();
         assert_eq!(app.world().resource::<Triggers>().get(Team::Human).len(), 1, "armed");

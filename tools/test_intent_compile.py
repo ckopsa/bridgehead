@@ -210,33 +210,41 @@ def test_forage_mid_with_cavalry_names_only_the_cavalry():
 
 
 def test_the_headline_directive():
-    """THESIS.md's example, end to end.
+    """THESIS.md's example, end to end — and it no longer defers.
 
-    Two clauses compile; the conditional one is deferred with the exact
-    follow-up command — and it is still deferred now that `trigger_set` EXISTS,
-    which is the interesting half. "their hero falls" is not deferred because
-    the language lacks a `when`; it is deferred because the predicate
-    vocabulary has no reading of an ENEMY hero's health, and answering it with
-    your own would be a different order carried out silently.
+    This test is the ledger of what the intel bead bought. All three clauses
+    compile now: "strike when their hero falls" was deferred for as long as the
+    engine had no honest reading of an enemy hero, and the sightings ledger is
+    that reading. Whether you WATCHED THEIR HERO DIE is a fact a human plainly
+    has — they were looking at it — so the predicate exists and the sentence
+    arms a rule instead of printing advice.
+
+    What is still refused is the neighbouring sentence about enemy hero
+    HEALTH; see `test_enemy_hero_health_still_defers_because_it_is_unknowable`.
+    The line between them is the whole point: not "is this about the enemy" but
+    "could a human have seen it".
     """
     result = compile_one("hold the west, forage mid with cavalry, "
                          "strike when their hero falls")
-    assert verbs(result) == ["squad", "posture", "squad", "posture"]
-    hold_squad, hold, forage_squad, forage = result.intents
+    assert verbs(result) == ["squad", "posture", "squad", "posture",
+                             "squad", "trigger_set"]
+    hold_squad, hold, forage_squad, forage, strike_squad, trigger = result.intents
     assert hold["posture"]["type"] == "defend"
     assert (hold["posture"]["x"], hold["posture"]["z"]) == ic.COMPASS["west"]
     assert forage["posture"]["type"] == "forage"
     # Distinct squads: the cavalry leaves the holding force for the forage job.
     assert hold["id"] != forage["id"]
     assert set(forage_squad["units"]) == {4294968130, 4294968131, 4294968132}
-    assert len(result.deferred) == 1
-    clause, condition, suggestion = result.deferred[0]
-    assert condition == "their hero falls"
-    # The action, ready to re-run the moment the event feed shows the trigger.
-    assert suggestion == "strike"
-    assert only(compile_one(suggestion), "posture")["posture"] == {
-        "type": "push", "x": -70.0, "z": -70.0
+    # The conditional: the membership is established NOW, the purpose waits.
+    assert trigger["when"] == {"type": "enemy_hero_down"}
+    assert trigger["name"] == "their-hero-down"
+    assert trigger["then"] == {
+        "type": "posture", "id": strike_squad["id"],
+        "posture": {"type": "push", "x": -70.0, "z": -70.0},
     }
+    # A once-trigger: "when" fires exactly one time and disarms.
+    assert "repeat" not in trigger
+    assert not result.errors and not result.deferred
 
 
 def test_escort_targets_a_unit_and_never_itself():
@@ -587,6 +595,10 @@ def test_every_predicate_has_a_phrase_that_reaches_it():
             {"type": "squad_below", "id": 2, "frac": 0.4},
         "when I see 3 or more siege, squad 1 defends our base":
             {"type": "enemy_sighted", "class": "Siege", "count": 3},
+        "when an enemy army of 6 is spotted, squad 1 defends our base":
+            {"type": "enemy_army_seen", "size": 6},
+        "when their hero falls, squad 1 pushes their base":
+            {"type": "enemy_hero_down"},
         "when a bounty appears, squad 1 forages mid":
             {"type": "bounty_spawned"},
         "when my mine runs dry, squad 1 defends our base":
@@ -609,16 +621,75 @@ def test_a_bare_enemy_sighting_defaults_to_one():
     assert t["when"] == {"type": "enemy_sighted", "class": "Cavalry", "count": 1}
 
 
-def test_an_unreadable_condition_defers_instead_of_guessing():
-    """The refusal that matters most. Nothing in `TriggerWhen` reads an ENEMY
-    hero's health, and the nearest predicate that exists reads YOUR OWN — so a
-    tool that reached for it would arm a rule meaning the opposite."""
+def test_strike_when_their_hero_falls_compiles():
+    """The sentence this tool was named after, finally armed.
+
+    `enemy_hero_down` is a LEVEL predicate — "their hero is currently believed
+    dead" — so a `when` (once) rule fires on the first sweep after the death is
+    witnessed and then disarms, which is the edge behaviour the English means.
+    """
     result = compile_one("strike when their hero falls")
+    trigger = only(result, "trigger_set")
+    assert trigger["when"] == {"type": "enemy_hero_down"}
+    assert trigger["then"]["posture"] == {"type": "push", "x": -70.0, "z": -70.0}
+    assert not result.deferred and not result.errors
+
+
+def test_a_named_hero_class_narrows_the_predicate_and_its_name():
+    """Two hero classes exist, so "their priestess" and "their champion" are
+    different rules and must not overwrite each other in the eight slots."""
+    champion = only(compile_one("when their champion dies, squad 2 pushes their base"),
+                    "trigger_set")
+    assert champion["when"] == {"type": "enemy_hero_down", "class": "Hero"}
+    # NOT "hero-down": that is one character from `hero_below`'s "hero-35", and
+    # the two are rules about opposite armies.
+    assert champion["name"] == "champion-down"
+    priestess = only(compile_one("when their priestess is killed, squad 1 pushes their base"),
+                     "trigger_set")
+    assert priestess["when"] == {"type": "enemy_hero_down", "class": "Priestess"}
+    assert priestess["name"] == "priestess-down"
+    assert champion["name"] != priestess["name"]
+
+
+def test_enemy_hero_health_still_defers_because_it_is_unknowable():
+    """The refusal that survived, and the reason it is a different question.
+
+    A human cannot select an enemy hero — ui.rs's pickers skip anything that is
+    not theirs — so no number about one has ever been on anybody's screen. That
+    a hero DIED is visible; that it is at 30% is not. The compiler must keep
+    telling those two apart, or the intel bead would have been an excuse to
+    hand a commander the enemy's health bars.
+    """
+    result = compile_one("strike when their hero is below 30%")
     assert not result.intents
     assert len(result.deferred) == 1
     _, condition, suggestion = result.deferred[0]
-    assert condition == "their hero falls"
+    assert condition == "their hero is below 30%"
     assert suggestion == "strike"
+
+
+def test_an_enemy_army_reads_the_ledger_and_can_bound_its_staleness():
+    """`enemy_army_seen` differs from `enemy_sighted` by MEMORY: it stays true
+    after the scout that found the army is killed, which is exactly what the
+    scout was killed to prevent. `within_s` is how a commander asks for a
+    current army rather than a known one."""
+    plain = only(compile_one("when an enemy army of 6 is spotted, squad 1 defends our base"),
+                 "trigger_set")
+    assert plain["when"] == {"type": "enemy_army_seen", "size": 6}
+    assert plain["name"] == "army-6"
+    bounded = only(
+        compile_one("whenever we know of an enemy force of 8 within 30s, "
+                    "squad 2 defends our base"),
+        "trigger_set")
+    assert bounded["when"] == {"type": "enemy_army_seen", "size": 8, "within_s": 30.0}
+    # "whenever" is the repeating connector.
+    assert bounded["repeat"] == ic.DEFAULT_REPEAT_S
+
+
+def test_minutes_are_accepted_as_a_staleness_bound():
+    t = only(compile_one("when an enemy army of 5 is seen within 2 minutes, "
+                         "squad 1 defends our base"), "trigger_set")
+    assert t["when"]["within_s"] == 120.0
 
 
 def test_a_multi_intent_action_sends_the_setup_and_defers_the_purpose():
@@ -669,6 +740,7 @@ KNOWN_VERBS = {
     "priority", "retreat", "leash", "autocast", "squad", "posture", "template",
     "trigger_set", "trigger_clear",
     "region_set", "region_clear",
+    "plan_set", "plan_clear",
     "autopilot", "surrender",
 }
 POSTURE_TYPES = {"defend", "push", "escort", "forage"}
@@ -751,7 +823,120 @@ def test_explain_lists_the_whole_vocabulary():
                    # name cannot speak one.
                    "region_set", "region_clear", "name <place>",
                    "our base", "their base", "mid", "Max 8 regions",
-                   "enemy_in", "5 or more enemies in"):
+                   "enemy_in", "5 or more enemies in",
+                   # The intel predicates, and the refusal that survived beside
+                   # them — a model must be able to see BOTH, or it will guess
+                   # that enemy hero health is available because enemy hero
+                   # death is.
+                   "an enemy army of 6 is spotted", "their hero falls",
+                   "within 30s", "ENEMY hero's health"):
+        assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
+
+
+# ---------------------------------------------------------------------------
+# Plans: "X, then Y, then Z"
+# ---------------------------------------------------------------------------
+
+
+def test_a_then_chain_becomes_one_plan():
+    """The headline. Three clauses joined by ", then" are ONE plan_set, not
+    three orders sent now — which is the whole point: the engine walks it."""
+    r = compile_one("build a barracks, then when we reach tier 2, build a sanctum, "
+                    "then train 2 sorcerers")
+    assert verbs(r) == ["plan_set"], verbs(r)
+    plan = r.intents[0]
+    kinds = [s["intent"]["type"] for s in plan["steps"]]
+    assert kinds == ["build", "build", "train", "train"], kinds
+    # The condition governs the step BEFORE it: the plan waits on the barracks
+    # step until tier 2, then puts up the sanctum.
+    assert plan["steps"][0]["advance"] == {
+        "type": "when", "when": {"type": "tier_reached", "tier": 2}}
+    assert "advance" not in plan["steps"][1], "a bare ', then' is the default"
+    assert plan["steps"][0]["intent"]["kind"] == "Barracks"
+    assert plan["steps"][1]["intent"]["kind"] == "Sanctum"
+
+
+def test_a_bare_then_chain_is_all_default_advances():
+    r = compile_one("build a barracks, then train 2 footmen")
+    plan = only(r, "plan_set")
+    assert all("advance" not in s for s in plan["steps"])
+    assert plan["name"] == "plan-build", plan["name"]
+
+
+def test_an_after_step_is_a_fixed_wait():
+    r = compile_one("push mid, then after 60s, push their base")
+    plan = only(r, "plan_set")
+    afters = [s.get("advance") for s in plan["steps"] if s.get("advance")]
+    assert afters == [{"type": "after", "secs": 60.0}], afters
+    # "after 2 minutes" is the same wait spelled the way people say it.
+    plan = only(compile_one("push mid, then after 2 minutes, push their base"), "plan_set")
+    assert [s["advance"] for s in plan["steps"] if "advance" in s] == [
+        {"type": "after", "secs": 120.0}]
+
+
+def test_a_focus_chain_is_not_a_plan():
+    """The comma is the disambiguation and it has to hold. 'focus siege then
+    heroes' is ONE clause with a priority chain in it; splitting it would turn
+    one correct order into two wrong ones."""
+    r = compile_one("focus siege then heroes")
+    assert verbs(r) == ["priority"], verbs(r)
+    assert only(r, "priority")["classes"] == ["Siege", "Hero"]
+
+
+def test_a_plan_can_be_named_and_the_derived_name_is_stable():
+    r = compile_one("build a barracks, then train 2 footmen as opener")
+    assert only(r, "plan_set")["name"] == "opener"
+    # Unnamed, the same directive twice derives the same name, so re-issuing it
+    # REPLACES the plan instead of spending the other of the two slots.
+    a = only(compile_one("build a barracks, then train 2 footmen"), "plan_set")["name"]
+    b = only(compile_one("build a barracks, then train 2 footmen"), "plan_set")["name"]
+    assert a == b == "plan-build"
+
+
+def test_the_squad_idiom_is_how_a_plan_names_units_it_does_not_have_yet():
+    """A step's units are frozen when the plan is set, so a step cannot name
+    soldiers that do not exist. The late-binding selector the language already
+    has is the SQUAD: a template stamps membership, and the posture step
+    resolves that membership when it runs."""
+    r = compile_one("the barracks units join squad 2, "
+                    "then when I have 8 footmen, squad 2 pushes their base")
+    plan = only(r, "plan_set")
+    kinds = [s["intent"]["type"] for s in plan["steps"]]
+    assert kinds[-1] == "posture" and "template" in kinds, kinds
+    # The wait is on the step before the push, and it is a unit COUNT — the
+    # plan waits for the army to exist rather than naming it.
+    waits = [s["advance"] for s in plan["steps"] if "advance" in s]
+    assert waits == [{"type": "when", "kind": "Footman", "count": 8}] or \
+        waits == [{"type": "when", "when": {"type": "unit_count",
+                                            "kind": "Footman", "count": 8}}], waits
+    # The push names the squad, never a unit list.
+    assert plan["steps"][-1]["intent"]["id"] == 2
+    assert "units" not in plan["steps"][-1]["intent"]
+
+
+def test_an_unknown_step_condition_is_an_error_not_a_guess():
+    """Same rule as the trigger layer: a condition outside the vocabulary is
+    refused by name. A plan that advanced on the wrong thing would be worse
+    than one that never compiled."""
+    r = compile_one("build a barracks, then when the sky falls, train 4 footmen")
+    assert not r.intents
+    assert any("not a condition the engine can watch" in why for _, why in r.errors), r.errors
+
+
+def test_a_plan_is_refused_when_it_is_too_long_or_shaped_like_a_trigger():
+    r = compile_one("train 9 footmen, then push mid")
+    assert not r.intents
+    assert any("steps" in why and "8" in why for _, why in r.errors), r.errors
+
+    # A condition cannot open a plan — that shape is a trigger, and the tool
+    # says which word to use rather than compiling something else.
+    r = compile_one("when we reach tier 2, build a sanctum, then train 2 sorcerers")
+    assert any("cannot open with a condition" in why for _, why in r.errors), r.errors
+
+
+def test_explain_documents_the_plan_grammar():
+    for phrase in ("PLANS", ", then", "then when <cond>", "then after <n>s",
+                   "at most 8 steps", "THE COMMA MATTERS"):
         assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
 
 

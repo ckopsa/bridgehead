@@ -5,7 +5,7 @@
 
 WHAT THIS IS
 ------------
-The game speaks exactly one language: `shared::Intent`, 27 verbs, documented in
+The game speaks exactly one language: `shared::Intent`, 29 verbs, documented in
 docs/INTENT.md. A human's mouse compiles to it; a bridge commander's JSON *is*
 it. This tool adds a third spelling of the same language — English — and it is
 a TOOL, not an engine feature. Nothing here is natural-language processing.
@@ -65,6 +65,33 @@ unparseable `when` clause is an error naming the predicates that exist, never
 a plain order that quietly runs right now. An order that fires at the wrong
 moment is the failure this tool exists to prevent, and it is worse when the
 commander believes they armed a rule.
+
+SEQUENCES ARE REAL TOO
+----------------------
+`then` is now a word the engine understands, so it is a word this tool
+compiles. A directive whose clauses are joined by ", then" becomes ONE
+`plan_set` — a named sequence the engine walks for you, submitting each step
+when its turn comes:
+
+    "build a barracks, then when we reach tier 2, build a sanctum,
+     then train 3 sorcerers"
+      -> {"type":"plan_set","name":"plan-build","steps":[
+           {"intent":{"type":"build",...},
+            "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}},
+           {"intent":{"type":"build",...}},
+           {"intent":{"type":"train",...}}]}
+
+The grammar is the English one. A bare ", then" means "as soon as that lands".
+A ", then when <condition>," is the same condition vocabulary triggers use, and
+it attaches to the step BEFORE it — because that is what it governs: the plan
+waits there until the condition holds. A ", then after 30s," is a fixed wait.
+
+The comma is load-bearing and that is deliberate: "focus siege then heroes" is
+a focus-fire chain, not a sequence, and splitting it would silently turn one
+clause into two. Say ", then" when you mean a step.
+
+A plan is once-through and bounded at 8 steps. Repetition is a trigger's job
+(`whenever`), which is the other half of the same sentence.
 """
 
 import argparse
@@ -90,6 +117,9 @@ FIRST_ALLOCATABLE_SQUAD = 1
 # within this many world units of the named place is treated as "that one".
 SQUAD_REUSE_RADIUS = 25.0
 DEFAULT_DEFEND_RADIUS = 18.0
+# shared.rs: MAX_PLAN_STEPS. Checked here rather than left to the engine so a
+# too-long sequence is refused before it is sent, with advice attached.
+MAX_PLAN_STEPS = 8
 
 # --- unit selectors --------------------------------------------------------
 # The nouns commanders actually use, mapped to snapshot `units[].kind` values.
@@ -1487,10 +1517,37 @@ def parse_when(text, snap=None):
                           r"burning|threatened)\b", t)):
         return {"type": "base_under_attack"}
 
+    # --- THEIR hero is down -----------------------------------------------
+    # This branch is the one that used to be a deferral, and the distinction it
+    # rests on is worth keeping in view. There is still no reading of an enemy
+    # hero's HEALTH — "strike when their hero is below 30%" is as unanswerable
+    # as it ever was, because no human can select an enemy hero and read a
+    # number off it. What changed is that whether you WATCHED IT DIE is a fact
+    # a human plainly has, and the intel ledger now keeps it. So the honest
+    # predicate is not "their hero is hurt" but "their hero is believed dead",
+    # and that is what these words compile to.
+    #
+    # Above the `not theirs` block so "their hero falls" cannot fall through
+    # into a rule about OUR hero — which is the silent wrong order this whole
+    # tool exists to avoid, and the reason the sentence was refused for so
+    # long.
+    if theirs and re.search(r"\b(hero(?:es)?|champion|priestess)\b", t):
+        if re.search(r"\b(falls?|fell|dies?|died|dying|down|dead|killed|"
+                     r"slain|drops?|goes\s+down)\b", t):
+            when = {"type": "enemy_hero_down"}
+            # Name the class only if they named it. "their hero falls" means
+            # whichever one — a commander who says "hero" is not asking to be
+            # told they should have said "champion".
+            for word, kind in (("champion", "Hero"), ("priestess", "Priestess")):
+                if re.search(rf"\b{word}\b", t):
+                    when["class"] = kind
+                    break
+            return when
+
     # --- a hero is dying --------------------------------------------------
-    # `their hero falls` is deliberately NOT this: the predicate vocabulary has
-    # no reading of an enemy hero's health, and answering it with your own would
-    # be the silent wrong order this whole tool exists to avoid.
+    # OURS. `their hero is below 40%` still reaches no branch and still defers:
+    # enemy hero health is not knowable, and answering it with our own number
+    # would be a rule that fires on the wrong army.
     if not theirs:
         m = re.search(r"\bhero(?:es)?\b.*?(?:below|under|at)\s*(?P<pct>\d+)\s*%", t)
         if m:
@@ -1548,6 +1605,31 @@ def parse_when(text, snap=None):
                     # anything in north-pass" are different rules.
                     return None
                 return out
+    # --- a body of their troops, from the ledger --------------------------
+    # Above the sighting branch because "army" is a noun the sighting branch
+    # cannot resolve to a class — it would return None and defer a sentence
+    # that is now perfectly expressible.
+    #
+    # The difference from `enemy_sighted` is memory, and it is worth stating
+    # because the two English sentences look alike. `enemy_sighted` is true
+    # only while eyes are ON them; `enemy_army_seen` reads the intel ledger, so
+    # it stays true after the scout that found them is killed — which is
+    # exactly what the scout was killed to prevent.
+    if re.search(r"\b(army|armies|force|forces|host|warband|stack|group|"
+                 r"doomstack|deathball)\b", t):
+        m = re.search(r"(?P<n>\d+)", t)
+        if m:
+            when = {"type": "enemy_army_seen", "size": int(m.group("n"))}
+            # "in the last 30 seconds" / "within 20s" — an optional bound on
+            # how stale the observation may be.
+            w = re.search(r"(?:within|in\s+the\s+last|no\s+older\s+than)\s+"
+                          r"(?P<w>\d+)\s*(?P<unit>s|secs?|seconds?|m|mins?|minutes?)\b", t)
+            if w:
+                secs = int(w.group("w"))
+                if w.group("unit").startswith("m"):
+                    secs *= 60
+                when["within_s"] = float(secs)
+            return when
 
     # --- eyes on the enemy ------------------------------------------------
     rest = None
@@ -1638,6 +1720,18 @@ def name_for(when):
         n = when.get("count", 1)
         where = normalize_place(when.get("region", "")).replace(" ", "-")
         return f"{where}-watch" if n <= 1 else f"{n}-in-{where}"
+    if kind == "enemy_army_seen":
+        return f"army-{when.get('size', 1)}"
+    if kind == "enemy_hero_down":
+        # The class when they named one, so a rule about their Champion and a
+        # rule about their Priestess do not overwrite each other. Spelled with
+        # the CLASS word rather than the wire kind: `Hero` would auto-name to
+        # `hero-down`, one character away from `hero_below`'s `hero-35`, and
+        # the two are about opposite armies.
+        cls = when.get("class")
+        if cls:
+            return {"Hero": "champion-down"}.get(cls, f"{cls.lower()}-down")
+        return "their-hero-down"
     if kind == "bounty_spawned":
         return "bounty-up"
     if kind == "mine_dry":
@@ -1731,6 +1825,128 @@ def compile_conditional(conn, cond_text, action_text, clause, ctx):
 
 
 # ---------------------------------------------------------------------------
+# Sequences: "X, then Y, then Z" -> one plan
+# ---------------------------------------------------------------------------
+#
+# One `plan_set`, because the engine walks a plan itself: the whole sequence is
+# handed over once and each step is submitted when its turn comes. The old
+# alternative was to send step 1 and remember to send step 2 next cycle, which
+# for a language model prices a five-step build order at five polls of nothing
+# but transcription.
+
+# The joint. A COMMA (or semicolon) is required before `then`, and that is the
+# whole disambiguation: "focus siege then heroes" is a focus-fire chain that
+# lives inside ONE clause, and treating its `then` as a step boundary would
+# turn one correct order into two wrong ones. A commander who means a step
+# types the comma, which is what they were going to type anyway.
+PLAN_JOINT = re.compile(r"[,;]\s*then\s+", re.I)
+
+# "after 30s, <action>" — the fixed-wait step introducer, matched on a part
+# after the joint has split it off.
+AFTER_STEP = re.compile(r"^after\s+(?P<n>\d+(?:\.\d+)?)\s*"
+                        r"(?P<unit>s|sec|secs|seconds|m|min|mins|minutes)?\s*,\s*"
+                        r"(?P<action>.+)$", re.I)
+# "when <cond>, <action>" — the same leading-conditional shape the trigger
+# layer uses, re-read here as an ADVANCE condition rather than as a trigger.
+WHEN_STEP = re.compile(rf"^(?:{CONNECTORS})\s+(?P<cond>.+?)\s*,\s*(?P<action>.+)$", re.I)
+
+
+def plan_name_for(steps):
+    """The auto-derived plan name.
+
+    Deterministic and short, for the reason `name_for` is: re-issuing the same
+    directive next cycle must REPLACE the plan rather than spend the other of
+    the two slots. Named after what the sequence starts by doing, which is how
+    a commander refers to it anyway ("my build order", "the push").
+    """
+    if not steps:
+        return "plan"
+    return f"plan-{steps[0]['intent']['type'].replace('_', '-')}"[:24]
+
+
+def compile_plan(parts, directive, ctx):
+    """A ", then"-joined directive -> one `plan_set`.
+
+    Each part compiles through the ORDINARY rules, so a plan step can say
+    anything the language can say. A part that compiles to several intents (a
+    `hold` is membership AND purpose) contributes them as consecutive steps,
+    because that is what it means — and it is honest about the step budget it
+    just spent.
+
+    The condition on a part attaches to the PREVIOUS step's `advance`: "X, then
+    when we reach tier 2, Y" means the plan sits on X until tier 2. That is the
+    only reading of the sentence, and getting it backwards would make a plan
+    wait for a condition after it had already acted on it.
+    """
+    name = None
+    steps = []
+    for i, raw in enumerate(parts):
+        part = raw.strip().rstrip(".")
+        advance = None
+        m = AFTER_STEP.match(part)
+        if m:
+            advance = {"type": "after",
+                       "secs": round(_seconds(m.group("n"), m.group("unit")), 1)}
+            part = m.group("action").strip()
+        else:
+            m = WHEN_STEP.match(part)
+            if m:
+                when = parse_when(m.group("cond"))
+                if when is None:
+                    ctx.result.fail(directive,
+                                    f"step {i + 1}: {m.group('cond').strip()!r} is not a "
+                                    f"condition the engine can watch — see --explain "
+                                    f"for the list")
+                    return []
+                advance = {"type": "when", "when": when}
+                part = m.group("action").strip()
+        # A trailing "as <name>" on the LAST part names the whole plan, the
+        # same modifier a trigger takes and in the same position.
+        nm = NAMED.match(part)
+        if nm:
+            part, name = nm.group("rest").strip(), nm.group("name").strip()
+
+        if advance is not None:
+            if not steps:
+                ctx.result.fail(directive,
+                                "a plan cannot open with a condition — say "
+                                "\"when <cond>, <action>\" for a trigger, or put the "
+                                "condition on a later step")
+                return []
+            # It governs the step BEFORE it: the plan waits there.
+            steps[-1]["advance"] = advance
+
+        out = compile_clause(part, ctx)
+        if out is None:
+            ctx.result.fail(directive, f"step {i + 1}: {part!r} did not compile — "
+                                       f"see --explain")
+            return []
+        # A plan may not set a plan; the engine refuses it and learning that
+        # from an error channel a turn later is exactly the round trip this
+        # tool exists to save.
+        if any(x["type"] in ("plan_set", "plan_clear") for x in out):
+            ctx.result.fail(directive, "a plan step cannot set or clear a plan — "
+                                       "plans are doctrine, not a scripting language")
+            return []
+        steps.extend({"intent": x} for x in out)
+
+    if not steps:
+        return []
+    if len(steps) > MAX_PLAN_STEPS:
+        ctx.result.fail(directive,
+                        f"that is {len(steps)} steps and the engine takes "
+                        f"{MAX_PLAN_STEPS} (some clauses cost two — \"hold X with Y\" "
+                        f"is membership and purpose). Split it into two plans")
+        return []
+
+    name = name or plan_name_for(steps)
+    ctx.result.ok(directive,
+                  f"plan {name!r}: {len(steps)} steps, "
+                  + " then ".join(s["intent"]["type"] for s in steps))
+    return [{"type": "plan_set", "name": name, "steps": steps}]
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -1790,6 +2006,14 @@ def compile_directives(directives, snap):
     result = Result()
     ctx = Ctx(snap, result)
     for directive in directives:
+        # A ", then" chain is matched against the WHOLE directive, ahead of
+        # everything else, for the same reason the leading conditional is: its
+        # commas are the joints of one sentence rather than separators between
+        # independent orders, and `split_clauses` would shred it.
+        chain = PLAN_JOINT.split(directive.strip().rstrip("."))
+        if len(chain) > 1:
+            result.intents.extend(compile_plan(chain, directive.strip(), ctx))
+            continue
         # The LEADING conditional is matched against the whole directive, before
         # `split_clauses` ever sees it. "when my base is attacked, squad 1
         # defends our base" has exactly one comma and it is the joint of one
@@ -1902,6 +2126,29 @@ TERRITORY — the ground, given names
     squad 2 defends north-pass         (no radius: the region's own is the ring)
     hold north-pass with the cavalry
     when 5 or more enemies enter north-pass, squad 2 defends north-pass
+PLANS — "X, then Y, then Z" (the engine walks the sequence for you)
+  A ", then"-joined directive becomes ONE plan_set: a named sequence the engine
+  steps through, submitting each step when its turn comes. Once through, never
+  looping; at most 8 steps, at most 2 plans running.
+
+    build a barracks, then train 4 footmen
+    build a barracks, then when we reach tier 2, build a sanctum,
+        then train 3 sorcerers
+    push mid, then after 60s, push their base
+    hold the west ford, then when I see 3 siege, retreat at 40%   as opener
+
+  , then                -> next step as soon as this one is accepted
+  , then when <cond>,   -> wait here until <cond> (the trigger vocabulary)
+  , then after <n>s,    -> wait here for <n> seconds
+  ... as <name>         -> name the plan (else a stable one is derived)
+
+  THE COMMA MATTERS. "focus siege then heroes" is a focus chain in ONE clause;
+  "focus siege, then push mid" is two steps. Say ", then" when you mean a step.
+
+  A step's units are frozen when you set the plan, so a step cannot name
+  soldiers you do not have yet. Name a SQUAD instead and let the squad fill up:
+    "the barracks units join squad 2, then when I have 8 footmen,
+     squad 2 pushes their base"
 
 TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
   A conditional compiles to one `trigger_set`. The engine evaluates the
@@ -1917,7 +2164,7 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
   whenever / every time / each time       -> REPEATS (45s cooldown by default)
   "... as <name>"   names it;   "... every 90s"   sets the cooldown.
 
-  THE TEN PREDICATES (this is the whole list — `shared::TriggerWhen`):
+  THE TWELVE PREDICATES (this is the whole list — `shared::TriggerWhen`):
     my base is attacked                 any of your buildings damaged (last 8s)
     my hero drops below 40%             any living hero of yours under that
     squad 2 drops below 50%             that squad's POOLED health under that
@@ -1927,6 +2174,14 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
                                         works; the wire name is `enemy_in`).
                                         Fog-honest: an army you have no eyes on
                                         does not trip it.
+    an enemy army of 6 is spotted       6+ enemy troops in your INTEL ledger,
+                                        which outlives the scout that found
+                                        them; add "within 30s" to require a
+                                        fresh sighting rather than a remembered
+                                        one. Workers do not count as an army.
+    their hero falls                    an enemy hero you WATCHED DIE and have
+                                        not seen alive since; name the champion
+                                        or the priestess to mean just one
     a bounty appears                    a cache you can see is on the map
     my mine runs dry                    a dry gold mine near one of your halls
     we reach tier 2                     your tech tier (1/2/3)
@@ -1936,8 +2191,11 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
   If your condition is not one of these the tool says so and falls back to the
   old advice — watch `events` (bridge_wait.py wakes you on them) and send the
   action yourself. It will not silently pick a predicate that is nearly right:
-  "strike when their hero falls" defers, because nothing here reads an ENEMY
-  hero's health and answering it with your own is a different order.
+  "strike when their hero is below 30%" still defers, because nothing reads an
+  ENEMY hero's health — you cannot select one, so no number about it is
+  knowable — and answering it with your own is a different order. "when their
+  hero FALLS" is a different question, and that one compiles: whether you
+  watched it die is a fact you have.
 
   A trigger's action is any intent, but exactly ONE. When your phrasing needs
   two ("hold the ford with the cavalry" is membership AND purpose), the
@@ -1984,7 +2242,7 @@ def report(result, stream):
         # CONDITION is outside `TriggerWhen`. The old watch-the-feed advice is
         # exactly right for that case and nothing else, so it lives here.
         print(f"  deferred {clause!r:<44} -> no predicate matches {cond!r} "
-              f"(see --explain for the nine); watch `events` for it, then run:",
+              f"(see --explain for the eleven); watch `events` for it, then run:",
               file=stream)
         print(f"           intent_compile.py --seat <SEAT> --send "
               f"{suggestion!r}" if suggestion else

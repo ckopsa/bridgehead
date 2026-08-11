@@ -647,6 +647,7 @@ a substitution inside `compile_intent`'s order arms and nothing else. The
 | `use_item`, `buy` | exempt |
 | `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt — doctrine IS the fast path |
 | `trigger_set`, `trigger_clear` | exempt — arming a rule is doctrine, and the rule's own firing is too (below) |
+| `plan_set`, `plan_clear` | exempt — writing a sequence down is doctrine, and the plan's own steps are too (below) |
 | `autopilot`, `surrender` | exempt — match level |
 
 The `cast` row was originally not a carve-out but an identity: every caster in
@@ -698,6 +699,27 @@ policy whose condition happened to come true: the commander reached the unit
 when they ARMED it, and charging the link again on firing would price one reach
 twice.
 
+**Plan steps pay nothing either, on the identical argument** (`wc3clone-c5b`,
+v3). A `plan_set` hands the engine a named sequence; when a step's turn comes,
+the engine submits that step's stored intent through the ordinary compiler, and
+that submission is **exempt from the link** whatever verb it carries. Same
+derivation, one rung along: a plan is standing policy the engine executes
+unattended, its author reached the units when they wrote the sequence down, and
+step 4 firing four minutes later is the engine doing what it was told rather
+than a new order travelling out from a commander.
+
+It also has to be exempt for the mechanism's own incentive to survive. If each
+step paid, a five-step plan would cost five links and be *strictly worse* than
+typing the same five commands by hand from the same place — which inverts C4
+("doctrine strictly better than micro at range") at exactly the layer where the
+tempo argument is strongest, because a plan is the one construct that is
+*entirely* decided in advance.
+
+Both rows are selected by the same named constructor: `CommandLink::exempt_issuer`,
+reached when `SubmitIntent` carries either a `trigger` or a `plan` stamp. One
+call site, two rows, and the constructor exists rather than a boolean precisely
+so this table has somewhere to point.
+
 It also extends C4 one rung. "Doctrine is strictly better than micro at range"
 was an argument about *continuous* work; with triggers exempt, *pre-arming a
 rule is strictly better than hand-answering an alarm at range* — the same
@@ -731,6 +753,13 @@ it should cost something to place.
 it calls the same `OrderIssuer` directly at its nine unit-order sites. Its
 `build` is exempt on the same row as everybody else's. Two tests pin it, in both
 flag states — if autopilot ever stops paying, the suite says so.
+
+> **Superseded by wc3clone-jem.** `ai.rs` speaks through the compiler now, so
+> it no longer touches `OrderIssuer` at all: the third seat pays because there
+> is no other path from a scripted decision to an order, rather than because
+> this file remembered to make it. The two tests survive and assert something
+> stronger — the same `ground_order` arm prices all three seats. See
+> docs/INTENT.md § the third seat.
 
 **The doctrine guards** (§4's integration hazard, and issue 5's subject) are in:
 `run_squad_postures` and `enforce_leash` both gained `Without<PendingOrder>`,
@@ -769,7 +798,13 @@ field, both absent when nothing was delayed, so a flag-off replay is
 character-for-character a v1 replay. `ai.rs` is not a player and writes no
 intent log, so an AI-vs-AI sweep would otherwise produce no evidence at all;
 `command::report_link_load` covers that with a periodic line giving orders in
-transit, mean link and worst link. That series is what issue 8's calibration
+transit, mean link and worst link.
+
+> **Superseded by wc3clone-jem** for the first half: `ai.rs` *is* a player, and
+> an AI-vs-AI sweep now writes a full intent log with its `link` annotations
+> intact — the scripted seat's sentences carry `(+0.7s link)` exactly as a
+> commander's do. `report_link_load` remains the aggregate view and is still
+> the series issue 8's calibration should read. That series is what issue 8's calibration
 should read: near-zero mean means the curve is not binding, a mean pinned at the
 cap means the armies have marched off the end of their own chain of command.
 
@@ -889,6 +924,12 @@ and this bead routes them through `OrderIssuer`; the composition is
 layer rather than around it and survives the deferred dispatch. All eleven sites
 compose, and no direct `Order` write remains in either the compiler or the
 script.
+
+> **Superseded by wc3clone-jem.** The `script(what, now)` provenance helper and
+> the `Cause::Script` rung it minted are both gone: the script's orders are
+> stamped by the compiler like everyone else's, as `order:<verb> by script`.
+> The composition question this paragraph answered no longer arises, because
+> there is only one mint site left.
 
 ---
 

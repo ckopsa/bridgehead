@@ -256,6 +256,99 @@ const REGION_MARK_RADIUS: f32 = DEFEND_RADIUS;
 /// is visible on a 100px minimap.
 const REGION_NUDGE: f32 = 4.0;
 
+/// The selection panel's one-line plan readout: every plan this team has, where
+/// it is, and whether it is in trouble.
+///
+/// **The asymmetry is deliberate and it is the same one triggers made.** The
+/// human gets a STATUS display and no authoring UI. That is not a seat the
+/// engine treats differently — `plan_set` is one verb in one language and a
+/// human's `intent_compile.py` sentence compiles to exactly the JSON a bridge
+/// commander writes. It is a rendering decision, which is the one place
+/// docs/INTENT.md permits the two seats to differ: a person at a keyboard
+/// *already has* sequencing — they press the keys in order, at 200ms each, and
+/// a mouse-driven step editor would be strictly slower than the thing it
+/// automates. What the person does NOT have is a way to see a sequence their
+/// co-commander set running unattended, and that is this line.
+///
+/// A blocked or halted plan shows its reason inline, truncated, because the
+/// whole failure design is that its owner never has to go correlate a status
+/// against an error channel.
+fn plan_line(plans: &Plans) -> String {
+    let mine = plans.get(Team::Human);
+    if mine.is_empty() {
+        return String::new();
+    }
+    /// How much of a refusal fits on a HUD line before it starts pushing the
+    /// other plan off the end. Enough for "not enough gold (need 160…".
+    const WHY_MAX: usize = 34;
+    let parts: Vec<String> = mine
+        .iter()
+        .map(|p| {
+            let head = format!("{} {}/{}", p.name, p.step_no(), p.steps.len());
+            match &p.state {
+                PlanState::Running => head,
+                PlanState::Done => format!("{head} (done)"),
+                PlanState::Blocked(why) | PlanState::Halted(why) => {
+                    let word = if matches!(p.state, PlanState::Blocked(_)) {
+                        "blocked"
+                    } else {
+                        "halted"
+                    };
+                    let short: String = if why.chars().count() > WHY_MAX {
+                        why.chars().take(WHY_MAX).collect::<String>() + "…"
+                    } else {
+                        why.clone()
+                    };
+                    format!("{head} ({word}: {short})")
+                }
+            }
+        })
+        .collect();
+    format!("Plans: {}", parts.join("  "))
+}
+
+/// What the player believes about the enemy's heroes, as one line.
+///
+/// The human half of the snapshot's `intel.heroes`, and it must stay the same
+/// claim: **one rule of knowability, rendered twice**. So it reads the same
+/// `FogGrid::hero_intel()` the bridge serialises, and it says the same three
+/// words — a class never seen is omitted here exactly as it is reported
+/// `"unknown"` there, because a HUD line listing every class the player has
+/// never met would be an enemy roster nobody scouted.
+///
+/// What it deliberately cannot say is a level. A human cannot select an enemy
+/// hero (the pickers are own-team only), so there is no gesture that would
+/// ever have shown them one, and printing it here would hand the keyboard an
+/// information right the wire does not have — the asymmetry backwards.
+///
+/// Empty string when nothing has been seen, which is how every other optional
+/// line in this panel disappears.
+fn enemy_hero_line(grid: &FogGrid, now: f32) -> String {
+    let parts: Vec<String> = grid
+        .hero_intel()
+        .iter()
+        .filter(|h| h.status != HeroStatus::Unknown)
+        .map(|h| {
+            let age = h.t_seen.map_or(String::new(), |t| {
+                format!(" {:.0}s ago", (now - t).max(0.0))
+            });
+            match h.status {
+                // No age on a death: you watched it happen, and "seen dying
+                // 40s ago" invites the reader to wonder whether it has since
+                // stopped being dead. It has not; it has possibly been
+                // revived, and that is a different sentence the moment
+                // anybody sees it.
+                HeroStatus::SeenDying => format!("{} down", kind_name(h.kind)),
+                _ => format!("{} alive{age}", kind_name(h.kind)),
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("Their heroes: {}", parts.join("   "))
+}
+
 /// Highest squad id a human gesture will ever mint. Matches the three control
 /// groups; a bridge commander may use any id it likes.
 const MAX_UI_SQUAD: u8 = 3;
@@ -464,6 +557,7 @@ impl Plugin for UiPlugin {
                         apply_fog_tint,
                         update_fog_overlay,
                         sync_building_ghosts,
+                        sync_intel_markers,
                         surrender_hotkey,
                         screenshot_hotkey,
                         scheduled_screenshots,
@@ -843,6 +937,14 @@ enum Slot {
     /// the two halves of standing policy the human can otherwise only infer
     /// from circles on the map: what will fire, and where the ground is.
     Regions,
+    /// Every plan this team has, where it is, and why it stopped if it did.
+    /// Empty until one is set. See `plan_line` for why the human gets a status
+    /// readout and no authoring UI.
+    Plans,
+    /// What we believe about the enemy's heroes — the HUD's rendering of the
+    /// snapshot's `intel.heroes`. Empty until one has been laid eyes on, so a
+    /// match where neither hero has been met looks exactly as it always did.
+    EnemyHeroes,
     /// Top bar: how much of this army is inside its own chain of command.
     /// Empty string whenever the mechanic is off.
     Coverage,
@@ -1860,6 +1962,10 @@ struct CastLookup<'w, 's> {
     /// named ground is standing policy, read by the same two systems that read
     /// the other two kinds.
     regions: Res<'w, Regions>,
+    /// And the sequenced kind, read by the same system for the same reason.
+    /// Needs no clock: a plan's state is a fact it already carries, not a
+    /// cooldown to be computed against now.
+    plans: Res<'w, Plans>,
     /// Rides along with `triggers` because it is only ever read to answer a
     /// question about them: is this repeating rule still inside its cooldown?
     clock: Res<'w, Time>,
@@ -2455,7 +2561,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         //
         // This is a PRESET, not an authoring surface, and the asymmetry is
         // real and documented (docs/INTENT.md § Triggers): a commander can
-        // write any of nine predicates against any of the 27 verbs, and the
+        // write any of nine predicates against any of the 29 verbs, and the
         // human at the keyboard gets one canned rule plus a readout. What
         // closes most of the gap is that the English compiler speaks the same
         // sentences to the same wire.
@@ -3830,9 +3936,36 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                 Color::srgb(0.85, 0.72, 0.40),
                 Slot::Triggers,
             ));
-        // The region line's own colour: the amber the marks are drawn in on
-        // both maps, so the readout and the circle are the same object.
-        c.spawn(text_bundle("", 12.0, Color::srgb(1.0, 0.78, 0.35), Slot::Regions));
+            // Directly beneath the rules, in the same colour: both are standing
+            // policy the engine runs without anybody watching, and a player
+            // scanning for "what is the game doing on my behalf" should find
+            // them as one block rather than two.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(0.85, 0.72, 0.40),
+                Slot::Plans,
+            ));
+            // Then the ground those two are written against. Amber — the
+            // colour the marks are drawn in on both maps, so the readout and
+            // the circle are visibly the same object.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(1.0, 0.78, 0.35),
+                Slot::Regions,
+            ));
+            // What we know of THEIR heroes. Same argument as the trigger line
+            // — it belongs to the faction rather than to the selection — and
+            // the same self-hiding empty string. Amber rather than the
+            // trigger line's gold: this is the one line in the panel that is
+            // about the opponent, and it should not read as something of ours.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(0.88, 0.60, 0.42),
+                Slot::EnemyHeroes,
+            ));
             c.spawn(text_bundle(
                 "Left-click / drag to select.",
                 13.0,
@@ -6703,6 +6836,33 @@ struct MinimapFog;
 #[derive(Component)]
 struct BuildingGhost;
 
+/// A pooled marker on the ground where the player last SAW an enemy unit.
+///
+/// Deliberately a different shape from `BuildingGhost` — a flat tile lying on
+/// the earth rather than a standing box — because the two memories mean
+/// different things. A ghost says *there is a barracks there*; a tile says
+/// *something stood here once*, and confusing the two would be worse than
+/// drawing neither.
+#[derive(Component)]
+struct IntelMarker;
+
+/// How many discrete age-fade materials a last-seen marker picks from.
+///
+/// Four handles, pre-built, swapped by the frame — never one material
+/// repainted. That is the `FogTinted` discipline and it is here for the
+/// identical reason: a `StandardMaterial`'s bind group is rebuilt only when
+/// the material asset changes, so anything repainted in place silently goes on
+/// rendering last time's colour. See `update_fog_overlay`.
+const INTEL_FADE_STEPS: usize = 4;
+
+/// Which fade a sighting of this age wears. Oldest step at the horizon, so a
+/// marker is at its faintest just before the ledger drops it and nothing ever
+/// blinks out at full strength.
+fn intel_fade_step(age: f32) -> usize {
+    let t = (age / SIGHTING_TTL_S).clamp(0.0, 1.0);
+    ((t * INTEL_FADE_STEPS as f32) as usize).min(INTEL_FADE_STEPS - 1)
+}
+
 #[derive(Resource)]
 struct FogAssets {
     /// Shared by the world quad's material and the minimap node — the literal
@@ -6714,6 +6874,10 @@ struct FogAssets {
     fog_mat: Handle<StandardMaterial>,
     ghost_mesh: Handle<Mesh>,
     ghost_mat: Handle<StandardMaterial>,
+    /// A flat tile for the last-seen unit markers.
+    intel_mesh: Handle<Mesh>,
+    /// One material per age band, freshest first. `INTEL_FADE_STEPS` long.
+    intel_mats: Vec<Handle<StandardMaterial>>,
 }
 
 /// Build the fog texture, the quad that wears it, and the minimap node that
@@ -6790,6 +6954,23 @@ fn setup_fog(
         ..default()
     });
 
+    // Last-seen unit markers: a flat amber tile, four pre-built fades deep.
+    // Amber rather than the ghost's dusty red so the two memories are told
+    // apart at a glance, and low enough to read as a mark ON the ground
+    // instead of a thing standing on it.
+    let intel_mesh = meshes.add(Cuboid::new(1.0, 0.12, 1.0));
+    let intel_mats: Vec<Handle<StandardMaterial>> = (0..INTEL_FADE_STEPS)
+        .map(|i| {
+            let t = i as f32 / (INTEL_FADE_STEPS - 1) as f32;
+            materials.add(StandardMaterial {
+                base_color: Color::srgba(0.90, 0.58, 0.28, 0.52 - 0.38 * t),
+                unlit: true,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            })
+        })
+        .collect();
+
     if let Ok(root) = minimap.single() {
         commands.spawn((
             Node {
@@ -6819,6 +7000,8 @@ fn setup_fog(
         fog_mat,
         ghost_mesh,
         ghost_mat,
+        intel_mesh,
+        intel_mats,
     });
 }
 
@@ -7139,6 +7322,80 @@ fn sync_building_ghosts(
     }
 }
 
+/// Pooled ground tiles where the player last saw an enemy unit — the human's
+/// rendering of the snapshot's `intel.sightings`.
+///
+/// Position, age and existence come from the shared ledger, so what the player
+/// sees fading in the fog is precisely what a bridge commander receives as a
+/// sighting record. Same knowability, both renderers — which is the promise
+/// this whole system is arranged to keep, now extended from structures to the
+/// things that move.
+///
+/// Markers under **currently visible** ground are suppressed, on exactly the
+/// rule `FogGrid::ghosts()` applies: sight beats memory, and a "something was
+/// here" tile lying on grass the player is looking at right now is memory
+/// arguing with eyes. Walk the scout on and the tile appears behind it.
+fn sync_intel_markers(
+    mut commands: Commands,
+    time: Res<Time>,
+    fog: Res<FogGrids>,
+    assets: Res<FogAssets>,
+    mut markers: Query<
+        (
+            &mut Transform,
+            &mut Visibility,
+            &mut MeshMaterial3d<StandardMaterial>,
+        ),
+        With<IntelMarker>,
+    >,
+) {
+    let now = time.elapsed_secs();
+    let grid = fog.get(Team::Human);
+    let wanted: Vec<(Vec3, usize)> = if fog.enabled() {
+        grid.sightings()
+            .filter(|s| !grid.sees(s.pos))
+            .map(|s| (s.pos, intel_fade_step(s.age(now))))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut used = 0usize;
+    for (mut tf, mut vis, mut mat) in &mut markers {
+        match wanted.get(used) {
+            Some((pos, step)) => {
+                // Just above the fog quad at 0.16, so a remembered contact is
+                // legible on remembered ground rather than buried under it.
+                tf.translation = Vec3::new(pos.x, 0.20, pos.z);
+                tf.scale = Vec3::new(1.8, 1.0, 1.8);
+                let want = &assets.intel_mats[*step];
+                if mat.0 != *want {
+                    mat.0 = want.clone();
+                }
+                if *vis != Visibility::Inherited {
+                    *vis = Visibility::Inherited;
+                }
+            }
+            None => {
+                if *vis != Visibility::Hidden {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+        used += 1;
+    }
+    // Grow the pool; never shrink it (same discipline as the ghost boxes).
+    for (pos, step) in wanted.iter().skip(used) {
+        commands.spawn((
+            Mesh3d(assets.intel_mesh.clone()),
+            MeshMaterial3d(assets.intel_mats[*step].clone()),
+            Transform::from_xyz(pos.x, 0.20, pos.z).with_scale(Vec3::new(1.8, 1.0, 1.8)),
+            Visibility::Inherited,
+            IntelMarker,
+        ));
+    }
+}
+
 fn update_minimap_bounties(
     hud: Res<HudLayout>,
     mut commands: Commands,
@@ -7251,6 +7508,21 @@ fn update_minimap(
             lighten(ghost.team.color(), -0.35),
         ));
     }
+    // Where enemy UNITS were last seen. Two pixels: smaller than a live
+    // contact (3.0) and far smaller than a structure (6.0), and darkened on
+    // top of that, so a memory can never be misread as a unit standing there.
+    // Suppressed over visible ground for the same reason the world markers
+    // are — sight beats memory.
+    for s in grid.sightings() {
+        if grid.sees(s.pos) {
+            continue;
+        }
+        wanted.push((
+            world_to_minimap(s.pos, hud.minimap_px),
+            2.0,
+            lighten(s.team.color(), -0.25),
+        ));
+    }
 
     // Mutate the pool in place; never despawn.
     let mut used = 0usize;
@@ -7360,6 +7632,10 @@ struct SelectionReasons<'w, 's> {
     /// Every unit on the map — the coverage indicator is about the whole army,
     /// not the part of it that happens to be selected.
     all: Query<'w, 's, (&'static Team, &'static Transform), With<Unit>>,
+    /// The intel ledger, for the enemy-hero line. It rides in this bundle
+    /// rather than as a parameter of its own because `update_hud` is already
+    /// on Bevy's 16-parameter ceiling — see the note on that function.
+    fog: Res<'w, FogGrids>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -7788,6 +8064,11 @@ fn update_hud(
     // and drawn whether or not either exists.
     let triggers_text = trigger_line(&cast.triggers, cast.clock.elapsed_secs());
     let regions_text = region_line(&cast.regions);
+    let plans_text = plan_line(&cast.plans);
+    // The same grid the snapshot's `intel.heroes` is built from, read for the
+    // same seat this whole file renders for.
+    let enemy_heroes_text =
+        enemy_hero_line(reasons.fog.get(Team::Human), cast.clock.elapsed_secs());
 
     // Hero commands: the ability of a selected caster, one train/revive button
     // per hero class the team's slots have room for, the building's own
@@ -8092,6 +8373,8 @@ fn update_hud(
             Slot::Link => text.0 = link_text.clone(),
             Slot::Triggers => text.0 = triggers_text.clone(),
             Slot::Regions => text.0 = regions_text.clone(),
+            Slot::Plans => text.0 = plans_text.clone(),
+            Slot::EnemyHeroes => text.0 = enemy_heroes_text.clone(),
             Slot::Coverage => text.0 = coverage_text.clone(),
             Slot::Overflow => text.0 = overflow_text.clone(),
             Slot::CardLetter(i) => {
@@ -9406,6 +9689,7 @@ mod tests {
             .init_resource::<TeamResearch>()
             .init_resource::<Triggers>()
             .init_resource::<Regions>()
+            .init_resource::<Plans>()
             .init_resource::<Time>()
             .add_event::<CameraFocus>()
             .add_event::<SubmitIntent>()
@@ -10009,7 +10293,7 @@ mod tests {
     /// second of those is byte-identical to the JSON in COMMANDER_BRIEF.md's
     /// home-guard recipe. This is the fairness invariant applied to the newest
     /// verb in the language: the human's surface is *narrower* (one preset
-    /// against nine predicates and 27 verbs), but nothing it produces is
+    /// against eleven predicates and 29 verbs), but nothing it produces is
     /// outside what the wire can say, and nothing the wire says is outside what
     /// the engine will do for the human.
     #[test]
@@ -10285,6 +10569,138 @@ mod tests {
         // The opponent's rules are their plans, and the panel never sees them.
         triggers.set(Team::Claude, rule("theirs", None, true, None)).unwrap();
         assert!(!trigger_line(&triggers, 100.0).contains("theirs"));
+    }
+
+    /// The human's plan readout. Status only — see `plan_line` for why
+    /// authoring stays in NL/preset territory, which is the same asymmetry the
+    /// trigger readout above documents.
+    ///
+    /// The load-bearing part is that a stopped plan says WHY on the line. A
+    /// status of "blocked" that made its owner go read `errors` would put the
+    /// human back in the polling loop this whole vocabulary exists to delete.
+    #[test]
+    fn the_plan_readout_names_every_plan_its_step_and_why_it_stopped() {
+        let mut plans = Plans::default();
+        let make = |name: &str, steps: usize, at: usize, state: PlanState| PlanRun {
+            name: PlanName::new(name).unwrap(),
+            steps: (0..steps)
+                .map(|_| PlanStep {
+                    intent: Intent::Stop { units: vec![] },
+                    advance: PlanAdvance::OnApplied,
+                })
+                .collect(),
+            source: IntentSource::Bridge,
+            state,
+            at,
+            submitted: true,
+            applied: true,
+            applied_at: 0.0,
+            last_try: 0.0,
+            blocked_since: None,
+            told_blocked: false,
+        };
+        assert_eq!(plan_line(&plans), "", "silent until there is one");
+
+        plans
+            .set(Team::Human, make("opening", 5, 1, PlanState::Running))
+            .unwrap();
+        assert_eq!(plan_line(&plans), "Plans: opening 2/5");
+
+        plans
+            .set(
+                Team::Human,
+                make(
+                    "boom",
+                    3,
+                    2,
+                    PlanState::Blocked("not enough gold".to_string()),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            plan_line(&plans),
+            "Plans: opening 2/5  boom 3/3 (blocked: not enough gold)"
+        );
+
+        // A long refusal is truncated rather than allowed to push the other
+        // plan off the end of the line.
+        plans.get_mut(Team::Human)[1].state = PlanState::Halted(
+            "site (56.0, -56.0) is blocked for TownHall; try (49.0, -56.0)".to_string(),
+        );
+        let line = plan_line(&plans);
+        assert!(line.contains("boom 3/3 (halted: site (56.0, -56.0) is blocked for …)"), "{line}");
+        assert!(line.starts_with("Plans: opening 2/5"), "{line}");
+
+        // A finished plan stays visible and says so.
+        plans.get_mut(Team::Human)[0].state = PlanState::Done;
+        assert!(plan_line(&plans).contains("opening 2/5 (done)"));
+
+        // The opponent's plans are theirs, and the panel never sees them.
+        plans
+            .set(Team::Claude, make("theirs", 2, 0, PlanState::Running))
+            .unwrap();
+        assert!(!plan_line(&plans).contains("theirs"));
+    }
+
+    /// **The hero intel line says only what the human could have seen.**
+    ///
+    /// The renderer half of the one rule: this line and the snapshot's
+    /// `intel.heroes` are built from the same `FogGrid::hero_intel()`, so they
+    /// cannot disagree about what is known. What it must never print is a
+    /// LEVEL — a human cannot select an enemy hero, so no number about one has
+    /// ever been on their screen, and printing it here would hand the keyboard
+    /// an information right the wire does not have.
+    #[test]
+    fn the_enemy_hero_line_reports_belief_and_never_a_level() {
+        let mut grids = FogGrids::test_dark();
+        assert_eq!(
+            enemy_hero_line(grids.get(Team::Human), 100.0),
+            "",
+            "silent until one has been laid eyes on — an unmet roster is not intel"
+        );
+
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::Alive,
+            Vec3::new(4.0, 0.0, 8.0),
+        );
+        let line = enemy_hero_line(grids.get(Team::Human), 40.0);
+        assert_eq!(line, "Their heroes: Hero alive 40s ago");
+        // The class never met stays off the line entirely.
+        assert!(!line.contains("Priestess"));
+
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Priestess,
+            HeroStatus::SeenDying,
+            Vec3::new(4.0, 0.0, 8.0),
+        );
+        let line = enemy_hero_line(grids.get(Team::Human), 40.0);
+        assert_eq!(line, "Their heroes: Hero alive 40s ago   Priestess down");
+        // Nothing a human has no gesture to obtain.
+        for forbidden in ["Lv", "level", "mana", "XP"] {
+            assert!(!line.contains(forbidden), "leaked {forbidden}: {line}");
+        }
+    }
+
+    /// The fade bands a last-seen marker wears, pinned at both ends: a fresh
+    /// sighting is at full strength and one at the horizon is at the faintest
+    /// band, so nothing ever blinks out while still bright.
+    #[test]
+    fn intel_markers_fade_across_the_whole_staleness_horizon() {
+        assert_eq!(intel_fade_step(0.0), 0);
+        assert_eq!(intel_fade_step(SIGHTING_TTL_S - 0.1), INTEL_FADE_STEPS - 1);
+        // Clamped rather than panicking on a record the ledger has not yet
+        // swept: the renderer must never be the thing that crashes.
+        assert_eq!(intel_fade_step(SIGHTING_TTL_S * 4.0), INTEL_FADE_STEPS - 1);
+        // Monotonic — a marker may never get BRIGHTER with age.
+        let mut prev = 0;
+        for i in 0..40 {
+            let step = intel_fade_step(i as f32 * (SIGHTING_TTL_S / 40.0));
+            assert!(step >= prev, "fade went backwards at {i}");
+            prev = step;
+        }
     }
 
     /// The parameterised half of the gap: the coarse [V] writes one fixed

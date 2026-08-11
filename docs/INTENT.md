@@ -28,28 +28,164 @@ There is now one list of verbs and one compiler.
 
 ## The fairness invariant
 
-> **No player-facing mutation path exists except intent submission.**
+> **No commander mutates game state except through intent submission.**
 
-`ui.rs` and `bridge.rs` contain zero writes to `Order`, `TrainingQueue`,
-`RallyPoint`, `TargetPriority`, `RetreatPolicy`, `LeashPolicy`,
-`AutoCastPolicy`, `SquadId`, `DoctrineTemplate` or `SquadOrders`, and zero
-sends of `CastAbility` / `BuyItem` / `UseItem` / `UpgradeBuilding` /
-`Surrender`. Both files used to carry a *field-for-field identical* four-writer
-`SystemParam` bundle (`CardActions` in ui.rs, `CmdEvents` in bridge.rs) —
-independent convergence on the same shape, which is exactly the duplication
-this layer removes. Both are gone; intent.rs owns the four writers. Both write
-`SubmitIntent` events and nothing else. This is grep-checkable, and checking it
-is the point: the invariant is only worth having if a regression is visible.
+It read "no *player-facing* mutation path exists except intent submission"
+until wc3clone-jem, and the hedge was carrying real weight: the scripted
+`ai.rs` was the one commander in the game still writing components directly.
+It speaks the language now, so the sentence needs no qualifier and names no
+exception. Three seats — `ui`, `bridge`/`copilot`, `script` — one verb list,
+one compiler.
+
+`ui.rs`, `bridge.rs`, `ai.rs` and `trigger.rs` contain zero writes to `Order`,
+`TrainingQueue`, `RallyPoint`, `TargetPriority`, `RetreatPolicy`,
+`LeashPolicy`, `AutoCastPolicy`, `SquadId`, `DoctrineTemplate` or
+`SquadOrders`, and zero sends of `CastAbility` / `BuyItem` / `UseItem` /
+`UpgradeBuilding` / `Surrender`. Each writes `SubmitIntent` events and nothing
+else. This is grep-checkable, and checking it is the point: the invariant is
+only worth having if a regression is visible. (`ai.rs` is down to *two* write
+statements in the whole file, and both are a `SubmitIntent`.)
+
+The two human-facing ones used to carry a *field-for-field identical*
+four-writer `SystemParam` bundle (`CardActions` in ui.rs, `CmdEvents` in
+bridge.rs) — independent convergence on the same shape, which is exactly the
+duplication this layer removes. Both are gone; intent.rs owns the four writers.
+
+Four producers, but **three seats**: `ui`, `bridge`/`copilot`, and `script`.
+`trigger.rs` is not a fourth author — a fired trigger carries the source of
+whoever *armed* it (`SubmitIntent::fired`), because a rule doing what it was
+told is still the commander speaking, just earlier.
 
 What the interfaces still own is the *gesture*: deciding which units a
 right-click meant, which worker is nearest the build site, what "guard" implies
 as an anchor and a radius. That is the human interface's real job. What comes
 out the other side is a value a commander could have typed.
 
+### The third seat
+
+`ai.rs` is a seat. Since **wc3clone-jem** the scripted commander mutates
+nothing: every action it takes is a `SubmitIntent` with
+`IntentSource::Script`, built out of the same `shared::Intent` values ui.rs
+compiles from a right-click and bridge.rs deserializes from `commands.json`,
+read by the same compiler in the same frame. There is no longer a footnote on
+the invariant, and no longer a rung of `Cause` that only the script could
+produce.
+
+What it converted, site by site: `move` (workers fleeing melee), `attackmove`
+(defend, the three wave branches, the rally gather), `harvest` (idle-worker
+assignment and the multi-mine rebalance), `return` (stranded haulers), `build`
+(the whole build order, expansions and ford emplacements included), `train`
+(workers, the army mix, casters, siege, heroes and revivals), `upgrade` (hall
+tier-ups), `research` (the forge ladder), `buy` and `use_item` (the Shop
+rules), `cast` (the Champion's Slam), and `autocast` (the ultimate doctrine a
+machine-driven team installs on its heroes).
+
+Four things follow, and they are the reason the bead was worth doing:
+
+- **It is validated.** The compiler refuses the script exactly as it refuses a
+  commander — fog, ownership, tech gates, prices, hero slots, queue caps. The
+  one place this bites is build placement, where `Intent::Build` snaps a site
+  to the nav lattice *before* checking the ground; `ai.rs` therefore snaps its
+  candidate first and vets the snapped point. Its site pickers clear
+  `size + BUILD_PADDING` — a full cell of slack per side against a half-cell
+  snap — so the snapped footprint is provably inside ground already known to
+  be free, and the conversion costs the script no placements.
+- **It appears in the replay.** `intent_log.jsonl` now records all three
+  authors. An AI-vs-AI sim writes a real transcript instead of nothing.
+- **It is attributable.** Its units answer `order:attackmove by script t=…`,
+  which joins against the log by the same rule everyone else joins by. (The
+  free-text `Cause::Script { what }` rung — `script:wave`, `script:flee` — is
+  gone with it. The *why* behind a script order lives in ai.rs's `info!` lines
+  and the log's sentence now, not on the unit.)
+- **It pays the link structurally.** docs/TEMPO.md §3 used to be satisfied
+  here by ai.rs reaching for `command::OrderIssuer` by hand — correct, and one
+  deleted call away from a cheat. It is satisfied by construction now: the
+  script has no way to issue an order except to ask the compiler to.
+
+  This survived meeting triggers (`wc3clone-pec`) without a special case, which
+  is the sort of thing the choke point is for. `apply_intents` hands the
+  *exempt* issuer to anything with `SubmitIntent::trigger` set, on the sound
+  reasoning that a rule's author paid the reach when they armed it. A scripted
+  think tick is not a trigger firing — it is a commander deciding, at the
+  moment of deciding, which is precisely what the link prices — so
+  `SubmitIntent::script` sets `trigger: None` and the script pays. It could
+  not accidentally have ridden the exemption either: `SubmitIntent::fired`
+  carries the *arming* seat's source, and `ai.rs` arms nothing.
+
+Two consequences worth stating plainly.
+
+**Frame order.** The script's actions used to land in `SimSet::AiThink`,
+*before* doctrine ran in `SimSet::Think`. They land in `SimSet::Intent` now —
+same frame, four sets later, which is exactly where a human's right-click and a
+bridge command have always landed. Nothing is deferred by a tick. What changed
+is that a squad posture or a retreat trigger can no longer overwrite a script
+order given in the same frame: the script lost a privilege rather than gaining
+one, and it only bites on a faction under autopilot that is still carrying
+doctrine a player set before handing it over.
+
+**Cost: none measurable.** A think tick that used to write components now
+writes events for one system to drain a few sets later. Interleaved A/B on the
+release binaries, same map, same seed, 1800 frames, at a population both
+binaries reach identically (13 units / 5 buildings a side): **1712ms before,
+1667ms after** — the same number, and the same verdict the pre-merge pair gave
+(784ms / 780ms). One sim's worth of extra event traffic is free, which is what
+you would hope from a handful of small `Vec`s a second going into a system that
+was already running.
+
+Two measurement notes, because both cost an hour here. Take the **minimum of
+several interleaved runs**: a contended machine reports whatever else it is
+doing, and samples on a box at load 18 disagreed by 2.5x in both directions.
+And measure **wall time, not CPU time** — user+sys says this branch costs 8–16%
+more, which is real and is not a slowdown: making `ai_think`'s building query
+read-only (it no longer pushes training queues) lets Bevy run more systems
+concurrently, and more parallelism buys lower wall time with *higher*
+CPU-seconds. The metric that answers "is the sim slower" is the clock.
+
+**What the sims say.** Headless AI-vs-AI matches across both maps, with
+`WC3_COMMAND_LATENCY` on and off, **all decisive**; `WC3_SEED` determinism
+verified on both maps (50 and 55 identical fingerprints across paired runs),
+which is the check that the script submits in a deterministic order. Five of
+six land in the documented 5–12min band, and on `open` the branch tracks the
+baseline closely — 478.0s against 461.1s, 475.0s against 449.1s.
+
+`crossings` is where it diverges, and `crossings` with latency **on** settles
+at 280.5s: under the band, and seed-insensitive.
+
+**The cause is worth being precise about, because it is the one behavioural
+consequence this refactor could not avoid.** `Intent::Build` snaps a site to
+the nav lattice before it checks the ground; the old direct path did not, so
+the scripted AI used to place buildings on coordinates no player could have
+chosen. It builds where a player builds now. Each footprint moves by at most
+half a cell — but a moved footprint occupies *different nav cells*, so the next
+site query gets a different answer, and by the time the build order reaches the
+ford emplacements the divergence is not small any more: on `crossings`/5 the
+defending Tower goes up at (-48,68) here against (-53,54) on master, both of
+them "8 back from the crossing" and 14 units apart. On a map whose whole
+strategy is who holds the fords, that is a different match.
+
+So it is a *placement* change cascading into a balance change, not a change in
+how the script fights — its orders are the ones it always gave. And it is
+forced: exempting the script from the snap would hand it back the privilege of
+building where nobody else can, which is the exact thing this bead removes.
+Flagging it for the next balance pass is the right disposal, and the specific
+thing to look at is the emplacement ring in `ai.rs::pick_spot`, which was tuned
+against unsnapped candidates.
+
+**Rejection.** The compiler can now say no to the script, which the old direct
+path could not. Nothing latches: a think tick states what it wants against the
+world it saw, the refusal is recorded, and the brain re-thinks a second later
+from the world as it is. Every optimistic flag re-derives itself — `pending_build`
+above all, which is released the moment no worker is actually building, and
+releases the expansion ring-fence with it. Script errors go to the **debug
+log**, not to `IntentErrors`: bridge.rs ships that list to whichever seat is
+reading, and a commander handed failures it did not cause would be debugging
+the autopilot instead of playing. The verdict is still on the record — the
+journal entry says `ok: false` and the intent log carries the string verbatim.
+
 ### Who is not a player
 
-Two categories deliberately keep writing components directly, and neither
-weakens the invariant:
+One category deliberately keeps writing components directly, and it does not
+weaken the invariant:
 
 - **Engine systems.** `economy.rs`'s harvest follow-through, `combat.rs`'s
   chase, `doctrine.rs`'s squad re-tasking and retreat triggers. These are the
@@ -57,20 +193,10 @@ weakens the invariant:
   it. Routing them through intents would be a category error — and it is
   exactly the line THESIS.md principle 3 draws ("the engine does what is fast;
   the player does what is wise").
-- **The scripted `ai.rs`.** *This is a known asymmetry.* `ai.rs` still writes
-  `Order`s and training-queue pushes directly, from ~9 call sites. It is engine
-  baseline rather than a seat — nothing is measuring fairness against it today
-  — but it means the invariant currently reads "no *human or bridge* mutation
-  path except intents". Routing `ai.rs` through the compiler is follow-up work.
 
-  It is **not**, as this document originally guessed, a prerequisite for
-  docs/TEMPO.md's Chain of Command. That bead needed all three seats to pay
-  latency identically, and got it by having `ai.rs` call the same
-  `command::OrderIssuer` the compiler calls — the mechanism lives one layer
-  below the compiler, so the third seat can reach it without speaking the
-  language first. What routing `ai.rs` through intents would still buy is
-  attribution: its decisions would appear in `intent_log.jsonl` as sentences,
-  and the fairness invariant would read without a footnote.
+The distinction that matters is not "human versus machine" — the script is a
+machine and it speaks — but **deciding versus executing**. `ai.rs` decides, so
+it speaks. `doctrine.rs` carries out a decision already made, so it does not.
 
 One more honest edge: `ui.rs::update_rally_flag` still removes a `RallyPoint`
 whose target has died. That is a validator reacting to a world event, not a
@@ -80,7 +206,7 @@ player expressing anything, so it stays where it is.
 
 ## The vocabulary
 
-27 verbs, grouped by what they are for. The serde shape **is** the bridge's
+29 verbs, grouped by what they are for. The serde shape **is** the bridge's
 historical wire format — tag is `type`, entity ids are `Entity::to_bits`,
 positions are flat `x`/`z` — so `commands.json` parses straight into `Intent`
 with no translation layer. Backward compatibility is not an adapter here; it is
@@ -155,6 +281,18 @@ does *continuously*; a trigger is what it does *when something happens*.
 And one field, on **every verb above that takes `x`/`z`**: an optional
 `region:"<name>"` that stands in for the pair. Full treatment below
 (§ Territory).
+### Plans — sequenced standing policy (v3)
+| Verb | Shape | Clears when |
+|---|---|---|
+| `plan_set` | `{name, steps:[{intent:{<any intent>}, advance?:{…}}]}` | — |
+| `plan_clear` | `{name}` or `{}` for every plan | — |
+
+`advance` is one of `{"type":"on_applied"}` (the default — "then"),
+`{"type":"when","when":{<any TriggerWhen>}}`, or `{"type":"after","secs":30}`.
+
+Full treatment below (§ Plans). One line here: doctrine is *continuous*, a
+trigger is *contingent*, a plan is *sequenced* — and the third one is the word
+`then`.
 
 ### Match level
 | Verb | Shape |
@@ -499,8 +637,51 @@ Every submitted intent — applied or rejected — is appended to
 `bridge/intent_log.jsonl` (override with `WC3_INTENT_LOG`; set it to `0` or
 empty to disable). The file is truncated at the first intent of a run, so it is
 one file per match. It is opened lazily, so a run in which nobody says anything
-leaves no file behind — an AI-vs-AI headless sim writes nothing, because
-`ai.rs` is not a player.
+leaves no file behind.
+
+Until **wc3clone-jem** an AI-vs-AI headless sim wrote nothing at all, because
+`ai.rs` was not a player. It is one now, so a scripted sim produces a full
+transcript. Measured across six AI-vs-AI matches on both maps, latency on and
+off: **3.7 to 10.4 intents per second across both factions**, i.e. 1.9–5.2 per
+team per second against a think tick that runs at 1Hz. A ten-minute match
+leaves a 2,000–5,000 line replay. Verb mix of one of them (`open`, seed 42,
+478.0s, 1,862 intents):
+
+```
+attackmove 1549   harvest 101   train 89   move 65   build 38   cast 8   autocast 7
+```
+
+`attackmove` is ~85% of it, and that is a real property of the script rather
+than an artifact: it states one order per unit for the army's current job
+(see below), and the `defend` branch restates the whole army every tick for as
+long as an enemy is standing in the base. The branches that *could* have been
+the worst offenders are already self-quieting, because ai.rs only speaks for
+units that are idle — a wave in contact, a worker line that is mining and a
+base at peace all say nothing. No dedupe layer was added: a few thousand lines
+per match is a replay, not a flood, and every suppression rule considered would
+have changed behaviour in a bead whose whole claim is that behaviour did not
+change.
+
+Volume is also the *reason* for one design decision worth knowing about.
+`move`/`attackmove` are the only verbs whose result depends on how many units
+one sentence names — `ground_order` spreads a group over `formation_offset`.
+Batching the military branches would have cut the log by ~6.6x (3,678 lines to
+555, measured on the pre-merge pair — the ratio is the point, not the
+absolutes), and it also made the scripted baseline about **40% more lethal**: a
+spread line engages with more of itself at once, and `crossings` fell from
+~7.6min to ~4.75min. That is a genuine improvement to how the script fights and
+a genuine change to every balance number keyed to the baseline, so it did not
+belong in a plumbing bead. The script therefore says one `attackmove` per unit,
+all naming the same point — the geometry it always had. Nothing is privileged
+by that: a human can click units one at a time and a commander can send twenty
+one-unit `move`s, and the compiler prices each unit's link identically either
+way. Verbs with no geometry (`harvest`, `return`) *are* batched, because there
+the two spellings are indistinguishable in the world.
+
+Rejections across all six runs: **zero**. The compiler is stricter than the old
+direct path, and the script is written to want only legal things — the one
+place the two could have disagreed is build placement, which is why ai.rs snaps
+to the compiler's lattice before it vets the ground.
 
 Line 1 is a session header; every line after it is one intent:
 
@@ -602,7 +783,7 @@ Verified end-to-end against a live `WC3_BRIDGE=1` seat driven by
   — the diff against master touches none of them.
 - Every historical command shape still parses, including the `caster` alias on
   `cast`, the `use_item` rename and the untagged ability selector
-  (`intent::tests::legacy_wire_commands_parse` covers all 27 verbs and their
+  (`intent::tests::legacy_wire_commands_parse` covers all 29 verbs and their
   optional-field forms).
 - `seq` gating, `last_seq`, the 4 Hz poll and the 1 Hz snapshot are untouched.
 - `tools/bridge_send.py`, `tools/bridge_view.py`, `tools/bridge_wait.py` and
@@ -773,7 +954,7 @@ with a `sentence()` renderer.*
 `tools/intent_compile.py` compiles a natural-language directive plus a snapshot
 into a batch of `Intent` objects. It is a **tool, not an engine feature**, and
 that placement is the design: the game gains no NLP, no new verb, and no new
-mutation path. What it gains is a shorter way to write the same 27 verbs.
+mutation path. What it gains is a shorter way to write the same 29 verbs.
 
 ```
 "hold the northwest ford, forage mid with the cavalry, retreat at 35%"
@@ -811,12 +992,20 @@ the Sorcerer, a caster but not a hero, is deliberately outside the word.
 
 It refuses rather than guesses. An unresolvable place, an unknown noun, a
 locked shop rung and a target class the engine does not have are all reported
-errors, never a silently different order. The one structural refusal is
-**conditionals**: "strike when their hero falls" has no verb, because the
-engine has no trigger system. The tool compiles the action, marks it deferred,
-and prints the command to run when the commander sees the condition in
-`events` — which is the honest shape of that request, not a limitation to
-paper over.
+errors, never a silently different order. **Conditionals** compile to
+`trigger_set` — "strike when their hero falls" arms a rule the engine watches
+at 4 Hz, which it could not do for as long as nothing in the game had an honest
+reading of an enemy hero. The sightings ledger is that reading: whether you
+*watched it die* is a fact a human plainly has.
+
+What still defers is a condition outside the predicate vocabulary, and the
+neighbouring sentence is the standing example — "strike when their hero is
+below 30%". No human can select an enemy hero, so no number about one has ever
+been on a screen, and a tool that reached for the nearest predicate would arm a
+rule about *our* hero and carry out the opposite order silently. The tool
+compiles the action, marks it deferred, and prints the command to run when the
+commander sees the condition in `events`. The line between the two sentences is
+not "is this about the enemy" but "could a human have seen it".
 
 The confirmation loop is `sentence()`. Compile, send, and the log reads back
 what the game understood in English. If the sentence is wrong, the compile was
@@ -834,8 +1023,12 @@ behaviour, because there is no second place that could disagree.
 | squad posture | `doctrine.rs::run_squad_postures` | `posture:push sq1` |
 | standing policy | `doctrine.rs` retreat / leash triggers | `policy:retreat t=210` |
 | producing building | `units.rs::spawn_units` via `spawn_provenance` | `template:Barracks#4294968258` |
-| scripted baseline | `ai.rs` (not a seat, so its own rung) | `script:wave` |
 | engine default | auto-enrolment, idle instinct | `instinct:auto-enroll`, `idle` |
+
+There used to be a sixth rung — `script:wave`, for the scripted baseline, "not
+a seat, so its own rung". wc3clone-jem made it a seat and the rung collapsed
+into the first row: `order:attackmove by script t=5`, produced by the same arm
+of the same compiler as `by ui` and `by bridge`.
 
 Exposed three ways, and it is the *same string* in all three: the snapshot's
 `units[].why` (own units only — an opponent's chain of command is their plan),
@@ -883,10 +1076,11 @@ Two implementation notes worth keeping:
   `Order::Harvest` intact, so nothing would ever expire the stamp and the
   worker would blame a five-second sprint for the rest of the match. Giving
   reflex behaviours an expiry is the general fix.
-- **`ai.rs` gets `Cause::Script`, not an `IntentSource`.** Correct today, since
-  it is engine baseline rather than a seat — but if `ai.rs` is ever routed
-  through the compiler (the prerequisite for TEMPO.md's Chain of Command), that
-  rung should collapse into `order:… by ai`.
+- ~~**`ai.rs` gets `Cause::Script`, not an `IntentSource`.**~~ **Done**
+  (wc3clone-jem), and the guess above was right about the shape: the rung
+  collapsed into `order:… by script`, an `IntentSource::Script` seat. It was
+  wrong about the prerequisite — Chain of Command reached the third seat a bead
+  earlier, one layer below the compiler.
 - **The tool cannot see money.** It happily compiles a `build` you cannot
   afford; economy.rs refuses it. That is the documented division below, but a
   `me.gold` check would turn a rejected batch into a better error.
@@ -916,10 +1110,14 @@ already printed the same string, and `ui.rs::why_line` already tallied mixed
 answers across a selection. That tally *is* the "did my partner re-task my
 push?" readout; it needed no code at all.
 
-The rung is a **seat**, not `Cause::Script`. A co-commander pays the same
-latency, obeys the same fog and speaks the same 27 verbs; the scripted `ai.rs`
-does none of those things, and collapsing the two would have made "who moved
-this unit" unanswerable in exactly the case it is asked.
+The rung is a **seat**, not the old `Cause::Script`. A co-commander pays the
+same latency, obeys the same fog and speaks the same 29 verbs; the scripted
+`ai.rs` did none of those things at the time, and collapsing the two would have
+made "who moved this unit" unanswerable in exactly the case it is asked.
+(wc3clone-jem later made `ai.rs` do all three, so it became a seat of its own —
+`IntentSource::Script` — rather than borrowing this one. The reasoning is
+unchanged: distinct authors get distinct rungs, and there are three of them
+now.)
 
 ### The real design question was conflict policy
 
@@ -1299,14 +1497,36 @@ what fired it.
 | `unit_count {kind, count}` | You field at least `count` living units of `kind`. |
 | `game_time {at}` | The match clock has passed `at` seconds. The one predicate about nothing in the world — it is here because "expand at six minutes" is a plan every commander already writes, and as a trigger it stops depending on remembering. |
 
-**What is deliberately missing** is anything about the *enemy's* internals — their
-gold, their tech, their hero's health. Not an oversight and not a fog problem
-you could scout your way around: those are facts the snapshot does not carry for
-either seat, so a predicate over them would be an information right the human
-does not have. `tools/intent_compile.py` therefore still **defers** "strike when
-their hero falls" — with `trigger_set` sitting right there — because the nearest
-predicate that exists reads *your own* hero and arming that would mean the
-opposite of what was asked.
+| `enemy_army_seen {size, within_s?}` | Your **intel ledger** holds at least `size` enemy troops that were observed as one concurrent force (`FogGrid::army_groups`). Reads MEMORY, unlike `enemy_sighted` — which is the point: an army does not stop existing because your scout died, and a rule that disarmed itself at that moment would disarm itself exactly when the enemy wanted. `within_s` bounds how stale the observation may be. Workers never count toward a force. Carries no region: regions are a different vocabulary, and a predicate that grew its own notion of "where" would be the second implementation this project keeps refusing to write. |
+| `enemy_hero_down {class?}` | An enemy hero class is **currently believed dead** — you watched one die and have not seen it alive since. A *level* predicate over a belief, not an edge over an event; see below. |
+
+**What is deliberately missing** is anything about the *enemy's* internals —
+their gold, their tech, their hero's **health**. Not an oversight and not a fog
+problem you could scout your way around: those are facts no observation
+produces, so a predicate over them would be an information right the human does
+not have. A human cannot even select an enemy hero — ui.rs's pickers skip
+anything that is not theirs — so no number about one has ever been on a screen.
+`tools/intent_compile.py` accordingly still **defers** "strike when their hero
+is below 30%".
+
+What it no longer defers is **"strike when their hero falls"**, and the
+distinction is the whole of what the intel bead bought. Whether their hero
+*died in front of you* is not an internal fact; it is the most public thing that
+can happen on a battlefield, and the sightings ledger records it the same way it
+records everything else — because one of your units was looking. So the honest
+predicate was never "their hero is hurt" but "their hero is believed dead", and
+once that was writable the sentence compiled. The line between the two requests
+is not *is this about the enemy* but *could a human have seen it*.
+
+`enemy_hero_down` is a **level** predicate, and the wording matters. Armed
+`once` — the normal case — it fires on the first sweep after the death is
+witnessed and disarms, which is the edge behaviour "when their hero falls"
+means, obtained without the engine keeping an edge-detection latch nobody can
+inspect. Armed with a `repeat` it re-fires while the belief stands, which reads
+as "keep pressing while they have no hero" and is a coherent second order. The
+belief is revocable: heroes revive through `HeroRecords`, so seeing the hero
+alive again returns the status to `alive` and a re-armed rule fires on the next
+death actually witnessed.
 
 ### once / repeating / spent
 
@@ -1428,7 +1648,7 @@ for a click they never made is a worse answer than none.
 
 | seat | authoring surface |
 |---|---|
-| bridge / copilot | full — nine predicates × 27 verbs, as JSON |
+| bridge / copilot | full — nine predicates × any ordinary verb, as JSON |
 | `tools/intent_compile.py` | full-ish — "when X, Y" over the same nine, in English |
 | human at the keyboard | **one preset**: `[I][H] Home guard`, plus a readout of every armed rule |
 
@@ -1514,7 +1734,279 @@ the word sends exactly the historical sixteen keys.
   arm time, so "when I have 8 footmen, attack-move them" has to say a squad
   rather than a list of ids. Squads are the right answer and the reason
   `squad_below` and the `squad N defends X` NL rule are here — but it is a real
-  edge and the plans bead will meet it again.
+  edge and the plans bead met it again — see § Plans, "The late-binding
+  problem", which answers it with the squad idiom rather than a new selector.
+
+---
+
+## Plans: `then` as a first-class word
+
+*`wc3clone-c5b`. Two verbs, three advance-conditions, one new file
+(`plan.rs`), and no new way to change the game.*
+
+Doctrine relocated **continuous** fast work into the engine. Triggers
+relocated **reaction**. Neither of them can say ORDER, and order is what a
+build order is:
+
+> "Barracks, then the keep, then a sanctum, then sorcerers" is a sequence a
+> commander settles before the match starts and then spends the first six
+> minutes hand-feeding to the engine, one command per poll. For a language
+> model that is ten to fifteen seconds *per step of a sequence with no
+> decisions left in it*. A human at a keyboard pays a keystroke.
+
+That difference is not judgment either — it is transcription. A plan is named
+ordered steps the engine walks for you, submitting each step's intent through
+the ordinary compiler when its turn comes.
+
+### The step/advance grammar
+
+A step is `{intent, advance}`. The intent is any of the 29 verbs; the advance
+says how the engine knows it is time for the next one. Three forms, and the
+middle one is the seam that matters:
+
+| `advance` | means |
+|---|---|
+| omitted / `{"type":"on_applied"}` | as soon as this step is **accepted**. The plain meaning of "then". |
+| `{"type":"when","when":{…}}` | when a **`TriggerWhen` predicate** holds — the *same* predicates triggers use (eleven of them as of the intel bead, and whatever the next one adds), level-triggered, evaluated by the same function at the same 4 Hz. |
+| `{"type":"after","secs":30}` | 30 seconds after this step was accepted. |
+
+*Accepted*, not *completed*: the engine does not wait for the barracks to
+finish, it waits for the order to be legal and taken. Waiting on completion is
+what the `when` form is for (`tier_reached`, `unit_count`), and conflating the
+two would make "then" mean something different for every verb.
+
+**The advance-condition of step *k* governs the move to step *k+1*.** The last
+step's advance decides when the plan reports itself finished.
+
+### The predicate seam is the whole reason `when` is not its own vocabulary
+
+`PlanAdvance::When` carries a `TriggerWhen`, and `plan.rs` answers it by calling
+`trigger::holds` — the same function, on the same world, at the same cadence.
+This was the one design decision worth being careful about, and it pays off
+twice:
+
+* A plan and a trigger cannot disagree about what "we reached tier 2" means.
+* **Any predicate a later bead adds is a plan advance-condition for free.** The
+  territory and intel beads landing beside this one add `TriggerWhen` arms; the
+  moment they do, `plan_set` accepts them with no work in `plan.rs`, because
+  `holds` is the only thing that reads the enum and `validate_predicate` is the
+  only thing that checks it. Neither lives here.
+
+### Failure semantics: blocked, then halted, **never skipped**
+
+A step's intent is frozen at `plan_set` time and compiled when it runs, so it
+can be refused. The engine has three options and only one is defensible:
+
+* **Skip and carry on.** Refused. A plan that quietly drops the Blacksmith and
+  goes on to research at it is worse than one that stopped, because its owner
+  reads `running` and believes the sequence they wrote is the sequence that ran.
+* **Halt immediately.** Too brittle. Most refusals are *timing*: forty gold
+  short, a worker mid-walk, a hall one tick from finishing. Halting on those
+  would make plans useless for exactly the economic sequencing they exist for.
+* **Block, retry, then halt.** What it does. The plan stops advancing, its
+  status becomes `blocked: <the compiler's own error, verbatim>`, it re-submits
+  the same step every `PLAN_RETRY_S` (5s), and if it is still refused after
+  `PLAN_BLOCK_GRACE_S` (60s) it becomes `halted: <error>` and stops for good —
+  **on the step that failed**, which is where a reader needs to find it.
+
+The grace window was **ten seconds until the canonical opening was run against a
+live seat and died of it**: the plan reached its `upgrade` step short on lumber,
+blocked correctly, and halted twenty seconds before the income that would have
+paid for it arrived. Ten seconds is right for the reason it was chosen (a worker
+mid-walk) and wrong for the reason plans exist — economic sequencing, where the
+dominant refusal is "not affordable yet" and money moves on a scale of tens of
+seconds. Halting later costs nothing, because the *owner* is told at the first
+bounce; the constant governs only how long the engine keeps trying.
+
+**A step that reached some of its targets is a partial success, not a refusal.**
+`own_units` reports every dead id and returns the survivors, so `move [a,b]`
+with `b` a corpse really does move `a`. Treating "any error" as "refused" made a
+plan block on the most ordinary event in the game — a squad member dying between
+`plan_set` and the step — and then halt a sequence that was running correctly.
+The compiler therefore reports whether it *reached* anything, and only a step
+that reached nothing blocks. The error still goes to every other channel.
+
+Both states are announced once on the owner's event feed (not once per retry —
+the human's alert stack is six rows) and both carry the reason in the status
+itself, so nothing has to be correlated against `errors`.
+
+The verdict reaches the plan through `SubmitIntent::plan` and `Plans::report`,
+in the same frame the step was compiled — not by scraping the error channel for
+a tag. A plan that could not tell "accepted" from "refused" would have to either
+skip or wedge, and both are the failure above.
+
+### Once through, never looping
+
+A plan does not repeat. Repetition is a trigger's `repeat`, and a construct with
+sequencing *and* iteration is a programming language with no debugger — which is
+the thing the caps exist to refuse.
+
+### The caps: two plans of eight steps
+
+Eight steps matches the trigger cap for the identical reason: it is the length
+of a sequence a person can recite. **Two plans** is one notch tighter than the
+eight triggers, and deliberately: a plan is a *sequence* running unattended, and
+two plans stepping over each other's build sites and squad ids is much harder to
+read out of a snapshot than two triggers that each fire once. Two is also what
+commanders actually want — an economic opening and a military follow-up.
+
+Replacing a plan by name is free and restarts it from step 1, so iterating on an
+opening never costs the other slot. The cap counts *live* plans: a `done` or
+`halted` plan is history rather than policy and stops holding a slot, while
+staying readable in the list.
+
+### Plans get their own storage, not eight chained triggers
+
+The obvious implementation is "a plan is N chained triggers". It is wrong.
+`MAX_TRIGGERS_PER_TEAM` is 8 and it is doctrine, not a budget — the number of
+rules a commander can hold in their head. A five-step plan that ate five of
+those slots would make two features compete for one scarce thing while being
+about different halves of the same sentence. `Plans` is its own resource with
+its own cap and its own evaluator, so arming a plan never costs a trigger and
+reading your triggers never means reading a plan's internals.
+
+### The deferral graph is two rungs deep and never points back up
+
+| from | may defer | may not |
+|---|---|---|
+| a trigger's `then` | any ordinary intent | `trigger_set`, `trigger_clear`, `plan_set`, `plan_clear` |
+| a plan's step | any ordinary intent, **including `trigger_set`** | `plan_set`, `plan_clear` |
+
+A plan step arming a trigger is a real idiom — "build the barracks, then arm the
+home guard" — and it stays bounded because a trigger cannot defer anything
+further and `Triggers::set` still refuses the ninth. Remove the trigger→plan
+refusal and a trigger could set a plan whose step re-armed the trigger, forever;
+that is why the trigger refusal was widened rather than left alone.
+
+### The late-binding problem, and the idiom that answers it
+
+A step's intent is frozen at `plan_set` time, exactly like a trigger's `then`.
+So a step **cannot** say "the eight footmen I will have by then" — there is no
+id to write, and there is no selector in the language that would produce one.
+
+The trigger chapter above flagged this as "a real edge the plans bead will meet
+again". It does, and the answer is that **the language already has a
+late-binding selector: the squad.** `template` stamps every unit a building
+trains into squad 2; `posture` addresses squad 2 *by number* and its membership
+resolves when the step executes. So the idiom is:
+
+```json
+{"type":"plan_set","name":"army","steps":[
+  {"intent":{"type":"template","building":<barracks>,"squad":2}},
+  {"intent":{"type":"train","building":<barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<barracks>,"unit":"Footman"},
+   "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":3}}},
+  {"intent":{"type":"posture","id":2,"posture":{"type":"push","x":70,"z":70}}}]}
+```
+
+Note the three separate `train` steps: `train` queues **one** unit, so a
+`unit_count` wait must be for a number the plan actually produces. A single
+`train` step under `count: 8` is a plan that waits forever, and the engine will
+not warn you — it is `running`, correctly, on a step whose condition is simply
+never going to hold.
+
+The last step moves whoever is in squad 2 when it runs. **No new selector was
+invented**, and that is the decision rather than an omission: a `{"squad":2}`
+form of every unit-taking verb would be a second way to spell membership, and
+this document exists because two spellings of one language is two languages. The
+answer to "I want to act on units I do not have yet" is *put them in a squad on
+the way in*, which is a thing a commander should be doing anyway.
+
+The NL layer says the same thing in English: `"the barracks units join squad 2,
+then when I have 8 footmen, squad 2 pushes their base"`.
+
+### The frame slot, and the one new determinism edge
+
+`SimSet::Think`, after `FogSet`, at 4 Hz, upstream of `SimSet::Intent` — all
+four of trigger.rs's reasons, unchanged, so a step submitted this tick is
+compiled this tick.
+
+One thing is new. plan.rs and trigger.rs both write `GameEvents` and
+`SubmitIntent`, and Bevy leaves two systems in one set unordered unless
+something forces an edge. Something has to, because `Order` is a component and
+last writer wins. **Plans are ordered `.before` triggers**, so a trigger lands
+last and wins a same-tick tie. That is the same ranking trigger.rs already
+argued for against doctrine, one rung along: a trigger is a rule written for the
+exact situation that just occurred; a plan is a sequence written before the
+match for the general case. If your opening says "push mid" on the tick your
+home guard says "the base is burning", the base is burning.
+
+### Latency: a plan step pays nothing
+
+Same row as a trigger in docs/TEMPO.md's verb table, same argument: a plan is
+standing policy the engine executes unattended, its author paid the reach when
+they wrote it down, and charging the link per step would make a plan strictly
+worse than typing the same commands by hand — which inverts C4.
+
+### Provenance: a third rung
+
+`Cause::Plan { plan, verb, source }` renders `plan:opening step 2/5 move by
+bridge t=41`. Its own rung beside `Cause::Trigger` because the step number is
+the part that makes the answer usable: it tells a reader where in the sequence
+they are without opening the plan.
+
+### The seats, honestly
+
+Same asymmetry triggers documented, and it is a *rendering* decision rather than
+a routing one — the one place this document permits the two seats to differ.
+
+* **The bridge** gets both verbs and a `plans` array with `step`/`of`/`status`,
+  the current step's sentence, and `steps` round-tripped as the JSON that was
+  sent (read it out, change one step, send it back under the same name).
+* **The human** gets a status line in the selection panel — `Plans: opening 2/5
+  boom 3/3 (blocked: not enough gold)` — and no authoring UI. That is not a
+  privileged seat: `plan_set` is one verb in one language, and
+  `intent_compile.py` compiles a person's English into exactly the JSON a
+  commander writes. It is that a person at a keyboard *already has* sequencing —
+  they press the keys in order at 200ms each, and a mouse-driven step editor
+  would be strictly slower than the thing it automates. What they did not have
+  is a way to *see* a sequence their co-commander set running unattended, and
+  that is the line.
+
+### Co-command: a proposed plan is one reviewable line
+
+This is the thing co-command wanted and could not have. A partner's opening used
+to arrive as five separate commands — five queue entries, each approvable alone,
+so the human could approve the barracks, veto the keep, and end up holding an
+incoherent half-sequence nobody proposed. `plan_set` makes the whole sequence
+one `Intent`, so it is one proposal, one sentence, one `[Enter]`.
+
+Nothing in copilot.rs knew a plan was coming: it wraps any command. And a plan's
+`sentence()` renders **every** step joined by "then", which is why — the human
+answering has to see what they are agreeing to on the line they are answering.
+
+### What this leaves open
+
+- **`plan_pause` / `plan_resume`.** Deferred, and not because it is hard to
+  implement but because its semantics are not honest. Pausing cannot un-issue
+  what the engine has already ordered, so "pause" would promise a rollback the
+  engine cannot deliver. `plan_clear` plus a re-stated `plan_set` is the idiom,
+  and re-stating restarts cleanly rather than resuming into a world that moved.
+- **No branching.** One sequence, no `else`. A plan that could branch is a
+  program; the composition you want is a plan *and* a trigger, which is why both
+  exist.
+- **A step still cannot name a unit that does not exist.** Answered by the squad
+  idiom above rather than solved. The residue is real: a plan cannot say "the
+  *specific* Catapult I am about to build".
+- **And there is no squad idiom for BUILDINGS**, which is the sharper half of
+  the same gap and worth stating plainly: a step cannot name a building the
+  plan itself is about to put up. "Build a Barracks, then train Footmen at it"
+  is unspellable in one plan, because step 1 mints the id that step 3 would
+  need. Squads close this for units because membership is late-bound by number;
+  buildings have no such handle. The working idiom is two plans — an economic
+  opening now, an army plan set on the poll after the Barracks appears in your
+  snapshot — and that is what tools/COMMANDER_BRIEF.md ships as the canonical
+  pair. A `{"building":{"kind":"Barracks","nth":0}}` selector would close it and
+  was deliberately not invented here: it is a second way to name a building, and
+  the argument against inventing one is the argument this whole document makes.
+- **A plan whose wait can never be satisfied is indistinguishable from one that
+  is merely early.** `unit_count >= 8` behind a single `train` step (which
+  queues one unit) is `running` forever, honestly and uselessly. Nothing
+  type-checks a plan against the world it will meet.
+- **Nothing watches for a plan whose premise died.** A plan waiting on
+  `unit_count` for an army whose barracks was razed waits forever, `running`,
+  and nothing tells you. The status is honest but passive.
 
 ---
 
