@@ -57,7 +57,10 @@ BH_BRIDGE=red cargo run     # red is played through bridge/red/
 The commander's manual is [tools/COMMANDER_BRIEF.md](tools/COMMANDER_BRIEF.md):
 it reads `bridge/red/state.json`, writes JSON command batches, and blocks on
 `tools/bridge_wait.py` — an event-driven loop, no polling, no screen parsing.
-`tools/arena_run.py` runs full LLM-vs-LLM arena rounds ([docs/ARENA.md](docs/ARENA.md)).
+
+**Want two LLMs battling each other?** Follow
+[docs/LLM_MATCH_QUICKSTART.md](docs/LLM_MATCH_QUICKSTART.md) — one build, one
+launch command, two agent prompts, and the result lands in the arena ledger.
 
 ## Verify
 
