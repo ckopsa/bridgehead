@@ -586,6 +586,19 @@ struct StateOut {
     /// identical to a v1 one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     triggers: Vec<TriggerOut>,
+    /// **This seat's own named regions**, in the order they were set.
+    ///
+    /// Own-team only, and that is doctrine rather than bookkeeping: a region is
+    /// a decision about which ground matters, and handing the enemy a list of
+    /// the places you have decided to watch would be the single most valuable
+    /// intelligence leak in the protocol. The map's built-in names are the
+    /// public half and live in `map.places`, where both seats see the same
+    /// list.
+    ///
+    /// Skipped when empty, so a snapshot from a seat that has never named
+    /// ground is byte-shape identical to a v2 one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    regions: Vec<RegionOut>,
 
     // --- co-command (copilot seats only) ---------------------------------
     //
@@ -743,6 +756,32 @@ struct MapOut {
     /// Gaps in the impassable terrain — empty on a map that has none. Armies,
     /// workers and expansions can only cross here.
     chokes: Vec<ChokeOut>,
+    /// **The map's own vocabulary**: every name both seats may speak without
+    /// arming anything — the two bases, `mid`, the four mines, and one entry
+    /// per ford. Any of these is legal wherever a verb takes `x`/`z`, as
+    /// `"region":"<name>"`.
+    ///
+    /// Public and neutral like everything else in this struct, with one honest
+    /// asymmetry: `our base` and `their base` are seat-relative, so the two
+    /// snapshots disagree about which coordinates those two names carry. That
+    /// is the point of the aliases — the WORDS are shared, and each seat reads
+    /// them from where it is standing.
+    places: Vec<RegionOut>,
+}
+
+/// A named circle of ground, in the seat's own words.
+///
+/// One shape for both kinds of name — the map's built-ins in `map.places` and
+/// the seat's own in `regions` — because a commander should not need to know
+/// which kind a name is before using it. The only difference is which array it
+/// arrived in, and that is exactly the difference: one is a map fact, the other
+/// is your doctrine.
+#[derive(Serialize)]
+struct RegionOut {
+    name: String,
+    /// Centre on the ground plane.
+    pos: [f32; 2],
+    radius: f32,
 }
 
 #[derive(Serialize)]
@@ -1296,6 +1335,11 @@ struct SeatVerdicts<'w> {
 struct StandingOrders<'w> {
     squads: Res<'w, SquadOrders>,
     triggers: Res<'w, Triggers>,
+    /// The third store on the same rule: written only by the intent compiler's
+    /// two `region_*` verbs, read here and in the HUD, and it answers the same
+    /// question about a different noun — what ground has this commander decided
+    /// to name.
+    regions: Res<'w, Regions>,
 }
 
 /// The co-command side-channel: the pending proposal queue and the team's
@@ -1368,6 +1412,7 @@ fn write_snapshot(
             &game_over,
             &standing.squads,
             standing.triggers.get(seat.team),
+            standing.regions.get(seat.team),
             *tech.tiers,
             *tech.research,
             &feed,
@@ -1398,6 +1443,7 @@ fn write_seat_snapshot(
     // the whole resource, so this function cannot read the opponent's plans
     // even by accident.
     my_triggers: &[TriggerRule],
+    my_regions: &[Region],
     tiers: TechTiers,
     team_research: TeamResearch,
     feed: &GameEvents,
@@ -1655,6 +1701,17 @@ fn write_seat_snapshot(
     // in, so it is the order they must be read in. NOT sorted, unlike every
     // other list here: sorting would hide the one thing about the list that is
     // load-bearing.
+    // This seat's own named ground, in the order it was named. Not sorted, for
+    // the same reason the trigger list is not: the order is the commander's.
+    let regions: Vec<RegionOut> = my_regions
+        .iter()
+        .map(|r| RegionOut {
+            name: r.name.clone(),
+            pos: [r1(r.center.x), r1(r.center.z)],
+            radius: r1(r.radius),
+        })
+        .collect();
+
     let triggers: Vec<TriggerOut> = my_triggers
         .iter()
         .map(|t| TriggerOut {
@@ -1849,6 +1906,14 @@ fn write_seat_snapshot(
             name: map.id(),
             summary: map.summary(),
             available: crate::terrain::MapKind::ALL.iter().map(|m| m.id()).collect(),
+            places: crate::shared::builtin_places(seat.team)
+                .into_iter()
+                .map(|r| RegionOut {
+                    name: r.name,
+                    pos: [r1(r.center.x), r1(r.center.z)],
+                    radius: r1(r.radius),
+                })
+                .collect(),
             chokes: map
                 .chokepoints()
                 .into_iter()
@@ -1874,6 +1939,7 @@ fn write_seat_snapshot(
         events,
         command_nodes,
         triggers,
+        regions,
         copilot: copilot_out,
         proposals: proposals_out,
         recent_resolutions: resolutions_out,

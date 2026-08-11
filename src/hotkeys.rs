@@ -172,6 +172,14 @@ pub enum Action {
     /// this squad falls back and defends it. A preset, not an authoring UI —
     /// see docs/INTENT.md on the asymmetry this leaves open.
     HomeGuard,
+    /// Arm the region marker: the next ground click names a circle. The name
+    /// is chosen by the engine (`mark 1`..`mark 8`) because the human has no
+    /// text entry — see ui.rs's `next_mark_name` for why that is the right
+    /// answer rather than a missing one.
+    MarkRegion,
+    /// Forget every region this team named. The whole-slate gesture, matching
+    /// the one `trigger_clear` already offers.
+    ClearRegions,
 
     // ---- doctrine page, production building ----
     TemplateSquad,
@@ -185,6 +193,8 @@ pub enum Action {
     NudgeFallbackUp,
     NudgeLeashDown,
     NudgeLeashUp,
+    NudgeRegionDown,
+    NudgeRegionUp,
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +471,8 @@ pub const REGISTRY: &[Binding] = &[
     b(Action::AutoCastSlot(1), KeyCode::KeyX, Ctx::DoctrinePage),
     b(Action::AutoCastSlot(2), KeyCode::KeyC, Ctx::DoctrinePage),
     b(Action::HomeGuard, KeyCode::KeyH, Ctx::DoctrinePage),
+    b(Action::MarkRegion, KeyCode::KeyM, Ctx::DoctrinePage),
+    b(Action::ClearRegions, KeyCode::KeyN, Ctx::DoctrinePage),
     // ---- doctrine page, production building ------------------------------
     b(Action::TemplateSquad, KeyCode::KeyQ, Ctx::DoctrineTemplate),
     b(Action::TemplateFallback, KeyCode::KeyW, Ctx::DoctrineTemplate),
@@ -475,6 +487,12 @@ pub const REGISTRY: &[Binding] = &[
     b(Action::NudgeFallbackUp, KeyCode::Equal, Ctx::Nudge),
     b(Action::NudgeLeashDown, KeyCode::BracketLeft, Ctx::Nudge),
     b(Action::NudgeLeashUp, KeyCode::BracketRight, Ctx::Nudge),
+    // The third numeric parameter. `,`/`.` would have been the obvious pair and
+    // is not available — `.` is the global idle-worker key, and a nudge that
+    // sometimes jumped the camera would be worse than an awkward pair. `;`/`'`
+    // is the next adjacent unshifted pair, and it is free everywhere.
+    b(Action::NudgeRegionDown, KeyCode::Semicolon, Ctx::Nudge),
+    b(Action::NudgeRegionUp, KeyCode::Quote, Ctx::Nudge),
 ];
 
 // ---------------------------------------------------------------------------
@@ -547,6 +565,8 @@ pub fn key_caption(k: KeyCode) -> &'static str {
         KeyCode::Backspace => "Bksp",
         KeyCode::Tab => "Tab",
         KeyCode::Period => ".",
+        KeyCode::Semicolon => ";",
+        KeyCode::Quote => "'",
         KeyCode::Minus => "-",
         KeyCode::Equal => "=",
         KeyCode::BracketLeft => "[",

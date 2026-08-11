@@ -4643,6 +4643,349 @@ pub fn intent_entity(id: IntentId) -> Option<Entity> {
 }
 
 // ---------------------------------------------------------------------------
+// Territory: named places and regions
+// ---------------------------------------------------------------------------
+//
+// Every verb in this language that touches ground has spoken it as a pair of
+// floats. `{"type":"posture","id":2,"posture":{"type":"defend","x":-60,"z":60,
+// "radius":18}}` is a legal sentence and an unreadable one: three months of
+// replay logs say "defend (-60.0, 60.0)" and nobody, human or model, can tell
+// from that whether the commander meant the northwest ford or a patch of grass.
+// intent_compile.py already knew this and had a private answer — a table of
+// fords, "mid", and the two bases that it resolved on the *read* side, in
+// Python, invisible to the engine. This section makes that vocabulary
+// first-class and gives it to both seats.
+//
+// Two kinds of name, and the difference is the whole design:
+//
+//   * **Built-in places** are map facts. Derived per map, read-only, IDENTICAL
+//     for both teams (modulo the two per-seat aliases), and they exist without
+//     anybody arming anything — you can say "hold the center ford" in the first
+//     second of a match. They are shared vocabulary: when one seat says
+//     "northwest ford" and the other reads "northwest ford" in the map summary,
+//     the two are talking about the same ground, and that is checkable.
+//
+//   * **Regions** are what a commander names. `region_set` gives a circle a
+//     name; from then on every verb that takes x/z takes `"region":"<name>"`
+//     instead. They are DOCTRINE, not information: a region appears only in its
+//     owner's snapshot, and naming ground is never a way to tell the enemy
+//     something. The cap and the replace-by-name rule are copied verbatim from
+//     `MAX_TRIGGERS_PER_TEAM` and for the identical reason — eight named places
+//     is a map a commander can hold in their head; eighty is a database.
+//
+// **Circles only.** A polygon region is more expressive and there is no
+// evidence anybody needs it: every shape the game already speaks — leash,
+// defend, `MINE_HOME_RADIUS`, ability areas, the fog grid's reveal — is a point
+// and a radius, `contains` is one distance test the frame can afford at 4 Hz,
+// and a circle is drawable on a 100px minimap in a way a polygon is not. If a
+// match is ever lost because a ford was square, the shape enum is one variant
+// away; until then the extra vocabulary is cost without a buyer.
+
+/// Longest region name the language accepts, in bytes. Same bound as
+/// [`TRIGGER_NAME_MAX`] and for the same reason: a name is a label, not a
+/// sentence, and both are echoed back in teaching errors that have to fit on a
+/// HUD line.
+pub const REGION_NAME_MAX: usize = 24;
+
+/// The most regions one team may have named at once. See
+/// [`MAX_TRIGGERS_PER_TEAM`] — this is that argument, applied to geography.
+/// Replacing by name is free, so tuning a region never costs a slot.
+pub const MAX_REGIONS_PER_TEAM: usize = 8;
+
+/// Smallest legal region radius, in world units. Below this a "region" is a
+/// coordinate wearing a name: `CELL` is 2.0, so a 3-unit circle cannot even
+/// hold a formation, and `defend`ing it would jitter.
+pub const REGION_RADIUS_MIN: f32 = 4.0;
+
+/// Largest legal region radius. `MAP_HALF` is 100, so 60 is a circle covering
+/// most of one half of the board — past that "the region" stops distinguishing
+/// anything and a rule keyed on it is a rule that is always true.
+pub const REGION_RADIUS_MAX: f32 = 60.0;
+
+/// A named circle of ground.
+///
+/// `name` is stored exactly as the commander spelled it — that is the string
+/// echoed in errors, drawn on the map and printed in sentences. Lookup folds
+/// case and punctuation ([`normalize_place`]), so `The Perimeter`,
+/// `the-perimeter` and `the perimeter` are one region, but the label keeps the
+/// commander's capitals.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Region {
+    pub name: String,
+    /// Centre on the ground plane (y is always 0).
+    pub center: Vec3,
+    pub radius: f32,
+}
+
+impl Region {
+    pub fn new(name: impl Into<String>, center: Vec3, radius: f32) -> Self {
+        Region {
+            name: name.into(),
+            center: Vec3::new(center.x, 0.0, center.z),
+            radius,
+        }
+    }
+
+    /// Is this world point inside the circle? Measured on XZ only — the game
+    /// is flat, and a y component here would be a bug waiting for a flying
+    /// unit.
+    pub fn contains(&self, p: Vec3) -> bool {
+        let d = p - self.center;
+        Vec2::new(d.x, d.z).length() <= self.radius
+    }
+}
+
+/// Fold a place name to its comparison form: lowercase, `-` and `_` become
+/// spaces, runs of whitespace collapse.
+///
+/// Deliberately does NOT drop articles or possessives. `our base` and `their
+/// base` are two different places whose only difference is a possessive, and a
+/// normalizer that threw those away would make the two built-ins collide — the
+/// exact bug intent_compile.py's `NOISE` list has to special-case around.
+pub fn normalize_place(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        let ch = if ch == '-' || ch == '_' { ' ' } else { ch };
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+/// `Ok` with the trimmed name, or `Err` saying why it is not a name.
+///
+/// Rejects rather than truncates, exactly like [`TriggerName::new`]: a
+/// truncated name is a name `region_clear` cannot spell.
+pub fn validate_region_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("a region needs a name".to_string());
+    }
+    if name.len() > REGION_NAME_MAX {
+        return Err(format!(
+            "region name '{name}' is longer than {REGION_NAME_MAX} characters"
+        ));
+    }
+    if !name.bytes().all(|b| (0x21..=0x7e).contains(&b) || b == b' ') {
+        return Err(format!(
+            "region name '{name}' must be printable ASCII"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Radii the built-in places are given. Not arbitrary: each one is the radius
+/// at which "a unit is at that place" is the answer a person would give.
+const BUILTIN_BASE_RADIUS: f32 = 28.0;
+const BUILTIN_MINE_RADIUS: f32 = 14.0;
+const BUILTIN_MID_RADIUS: f32 = 22.0;
+
+/// The map's own vocabulary, from this seat's point of view.
+///
+/// Read-only and derived — there is no resource holding these, because they are
+/// not state: they are what the map *is*, and re-deriving them is four
+/// distances and a `Vec`. Both teams get the same list except for the two
+/// aliases whose whole job is to be seat-relative.
+///
+/// The list, in the order it is offered:
+///
+///   * `our base` / `their base` — the two starting halls, per-seat.
+///   * `mid` — the map centre, where bounties spawn and the centre ford is.
+///   * `<compass> mine` — one per [`GOLD_MINE_POSITIONS`] entry, named for the
+///     compass anchor it is nearest. These are exactly the names
+///     intent_compile.py's `pick_mine` already resolves, so the NL front end
+///     and the wire protocol name the same four holes in the ground.
+///   * `<name> ford` — one per [`crate::terrain::ChokePoint`] on maps that have
+///     any, named by the map itself. Empty on `open`.
+pub fn builtin_places(team: Team) -> Vec<Region> {
+    let (ours, theirs) = match team {
+        Team::Human => (HUMAN_BASE, CLAUDE_BASE),
+        Team::Claude => (CLAUDE_BASE, HUMAN_BASE),
+    };
+    let mut out = vec![
+        Region::new("our base", ours, BUILTIN_BASE_RADIUS),
+        Region::new("their base", theirs, BUILTIN_BASE_RADIUS),
+        Region::new("mid", Vec3::ZERO, BUILTIN_MID_RADIUS),
+    ];
+    for pos in GOLD_MINE_POSITIONS {
+        out.push(Region::new(
+            format!("{} mine", compass_word(pos)),
+            pos,
+            BUILTIN_MINE_RADIUS,
+        ));
+    }
+    for choke in crate::terrain::active_map().chokepoints() {
+        // The ford's own opening is the honest radius: `width` is how wide the
+        // gap is, so half of it is "inside the ford". Floored at
+        // `REGION_RADIUS_MIN` so a narrow gap is still a place you can stand.
+        out.push(Region::new(
+            choke.name,
+            choke.pos,
+            (choke.width * 0.5).max(REGION_RADIUS_MIN),
+        ));
+    }
+    out
+}
+
+/// Which of the eight compass anchors a point is nearest.
+///
+/// The anchors are intent_compile.py's `COMPASS` table, byte for byte, and that
+/// is the point: this function is the inverse of `pick_mine`, so a mine this
+/// names `northwest mine` is the mine that tool hands back for the words
+/// "northwest mine". The map's own convention (bases on the SW→NE diagonal,
+/// west is -x, north is +z) is read off terrain.rs's ford names.
+fn compass_word(p: Vec3) -> &'static str {
+    const ANCHORS: [(&str, f32, f32); 8] = [
+        ("west", -65.0, 0.0),
+        ("east", 65.0, 0.0),
+        ("north", 0.0, 65.0),
+        ("south", 0.0, -65.0),
+        ("northwest", -60.0, 60.0),
+        ("northeast", 60.0, 60.0),
+        ("southwest", -60.0, -60.0),
+        ("southeast", 60.0, -60.0),
+    ];
+    ANCHORS
+        .iter()
+        .min_by(|a, b| {
+            let da = Vec2::new(a.1 - p.x, a.2 - p.z).length();
+            let db = Vec2::new(b.1 - p.x, b.2 - p.z).length();
+            da.total_cmp(&db)
+        })
+        .map(|a| a.0)
+        .unwrap_or("center")
+}
+
+/// Every team's named regions, in the order they were set.
+///
+/// A `Vec` for the same determinism reason as [`Triggers`]: the snapshot walks
+/// it, the renderer draws it, and both have to produce the same order on every
+/// run of the same binary. `set` replaces **in place** by name.
+///
+/// Built-ins are NOT stored here. They are derived by [`builtin_places`] at the
+/// three places that need them (resolution, snapshot, renderer), which is what
+/// makes "a built-in exists without arming anything" true rather than a startup
+/// system somebody could forget to run.
+#[derive(Resource, Default)]
+pub struct Regions {
+    human: Vec<Region>,
+    claude: Vec<Region>,
+}
+
+impl Regions {
+    pub fn get(&self, team: Team) -> &Vec<Region> {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+
+    pub fn get_mut(&mut self, team: Team) -> &mut Vec<Region> {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+
+    /// Create or replace by name. `Err` names why it was refused.
+    ///
+    /// Refuses a name a built-in already owns. Shadowing would be the worse
+    /// answer: `our base` would silently mean different ground for the two
+    /// seats depending on whether either had redefined it, and the shared
+    /// vocabulary is only shared if nobody can quietly repoint a word in it.
+    pub fn set(&mut self, team: Team, region: Region) -> Result<(), String> {
+        let key = normalize_place(&region.name);
+        if let Some(builtin) = builtin_places(team)
+            .into_iter()
+            .find(|b| normalize_place(&b.name) == key)
+        {
+            return Err(format!(
+                "'{}' is a built-in place on this map ({} at ({:.0}, {:.0})) — \
+                 pick another name",
+                region.name, builtin.name, builtin.center.x, builtin.center.z
+            ));
+        }
+        let list = self.get_mut(team);
+        if let Some(slot) = list.iter_mut().find(|r| normalize_place(&r.name) == key) {
+            *slot = region;
+            return Ok(());
+        }
+        if list.len() >= MAX_REGIONS_PER_TEAM {
+            return Err(format!(
+                "you already have {MAX_REGIONS_PER_TEAM} regions ({}) — \
+                 clear one first, or re-use its name to move it",
+                list.iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        list.push(region);
+        Ok(())
+    }
+
+    /// Remove one by name; `true` if anything was there.
+    pub fn clear(&mut self, team: Team, name: &str) -> bool {
+        let key = normalize_place(name);
+        let list = self.get_mut(team);
+        let before = list.len();
+        list.retain(|r| normalize_place(&r.name) != key);
+        list.len() != before
+    }
+
+    /// Remove every region of a team. Returns how many went.
+    pub fn clear_all(&mut self, team: Team) -> usize {
+        let list = self.get_mut(team);
+        let n = list.len();
+        list.clear();
+        n
+    }
+
+    /// Resolve a name to a shape, for this seat.
+    ///
+    /// Own regions first, then the map's built-ins — an order that cannot
+    /// matter, because `set` refuses to create the collision. Stated anyway so
+    /// the invariant is visible from the lookup as well as the writer.
+    pub fn find(&self, team: Team, name: &str) -> Option<Region> {
+        let key = normalize_place(name);
+        self.get(team)
+            .iter()
+            .find(|r| normalize_place(&r.name) == key)
+            .cloned()
+            .or_else(|| {
+                builtin_places(team)
+                    .into_iter()
+                    .find(|b| normalize_place(&b.name) == key)
+            })
+    }
+
+    /// Every name this seat may speak, own regions first. The teaching half of
+    /// an unknown-name refusal: a commander who mistyped gets the menu rather
+    /// than a "no".
+    pub fn known_names(&self, team: Team) -> Vec<String> {
+        let mut out: Vec<String> = self.get(team).iter().map(|r| r.name.clone()).collect();
+        out.extend(builtin_places(team).into_iter().map(|b| b.name));
+        out
+    }
+
+    /// The refusal an unknown name earns, with the menu attached.
+    pub fn unknown(&self, team: Team, name: &str) -> String {
+        format!(
+            "no region named '{name}' — known places: {}",
+            self.known_names(team).join(", ")
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Triggers: 'when' as a first-class word
 // ---------------------------------------------------------------------------
 //
@@ -4765,6 +5108,34 @@ pub enum TriggerWhen {
         #[serde(default = "one_u32")]
         count: u32,
     },
+    /// We can SEE at least `count` enemy units **inside a named region** right
+    /// now, optionally of one `class`.
+    ///
+    /// The territorial half of `enemy_sighted`, and the reason regions are
+    /// worth having: "any enemy is sighted" fires on a lone scout wandering
+    /// past a tower, whereas "five enemies are in north-pass" is the sentence a
+    /// commander actually wants to sleep behind. The region may be one this
+    /// team named or one the map named, so `{"type":"enemy_in","region":
+    /// "center ford","count":5}` is legal from the first second of a match.
+    ///
+    /// **Fog-honest by construction**, through the identical call
+    /// `enemy_sighted` uses: it counts bodies this team's own `FogGrid::sees`
+    /// admits AND that are inside the circle. Both filters, always — a region
+    /// is a place you are watching, not a place you are told about, and a
+    /// region nobody has eyes on stays quiet no matter what walks into it.
+    ///
+    /// An unknown region name is refused **at arm time** by the compiler, so
+    /// this predicate never has to have an opinion about a name that is not a
+    /// place. If its region is cleared after arming, it goes quiet rather than
+    /// firing on the whole map — see `trigger.rs`.
+    EnemyIn {
+        region: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
+        /// Defaults to 1.
+        #[serde(default = "one_u32")]
+        count: u32,
+    },
     /// At least one neutral bounty cache is on the map AND visible to us. Also
     /// fog-honest — the snapshot's `bounties` array is filtered the same way,
     /// so the trigger sees exactly the caches its owner is shown.
@@ -4825,6 +5196,21 @@ impl TriggerWhen {
                     format!("any {what} are sighted")
                 } else {
                     format!("{count} or more {what} are sighted")
+                }
+            }
+            TriggerWhen::EnemyIn {
+                region,
+                class,
+                count,
+            } => {
+                let what = match class {
+                    Some(class) => format!("enemy {class}"),
+                    None => "enemies".to_string(),
+                };
+                if *count <= 1 {
+                    format!("any {what} are seen in {region}")
+                } else {
+                    format!("{count} or more {what} are seen in {region}")
                 }
             }
             TriggerWhen::BountySpawned => "a bounty cache is sighted".to_string(),
@@ -4971,15 +5357,29 @@ impl Triggers {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Intent {
     // --- unit orders ---
+    /// Walk to a point. **Every verb below that takes `x`/`z` also takes
+    /// `"region": "<name>"` instead** — see [`Regions`] for what a name is, and
+    /// `intent::resolve_places` for the single point at which one becomes a
+    /// coordinate. `x`/`z` are `Option` for exactly that reason: "no place at
+    /// all" is now a thing a sentence can say, and it earns a refusal that
+    /// names both spellings rather than serde's "missing field x".
     Move {
         units: Vec<IntentId>,
-        x: f32,
-        z: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
     },
     AttackMove {
         units: Vec<IntentId>,
-        x: f32,
-        z: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
     },
     Attack {
         units: Vec<IntentId>,
@@ -5006,8 +5406,12 @@ pub enum Intent {
     Build {
         worker: IntentId,
         kind: String,
-        x: f32,
-        z: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
     },
     Train {
         building: IntentId,
@@ -5049,6 +5453,8 @@ pub enum Intent {
         x: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<IntentId>,
     },
@@ -5148,14 +5554,23 @@ pub enum Intent {
         x: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
     },
     /// Anchor to x/z within `radius`. `radius <= 0` clears the policy.
+    ///
+    /// Given a `region` and no `radius`, the REGION'S OWN radius is the leash —
+    /// which is the whole point of naming a circle: "hold the perimeter" should
+    /// not also require remembering how big you said the perimeter was. An
+    /// explicit `radius` still wins.
     Leash {
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         radius: Option<f32>,
     },
@@ -5234,6 +5649,34 @@ pub enum Intent {
         name: Option<String>,
     },
 
+    // --- territory: the ground, given names ---
+    /// **Name a circle of ground.** Create it, or move an existing one of the
+    /// same name in place.
+    ///
+    /// From then on every verb that takes `x`/`z` takes `"region":"<name>"`
+    /// instead, and the compiler resolves it at submit time. A region is
+    /// private doctrine: it appears in its owner's snapshot only, and naming
+    /// ground tells the enemy nothing.
+    ///
+    /// Refused if the name is a built-in place, if the team already holds
+    /// [`MAX_REGIONS_PER_TEAM`] under other names, or if the radius is outside
+    /// [`REGION_RADIUS_MIN`]..[`REGION_RADIUS_MAX`].
+    #[serde(rename = "region_set")]
+    RegionSet {
+        name: String,
+        x: f32,
+        z: f32,
+        radius: f32,
+    },
+    /// **Forget a region.** `name` omitted clears every region this team named
+    /// — the whole-slate form, matching `trigger_clear`. Built-ins are map
+    /// facts and are never cleared by this.
+    #[serde(rename = "region_clear")]
+    RegionClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+
     // --- match level ---
     /// Hand this faction to the scripted AI (or take it back).
     Autopilot {
@@ -5252,14 +5695,58 @@ pub struct RetreatIntent {
 }
 
 /// The inner object of a `posture` intent.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+///
+/// **Three of the four take a region**, and each mapping is stated here rather
+/// than left to be discovered from the compiler:
+///
+///   * `defend` — the region IS the ring. Centre becomes the anchor, and the
+///     region's own radius becomes the defend radius unless `radius` is given
+///     explicitly. "Squad 2 defends north-pass" is then one sentence with no
+///     numbers in it, which is the entire feature.
+///   * `push` — push to the region's CENTRE. A push is a direction, not an
+///     area; the radius is deliberately dropped, and dropping it silently is
+///     fine because `push` has never had a radius to confuse it with.
+///   * `forage` — the region's centre is the muster point held while no bounty
+///     is up. Radius dropped, same reasoning: foraging is bounded by where the
+///     caches are, not by where you were standing.
+///   * `escort` — names a unit, not ground. No region form, and there should
+///     not be one: a region that followed a hero would be a second, moving
+///     vocabulary for the same word.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PostureIntent {
-    Defend { x: f32, z: f32, radius: f32 },
-    Push { x: f32, z: f32 },
-    Escort { unit: IntentId },
-    /// Hunt bounty caches; x/z is the muster point held while none exist.
-    Forage { x: f32, z: f32 },
+    Defend {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+        /// Optional ONLY when a region supplies it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radius: Option<f32>,
+    },
+    Push {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+    },
+    Escort {
+        unit: IntentId,
+    },
+    /// Hunt bounty caches; x/z (or a region's centre) is the muster point held
+    /// while none exist.
+    Forage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+    },
 }
 
 impl Intent {
@@ -5291,6 +5778,8 @@ impl Intent {
             Intent::Template { .. } => "template",
             Intent::TriggerSet { .. } => "trigger_set",
             Intent::TriggerClear { .. } => "trigger_clear",
+            Intent::RegionSet { .. } => "region_set",
+            Intent::RegionClear { .. } => "region_clear",
             Intent::Autopilot { .. } => "autopilot",
             Intent::Surrender => "surrender",
         }
@@ -5328,6 +5817,20 @@ impl Intent {
         fn at(x: f32, z: f32) -> String {
             format!("({x:.1}, {z:.1})")
         }
+        /// How a sentence names ground. **A named place is spoken as its
+        /// name**, and that is most of why regions exist: the replay line for a
+        /// defended ford should read "defends north-pass", not "defends
+        /// (-60.0, 60.0)". Falls back to the coordinates when no name was used,
+        /// and says so plainly when a sentence names no ground at all — that
+        /// last case is a refusal being described, and describing it as
+        /// "(0.0, 0.0)" would put the map centre in the log.
+        fn place(x: &Option<f32>, z: &Option<f32>, region: &Option<String>) -> String {
+            match (region, x, z) {
+                (Some(name), _, _) => name.clone(),
+                (None, Some(x), Some(z)) => at(*x, *z),
+                _ => "(unspecified)".to_string(),
+            }
+        }
         fn group(units: &[IntentId]) -> String {
             match units.len() {
                 1 => format!("unit {}", units[0]),
@@ -5344,11 +5847,11 @@ impl Intent {
             }
         }
         match self {
-            Intent::Move { units, x, z } => {
-                format!("move {} to {}", group(units), at(*x, *z))
+            Intent::Move { units, x, z, region } => {
+                format!("move {} to {}", group(units), place(x, z, region))
             }
-            Intent::AttackMove { units, x, z } => {
-                format!("attack-move {} to {}", group(units), at(*x, *z))
+            Intent::AttackMove { units, x, z, region } => {
+                format!("attack-move {} to {}", group(units), place(x, z, region))
             }
             Intent::Attack { units, target } => {
                 format!("{} attack {target}", group(units))
@@ -5366,7 +5869,8 @@ impl Intent {
                 kind,
                 x,
                 z,
-            } => format!("worker {worker} builds {kind} at {}", at(*x, *z)),
+                region,
+            } => format!("worker {worker} builds {kind} at {}", place(x, z, region)),
             Intent::Train { building, unit } => {
                 format!("building {building} trains {unit}")
             }
@@ -5383,12 +5887,16 @@ impl Intent {
                 building,
                 x,
                 z,
+                region,
                 target,
-            } => match (x, z, target) {
-                (Some(x), Some(z), _) => {
+            } => match (x, z, region, target) {
+                (_, _, Some(name), _) => {
+                    format!("building {building} rallies to {name}")
+                }
+                (Some(x), Some(z), _, _) => {
                     format!("building {building} rallies to {}", at(*x, *z))
                 }
-                (_, _, Some(t)) => format!("building {building} rallies onto {t}"),
+                (_, _, _, Some(t)) => format!("building {building} rallies onto {t}"),
                 _ => format!("building {building} rally (unspecified)"),
             },
             // The sentence carries the AIM, because "who cast what" stopped
@@ -5434,23 +5942,36 @@ impl Intent {
                     format!("{} focus {}", group(units), classes.join(" > "))
                 }
             }
-            Intent::Retreat { units, below, x, z } => match (below, x, z) {
-                (Some(b), Some(x), Some(z)) if *b > 0.0 => format!(
-                    "{} fall back to {} below {:.0}% health",
-                    group(units),
-                    at(*x, *z),
-                    b * 100.0
-                ),
-                _ => format!("{} clear retreat policy", group(units)),
-            },
-            Intent::Leash { units, x, z, radius } => match (x, z, radius) {
-                (Some(x), Some(z), Some(r)) if *r > 0.0 => format!(
-                    "{} hold within {r:.0} of {}",
-                    group(units),
-                    at(*x, *z)
-                ),
-                _ => format!("{} clear leash", group(units)),
-            },
+            Intent::Retreat { units, below, x, z, region } => {
+                let has_place = region.is_some() || (x.is_some() && z.is_some());
+                match below {
+                    Some(b) if *b > 0.0 && has_place => format!(
+                        "{} fall back to {} below {:.0}% health",
+                        group(units),
+                        place(x, z, region),
+                        b * 100.0
+                    ),
+                    _ => format!("{} clear retreat policy", group(units)),
+                }
+            }
+            Intent::Leash { units, x, z, region, radius } => {
+                let has_place = region.is_some() || (x.is_some() && z.is_some());
+                // A leash whose radius came from the region has no number to
+                // print, so it names the shape instead — and "hold the
+                // perimeter" is the more honest rendering of what was said.
+                match (radius, has_place) {
+                    (Some(r), true) if *r > 0.0 => format!(
+                        "{} hold within {r:.0} of {}",
+                        group(units),
+                        place(x, z, region)
+                    ),
+                    (None, true) => match region {
+                        Some(name) => format!("{} hold {name}", group(units)),
+                        None => format!("{} clear leash", group(units)),
+                    },
+                    _ => format!("{} clear leash", group(units)),
+                }
+            }
             Intent::Autocast {
                 units,
                 min_enemies,
@@ -5473,17 +5994,22 @@ impl Intent {
             },
             Intent::Posture { id, posture } => match posture {
                 None => format!("squad {id} stands down (posture cleared)"),
-                Some(PostureIntent::Defend { x, z, radius }) => {
-                    format!("squad {id} defends {} within {radius:.0}", at(*x, *z))
-                }
-                Some(PostureIntent::Push { x, z }) => {
-                    format!("squad {id} pushes to {}", at(*x, *z))
+                Some(PostureIntent::Defend { x, z, region, radius }) => match radius {
+                    Some(r) => {
+                        format!("squad {id} defends {} within {r:.0}", place(x, z, region))
+                    }
+                    // The region is the ring: no number was said, so none is
+                    // printed. This is the sentence the feature exists for.
+                    None => format!("squad {id} defends {}", place(x, z, region)),
+                },
+                Some(PostureIntent::Push { x, z, region }) => {
+                    format!("squad {id} pushes to {}", place(x, z, region))
                 }
                 Some(PostureIntent::Escort { unit }) => {
                     format!("squad {id} escorts {unit}")
                 }
-                Some(PostureIntent::Forage { x, z }) => {
-                    format!("squad {id} forages, mustering at {}", at(*x, *z))
+                Some(PostureIntent::Forage { x, z, region }) => {
+                    format!("squad {id} forages, mustering at {}", place(x, z, region))
                 }
             },
             Intent::Template {
@@ -5545,6 +6071,19 @@ impl Intent {
             Intent::TriggerClear { name } => match name {
                 Some(name) => format!("clear trigger {name}"),
                 None => "clear every trigger".to_string(),
+            },
+            Intent::RegionSet {
+                name,
+                x,
+                z,
+                radius,
+            } => format!(
+                "'{name}' is the ground within {radius:.0} of {}",
+                at(*x, *z)
+            ),
+            Intent::RegionClear { name } => match name {
+                Some(name) => format!("forget the region {name}"),
+                None => "forget every region".to_string(),
             },
             Intent::Autopilot { on } => {
                 if *on {

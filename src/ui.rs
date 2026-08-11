@@ -200,6 +200,62 @@ fn trigger_line(triggers: &Triggers, now: f32) -> String {
         .collect();
     format!("Triggers: {}", parts.join("  "))
 }
+
+/// The panel's region readout: every circle THIS team has named, with its
+/// radius.
+///
+/// Own regions only. The map's built-ins are on the map itself — a line that
+/// recited `our base, their base, mid, four mines` every frame would be a
+/// readout of things that cannot change, crowding out the one list that does.
+/// Empty string when there are none, like every other optional line here.
+fn region_line(regions: &Regions) -> String {
+    let named = regions.get(Team::Human);
+    if named.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = named
+        .iter()
+        .map(|r| format!("{} r{}", r.name, trim_num(r.radius)))
+        .collect();
+    format!("Regions: {}", parts.join("  "))
+}
+
+/// The name the next `[M]` click will give its circle: the lowest free
+/// `mark N`.
+///
+/// The human has no text entry, and building one would be a keyboard-capture
+/// mode inside a game whose every other gesture is a click — so the engine
+/// names the region and the player renames nothing. `mark 1`..`mark 8` is a
+/// vocabulary a person can hold, it matches `MAX_REGIONS_PER_TEAM`, and it is
+/// spellable by the seat that most wants to read it: a co-commander sharing
+/// this team sees `mark 2` in its snapshot and can say `defend mark 2` back.
+///
+/// `None` when all eight are taken — the tile greys out rather than silently
+/// stealing a name the player is using.
+fn mark_number(regions: &Regions) -> Option<usize> {
+    (1..=MAX_REGIONS_PER_TEAM).find(|n| {
+        let name = format!("mark {n}");
+        !regions
+            .get(Team::Human)
+            .iter()
+            .any(|r| normalize_place(&r.name) == normalize_place(&name))
+    })
+}
+
+/// The same answer, spelled. One of the two is always derived from the other,
+/// so they cannot disagree about which slot is next.
+fn next_mark_name(regions: &Regions) -> Option<String> {
+    mark_number(regions).map(|n| format!("mark {n}"))
+}
+/// Radius a `[M]` mark gets before anybody tunes it. `DEFEND_RADIUS`, and not
+/// by coincidence: the commonest thing to do with a marked circle is defend it,
+/// and a mark whose ring did not match the ring a squad would hold there would
+/// be a picture of the wrong decision.
+const REGION_MARK_RADIUS: f32 = DEFEND_RADIUS;
+/// One `,`/`.` press, in world units. Two nav cells — the smallest change that
+/// is visible on a 100px minimap.
+const REGION_NUDGE: f32 = 4.0;
+
 /// Highest squad id a human gesture will ever mint. Matches the three control
 /// groups; a bridge commander may use any id it likes.
 const MAX_UI_SQUAD: u8 = 3;
@@ -430,7 +486,11 @@ impl Plugin for UiPlugin {
                         // genuinely free — which is exactly what a nested tuple
                         // says, while keeping the group's place in the chain.
                         (update_ghost, update_posture_marker),
-                        update_rally_flag,
+                        // Nested with the rally flag rather than listed: this
+                        // tuple is at Bevy's 20-element ceiling, and the two
+                        // draw unrelated standing facts whose relative order is
+                        // genuinely free.
+                        (update_rally_flag, update_region_rings),
                         // Chain of Command feedback. Like every system here it
                         // runs before the compiler, so a click gets its marker
                         // on the next frame rather than this one — 16ms, which
@@ -443,7 +503,7 @@ impl Plugin for UiPlugin {
                         hover_feedback,
                         sync_selection_rings,
                         update_minimap,
-                        update_minimap_bounties,
+                        (update_minimap_bounties, update_minimap_regions),
                         update_notifications,
                         // After the drain that fills the ping list, so a ring
                         // is on screen the same frame its alert row is.
@@ -524,6 +584,17 @@ struct UiState {
     /// taught and postures borrowed. A `Caster`-geometry ability never arms
     /// anything and fires on the key press exactly as it always did.
     cast_place: Option<CastArm>,
+    /// True while `[M]` has armed the region marker: the next left-click on
+    /// the ground names a circle at that point. The fifth user of the
+    /// press-then-click vocabulary building placement taught.
+    region_place: bool,
+    /// The radius the next marked region gets, in world units, or `None` for
+    /// [`REGION_MARK_RADIUS`]. Free-entry, not a preset ladder — `,`/`.` tune
+    /// it, and it persists between marks so a player who wants three 30-unit
+    /// circles sets the size once. `Option` so the first nudge lands on the
+    /// default rather than on zero, which is what `nudge_value` already does
+    /// for the other two numeric parameters on this page.
+    region_radius: Option<f32>,
     /// A teleport item waiting for the player to click WHICH hall it goes to.
     /// Armed only when there are two or more to choose between; see
     /// [`TeleportArm`].
@@ -569,6 +640,12 @@ struct UiAssets {
     ghost_bad: Handle<StandardMaterial>,
     /// docs/TEMPO.md §4 — the circle inside which your orders are free.
     node_ring_mat: Handle<StandardMaterial>,
+    /// A region this team named: warmer and slightly louder than the map's own
+    /// places, because it is the one of the two the player chose and can move.
+    region_mine_mat: Handle<StandardMaterial>,
+    /// A built-in place. The quietest thing on the ground — it is on screen for
+    /// the whole match on every map, and a permanent fact has to be ignorable.
+    region_map_mat: Handle<StandardMaterial>,
     /// An order still travelling, in the rally flag's gold: both mean "this is
     /// where a thing you said is going to happen".
     transit_mat: Handle<StandardMaterial>,
@@ -670,6 +747,13 @@ struct RallyFlag;
 #[derive(Component)]
 struct LinkRing;
 
+/// One pooled ring drawing a named region on the ground. Own regions and the
+/// map's built-ins share the pool and are told apart by material, not by
+/// component: they are the same kind of object, and the difference the player
+/// needs is "mine" versus "the map's", which is a colour.
+#[derive(Component)]
+struct RegionRing;
+
 /// One pooled marker at the destination of a selected unit's in-transit order,
 /// closing as the order arrives. This is the countdown: the ring's radius is
 /// `ready_at - now` made visible, so an order in flight looks like an order in
@@ -698,6 +782,11 @@ struct MinimapStatic;
 /// pulse on their own clock instead of tracking a unit.
 #[derive(Component)]
 struct MinimapBounty;
+
+/// A named place's outline on the minimap. Pooled, never despawned — the same
+/// contract every other dynamic minimap marker keeps.
+#[derive(Component)]
+struct MinimapRegion;
 
 /// The camera-viewport outline drawn on the minimap.
 #[derive(Component)]
@@ -750,6 +839,10 @@ enum Slot {
     /// Every trigger this team has armed, and its state. Empty until the
     /// player (or their co-commander) arms one.
     Triggers,
+    /// The region readout, directly under the triggers line. Together they are
+    /// the two halves of standing policy the human can otherwise only infer
+    /// from circles on the map: what will fire, and where the ground is.
+    Regions,
     /// Top bar: how much of this army is inside its own chain of command.
     /// Empty string whenever the mechanic is off.
     Coverage,
@@ -972,6 +1065,12 @@ enum CmdAction {
     TemplateClear,
     /// Arm or clear the `home-guard` trigger for the selection's squad.
     ToggleHomeGuard,
+    /// Arm the region marker: the next ground click names a circle.
+    MarkRegion,
+    /// Forget every region this team named.
+    ClearRegions,
+    /// Free-entry radius for the next mark; `true` is bigger.
+    NudgeRegion(bool),
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,6 +1856,10 @@ struct CastLookup<'w, 's> {
     /// squads and triggers are the same kind of thing (standing policy the
     /// engine executes), read by the same two systems for the same reason.
     triggers: Res<'w, Triggers>,
+    /// Rides along with `triggers` for the same reason and on the same rule:
+    /// named ground is standing policy, read by the same two systems that read
+    /// the other two kinds.
+    regions: Res<'w, Regions>,
     /// Rides along with `triggers` because it is only ever read to answer a
     /// question about them: is this repeating rule still inside its cooldown?
     clock: Res<'w, Time>,
@@ -2219,6 +2322,18 @@ struct DoctrineCard {
     /// Is the `home-guard` trigger armed right now? The tile is a toggle, so
     /// this is what decides whether pressing it arms or clears.
     home_guard: bool,
+    /// The number of the next free `mark N`, or `None` when all
+    /// `MAX_REGIONS_PER_TEAM` are taken. A number rather than the name so this
+    /// struct stays `Copy` — `next_mark_name` spells it out at the two places
+    /// that need the string.
+    region_mark: Option<usize>,
+    /// How many regions this team has named. Decides whether the clear tile is
+    /// worth offering.
+    region_count: usize,
+    /// Radius the next mark gets, already defaulted.
+    region_radius: f32,
+    /// Is the marker armed, waiting for a ground click?
+    region_armed: bool,
 }
 
 /// Page two: the doctrine card. This is the half of docs/TEMPO.md §2.0 that
@@ -2404,6 +2519,44 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
     // Pinned last, like the orders card's — `paginate` puts it in the final
     // slot of every page, so [I] is always the way back however deep the
     // doctrine card gets.
+    // --- territory ---------------------------------------------------------
+    //
+    // Deliberately OUTSIDE the selection branches above: naming ground is about
+    // the ground, not about who is standing on it, and a player who has to
+    // select a footman before they may mark a ford would rightly ask why.
+    //
+    // These two are the human's whole authoring surface for regions, and unlike
+    // the home-guard preset it is not a canned sentence — the player picks the
+    // point and the radius, and only the NAME is chosen for them, because there
+    // is no text entry anywhere in this HUD. `mark 3` is a poorer name than
+    // `north-pass`, and it is a real name: it round-trips through the wire, the
+    // snapshot and a co-commander's directive unchanged.
+    let mut mark = CmdEntry::plain(
+        CmdAction::MarkRegion,
+        bind(Hk::MarkRegion),
+        &match card.region_mark {
+            Some(n) => format!("Mark {n} r{}", trim_num(card.region_radius)),
+            None => "Mark region".to_string(),
+        },
+    )
+    .active(card.region_armed);
+    mark.enabled = card.region_mark.is_some();
+    mark.cost = if card.region_mark.is_some() {
+        "; / ' size".to_string()
+    } else {
+        format!("{MAX_REGIONS_PER_TEAM} named")
+    };
+    out.push(mark);
+
+    let mut forget = CmdEntry::plain(
+        CmdAction::ClearRegions,
+        bind(Hk::ClearRegions),
+        "Forget marks",
+    );
+    forget.enabled = card.region_count > 0;
+    forget.cost = format!("{} named", card.region_count);
+    out.push(forget);
+
     out.push(CmdEntry::plain(
         CmdAction::TogglePage,
         bind(Hk::ModeToggle),
@@ -2801,9 +2954,23 @@ fn ground_intent(
     say(
         submissions,
         if attack_move {
-            Intent::AttackMove { units, x, z }
+            Intent::AttackMove {
+                units,
+                x: Some(x),
+                z: Some(z),
+                // A mouse click names ground, never a name. The region form is
+                // for sentences; a gesture already knows exactly where it
+                // pointed, and re-deriving a name for it would be the UI
+                // guessing at what the player meant.
+                region: None,
+            }
         } else {
-            Intent::Move { units, x, z }
+            Intent::Move {
+                units,
+                x: Some(x),
+                z: Some(z),
+                region: None,
+            }
         },
     );
 }
@@ -2819,12 +2986,21 @@ fn posture_intent(arm: PostureArm, ground: Vec3) -> Option<Intent> {
     let p = clamp_to_map(ground);
     let posture = match arm.kind {
         PostureKind::Defend => PostureIntent::Defend {
-            x: p.x,
-            z: p.z,
-            radius: DEFEND_RADIUS,
+            x: Some(p.x),
+            z: Some(p.z),
+            region: None,
+            radius: Some(DEFEND_RADIUS),
         },
-        PostureKind::Push => PostureIntent::Push { x: p.x, z: p.z },
-        PostureKind::Forage => PostureIntent::Forage { x: p.x, z: p.z },
+        PostureKind::Push => PostureIntent::Push {
+            x: Some(p.x),
+            z: Some(p.z),
+            region: None,
+        },
+        PostureKind::Forage => PostureIntent::Forage {
+            x: Some(p.x),
+            z: Some(p.z),
+            region: None,
+        },
         PostureKind::Escort => return None,
     };
     Some(Intent::Posture {
@@ -2890,6 +3066,23 @@ fn setup_ui(
         // ignorable — docs/TEMPO.md §4 asks for feedback, not for decoration.
         base_color: Color::srgba(0.42, 0.72, 1.0, 0.30),
         emissive: LinearRgba::new(0.06, 0.16, 0.30, 1.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    // The two region materials. Both hairlines, both unlit, both blended — what
+    // separates them is hue and alpha, so "which of these circles did I draw?"
+    // is answerable at a glance without a legend.
+    let region_mine_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.78, 0.35, 0.50),
+        emissive: LinearRgba::new(0.32, 0.22, 0.05, 1.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    let region_map_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.72, 0.78, 0.86, 0.16),
+        emissive: LinearRgba::new(0.06, 0.07, 0.09, 1.0),
         unlit: true,
         alpha_mode: AlphaMode::Blend,
         ..default()
@@ -2986,6 +3179,8 @@ fn setup_ui(
         ghost_ok,
         ghost_bad,
         node_ring_mat,
+        region_mine_mat,
+        region_map_mat,
         transit_mat,
     });
 
@@ -3635,6 +3830,9 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                 Color::srgb(0.85, 0.72, 0.40),
                 Slot::Triggers,
             ));
+        // The region line's own colour: the amber the marks are drawn in on
+        // both maps, so the readout and the circle are the same object.
+        c.spawn(text_bundle("", 12.0, Color::srgb(1.0, 0.78, 0.35), Slot::Regions));
             c.spawn(text_bundle(
                 "Left-click / drag to select.",
                 13.0,
@@ -3810,6 +4008,8 @@ fn command_input(
             ui.wall_chain.clear();
         } else if ui.posture_place.is_some() {
             ui.posture_place = None;
+        } else if ui.region_place {
+            ui.region_place = false;
         } else if ui.attack_move_armed {
             ui.attack_move_armed = false;
         } else {
@@ -4024,6 +4224,10 @@ fn command_input(
             .map(posture_kind),
         tmpl: single_template,
         home_guard: has_trigger(&cast.triggers, HOME_GUARD),
+        region_mark: mark_number(&cast.regions),
+        region_count: cast.regions.get(Team::Human).len(),
+        region_radius: ui.region_radius.unwrap_or(REGION_MARK_RADIUS),
+        region_armed: ui.region_place,
     };
     let entries = command_entries(
         ui.page,
@@ -4066,10 +4270,16 @@ fn command_input(
     // is now pinned to every page so the tile is always there, but the doctrine
     // page is the only route to postures and templates and a route that depends
     // on a tile being drawn is one a future card can close.
+    //
+    // The old gate here was `a selection, or a production building` — because
+    // every tile on page two was about one or the other. Territory broke that:
+    // `Mark region` and `Forget marks` are about the GROUND, and they are the
+    // human's only authoring surface for regions, so a page that refused to
+    // open with nothing selected would put them behind a footman for no
+    // reason. The page now always has something on it, so the gate is gone.
     if !ctrl
         && keys.just_pressed(bind(Hk::ModeToggle))
         && !actions.contains(&CmdAction::TogglePage)
-        && (!own_units.is_empty() || single_template.capable)
     {
         actions.push(CmdAction::TogglePage);
     }
@@ -4084,6 +4294,21 @@ fn command_input(
             (bind(Hk::NudgeFallbackUp), CmdAction::NudgeFallback(true)),
             (bind(Hk::NudgeLeashDown), CmdAction::NudgeLeash(false)),
             (bind(Hk::NudgeLeashUp), CmdAction::NudgeLeash(true)),
+        ] {
+            if keys.just_pressed(key) {
+                actions.push(action);
+            }
+        }
+    }
+    // The region nudges are NOT gated on a selection, unlike the two above:
+    // marking ground is about the ground, and requiring a footman to be
+    // selected before you may resize a circle would be a rule with no reason
+    // behind it. Same raw-key idiom otherwise — no tile, advertised on the cost
+    // line of the tile they tune.
+    if !ctrl && ui.page == CardPage::Doctrine {
+        for (key, action) in [
+            (bind(Hk::NudgeRegionDown), CmdAction::NudgeRegion(false)),
+            (bind(Hk::NudgeRegionUp), CmdAction::NudgeRegion(true)),
         ] {
             if keys.just_pressed(key) {
                 actions.push(action);
@@ -4173,6 +4398,7 @@ fn command_input(
                 ui.attack_move_armed = true;
                 ui.placement = None;
                 ui.teleport_place = None;
+                ui.region_place = false;
             }
             CmdAction::Stop => {
                 if !own_units.is_empty() {
@@ -4190,6 +4416,7 @@ fn command_input(
                 ui.wall_chain.clear();
                 ui.attack_move_armed = false;
                 ui.teleport_place = None;
+                ui.region_place = false;
             }
             // Abilities: combat.rs owns the unlock/mana/cooldown verdict,
             // exactly as it does for the AI and the bridge. The hotkey IS the
@@ -4234,6 +4461,7 @@ fn command_input(
                     ui.placement = None;
                     ui.posture_place = None;
                     ui.teleport_place = None;
+                    ui.region_place = false;
                     continue;
                 }
                 for (hero, _, _, _) in &own_casters {
@@ -4256,6 +4484,7 @@ fn command_input(
                         ui.placement = None;
                         ui.posture_place = None;
                         ui.teleport_place = None;
+                        ui.region_place = false;
                         continue;
                     }
                     say(&mut submissions, cast_here(entity, index, None));
@@ -4349,6 +4578,7 @@ fn command_input(
                         ui.placement = None;
                         ui.posture_place = None;
                         ui.cast_place = None;
+                        ui.region_place = false;
                         continue;
                     }
                 }
@@ -4383,6 +4613,7 @@ fn command_input(
                             units: own_ids(),
                             x: Some(anchor.x),
                             z: Some(anchor.z),
+                            region: None,
                             radius: Some(GUARD_RADIUS),
                         },
                     );
@@ -4395,6 +4626,7 @@ fn command_input(
                             units: own_ids(),
                             x: None,
                             z: None,
+                            region: None,
                             radius: Some(0.0),
                         },
                     );
@@ -4414,6 +4646,7 @@ fn command_input(
                             below: Some(FALLBACK_FRAC),
                             x: Some(rally.x),
                             z: Some(rally.z),
+                            region: None,
                         },
                     );
                 } else {
@@ -4425,6 +4658,7 @@ fn command_input(
                             below: Some(0.0),
                             x: None,
                             z: None,
+                            region: None,
                         },
                     );
                 }
@@ -4512,11 +4746,56 @@ fn command_input(
                 ui.posture_place = None;
                 ui.cast_place = None;
                 ui.teleport_place = None;
+                ui.region_place = false;
             }
             // The one trigger gesture the human has. A toggle, like [G] Guard:
             // armed, it clears; unarmed, it arms. Both halves submit an intent
             // a commander could have typed, and the replay log cannot tell
             // which of us pressed it.
+            // --- territory ---------------------------------------------
+            //
+            // Arming, not acting: the mark needs a point, and the point is a
+            // click. Same mutual exclusion every other armed mode observes —
+            // two armed modes would make the next click ambiguous, and the
+            // player would find out which one won by losing a building.
+            CmdAction::MarkRegion => {
+                if next_mark_name(&cast.regions).is_none() {
+                    continue;
+                }
+                ui.region_place = !ui.region_place;
+                if ui.region_place {
+                    ui.attack_move_armed = false;
+                    ui.placement = None;
+                    ui.wall_chain.clear();
+                    ui.posture_place = None;
+                    ui.cast_place = None;
+                    ui.teleport_place = None;
+                }
+            }
+            CmdAction::ClearRegions => {
+                if cast.regions.get(Team::Human).is_empty() {
+                    continue;
+                }
+                ui.region_place = false;
+                // The whole-slate form, which is the only one a mouse can
+                // reach: picking WHICH mark to forget would need a click target
+                // the minimap does not offer, and re-marking is one keypress.
+                say(&mut submissions, Intent::RegionClear { name: None });
+            }
+            CmdAction::NudgeRegion(up) => {
+                // Tunes the SIZE OF THE NEXT MARK, and does not touch the ones
+                // already on the map. Re-marking over a name replaces it, so
+                // resizing an existing circle is "tune, then mark again" — one
+                // rule, no second verb.
+                ui.region_radius = nudge_value(
+                    ui.region_radius,
+                    up,
+                    REGION_NUDGE,
+                    REGION_MARK_RADIUS,
+                    REGION_RADIUS_MIN,
+                    REGION_RADIUS_MAX,
+                );
+            }
             CmdAction::ToggleHomeGuard => {
                 if has_trigger(&cast.triggers, HOME_GUARD) {
                     say(
@@ -4546,9 +4825,10 @@ fn command_input(
                         then: Box::new(Intent::Posture {
                             id: squad,
                             posture: Some(PostureIntent::Defend {
-                                x: home.x,
-                                z: home.z,
-                                radius: HOME_GUARD_RADIUS,
+                                x: Some(home.x),
+                                z: Some(home.z),
+                                region: None,
+                                radius: Some(HOME_GUARD_RADIUS),
                             }),
                         }),
                         // Repeating, and this is the only interesting choice in
@@ -4574,6 +4854,7 @@ fn command_input(
                 ui.wall_chain.clear();
                 ui.cast_place = None;
                 ui.teleport_place = None;
+                ui.region_place = false;
             }
             CmdAction::ClearPosture => {
                 // Clearing a posture leaves membership intact: the squad stops
@@ -4602,6 +4883,7 @@ fn command_input(
                                 below: Some(below),
                                 x: Some(rally.x),
                                 z: Some(rally.z),
+                                region: None,
                             },
                         );
                     }
@@ -4612,6 +4894,7 @@ fn command_input(
                             below: Some(0.0),
                             x: None,
                             z: None,
+                            region: None,
                         },
                     ),
                 }
@@ -4642,6 +4925,7 @@ fn command_input(
                                 below: Some(below),
                                 x: Some(rally.x),
                                 z: Some(rally.z),
+                                region: None,
                             },
                         );
                     }
@@ -4652,6 +4936,7 @@ fn command_input(
                             below: Some(0.0),
                             x: None,
                             z: None,
+                            region: None,
                         },
                     ),
                 }
@@ -4676,6 +4961,7 @@ fn command_input(
                                 units: own_ids(),
                                 x: Some(anchor.x),
                                 z: Some(anchor.z),
+                                region: None,
                                 radius: Some(radius),
                             },
                         );
@@ -4686,6 +4972,7 @@ fn command_input(
                             units: own_ids(),
                             x: None,
                             z: None,
+                            region: None,
                             radius: Some(0.0),
                         },
                     ),
@@ -4704,6 +4991,7 @@ fn command_input(
                                 units: own_ids(),
                                 x: Some(anchor.x),
                                 z: Some(anchor.z),
+                                region: None,
                                 radius: Some(radius),
                             },
                         );
@@ -4714,6 +5002,7 @@ fn command_input(
                             units: own_ids(),
                             x: None,
                             z: None,
+                            region: None,
                             radius: Some(0.0),
                         },
                     ),
@@ -5133,6 +5422,8 @@ fn left_mouse(
     nav: Res<NavGrid>,
     economies: Res<Economies>,
     game_over: Res<GameOver>,
+    // Read-only: which `mark N` is free, so an armed marker names the next one.
+    regions: Res<Regions>,
     mut submissions: EventWriter<SubmitIntent>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
@@ -5217,8 +5508,9 @@ fn left_mouse(
                                 Intent::Build {
                                     worker: intent_id(worker),
                                     kind: building_name(kind).to_string(),
-                                    x: pos.x,
-                                    z: pos.z,
+                                    x: Some(pos.x),
+                                    z: Some(pos.z),
+                                    region: None,
                                 },
                             );
                             if chaining {
@@ -5274,6 +5566,31 @@ fn left_mouse(
                         say(&mut submissions, intent);
                     }
                     ui.posture_place = None;
+                    return;
+                }
+
+                // Region mark. `[M]` armed it; this click is the centre, and
+                // the radius came off the card. One `region_set` sentence — the
+                // same object a commander sends as
+                // {"type":"region_set","name":"mark 1","x":..,"z":..,"radius":..},
+                // which is what lets a co-commander sharing this team read the
+                // human's marks and name them back.
+                if ui.region_place {
+                    if let (Some(g), Some(name)) =
+                        (ground, next_mark_name(&regions))
+                    {
+                        let p = clamp_to_map(g);
+                        say(
+                            &mut submissions,
+                            Intent::RegionSet {
+                                name,
+                                x: p.x,
+                                z: p.z,
+                                radius: ui.region_radius.unwrap_or(REGION_MARK_RADIUS),
+                            },
+                        );
+                    }
+                    ui.region_place = false;
                     return;
                 }
 
@@ -5564,6 +5881,7 @@ fn right_mouse(
         || ui.posture_place.is_some()
         || ui.cast_place.is_some()
         || ui.teleport_place.is_some()
+        || ui.region_place
     {
         ui.placement = None;
         ui.wall_chain.clear();
@@ -5571,6 +5889,7 @@ fn right_mouse(
         ui.posture_place = None;
         ui.cast_place = None;
         ui.teleport_place = None;
+        ui.region_place = false;
         return;
     }
 
@@ -5729,6 +6048,7 @@ fn right_mouse(
                     building: intent_id(e),
                     x,
                     z,
+                    region: None,
                     target,
                 },
             );
@@ -6064,6 +6384,89 @@ fn update_link_rings(
         ));
     }
 }
+
+/// Draw every named place on the ground: the map's built-ins, always, and this
+/// team's own regions on top of them.
+///
+/// **Both kinds, always on.** The built-ins were the harder call — they are
+/// permanent, they are on every map, and seven faint circles could easily be
+/// seven pieces of clutter. They are drawn anyway, and at 16% alpha, because
+/// the vocabulary is only shared if the human can SEE what the words mean: a
+/// commander that says "5 enemies in the center ford" and a human watching a
+/// circle labelled center ford are then demonstrably talking about the same
+/// ground. Screenshotted and checked at the default camera height, which is
+/// what settled the alpha.
+///
+/// Own team only for the second list, matching the snapshot exactly: a region
+/// is doctrine, and the enemy learns nothing about which ground you decided to
+/// care about.
+fn update_region_rings(
+    mut commands: Commands,
+    assets: Res<UiAssets>,
+    regions: Res<Regions>,
+    mut rings: Query<
+        (&mut Transform, &mut Visibility, &mut MeshMaterial3d<StandardMaterial>),
+        With<RegionRing>,
+    >,
+) {
+    // Built-ins first so an own region drawn over the same ground (a mark on a
+    // ford) is the one on top — the pool preserves order, and the player's own
+    // circle is the one they are looking for.
+    let mut wanted: Vec<(Vec3, f32, bool)> = builtin_places(Team::Human)
+        .into_iter()
+        .map(|r| (r.center, r.radius, false))
+        .collect();
+    wanted.extend(
+        regions
+            .get(Team::Human)
+            .iter()
+            .map(|r| (r.center, r.radius, true)),
+    );
+
+    // The same pool shape `update_link_rings` uses: reuse, hide the surplus,
+    // spawn the shortfall. Regions are set and cleared mid-match, so the count
+    // moves.
+    let mut used = 0usize;
+    for (mut tf, mut vis, mut mat) in &mut rings {
+        match wanted.get(used) {
+            Some((pos, radius, mine)) => {
+                tf.translation = Vec3::new(pos.x, REGION_RING_Y, pos.z);
+                tf.scale = Vec3::new(*radius, 0.12, *radius);
+                let want = if *mine {
+                    assets.region_mine_mat.clone()
+                } else {
+                    assets.region_map_mat.clone()
+                };
+                // Assigned every frame rather than compared: a pooled slot can
+                // change kind when a region is cleared, and a stale material
+                // would draw somebody's mark in the map's colour.
+                mat.0 = want;
+                *vis = Visibility::Visible;
+            }
+            None => *vis = Visibility::Hidden,
+        }
+        used += 1;
+    }
+    for (pos, radius, mine) in wanted.iter().skip(used) {
+        commands.spawn((
+            Mesh3d(assets.hairline_mesh.clone()),
+            MeshMaterial3d(if *mine {
+                assets.region_mine_mat.clone()
+            } else {
+                assets.region_map_mat.clone()
+            }),
+            Transform::from_xyz(pos.x, REGION_RING_Y, pos.z)
+                .with_scale(Vec3::new(*radius, 0.12, *radius)),
+            RegionRing,
+        ));
+    }
+}
+
+/// Region rings sit at the command-ring layer and BELOW `FOG_PLANE_Y` (0.16):
+/// a place you have named is not a place you can see into, and a circle that
+/// stayed bright through black fog would be the one overlay in this HUD that
+/// lied about knowability.
+const REGION_RING_Y: f32 = 0.1;
 
 /// **The countdown.** A ring at the destination of every selected unit's
 /// in-transit order, closing as the order arrives.
@@ -6599,6 +7002,96 @@ fn apply_fog_visibility(
 /// Pooled translucent boxes where the player remembers enemy structures.
 /// Position, footprint and existence come from the shared grid's memory, so
 /// what the player sees standing in the fog is precisely what a bridge
+
+/// One outlined circle per named place on the minimap.
+///
+/// The minimap is where a region earns its keep: the 3D ring is only visible
+/// where the camera is pointing, and the whole reason to name `north-pass` is
+/// to reason about ground you are NOT looking at. Same two-tone scheme as the
+/// world rings, so the two readouts are one picture.
+///
+/// `MinimapStatic` would have been wrong here even though built-ins never move:
+/// own regions are set and cleared mid-match, and one pooled system for both
+/// keeps the layering rule in one place.
+fn update_minimap_regions(
+    mut commands: Commands,
+    hud: Res<HudLayout>,
+    regions: Res<Regions>,
+    root: Query<Entity, With<MinimapRoot>>,
+    mut rings: Query<(&mut Node, &mut BorderColor, &mut Visibility), With<MinimapRegion>>,
+) {
+    let Ok(root) = root.single() else {
+        return;
+    };
+    let mut wanted: Vec<(Vec3, f32, bool)> = builtin_places(Team::Human)
+        .into_iter()
+        .map(|r| (r.center, r.radius, false))
+        .collect();
+    wanted.extend(
+        regions
+            .get(Team::Human)
+            .iter()
+            .map(|r| (r.center, r.radius, true)),
+    );
+
+    let px = hud.minimap_px;
+    // World units -> minimap pixels. `world_to_minimap` maps the whole
+    // 2*MAP_HALF span onto `px`, so a radius scales by the same ratio.
+    let scale = px / (2.0 * MAP_HALF);
+    let mut used = 0usize;
+    for (mut node, mut border, mut vis) in &mut rings {
+        match wanted.get(used) {
+            Some((pos, radius, mine)) => {
+                let c = world_to_minimap(*pos, px);
+                let r = (radius * scale).max(1.5);
+                node.left = Val::Px(c.x - r);
+                node.top = Val::Px(c.y - r);
+                node.width = Val::Px(r * 2.0);
+                node.height = Val::Px(r * 2.0);
+                *border = BorderColor(region_minimap_color(*mine));
+                *vis = Visibility::Visible;
+            }
+            None => *vis = Visibility::Hidden,
+        }
+        used += 1;
+    }
+    for (pos, radius, mine) in wanted.iter().skip(used) {
+        let c = world_to_minimap(*pos, px);
+        let r = (radius * scale).max(1.5);
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(c.x - r),
+                top: Val::Px(c.y - r),
+                width: Val::Px(r * 2.0),
+                height: Val::Px(r * 2.0),
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            BorderRadius::MAX,
+            BorderColor(region_minimap_color(*mine)),
+            BackgroundColor(Color::NONE),
+            // Above the fog layer (1), with the mines and pings. A named place
+            // is something you know rather than something you see, so unlike a
+            // unit dot it is not hidden by fog — the same rule the 3D ring
+            // follows by sitting under the fog plane and this one has to state.
+            ZIndex(2),
+            MinimapRegion,
+            ChildOf(root),
+        ));
+    }
+}
+
+/// Minimap ink for the two kinds of named place. Brighter than the world rings
+/// at both ends: a 100px map has no room for a 16%-alpha hairline.
+fn region_minimap_color(mine: bool) -> Color {
+    if mine {
+        Color::srgba(1.0, 0.78, 0.35, 0.85)
+    } else {
+        Color::srgba(0.72, 0.78, 0.86, 0.34)
+    }
+}
+
 /// commander receives as a `last_seen` building record.
 fn sync_building_ghosts(
     mut commands: Commands,
@@ -7294,6 +7787,7 @@ fn update_hud(
     // The team's armed rules — nothing to do with the selection or the link,
     // and drawn whether or not either exists.
     let triggers_text = trigger_line(&cast.triggers, cast.clock.elapsed_secs());
+    let regions_text = region_line(&cast.regions);
 
     // Hero commands: the ability of a selected caster, one train/revive button
     // per hero class the team's slots have room for, the building's own
@@ -7390,6 +7884,10 @@ fn update_hud(
             doc,
             posture: live_posture.map(posture_kind),
             tmpl: single_template,
+            region_mark: mark_number(&cast.regions),
+            region_count: cast.regions.get(Team::Human).len(),
+            region_radius: ui.region_radius.unwrap_or(REGION_MARK_RADIUS),
+            region_armed: ui.region_place,
             home_guard: has_trigger(&cast.triggers, HOME_GUARD),
         },
         &completed,
@@ -7593,6 +8091,7 @@ fn update_hud(
             Slot::Why => text.0 = why_text.clone(),
             Slot::Link => text.0 = link_text.clone(),
             Slot::Triggers => text.0 = triggers_text.clone(),
+            Slot::Regions => text.0 = regions_text.clone(),
             Slot::Coverage => text.0 = coverage_text.clone(),
             Slot::Overflow => text.0 = overflow_text.clone(),
             Slot::CardLetter(i) => {
@@ -8903,9 +9402,10 @@ mod tests {
             .init_resource::<SquadOrders>()
             // `CastLookup` reads them, so the card cannot be built without
             // them: research for the forge buttons, triggers and the clock for
-            // the home-guard toggle's lit state.
+            // the home-guard toggle's lit state, regions for the mark tile's.
             .init_resource::<TeamResearch>()
             .init_resource::<Triggers>()
+            .init_resource::<Regions>()
             .init_resource::<Time>()
             .add_event::<CameraFocus>()
             .add_event::<SubmitIntent>()
@@ -9543,6 +10043,189 @@ mod tests {
         assert_eq!(json(&out[1]), json(&typed));
     }
 
+    // -----------------------------------------------------------------------
+    // Territory: the human's half
+    // -----------------------------------------------------------------------
+
+    /// `[M]` ARMS; it does not name. A click is the second half of the
+    /// gesture, exactly like building placement and postures — and until it
+    /// comes, nothing has been said.
+    #[test]
+    fn marking_a_region_arms_a_click_and_says_nothing_yet() {
+        let mut app = ui_app();
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyM]);
+        assert!(
+            app.world().resource::<UiState>().region_place,
+            "[M] arms the marker"
+        );
+        assert!(
+            said(&app).is_empty(),
+            "an armed gesture is not a sentence — the ground has not been picked"
+        );
+        // Pressed again, it disarms: the one key the human has must not be a
+        // one-way door, the same rule the home-guard tile follows.
+        press(&mut app, &[KeyCode::KeyM]);
+        assert!(!app.world().resource::<UiState>().region_place);
+    }
+
+    /// **Armed modes are mutually exclusive**, and the region marker joins the
+    /// set rather than sitting beside it. Two armed gestures would make the
+    /// next click ambiguous, and the player would find out which one won by
+    /// losing a building.
+    #[test]
+    fn arming_anything_else_disarms_the_region_marker() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+
+        // Marker armed, then a posture armed on top of it.
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyM]);
+        assert!(app.world().resource::<UiState>().region_place);
+        press(&mut app, &[KeyCode::KeyQ]);
+        assert!(
+            !app.world().resource::<UiState>().region_place,
+            "arming a posture must disarm the marker"
+        );
+        assert!(app.world().resource::<UiState>().posture_place.is_some());
+
+        // ...and the other way: the marker disarms the posture.
+        press(&mut app, &[KeyCode::KeyM]);
+        assert!(app.world().resource::<UiState>().region_place);
+        assert!(
+            app.world().resource::<UiState>().posture_place.is_none(),
+            "arming the marker must disarm the posture"
+        );
+
+        // Flipping the card cancels whatever the other page armed, the marker
+        // included — it lives on the page being left.
+        press(&mut app, &[KeyCode::KeyI]);
+        assert!(!app.world().resource::<UiState>().region_place);
+    }
+
+    /// The mark's name comes from the engine, and it is the lowest free slot —
+    /// so a player who marks, forgets and marks again gets `mark 1` back rather
+    /// than climbing forever.
+    #[test]
+    fn marks_are_named_from_the_lowest_free_slot() {
+        let mut regions = Regions::default();
+        assert_eq!(next_mark_name(&regions).as_deref(), Some("mark 1"));
+        regions
+            .set(Team::Human, Region::new("mark 1", Vec3::ZERO, 20.0))
+            .unwrap();
+        assert_eq!(next_mark_name(&regions).as_deref(), Some("mark 2"));
+        // A hole in the middle is reused rather than skipped.
+        regions
+            .set(Team::Human, Region::new("mark 3", Vec3::ZERO, 20.0))
+            .unwrap();
+        assert_eq!(next_mark_name(&regions).as_deref(), Some("mark 2"));
+        // Full: the tile has nothing left to offer and says so by going dark.
+        for n in 2..=MAX_REGIONS_PER_TEAM {
+            let _ = regions.set(Team::Human, Region::new(format!("mark {n}"), Vec3::ZERO, 20.0));
+        }
+        assert_eq!(next_mark_name(&regions), None);
+    }
+
+    /// The radius is free entry, on the same helper the other two numeric
+    /// parameters use, clamped by the language's own bounds rather than by a
+    /// second opinion in the HUD.
+    #[test]
+    fn the_region_radius_is_free_entry_between_the_languages_own_bounds() {
+        // From "never touched" the first nudge lands on the default rather
+        // than on zero.
+        assert_eq!(
+            nudge_value(None, true, REGION_NUDGE, REGION_MARK_RADIUS, REGION_RADIUS_MIN, REGION_RADIUS_MAX),
+            Some(REGION_MARK_RADIUS)
+        );
+        // It climbs and stops at the ceiling the compiler would refuse past.
+        let mut r = Some(REGION_RADIUS_MAX - 1.0);
+        r = nudge_value(r, true, REGION_NUDGE, REGION_MARK_RADIUS, REGION_RADIUS_MIN, REGION_RADIUS_MAX);
+        assert_eq!(r, Some(REGION_RADIUS_MAX), "clamped, not refused");
+        // And it cannot be driven under the floor into a circle the compiler
+        // would reject — the HUD never composes an illegal sentence.
+        let mut r = Some(REGION_RADIUS_MIN);
+        r = nudge_value(r, false, REGION_NUDGE, REGION_MARK_RADIUS, REGION_RADIUS_MIN, REGION_RADIUS_MAX);
+        assert_eq!(r, None, "below the floor is 'off', not an illegal radius");
+    }
+
+    /// The panel names what the player marked, with its size, and says nothing
+    /// at all when there is nothing to say.
+    #[test]
+    fn the_region_readout_names_every_mark_and_its_size() {
+        let mut regions = Regions::default();
+        assert_eq!(region_line(&regions), "", "no marks, no line");
+        regions
+            .set(Team::Human, Region::new("mark 1", Vec3::new(-60.0, 0.0, 60.0), 20.0))
+            .unwrap();
+        regions
+            .set(Team::Human, Region::new("mark 2", Vec3::new(0.0, 0.0, 0.0), 26.0))
+            .unwrap();
+        assert_eq!(region_line(&regions), "Regions: mark 1 r20  mark 2 r26");
+        // The enemy's marks are not this seat's business, and the line is the
+        // snapshot's rule rendered.
+        regions
+            .set(Team::Claude, Region::new("their plan", Vec3::ZERO, 30.0))
+            .unwrap();
+        assert!(!region_line(&regions).contains("their plan"));
+    }
+
+    /// The two region tiles are on the doctrine page whatever is selected,
+    /// because naming ground is not about the selection — and they carry the
+    /// nudge keys on their cost line, the way every free-entry control here
+    /// advertises itself.
+    #[test]
+    fn the_mark_tiles_are_offered_without_a_selection() {
+        let card = DoctrineCard {
+            region_mark: Some(1),
+            region_radius: 22.0,
+            ..default()
+        };
+        for units in [0usize, 3usize] {
+            let entries = doctrine_entries(units, card);
+            let mark = entries
+                .iter()
+                .find(|e| e.action == CmdAction::MarkRegion)
+                .expect("the mark tile is always offered");
+            assert!(mark.enabled);
+            assert_eq!(mark.label, "Mark 1 r22");
+            assert_eq!(mark.cost, "; / ' size");
+            assert!(entries.iter().any(|e| e.action == CmdAction::ClearRegions));
+        }
+        // With all eight named the tile goes dark rather than silently
+        // stealing a name already in use.
+        let full = DoctrineCard {
+            region_mark: None,
+            region_count: MAX_REGIONS_PER_TEAM,
+            ..default()
+        };
+        let entries = doctrine_entries(0, full);
+        let mark = entries
+            .iter()
+            .find(|e| e.action == CmdAction::MarkRegion)
+            .unwrap();
+        assert!(!mark.enabled);
+        assert!(mark.cost.contains(&MAX_REGIONS_PER_TEAM.to_string()));
+    }
+
+    /// Forgetting is the whole-slate form — the only one a mouse can reach,
+    /// and the same sentence a commander sends as
+    /// `{"type":"region_clear"}`.
+    #[test]
+    fn forget_marks_is_the_sentence_a_commander_could_have_typed() {
+        let mut app = ui_app();
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .set(Team::Human, Region::new("mark 1", Vec3::ZERO, 20.0))
+            .unwrap();
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyN]);
+        let out = said(&app);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].sentence(), "forget every region");
+        let typed: Intent = serde_json::from_str(r#"{"type":"region_clear"}"#).unwrap();
+        assert_eq!(json(&out[0]), json(&typed));
+    }
+
     /// The tile is a TOGGLE, like `[G] Guard`: pressed while armed it clears
     /// the rule rather than arming a second copy. Without this the one key the
     /// human has would be a one-way door.
@@ -9820,30 +10503,47 @@ mod tests {
             UnitKind::Hero,
             None,
         )]);
-        for (units, card) in [
-            (2usize, DoctrineCard { doc: caster, ..default() }),
+        for (units, card, want_pages) in [
+            (2usize, DoctrineCard { doc: caster, ..default() }, 2usize),
             (
                 0usize,
                 DoctrineCard {
                     tmpl: TemplateView { capable: true, ..default() },
                     ..default()
                 },
+                1usize,
             ),
         ] {
             let entries = doctrine_entries(units, card);
-            // BUDGET NOTE: a page holds `CMD_SLOTS - 1` = 11 content tiles
-            // (the mode toggle is pinned). A two-ability caster's doctrine card
-            // is now exactly 11 — 4 postures, Stand Down, Fall back, Guard,
-            // Priority, two auto-casts, Home guard. It is FULL. The next tile
-            // that wants to live here spills the card to a [Tab] page and trips
-            // this assertion, which is the intended tripwire: overflow paging
-            // works and every hotkey stays live across it, but a doctrine
-            // vocabulary that no longer fits on one screen is a design decision
-            // rather than an accident, and it should be made deliberately.
+            // BUDGET NOTE, and the decision it demanded. A page holds
+            // `CMD_SLOTS - 1` = 11 content tiles (the mode toggle is pinned).
+            // A two-ability caster's doctrine card was EXACTLY 11 and this
+            // assertion was the tripwire on the twelfth: not a ban, a demand
+            // that spilling the card be chosen rather than discovered.
+            //
+            // Territory spent it, deliberately. `Mark region` and `Forget
+            // marks` are tiles 12 and 13, so a caster's doctrine card is now
+            // two [Tab] pages. What made it the right trade:
+            //
+            //   * The two new tiles are the ONLY authoring surface the human
+            //     has for regions. Everything else on this card has a bridge
+            //     equivalent a co-commander can send; a mark has to be clicked,
+            //     because it is a point on the ground.
+            //   * Paging is already load-bearing here and already tested —
+            //     `a_hotkey_on_page_two_still_fires_from_page_one` proves [M]
+            //     and [N] work from page one regardless of which page shows
+            //     them, so the spill costs discoverability, not reach.
+            //   * The overflow lands on the two tiles that are about GROUND
+            //     rather than about the selection, which is the honest seam:
+            //     page one stays "what these units are for", page two is "what
+            //     the map is called".
+            //
+            // The tripwire stays armed at the new number. Tile 14 is somebody
+            // else's deliberate decision.
             assert_eq!(
                 paginate(&entries, 0).pages,
-                1,
-                "the doctrine card still fits on one page at {} entries",
+                want_pages,
+                "the doctrine card's page budget changed at {} entries",
                 entries.len()
             );
             let mut keys: Vec<KeyCode> = entries.iter().map(|e| e.key).collect();

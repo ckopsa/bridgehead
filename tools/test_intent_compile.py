@@ -96,10 +96,21 @@ def test_bases_and_middle():
 
 def test_mines_are_named_by_direction_and_not_stolen_by_chokes():
     s = snap()
-    # "northwest" appears in "northwest ford"; the mine noun must win, and
-    # pick the mine nearest that direction rather than the ford at it.
-    assert ic.resolve_place("the northwest mine", s) == (-58.0, 58.0)
-    assert ic.resolve_place("the southeast mine", s) == (58.0, -58.0)
+    # "northwest" appears in "northwest ford"; the mine noun must win, and pick
+    # the mine at that direction rather than the ford at it.
+    #
+    # NOTE the two spellings resolve through DIFFERENT machinery now, and
+    # deliberately. `the northwest mine` is a name in the map's own vocabulary
+    # (`map.places`), so it resolves to the map's circle — the identical
+    # coordinates the engine gives for `{"region":"northwest mine"}`, which is
+    # the point: the tool and the engine must not disagree about where a word
+    # points. The fuzzy picker below still owns every phrasing that is a
+    # description rather than a name.
+    nw = [p for p in s.places if p["name"] == "northwest mine"][0]
+    assert ic.resolve_place("the northwest mine", s) == tuple(nw["pos"])
+    se = [p for p in s.places if p["name"] == "southeast mine"][0]
+    assert ic.resolve_place("the southeast mine", s) == tuple(se["pos"])
+    # Descriptions, not names: still the picker, still against the LIVE nodes.
     assert ic.resolve_place("the contested mine", s) == (22.0, 52.0)
     assert ic.resolve_place("the nearest bounty", s) == (6.0, -12.0)
 
@@ -657,6 +668,7 @@ KNOWN_VERBS = {
     "cast", "buy", "use_item",
     "priority", "retreat", "leash", "autocast", "squad", "posture", "template",
     "trigger_set", "trigger_clear",
+    "region_set", "region_clear",
     "autopilot", "surrender",
 }
 POSTURE_TYPES = {"defend", "push", "escort", "forage"}
@@ -733,7 +745,13 @@ def test_explain_lists_the_whole_vocabulary():
                    "my hero drops below", "squad 2 drops below",
                    "I see 3 or more siege", "a bounty appears",
                    "my mine runs dry", "we reach tier 2", "we have 8 footmen",
-                   "the clock passes 6 minutes", "Max 8 armed triggers"):
+                   "the clock passes 6 minutes", "Max 8 armed triggers",
+                   # Territory: the two verbs, the built-in vocabulary and the
+                   # predicate that reads it. A model that cannot see a place
+                   # name cannot speak one.
+                   "region_set", "region_clear", "name <place>",
+                   "our base", "their base", "mid", "Max 8 regions",
+                   "enemy_in", "5 or more enemies in"):
         assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
 
 
@@ -766,6 +784,220 @@ def _run():
     print(f"{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 
+
+
+# ---------------------------------------------------------------------------
+# Territory: named places and regions
+# ---------------------------------------------------------------------------
+
+
+def region_snap(*regions):
+    """The fixture seat with some ground already named."""
+    s = snap()
+    s.regions = [
+        {"name": n, "pos": list(pos), "radius": r} for (n, pos, r) in regions
+    ]
+    return s
+
+
+def test_the_maps_own_vocabulary_is_speakable_with_nothing_armed():
+    s = snap()
+    assert s.regions == [], "the fixture seat has named nothing"
+    # ...and every built-in still resolves, because they are map facts.
+    for name in ("mid", "our base", "their base", "center ford",
+                 "northwest ford", "southeast mine"):
+        assert ic.resolve_place(name, s) is not None, name
+    assert ic.resolve_place("center ford", s) == CENTER_FORD
+    assert ic.resolve_place("our base", s) == MY_BASE
+    assert ic.resolve_place("their base", s) == THEIR_BASE
+
+
+def test_a_named_region_resolves_and_survives_spelling():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    for spelling in ("north-pass", "north pass", "NORTH-PASS",
+                     "north_pass", "the north-pass"):
+        assert ic.resolve_place(spelling, s) == NW_FORD, spelling
+
+
+def test_a_name_beats_the_heuristics_it_contains():
+    """A commander who named ground "west" means THAT ground, not the compass."""
+    s = region_snap(("west", (10.0, -10.0), 20.0))
+    assert ic.resolve_place("west", s) == (10.0, -10.0)
+    # The compass is still there for everything that is not a name.
+    assert ic.resolve_place("the east", s) == (65.0, 0.0)
+
+
+def test_a_user_region_goes_on_the_wire_by_name():
+    """The late-binding rule: a region can MOVE, so the engine resolves it."""
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["squad 2 defends north-pass"], s)
+    posture = only(result, "posture")["posture"]
+    assert posture == {"type": "defend", "region": "north-pass"}, posture
+    # No radius: the region's own becomes the ring, at the engine's one
+    # resolution point. A sentence with no numbers in it at either end.
+    assert "radius" not in posture
+    assert "x" not in posture and "z" not in posture
+
+
+def test_a_built_in_place_is_resolved_here_because_it_cannot_move():
+    s = snap()
+    result = ic.compile_directives(["squad 2 defends the center ford"], s)
+    posture = only(result, "posture")["posture"]
+    assert (posture["x"], posture["z"]) == CENTER_FORD
+    assert "region" not in posture
+
+
+def test_an_explicit_radius_still_wins_over_the_regions_own():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["squad 2 defends north-pass within 30"], s)
+    posture = only(result, "posture")["posture"]
+    assert posture["region"] == "north-pass"
+    assert posture["radius"] == 30.0
+
+
+def test_hold_with_units_names_the_region_too():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["hold north-pass with everything"], s)
+    assert verbs(result) == ["squad", "posture"]
+    assert only(result, "posture")["posture"]["region"] == "north-pass"
+
+
+def test_naming_ground_is_the_deterministic_form_only():
+    s = snap()
+    result = ic.compile_directives(['name the southeast ford "south-gate" radius 18'], s)
+    assert only(result, "region_set") == {
+        "type": "region_set", "name": "south-gate",
+        "x": SE_FORD[0], "z": SE_FORD[1], "radius": 18.0,
+    }
+    # The `as` spelling, and the default radius.
+    result = ic.compile_directives(["name mid as the-middle"], snap())
+    region = only(result, "region_set")
+    assert region["name"] == "the-middle"
+    assert (region["x"], region["z"]) == CENTER_FORD
+    assert region["radius"] == ic.DEFAULT_REGION_RADIUS
+    # The LOOSE spelling is deliberately not a rule: "call this the perimeter"
+    # is ambiguous between a name and a place phrase this very file resolves.
+    result = ic.compile_directives(["call this the perimeter"], snap())
+    assert result.intents == []
+
+
+def test_a_region_may_not_be_named_over_a_built_in():
+    result = ic.compile_directives(['name our base "mid"'], snap())
+    assert result.intents == []
+    assert result.errors and "built-in" in result.errors[0][1]
+
+
+def test_a_region_radius_is_checked_against_the_engines_bounds():
+    for bad in (1, 200):
+        result = ic.compile_directives([f'name mid "x" radius {bad}'], snap())
+        assert result.intents == [], bad
+        assert result.errors and "outside" in result.errors[0][1]
+
+
+def test_a_region_named_in_a_directive_is_usable_later_in_it():
+    """The batch applies in order, so clause two can name what clause one made.
+
+    A compiler that refused the later clause would be disagreeing with the
+    machine it is writing for.
+    """
+    result = ic.compile_directives(
+        ['name the center ford "the-gate" radius 12', "squad 3 defends the-gate"],
+        snap(),
+    )
+    assert verbs(result) == ["region_set", "posture"]
+    assert only(result, "posture")["posture"] == {
+        "type": "defend", "region": "the-gate",
+    }
+
+
+def test_forgetting_ground_is_one_or_all():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["forget region north-pass"], s)
+    assert only(result, "region_clear") == {
+        "type": "region_clear", "name": "north-pass",
+    }
+    result = ic.compile_directives(["forget all regions"], region_snap(("a", NW_FORD, 20.0)))
+    assert only(result, "region_clear") == {"type": "region_clear"}
+
+
+def test_a_forgotten_region_stops_resolving_in_the_same_directive():
+    result = ic.compile_directives(
+        ["forget region north-pass", "squad 2 defends north-pass"],
+        region_snap(("north-pass", NW_FORD, 20.0)),
+    )
+    assert verbs(result) == ["region_clear"]
+    assert result.errors and "cannot resolve place" in result.errors[0][1]
+
+
+def test_here_is_the_armys_centre_of_mass():
+    s = snap()
+    army = [u for u in s.own_units() if u.get("kind") != ic.WORKER_KIND]
+    assert army, "the fixture has an army to be the centre of"
+    want = (
+        round(sum(float(u["pos"][0]) for u in army) / len(army), 4),
+        round(sum(float(u["pos"][1]) for u in army) / len(army), 4),
+    )
+    got = ic.resolve_place("here", s)
+    assert abs(got[0] - want[0]) < 1e-3 and abs(got[1] - want[1]) < 1e-3, (got, want)
+
+
+def test_the_region_verbs_are_in_the_wire_vocabulary():
+    """Every verb this tool can emit must be one the engine accepts."""
+    emitted = set()
+    for text, s in [
+        ('name mid "m"', snap()),
+        ("forget all regions", region_snap(("a", NW_FORD, 20.0))),
+    ]:
+        for intent in ic.compile_directives([text], s).intents:
+            emitted.add(intent["type"])
+    assert emitted == {"region_set", "region_clear"}
+
+
+def test_enemies_entering_a_named_place_is_the_territorial_predicate():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(
+        ["when 5 or more enemies enter north-pass, squad 2 defends north-pass"], s)
+    trigger = only(result, "trigger_set")
+    assert trigger["when"] == {
+        "type": "enemy_in", "region": "north-pass", "count": 5,
+    }
+    assert trigger["then"]["posture"] == {"type": "defend", "region": "north-pass"}
+    # Fires once by default; `whenever` repeats, like every other predicate.
+    assert "repeat" not in trigger
+    result = ic.compile_directives(
+        ["whenever enemies are in north-pass, squad 1 defends north-pass"], s)
+    assert only(result, "trigger_set").get("repeat")
+
+
+def test_a_class_inside_a_place_is_kept_and_an_unknown_one_defers():
+    s = snap()
+    trigger = only(
+        ic.compile_directives(
+            ["when 3 enemy siege enter the center ford, squad 1 defends mid"], s),
+        "trigger_set")
+    assert trigger["when"] == {
+        "type": "enemy_in", "region": "center ford", "count": 3, "class": "Siege",
+    }
+    # A noun that is not a class must NOT be silently dropped — "5 catapults in
+    # north-pass" and "5 of anything in north-pass" are different rules.
+    assert ic.parse_when("3 enemy wyverns enter the center ford", s) is None
+
+
+def test_a_place_the_seat_cannot_name_defers_rather_than_guessing():
+    s = snap()
+    assert ic.parse_when("5 enemies enter the mushroom kingdom", s) is None
+    # ...and with no snapshot at all the predicate is simply unavailable,
+    # rather than resolving against a vocabulary that is not there.
+    assert ic.parse_when("5 enemies enter north-pass") is None
+
+
+def test_the_built_in_places_need_nothing_armed_to_be_watched():
+    """A map place is a map fact: watchable in the first second of a match."""
+    s = snap()
+    assert s.regions == []
+    assert ic.parse_when("5 enemies enter the center ford", s) == {
+        "type": "enemy_in", "region": "center ford", "count": 5,
+    }
 
 if __name__ == "__main__":
     sys.exit(_run())

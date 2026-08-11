@@ -146,6 +146,16 @@ slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
 Full treatment below (§ Triggers). One line here: doctrine is what the engine
 does *continuously*; a trigger is what it does *when something happens*.
 
+### Territory — named places and regions (v3)
+| Verb | Shape | Clears when |
+|---|---|---|
+| `region_set` | `{name, x, z, radius}` | — |
+| `region_clear` | `{name}` or `{}` for every region | — |
+
+And one field, on **every verb above that takes `x`/`z`**: an optional
+`region:"<name>"` that stands in for the pair. Full treatment below
+(§ Territory).
+
 ### Match level
 | Verb | Shape |
 |---|---|
@@ -1507,6 +1517,177 @@ the word sends exactly the historical sixteen keys.
   edge and the plans bead will meet it again.
 
 ---
+
+## Territory: named places and regions
+
+Every verb in this language that touches ground has spoken it as two floats.
+`{"type":"posture","id":2,"posture":{"type":"defend","x":-60,"z":60,
+"radius":18}}` is a legal sentence and an unreadable one. Three rounds of replay
+logs say `squad 2 defends (-60.0, 60.0) within 18`, and nobody — human or model
+— can tell from that line whether the commander meant the northwest ford or a
+patch of grass twelve units from it.
+
+The evidence that this was a real gap is that a workaround already existed and
+was *invisible to the engine*. `tools/intent_compile.py` carried a private table
+of fords, `mid`, the two bases and the four mines, and resolved names to
+coordinates on the READ side, in Python, before anything reached the wire. It
+worked, and it meant the vocabulary a commander spoke in English did not exist
+in the protocol, could not be spoken by the human, could not be referenced by a
+trigger, and could not be extended by either player. This section makes it
+first-class and gives it to both seats.
+
+### Two kinds of name
+
+**Built-in places** are map facts. Derived per map, read-only, identical for
+both teams except two seat-relative aliases, and they exist *without anybody
+arming anything* — `"region":"center ford"` is a legal sentence in the first
+second of a match. They are the shared half: both snapshots carry the same list
+under `map.places`, so when one seat says `northwest ford` and the other reads
+`northwest ford`, the two are demonstrably talking about the same ground.
+
+| name | derived from |
+|---|---|
+| `our base` / `their base` | the two starting halls, per seat |
+| `mid` | the map centre |
+| `<compass> mine` | one per `GOLD_MINE_POSITIONS`, named for its nearest compass anchor |
+| `<name> ford` | one per `MapKind::chokepoints()` — the map names these itself, so `open` has none and `crossings` has three |
+
+The mine names are the **inverse of `intent_compile.py`'s `pick_mine`**, on
+purpose and with a test pinning it: the mine the engine calls `northwest mine`
+is the mine that tool hands back for the words "northwest mine". Two
+vocabularies that disagree about where a word points would be worse than one
+vocabulary.
+
+**Regions** are what a commander names. `region_set` gives a circle a name; from
+then on every verb that takes `x`/`z` takes `"region":"<name>"` instead. They are
+**doctrine, not information**: a region appears in its owner's snapshot only
+(`regions`), and naming ground is never a way to tell the enemy something. The
+cap (8) and the replace-by-name rule are copied verbatim from triggers, for the
+identical reason — eight named places is a map a commander can hold in their
+head; eighty is a database.
+
+### Circles only
+
+A region is `{center, radius}` and nothing else. Polygons are more expressive
+and there is no evidence anybody needs one: every shape this game already speaks
+— `leash`, `defend`, `MINE_HOME_RADIUS`, ability areas, fog reveal — is a point
+and a radius; `contains` is one distance test the 4 Hz trigger sweep can afford;
+and a circle is drawable on a 100px minimap in a way a polygon is not. If a
+match is ever lost because a ford was square, the shape becomes an enum with a
+second variant. Until then the extra vocabulary is cost without a buyer.
+
+### One resolution point
+
+`intent::resolve_places` runs once, at the top of `compile_intent`, before any
+verb arm sees the intent. It turns every `region` into coordinates or refuses
+with the list of names this seat may speak. Everything downstream sees the
+language it has always seen.
+
+The alternative — each verb resolving its own place — is how you get `defend`
+accepting a name `push` does not, and two spellings of the unknown-name error.
+Here there is one function and one refusal:
+
+```
+cmd 3: no region named 'the-perimiter' - known places: the-perimeter, our base,
+their base, mid, southwest mine, northeast mine, northwest mine, southeast mine,
+northwest ford, center ford, southeast ford
+```
+
+That is the teaching error the rest of this document argues for, applied to
+geography: a commander who mistyped gets the menu back, not a "no".
+
+**Precedence**, stated once so no verb can disagree: a `region` given alongside
+`x`/`z` **wins**. The name is the decision; numbers next to it are not.
+
+**What each verb does with a region** - every mapping stated rather than left to
+be discovered:
+
+| verb | mapping |
+|---|---|
+| `move` / `attackmove` / `build` / `rally` / `retreat` | the centre |
+| `posture` `defend` | centre is the anchor, and **the region's own radius is the ring** unless `radius` is given |
+| `posture` `push` | the centre. A push is a direction, not an area; the radius is dropped |
+| `posture` `forage` | the centre is the muster point held while no cache is up |
+| `posture` `escort` | **no region form.** It names a unit, and a region that followed a hero would be a second, moving vocabulary for one word |
+| `leash` | anchor at the centre; the region's own radius is the leash unless `radius` is given |
+
+`x`/`z` became `Option` on the verbs that required them, and that is a
+deliberate improvement rather than a cost: "this sentence names no ground at
+all" is now a thing the language can say, and it earns
+`move needs x/z or a region name` instead of serde's `missing field x`.
+
+### What a trigger stores
+
+`resolve_places` deliberately does **not** recurse into a trigger's `then`. That
+follows the rule already stated in the Triggers section - the action is
+validated when it *fires*, against the world that fired it - and applying it to
+territory buys something specific: an armed rule keeps naming *the perimeter*, so
+
+* moving a region with a second `region_set` **re-aims every standing order and
+  every armed rule that mentions it**, in one command, at zero polls;
+* clearing a region makes those rules refuse *out loud*, into the arming seat's
+  own error channel, rather than silently acting on stale coordinates.
+
+The `when` half is the opposite case and is checked immediately: a predicate's
+parameters are constants the commander typed, so `enemy_in`'s region is
+validated at **arm time**, with the same menu attached.
+
+A trigger may not `region_set` or `region_clear`, for the same reason it may not
+arm another trigger and one step further out: a rule that renamed ground while
+the match ran would make every other rule's meaning depend on firing order, and
+"what does `north-pass` mean right now?" would stop being answerable by reading
+the snapshot.
+
+### `enemy_in` - the territorial predicate
+
+```json
+{"type":"enemy_in","region":"north-pass","class":"Siege","count":5}
+```
+
+Fog-honest in **both** directions: it counts bodies the arming team's own
+`FogGrid::sees` admits AND that are inside the circle. Both filters, always. A
+region is ground you are *watching*, not a sensor bolted to the map - an army
+walking unseen through your named pass does not trip the rule, which is the same
+knowability rule `enemy_sighted` obeys, applied to a smaller piece of the board.
+
+This is the predicate that makes regions pay for themselves. `enemy_sighted`
+fires on a lone scout wandering past a tower; "five enemies are in north-pass"
+is the sentence a commander can actually sleep behind.
+
+If a rule's region is cleared after arming, the rule goes **quiet** rather than
+falling back to the whole map. An unresolvable name is not a bigger question; it
+is no question, and firing a defence of nowhere is strictly worse than firing
+nothing.
+
+### Both seats, again
+
+The human names ground with `[I][M]`: an armed marker whose next ground click is
+the centre, `;`/`'` tuning the radius on the same free-entry helper the fallback
+and leash numbers use, and `[N]` forgetting the lot. The engine picks the name
+(`mark 1`..`mark 8`) because there is no text entry anywhere in this HUD - a
+poorer name than `north-pass`, and a real one: it round-trips through the wire,
+the snapshot and a co-commander's directive unchanged. That last part is the
+point. A human and their LLM co-commander share a team and therefore share its
+regions, so `[I][M]` on a ford is a sentence the partner can read and answer
+with `squad 2 defends mark 1`.
+
+Both kinds of place render: the map's built-ins as permanent faint circles, own
+regions in amber, on the ground and on the minimap, with the armed marks listed
+on the panel. The built-ins being drawn at all was the harder call - seven faint
+circles could easily be seven pieces of clutter - and they are drawn because the
+vocabulary is only *shared* if the human can see what the words mean.
+
+The English compiler learned both halves. `map.places` and `regions` join its
+place resolution, and an exact name beats every heuristic below it, because a
+commander who called some ground "the perimeter" must not have that word
+re-read as a compass direction. A **user** region is passed to the wire *by
+name*, unresolved - it can move, so the engine should decide where it is - while
+a built-in is resolved in the tool, because `mid` is the middle of the map for
+the whole match. Authoring is the deterministic form only:
+`name the northwest ford "north-pass" radius 20`. The tempting spelling,
+`call this the perimeter`, is a trap: `the perimeter` is both a name and a
+phrase that file resolves as a place, so the parse is ambiguous in exactly the
+sentences a commander would write.
 
 ## What this unlocks
 
