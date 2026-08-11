@@ -88,7 +88,7 @@
         races: [Kingdom],
         role: HeroMelee,
         name: "Hero",
-        description: "The Champion: melee hero, levels from nearby enemy deaths, AoE Slam ability. FREE to train the first time (the 25s and the 5 supply are still real, and both are spent at the hall that makes your workers); the bill arrives only if it DIES — see revive_gold/revive_lumber, which buy it back with its level preserved. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class.",
+        description: "The Champion: melee hero, levels from nearby enemy deaths, AoE Slam ability. Your team's FIRST hero is FREE (the 25s and the 5 supply are still real, and both are spent at the hall that makes your workers); every hero after it — a second class, or this one back from the dead — costs revive_gold/revive_lumber, which is why that pair doubles as the fielding price. Revival preserves the level. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class.",
         requires: [],
         stats: (
             cost_gold: 0, cost_lumber: 0, supply: 5, hp: 320.0, damage: 24.0,
@@ -147,7 +147,7 @@
         races: [Kingdom],
         role: HeroSupport,
         name: "Priestess",
-        description: "Support hero: ranged attack, Heal ability (AoE ally healing). FREE to train the first time; only her death costs you (revive_gold/revive_lumber, level preserved). Occupies one hero slot — a Keep lets her stand alongside a Champion.",
+        description: "Support hero: ranged attack, Heal ability (AoE ally healing). Free only if she is your team's first hero ever; standing alongside a Champion costs revive_gold/revive_lumber, the same price her death does — a Keep grants the SLOT, not the hero. Revival preserves the level. Occupies one hero slot.",
         requires: [],
         stats: (
             cost_gold: 0, cost_lumber: 0, supply: 5, hp: 240.0, damage: 14.0,
@@ -507,7 +507,7 @@
         races: [Horde],
         role: HeroMelee,
         name: "Warchief",
-        description: "The Warchief: melee hero, levels from nearby enemy deaths, AoE Cleave ability. FREE to train the first time (the 25s and the 5 supply are still real, and both are spent at the hall that makes your workers); the bill arrives only if he DIES — see revive_gold/revive_lumber, which buy him back with his level preserved. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class.",
+        description: "The Warchief: melee hero, levels from nearby enemy deaths, AoE Cleave ability. Your team's FIRST hero is FREE (the 25s and the 5 supply are still real, and both are spent at the hall that makes your workers); every hero after him — a second class, or this one back from the dead — costs revive_gold/revive_lumber, which is why that pair doubles as the fielding price. Revival preserves the level. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class.",
         requires: [],
         stats: (
             cost_gold: 0, cost_lumber: 0, supply: 5, hp: 340.0, damage: 23.0,
@@ -528,7 +528,7 @@
         races: [Horde],
         role: HeroSupport,
         name: "FarSeer",
-        description: "Support hero: ranged attack, Mend ability (AoE ally healing), and the widest eye of any ground unit in the game. FREE to train the first time; only his death costs you (revive_gold/revive_lumber, level preserved). Occupies one hero slot — a Fortress lets him stand alongside a Warchief.",
+        description: "Support hero: ranged attack, Mend ability (AoE ally healing), and the widest eye of any ground unit in the game. Free only if he is your team's first hero ever; standing alongside a Warchief costs revive_gold/revive_lumber, the same price his death does — a Fortress grants the SLOT, not the hero. Revival preserves the level. Occupies one hero slot.",
         requires: [],
         stats: (
             cost_gold: 0, cost_lumber: 0, supply: 5, hp: 250.0, damage: 13.0,
