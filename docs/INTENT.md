@@ -206,7 +206,7 @@ player expressing anything, so it stays where it is.
 
 ## The vocabulary
 
-27 verbs, grouped by what they are for. The serde shape **is** the bridge's
+29 verbs, grouped by what they are for. The serde shape **is** the bridge's
 historical wire format — tag is `type`, entity ids are `Entity::to_bits`,
 positions are flat `x`/`z` — so `commands.json` parses straight into `Intent`
 with no translation layer. Backward compatibility is not an adapter here; it is
@@ -271,6 +271,19 @@ slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
 
 Full treatment below (§ Triggers). One line here: doctrine is what the engine
 does *continuously*; a trigger is what it does *when something happens*.
+
+### Plans — sequenced standing policy (v3)
+| Verb | Shape | Clears when |
+|---|---|---|
+| `plan_set` | `{name, steps:[{intent:{<any intent>}, advance?:{…}}]}` | — |
+| `plan_clear` | `{name}` or `{}` for every plan | — |
+
+`advance` is one of `{"type":"on_applied"}` (the default — "then"),
+`{"type":"when","when":{<any TriggerWhen>}}`, or `{"type":"after","secs":30}`.
+
+Full treatment below (§ Plans). One line here: doctrine is *continuous*, a
+trigger is *contingent*, a plan is *sequenced* — and the third one is the word
+`then`.
 
 ### Match level
 | Verb | Shape |
@@ -761,7 +774,7 @@ Verified end-to-end against a live `WC3_BRIDGE=1` seat driven by
   — the diff against master touches none of them.
 - Every historical command shape still parses, including the `caster` alias on
   `cast`, the `use_item` rename and the untagged ability selector
-  (`intent::tests::legacy_wire_commands_parse` covers all 27 verbs and their
+  (`intent::tests::legacy_wire_commands_parse` covers all 29 verbs and their
   optional-field forms).
 - `seq` gating, `last_seq`, the 4 Hz poll and the 1 Hz snapshot are untouched.
 - `tools/bridge_send.py`, `tools/bridge_view.py`, `tools/bridge_wait.py` and
@@ -932,7 +945,7 @@ with a `sentence()` renderer.*
 `tools/intent_compile.py` compiles a natural-language directive plus a snapshot
 into a batch of `Intent` objects. It is a **tool, not an engine feature**, and
 that placement is the design: the game gains no NLP, no new verb, and no new
-mutation path. What it gains is a shorter way to write the same 27 verbs.
+mutation path. What it gains is a shorter way to write the same 29 verbs.
 
 ```
 "hold the northwest ford, forage mid with the cavalry, retreat at 35%"
@@ -1089,7 +1102,7 @@ answers across a selection. That tally *is* the "did my partner re-task my
 push?" readout; it needed no code at all.
 
 The rung is a **seat**, not the old `Cause::Script`. A co-commander pays the
-same latency, obeys the same fog and speaks the same 27 verbs; the scripted
+same latency, obeys the same fog and speaks the same 29 verbs; the scripted
 `ai.rs` did none of those things at the time, and collapsing the two would have
 made "who moved this unit" unanswerable in exactly the case it is asked.
 (wc3clone-jem later made `ai.rs` do all three, so it became a seat of its own —
@@ -1626,7 +1639,7 @@ for a click they never made is a worse answer than none.
 
 | seat | authoring surface |
 |---|---|
-| bridge / copilot | full — nine predicates × 27 verbs, as JSON |
+| bridge / copilot | full — nine predicates × any ordinary verb, as JSON |
 | `tools/intent_compile.py` | full-ish — "when X, Y" over the same nine, in English |
 | human at the keyboard | **one preset**: `[I][H] Home guard`, plus a readout of every armed rule |
 
@@ -1712,7 +1725,279 @@ the word sends exactly the historical sixteen keys.
   arm time, so "when I have 8 footmen, attack-move them" has to say a squad
   rather than a list of ids. Squads are the right answer and the reason
   `squad_below` and the `squad N defends X` NL rule are here — but it is a real
-  edge and the plans bead will meet it again.
+  edge and the plans bead met it again — see § Plans, "The late-binding
+  problem", which answers it with the squad idiom rather than a new selector.
+
+---
+
+## Plans: `then` as a first-class word
+
+*`wc3clone-c5b`. Two verbs, three advance-conditions, one new file
+(`plan.rs`), and no new way to change the game.*
+
+Doctrine relocated **continuous** fast work into the engine. Triggers
+relocated **reaction**. Neither of them can say ORDER, and order is what a
+build order is:
+
+> "Barracks, then the keep, then a sanctum, then sorcerers" is a sequence a
+> commander settles before the match starts and then spends the first six
+> minutes hand-feeding to the engine, one command per poll. For a language
+> model that is ten to fifteen seconds *per step of a sequence with no
+> decisions left in it*. A human at a keyboard pays a keystroke.
+
+That difference is not judgment either — it is transcription. A plan is named
+ordered steps the engine walks for you, submitting each step's intent through
+the ordinary compiler when its turn comes.
+
+### The step/advance grammar
+
+A step is `{intent, advance}`. The intent is any of the 29 verbs; the advance
+says how the engine knows it is time for the next one. Three forms, and the
+middle one is the seam that matters:
+
+| `advance` | means |
+|---|---|
+| omitted / `{"type":"on_applied"}` | as soon as this step is **accepted**. The plain meaning of "then". |
+| `{"type":"when","when":{…}}` | when a **`TriggerWhen` predicate** holds — the *same* predicates triggers use (eleven of them as of the intel bead, and whatever the next one adds), level-triggered, evaluated by the same function at the same 4 Hz. |
+| `{"type":"after","secs":30}` | 30 seconds after this step was accepted. |
+
+*Accepted*, not *completed*: the engine does not wait for the barracks to
+finish, it waits for the order to be legal and taken. Waiting on completion is
+what the `when` form is for (`tier_reached`, `unit_count`), and conflating the
+two would make "then" mean something different for every verb.
+
+**The advance-condition of step *k* governs the move to step *k+1*.** The last
+step's advance decides when the plan reports itself finished.
+
+### The predicate seam is the whole reason `when` is not its own vocabulary
+
+`PlanAdvance::When` carries a `TriggerWhen`, and `plan.rs` answers it by calling
+`trigger::holds` — the same function, on the same world, at the same cadence.
+This was the one design decision worth being careful about, and it pays off
+twice:
+
+* A plan and a trigger cannot disagree about what "we reached tier 2" means.
+* **Any predicate a later bead adds is a plan advance-condition for free.** The
+  territory and intel beads landing beside this one add `TriggerWhen` arms; the
+  moment they do, `plan_set` accepts them with no work in `plan.rs`, because
+  `holds` is the only thing that reads the enum and `validate_predicate` is the
+  only thing that checks it. Neither lives here.
+
+### Failure semantics: blocked, then halted, **never skipped**
+
+A step's intent is frozen at `plan_set` time and compiled when it runs, so it
+can be refused. The engine has three options and only one is defensible:
+
+* **Skip and carry on.** Refused. A plan that quietly drops the Blacksmith and
+  goes on to research at it is worse than one that stopped, because its owner
+  reads `running` and believes the sequence they wrote is the sequence that ran.
+* **Halt immediately.** Too brittle. Most refusals are *timing*: forty gold
+  short, a worker mid-walk, a hall one tick from finishing. Halting on those
+  would make plans useless for exactly the economic sequencing they exist for.
+* **Block, retry, then halt.** What it does. The plan stops advancing, its
+  status becomes `blocked: <the compiler's own error, verbatim>`, it re-submits
+  the same step every `PLAN_RETRY_S` (5s), and if it is still refused after
+  `PLAN_BLOCK_GRACE_S` (60s) it becomes `halted: <error>` and stops for good —
+  **on the step that failed**, which is where a reader needs to find it.
+
+The grace window was **ten seconds until the canonical opening was run against a
+live seat and died of it**: the plan reached its `upgrade` step short on lumber,
+blocked correctly, and halted twenty seconds before the income that would have
+paid for it arrived. Ten seconds is right for the reason it was chosen (a worker
+mid-walk) and wrong for the reason plans exist — economic sequencing, where the
+dominant refusal is "not affordable yet" and money moves on a scale of tens of
+seconds. Halting later costs nothing, because the *owner* is told at the first
+bounce; the constant governs only how long the engine keeps trying.
+
+**A step that reached some of its targets is a partial success, not a refusal.**
+`own_units` reports every dead id and returns the survivors, so `move [a,b]`
+with `b` a corpse really does move `a`. Treating "any error" as "refused" made a
+plan block on the most ordinary event in the game — a squad member dying between
+`plan_set` and the step — and then halt a sequence that was running correctly.
+The compiler therefore reports whether it *reached* anything, and only a step
+that reached nothing blocks. The error still goes to every other channel.
+
+Both states are announced once on the owner's event feed (not once per retry —
+the human's alert stack is six rows) and both carry the reason in the status
+itself, so nothing has to be correlated against `errors`.
+
+The verdict reaches the plan through `SubmitIntent::plan` and `Plans::report`,
+in the same frame the step was compiled — not by scraping the error channel for
+a tag. A plan that could not tell "accepted" from "refused" would have to either
+skip or wedge, and both are the failure above.
+
+### Once through, never looping
+
+A plan does not repeat. Repetition is a trigger's `repeat`, and a construct with
+sequencing *and* iteration is a programming language with no debugger — which is
+the thing the caps exist to refuse.
+
+### The caps: two plans of eight steps
+
+Eight steps matches the trigger cap for the identical reason: it is the length
+of a sequence a person can recite. **Two plans** is one notch tighter than the
+eight triggers, and deliberately: a plan is a *sequence* running unattended, and
+two plans stepping over each other's build sites and squad ids is much harder to
+read out of a snapshot than two triggers that each fire once. Two is also what
+commanders actually want — an economic opening and a military follow-up.
+
+Replacing a plan by name is free and restarts it from step 1, so iterating on an
+opening never costs the other slot. The cap counts *live* plans: a `done` or
+`halted` plan is history rather than policy and stops holding a slot, while
+staying readable in the list.
+
+### Plans get their own storage, not eight chained triggers
+
+The obvious implementation is "a plan is N chained triggers". It is wrong.
+`MAX_TRIGGERS_PER_TEAM` is 8 and it is doctrine, not a budget — the number of
+rules a commander can hold in their head. A five-step plan that ate five of
+those slots would make two features compete for one scarce thing while being
+about different halves of the same sentence. `Plans` is its own resource with
+its own cap and its own evaluator, so arming a plan never costs a trigger and
+reading your triggers never means reading a plan's internals.
+
+### The deferral graph is two rungs deep and never points back up
+
+| from | may defer | may not |
+|---|---|---|
+| a trigger's `then` | any ordinary intent | `trigger_set`, `trigger_clear`, `plan_set`, `plan_clear` |
+| a plan's step | any ordinary intent, **including `trigger_set`** | `plan_set`, `plan_clear` |
+
+A plan step arming a trigger is a real idiom — "build the barracks, then arm the
+home guard" — and it stays bounded because a trigger cannot defer anything
+further and `Triggers::set` still refuses the ninth. Remove the trigger→plan
+refusal and a trigger could set a plan whose step re-armed the trigger, forever;
+that is why the trigger refusal was widened rather than left alone.
+
+### The late-binding problem, and the idiom that answers it
+
+A step's intent is frozen at `plan_set` time, exactly like a trigger's `then`.
+So a step **cannot** say "the eight footmen I will have by then" — there is no
+id to write, and there is no selector in the language that would produce one.
+
+The trigger chapter above flagged this as "a real edge the plans bead will meet
+again". It does, and the answer is that **the language already has a
+late-binding selector: the squad.** `template` stamps every unit a building
+trains into squad 2; `posture` addresses squad 2 *by number* and its membership
+resolves when the step executes. So the idiom is:
+
+```json
+{"type":"plan_set","name":"army","steps":[
+  {"intent":{"type":"template","building":<barracks>,"squad":2}},
+  {"intent":{"type":"train","building":<barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<barracks>,"unit":"Footman"},
+   "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":3}}},
+  {"intent":{"type":"posture","id":2,"posture":{"type":"push","x":70,"z":70}}}]}
+```
+
+Note the three separate `train` steps: `train` queues **one** unit, so a
+`unit_count` wait must be for a number the plan actually produces. A single
+`train` step under `count: 8` is a plan that waits forever, and the engine will
+not warn you — it is `running`, correctly, on a step whose condition is simply
+never going to hold.
+
+The last step moves whoever is in squad 2 when it runs. **No new selector was
+invented**, and that is the decision rather than an omission: a `{"squad":2}`
+form of every unit-taking verb would be a second way to spell membership, and
+this document exists because two spellings of one language is two languages. The
+answer to "I want to act on units I do not have yet" is *put them in a squad on
+the way in*, which is a thing a commander should be doing anyway.
+
+The NL layer says the same thing in English: `"the barracks units join squad 2,
+then when I have 8 footmen, squad 2 pushes their base"`.
+
+### The frame slot, and the one new determinism edge
+
+`SimSet::Think`, after `FogSet`, at 4 Hz, upstream of `SimSet::Intent` — all
+four of trigger.rs's reasons, unchanged, so a step submitted this tick is
+compiled this tick.
+
+One thing is new. plan.rs and trigger.rs both write `GameEvents` and
+`SubmitIntent`, and Bevy leaves two systems in one set unordered unless
+something forces an edge. Something has to, because `Order` is a component and
+last writer wins. **Plans are ordered `.before` triggers**, so a trigger lands
+last and wins a same-tick tie. That is the same ranking trigger.rs already
+argued for against doctrine, one rung along: a trigger is a rule written for the
+exact situation that just occurred; a plan is a sequence written before the
+match for the general case. If your opening says "push mid" on the tick your
+home guard says "the base is burning", the base is burning.
+
+### Latency: a plan step pays nothing
+
+Same row as a trigger in docs/TEMPO.md's verb table, same argument: a plan is
+standing policy the engine executes unattended, its author paid the reach when
+they wrote it down, and charging the link per step would make a plan strictly
+worse than typing the same commands by hand — which inverts C4.
+
+### Provenance: a third rung
+
+`Cause::Plan { plan, verb, source }` renders `plan:opening step 2/5 move by
+bridge t=41`. Its own rung beside `Cause::Trigger` because the step number is
+the part that makes the answer usable: it tells a reader where in the sequence
+they are without opening the plan.
+
+### The seats, honestly
+
+Same asymmetry triggers documented, and it is a *rendering* decision rather than
+a routing one — the one place this document permits the two seats to differ.
+
+* **The bridge** gets both verbs and a `plans` array with `step`/`of`/`status`,
+  the current step's sentence, and `steps` round-tripped as the JSON that was
+  sent (read it out, change one step, send it back under the same name).
+* **The human** gets a status line in the selection panel — `Plans: opening 2/5
+  boom 3/3 (blocked: not enough gold)` — and no authoring UI. That is not a
+  privileged seat: `plan_set` is one verb in one language, and
+  `intent_compile.py` compiles a person's English into exactly the JSON a
+  commander writes. It is that a person at a keyboard *already has* sequencing —
+  they press the keys in order at 200ms each, and a mouse-driven step editor
+  would be strictly slower than the thing it automates. What they did not have
+  is a way to *see* a sequence their co-commander set running unattended, and
+  that is the line.
+
+### Co-command: a proposed plan is one reviewable line
+
+This is the thing co-command wanted and could not have. A partner's opening used
+to arrive as five separate commands — five queue entries, each approvable alone,
+so the human could approve the barracks, veto the keep, and end up holding an
+incoherent half-sequence nobody proposed. `plan_set` makes the whole sequence
+one `Intent`, so it is one proposal, one sentence, one `[Enter]`.
+
+Nothing in copilot.rs knew a plan was coming: it wraps any command. And a plan's
+`sentence()` renders **every** step joined by "then", which is why — the human
+answering has to see what they are agreeing to on the line they are answering.
+
+### What this leaves open
+
+- **`plan_pause` / `plan_resume`.** Deferred, and not because it is hard to
+  implement but because its semantics are not honest. Pausing cannot un-issue
+  what the engine has already ordered, so "pause" would promise a rollback the
+  engine cannot deliver. `plan_clear` plus a re-stated `plan_set` is the idiom,
+  and re-stating restarts cleanly rather than resuming into a world that moved.
+- **No branching.** One sequence, no `else`. A plan that could branch is a
+  program; the composition you want is a plan *and* a trigger, which is why both
+  exist.
+- **A step still cannot name a unit that does not exist.** Answered by the squad
+  idiom above rather than solved. The residue is real: a plan cannot say "the
+  *specific* Catapult I am about to build".
+- **And there is no squad idiom for BUILDINGS**, which is the sharper half of
+  the same gap and worth stating plainly: a step cannot name a building the
+  plan itself is about to put up. "Build a Barracks, then train Footmen at it"
+  is unspellable in one plan, because step 1 mints the id that step 3 would
+  need. Squads close this for units because membership is late-bound by number;
+  buildings have no such handle. The working idiom is two plans — an economic
+  opening now, an army plan set on the poll after the Barracks appears in your
+  snapshot — and that is what tools/COMMANDER_BRIEF.md ships as the canonical
+  pair. A `{"building":{"kind":"Barracks","nth":0}}` selector would close it and
+  was deliberately not invented here: it is a second way to name a building, and
+  the argument against inventing one is the argument this whole document makes.
+- **A plan whose wait can never be satisfied is indistinguishable from one that
+  is merely early.** `unit_count >= 8` behind a single `train` step (which
+  queues one unit) is `running` forever, honestly and uselessly. Nothing
+  type-checks a plan against the world it will meet.
+- **Nothing watches for a plan whose premise died.** A plan waiting on
+  `unit_count` for an army whose barracks was razed waits forever, `running`,
+  and nothing tells you. The status is honest but passive.
 
 ---
 

@@ -6003,6 +6003,428 @@ impl Triggers {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Plans: 'then' as a first-class word
+// ---------------------------------------------------------------------------
+//
+// Doctrine is CONTINUOUS standing policy; a trigger is the CONTINGENT half.
+// Neither of them can say ORDER. "Build the barracks, then when we hit tier 2
+// put up the sanctum, then train sorcerers" is the single most common thing a
+// commander thinks, and until now it could only be spelled by *remembering* to
+// send the next command — which for a language model is one ten-to-fifteen
+// second poll per step of a build order, spent on a sequence that was fully
+// decided before the match started.
+//
+// A plan is that sequence, handed to the engine: named ordered steps, each an
+// ordinary `Intent`, each with a condition for moving on to the next one. The
+// engine walks it at the same 4 Hz the trigger evaluator uses and submits each
+// step through the same compiler.
+//
+// ## Why plans are not compiled into triggers
+//
+// The obvious implementation is "a plan is N chained triggers". It is wrong for
+// a reason worth writing down: `MAX_TRIGGERS_PER_TEAM` is 8 and it is doctrine,
+// not a budget — it is the number of rules a commander can hold in their head.
+// A five-step plan that ate five of those slots would make the two features
+// compete for the same scarce thing while being about different halves of the
+// same sentence. Plans get their own storage, their own (smaller) cap and their
+// own evaluator, so arming a plan never costs a trigger and reading your
+// triggers never means reading a plan's internals.
+//
+// ## What a plan deliberately cannot do
+//
+// **Loop.** A plan runs once through and stops. Repetition is the trigger's
+// job (`repeat`), and a construct with both sequencing *and* iteration is a
+// programming language with no debugger — the exact thing `MAX_TRIGGERS_PER_TEAM`
+// exists to refuse.
+//
+// **Name units it does not have yet.** A step's intent is frozen at plan_set
+// time, exactly like a trigger's `then`, so a step cannot say "the eight
+// footmen I will have by then" — there is no id to write. The idiom, and it is
+// the same one triggers already use, is the LATE-BINDING SELECTOR the language
+// already has: **squads and doctrine templates**. `template` stamps every unit
+// a building trains into squad 2; `posture` addresses squad 2 by number and
+// resolves its membership at execution time. So a plan says "the barracks
+// stamps squad 2" as step 1 and "squad 2 pushes their base" as step 4, and the
+// units that obey step 4 are whoever exists when it runs. See docs/INTENT.md
+// § "Plans" for the worked example.
+
+/// A plan's name. The same scalar a trigger's name is, and for the same reason:
+/// it rides inside [`Cause`], which is `Copy` and allocation-free.
+///
+/// An alias rather than a second type because the constraint, the parser and
+/// the failure mode are identical — two structurally identical names would be
+/// two chances to fix a bug in one of them.
+pub type PlanName = TriggerName;
+
+/// The most plans one team may run at once.
+///
+/// **Two is doctrine, not programming**, the same argument as
+/// [`MAX_TRIGGERS_PER_TEAM`] one notch tighter. A plan is a *sequence* running
+/// unattended, and the failure it can produce — two plans stepping over each
+/// other's build sites and squad ids — is much harder to read out of a snapshot
+/// than two triggers that each fire once. Two is also what commanders actually
+/// want: an economic opening and a military follow-up. A third would be the
+/// point where "what is my base doing" stops being answerable.
+///
+/// Replacing a plan by name is free and restarts it from step 1, so iterating
+/// on an opening never costs a slot.
+pub const MAX_PLANS_PER_TEAM: usize = 2;
+
+/// The most steps one plan may have.
+///
+/// Eight, matching the trigger cap, and for the identical reason: it is the
+/// length of a sequence a person can recite. A build order longer than eight
+/// steps is two plans, or a plan and some triggers.
+pub const MAX_PLAN_STEPS: usize = 8;
+
+/// **When the engine moves off a step and onto the next one.**
+///
+/// Three arms, deliberately, and the middle one is the whole seam: it is a
+/// [`TriggerWhen`], the *same* predicate vocabulary triggers use. That is not
+/// code reuse for its own sake — it means a plan and a trigger agree on what
+/// "we reached tier 2" means, one evaluator answers both, and any predicate a
+/// later bead adds (territory held, intel gathered) becomes a plan
+/// advance-condition the moment it becomes a trigger condition, with no work in
+/// this file.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PlanAdvance {
+    /// The instant the step's intent is ACCEPTED by the compiler. The default,
+    /// and what a bare "X, then Y" means: do this, then do that.
+    ///
+    /// Accepted, not *completed* — the engine does not wait for the barracks to
+    /// finish, it waits for the order to be legal and taken. Waiting on
+    /// completion is what the `when` form is for (`unit_count`, `tier_reached`),
+    /// and conflating the two would make "then" mean something different for
+    /// every verb.
+    #[default]
+    OnApplied,
+    /// When a predicate holds. Level-triggered, exactly like a trigger: the
+    /// engine checks whether it is true *now*, not whether it became true.
+    When { when: TriggerWhen },
+    /// After a fixed wait, measured from the moment the step's intent was
+    /// accepted. The one arm about nothing in the world, present for the same
+    /// reason `game_time` is a trigger predicate: "give it thirty seconds" is a
+    /// thing commanders really say.
+    #[serde(rename = "after")]
+    AfterSeconds { secs: f32 },
+}
+
+impl PlanAdvance {
+    /// The clause that introduces the NEXT step, read after "then". Empty for
+    /// the default, because "then" already says it.
+    pub fn phrase(&self) -> String {
+        match self {
+            PlanAdvance::OnApplied => String::new(),
+            PlanAdvance::When { when } => format!("when {}: ", when.phrase()),
+            PlanAdvance::AfterSeconds { secs } => format!("after {secs:.0}s: "),
+        }
+    }
+
+    /// The same condition read as a trailing clause — what the LAST step's
+    /// advance means, since it introduces no next step and instead decides when
+    /// the plan is finished. `None` for the default, which needs no words.
+    pub fn trailing_phrase(&self) -> Option<String> {
+        match self {
+            PlanAdvance::OnApplied => None,
+            PlanAdvance::When { when } => Some(format!("when {}", when.phrase())),
+            PlanAdvance::AfterSeconds { secs } => Some(format!("{secs:.0}s later")),
+        }
+    }
+}
+
+/// One step of a plan: something to do, and how to know it is time for the
+/// next thing.
+///
+/// `advance` defaults to [`PlanAdvance::OnApplied`], so the terse form
+/// `{"intent":{…}}` is a legal step and a plan of nothing but terse steps is a
+/// straight-through build order.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlanStep {
+    pub intent: Intent,
+    #[serde(default)]
+    pub advance: PlanAdvance,
+}
+
+/// Where a plan is, as one word plus (when it is bad news) the reason.
+///
+/// `Blocked` and `Halted` carry the compiler's own error string verbatim. A
+/// status of "blocked" with no reason would send its owner to the error channel
+/// to go looking, and the whole point of a plan is that nobody is watching.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanState {
+    /// Walking its steps.
+    Running,
+    /// The current step's intent was REFUSED. The plan is retrying it at
+    /// [`PLAN_RETRY_S`]; it will halt if it is still refused after
+    /// [`PLAN_BLOCK_GRACE_S`].
+    Blocked(String),
+    /// The current step was still refused after the grace window. The plan
+    /// stops here, on this step, forever — it never skips ahead.
+    Halted(String),
+    /// Every step ran and the last one's advance-condition came true.
+    Done,
+}
+
+/// How long a blocked plan keeps retrying its refused step before giving up.
+///
+/// **A minute, and the number was raised from ten seconds by watching a plan
+/// die.** The canonical opening in tools/COMMANDER_BRIEF.md reached its
+/// `upgrade` step with 180 of the 320 gold a Keep costs, blocked correctly,
+/// and then *halted* — while the income that would have paid for it was
+/// twenty seconds away. Ten seconds is the right window for the reason it was
+/// picked (a worker mid-walk, a building one tick from done) and the wrong one
+/// for the reason plans actually exist: **economic sequencing, where the
+/// dominant refusal is "not yet affordable" and money arrives on a scale of
+/// tens of seconds.**
+///
+/// Halting late costs nothing, which is what makes the long window safe. The
+/// owner is told at the *first* bounce — the status becomes
+/// `blocked: <why>` within a tick and an event line goes out — so this constant
+/// governs only how long the engine keeps *trying* before it stops. A commander
+/// who wants it dead sooner sends `plan_clear`.
+pub const PLAN_BLOCK_GRACE_S: f32 = 60.0;
+
+/// How often a blocked plan re-submits its refused step.
+///
+/// Not every sweep: retrying at 4 Hz would put 240 copies of the same refusal
+/// into the error channel and the replay log inside the grace window, and a
+/// channel that floods is a channel nobody reads. Five seconds gives twelve
+/// attempts across the window — enough that a step waiting on income retries
+/// several times per mining trip, few enough to read.
+pub const PLAN_RETRY_S: f32 = 5.0;
+
+/// One plan, as the engine holds it.
+///
+/// Everything above `state` is what the commander said; everything from `state`
+/// down is runtime. A finished plan stays in the list, `Done`, for the same
+/// reason a spent trigger does: "did my opening actually run?" has to be
+/// answerable from the snapshot, and an absence cannot answer it.
+#[derive(Clone, Debug)]
+pub struct PlanRun {
+    pub name: PlanName,
+    pub steps: Vec<PlanStep>,
+    /// The seat that set it. The AUTHOR — the engine only executes.
+    pub source: IntentSource,
+    pub state: PlanState,
+    /// Index of the step being worked. Stays pinned at the last index when the
+    /// plan is `Done` or `Halted`, so `step k/n` always names a real step.
+    pub at: usize,
+    /// Has the current step's intent been submitted yet this visit?
+    pub submitted: bool,
+    /// Has the current step's intent been ACCEPTED? Gates
+    /// [`PlanAdvance::OnApplied`] and starts the `after` clock.
+    pub applied: bool,
+    /// Game time the current step's intent was accepted.
+    pub applied_at: f32,
+    /// Game time of the last submit attempt, so a blocked step retries on
+    /// [`PLAN_RETRY_S`] rather than every sweep.
+    pub last_try: f32,
+    /// Game time the current step first bounced, `None` if it has not.
+    pub blocked_since: Option<f32>,
+    /// Has the owner been told about the current block? One notice per block,
+    /// not one per retry: the human's alert stack is six rows and five copies
+    /// of "not enough gold" would push the match's actual news off it.
+    pub told_blocked: bool,
+}
+
+impl PlanRun {
+    /// `k` of `step k/n`, one-based, as a person counts.
+    pub fn step_no(&self) -> usize {
+        (self.at + 1).min(self.steps.len())
+    }
+
+    /// The step the plan is on, or the last one once it is finished.
+    pub fn current(&self) -> Option<&PlanStep> {
+        self.steps.get(self.at.min(self.steps.len().saturating_sub(1)))
+    }
+
+    /// What the snapshot and the HUD call this plan's state. Blocked and halted
+    /// carry their reason — the word alone would be a status you have to go
+    /// research.
+    pub fn status(&self) -> String {
+        match &self.state {
+            PlanState::Running => "running".to_string(),
+            PlanState::Blocked(why) => format!("blocked: {why}"),
+            PlanState::Halted(why) => format!("halted: {why}"),
+            PlanState::Done => "done".to_string(),
+        }
+    }
+
+    /// Is this plan still going to do anything?
+    pub fn live(&self) -> bool {
+        matches!(self.state, PlanState::Running | PlanState::Blocked(_))
+    }
+}
+
+/// Every team's plans, in the order they were set.
+///
+/// A `Vec` for the same determinism reason [`Triggers`] is one: two plans can
+/// step on the same tick and the order they submit in has to be the order they
+/// were written, on every run.
+#[derive(Resource, Default)]
+pub struct Plans {
+    human: Vec<PlanRun>,
+    claude: Vec<PlanRun>,
+}
+
+impl Plans {
+    pub fn get(&self, team: Team) -> &Vec<PlanRun> {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+
+    pub fn get_mut(&mut self, team: Team) -> &mut Vec<PlanRun> {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+
+    /// Create or replace by name. Replacing restarts from step 1 — a re-stated
+    /// plan is a new plan with the same label, which is what "set" means
+    /// everywhere else in this language and is how a commander iterates on an
+    /// opening without spending the other slot.
+    ///
+    /// The cap counts plans that are still LIVE. A `done` or `halted` plan is
+    /// history rather than policy, and holding a slot open for a sequence that
+    /// finished four minutes ago would make the cap about bookkeeping instead
+    /// of about how much is running unattended. Finished plans stay readable in
+    /// the list; the oldest one is evicted to make room.
+    pub fn set(&mut self, team: Team, plan: PlanRun) -> Result<(), String> {
+        // A plan with no steps can never finish — nothing to submit, nothing to
+        // advance — so it would sit `running` and hold one of the two slots for
+        // the rest of the match. The compiler refuses this with a better
+        // message; this is the same refusal at the door of the store, so no
+        // caller can install one by construction.
+        if plan.steps.is_empty() {
+            return Err("a plan needs at least one step".to_string());
+        }
+        let list = self.get_mut(team);
+        if let Some(slot) = list.iter_mut().find(|p| p.name == plan.name) {
+            *slot = plan;
+            return Ok(());
+        }
+        if list.iter().filter(|p| p.live()).count() >= MAX_PLANS_PER_TEAM {
+            return Err(format!(
+                "you already have {MAX_PLANS_PER_TEAM} plans running ({}) — \
+                 clear one first, or re-use its name to replace it",
+                list.iter()
+                    .filter(|p| p.live())
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // Room for the new one; drop the oldest finished plan if the list has
+        // grown past what a reader can hold.
+        while list.len() >= MAX_PLANS_PER_TEAM * 2 {
+            let Some(oldest) = list.iter().position(|p| !p.live()) else {
+                break;
+            };
+            list.remove(oldest);
+        }
+        list.push(plan);
+        Ok(())
+    }
+
+    /// **The compiler's verdict on a step it just compiled**, routed back to
+    /// the plan that submitted it.
+    ///
+    /// This is the whole of plans' failure semantics and it is why
+    /// [`SubmitIntent::plan`] exists rather than plan.rs scraping the error
+    /// channel for its own tag. A plan that could not tell "accepted" from
+    /// "refused" would have exactly two options, and both are bad: advance
+    /// anyway (silently skipping the step, which is the failure mode this whole
+    /// design is here to refuse) or never advance (wedging on the first hiccup).
+    ///
+    /// `error` is the compiler's own first message for that step, `None` if it
+    /// was accepted. Verdicts for a step the plan has already moved off are
+    /// ignored — a plan replaced mid-flight must not inherit the old one's news.
+    pub fn report(&mut self, team: Team, stamp: PlanStamp, error: Option<String>, now: f32) {
+        let Some(plan) = self
+            .get_mut(team)
+            .iter_mut()
+            .find(|p| p.name == stamp.name)
+        else {
+            return;
+        };
+        // Three conditions, and the third is the one that makes "replaced
+        // mid-flight" safe. `plan_set` is compiled in `SimSet::Intent`, the
+        // same set as this verdict and ahead of it in the batch whenever the
+        // replacement came from a seat — so a fresh `PlanRun` can be sitting
+        // under the old one's name when the old step's verdict arrives. Name
+        // and step number do NOT tell them apart (both are "opening", both are
+        // on step 1). `submitted` does, and unconditionally: a plan that has
+        // sent nothing cannot be the addressee of a verdict, and `Plans::set`
+        // always installs a replacement with `submitted: false`.
+        if !plan.submitted || plan.step_no() != stamp.step as usize || !plan.live() {
+            return;
+        }
+        match error {
+            None => {
+                plan.applied = true;
+                plan.applied_at = now;
+                plan.blocked_since = None;
+                plan.told_blocked = false;
+                plan.state = PlanState::Running;
+            }
+            Some(why) => {
+                // The clock starts at the FIRST bounce, not this one, so the
+                // grace window measures how long the step has been impossible
+                // rather than how long since the last retry.
+                plan.blocked_since.get_or_insert(now);
+                plan.applied = false;
+                // A refusal that CHANGES is news. "cannot afford it" becoming
+                // "the site is blocked" is a different problem with a different
+                // answer, and staying quiet about the second would leave the
+                // owner acting on the first right up until the plan halted on
+                // the other one.
+                if plan.state != PlanState::Blocked(why.clone()) {
+                    plan.told_blocked = false;
+                }
+                plan.state = PlanState::Blocked(why);
+            }
+        }
+    }
+
+    /// Remove one by name; `true` if anything was there.
+    pub fn clear(&mut self, team: Team, name: &str) -> bool {
+        let list = self.get_mut(team);
+        let before = list.len();
+        list.retain(|p| p.name.as_str() != name);
+        list.len() != before
+    }
+
+    /// Remove every plan of a team. Returns how many went.
+    pub fn clear_all(&mut self, team: Team) -> usize {
+        let list = self.get_mut(team);
+        let n = list.len();
+        list.clear();
+        n
+    }
+}
+
+/// Which plan and which step an intent came from, as a `Copy` scalar so it can
+/// ride in [`Cause`] and in [`SubmitIntent`] without an allocation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlanStamp {
+    pub name: PlanName,
+    /// One-based, as `step k/n` reads.
+    pub step: u8,
+    pub of: u8,
+}
+
+impl std::fmt::Display for PlanStamp {
+    /// `opening step 2/5` — the phrase every channel uses, defined once.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} step {}/{}", self.name, self.step, self.of)
+    }
+}
+
 /// Everything a player can mean.
 ///
 /// Grouped by what it is for: unit orders, production, the doctrine layer that
@@ -6276,6 +6698,43 @@ pub enum Intent {
         name: Option<String>,
     },
 
+    // --- plans: sequenced standing policy ---
+    /// **Set a plan.** Named ordered steps the engine walks for you, one at a
+    /// time, submitting each step's intent through this same compiler when its
+    /// turn comes. Create it, or replace an existing one of the same name —
+    /// which restarts it from step 1.
+    ///
+    /// Each step is `{"intent": <any intent>, "advance": <how to move on>}`,
+    /// and `advance` may be omitted for the ordinary meaning of "then": as soon
+    /// as this step is accepted, do the next one. The other two forms are
+    /// `{"type":"when","when":{…}}` — any [`TriggerWhen`] predicate — and
+    /// `{"type":"after","secs":30}`.
+    ///
+    /// Bounded at [`MAX_PLANS_PER_TEAM`] live plans of [`MAX_PLAN_STEPS`] steps
+    /// each, on the same argument as the trigger cap: a sequence running
+    /// unattended has to be one its owner can recite.
+    ///
+    /// **Once through, never looping.** Repetition is what a trigger's `repeat`
+    /// is for. A step may arm a `trigger_set` — that is a real idiom ("build
+    /// the barracks, then arm the home guard") and stays bounded because
+    /// `trigger_set` still cannot arm anything — but a step may not be a
+    /// `plan_set` or `plan_clear`, and neither may a trigger's `then`. Those
+    /// two refusals are what make the caps actual bounds rather than starting
+    /// balances.
+    ///
+    /// Every step's intent is frozen at set time, exactly like a trigger's
+    /// `then`. To act on units that do not exist yet, name a SQUAD: see the
+    /// module comment above [`PlanAdvance`] and docs/INTENT.md § "Plans".
+    #[serde(rename = "plan_set")]
+    PlanSet { name: String, steps: Vec<PlanStep> },
+    /// **Drop a plan.** `name` omitted drops every plan this team has, finished
+    /// ones included.
+    #[serde(rename = "plan_clear")]
+    PlanClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+
     // --- match level ---
     /// Hand this faction to the scripted AI (or take it back).
     Autopilot {
@@ -6333,6 +6792,8 @@ impl Intent {
             Intent::Template { .. } => "template",
             Intent::TriggerSet { .. } => "trigger_set",
             Intent::TriggerClear { .. } => "trigger_clear",
+            Intent::PlanSet { .. } => "plan_set",
+            Intent::PlanClear { .. } => "plan_clear",
             Intent::Autopilot { .. } => "autopilot",
             Intent::Surrender => "surrender",
         }
@@ -6588,6 +7049,43 @@ impl Intent {
                 Some(name) => format!("clear trigger {name}"),
                 None => "clear every trigger".to_string(),
             },
+            // A plan's sentence carries EVERY step, joined by the word the verb
+            // is named after. That is deliberate and it is what makes a plan
+            // reviewable: a co-commander proposing an opening is proposing ONE
+            // thing, and the human answering it needs the whole sequence on the
+            // line they are answering — not a step count they would have to go
+            // expand. Bounded by `MAX_PLAN_STEPS`, so "the whole thing" is at
+            // most eight clauses.
+            //
+            // The advance-condition of step k introduces step k+1, because that
+            // is what it governs: `A, then when we reach tier 2: B`. The last
+            // step's advance decides when the plan reports itself finished, so
+            // it is rendered as a trailing clause when it is not the plain
+            // "as soon as it lands" default.
+            Intent::PlanSet { name, steps } => {
+                if steps.is_empty() {
+                    return format!("plan {name}: no steps");
+                }
+                let mut out = format!("plan {name} ({} steps): ", steps.len());
+                for (i, step) in steps.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", then ");
+                        out.push_str(&steps[i - 1].advance.phrase());
+                    }
+                    out.push_str(&step.intent.sentence());
+                }
+                if let Some(clause) = steps
+                    .last()
+                    .and_then(|last| last.advance.trailing_phrase())
+                {
+                    out.push_str(&format!(" (done {clause})"));
+                }
+                out
+            }
+            Intent::PlanClear { name } => match name {
+                Some(name) => format!("clear plan {name}"),
+                None => "clear every plan".to_string(),
+            },
             Intent::Autopilot { on } => {
                 if *on {
                     "hand the faction to the scripted AI".to_string()
@@ -6711,6 +7209,17 @@ pub enum Cause {
         verb: &'static str,
         source: IntentSource,
     },
+    /// A **plan** the player set reached this step, and the engine submitted
+    /// its intent. Its own rung beside `Trigger` and for the same reason: the
+    /// honest answer to "why are you doing that" is not "somebody said so just
+    /// now", it is "you wrote this down as step 4 of five", and the step number
+    /// is the part that makes the answer usable — it tells the reader where in
+    /// the sequence they are without opening the plan.
+    Plan {
+        plan: PlanStamp,
+        verb: &'static str,
+        source: IntentSource,
+    },
     /// The unit's squad has a standing posture and the engine is executing it.
     Posture { squad: u8, posture: &'static str },
     /// A standing policy fired: a retreat threshold, a leash snapping back.
@@ -6771,6 +7280,11 @@ impl Provenance {
                 source.name(),
                 self.at
             ),
+            Cause::Plan {
+                plan,
+                verb,
+                source,
+            } => format!("plan:{plan} {verb} by {} t={:.0}", source.name(), self.at),
             Cause::Posture { squad, posture } => format!("posture:{posture} sq{squad}"),
             Cause::Policy { policy } => format!("policy:{policy} t={:.0}", self.at),
             Cause::Stamp {
@@ -6831,18 +7345,28 @@ pub struct IntentMark {
     /// speaking it now. Carried here rather than checked at each of the eight
     /// order arms so that the rung a unit ends up on is decided in one place.
     pub trigger: Option<TriggerName>,
+    /// Set when a **plan step** submitted this intent. Same role as `trigger`
+    /// one rung along: the two are mutually exclusive by construction (a plan
+    /// step's intent is submitted by plan.rs, a trigger's by trigger.rs) and
+    /// `order` prefers the trigger arm if both are somehow set.
+    pub plan: Option<PlanStamp>,
 }
 
 impl IntentMark {
     /// The provenance a direct order of `verb` stamps on its targets.
     pub fn order(&self, verb: &'static str) -> Provenance {
-        let cause = match self.trigger {
-            Some(name) => Cause::Trigger {
+        let cause = match (self.trigger, self.plan) {
+            (Some(name), _) => Cause::Trigger {
                 name,
                 verb,
                 source: self.source,
             },
-            None => Cause::Order {
+            (None, Some(plan)) => Cause::Plan {
+                plan,
+                verb,
+                source: self.source,
+            },
+            (None, None) => Cause::Order {
                 verb,
                 source: self.source,
             },
@@ -6874,6 +7398,13 @@ pub struct SubmitIntent {
     /// * the human's refusal notice, which names the rule that failed rather
     ///   than a gesture the player never made.
     pub trigger: Option<TriggerName>,
+    /// Set when a **plan step** submitted this intent. Read by the same three
+    /// consumers as `trigger`, for the same three reasons — the link exemption
+    /// (a plan is standing policy the engine executes), [`Provenance`], and the
+    /// human's refusal notice — plus a fourth that is plans' own: the compiler
+    /// reports the verdict back to `Plans` through it, which is how a plan
+    /// learns that its step bounced instead of silently walking past it.
+    pub plan: Option<PlanStamp>,
 }
 
 impl SubmitIntent {
@@ -6885,6 +7416,7 @@ impl SubmitIntent {
             tag: "ui".to_string(),
             intent,
             trigger: None,
+            plan: None,
         }
     }
 
@@ -6901,6 +7433,24 @@ impl SubmitIntent {
             tag: format!("trigger:{name}"),
             intent,
             trigger: Some(name),
+            plan: None,
+        }
+    }
+
+    /// An intent a **plan step** submitted, on behalf of the seat that set it.
+    ///
+    /// The tag names the plan AND the step (`plan:opening#2`), so every channel
+    /// that already prefixes by tag says which step spoke. The `#k` is what a
+    /// commander needs that a trigger never did: with eight steps a bare plan
+    /// name would not say which of them bounced.
+    pub fn plan_step(team: Team, source: IntentSource, plan: PlanStamp, intent: Intent) -> Self {
+        SubmitIntent {
+            team,
+            source,
+            tag: format!("plan:{}#{}", plan.name, plan.step),
+            intent,
+            trigger: None,
+            plan: Some(plan),
         }
     }
 
@@ -6926,6 +7476,13 @@ impl SubmitIntent {
             // autopilot becomes a cheat at the third seat" is enforced by this
             // field being what it is.
             trigger: None,
+            // And `plan` is `None` on the identical argument, which is the same
+            // sentence one verb further along: a plan step is *also* handed the
+            // `exempt_issuer`, so a script that could stamp this field could
+            // claim the exemption without ever having written a plan down. The
+            // scripted seat decides at the moment of deciding; it never defers,
+            // so it never earns the discount for having deferred.
+            plan: None,
         }
     }
 }
@@ -9373,7 +9930,7 @@ mod tests {
     fn the_log_tag_and_the_units_answer_are_the_same_string() {
         let intent: Intent =
             serde_json::from_str(r#"{"type":"move","units":[1,2],"x":40.0,"z":40.0}"#).unwrap();
-        let mark = IntentMark { source: IntentSource::Bridge, at: 21.5, trigger: None };
+        let mark = IntentMark { source: IntentSource::Bridge, at: 21.5, trigger: None, plan: None };
         let logged = mark.order(intent.provenance_verb().unwrap()).why();
         let on_the_unit = Provenance::new(
             Cause::Order { verb: "move", source: IntentSource::Bridge },

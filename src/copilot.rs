@@ -731,6 +731,7 @@ fn ingest_wire(
                         tag,
                         intent,
                         trigger: None,
+                        plan: None,
                     });
                 }
                 Ok(intent) => {
@@ -1125,6 +1126,7 @@ fn resolve_proposals(
                 tag: format!("prop {} cmd {j}", proposal.id),
                 intent,
                 trigger: None,
+                plan: None,
             });
         }
         feed.push(
@@ -1350,6 +1352,61 @@ mod tests {
         // The attribution that makes two authors legible to each other.
         assert_eq!(why_of(&app, unit), "order:move by copilot t=0");
         assert!(errors(&app).is_empty(), "a clean batch is refused nothing");
+    }
+
+    /// **A proposed PLAN is one proposal, and one reviewable line.**
+    ///
+    /// This is the thing co-command wanted and could not have before: a
+    /// partner's opening used to arrive as five separate commands, each its own
+    /// queue entry, each approvable on its own — so the human could approve the
+    /// barracks and veto the keep and end up with an incoherent half-sequence
+    /// nobody proposed. `plan_set` makes the whole sequence ONE `Intent`, so it
+    /// is one queue entry with one sentence and one `[Enter]`.
+    ///
+    /// Nothing in copilot.rs knew a plan was coming. It wraps any command, and
+    /// this test is the confirmation rather than the mechanism — which is the
+    /// choke point (docs/INTENT.md) paying for itself again.
+    #[test]
+    fn a_proposed_plan_is_one_proposal_with_the_whole_sequence_on_its_line() {
+        let mut app = co_app();
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"the boomer opening — sanctum before army",
+                 "commands":[{"type":"plan_set","name":"boomer","steps":[
+                    {"intent":{"type":"build","worker":7,"kind":"Barracks","x":-60.0,"z":-60.0},
+                     "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}},
+                    {"intent":{"type":"train","building":9,"unit":"Sorcerer"}}]}]}"#,
+        );
+
+        let proposal = &pending(&app)[0];
+        assert_eq!(pending(&app).len(), 1, "a five-step opening is ONE decision");
+        assert_eq!(
+            proposal.sentences.len(),
+            1,
+            "and one line to answer it on: {:?}",
+            proposal.sentences
+        );
+        assert_eq!(
+            proposal.sentences[0],
+            "plan boomer (2 steps): worker 7 builds Barracks at (-60.0, -60.0), \
+             then when we reach tier 2: building 9 trains Sorcerer",
+            "the whole sequence, in the English the replay log will write"
+        );
+
+        // A plan is not a doctrine verb, so `split` trust makes the human
+        // decide — which is correct: its steps spend money.
+        app.world_mut().send_event(ProposalVerdict::approve(1));
+        app.update();
+        assert!(pending(&app).is_empty());
+        let plans = app.world().resource::<Plans>();
+        assert_eq!(plans.get(Team::Human).len(), 1, "approval set it running");
+        assert_eq!(plans.get(Team::Human)[0].name.as_str(), "boomer");
+        assert_eq!(
+            plans.get(Team::Human)[0].source,
+            IntentSource::Copilot,
+            "attributed to the partner who proposed it, not to the human who \
+             approved it — approval is consent, not authorship"
+        );
     }
 
     /// A veto is not a delay. Nothing is submitted, ever — and the seat learns

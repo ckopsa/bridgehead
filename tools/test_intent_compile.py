@@ -814,6 +814,113 @@ def test_explain_lists_the_whole_vocabulary():
         assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
 
 
+# ---------------------------------------------------------------------------
+# Plans: "X, then Y, then Z"
+# ---------------------------------------------------------------------------
+
+
+def test_a_then_chain_becomes_one_plan():
+    """The headline. Three clauses joined by ", then" are ONE plan_set, not
+    three orders sent now — which is the whole point: the engine walks it."""
+    r = compile_one("build a barracks, then when we reach tier 2, build a sanctum, "
+                    "then train 2 sorcerers")
+    assert verbs(r) == ["plan_set"], verbs(r)
+    plan = r.intents[0]
+    kinds = [s["intent"]["type"] for s in plan["steps"]]
+    assert kinds == ["build", "build", "train", "train"], kinds
+    # The condition governs the step BEFORE it: the plan waits on the barracks
+    # step until tier 2, then puts up the sanctum.
+    assert plan["steps"][0]["advance"] == {
+        "type": "when", "when": {"type": "tier_reached", "tier": 2}}
+    assert "advance" not in plan["steps"][1], "a bare ', then' is the default"
+    assert plan["steps"][0]["intent"]["kind"] == "Barracks"
+    assert plan["steps"][1]["intent"]["kind"] == "Sanctum"
+
+
+def test_a_bare_then_chain_is_all_default_advances():
+    r = compile_one("build a barracks, then train 2 footmen")
+    plan = only(r, "plan_set")
+    assert all("advance" not in s for s in plan["steps"])
+    assert plan["name"] == "plan-build", plan["name"]
+
+
+def test_an_after_step_is_a_fixed_wait():
+    r = compile_one("push mid, then after 60s, push their base")
+    plan = only(r, "plan_set")
+    afters = [s.get("advance") for s in plan["steps"] if s.get("advance")]
+    assert afters == [{"type": "after", "secs": 60.0}], afters
+    # "after 2 minutes" is the same wait spelled the way people say it.
+    plan = only(compile_one("push mid, then after 2 minutes, push their base"), "plan_set")
+    assert [s["advance"] for s in plan["steps"] if "advance" in s] == [
+        {"type": "after", "secs": 120.0}]
+
+
+def test_a_focus_chain_is_not_a_plan():
+    """The comma is the disambiguation and it has to hold. 'focus siege then
+    heroes' is ONE clause with a priority chain in it; splitting it would turn
+    one correct order into two wrong ones."""
+    r = compile_one("focus siege then heroes")
+    assert verbs(r) == ["priority"], verbs(r)
+    assert only(r, "priority")["classes"] == ["Siege", "Hero"]
+
+
+def test_a_plan_can_be_named_and_the_derived_name_is_stable():
+    r = compile_one("build a barracks, then train 2 footmen as opener")
+    assert only(r, "plan_set")["name"] == "opener"
+    # Unnamed, the same directive twice derives the same name, so re-issuing it
+    # REPLACES the plan instead of spending the other of the two slots.
+    a = only(compile_one("build a barracks, then train 2 footmen"), "plan_set")["name"]
+    b = only(compile_one("build a barracks, then train 2 footmen"), "plan_set")["name"]
+    assert a == b == "plan-build"
+
+
+def test_the_squad_idiom_is_how_a_plan_names_units_it_does_not_have_yet():
+    """A step's units are frozen when the plan is set, so a step cannot name
+    soldiers that do not exist. The late-binding selector the language already
+    has is the SQUAD: a template stamps membership, and the posture step
+    resolves that membership when it runs."""
+    r = compile_one("the barracks units join squad 2, "
+                    "then when I have 8 footmen, squad 2 pushes their base")
+    plan = only(r, "plan_set")
+    kinds = [s["intent"]["type"] for s in plan["steps"]]
+    assert kinds[-1] == "posture" and "template" in kinds, kinds
+    # The wait is on the step before the push, and it is a unit COUNT — the
+    # plan waits for the army to exist rather than naming it.
+    waits = [s["advance"] for s in plan["steps"] if "advance" in s]
+    assert waits == [{"type": "when", "kind": "Footman", "count": 8}] or \
+        waits == [{"type": "when", "when": {"type": "unit_count",
+                                            "kind": "Footman", "count": 8}}], waits
+    # The push names the squad, never a unit list.
+    assert plan["steps"][-1]["intent"]["id"] == 2
+    assert "units" not in plan["steps"][-1]["intent"]
+
+
+def test_an_unknown_step_condition_is_an_error_not_a_guess():
+    """Same rule as the trigger layer: a condition outside the vocabulary is
+    refused by name. A plan that advanced on the wrong thing would be worse
+    than one that never compiled."""
+    r = compile_one("build a barracks, then when the sky falls, train 4 footmen")
+    assert not r.intents
+    assert any("not a condition the engine can watch" in why for _, why in r.errors), r.errors
+
+
+def test_a_plan_is_refused_when_it_is_too_long_or_shaped_like_a_trigger():
+    r = compile_one("train 9 footmen, then push mid")
+    assert not r.intents
+    assert any("steps" in why and "8" in why for _, why in r.errors), r.errors
+
+    # A condition cannot open a plan — that shape is a trigger, and the tool
+    # says which word to use rather than compiling something else.
+    r = compile_one("when we reach tier 2, build a sanctum, then train 2 sorcerers")
+    assert any("cannot open with a condition" in why for _, why in r.errors), r.errors
+
+
+def test_explain_documents_the_plan_grammar():
+    for phrase in ("PLANS", ", then", "then when <cond>", "then after <n>s",
+                   "at most 8 steps", "THE COMMA MATTERS"):
+        assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
+
+
 def test_cli_end_to_end(tmp_path=None):
     import subprocess
     out = subprocess.run(

@@ -200,6 +200,57 @@ fn trigger_line(triggers: &Triggers, now: f32) -> String {
         .collect();
     format!("Triggers: {}", parts.join("  "))
 }
+/// The selection panel's one-line plan readout: every plan this team has, where
+/// it is, and whether it is in trouble.
+///
+/// **The asymmetry is deliberate and it is the same one triggers made.** The
+/// human gets a STATUS display and no authoring UI. That is not a seat the
+/// engine treats differently — `plan_set` is one verb in one language and a
+/// human's `intent_compile.py` sentence compiles to exactly the JSON a bridge
+/// commander writes. It is a rendering decision, which is the one place
+/// docs/INTENT.md permits the two seats to differ: a person at a keyboard
+/// *already has* sequencing — they press the keys in order, at 200ms each, and
+/// a mouse-driven step editor would be strictly slower than the thing it
+/// automates. What the person does NOT have is a way to see a sequence their
+/// co-commander set running unattended, and that is this line.
+///
+/// A blocked or halted plan shows its reason inline, truncated, because the
+/// whole failure design is that its owner never has to go correlate a status
+/// against an error channel.
+fn plan_line(plans: &Plans) -> String {
+    let mine = plans.get(Team::Human);
+    if mine.is_empty() {
+        return String::new();
+    }
+    /// How much of a refusal fits on a HUD line before it starts pushing the
+    /// other plan off the end. Enough for "not enough gold (need 160…".
+    const WHY_MAX: usize = 34;
+    let parts: Vec<String> = mine
+        .iter()
+        .map(|p| {
+            let head = format!("{} {}/{}", p.name, p.step_no(), p.steps.len());
+            match &p.state {
+                PlanState::Running => head,
+                PlanState::Done => format!("{head} (done)"),
+                PlanState::Blocked(why) | PlanState::Halted(why) => {
+                    let word = if matches!(p.state, PlanState::Blocked(_)) {
+                        "blocked"
+                    } else {
+                        "halted"
+                    };
+                    let short: String = if why.chars().count() > WHY_MAX {
+                        why.chars().take(WHY_MAX).collect::<String>() + "…"
+                    } else {
+                        why.clone()
+                    };
+                    format!("{head} ({word}: {short})")
+                }
+            }
+        })
+        .collect();
+    format!("Plans: {}", parts.join("  "))
+}
+
 /// What the player believes about the enemy's heroes, as one line.
 ///
 /// The human half of the snapshot's `intel.heroes`, and it must stay the same
@@ -793,6 +844,10 @@ enum Slot {
     /// Every trigger this team has armed, and its state. Empty until the
     /// player (or their co-commander) arms one.
     Triggers,
+    /// Every plan this team has, where it is, and why it stopped if it did.
+    /// Empty until one is set. See `plan_line` for why the human gets a status
+    /// readout and no authoring UI.
+    Plans,
     /// What we believe about the enemy's heroes — the HUD's rendering of the
     /// snapshot's `intel.heroes`. Empty until one has been laid eyes on, so a
     /// match where neither hero has been met looks exactly as it always did.
@@ -1804,6 +1859,10 @@ struct CastLookup<'w, 's> {
     /// squads and triggers are the same kind of thing (standing policy the
     /// engine executes), read by the same two systems for the same reason.
     triggers: Res<'w, Triggers>,
+    /// And the sequenced kind, read by the same system for the same reason.
+    /// Needs no clock: a plan's state is a fact it already carries, not a
+    /// cooldown to be computed against now.
+    plans: Res<'w, Plans>,
     /// Rides along with `triggers` because it is only ever read to answer a
     /// question about them: is this repeating rule still inside its cooldown?
     clock: Res<'w, Time>,
@@ -2387,7 +2446,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         //
         // This is a PRESET, not an authoring surface, and the asymmetry is
         // real and documented (docs/INTENT.md § Triggers): a commander can
-        // write any of nine predicates against any of the 27 verbs, and the
+        // write any of nine predicates against any of the 29 verbs, and the
         // human at the keyboard gets one canned rule plus a readout. What
         // closes most of the gap is that the English compiler speaks the same
         // sentences to the same wire.
@@ -3681,6 +3740,16 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                 12.0,
                 Color::srgb(0.85, 0.72, 0.40),
                 Slot::Triggers,
+            ));
+            // Directly beneath the rules, in the same colour: both are standing
+            // policy the engine runs without anybody watching, and a player
+            // scanning for "what is the game doing on my behalf" should find
+            // them as one block rather than two.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(0.85, 0.72, 0.40),
+                Slot::Plans,
             ));
             // What we know of THEIR heroes. Same argument as the trigger line
             // — it belongs to the faction rather than to the selection — and
@@ -7495,6 +7564,7 @@ fn update_hud(
     // The team's armed rules — nothing to do with the selection or the link,
     // and drawn whether or not either exists.
     let triggers_text = trigger_line(&cast.triggers, cast.clock.elapsed_secs());
+    let plans_text = plan_line(&cast.plans);
     // The same grid the snapshot's `intel.heroes` is built from, read for the
     // same seat this whole file renders for.
     let enemy_heroes_text =
@@ -7798,6 +7868,7 @@ fn update_hud(
             Slot::Why => text.0 = why_text.clone(),
             Slot::Link => text.0 = link_text.clone(),
             Slot::Triggers => text.0 = triggers_text.clone(),
+            Slot::Plans => text.0 = plans_text.clone(),
             Slot::EnemyHeroes => text.0 = enemy_heroes_text.clone(),
             Slot::Coverage => text.0 = coverage_text.clone(),
             Slot::Overflow => text.0 = overflow_text.clone(),
@@ -9112,6 +9183,7 @@ mod tests {
             // the home-guard toggle's lit state.
             .init_resource::<TeamResearch>()
             .init_resource::<Triggers>()
+            .init_resource::<Plans>()
             .init_resource::<Time>()
             .add_event::<CameraFocus>()
             .add_event::<SubmitIntent>()
@@ -9715,7 +9787,7 @@ mod tests {
     /// second of those is byte-identical to the JSON in COMMANDER_BRIEF.md's
     /// home-guard recipe. This is the fairness invariant applied to the newest
     /// verb in the language: the human's surface is *narrower* (one preset
-    /// against eleven predicates and 27 verbs), but nothing it produces is
+    /// against eleven predicates and 29 verbs), but nothing it produces is
     /// outside what the wire can say, and nothing the wire says is outside what
     /// the engine will do for the human.
     #[test]
@@ -9808,6 +9880,77 @@ mod tests {
         // The opponent's rules are their plans, and the panel never sees them.
         triggers.set(Team::Claude, rule("theirs", None, true, None)).unwrap();
         assert!(!trigger_line(&triggers, 100.0).contains("theirs"));
+    }
+
+    /// The human's plan readout. Status only — see `plan_line` for why
+    /// authoring stays in NL/preset territory, which is the same asymmetry the
+    /// trigger readout above documents.
+    ///
+    /// The load-bearing part is that a stopped plan says WHY on the line. A
+    /// status of "blocked" that made its owner go read `errors` would put the
+    /// human back in the polling loop this whole vocabulary exists to delete.
+    #[test]
+    fn the_plan_readout_names_every_plan_its_step_and_why_it_stopped() {
+        let mut plans = Plans::default();
+        let make = |name: &str, steps: usize, at: usize, state: PlanState| PlanRun {
+            name: PlanName::new(name).unwrap(),
+            steps: (0..steps)
+                .map(|_| PlanStep {
+                    intent: Intent::Stop { units: vec![] },
+                    advance: PlanAdvance::OnApplied,
+                })
+                .collect(),
+            source: IntentSource::Bridge,
+            state,
+            at,
+            submitted: true,
+            applied: true,
+            applied_at: 0.0,
+            last_try: 0.0,
+            blocked_since: None,
+            told_blocked: false,
+        };
+        assert_eq!(plan_line(&plans), "", "silent until there is one");
+
+        plans
+            .set(Team::Human, make("opening", 5, 1, PlanState::Running))
+            .unwrap();
+        assert_eq!(plan_line(&plans), "Plans: opening 2/5");
+
+        plans
+            .set(
+                Team::Human,
+                make(
+                    "boom",
+                    3,
+                    2,
+                    PlanState::Blocked("not enough gold".to_string()),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            plan_line(&plans),
+            "Plans: opening 2/5  boom 3/3 (blocked: not enough gold)"
+        );
+
+        // A long refusal is truncated rather than allowed to push the other
+        // plan off the end of the line.
+        plans.get_mut(Team::Human)[1].state = PlanState::Halted(
+            "site (56.0, -56.0) is blocked for TownHall; try (49.0, -56.0)".to_string(),
+        );
+        let line = plan_line(&plans);
+        assert!(line.contains("boom 3/3 (halted: site (56.0, -56.0) is blocked for …)"), "{line}");
+        assert!(line.starts_with("Plans: opening 2/5"), "{line}");
+
+        // A finished plan stays visible and says so.
+        plans.get_mut(Team::Human)[0].state = PlanState::Done;
+        assert!(plan_line(&plans).contains("opening 2/5 (done)"));
+
+        // The opponent's plans are theirs, and the panel never sees them.
+        plans
+            .set(Team::Claude, make("theirs", 2, 0, PlanState::Running))
+            .unwrap();
+        assert!(!plan_line(&plans).contains("theirs"));
     }
 
     /// **The hero intel line says only what the human could have seen.**

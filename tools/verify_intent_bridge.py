@@ -38,7 +38,11 @@ EXPECTED_TOP_KEYS = {
 #   * triggers is present only once this seat has armed one (`trigger_set`).
 #     Like `command_nodes` and `applied` it is `skip_serializing_if` empty, so
 #     a seat that never speaks the word sends exactly the historical key set.
-OPTIONAL_TOP_KEYS = {"applied", "game_over_reason", "triggers"}
+#   * plans, identically, appears only once this seat has set one (`plan_set`).
+#     Same `skip_serializing_if` rule and the same reason: the v3 vocabulary is
+#     additive, and a commander that never says the word must not be able to
+#     tell it exists from the shape of its snapshot.
+OPTIONAL_TOP_KEYS = {"applied", "game_over_reason", "triggers", "plans"}
 
 
 def upgrade_price(st):
