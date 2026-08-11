@@ -75,7 +75,8 @@
 #   BRIDGE_CAP=20000   that engine's WC3_MAX_GAME_SECS — high on purpose, so the
 #                      match cannot time-cap out from under the verifier; the
 #                      engine is stopped by PID when the verifier returns
-#   KEEP_LOGS=1        keep the log directory (and identity's extracted ref tree)
+#   KEEP_LOGS=1        keep the log directory, and identity's target/verify-identity
+#                      work area (the two binaries and the extracted ref tree)
 #
 # Logs for every stage land in one temp directory, printed at the end.
 #
@@ -136,6 +137,7 @@ LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/wc3verify.XXXXXX")"
 # ---------------------------------------------------------------------------
 
 ENGINE_PIDS=()
+IDENT_WORK=""
 IDENT_CHECKOUT=""
 
 track_engine() { ENGINE_PIDS+=("$1"); }
@@ -180,8 +182,8 @@ cleanup() {
         [ -n "$p" ] || continue
         kill -KILL "$p" 2>/dev/null
     done
-    if [ -n "$IDENT_CHECKOUT" ] && [ -d "$IDENT_CHECKOUT" ] && [ "$KEEP_LOGS" != "1" ]; then
-        rm -rf "$IDENT_CHECKOUT"
+    if [ -n "$IDENT_WORK" ] && [ -d "$IDENT_WORK" ] && [ "$KEEP_LOGS" != "1" ]; then
+        rm -rf "$IDENT_WORK"
     fi
     if [ "$rc" -eq 0 ] && [ "$KEEP_LOGS" != "1" ]; then
         rm -rf "$LOGDIR"
@@ -458,17 +460,23 @@ st_identity() {
     # the ref build cannot clobber it. Both builds share one target dir on
     # purpose: a second target dir is a cold build of every dependency, and the
     # only thing that actually recompiles here is this crate.
+    # Everything heavy lives under target/ (gitignored, and on disk): the debug
+    # binary is well over a gigabyte and $TMPDIR is commonly tmpfs, i.e. RAM.
+    IDENT_WORK="$ROOT/target/verify-identity"
+    rm -rf "$IDENT_WORK"
+    mkdir -p "$IDENT_WORK" || return 1
+
     printf '  building HEAD ...\n'
     cargo build >"$LOGDIR/build-head.log" 2>&1 || {
         tail -n 30 "$LOGDIR/build-head.log"; return 1; }
-    cp "$BIN" "$LOGDIR/bin-head" || return 1
+    cp "$BIN" "$IDENT_WORK/bin-head" || return 1
 
     # `git archive | tar -x`, deliberately, and NOT `git worktree add`: adding a
     # worktree writes into the shared .git directory that every sibling agent's
     # checkout hangs off. Materialising the ref as a plain directory is
     # read-only on the repo, needs no cleanup registration, and there is no
     # build.rs here that would miss the missing .git.
-    IDENT_CHECKOUT="$LOGDIR/ref-checkout"
+    IDENT_CHECKOUT="$IDENT_WORK/ref-checkout"
     printf '  extracting ref into %s ...\n' "$IDENT_CHECKOUT"
     mkdir -p "$IDENT_CHECKOUT" || return 1
     git -C "$ROOT" archive --format=tar "$ref_sha" 2>"$LOGDIR/archive.log" \
@@ -482,13 +490,13 @@ st_identity() {
     ( cd "$IDENT_CHECKOUT" && CARGO_TARGET_DIR="$ROOT/target" cargo build ) \
         >"$LOGDIR/build-ref.log" 2>&1 || {
         tail -n 30 "$LOGDIR/build-ref.log"; return 1; }
-    cp "$BIN" "$LOGDIR/bin-ref" || return 1
+    cp "$BIN" "$IDENT_WORK/bin-ref" || return 1
 
     local map rc=0
     for map in open crossings; do
-        fingerprints "$LOGDIR/bin-head" "$ROOT" "$map" "$IDENT_SEED" \
+        fingerprints "$IDENT_WORK/bin-head" "$ROOT" "$map" "$IDENT_SEED" \
             "$LOGDIR/fp-head-$map" || { rc=1; continue; }
-        fingerprints "$LOGDIR/bin-ref" "$IDENT_CHECKOUT" "$map" "$IDENT_SEED" \
+        fingerprints "$IDENT_WORK/bin-ref" "$IDENT_CHECKOUT" "$map" "$IDENT_SEED" \
             "$LOGDIR/fp-ref-$map" || { rc=1; continue; }
         local n
         n="$(wc -l <"$LOGDIR/fp-head-$map")"
@@ -504,7 +512,7 @@ st_identity() {
 
     # The ref build left target/debug/wc3clone belonging to the ref. Put HEAD's
     # back so the next thing to use this checkout is not quietly running old code.
-    cp "$LOGDIR/bin-head" "$BIN" 2>/dev/null
+    cp "$IDENT_WORK/bin-head" "$BIN" 2>/dev/null
     return "$rc"
 }
 
