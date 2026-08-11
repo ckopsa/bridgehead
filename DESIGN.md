@@ -453,3 +453,19 @@ is exactly what it was.**
 When done, run `cargo check` from the repo root (timeout 600s — first run may
 wait on a build lock held by another agent; that's fine, wait it out). Fix your
 own file's errors. If errors are clearly in someone else's file, ignore them.
+
+Beyond `cargo check`, do not hand-roll a verification recipe: `tools/verify.sh`
+is the definition of done as one executable, in four cumulative tiers.
+
+| tier | what it runs | when |
+| --- | --- | --- |
+| `smoke` | `cargo build` (dev) + `cargo test` + one decisive open-map sim | fastest honest "did I break it" |
+| `standard` | smoke + a decisive crossings sim + every `tools/test_*.py` suite | the bar for closing a bead; what a bare `tools/verify.sh` runs |
+| `full` | standard + a 2-seed x 2-map sim matrix + a determinism pair + all four bridge verifiers on a live engine | before merging anything that touches the sim or the bridge |
+| `identity [ref]` | builds `ref` (default: merge-base with master) and HEAD, fingerprints both maps with each binary, byte-compares | for "this changes no behavior" claims |
+
+It runs the binary it built (never `cargo run`, whose rebuilds make the verdict
+unattributable), treats a sim that hits `WC3_MAX_GAME_SECS` as a failure rather
+than a pass, kills every engine it starts by saved PID, and names the failing
+stage. `tools/verify.sh --list` prints the tiers; the script's own header is its
+documentation.
