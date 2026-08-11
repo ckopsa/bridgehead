@@ -319,6 +319,11 @@ mod tests {
     /// testing the clock.
     fn plan_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or the intent compiler (which reads it to gate
+        // the `build` verb by roster) panics inside Bevy's worker pool and
+        // the test HANGS or dies in `run_main` rather than failing cleanly.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<Plans>()
             // `TriggerWorld` reads it: a plan step may advance on `enemy_in`,
@@ -336,6 +341,11 @@ mod tests {
     /// the way a commander does and watch the engine walk it.
     fn full_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or the intent compiler (which reads it to gate
+        // the `build` verb by roster) panics inside Bevy's worker pool and
+        // the test HANGS or dies in `run_main` rather than failing cleanly.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<Triggers>()
             .init_resource::<Plans>()

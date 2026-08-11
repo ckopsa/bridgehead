@@ -954,6 +954,10 @@ mod tests {
     #[test]
     fn issuing_with_the_flag_off_writes_the_order_directly() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.insert_resource(CommandLatency::default())
             .init_resource::<CommandNodes>();
 
@@ -1001,6 +1005,10 @@ mod tests {
     #[test]
     fn every_living_hero_is_its_own_command_node() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.insert_resource(tuned())
             .init_resource::<CommandNodes>()
             .add_systems(Update, refresh_command_nodes);
@@ -1055,6 +1063,10 @@ mod tests {
     #[test]
     fn a_distant_order_arrives_late_and_then_arrives() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .insert_resource(tuned())
             .init_resource::<CommandNodes>()
@@ -1144,6 +1156,10 @@ mod tests {
     #[test]
     fn a_delayed_orders_reason_is_stamped_when_it_lands() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .insert_resource(tuned())
             .insert_resource(cache(Vec::new()))
@@ -1224,6 +1240,10 @@ mod tests {
     #[test]
     fn repeating_an_order_does_not_restart_its_journey() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .insert_resource(tuned())
             // The severed-arm case: no command nodes at all, so every order
@@ -1376,6 +1396,10 @@ mod tests {
     #[test]
     fn a_distant_cast_arrives_late() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .insert_resource(tuned())
             .insert_resource(cache(Vec::new()))
@@ -1438,6 +1462,10 @@ mod tests {
     #[test]
     fn a_delayed_cast_carries_its_aim() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .insert_resource(tuned())
             .insert_resource(cache(Vec::new()))

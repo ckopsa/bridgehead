@@ -928,6 +928,116 @@ impl Voice<'_, '_> {
     }
 }
 
+/// **The scripted commander's roster lookup — one kind per ROLE.**
+///
+/// This is the whole of ai.rs's race awareness, and it is deliberately a
+/// TRANSLATION TABLE rather than a fork. Every `UnitKind::Footman` and
+/// `BuildingKind::Barracks` this file used to name became `r.line` and
+/// `r.production`; for `Race::Kingdom` those resolve to exactly the kinds that
+/// were written there before, so a Kingdom-vs-Kingdom match is
+/// instruction-for-instruction the game it was.
+///
+/// **How dirty this got, honestly.** Three things did not translate, and they
+/// are the real cost of race asymmetry in a scripted commander:
+///
+///  1. **`Option` everywhere.** A race need not have a role. The Horde has no
+///     `Barrier` (no wall) and no `Siegeworks` (its siege comes out of its one
+///     production building), so eight fields here are `Option` and every build
+///     branch that used to be a plain `else if` now has an `is_some()` in it.
+///     That is not incidental noise — it is the build order honestly admitting
+///     that a branch may not apply to the roster it is playing.
+///  2. **Two roles can land on ONE building.** The Kingdom trains siege at a
+///     Workshop and casters at a Sanctum; the Horde trains siege at its
+///     WarCamp and its flyer at its Spirit Lodge. A `match` on the building's
+///     kind can only take one arm, so the production and tech arms grew a
+///     "…and if this building ALSO trains the siege/air unit, pace it here"
+///     tail. Those tails are dead code for the Kingdom (its Barracks trains no
+///     Catapult, its Sanctum no Gryphon), which is exactly why the Kingdom's
+///     behaviour is unchanged — and exactly why they are the part of this
+///     file most likely to rot.
+///  3. **Tech gates had to be asked, not asserted.** `raider_ok` was
+///     "a Workshop is standing" and `knight_ok` was "tier >= 3". Both are now
+///     `unit_gate_ok`, which asks `unit_requires` the same question
+///     economy.rs will ask at the pay-point. Equivalent for the Kingdom,
+///     correct for a roster that gates its cavalry on a hall rung instead.
+///
+/// What did NOT need translating is the more interesting half: waves, retreat,
+/// worker assignment, expansion timing, the Slam rule, the item rules, the
+/// research ladder and every threat reaction are written against roles,
+/// positions and stats already, and not one of them was touched.
+#[derive(Clone, Copy)]
+struct Roster {
+    hall: BuildingKind,
+    production: BuildingKind,
+    supply: BuildingKind,
+    defense: Option<BuildingKind>,
+    barrier: Option<BuildingKind>,
+    /// The tier-2 caster building.
+    tech: Option<BuildingKind>,
+    forge: Option<BuildingKind>,
+    /// A DEDICATED siege building. `None` for a race whose production building
+    /// makes siege itself — see the note above about two roles on one kind.
+    siegeworks: Option<BuildingKind>,
+    vendor: Option<BuildingKind>,
+    worker: UnitKind,
+    line: UnitKind,
+    ranged: Option<UnitKind>,
+    cavalry: Option<UnitKind>,
+    anti_cavalry: Option<UnitKind>,
+    siege: Option<UnitKind>,
+    caster: Option<UnitKind>,
+    flyer: Option<UnitKind>,
+    shock: Option<UnitKind>,
+}
+
+impl Roster {
+    fn of(race: Race) -> Roster {
+        Roster {
+            hall: race_hall(race),
+            production: race_building(race, BuildingRole::Production)
+                .unwrap_or_else(|| race_hall(race)),
+            supply: race_building(race, BuildingRole::Supply)
+                .unwrap_or_else(|| race_hall(race)),
+            defense: race_building(race, BuildingRole::Defense),
+            barrier: race_building(race, BuildingRole::Barrier),
+            tech: race_building(race, BuildingRole::Tech),
+            forge: race_building(race, BuildingRole::Forge),
+            siegeworks: race_building(race, BuildingRole::Siegeworks),
+            vendor: race_building(race, BuildingRole::Vendor),
+            worker: race_worker(race),
+            // The line unit is the only one with no honest fallback: it is
+            // what every "I could not afford the good one" branch degrades
+            // to, and the loader refuses a race without one.
+            line: race_unit(race, UnitRole::Line).unwrap_or_else(|| race_worker(race)),
+            ranged: race_unit(race, UnitRole::Ranged),
+            cavalry: race_unit(race, UnitRole::Cavalry),
+            anti_cavalry: race_unit(race, UnitRole::AntiCavalry),
+            siege: race_unit(race, UnitRole::Siege),
+            caster: race_unit(race, UnitRole::Caster),
+            flyer: race_unit(race, UnitRole::Flyer),
+            shock: race_unit(race, UnitRole::Shock),
+        }
+    }
+
+    /// The hero classes to open slots with, in preference order: the melee
+    /// class first, the support class as the second slot a tier-2 hall opens.
+    /// Was a `const HERO_PICK_ORDER: [UnitKind; 2]`; the ORDER survives as the
+    /// role order, which is the same decision written once for both rosters.
+    fn heroes(&self, race: Race) -> Vec<UnitKind> {
+        [UnitRole::HeroMelee, UnitRole::HeroSupport]
+            .into_iter()
+            .filter_map(|role| race_unit(race, role))
+            .collect()
+    }
+}
+
+/// Can this team train `kind` right now, gate-wise? Asks `unit_requires` the
+/// same question economy.rs asks when it takes the money, instead of the
+/// hand-rolled "a Workshop is standing" / "tier >= 3" tests this replaced.
+fn unit_gate_ok(kind: UnitKind, completed: &[BuildingKind]) -> bool {
+    requirements_met(unit_requires(kind), completed.iter().copied())
+}
+
 /// Drives one think tick for every team the AI is currently playing.
 #[allow(clippy::too_many_arguments)]
 fn ai_think(
@@ -950,6 +1060,10 @@ fn ai_think(
     units: UnitQuery,
     buildings: BuildingQuery,
     nodes: NodeQuery,
+    // Which roster each team is playing. The one race-dependent input the
+    // script has: everything below reaches for a ROLE and this resolves it to
+    // a kind (see `Roster`).
+    races: Res<Races>,
 ) {
     if game_over.winner.is_some() {
         return;
@@ -976,6 +1090,7 @@ fn ai_think(
         };
         think(
             team,
+            races.get(team),
             brain,
             now,
             &economies,
@@ -1001,6 +1116,9 @@ fn ai_think(
 #[allow(clippy::too_many_arguments)]
 fn think(
     me: Team,
+    // The roster this team is playing. Everything race-dependent below goes
+    // through `Roster`, built from it once on the next line.
+    race: Race,
     brain: &mut AiBrain,
     now: f32,
     economies: &Economies,
@@ -1020,6 +1138,8 @@ fn think(
     buildings: &BuildingQuery,
     nodes: &NodeQuery,
 ) {
+    let r = Roster::of(race);
+
     // --- snapshot the world (read-only) --------------------------------------
     let mut workers: Vec<UnitInfo> = Vec::new();
     let mut army: Vec<UnitInfo> = Vec::new();
@@ -1080,7 +1200,7 @@ fn think(
             // Everything that isn't a Worker is army: heroes, Archers,
             // Catapults and Raiders all join waves with no extra wiring.
             match unit.kind {
-                UnitKind::Worker => workers.push(info),
+                k if is_worker_kind(k) => workers.push(info),
                 _ => army.push(info),
             }
         } else if fog.sees(info.pos) {
@@ -1097,12 +1217,17 @@ fn think(
             }
             // The two reactions. Both are pure sight: a kind we are looking at
             // right now, never a kind we were killed by ten seconds ago.
-            if matches!(unit.kind, UnitKind::Raider | UnitKind::Knight) {
+            // By CLASS, not by kind: `TargetClass::Cavalry` is what the
+            // Spearman's 5x is keyed off, so "did we see cavalry" and "does
+            // the spear line answer it" are now the same question — and a
+            // Wolfrider trips it for the same reason a Knight does, with no
+            // second race named here.
+            if TargetClass::of(Some(unit.kind), false) == Some(TargetClass::Cavalry) {
                 saw_cavalry = true;
             }
             // Workers don't hunt, and neither does anything that cannot shoot
             // downward — so neither should make a harvest crew run.
-            if unit.kind != UnitKind::Worker && unit_stats(unit.kind).can_hit_ground {
+            if !is_worker_kind(unit.kind) && unit_stats(unit.kind).can_hit_ground {
                 enemy_combat.push(info.pos);
             }
         }
@@ -1166,7 +1291,7 @@ fn think(
                 if is_hero_kind(*k) {
                     heroes_queued.push(*k);
                 }
-                if *k == UnitKind::Sorcerer {
+                if Some(*k) == r.caster {
                     queued_sorcerers += 1;
                 }
             }
@@ -1323,6 +1448,7 @@ fn think(
         let expansion = if halls_total > 0 && !hall_going_up {
             plan_expansion(
                 me,
+                r.hall,
                 &own_buildings,
                 &enemy_buildings,
                 &mines,
@@ -1343,12 +1469,13 @@ fn think(
         let keep_standing = own_buildings
             .iter()
             .any(|b| b.done && is_hall(b.kind) && building_tier(b.kind) >= 2);
-        let towers_standing = count_of(BuildingKind::Tower);
+        let towers_standing = r.defense.map_or(0, count_of);
         // Two independent ceilings, and the tighter one wins: the rules' own
         // quota, and the hard cap that exists so no future rule can talk this
         // script into a fortress. See `MAX_TOWERS`.
-        let tower_wanted = wants_tower(
-            done_count(BuildingKind::Barracks) >= 1,
+        let tower_wanted = r.defense.is_some()
+            && wants_tower(
+            done_count(r.production) >= 1,
             towers_standing,
             keep_standing,
             air_alert,
@@ -1367,15 +1494,16 @@ fn think(
         let ford_tower = ford.as_ref().is_some_and(|f| {
             own_buildings
                 .iter()
-                .any(|b| b.kind == BuildingKind::Tower && xz_dist(b.pos, f.hold) < FORD_AREA)
+                .any(|b| Some(b.kind) == r.defense && xz_dist(b.pos, f.hold) < FORD_AREA)
         });
         let ford_walls = ford.as_ref().map_or(0, |f| {
             own_buildings
                 .iter()
-                .filter(|b| b.kind == BuildingKind::Wall && xz_dist(b.pos, f.hold) < FORD_AREA)
+                .filter(|b| Some(b.kind) == r.barrier && xz_dist(b.pos, f.hold) < FORD_AREA)
                 .count()
         });
-        let wall_wanted = ford_tower
+        let wall_wanted = r.barrier.is_some()
+            && ford_tower
             && ford.as_ref().is_some_and(|f| !ford_wall_sites(f).is_empty())
             && ford_walls < FORD_WALLS
             && gold > TOWER_GOLD;
@@ -1383,16 +1511,19 @@ fn think(
         // A Shop is a conversion, not production: surplus gold into hero
         // uptime. Bottom of the chain, Keep-gated, bank-gated, one ever.
         let shop_wanted = keep_standing
-            && count_of(BuildingKind::Shop) == 0
+            && r.vendor.is_some_and(|v| count_of(v) == 0)
             && gold > SHOP_GOLD;
 
         let want = if halls_total == 0 {
-            Some(BuildingKind::TownHall)
-        } else if headroom < SUPPLY_BUFFER && !under_construction(BuildingKind::Farm) {
-            Some(BuildingKind::Farm)
-        } else if count_of(BuildingKind::Barracks) == 0 {
-            Some(BuildingKind::Barracks)
-        } else if tier_now >= 2 && count_of(BuildingKind::Sanctum) == 0 && gold > SANCTUM_GOLD {
+            Some(r.hall)
+        } else if headroom < SUPPLY_BUFFER && !under_construction(r.supply) {
+            Some(r.supply)
+        } else if count_of(r.production) == 0 {
+            Some(r.production)
+        } else if tier_now >= 2
+            && r.tech.is_some_and(|t| count_of(t) == 0)
+            && gold > SANCTUM_GOLD
+        {
             // The caster branch, and deliberately ABOVE the expansion. That
             // looks like it contradicts "income first", and it does not: this
             // is a ONE-OFF 150g/130l purchase gated behind a Keep the team has
@@ -1401,31 +1532,30 @@ fn think(
             // below it, the Sanctum loses every roll forever — five straight
             // sim runs reached tier 2 and finished with no caster ever built,
             // which is a tier-2 unlock that has never been played.
-            Some(BuildingKind::Sanctum)
+            r.tech
         } else if expansion.is_some() {
             // Above the remaining luxuries (second Barracks, Workshop) and
             // below the army's first Barracks: income outlives any one more
             // Footman, but a base with no defenders never gets to spend it.
-            Some(BuildingKind::TownHall)
+            Some(r.hall)
         } else if tower_wanted && air_alert {
             // The reactive Tower, and the only branch in this chain with no
             // gold gate of its own. A flyer cannot be walked around, blocked,
             // or out-ranged by anything the Barracks makes in time; a Tower is
             // the answer that is already standing when it arrives. "We could
             // not afford to answer air" is not a position worth protecting.
-            Some(BuildingKind::Tower)
-        } else if gold > SECOND_BARRACKS_GOLD && count_of(BuildingKind::Barracks) < MAX_BARRACKS {
-            Some(BuildingKind::Barracks)
-        } else if done_count(BuildingKind::Barracks) >= 1
-            && count_of(BuildingKind::Workshop) == 0
+            r.defense
+        } else if gold > SECOND_BARRACKS_GOLD && count_of(r.production) < MAX_BARRACKS {
+            Some(r.production)
+        } else if r.siegeworks.is_some_and(|w| count_of(w) == 0)
+            && done_count(r.production) >= 1
             && gold > WORKSHOP_GOLD
         {
             // Siege branch. `count_of` (not `done_count`) means one Workshop
             // ever — including one still under construction — so the AI can't
             // spam a second while the first is going up.
-            Some(BuildingKind::Workshop)
-        } else if done_count(BuildingKind::Blacksmith) == 0
-            && count_of(BuildingKind::Blacksmith) == 0
+            r.siegeworks
+        } else if r.forge.is_some_and(|f| done_count(f) == 0 && count_of(f) == 0)
             && own_buildings
                 .iter()
                 .any(|b| b.done && is_hall(b.kind) && building_tier(b.kind) >= 2)
@@ -1437,12 +1567,12 @@ fn think(
             // rather than on `building_requires`, matching how every other
             // branch here spells its prerequisite — ai.rs hand-rolls its gates
             // and economy.rs enforces the real one at placement.
-            Some(BuildingKind::Blacksmith)
+            r.forge
         } else if shop_wanted {
             // 75g/60l, the cheapest thing left on this list, and like the forge
             // above it its benefit travels with the army instead of guarding
             // one patch of dirt. Same argument, same side of the towers.
-            Some(BuildingKind::Shop)
+            r.vendor
         } else if tower_wanted && halls >= 2 && gold > TOWER_GOLD {
             // The baseline tower, at the bottom of the chain. Everything above
             // either earns money, makes soldiers, or makes soldiers better; a
@@ -1453,9 +1583,9 @@ fn think(
             // A base that has not expanded yet cannot spare the gold OR the
             // tempo, and buying static defense out of a single mine is how the
             // scripted matchup stops converging (see BASELINE_TOWERS).
-            Some(BuildingKind::Tower)
+            r.defense
         } else if wall_wanted {
-            Some(BuildingKind::Wall)
+            r.barrier
         } else {
             None
         };
@@ -1463,7 +1593,7 @@ fn think(
         if let Some(kind) = want {
             let stats = building_stats(kind);
             saving_for_expansion = expansion.is_some()
-                && kind == BuildingKind::TownHall
+                && kind == r.hall
                 && !eco.can_afford(stats.cost_gold, stats.cost_lumber);
             if eco.can_afford(stats.cost_gold, stats.cost_lumber) {
                 // Anchor on the town hall, or any surviving building if the
@@ -1476,7 +1606,7 @@ fn think(
                     .unwrap_or(base);
                 // An expansion hall goes next to its mine, not next to home —
                 // the whole point is a short haul at the *new* patch.
-                let expanding = kind == BuildingKind::TownHall && expansion.is_some();
+                let expanding = kind == r.hall && expansion.is_some();
                 let footprint = stats.size + BUILD_PADDING;
                 // Three siting rules, in order of how much the placement
                 // matters: an expansion goes to its mine, an emplacement goes
@@ -1484,9 +1614,9 @@ fn think(
                 // ring around the base like it always did.
                 let site = match (&expansion, kind, &ford) {
                     (Some(plan), _, _) if expanding => Some(plan.site),
-                    (_, BuildingKind::Tower, Some(f)) => pick_spot(nav, f.hold, footprint)
+                    (_, k, Some(f)) if Some(k) == r.defense => pick_spot(nav, f.hold, footprint)
                         .or_else(|| pick_site(nav, anchor, footprint)),
-                    (_, BuildingKind::Wall, Some(f)) => ford_wall_sites(f)
+                    (_, k, Some(f)) if Some(k) == r.barrier => ford_wall_sites(f)
                         .into_iter()
                         .find(|p| nav.rect_is_free(*p, footprint)),
                     _ => pick_site(nav, anchor, footprint),
@@ -1547,7 +1677,7 @@ fn think(
                         // far from its centre, and whether it was the baseline
                         // pair or an answer to something in the air. This is
                         // the evidence a sim run is read for.
-                        if matches!(kind, BuildingKind::Tower | BuildingKind::Wall) {
+                        if Some(kind) == r.defense || Some(kind) == r.barrier {
                             match &ford {
                                 Some(f) => info!(
                                     "[ai {me:?}] fortifying the {}: {} at ({:.0},{:.0}), {:.0} back \
@@ -1572,7 +1702,7 @@ fn think(
                                 ),
                             }
                         }
-                        if kind == BuildingKind::Shop {
+                        if Some(kind) == r.vendor {
                             info!(
                                 "[ai {me:?}] Shop at ({:.0},{:.0}) — hero items are open",
                                 site.x, site.z
@@ -1581,8 +1711,9 @@ fn think(
                         if let (true, Some(plan)) = (expanding, &expansion) {
                             brain.expansion_pending = true;
                             info!(
-                                "[ai {me:?}] expanding: TownHall at ({:.0},{:.0}) for the mine at \
+                                "[ai {me:?}] expanding: {} at ({:.0},{:.0}) for the mine at \
                                  ({:.0},{:.0}) holding {} gold — held mines are down to {}",
+                                building_name(kind),
                                 site.x,
                                 site.z,
                                 plan.mine_pos.x,
@@ -1640,7 +1771,7 @@ fn think(
 
     let barracks_up = own_buildings
         .iter()
-        .any(|b| b.kind == BuildingKind::Barracks && b.done);
+        .any(|b| b.kind == r.production && b.done);
     let mut tierup_reserve = (0u32, 0u32);
     brain.tierup_pending = false;
     if !hall_upgrading && !saving_for_expansion && !brain.expansion_pending {
@@ -1850,22 +1981,20 @@ fn think(
     // fixed order: Champion first, Priestess as the second slot a Keep opens.
     // Revival of a class it has already lost outranks opening a new one — a
     // level-6 Champion at 250g is the best gold in the game.
-    const HERO_PICK_ORDER: [UnitKind; 2] = [UnitKind::Hero, UnitKind::Priestess];
+    let hero_pick_order = r.heroes(race);
     let mut held_classes: Vec<UnitKind> = army
         .iter()
         .filter(|u| is_hero_kind(u.kind))
         .map(|u| u.kind)
         .collect();
     held_classes.extend(heroes_queued.iter().copied());
-    let barracks_standing = own_buildings
-        .iter()
-        .any(|b| b.kind == BuildingKind::Barracks);
+    let barracks_standing = own_buildings.iter().any(|b| b.kind == r.production);
     let slots_open = (held_classes.len() as u32) < hero_slots(TechTier::from_level(current_tier));
     // Opening an ADDITIONAL slot is a luxury; filling the first one never was.
     let fighters = army.iter().filter(|u| !is_hero_kind(u.kind)).count();
     let can_open_another = held_classes.is_empty() || fighters >= SECOND_HERO_MIN_ARMY;
     let candidates = |revivals_only: bool| {
-        HERO_PICK_ORDER.into_iter().find(|k| {
+        hero_pick_order.iter().copied().find(|k| {
             if held_classes.contains(k) {
                 return false;
             }
@@ -1919,7 +2048,7 @@ fn think(
     // drains every delivery and a 385g/205l TownHall is never reached — the AI
     // would "want" to expand forever while its last mine ran out.
     if saving_for_expansion || brain.expansion_pending {
-        let stats = building_stats(BuildingKind::TownHall);
+        let stats = building_stats(r.hall);
         reserve_gold += stats.cost_gold;
         reserve_lumber += stats.cost_lumber;
     }
@@ -1945,7 +2074,7 @@ fn think(
     brain.item_pending = false;
     let shop = own_buildings
         .iter()
-        .find(|b| b.done && b.kind == BuildingKind::Shop);
+        .find(|b| b.done && Some(b.kind) == r.vendor);
     if let (Some(shop), Some(hero)) = (shop, own_heroes.first()) {
         let tier = tech_tier_for(own_buildings.iter().filter(|b| b.done).map(|b| b.kind));
         // "A real fight", the same shape as the Slam rule: a clump on the hero.
@@ -2010,7 +2139,7 @@ fn think(
     // in a queue so a two-Sanctum team can't double-order them.
     let sorcerers_alive = army
         .iter()
-        .filter(|u| u.kind == UnitKind::Sorcerer)
+        .filter(|u| Some(u.kind) == r.caster)
         .count()
         + own_buildings
             .iter()
@@ -2024,8 +2153,13 @@ fn think(
     // wants one every few seconds, so in build order it always loses the race
     // and the tier-2 unlock the team paid 150g/130l for never produces a
     // single caster. Everything else keeps its historical relative order.
+    // Standing, finished buildings — the same list `requirements_met` wants,
+    // and what `unit_gate_ok` asks below in place of the hand-rolled "a
+    // Workshop is up" / "tier >= 3" tests this file used to carry.
+    let completed: Vec<BuildingKind> =
+        own_buildings.iter().filter(|b| b.done).map(|b| b.kind).collect();
     let mut production: Vec<&BuildingInfo> = own_buildings.iter().filter(|b| b.done).collect();
-    production.sort_by_key(|b| u8::from(b.kind != BuildingKind::Sanctum));
+    production.sort_by_key(|b| u8::from(Some(b.kind) != r.tech));
 
     for b in production {
         // A Keep and a Castle are the hall, so worker production keys off the
@@ -2035,18 +2169,18 @@ fn think(
             if worker_count >= TARGET_WORKERS || b.queue_len > 0 {
                 continue;
             }
-            let s = unit_stats(UnitKind::Worker);
+            let s = unit_stats(r.worker);
             if gold >= s.cost_gold && lumber >= s.cost_lumber && headroom >= s.supply {
                 gold -= s.cost_gold;
                 lumber -= s.cost_lumber;
                 headroom -= s.supply;
                 worker_count += 1;
-                orders.push((b.entity, UnitKind::Worker));
+                orders.push((b.entity, r.worker));
             }
             continue;
         }
         match b.kind {
-            BuildingKind::Barracks => {
+            k if k == r.production => {
                 if b.queue_len >= BARRACKS_QUEUE_MAX {
                     continue;
                 }
@@ -2056,30 +2190,59 @@ fn think(
                 let next = brain.army_counter.wrapping_add(1);
                 // Raiders are Workshop-gated: queueing one early would park an
                 // unpayable item at the front and stall the whole Barracks.
-                let raider_ok = own_buildings
-                    .iter()
-                    .any(|ob| ob.kind == BuildingKind::Workshop && ob.done);
+                let raider_ok = r.cavalry.is_some_and(|c| unit_gate_ok(c, &completed));
                 // Knights are Castle-gated the same way, and for the same
                 // reason: an unpayable item at the front stalls the Barracks.
                 // `current_tier` is the highest completed hall rung, so this is
                 // exactly the condition `unit_requires` will re-check on pay.
-                let knight_ok = current_tier >= 3;
+                let knight_ok = r.shock.is_some_and(|k| unit_gate_ok(k, &completed));
                 // `archer_nth` / `spearman_nth` are the standing cadences until
                 // this team has actually LOOKED at a flyer or a horse, at which
                 // point the relevant one tightens for ~50 thoughts and then
                 // relaxes again. That is the entire reaction: same catalog,
                 // same rule, a different number for a while.
-                let wanted = pick_army_kind(next, knight_ok, raider_ok, archer_nth, spearman_nth);
+                let mut wanted =
+                    pick_army_kind(&r, next, knight_ok, raider_ok, archer_nth, spearman_nth);
+                // **The two-roles-on-one-building tail.** A race whose
+                // production building also makes siege (the Horde's WarCamp
+                // does; the Kingdom's Barracks does not, so this is dead code
+                // for it) paces siege here instead of at a Siegeworks, on the
+                // same every-Nth beat and against the same counter.
                 let affordable = |k: UnitKind| {
                     let s = unit_stats(k);
                     gold.saturating_sub(reserve_gold) >= s.cost_gold
                         && lumber.saturating_sub(reserve_lumber) >= s.cost_lumber
                         && headroom >= s.supply
                 };
+                if r.siegeworks.is_none() {
+                    if let Some(siege) = r.siege.filter(|k| {
+                        trainable(b.kind).contains(k) && unit_gate_ok(*k, &completed)
+                    }) {
+                        // **Both gates, and affordability too.** A Siegeworks
+                        // arm can lean on the ratio alone because siege is the
+                        // ONLY thing it makes: an unaffordable Catapult just
+                        // stalls its own building. Here the same substitution
+                        // would eat the army'''s beat — `siege_counter` only
+                        // advances when one is actually queued, so a Demolisher
+                        // the bank cannot cover would win every beat forever
+                        // and the WarCamp would fall back to line units and
+                        // never make a Headhunter, an Impaler or a Wolfrider
+                        // again. Measured, before this line existed: 13 Grunts,
+                        // 1 Headhunter and no cavalry at all in a won game.
+                        //
+                        // So siege takes the beat only when it is genuinely
+                        // due AND payable; otherwise the roster mix stands.
+                        let due = brain.siege_counter * CATAPULT_PER_ARMY <= brain.army_counter
+                            && next % CATAPULT_PER_ARMY == 0;
+                        if due && affordable(siege) {
+                            wanted = siege;
+                        }
+                    }
+                }
                 let kind = if affordable(wanted) {
                     Some(wanted)
-                } else if wanted != UnitKind::Footman && affordable(UnitKind::Footman) {
-                    Some(UnitKind::Footman)
+                } else if wanted != r.line && affordable(r.line) {
+                    Some(r.line)
                 } else {
                     None
                 };
@@ -2088,15 +2251,38 @@ fn think(
                     gold -= s.cost_gold;
                     lumber -= s.cost_lumber;
                     headroom -= s.supply;
-                    brain.army_counter = next;
+                    if Some(kind) == r.siege {
+                        brain.siege_counter = brain.siege_counter.wrapping_add(1);
+                    } else {
+                        brain.army_counter = next;
+                    }
                     orders.push((b.entity, kind));
                 }
             }
-            BuildingKind::Sanctum => {
-                if b.queue_len >= SANCTUM_QUEUE_MAX || sorcerers_wanted == 0 {
+            k if Some(k) == r.tech => {
+                if b.queue_len >= SANCTUM_QUEUE_MAX {
                     continue;
                 }
-                let s = unit_stats(UnitKind::Sorcerer);
+                // **The other two-roles-on-one-building tail.** A race that
+                // trains its flyer at its caster building (the Horde's Spirit
+                // Lodge; the Kingdom's Sanctum trains no Gryphon, so again
+                // this is dead code for it) buys air out of surplus here, on
+                // the same Castle-standing / fat-bank / every-Nth test the
+                // Siegeworks arm uses below.
+                let air = r.flyer.filter(|k| {
+                    r.siegeworks.is_none()
+                        && trainable(b.kind).contains(k)
+                        && unit_gate_ok(*k, &completed)
+                        && gold.saturating_sub(reserve_gold) >= gryphon_bank_gold()
+                        && brain.siege_counter % gryphon_every_nth() == 0
+                });
+                let pick = match air {
+                    Some(flyer) => Some(flyer),
+                    None if sorcerers_wanted == 0 => None,
+                    None => r.caster,
+                };
+                let Some(pick) = pick else { continue };
+                let s = unit_stats(pick);
                 if gold.saturating_sub(reserve_gold) >= s.cost_gold
                     && lumber.saturating_sub(reserve_lumber) >= s.cost_lumber
                     && headroom >= s.supply
@@ -2104,11 +2290,15 @@ fn think(
                     gold -= s.cost_gold;
                     lumber -= s.cost_lumber;
                     headroom -= s.supply;
-                    sorcerers_wanted -= 1;
-                    orders.push((b.entity, UnitKind::Sorcerer));
+                    if Some(pick) == r.caster {
+                        sorcerers_wanted -= 1;
+                    } else {
+                        brain.siege_counter = brain.siege_counter.wrapping_add(1);
+                    }
+                    orders.push((b.entity, pick));
                 }
             }
-            BuildingKind::Workshop => {
+            k if Some(k) == r.siegeworks => {
                 if b.queue_len >= WORKSHOP_QUEUE_MAX {
                     continue;
                 }
@@ -2126,10 +2316,10 @@ fn think(
                 let want_air = current_tier >= 3
                     && gold.saturating_sub(reserve_gold) >= gryphon_bank_gold()
                     && brain.siege_counter % gryphon_every_nth() == 0;
-                let kind = if want_air {
-                    UnitKind::GryphonRider
-                } else {
-                    UnitKind::Catapult
+                let Some(siege) = r.siege else { continue };
+                let kind = match r.flyer.filter(|_| want_air) {
+                    Some(flyer) => flyer,
+                    None => siege,
                 };
                 let affordable = |k: UnitKind| {
                     let s = unit_stats(k);
@@ -2139,8 +2329,8 @@ fn think(
                 };
                 let kind = if affordable(kind) {
                     Some(kind)
-                } else if kind != UnitKind::Catapult && affordable(UnitKind::Catapult) {
-                    Some(UnitKind::Catapult)
+                } else if kind != siege && affordable(siege) {
+                    Some(siege)
                 } else {
                     None
                 };
@@ -2421,24 +2611,31 @@ fn reactive_cadences(air_alert: bool, cavalry_alert: bool) -> (u32, u32) {
 
 /// What the Barracks queues as its `next`th item. Order is priority order:
 /// the tier-3 line-breaker, then cavalry, then the two reactive slots.
+/// The cadences are the ROSTER'S, resolved by role: the tier-3 line-breaker,
+/// then cavalry, then the two reactive slots, then the line unit. Identical
+/// output to the kind-named version it replaced for `Race::Kingdom`, and the
+/// only place the Horde's mix is decided too — a race with no `Shock` unit
+/// simply never takes the first branch.
 fn pick_army_kind(
+    r: &Roster,
     next: u32,
     knight_ok: bool,
     raider_ok: bool,
     archer_nth: u32,
     spearman_nth: u32,
 ) -> UnitKind {
-    if knight_ok && next % KNIGHT_EVERY_NTH == 0 {
-        UnitKind::Knight
+    let pick = if knight_ok && next % KNIGHT_EVERY_NTH == 0 {
+        r.shock
     } else if raider_ok && next % RAIDER_EVERY_NTH == 0 {
-        UnitKind::Raider
+        r.cavalry
     } else if next % archer_nth == 0 {
-        UnitKind::Archer
+        r.ranged
     } else if next % spearman_nth == 0 {
-        UnitKind::Spearman
+        r.anti_cavalry
     } else {
-        UnitKind::Footman
-    }
+        None
+    };
+    pick.unwrap_or(r.line)
 }
 
 /// A crossing worth fortifying, and where the emplacement stands.
@@ -2592,6 +2789,9 @@ fn xz_dist(a: Vec3, b: Vec3) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn plan_expansion(
     me: Team,
+    // This race's tier-1 hall — an expansion is a hall, and which hall depends
+    // on who is expanding.
+    hall: BuildingKind,
     own_buildings: &[BuildingInfo],
     enemy_buildings: &[Vec3],
     mines: &[MineInfo],
@@ -2647,7 +2847,7 @@ fn plan_expansion(
     }
     let (_, mine) = best?;
 
-    let footprint = building_stats(BuildingKind::TownHall).size + BUILD_PADDING;
+    let footprint = building_stats(hall).size + BUILD_PADDING;
     let site = pick_expansion_site(nav, mine.pos, home, footprint)?;
     Some(ExpansionPlan {
         site,
@@ -3074,7 +3274,7 @@ mod tests {
         let (a_nth, s_nth) = reactive_cadences(air, cavalry);
         let (mut archers, mut spears, mut footmen) = (0, 0, 0);
         for next in 1..=24u32 {
-            match pick_army_kind(next, false, false, a_nth, s_nth) {
+            match pick_army_kind(&Roster::of(Race::Kingdom), next, false, false, a_nth, s_nth) {
                 UnitKind::Archer => archers += 1,
                 UnitKind::Spearman => spears += 1,
                 UnitKind::Footman => footmen += 1,
@@ -3125,11 +3325,11 @@ mod tests {
     #[test]
     fn reactions_cannot_smuggle_in_gated_units() {
         for next in 1..=40u32 {
-            let k = pick_army_kind(next, false, false, 2, 2);
+            let k = pick_army_kind(&Roster::of(Race::Kingdom), next, false, false, 2, 2);
             assert!(!matches!(k, UnitKind::Knight | UnitKind::Raider));
         }
         assert_eq!(
-            pick_army_kind(KNIGHT_EVERY_NTH, true, false, 3, 4),
+            pick_army_kind(&Roster::of(Race::Kingdom), KNIGHT_EVERY_NTH, true, false, 3, 4),
             UnitKind::Knight
         );
     }
@@ -3164,6 +3364,10 @@ mod tests {
     /// intention.
     fn ai_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<AiState>()
             .init_resource::<GameOver>()
@@ -3777,6 +3981,10 @@ mod tests {
     /// Claude team whose only command node is its own hall.
     fn ai_world(latency_on: bool) -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<AiState>()
             .init_resource::<GameOver>()

@@ -280,6 +280,169 @@
             unlock: Always,
             description: "Dev demo: thrown up to 9 away, deals 60 damage and slows every enemy within 4 by 35% for 4s. Defined entirely in abilities.ron — no Rust knows its name.",
         ),
+
+        // ==================================================================
+        // THE HORDE'S KIT — and the effect vocabulary's report card
+        // ==================================================================
+        //
+        // Five rows below, and the number of lines of Rust they needed is
+        // ZERO. Every one of them is a new COMBINATION of existing atoms, and
+        // two of them (`Bloodlust`, `AncestralCall`) are mechanics this engine
+        // has never had. What the grammar could NOT express is written up
+        // beside the rows that wanted it — that is the honest half of the
+        // report, and every entry is a candidate for a new ATOM rather than a
+        // new row.
+
+        // The Warchief's opener: the Slam, in Horde numbers. Deliberately the
+        // most boring row here — proof that a second race's baseline kit costs
+        // nothing, so the interesting budget can go on the rows below.
+        (
+            name: "Cleave",
+            effects: [
+                (atom: Damage(amount: 42.0)),
+            ],
+            mana_cost: 40.0,
+            cooldown: 10.0,
+            radius: 6.5,
+            hits_air: false,
+            unlock: Always,
+            description: "AoE damage around the Warchief (ground only), scales with level.",
+        ),
+        // **Warchief ultimate, and the Warcry's deliberate opposite.** The
+        // Champion's shout is +30% damage; this is +20% damage AND +30% move
+        // speed, which in this engine are two DIFFERENT statuses (see
+        // `effective_stats_with`: `Haste` moves the legs and nothing else —
+        // it does not touch attack cooldown, and a row that claimed otherwise
+        // would be lying).
+        //
+        // So the Kingdom's ultimate wins the fight you are already in and the
+        // Horde's decides whether the fight happens: 8 seconds of a Grunt line
+        // moving at 8.1 instead of 6.2 is a Grunt line that catches something.
+        // That is the race's whole thesis expressed as one ultimate.
+        (
+            name: "Bloodfury",
+            effects: [
+                (atom: ApplyStatus(status: DamageBuff, magnitude: 0.20, duration: 8.0, targets: Allies)),
+                (atom: ApplyStatus(status: Haste,      magnitude: 0.30, duration: 8.0, targets: Allies)),
+            ],
+            mana_cost: 75.0,
+            cooldown: 45.0,
+            radius: 8.0,
+            hits_air: true,
+            unlock: HeroLevel(5),
+            description: "Ultimate: allies around the Warchief deal +20% damage and move 30% faster for 8s. Hero level 5.",
+        ),
+        // **The first shipped use of `OverTime`.** The Priestess's Heal is 60
+        // hp in one instant; Mend is 12 hp a second for five seconds, same 60,
+        // and the difference is a real one: it loses to burst and wins against
+        // attrition, and — because a scheduled clause re-resolves its targets
+        // each tick around the ORIGINAL centre — it is a patch of GROUND that
+        // mends, not a buff that follows anybody. A FarSeer drops it where the
+        // line is about to be and the line walks into it.
+        //
+        // That last property is emergent rather than designed, and it is worth
+        // naming as a limit as much as a feature: the vocabulary has no way to
+        // say "attach this to the units it caught". A scheduled atom is always
+        // anchored to a point.
+        (
+            name: "Mend",
+            effects: [
+                (atom: Heal(amount: 12.0, targets: Allies), schedule: OverTime(interval: 1.0, ticks: 5)),
+            ],
+            mana_cost: 45.0,
+            cooldown: 12.0,
+            radius: 8.0,
+            hits_air: true,
+            unlock: Always,
+            description: "Mends allies standing within 8 of the FarSeer for 12 HP a second over 5s, air included. A patch of ground that heals — walk the line into it.",
+        ),
+        // **The first shipped use of `Summon`.** The FarSeer calls two Grunts
+        // out of the ancestors for 40 seconds: ~290 gold of bodies, on a 60s
+        // cooldown, at hero level 5.
+        //
+        // Grunts and not Wolfriders on purpose. A summon bypasses tech gates
+        // entirely — it is an atom, not a training queue — so summoning the
+        // Fortress-gated cavalry would hand a tier-1 Horde a tier-2 unit, and
+        // "the ultimate that skips your own tech tree" is a mechanic nobody
+        // designed. Bodies, not tech.
+        //
+        // What the grammar could NOT express here, and wanted to: the summoned
+        // unit is a full `UnitKind` with a row and a mesh, so there is no way
+        // to call something that is ONLY a summon (a spirit wolf, a sentry
+        // ward) without paying the whole add-a-kind cost. `Summon` takes a
+        // kind because kinds are code identity; a summon-only body would need
+        // either a `summon_only` flag on the unit row (data, cheap, and the
+        // obvious follow-up) or a genuinely new atom.
+        (
+            name: "AncestralCall",
+            effects: [
+                (atom: Summon(unit_kind: Grunt, count: 2, lifetime: Some(40.0))),
+            ],
+            mana_cost: 90.0,
+            cooldown: 60.0,
+            radius: 4.0,
+            hits_air: false,
+            unlock: HeroLevel(5),
+            description: "Ultimate: two Grunts of the ancestors fight beside the FarSeer for 40s. Hero level 5.",
+        ),
+        // **Bloodlust — the Horde's tier-2 caster spell, and the Slow's mirror
+        // image in every respect the vocabulary can express.**
+        //
+        //   * Two atoms, one row: `DamageBuff` and `Haste`, both at `Allies`,
+        //     both 10 seconds. The Sorcerer's cooldown makes the enemy worse;
+        //     the Shaman's makes its own army better.
+        //   * Thrown, for the same reason Slow is: `target: Point(range: 8.0)`
+        //     with `radius: 5.0` lets the Shaman buff the front rank from
+        //     behind it. A caster that had to stand inside its own buff bubble
+        //     would be a caster standing in the melee.
+        //   * **Atom 0 aims, and atom 0 is looking at ALLIES.** Nothing
+        //     shipped before this aimed a cast at friendly units, and it
+        //     needed no code: `cast_center`'s auto-pick and doctrine's
+        //     auto-cast counter both ask `AbilityDef::aim()` who they are
+        //     looking for, so the Shaman's auto-cast centres on the biggest
+        //     ALLY clump it can reach and fires when three of them are there.
+        //   * No mana — the Shaman is not a hero — so the 12s cooldown is the
+        //     only cost, and `StackPolicy` decides the rest: `DamageBuff` and
+        //     `Haste` both STACK, so two Shamans really are twice the
+        //     Bloodlust up to the per-kind cap. That is the deliberate
+        //     difference from Slow (which refreshes): the Kingdom wants a few
+        //     Sorcerers for coverage, the Horde wants Shamans in a clump for
+        //     depth, and both fall out of the status framework rather than out
+        //     of the spell.
+        //
+        // Balance intent: +20% damage on a 175hp/8.8dps Grunt line is roughly
+        // the Grunt the Kingdom's Footman already beats on price, handed back;
+        // +25% move speed is the part that actually decides games, because
+        // 7.75 is a Grunt that can chase an Archer.
+        (
+            name: "Bloodlust",
+            effects: [
+                (atom: ApplyStatus(status: DamageBuff, magnitude: 0.20, duration: 10.0, targets: Allies)),
+                (atom: ApplyStatus(status: Haste,      magnitude: 0.25, duration: 10.0, targets: Allies)),
+            ],
+            target: Point(range: 8.0),
+            mana_cost: 0.0,
+            cooldown: 12.0,
+            radius: 5.0,
+            hits_air: true,
+            unlock: Always,
+            description: "Cast at a point up to 8 away: every ally within 5 of it deals +20% damage and moves 25% faster for 10s. Stacks with a second Shaman up to the status cap; no mana, 12s cooldown. Omit the point and the Shaman aims at the biggest friendly clump it can reach.",
+        ),
+        // The Stronghold's answer to the TownHall's Call to Arms. Same atom,
+        // Horde numbers: five fewer seconds of militia, because a Peon has
+        // fewer hit points to spend on being brave.
+        (
+            name: "WarDrums",
+            effects: [
+                (atom: Militia(duration: 35.0)),
+            ],
+            mana_cost: 0.0,
+            cooldown: 90.0,
+            radius: 16.0,
+            hits_air: false,
+            unlock: Always,
+            description: "Own peons near the Stronghold become fighters for 35s.",
+        ),
     ],
 
     unit_casters: [
@@ -302,10 +465,26 @@
         // cooldown when the real charge lands, this number — not the geometry
         // — is the knob.
         (kind: Sorcerer,  abilities: ["Slow"],              probe_abilities: [],            autocast: Some((ability: "Slow", min_targets: 1))),
+
+        // ---- Horde -------------------------------------------------------
+        // Same shape, same slot discipline: opener in slot 0, ultimate in slot
+        // 1, no default autocast on a hero.
+        (kind: Warchief,  abilities: ["Cleave", "Bloodfury"],    probe_abilities: [], autocast: None),
+        (kind: FarSeer,   abilities: ["Mend", "AncestralCall"],  probe_abilities: [], autocast: None),
+        // Three allies, not one. Slow's `min_targets: 1` is right because one
+        // slowed Raider diving your workers is the moment the Sorcerer exists
+        // for; Bloodlust on a single passing Peon is a wasted 12 seconds, and
+        // a buff is only worth its cooldown when there is an army standing in
+        // it. This is also the first ALLY-counted auto-cast in the game — the
+        // trigger counts whoever atom 0 is aimed at, and atom 0 is aimed at
+        // friends.
+        (kind: Shaman,    abilities: ["Bloodlust"],             probe_abilities: [], autocast: Some((ability: "Bloodlust", min_targets: 3))),
     ],
 
-    // Keyed by ladder ROOT: the Keep and the Castle inherit this row.
+    // Keyed by ladder ROOT: the Keep and the Castle inherit the TownHall's
+    // row, the Fortress and the Hold inherit the Stronghold's.
     building_casters: [
-        (kind: TownHall, abilities: ["CallToArms"]),
+        (kind: TownHall,   abilities: ["CallToArms"]),
+        (kind: Stronghold, abilities: ["WarDrums"]),
     ],
 )

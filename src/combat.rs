@@ -516,7 +516,7 @@ fn acquire_targets(
     for (entity, unit, team, tf, order, move_to, priority, leash, militia) in &seekers {
         // Workers have damage but never pick fights on their own — unless the
         // Town Hall called them to arms, in which case they are soldiers.
-        if unit.kind == UnitKind::Worker && militia.is_none() {
+        if is_worker_kind(unit.kind) && militia.is_none() {
             continue;
         }
         // Aggro while idle, attack-moving, or standing around after a
@@ -746,7 +746,7 @@ fn engagement(
             target_building.is_some(),
         );
         // A worker under Call to Arms swings a militia weapon, not a pickaxe.
-        let base_damage = if unit.kind == UnitKind::Worker && militia.is_some() {
+        let base_damage = if is_worker_kind(unit.kind) && militia.is_some() {
             MILITIA_DAMAGE
         } else {
             stats.damage
@@ -1090,7 +1090,7 @@ fn effect_hits(
         AbilityTargets::Enemies => other_team != team && (structures_too || unit.is_some()),
         AbilityTargets::Allies => other_team == team && unit.is_some(),
         AbilityTargets::OwnWorkers => {
-            other_team == team && unit.map(|u| u.kind) == Some(UnitKind::Worker)
+            other_team == team && unit.is_some_and(|u| is_worker_kind(u.kind))
         }
     }
 }
@@ -1880,7 +1880,7 @@ fn apply_damage(
             continue;
         }
 
-        if unit.kind == UnitKind::Worker && militia.is_none() {
+        if is_worker_kind(unit.kind) && militia.is_none() {
             // Workers panic and run home instead of fighting — militia stand
             // their ground and hit back like everyone else.
             let home = team.base_pos();
@@ -2208,6 +2208,10 @@ impl FixedClockSim {
 
     pub(crate) fn new() -> Self {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         // No TimePlugin: this `Time` is ours, and only `step` moves it.
         app.init_resource::<Time>()
             .init_resource::<NavGrid>()
@@ -2606,6 +2610,186 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The cross-race counter matrix
+    // -----------------------------------------------------------------------
+    //
+    // **The claim this whole section exists to check: the counter-triangle is
+    // drawn on CLASSES, so it holds across races for free.** Not one line of
+    // Rust anywhere in the engine mentions two races at once. What makes a
+    // Kingdom Spearman delete a Horde Wolfrider is that `vs_cavalry_mult` is
+    // keyed off `TargetClass`, `TargetClass` is keyed off the row's `role`,
+    // and both rosters' cavalry declare `role: Cavalry`.
+    //
+    // The pairings below are the ones that would actually decide a
+    // Kingdom-vs-Horde game, and each is checked in BOTH directions so a
+    // matrix that only worked one way is caught.
+
+    /// Every cavalry unit in the game, of either race, is `TargetClass::Cavalry`
+    /// — and every anti-cavalry unit's 5x therefore lands on all of them.
+    #[test]
+    fn the_counter_matrix_is_drawn_on_classes_not_on_races() {
+        let cavalry = [UnitKind::Raider, UnitKind::Knight, UnitKind::Wolfrider];
+        for k in cavalry {
+            assert_eq!(
+                TargetClass::of(Some(k), false),
+                Some(TargetClass::Cavalry),
+                "{k:?} must ride under the cavalry class or no spear answers it",
+            );
+        }
+        for spear in [UnitKind::Spearman, UnitKind::Impaler] {
+            let stats = unit_stats(spear);
+            for k in cavalry {
+                assert_eq!(
+                    type_damage_mult(&stats, Some(k), false),
+                    5.0,
+                    "{spear:?} must take 5x off {k:?} — the triangle is one rule, \
+                     not one rule per race",
+                );
+            }
+            // ...and is still deliberately bad at everything else, on both
+            // sides of the matchup.
+            for other in [UnitKind::Footman, UnitKind::Grunt, UnitKind::Headhunter] {
+                assert_eq!(type_damage_mult(&stats, Some(other), false), 1.0);
+            }
+        }
+    }
+
+    /// **The cross-race duel matrix.** Each row is a pairing a player will
+    /// actually meet, with the side that must win it. Run through the same
+    /// arithmetic probe every other balance claim in this file uses.
+    #[test]
+    fn the_cross_race_duels_land_the_way_the_design_says() {
+        // (winner, n, loser, n, why)
+        let cases: [(UnitKind, usize, UnitKind, usize, &str); 8] = [
+            // The anti-cavalry leg, both directions across the races.
+            (
+                UnitKind::Spearman, 1, UnitKind::Wolfrider, 1,
+                "a Kingdom spear must answer a Horde horse",
+            ),
+            (
+                UnitKind::Impaler, 1, UnitKind::Raider, 1,
+                "a Horde spear must answer a Kingdom horse",
+            ),
+            // The Impaler is the Horde's answer to the Knight, at equal gold —
+            // exactly the claim the Spearman makes. 3x85=255 against 270.
+            (
+                UnitKind::Impaler, 3, UnitKind::Knight, 1,
+                "equal gold of Horde spears must break a Knight",
+            ),
+            // Massed ranged answers air, on both sides. 3x85=255 vs a 265g
+            // Wyvern; 3x90=270 vs a 280g Gryphon.
+            (
+                UnitKind::Headhunter, 3, UnitKind::Wyvern, 1,
+                "massed Headhunters must beat a Wyvern at equal gold",
+            ),
+            (
+                UnitKind::Headhunter, 3, UnitKind::GryphonRider, 1,
+                "the Horde's ranged line must answer the Kingdom's flyer",
+            ),
+            (
+                UnitKind::Archer, 3, UnitKind::Wyvern, 1,
+                "the Kingdom's ranged line must answer the Horde's flyer",
+            ),
+            // Cavalry still dives siege, whoever built either.
+            (
+                UnitKind::Wolfrider, 1, UnitKind::Catapult, 1,
+                "cavalry dives siege across races too",
+            ),
+            (
+                UnitKind::Raider, 1, UnitKind::Demolisher, 1,
+                "...and in the other direction",
+            ),
+        ];
+        for (win, wn, lose, ln, why) in cases {
+            let out = engage(win, wn, lose, ln);
+            assert_eq!(out.b_alive(), 0, "{why}: {lose:?} should be dead");
+            assert!(out.a_alive() > 0, "{why}: {win:?} should have survivors");
+        }
+    }
+
+    /// **The line units trade.** The duel is a coin-flip's width apart — the
+    /// Footman takes it with a sliver left — and the Grunt buys that back at
+    /// equal GOLD, where it fields more bodies and far more hit points. If
+    /// either half of this ever became a rout, the race would be strictly
+    /// better or strictly worse than its counterpart, which is the one failure
+    /// mode a second roster exists to avoid.
+    #[test]
+    fn the_two_line_units_trade_rather_than_one_winning() {
+        // The straight duel: close, and the Footman's.
+        let duel = engage(UnitKind::Footman, 1, UnitKind::Grunt, 1);
+        assert_eq!(duel.b_alive(), 0, "the Footman should take the 1v1");
+        let left = duel.a_hp_fraction(UnitKind::Footman, 1);
+        assert!(
+            left < 0.25,
+            "...but only just — it had {left:.3} left, which is a rout, not a trade",
+        );
+
+        // Equal gold is the other side of the same coin: 5 Grunts (625g) vs
+        // 4 Footmen (540g) is as close as the two price lists get, and the
+        // cheaper, tankier body is expected to come out ahead on it.
+        let g = unit_stats(UnitKind::Grunt);
+        let f = unit_stats(UnitKind::Footman);
+        assert!(g.cost_gold < f.cost_gold, "the Grunt is the cheaper body");
+        assert!(g.hp > f.hp, "...and the tankier one");
+        assert!(g.speed < f.speed, "...and the slower one");
+        let mass = engage(UnitKind::Grunt, 5, UnitKind::Footman, 4);
+        assert_eq!(mass.b_alive(), 0, "equal-gold Grunts should win the block fight");
+
+        // **The fallback floor.** The scripted commander degrades to its
+        // roster's `Line` unit whenever it cannot afford the pick it wanted,
+        // and it ring-fences gold for a hero, an expansion and a tier-up. So
+        // the line unit is the ONE body that has to stay payable under a
+        // squeeze — if it is not, the production building queues nothing at
+        // all and the bank just grows.
+        //
+        // Asserted for the HORDE and not for both, because it is not a general
+        // law: the Kingdom's 135g Footman is dearer than its own 90g Archer
+        // and is fine, since the Kingdom spreads production across a Barracks,
+        // a Workshop and a Sanctum and a stalled queue is never the whole
+        // army. The Horde has ONE martial building, so a stall there IS the
+        // army — measured, before the Grunt came down to 125g: 1343 banked
+        // gold, eight units on the field, against twenty-eight.
+        // The check that encodes it: the Horde's fallback must cost no more
+        // than the Kingdom's, whose price the scripted commander is known to
+        // sustain through a squeeze. "Cheapest on the card" is NOT the rule —
+        // a line unit is not supposed to be the cheapest thing a barracks
+        // makes — but "no dearer than the one that demonstrably works" is a
+        // real ceiling, and the 145g Grunt broke it.
+        let horde_line = race_unit(Race::Horde, UnitRole::Line).expect("a line unit");
+        let kingdom_line = race_unit(Race::Kingdom, UnitRole::Line).expect("a line unit");
+        assert!(
+            unit_stats(horde_line).cost_gold <= unit_stats(kingdom_line).cost_gold,
+            "the Horde has ONE production building, so its fallback {horde_line:?} must not \
+             cost more than the Kingdom's {kingdom_line:?} — a stall there is the whole army",
+        );
+    }
+
+    /// Melee cannot touch air, in both rosters, for the same one reason. This
+    /// is the rule that makes the flyer a scalpel rather than an autowin, and
+    /// a second race is exactly where a hand-maintained list of "who shoots
+    /// up" would have rotted.
+    #[test]
+    fn the_air_rule_is_the_same_rule_for_both_rosters() {
+        for melee in [
+            UnitKind::Footman, UnitKind::Spearman, UnitKind::Knight, UnitKind::Hero,
+            UnitKind::Grunt, UnitKind::Impaler, UnitKind::Wolfrider, UnitKind::Warchief,
+        ] {
+            assert!(!unit_can_hit(melee, true), "{melee:?} must not reach air");
+        }
+        for shooter in [
+            UnitKind::Archer, UnitKind::Priestess, UnitKind::Sorcerer,
+            UnitKind::Headhunter, UnitKind::FarSeer, UnitKind::Shaman,
+        ] {
+            assert!(unit_can_hit(shooter, true), "{shooter:?} must reach air");
+        }
+        // Siege is the deliberate exception on both sides: a projectile that
+        // cannot track a flyer.
+        for siege in [UnitKind::Catapult, UnitKind::Demolisher] {
+            assert!(!unit_can_hit(siege, true), "{siege:?} is a ground weapon");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Tier 3: the Knight, and the claim that a tech advantage is not immunity
     // -----------------------------------------------------------------------
 
@@ -2838,6 +3022,10 @@ mod tests {
     /// `cast_abilities`' own arithmetic.
     fn cast_world() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<TechTiers>()
             .init_resource::<TeamResearch>()
@@ -3064,6 +3252,10 @@ mod tests {
     /// second in the same tick, which is how the real schedule runs them.
     fn teleport_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<NavGrid>()
             .init_resource::<GameEvents>()
@@ -3370,6 +3562,10 @@ mod tests {
     #[test]
     fn a_summon_atom_calls_bodies_that_know_when_to_leave() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .add_event::<DamageEvent>()
             .add_event::<SpawnUnitEvent>()
@@ -3405,6 +3601,10 @@ mod tests {
     #[test]
     fn a_summon_with_no_lifetime_is_permanent() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .add_event::<DamageEvent>()
             .add_event::<SpawnUnitEvent>()
@@ -3426,6 +3626,10 @@ mod tests {
     #[test]
     fn each_atom_asks_its_own_question_about_who_is_hit() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .add_event::<DamageEvent>()
             .add_event::<SpawnUnitEvent>()
@@ -3472,6 +3676,10 @@ mod tests {
     #[test]
     fn an_over_time_schedule_pays_out_one_tick_at_a_time() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .add_event::<DamageEvent>()
             .add_event::<SpawnUnitEvent>()

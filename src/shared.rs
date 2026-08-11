@@ -127,6 +127,308 @@ impl Team {
 }
 
 // ---------------------------------------------------------------------------
+// Races
+// ---------------------------------------------------------------------------
+//
+// A RACE is a per-team choice of which rows of the content tables that team is
+// allowed to use. It is deliberately NOT a second copy of the rules: both
+// races share the map, the economy, the win condition, the upkeep curve, the
+// research ladders, the item shelf, the status framework and every formula.
+// What a race owns is a ROSTER — which units, which buildings, which hall
+// ladder — and the roster is data (`races` on every unit and building row).
+//
+// The reason the concept had to exist at all, rather than "just add rows", is
+// that four questions in the engine had no race-free answer: what hall does a
+// team start with, what worker does it start with, which build buttons does a
+// worker draw, and which kind does the scripted commander reach for when it
+// wants "a line unit". The first two are answered by `race_hall`/`race_worker`,
+// the third by `race_can_build`, the fourth by `race_unit(race, role)` — all
+// four derived from the tables, none of them a match on a kind.
+
+/// The two playable rosters. `WC3_RACE_BLUE` / `WC3_RACE_RED` pick one per
+/// team; the default is `Kingdom` for both, which is exactly the game that
+/// shipped before this existed.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Deserialize)]
+pub enum Race {
+    /// The original roster: Footman / Archer / Raider / Spearman, the
+    /// TownHall→Keep→Castle ladder, siege out of a Workshop.
+    Kingdom,
+    /// The asymmetric counterpart: cheaper, faster, more numerous bodies out
+    /// of fewer buildings, on the Stronghold→Fortress→Hold ladder.
+    Horde,
+}
+
+pub const ALL_RACES: [Race; 2] = [Race::Kingdom, Race::Horde];
+
+impl Race {
+    pub fn name(self) -> &'static str {
+        match self {
+            Race::Kingdom => "kingdom",
+            Race::Horde => "horde",
+        }
+    }
+    /// Parse an env value / wire word. Case-insensitive; `None` for anything
+    /// unrecognised, so the caller can warn and fall back rather than panic on
+    /// a typo in a shell variable.
+    pub fn parse(text: &str) -> Option<Race> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "kingdom" | "human" | "alliance" => Some(Race::Kingdom),
+            "horde" | "orc" | "orcs" => Some(Race::Horde),
+            _ => None,
+        }
+    }
+}
+
+/// Env var naming the BLUE team's race (`Team::Human`, the player, base SW).
+pub const RACE_BLUE_ENV: &str = "WC3_RACE_BLUE";
+/// Env var naming the RED team's race (`Team::Claude`, base NE).
+pub const RACE_RED_ENV: &str = "WC3_RACE_RED";
+
+/// Which race each team is playing. Written once at startup from the
+/// environment and never again — a race is a property of the match, not a
+/// thing a unit can change mid-game.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct Races {
+    pub human: Race,
+    pub claude: Race,
+}
+
+impl Default for Races {
+    fn default() -> Self {
+        Races { human: Race::Kingdom, claude: Race::Kingdom }
+    }
+}
+
+impl Races {
+    pub fn get(&self, team: Team) -> Race {
+        match team {
+            Team::Human => self.human,
+            Team::Claude => self.claude,
+        }
+    }
+    pub fn set(&mut self, team: Team, race: Race) {
+        match team {
+            Team::Human => self.human = race,
+            Team::Claude => self.claude = race,
+        }
+    }
+    /// Read the pair out of the environment. An unset variable — or one that
+    /// does not name a race — leaves that side on `Kingdom`, so a run with no
+    /// env at all is byte-for-byte the pre-race game.
+    pub fn from_env() -> Races {
+        let pick = |var: &str| {
+            std::env::var(var).ok().and_then(|raw| {
+                let parsed = Race::parse(&raw);
+                if parsed.is_none() {
+                    warn!("{var}=\"{raw}\" is not a race (kingdom|horde) — ignoring");
+                }
+                parsed
+            })
+        };
+        Races {
+            human: pick(RACE_BLUE_ENV).unwrap_or(Race::Kingdom),
+            claude: pick(RACE_RED_ENV).unwrap_or(Race::Kingdom),
+        }
+    }
+}
+
+/// **What a unit is FOR**, independent of which race fields it.
+///
+/// This is the second half of the race concept and the more load-bearing one.
+/// Without it, every consumer that wanted "the cheap melee line" had to name
+/// `UnitKind::Footman`, and a second race would have meant a fork of that
+/// consumer. With it, `race_unit(race, UnitRole::Line)` answers the same
+/// question for any roster, and `ai.rs` — the biggest such consumer — maps
+/// roles instead of forking.
+///
+/// It also pays for itself inside the ORIGINAL race: `is_hero_kind` and
+/// `TargetClass::of` used to be lists of kinds that a new unit had to be added
+/// to by hand (and would classify as `None` if you forgot). Both are now
+/// derived from the role, so a kind is classifiable the moment its row exists.
+///
+/// Roles are single-occupancy per race *by validation* for `Worker`, and free
+/// for everything else — a race may field two `Line` units or no `Siege` at
+/// all, and the AI's lookup takes the first row in table order.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Deserialize)]
+pub enum UnitRole {
+    /// Harvests, builds, cannot fight. Exactly one per race.
+    Worker,
+    /// The cheap melee body the army is mostly made of.
+    Line,
+    /// The fragile ranged back rank.
+    Ranged,
+    /// Fast flankers. `TargetClass::Cavalry`, so the spear line answers them.
+    Cavalry,
+    /// The answer to `Cavalry` — cheap, slow, enormous `vs_cavalry_mult`.
+    AntiCavalry,
+    /// Bombardment: outranges static defense, feeble against bodies.
+    Siege,
+    /// A body bought for an EFFECT rather than for its stats.
+    Caster,
+    /// Airborne capstone.
+    Flyer,
+    /// Tier-3 ground line-breaker. Also `TargetClass::Cavalry` — the triangle
+    /// is drawn on classes, not on tiers.
+    Shock,
+    /// Melee hero class.
+    HeroMelee,
+    /// Ranged/support hero class.
+    HeroSupport,
+}
+
+/// **What a building is FOR.** Same argument as `UnitRole`, and it retires the
+/// last derived-fact that was still keyed on a kind: `is_hall` used to ask
+/// `upgrade_root(kind) == TownHall`, which is precisely the sentence a second
+/// hall ladder makes false.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Deserialize)]
+pub enum BuildingRole {
+    /// A rung of the town-hall ladder: drop-off point, supply, hero slots.
+    Hall,
+    /// Trains the army.
+    Production,
+    /// Supply only (a farm, or a farm that shoots).
+    Supply,
+    /// Static defense.
+    Defense,
+    /// Blocking segment with no other function.
+    Barrier,
+    /// Unlocks and trains tier-2 casters.
+    Tech,
+    /// Runs the research ladders.
+    Forge,
+    /// Siege / air works.
+    Siegeworks,
+    /// Item vendor.
+    Vendor,
+}
+
+/// Which races may field this unit kind. A row that names no race is NEUTRAL
+/// and belongs to every race (nothing uses that today for units; the Shop uses
+/// it for buildings).
+pub fn unit_races(kind: UnitKind) -> &'static [Race] {
+    &crate::data::unit_row(kind).races
+}
+
+/// Which races may build this building kind.
+pub fn building_races(kind: BuildingKind) -> &'static [Race] {
+    &crate::data::building_row(kind).races
+}
+
+pub fn unit_role(kind: UnitKind) -> UnitRole {
+    crate::data::unit_row(kind).role
+}
+
+/// The catalog spelling of a row's `races`. A NEUTRAL row (empty list) is
+/// reported as every race rather than as an absence: the field answers "may I
+/// build this", and an empty array is the one answer a commander would read
+/// backwards.
+fn catalog_races(list: &[Race]) -> Vec<&'static str> {
+    if list.is_empty() {
+        ALL_RACES.iter().map(|r| r.name()).collect()
+    } else {
+        list.iter().map(|r| r.name()).collect()
+    }
+}
+
+/// Wire spelling of a unit role — the catalog's `role` field.
+pub fn role_name(role: UnitRole) -> &'static str {
+    match role {
+        UnitRole::Worker => "Worker",
+        UnitRole::Line => "Line",
+        UnitRole::Ranged => "Ranged",
+        UnitRole::Cavalry => "Cavalry",
+        UnitRole::AntiCavalry => "AntiCavalry",
+        UnitRole::Siege => "Siege",
+        UnitRole::Caster => "Caster",
+        UnitRole::Flyer => "Flyer",
+        UnitRole::Shock => "Shock",
+        UnitRole::HeroMelee => "HeroMelee",
+        UnitRole::HeroSupport => "HeroSupport",
+    }
+}
+
+/// Wire spelling of a building role.
+pub fn building_role_name(role: BuildingRole) -> &'static str {
+    match role {
+        BuildingRole::Hall => "Hall",
+        BuildingRole::Production => "Production",
+        BuildingRole::Supply => "Supply",
+        BuildingRole::Defense => "Defense",
+        BuildingRole::Barrier => "Barrier",
+        BuildingRole::Tech => "Tech",
+        BuildingRole::Forge => "Forge",
+        BuildingRole::Siegeworks => "Siegeworks",
+        BuildingRole::Vendor => "Vendor",
+    }
+}
+
+pub fn building_role(kind: BuildingKind) -> BuildingRole {
+    crate::data::building_row(kind).role
+}
+
+/// May `race` field this unit at all? The training path checks this in
+/// addition to the tech gate, so a captured/odd code path can never queue the
+/// other roster's unit.
+pub fn race_has_unit(race: Race, kind: UnitKind) -> bool {
+    let list = unit_races(kind);
+    list.is_empty() || list.contains(&race)
+}
+
+/// May `race` place this building at all?
+pub fn race_has_building(race: Race, kind: BuildingKind) -> bool {
+    let list = building_races(kind);
+    list.is_empty() || list.contains(&race)
+}
+
+/// The first unit this race fields in `role`, in table order. `None` if the
+/// race simply has no such thing — which is a legal roster asymmetry (the
+/// Horde has no `Shock` unit and no `Barrier` building), and the reason every
+/// consumer of this takes an `Option`.
+pub fn race_unit(race: Race, role: UnitRole) -> Option<UnitKind> {
+    ALL_UNIT_KINDS
+        .into_iter()
+        .find(|&k| unit_role(k) == role && race_has_unit(race, k))
+}
+
+/// The first building this race places in `role`, in table order. Hall lookups
+/// come back as the ROOT rung, because table order puts the tier-1 rung first.
+pub fn race_building(race: Race, role: BuildingRole) -> Option<BuildingKind> {
+    ALL_BUILDING_KINDS
+        .into_iter()
+        .find(|&k| building_role(k) == role && race_has_building(race, k) && building_placeable(k))
+}
+
+/// This race's tier-1 hall — what it starts the match with, and what its
+/// expansions are.
+pub fn race_hall(race: Race) -> BuildingKind {
+    race_building(race, BuildingRole::Hall)
+        .unwrap_or_else(|| panic!("{race:?} has no placeable Hall — the loader should have caught it"))
+}
+
+/// This race's worker.
+pub fn race_worker(race: Race) -> UnitKind {
+    race_unit(race, UnitRole::Worker)
+        .unwrap_or_else(|| panic!("{race:?} has no Worker — the loader should have caught it"))
+}
+
+/// Every building kind this race may PLACE, in table order — the build menu,
+/// before tech gating.
+pub fn race_build_menu(race: Race) -> Vec<BuildingKind> {
+    ALL_BUILDING_KINDS
+        .into_iter()
+        .filter(|&k| building_placeable(k) && race_has_building(race, k))
+        .collect()
+}
+
+/// The hero CLASSES this race may train, in table order.
+pub fn race_hero_classes(race: Race) -> Vec<UnitKind> {
+    ALL_UNIT_KINDS
+        .into_iter()
+        .filter(|&k| is_hero_kind(k) && race_has_unit(race, k))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Unit & building kinds + stats tables
 // ---------------------------------------------------------------------------
 
@@ -161,12 +463,51 @@ pub enum UnitKind {
     /// nav grid, hits ground and air, and can only be answered by something
     /// that shoots.
     GryphonRider,
+
+    // ---- Horde -----------------------------------------------------------
+    // The second race. Every variant below is a ROW in the same tables the
+    // Kingdom's variants live in; what makes them a race is the `races` field
+    // on those rows, not anything here.
+    /// The Horde's worker.
+    Peon,
+    /// Melee line: tankier than a Footman and slower. The Horde's body.
+    Grunt,
+    /// Ranged line: shorter reach than an Archer, harder hit.
+    Headhunter,
+    /// Fast cavalry, `TargetClass::Cavalry` — so a Spearman AND an Impaler
+    /// both delete it, which is the cross-race half of the triangle.
+    Wolfrider,
+    /// The Horde's anti-cavalry pike line.
+    Impaler,
+    /// The Horde's siege engine, out of the WarCamp rather than a Workshop.
+    Demolisher,
+    /// Tier-2 caster: Bloodlust, an ally buff rather than an enemy debuff.
+    Shaman,
+    /// Horde melee hero class.
+    Warchief,
+    /// Horde ranged support hero class.
+    FarSeer,
+    /// Tier-3 air capstone.
+    Wyvern,
 }
 
 /// Hero-class unit kinds (carry the `Hero` component, occupy one of the team's
 /// tier-scaled hero SLOTS, revive through `HeroRecords`).
+///
+/// Derived from the row's ROLE rather than from a list of kinds: a second
+/// race's hero classes are hero classes because their rows say so, and the
+/// list this used to be would have silently omitted them.
 pub fn is_hero_kind(kind: UnitKind) -> bool {
-    matches!(kind, UnitKind::Hero | UnitKind::Priestess)
+    matches!(unit_role(kind), UnitRole::HeroMelee | UnitRole::HeroSupport)
+}
+
+/// Does this kind harvest, build, and decline to fight? Every `kind ==
+/// UnitKind::Worker` in the engine became this, for exactly the reason
+/// `is_hero_kind` did: a Peon is a worker because its row says `role: Worker`,
+/// and the eleven call sites that used to name the Kingdom's Peasant would
+/// otherwise have quietly stopped meaning "worker" for half the game.
+pub fn is_worker_kind(kind: UnitKind) -> bool {
+    unit_role(kind) == UnitRole::Worker
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Deserialize)]
@@ -196,9 +537,33 @@ pub enum BuildingKind {
     /// Tier-2 magic college: trains Sorcerers. Requires a Keep, which is the
     /// first thing in the game a hall upgrade actually *buys* you.
     Sanctum,
+
+    // ---- Horde -----------------------------------------------------------
+    /// Tier 1 of the Horde hall ladder.
+    Stronghold,
+    /// The Horde's one martial building: trains the whole army, gated by tier
+    /// instead of by a second and third production building. This is the
+    /// "fewer buildings, more aggression" identity in one row.
+    WarCamp,
+    /// Supply + a weak emplacement. A farm that bites — the first building in
+    /// the game to combine `supply_provided` with an `attack`, and it needed
+    /// no code at all, because combat.rs's tower systems key off
+    /// `building_stats(kind).attack.is_some()` rather than on the Tower kind.
+    Burrow,
+    /// The Horde's static defense.
+    Watchtower,
+    /// Tier-2 caster hut: trains Shamans. Requires a Fortress.
+    SpiritLodge,
+    /// The Horde's forge: runs the SAME two research ladders the Blacksmith
+    /// does. Research is shared content, the building that sells it is not.
+    WarMill,
+    /// Tier 2 of the Horde hall ladder.
+    Fortress,
+    /// Tier 3 of the Horde hall ladder.
+    Hold,
 }
 
-pub const ALL_UNIT_KINDS: [UnitKind; 11] = [
+pub const ALL_UNIT_KINDS: [UnitKind; 21] = [
     UnitKind::Worker,
     UnitKind::Footman,
     UnitKind::Archer,
@@ -210,8 +575,18 @@ pub const ALL_UNIT_KINDS: [UnitKind; 11] = [
     UnitKind::Sorcerer,
     UnitKind::Knight,
     UnitKind::GryphonRider,
+    UnitKind::Peon,
+    UnitKind::Grunt,
+    UnitKind::Headhunter,
+    UnitKind::Wolfrider,
+    UnitKind::Impaler,
+    UnitKind::Demolisher,
+    UnitKind::Shaman,
+    UnitKind::Warchief,
+    UnitKind::FarSeer,
+    UnitKind::Wyvern,
 ];
-pub const ALL_BUILDING_KINDS: [BuildingKind; 11] = [
+pub const ALL_BUILDING_KINDS: [BuildingKind; 19] = [
     BuildingKind::TownHall,
     BuildingKind::Barracks,
     BuildingKind::Farm,
@@ -223,6 +598,14 @@ pub const ALL_BUILDING_KINDS: [BuildingKind; 11] = [
     BuildingKind::Keep,
     BuildingKind::Castle,
     BuildingKind::Sanctum,
+    BuildingKind::Stronghold,
+    BuildingKind::WarCamp,
+    BuildingKind::Burrow,
+    BuildingKind::Watchtower,
+    BuildingKind::SpiritLodge,
+    BuildingKind::WarMill,
+    BuildingKind::Fortress,
+    BuildingKind::Hold,
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -441,11 +824,16 @@ pub fn building_satisfies(owned: BuildingKind, req: BuildingKind) -> bool {
     upgrade_root(owned) == upgrade_root(req) && building_tier(owned) >= building_tier(req)
 }
 
-/// Everything on the town hall ladder. The one question the drop-off logic,
+/// Everything on a town hall ladder. The one question the drop-off logic,
 /// Town Portal, rally fallbacks and the AI's base bookkeeping actually mean
 /// when they used to ask `kind == TownHall`.
+///
+/// Was `upgrade_root(kind) == TownHall`, which is exactly the sentence a
+/// second hall ladder makes false. It is the row's ROLE now, so the Horde's
+/// Stronghold→Fortress→Hold is a hall ladder for the same reason the
+/// Kingdom's is: because the table says `role: Hall`.
 pub fn is_hall(kind: BuildingKind) -> bool {
-    upgrade_root(kind) == BuildingKind::TownHall
+    building_role(kind) == BuildingRole::Hall
 }
 
 /// Total resources sunk into a building including every upgrade below it — a
@@ -921,11 +1309,34 @@ pub fn research_bonus(kind: ResearchKind, level: u32) -> f32 {
     level.min(RESEARCH_MAX_LEVEL) as f32
 }
 
-/// Which building kind researches a ladder. One function so a second forge (or
-/// moving a ladder to another building) is a data change.
+/// Which building kind researches a ladder, for the roster that shipped
+/// first. One function so a second forge (or moving a ladder to another
+/// building) is a data change.
+///
+/// **Research is SHARED content and the forge is not.** Both races buy the
+/// same two ladders — the same ids, the same prices, the same `+1/+2/+3` — out
+/// of their own building (`research_buildings` lists them all). That is the
+/// honest v1 call: the ladders are a *property of the faction* expressed as
+/// two flat terms in one stat law, and a per-race price list would have been a
+/// balance lever nobody asked for dressed up as content. If a race ever needs
+/// its own ladder, `research.ron` grows a race field and this returns an
+/// `Option<BuildingKind>` per race — which is exactly the shape below.
 pub fn research_building(kind: ResearchKind) -> BuildingKind {
     let _ = kind;
-    crate::data::research_building()
+    crate::data::research_buildings()[0]
+}
+
+/// Every forge in the game — one per race.
+pub fn research_buildings() -> &'static [BuildingKind] {
+    crate::data::research_buildings()
+}
+
+/// The forge THIS race builds, if it has one.
+pub fn research_building_for(race: Race) -> Option<BuildingKind> {
+    research_buildings()
+        .iter()
+        .copied()
+        .find(|&k| race_has_building(race, k))
 }
 
 /// Can this building kind run research at all? What the command card asks
@@ -1058,6 +1469,17 @@ pub fn building_description(kind: BuildingKind) -> &'static str {
 #[derive(Serialize, Clone, Debug)]
 pub struct CatalogUnit {
     pub id: &'static str,
+    /// **Which rosters may field this.** The catalog is one document for the
+    /// whole session (both seats get byte-identical files), so a commander
+    /// finds its own roster by matching this against the `race` its snapshot
+    /// carries. A row that lists both races is neutral content.
+    pub race: Vec<&'static str>,
+    /// What this unit is FOR, race-independently (`Line`, `Ranged`,
+    /// `Cavalry`, `AntiCavalry`, `Siege`, `Caster`, `Flyer`, `Shock`,
+    /// `Worker`, `HeroMelee`, `HeroSupport`). The cross-race Rosetta stone: a
+    /// commander that knows to screen `Ranged` behind `Line` needs no table of
+    /// kind names to do it on either side.
+    pub role: &'static str,
     pub cost_gold: u32,
     pub cost_lumber: u32,
     pub supply: u32,
@@ -1151,6 +1573,11 @@ pub struct CatalogTrains {
 #[derive(Serialize, Clone, Debug)]
 pub struct CatalogBuilding {
     pub id: &'static str,
+    /// Which rosters may build this. See `CatalogUnit::race`.
+    pub race: Vec<&'static str>,
+    /// What this building is FOR (`Hall`, `Production`, `Supply`, `Defense`,
+    /// `Barrier`, `Tech`, `Forge`, `Siegeworks`, `Vendor`).
+    pub role: &'static str,
     /// For a placeable building, the price a worker pays to put it down. For an
     /// upgrade-only building (`placeable: false`) this is the price of the
     /// upgrade step that produces it — the same numbers as the lower rung's
@@ -1387,8 +1814,13 @@ pub struct CatalogResearch {
     /// Wire id — what the `research` command's `upgrade` field accepts.
     pub id: &'static str,
     pub name: &'static str,
-    /// Catalog id of the building that researches it.
+    /// Catalog id of the building that researches it, for the roster that
+    /// shipped first. See `forges` for the full per-race list.
     pub researched_at: &'static str,
+    /// **Every** building that runs this ladder — one per race. The ladders
+    /// themselves are shared content: same ids, same prices, same bonuses,
+    /// whichever forge you paid.
+    pub forges: Vec<&'static str>,
     pub max_level: u32,
     /// What the bonus applies to, in one phrase — the answer to "do my towers
     /// get this?" without reading the source. See `description` for why.
@@ -1442,6 +1874,8 @@ pub fn game_catalog() -> Catalog {
                 let s = unit_stats(k);
                 CatalogUnit {
                     id: kind_name(k),
+                    race: catalog_races(unit_races(k)),
+                    role: role_name(unit_role(k)),
                     cost_gold: s.cost_gold,
                     cost_lumber: s.cost_lumber,
                     supply: s.supply,
@@ -1473,6 +1907,8 @@ pub fn game_catalog() -> Catalog {
                 let s = building_stats(k);
                 CatalogBuilding {
                     id: building_name(k),
+                    race: catalog_races(building_races(k)),
+                    role: building_role_name(building_role(k)),
                     cost_gold: s.cost_gold,
                     cost_lumber: s.cost_lumber,
                     hp: s.hp,
@@ -1568,6 +2004,7 @@ pub fn game_catalog() -> Catalog {
                 id: k.id(),
                 name: k.label(),
                 researched_at: building_name(research_building(k)),
+                forges: research_buildings().iter().map(|b| building_name(*b)).collect(),
                 max_level: RESEARCH_MAX_LEVEL,
                 applies_to: "units only (not buildings or towers)",
                 levels: (1..=RESEARCH_MAX_LEVEL)
@@ -2949,9 +3386,21 @@ pub const SANCTUARY_MIN_TARGETS: u32 = 3;
 /// player's `T` toggle and the scripted AI's own explicit cast.
 pub fn machine_autocast_rules(kind: UnitKind) -> Vec<(usize, u32)> {
     let list = abilities_of_unit(kind);
+    // By NAME across both rosters: a hero class's ultimate is its slot-1 row
+    // whichever race trained it, and naming them keeps the rule where the
+    // content is. `filter_map` means a name that is not on this kind's list
+    // simply does not apply, so the table is a union rather than a match.
+    //
+    // The FarSeer's `AncestralCall` is deliberately ABSENT, and the reason is
+    // a real limit of the effect vocabulary rather than an oversight: a
+    // `Summon` atom has no crowd to count, so doctrine's auto-cast trigger
+    // (which counts whoever atom 0 is aimed at) can never fire it. A summon is
+    // a hand-cast ultimate for both seats until an atom exists that a
+    // `min_targets` rule can mean something about.
     [
         ("Warcry", WARCRY_MIN_TARGETS),
         ("Sanctuary", SANCTUARY_MIN_TARGETS),
+        ("Bloodfury", WARCRY_MIN_TARGETS),
     ]
     .iter()
     .filter_map(|(id, min)| ability_index_by_id(list, id).map(|index| (index, *min)))
@@ -3433,27 +3882,40 @@ impl TargetClass {
         if target_is_air(unit) {
             return Some(TargetClass::Air);
         }
+        // Everything below is derived from the row's ROLE rather than from a
+        // list of kinds. That is what makes the counter-triangle hold ACROSS
+        // races without a single cross-race line of code: `vs_cavalry_mult`
+        // is keyed off the CLASS, the class is keyed off the role, and both
+        // races' cavalry declare `role: Cavalry` — so a Kingdom Spearman's 5x
+        // lands on a Horde Wolfrider exactly as hard as on a Raider, and an
+        // Impaler's lands on a Knight.
         match (unit, building) {
-            // Both hero classes are "Hero" for targeting purposes.
-            (Some(UnitKind::Hero) | Some(UnitKind::Priestess), _) => Some(TargetClass::Hero),
-            // The Sorcerer answers to "Archer": the class is the fragile
-            // ranged BACK RANK, and a doctrine that says "kill their archers"
-            // means "get behind the line and kill the soft things", which is
-            // exactly the order you want pointed at a caster. Naming a
-            // separate Caster class would let a priority list that already
-            // says Archer silently miss the most valuable target on the field.
-            (Some(UnitKind::Archer) | Some(UnitKind::Sorcerer), _) => Some(TargetClass::Archer),
-            // The Spearman answers to "Footman" for targeting purposes: the
-            // class is the melee line, and a doctrine that says "focus the
-            // front rank" means the front rank, whatever it is holding.
-            (Some(UnitKind::Footman) | Some(UnitKind::Spearman), _) => Some(TargetClass::Footman),
-            (Some(UnitKind::Worker), _) => Some(TargetClass::Worker),
-            (Some(UnitKind::Catapult), _) => Some(TargetClass::Siege),
-            // The Knight rides in under the same class as the Raider, which is
-            // the entire counter-triangle in one line: `vs_cavalry_mult` is
-            // keyed off the CLASS, so a Spearman's 5x lands on a 270g tier-3
-            // Knight exactly as hard as on a 170g tier-2 Raider.
-            (Some(UnitKind::Raider) | Some(UnitKind::Knight), _) => Some(TargetClass::Cavalry),
+            (Some(kind), _) => match unit_role(kind) {
+                // Every hero class is "Hero" for targeting purposes.
+                UnitRole::HeroMelee | UnitRole::HeroSupport => Some(TargetClass::Hero),
+                // Casters answer to "Archer": the class is the fragile ranged
+                // BACK RANK, and a doctrine that says "kill their archers"
+                // means "get behind the line and kill the soft things", which
+                // is exactly the order you want pointed at a caster. Naming a
+                // separate Caster class would let a priority list that already
+                // says Archer silently miss the most valuable target on the
+                // field.
+                UnitRole::Ranged | UnitRole::Caster => Some(TargetClass::Archer),
+                // Anti-cavalry answers to "Footman": the class is the melee
+                // line, and a doctrine that says "focus the front rank" means
+                // the front rank, whatever it is holding.
+                UnitRole::Line | UnitRole::AntiCavalry => Some(TargetClass::Footman),
+                UnitRole::Worker => Some(TargetClass::Worker),
+                UnitRole::Siege => Some(TargetClass::Siege),
+                // The tier-3 shock unit rides in under the same class as the
+                // light cavalry, which is the whole counter-triangle in one
+                // line: a tech advantage buys tempo and reach, never immunity
+                // to a counter.
+                UnitRole::Cavalry | UnitRole::Shock => Some(TargetClass::Cavalry),
+                // Unreachable in practice — a flyer was classified as `Air`
+                // above — but a grounded flyer-role row would still classify.
+                UnitRole::Flyer => Some(TargetClass::Air),
+            },
             (None, true) => Some(TargetClass::Building),
             _ => None,
         }
@@ -4936,6 +5398,10 @@ mod fog_tests {
         let far_corner = Vec3::new(-90.0, 0.0, -90.0);
 
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>();
         let mut grids = FogGrids::default();
         // Pin the mode: the ambient WC3_FOG must not decide a test's outcome.
@@ -5034,6 +5500,10 @@ mod fog_tests {
         let far_corner = Vec3::new(-90.0, 0.0, -90.0);
 
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>();
         let mut grids = FogGrids::default();
         grids.enabled = true;
@@ -8574,7 +9044,22 @@ impl Plugin for CorePlugin {
             app.configure_sets(Update, pair[0].before(pair[1]));
         }
 
-        app.init_resource::<NavGrid>()
+        // Races: read once, here, before any spawn. `Races::from_env`
+        // defaults both sides to `Kingdom`, so a run with neither variable set
+        // is the pre-race game exactly. Inserted rather than `init_resource`d
+        // because the environment is the source and `Default` is only the
+        // fallback a test wants.
+        let races = Races::from_env();
+        if races.human != Race::Kingdom || races.claude != Race::Kingdom {
+            info!(
+                "races: blue={} red={}",
+                races.human.name(),
+                races.claude.name()
+            );
+        }
+
+        app.insert_resource(races)
+            .init_resource::<NavGrid>()
             .init_resource::<Economies>()
             .init_resource::<GameOver>()
             .init_resource::<HeroRecords>()
@@ -8667,14 +9152,20 @@ impl Plugin for CorePlugin {
     }
 }
 
+/// The opening position: one tier-1 hall and five workers per team — of
+/// **that team's race**. The two kinds are the only thing a race changes here;
+/// the geometry, the count and the starting bank are identical, because a race
+/// is a roster and not a different game.
 fn initial_spawns(
+    races: Res<Races>,
     mut unit_events: EventWriter<SpawnUnitEvent>,
     mut building_events: EventWriter<SpawnBuildingEvent>,
 ) {
     for team in [Team::Human, Team::Claude] {
+        let race = races.get(team);
         let base = team.base_pos();
         building_events.write(SpawnBuildingEvent {
-            kind: BuildingKind::TownHall,
+            kind: race_hall(race),
             team,
             pos: base,
             completed: true,
@@ -8684,7 +9175,7 @@ fn initial_spawns(
             let side = Vec3::new(-toward_center.z, 0.0, toward_center.x);
             let pos = base + toward_center * 8.0 + side * (i as f32 - 2.0) * 2.5;
             unit_events.write(SpawnUnitEvent {
-                kind: UnitKind::Worker,
+                kind: race_worker(race),
                 team,
                 pos,
                 rally: None,
@@ -10709,9 +11200,9 @@ mod tests {
         targeted.dedup();
         assert_eq!(
             targeted,
-            vec![("Slow", "point", Some(9.0))],
-            "Slow is the only targeted ability in the game; every other row must \
-             still centre on its caster"
+            vec![("Bloodlust", "point", Some(8.0)), ("Slow", "point", Some(9.0))],
+            "the two casters' spells are the only targeted abilities in the game; \
+             every other row must still centre on its caster"
         );
         // And `Caster` rows carry no range, so nothing can accidentally
         // range-check an ability that has no reach to check.
@@ -11236,6 +11727,10 @@ mod tests {
     #[test]
     fn a_summon_leaves_when_its_time_is_up() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .add_systems(Update, tick_militia_and_cooldowns);
         let temporary = app
@@ -11315,13 +11810,20 @@ mod tests {
         assert_eq!(call.power, 40.0, "the v2 pair is reproduced exactly");
         assert_eq!(call.duration, 0.0);
 
-        // Nothing on the wire carries a schedule the engine cannot run.
+        // Nothing on the wire carries a schedule the engine cannot RUN.
+        // `over_time` joined `instant` as shipping content when the FarSeer's
+        // Mend shipped — the first row to use the schedule the v3 vocabulary
+        // had carried unused. The two unimplemented schedules (`on_hit`,
+        // `on_death`) are refused by the loader, so reaching them here is
+        // impossible; this asserts the *runnable* set rather than a
+        // historical accident.
         for ability in &catalog.abilities {
             for clause in &ability.effects {
-                assert_eq!(
-                    clause.schedule, "instant",
-                    "{}: shipping content is all instant today",
-                    ability.id
+                assert!(
+                    matches!(clause.schedule, "instant" | "over_time"),
+                    "{}: schedule {:?} is not one the engine can run",
+                    ability.id,
+                    clause.schedule
                 );
             }
         }
@@ -11597,21 +12099,25 @@ mod tests {
             .filter(|u| u.class == Some("Cavalry"))
             .map(|u| u.id)
             .collect();
-        assert_eq!(cavalry, vec!["Raider", "Knight"]);
+        // Both rosters' cavalry, in one list, because the class is one class.
+        // That is the whole cross-race claim stated as catalog data: whatever
+        // appears here takes 5x from whatever appears in `anti_cavalry` below,
+        // and neither list is grouped by race.
+        assert_eq!(cavalry, vec!["Raider", "Knight", "Wolfrider"]);
         let anti_cavalry: Vec<&str> = catalog
             .units
             .iter()
             .filter(|u| u.vs_cavalry_mult > 1.0)
             .map(|u| u.id)
             .collect();
-        assert_eq!(anti_cavalry, vec!["Spearman"]);
+        assert_eq!(anti_cavalry, vec!["Spearman", "Impaler"]);
         let anti_siege: Vec<&str> = catalog
             .units
             .iter()
             .filter(|u| u.vs_siege_mult > 1.0)
             .map(|u| u.id)
             .collect();
-        assert_eq!(anti_siege, vec!["Raider"]);
+        assert_eq!(anti_siege, vec!["Raider", "Wolfrider"]);
         assert_eq!(unit("Catapult").class, Some("Siege"));
         // Siege is the answer to fortification, and it says so numerically.
         assert!(unit("Catapult").vs_building_mult > 1.0);
@@ -11926,6 +12432,10 @@ mod tests {
     fn the_verdict_says_which_win_it_was() {
         let verdict = |setup: &dyn Fn(&mut App)| -> (Option<Team>, Option<GameOverReason>) {
             let mut app = App::new();
+            // Races: `CorePlugin` supplies this in a real match; a hand-built
+            // test app must too, or any system reading it panics inside Bevy's
+            // worker pool and the test HANGS rather than fails.
+            app.init_resource::<Races>();
             app.init_resource::<Time>()
                 .init_resource::<GameOver>()
                 .add_event::<Surrender>()
@@ -11976,6 +12486,10 @@ mod tests {
     #[test]
     fn the_claiming_team_is_told_it_claimed_and_the_enemy_is_not() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<GameEvents>()
             .add_event::<BountyClaim>()
@@ -12149,6 +12663,234 @@ mod tests {
     // Hero slots
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // v3: races
+    // -----------------------------------------------------------------------
+
+    /// **The default is the game that shipped.** With neither env var set both
+    /// teams are Kingdom, which is what makes "zero change unless you opt in"
+    /// a property rather than a hope.
+    #[test]
+    fn the_default_race_pair_is_the_pre_race_game() {
+        let races = Races::default();
+        assert_eq!(races.get(Team::Human), Race::Kingdom);
+        assert_eq!(races.get(Team::Claude), Race::Kingdom);
+        assert_eq!(race_hall(Race::Kingdom), BuildingKind::TownHall);
+        assert_eq!(race_worker(Race::Kingdom), UnitKind::Worker);
+    }
+
+    /// The env words a match is selected with, including the aliases and the
+    /// rejection of anything else (which the reader turns into a warning and a
+    /// Kingdom fallback rather than a panic — a typo in a shell variable must
+    /// not stop a sim).
+    #[test]
+    fn race_parses_the_words_a_match_is_started_with() {
+        assert_eq!(Race::parse("kingdom"), Some(Race::Kingdom));
+        assert_eq!(Race::parse("HORDE"), Some(Race::Horde));
+        assert_eq!(Race::parse("  Horde  "), Some(Race::Horde));
+        assert_eq!(Race::parse("orc"), Some(Race::Horde));
+        assert_eq!(Race::parse("undead"), None);
+        assert_eq!(Race::parse(""), None);
+        for race in ALL_RACES {
+            assert_eq!(Race::parse(race.name()), Some(race), "{race:?} round-trips");
+        }
+    }
+
+    /// **Each race's opening position resolves, and to different kinds.** This
+    /// is what `initial_spawns` reads, and a race whose hall or worker did not
+    /// resolve would panic at the first frame of a match rather than at load.
+    #[test]
+    fn every_race_has_an_opening_position() {
+        let halls: Vec<BuildingKind> = ALL_RACES.into_iter().map(race_hall).collect();
+        let workers: Vec<UnitKind> = ALL_RACES.into_iter().map(race_worker).collect();
+        assert_eq!(halls, vec![BuildingKind::TownHall, BuildingKind::Stronghold]);
+        assert_eq!(workers, vec![UnitKind::Worker, UnitKind::Peon]);
+        for &hall in &halls {
+            assert!(is_hall(hall), "{hall:?} must be a hall");
+            assert!(building_placeable(hall), "{hall:?} must be placeable");
+            assert_eq!(building_tier(hall), 1);
+            // Three rungs, because `hero_slots` and every tier gate are read
+            // off the rung.
+            assert_eq!(
+                tech_tier_for(std::iter::once(top_rung(hall))).level(),
+                3,
+                "{hall:?}'s ladder must reach tier 3"
+            );
+        }
+        for &w in &workers {
+            assert!(is_worker_kind(w));
+        }
+    }
+
+    /// The top of a hall's ladder, walked through `upgrades_to`.
+    fn top_rung(mut kind: BuildingKind) -> BuildingKind {
+        while let Some(next) = building_upgrades_to(kind) {
+            kind = next;
+        }
+        kind
+    }
+
+    /// **`is_hall` covers both ladders**, which is the one derived fact that
+    /// used to name `TownHall` directly. Drop-off, Town Portal, rally
+    /// fallbacks, the AI's base bookkeeping and `tech_tier_for` all ask this
+    /// question, so a second ladder it did not answer for would be six silent
+    /// bugs rather than one.
+    #[test]
+    fn is_hall_answers_for_every_ladder() {
+        let halls: Vec<BuildingKind> =
+            ALL_BUILDING_KINDS.into_iter().filter(|&k| is_hall(k)).collect();
+        assert_eq!(
+            halls,
+            vec![
+                BuildingKind::TownHall,
+                BuildingKind::Keep,
+                BuildingKind::Castle,
+                BuildingKind::Stronghold,
+                BuildingKind::Fortress,
+                BuildingKind::Hold,
+            ],
+        );
+        // Every rung of a race's ladder belongs to that race — a team must
+        // never tier up into a building it may not own.
+        for race in ALL_RACES {
+            let mut rung = race_hall(race);
+            loop {
+                assert!(race_has_building(race, rung), "{race:?} cannot own {rung:?}");
+                match building_upgrades_to(rung) {
+                    Some(next) => rung = next,
+                    None => break,
+                }
+            }
+        }
+    }
+
+    /// **The role lookups every consumer asks through.** `race_unit` /
+    /// `race_building` are what replaced twenty `UnitKind::Footman` literals in
+    /// ai.rs, so if either stopped resolving the scripted commander would go
+    /// quietly passive rather than fail.
+    #[test]
+    fn every_race_resolves_the_roles_the_engine_asks_for() {
+        for race in ALL_RACES {
+            for role in [UnitRole::Worker, UnitRole::Line, UnitRole::Ranged, UnitRole::AntiCavalry]
+            {
+                let got = race_unit(race, role);
+                assert!(got.is_some(), "{race:?} has no {role:?}");
+                assert_eq!(unit_role(got.unwrap()), role);
+                assert!(race_has_unit(race, got.unwrap()));
+            }
+            for role in [BuildingRole::Production, BuildingRole::Supply, BuildingRole::Defense] {
+                assert!(race_building(race, role).is_some(), "{race:?} has no {role:?}");
+            }
+            // Two hero classes each, melee first — the order ai.rs fills slots
+            // in and the order the command card lays them out in.
+            let heroes = race_hero_classes(race);
+            assert_eq!(heroes.len(), 2, "{race:?}: {heroes:?}");
+            assert_eq!(unit_role(heroes[0]), UnitRole::HeroMelee);
+            assert_eq!(unit_role(heroes[1]), UnitRole::HeroSupport);
+            // Exactly one forge, because research is shared and the building
+            // that sells it is not.
+            assert!(research_building_for(race).is_some(), "{race:?} has no forge");
+        }
+        // The asymmetries, asserted rather than assumed — these are design,
+        // and a later edit that quietly gave the Horde a wall or a shock unit
+        // should have to change this line.
+        assert!(race_unit(Race::Horde, UnitRole::Shock).is_none());
+        assert!(race_building(Race::Horde, BuildingRole::Barrier).is_none());
+        assert!(race_building(Race::Horde, BuildingRole::Siegeworks).is_none());
+        assert!(race_unit(Race::Horde, UnitRole::Siege).is_some());
+        assert!(race_unit(Race::Horde, UnitRole::Flyer).is_some());
+    }
+
+    /// The build menu is per-race, and neither race can place the other's
+    /// buildings. The Shop is the one row both may build.
+    #[test]
+    fn the_build_menu_is_the_race_s_own() {
+        let kingdom = race_build_menu(Race::Kingdom);
+        let horde = race_build_menu(Race::Horde);
+        assert!(kingdom.contains(&BuildingKind::Barracks));
+        assert!(!kingdom.contains(&BuildingKind::WarCamp));
+        assert!(horde.contains(&BuildingKind::WarCamp));
+        assert!(!horde.contains(&BuildingKind::Barracks));
+        assert!(!horde.contains(&BuildingKind::Wall), "the Horde does not turtle");
+        let shared: Vec<BuildingKind> = kingdom
+            .iter()
+            .copied()
+            .filter(|k| horde.contains(k))
+            .collect();
+        assert_eq!(shared, vec![BuildingKind::Shop]);
+        // Nothing on either menu is an upgrade-only rung.
+        for k in kingdom.iter().chain(horde.iter()) {
+            assert!(building_placeable(*k), "{k:?} is not placeable");
+        }
+    }
+
+    /// **Every kind classifies.** `TargetClass::of` was a list of kinds that a
+    /// new unit had to be added to by hand, and that returned `None` — silently
+    /// un-focusable — if you forgot. It reads the row's role now, so this is
+    /// the test that the whole roster is focus-fireable, both races at once.
+    #[test]
+    fn every_unit_kind_has_a_target_class() {
+        for kind in ALL_UNIT_KINDS {
+            assert!(
+                TargetClass::of(Some(kind), false).is_some(),
+                "{kind:?} has no target class — a doctrine cannot name it"
+            );
+        }
+        // The classes that carry a multiplier are the ones worth spelling out.
+        assert_eq!(
+            TargetClass::of(Some(UnitKind::Wolfrider), false),
+            Some(TargetClass::Cavalry)
+        );
+        assert_eq!(
+            TargetClass::of(Some(UnitKind::Grunt), false),
+            Some(TargetClass::Footman)
+        );
+        assert_eq!(
+            TargetClass::of(Some(UnitKind::Impaler), false),
+            Some(TargetClass::Footman)
+        );
+        assert_eq!(
+            TargetClass::of(Some(UnitKind::Shaman), false),
+            Some(TargetClass::Archer)
+        );
+        assert_eq!(
+            TargetClass::of(Some(UnitKind::Demolisher), false),
+            Some(TargetClass::Siege)
+        );
+        assert_eq!(
+            TargetClass::of(Some(UnitKind::Wyvern), false),
+            Some(TargetClass::Air)
+        );
+        for hero in [UnitKind::Warchief, UnitKind::FarSeer] {
+            assert_eq!(TargetClass::of(Some(hero), false), Some(TargetClass::Hero));
+            assert!(is_hero_kind(hero));
+        }
+    }
+
+    /// The catalog carries the race and the role of every row, which is how a
+    /// bridge commander finds its own roster in a document both seats share.
+    #[test]
+    fn the_catalog_tells_a_commander_which_rows_are_its_own() {
+        let catalog = game_catalog();
+        let peon = catalog.units.iter().find(|u| u.id == "Peon").expect("Peon row");
+        assert_eq!(peon.race, vec!["horde"]);
+        assert_eq!(peon.role, "Worker");
+        let footman = catalog.units.iter().find(|u| u.id == "Footman").unwrap();
+        assert_eq!(footman.race, vec!["kingdom"]);
+        assert_eq!(footman.role, "Line");
+        // The neutral row says so by listing both.
+        let shop = catalog.buildings.iter().find(|b| b.id == "Shop").unwrap();
+        assert_eq!(shop.race, vec!["kingdom", "horde"]);
+        assert_eq!(shop.role, "Vendor");
+        // Every row carries at least one race, or a commander cannot tell
+        // whether it may build the thing.
+        assert!(catalog.units.iter().all(|u| !u.race.is_empty()));
+        assert!(catalog.buildings.iter().all(|b| !b.race.is_empty()));
+        // Research is shared content sold by two different forges.
+        let attack = catalog.research.iter().find(|r| r.id == "attack").unwrap();
+        assert_eq!(attack.forges, vec!["Blacksmith", "WarMill"]);
+    }
+
     /// One rung, one hero. Derived from the ladder, so a fourth rung needs no
     /// edit here — and tier 3's third slot is deliberately unreachable today,
     /// because only two hero classes exist.
@@ -12168,15 +12910,18 @@ mod tests {
             );
         }
 
-        let classes = ALL_UNIT_KINDS
-            .into_iter()
-            .filter(|k| is_hero_kind(*k))
-            .count();
-        assert_eq!(
-            classes, 2,
-            "if a third hero class ships, tier 3's third slot becomes reachable — \
-             update docs and the AI's HERO_PICK_ORDER",
-        );
+        // Two classes PER RACE, and a team only ever sees its own — so
+        // tier 3's third slot is still unreachable, which is the claim this
+        // line has always been making. Counting every hero kind in the game
+        // stopped being the way to ask it the moment a second roster shipped.
+        for race in ALL_RACES {
+            assert_eq!(
+                race_hero_classes(race).len(),
+                2,
+                "if {race:?} gets a third hero class, tier 3's third slot becomes \
+                 reachable — update docs and ai.rs's `Roster::heroes`",
+            );
+        }
     }
 
     /// The slot rule itself, including the case that made it worth extracting:
@@ -12617,12 +13362,25 @@ mod tests {
         ));
 
         // Nothing else researches, so a `research` command naming any other
-        // building is refused by the same table the card draws from.
-        for other in ALL_BUILDING_KINDS.into_iter().filter(|k| *k != kind) {
+        // building is refused by the same table the card draws from. "Nothing
+        // else" means "nothing outside the one forge PER RACE": research is
+        // shared content sold by two different buildings, and each race can
+        // only ever reach its own.
+        for other in ALL_BUILDING_KINDS
+            .into_iter()
+            .filter(|k| !research_buildings().contains(k))
+        {
             assert!(
                 building_researches(other).is_empty(),
                 "{other:?} is not a forge"
             );
+        }
+        for race in ALL_RACES {
+            let forge = research_building_for(race).expect("every race has a forge");
+            assert!(race_has_building(race, forge));
+            for r in ALL_RESEARCH_KINDS {
+                assert!(building_researches(forge).contains(&r));
+            }
         }
     }
 

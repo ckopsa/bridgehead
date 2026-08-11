@@ -222,9 +222,11 @@ def test_the_backfilled_series_matches_the_history_it_came_from():
 
     Pinned to the BACKFILLED rounds only — the live series keeps growing, and a
     test that froze the whole ledger would fail the moment round 12 was played
-    (it did). The claim under test is about the reconstruction, not the future.
+    (it did, twice, in two worktrees). The claim under test is about the
+    reconstruction, not the future.
     """
     backfilled = [r for r in arena.load(LEDGER) if r["provenance"] == "backfilled"]
+    assert len(backfilled) == 10, [r["id"] for r in backfilled]
     tally = arena.series(backfilled)
     assert tally["rusher"] == 6, tally
     assert tally["boomer"] == 3, tally

@@ -55,7 +55,7 @@ use bevy::prelude::KeyCode;
 
 use crate::shared::{
     abilities_of_building, building_placeable, building_researches, building_upgrades_to,
-    trainable, BuildingKind, ALL_BUILDING_KINDS,
+    race_has_building, trainable, BuildingKind, Race, ALL_BUILDING_KINDS, ALL_RACES,
 };
 
 // ---------------------------------------------------------------------------
@@ -258,8 +258,12 @@ pub enum Ctx {
 pub enum CardContext {
     /// Nothing of ours selected — no card, but the global keys still fire.
     Empty,
-    /// Own units, orders page.
-    Units { worker: bool, hero: bool },
+    /// Own units, orders page. Carries the selecting team RACE, because the
+    /// build buttons a worker draws are the ones that race may place — and
+    /// because both races claim the same letters, the validator has to check
+    /// each race card separately or it would see a collision that no player
+    /// can ever be shown.
+    Units { worker: bool, hero: bool, race: Race },
     /// Own units, doctrine page.
     UnitsDoctrine,
     /// Exactly one completed own building, orders page.
@@ -274,7 +278,9 @@ impl CardContext {
         let mut out = vec![CardContext::Empty, CardContext::UnitsDoctrine];
         for worker in [false, true] {
             for hero in [false, true] {
-                out.push(CardContext::Units { worker, hero });
+                for race in ALL_RACES {
+                    out.push(CardContext::Units { worker, hero, race });
+                }
             }
         }
         for kind in ALL_BUILDING_KINDS {
@@ -282,6 +288,17 @@ impl CardContext {
         }
         out.push(CardContext::BuildingDoctrine);
         out
+    }
+
+    /// The race whose card this is, for the contexts that have one. A card
+    /// with no race shows no race-scoped binding at all, which is correct:
+    /// build buttons only ever appear on a unit selection that contains a
+    /// worker, and that selection always belongs to somebody.
+    pub fn race(self) -> Option<Race> {
+        match self {
+            CardContext::Units { race, .. } => Some(race),
+            _ => None,
+        }
     }
 
     /// Which tags can put a button on THIS card.
@@ -294,7 +311,7 @@ impl CardContext {
         let mut tags = vec![Ctx::Global];
         match self {
             CardContext::Empty => {}
-            CardContext::Units { worker, hero } => {
+            CardContext::Units { worker, hero, .. } => {
                 tags.extend([Ctx::Pinned, Ctx::Orders, Ctx::DoctrineQuick]);
                 if worker {
                     tags.push(Ctx::WorkerBuild);
@@ -333,8 +350,9 @@ impl CardContext {
     pub fn name(self) -> String {
         match self {
             CardContext::Empty => "empty selection".to_string(),
-            CardContext::Units { worker, hero } => format!(
-                "unit selection (worker: {worker}, hero: {hero}), orders page"
+            CardContext::Units { worker, hero, race } => format!(
+                "{} unit selection (worker: {worker}, hero: {hero}), orders page",
+                race.name()
             ),
             CardContext::UnitsDoctrine => "unit selection, doctrine page".to_string(),
             CardContext::Building(kind) => format!("{kind:?}, orders page"),
@@ -355,16 +373,35 @@ pub fn sells_items(kind: BuildingKind) -> bool {
 // The table
 // ---------------------------------------------------------------------------
 
-/// One binding: what it does, which key does it, where it can appear.
+/// One binding: what it does, which key does it, where it can appear, and —
+/// for the build card only — which RACE it appears for.
+///
+/// The race field is what lets both rosters keep the same build muscle memory.
+/// [B] is the production building and [F] is the supply building for everybody;
+/// which BUILDING those are depends on who you are playing. A player who learns
+/// one race has learned the other's keyboard, which is the whole reason to
+/// spend a field here instead of giving the Horde six spare letters nobody
+/// would remember.
+///
+/// `None` means the binding is race-independent, which is everything except
+/// the `Ctx::WorkerBuild` rows.
 #[derive(Clone, Copy, Debug)]
 pub struct Binding {
     pub action: Action,
     pub key: KeyCode,
     pub ctx: Ctx,
+    pub race: Option<Race>,
 }
 
 const fn b(action: Action, key: KeyCode, ctx: Ctx) -> Binding {
-    Binding { action, key, ctx }
+    Binding { action, key, ctx, race: None }
+}
+
+/// A build binding scoped to one race. Only `Ctx::WorkerBuild` rows use this:
+/// the same letter may be claimed once per race, and `validate` proves the two
+/// claims never land on the same card.
+const fn rb(action: Action, key: KeyCode, race: Race) -> Binding {
+    Binding { action, key, ctx: Ctx::WorkerBuild, race: Some(race) }
 }
 
 /// **Every key the game binds.** See the module docs for how to add one.
@@ -411,15 +448,34 @@ pub const REGISTRY: &[Binding] = &[
     // Blacksmith and the Sanctum: legal because `WorkerBuild` and
     // `BuildingAbility` never share a context, which the validator now checks
     // instead of the comment that used to say it.
-    b(Action::Build(BuildingKind::Barracks), KeyCode::KeyB, Ctx::WorkerBuild),
-    b(Action::Build(BuildingKind::Farm), KeyCode::KeyF, Ctx::WorkerBuild),
-    b(Action::Build(BuildingKind::TownHall), KeyCode::KeyH, Ctx::WorkerBuild),
-    b(Action::Build(BuildingKind::Tower), KeyCode::KeyO, Ctx::WorkerBuild),
-    b(Action::Build(BuildingKind::Wall), KeyCode::KeyL, Ctx::WorkerBuild),
-    b(Action::Build(BuildingKind::Workshop), KeyCode::KeyK, Ctx::WorkerBuild),
+    rb(Action::Build(BuildingKind::Barracks), KeyCode::KeyB, Race::Kingdom),
+    rb(Action::Build(BuildingKind::Farm), KeyCode::KeyF, Race::Kingdom),
+    rb(Action::Build(BuildingKind::TownHall), KeyCode::KeyH, Race::Kingdom),
+    rb(Action::Build(BuildingKind::Tower), KeyCode::KeyO, Race::Kingdom),
+    rb(Action::Build(BuildingKind::Wall), KeyCode::KeyL, Race::Kingdom),
+    rb(Action::Build(BuildingKind::Workshop), KeyCode::KeyK, Race::Kingdom),
+    // The Shop is neutral content, so its binding is too: ONE row, no race,
+    // on both cards. A second race-scoped row would be the same action bound
+    // twice, which `no_action_is_registered_twice` refuses — correctly, since
+    // an action with two bindings has no single answer to "what key is this".
     b(Action::Build(BuildingKind::Shop), KeyCode::KeyN, Ctx::WorkerBuild),
-    b(Action::Build(BuildingKind::Blacksmith), KeyCode::KeyC, Ctx::WorkerBuild),
-    b(Action::Build(BuildingKind::Sanctum), KeyCode::KeyM, Ctx::WorkerBuild),
+    rb(Action::Build(BuildingKind::Blacksmith), KeyCode::KeyC, Race::Kingdom),
+    rb(Action::Build(BuildingKind::Sanctum), KeyCode::KeyM, Race::Kingdom),
+    // The Horde's build card, letter for letter against the Kingdom's above.
+    // [B] production, [F] supply, [H] hall, [O] static defense, [N] the shared
+    // Shop, [C] forge, [M] the tier-2 tech building. A player who has learned
+    // one race's opening has learned the other's.
+    //
+    // Two letters are simply ABSENT: [L] (the Horde has no Wall — it does not
+    // turtle) and [K] (it has no Workshop — its siege comes out of the
+    // WarCamp). A race with fewer buildings has fewer buttons, which is what a
+    // roster difference is supposed to feel like on the keyboard.
+    rb(Action::Build(BuildingKind::WarCamp), KeyCode::KeyB, Race::Horde),
+    rb(Action::Build(BuildingKind::Burrow), KeyCode::KeyF, Race::Horde),
+    rb(Action::Build(BuildingKind::Stronghold), KeyCode::KeyH, Race::Horde),
+    rb(Action::Build(BuildingKind::Watchtower), KeyCode::KeyO, Race::Horde),
+    rb(Action::Build(BuildingKind::WarMill), KeyCode::KeyC, Race::Horde),
+    rb(Action::Build(BuildingKind::SpiritLodge), KeyCode::KeyM, Race::Horde),
     // ---- hero-cast ------------------------------------------------------
     // [R] is where the one hero ability has always lived. Slot 3 is [D] rather
     // than [U] because the tier-up took [U]; the two are on disjoint cards, but
@@ -512,9 +568,18 @@ pub fn key(action: Action) -> Option<KeyCode> {
 /// Every binding visible on a given card.
 pub fn bindings_in(context: CardContext) -> Vec<Binding> {
     let tags = context.tags();
+    let race = context.race();
     REGISTRY
         .iter()
         .filter(|bind| tags.contains(&bind.ctx))
+        // A race-scoped binding appears only on a card that HAS a race, and
+        // only on that race's. This is what keeps [B] from being a collision:
+        // the Kingdom Barracks row and the Horde WarCamp row are never on the
+        // same card, and `validate` walks both cards to prove it.
+        .filter(|bind| match bind.race {
+            None => true,
+            Some(r) => race == Some(r),
+        })
         .copied()
         .collect()
 }
@@ -585,11 +650,14 @@ pub fn key_caption(k: KeyCode) -> &'static str {
 /// The build card, in card order, as the registry declares it. The row order in
 /// [`REGISTRY`] IS the left-to-right order of the build buttons, so a new
 /// building's position and its letter are one decision in one place.
-pub fn build_order() -> Vec<(BuildingKind, KeyCode)> {
+pub fn build_order(race: Race) -> Vec<(BuildingKind, KeyCode)> {
     REGISTRY
         .iter()
+        .filter(|bind| bind.race.is_none_or(|r| r == race))
         .filter_map(|bind| match bind.action {
-            Action::Build(kind) if building_placeable(kind) => Some((kind, bind.key)),
+            Action::Build(kind) if building_placeable(kind) && race_has_building(race, kind) => {
+                Some((kind, bind.key))
+            }
             _ => None,
         })
         .collect()
@@ -704,8 +772,68 @@ mod tests {
             );
         }
         // ...and nothing unplaceable claims one, which would waste a letter.
-        for (kind, _) in build_order() {
-            assert!(building_placeable(kind), "{kind:?} is not placeable");
+        for race in ALL_RACES {
+            for (kind, _) in build_order(race) {
+                assert!(building_placeable(kind), "{kind:?} is not placeable");
+            }
+        }
+    }
+
+    /// **The build card is the player's OWN roster, and only that.** A letter
+    /// that placed the other race's building would be a button the intent
+    /// compiler refuses, which is the worst kind of button.
+    #[test]
+    fn the_build_card_shows_one_race_at_a_time() {
+        for race in ALL_RACES {
+            let card = build_order(race);
+            for (kind, _) in &card {
+                assert!(
+                    race_has_building(race, *kind),
+                    "{race:?}'s build card offers {kind:?}, which it may not place",
+                );
+            }
+            // Every building this race can place has a button. The half of the
+            // check above that matters for a NEW race: a roster whose forge
+            // never made it into the registry is a forge nobody can build.
+            for kind in ALL_BUILDING_KINDS {
+                if building_placeable(kind) && race_has_building(race, kind) {
+                    assert!(
+                        card.iter().any(|(k, _)| *k == kind),
+                        "{race:?} may place {kind:?} but has no button for it",
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Both rosters keep the same muscle memory.** [B] is the production
+    /// building, [F] the supply building and [H] the hall on either card, which
+    /// is the entire reason `Binding` grew a race field instead of the Horde
+    /// being handed six spare letters.
+    #[test]
+    fn the_two_races_share_the_classic_build_trio() {
+        let letter = |race: Race, k: KeyCode| {
+            build_order(race)
+                .into_iter()
+                .find(|(_, key)| *key == k)
+                .map(|(kind, _)| kind)
+        };
+        for (k, role) in [
+            (KeyCode::KeyB, crate::shared::BuildingRole::Production),
+            (KeyCode::KeyF, crate::shared::BuildingRole::Supply),
+            (KeyCode::KeyH, crate::shared::BuildingRole::Hall),
+            (KeyCode::KeyO, crate::shared::BuildingRole::Defense),
+        ] {
+            for race in ALL_RACES {
+                let kind = letter(race, k)
+                    .unwrap_or_else(|| panic!("{race:?} binds nothing to {:?}", key_caption(k)));
+                assert_eq!(
+                    crate::shared::building_role(kind),
+                    role,
+                    "{:?} must mean {role:?} for every race; for {race:?} it means {kind:?}",
+                    key_caption(k),
+                );
+            }
         }
     }
 

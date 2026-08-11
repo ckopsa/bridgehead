@@ -237,6 +237,10 @@ pub struct IntentTables<'w> {
     economies: Res<'w, Economies>,
     records: Res<'w, HeroRecords>,
     tiers: Res<'w, TechTiers>,
+    /// Which roster each team is playing — the gate on the `build` verb. Beside
+    /// `tiers` because it answers the same shape of question: what content is
+    /// this team allowed to reach for.
+    races: Res<'w, Races>,
     nav: Res<'w, NavGrid>,
     fog: Res<'w, FogGrids>,
     team_research: Res<'w, TeamResearch>,
@@ -444,6 +448,8 @@ fn apply_intents(
             &tables.records,
             // The issuing team's tech tier: what hero slots it has open.
             tables.tiers.get(submission.team),
+            // ...and its roster: which buildings it may place at all.
+            *tables.races,
             &tables.nav,
             &tables.team_research,
             // The issuer's own fog: what *they* can see decides what they may
@@ -798,6 +804,7 @@ fn compile_intent(
     economies: &Economies,
     records: &HeroRecords,
     tier: TechTier,
+    races: Races,
     nav: &NavGrid,
     team_research: &TeamResearch,
     fog: &FogGrid,
@@ -1058,6 +1065,19 @@ fn compile_intent(
             };
             if !is_worker(units, entity) {
                 errors.push(format!("{tag}: unit {worker} is not a Worker"));
+                return;
+            }
+            // The ROSTER gate, ahead of the tech gate: a building this team's
+            // race does not have is not a missing requirement, it is a
+            // different game, and saying so plainly is more use to a commander
+            // than a list of prerequisites it can never meet. economy.rs
+            // re-checks this at the pay-point; this is the error string.
+            if !race_has_building(races.get(me), building_kind) {
+                errors.push(format!(
+                    "{tag}: {} is not in the {} roster",
+                    building_name(building_kind),
+                    races.get(me).name()
+                ));
                 return;
             }
             // Same tech gate economy.rs applies at placement — reported
@@ -2789,7 +2809,7 @@ fn completed_kinds(buildings: &IntentBuildings, me: Team) -> Vec<BuildingKind> {
 }
 
 fn is_worker(units: &IntentUnits, entity: Entity) -> bool {
-    matches!(units.get(entity), Ok((_, u, _, _, _)) if u.kind == UnitKind::Worker)
+    matches!(units.get(entity), Ok((_, u, _, _, _)) if is_worker_kind(u.kind))
 }
 
 /// Move / AttackMove for a group, spread over the UI's formation grid.
@@ -3036,6 +3056,10 @@ mod tests {
     /// and must not leave a file behind.
     fn compiler_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<Economies>()
             .init_resource::<HeroRecords>()

@@ -37,12 +37,12 @@ use serde::Deserialize;
 use std::sync::LazyLock;
 
 use crate::shared::{
-    is_hero_kind, kind_name, normalize_name, status_probe_enabled, upgrade_root, AbilityDef,
+    normalize_name, status_probe_enabled, upgrade_root, AbilityDef,
     AbilityTarget, AbilityTargets, Effect, EffectAtom, EffectSchedule,
-    BuildingKind,
-    BuildingStats, ItemDef, ItemId, ResearchKind, ResearchStep, TechTier, UnitKind,
-    UnitStats,
-    AbilityUnlock, ALL_BUILDING_KINDS, ALL_ITEMS, ALL_RESEARCH_KINDS, ALL_UNIT_KINDS,
+    BuildingKind, BuildingRole,
+    BuildingStats, ItemDef, ItemId, Race, ResearchKind, ResearchStep, TechTier, UnitKind,
+    UnitRole, UnitStats,
+    AbilityUnlock, ALL_BUILDING_KINDS, ALL_ITEMS, ALL_RACES, ALL_RESEARCH_KINDS, ALL_UNIT_KINDS,
     RESEARCH_MAX_LEVEL,
 };
 
@@ -117,6 +117,18 @@ pub struct UnitRow {
     pub kind: UnitKind,
     pub name: String,
     pub description: String,
+    /// **Which rosters may field this.** Empty means NEUTRAL — every race —
+    /// which is why the field is defaulted: a row that predates races reads
+    /// exactly as it did, and neutrality is the honest default for content
+    /// nobody has assigned yet. The loader still refuses a race whose tree is
+    /// incomplete, so a forgotten `races` shows up as a completeness failure
+    /// rather than as a unit quietly appearing in both build menus.
+    #[serde(default)]
+    pub races: Vec<Race>,
+    /// What this unit is FOR. See `UnitRole` — it is what `is_hero_kind`,
+    /// `TargetClass::of` and the scripted commander's roster lookup all read
+    /// instead of matching on the kind.
+    pub role: UnitRole,
     /// Tech gate beyond owning the trainer building.
     pub requires: Vec<BuildingKind>,
     pub stats: UnitStats,
@@ -129,6 +141,13 @@ pub struct BuildingRow {
     pub kind: BuildingKind,
     pub name: String,
     pub description: String,
+    /// Which rosters may build this. Empty means neutral — the Shop is the
+    /// one shipped example, because an item vendor is not a faction trait.
+    #[serde(default)]
+    pub races: Vec<Race>,
+    /// What this building is FOR. `is_hall` reads it, which is what lets a
+    /// second hall ladder exist at all.
+    pub role: BuildingRole,
     pub requires: Vec<BuildingKind>,
     pub trains: Vec<UnitKind>,
     pub researches: Vec<ResearchKind>,
@@ -266,7 +285,10 @@ struct ItemRow {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct ResearchFile {
-    building: BuildingKind,
+    /// **One forge per race.** The ladders below are shared content — same
+    /// ids, same prices, same bonuses — and only the building that sells them
+    /// is a faction trait. The validator checks every race has exactly one.
+    buildings: Vec<BuildingKind>,
     ladders: Vec<ResearchLadderRow>,
     steps: Vec<ResearchStep>,
 }
@@ -294,7 +316,7 @@ pub struct Tables {
     /// Indexed by LADDER ROOT; `abilities_of_building` resolves the root.
     building_abilities: Vec<Vec<AbilityDef>>,
     items: Vec<ItemDef>,
-    research_building: BuildingKind,
+    research_buildings: Vec<BuildingKind>,
     research_ladders: Vec<ResearchLadderRow>,
     research_steps: Vec<ResearchStep>,
 }
@@ -485,7 +507,7 @@ fn load() -> Tables {
         unit_autocast,
         building_abilities,
         items,
-        research_building: research_file.building,
+        research_buildings: research_file.buildings,
         research_ladders,
         research_steps: research_file.steps,
     };
@@ -726,11 +748,22 @@ fn check_values(t: &Tables, defs: &[AbilityDef]) -> Vec<String> {
                     // A hero is a progression, a revival cost and a record —
                     // not a body. Summoning one would mint a second Champion
                     // with the first one's level and no way to bury it.
-                    if is_hero_kind(unit_kind) {
+                    // **Read out of the table being validated, never through
+                    // the shared accessors.** `is_hero_kind` and `kind_name`
+                    // both go through `data::unit_row` -> `TABLES`, and this
+                    // code runs INSIDE `LazyLock`s initializer — so calling
+                    // them here is a re-entrant force that deadlocks the
+                    // process rather than panicking. It was harmless while
+                    // `is_hero_kind` was a `matches!` over kinds; it stopped
+                    // being harmless the moment the hero test became a lookup
+                    // of the row's role, and the first `Summon` row in the
+                    // shipped data is what would have found out.
+                    let row = &t.units[unit_kind as usize];
+                    if matches!(row.role, UnitRole::HeroMelee | UnitRole::HeroSupport) {
                         p.push(format!(
                             "{clause}: cannot Summon {} — hero kinds carry progression \
                              and a revival contract, so they are trained, never called",
-                            kind_name(unit_kind)
+                            row.name
                         ));
                     }
                     if let Some(lifetime) = lifetime {
@@ -821,22 +854,23 @@ fn check_values(t: &Tables, defs: &[AbilityDef]) -> Vec<String> {
             step.research_time,
         );
     }
-    // The forge and the building table have to agree about who researches
+    // The forges and the building table have to agree about who researches
     // what, or the command card draws buttons the intent compiler refuses.
-    let forge = &t.buildings[t.research_building as usize];
-    for &kind in &ALL_RESEARCH_KINDS {
-        if !forge.researches.contains(&kind) {
-            p.push(format!(
-                "research.ron names {:?} as the research building, but buildings.ron does not \
-                 list {kind:?} in its `researches`",
-                t.research_building
-            ));
+    for &forge_kind in &t.research_buildings {
+        let forge = &t.buildings[forge_kind as usize];
+        for &kind in &ALL_RESEARCH_KINDS {
+            if !forge.researches.contains(&kind) {
+                p.push(format!(
+                    "research.ron names {forge_kind:?} as a research building, but buildings.ron \
+                     does not list {kind:?} in its `researches`"
+                ));
+            }
         }
     }
 
     // --- cross-table ------------------------------------------------------
     // Every unit must be trainable somewhere, or it is content nobody can
-    // reach; every `researches` entry must be on the forge.
+    // reach; every `researches` entry must be on a forge.
     for &kind in &ALL_UNIT_KINDS {
         if !t.buildings.iter().any(|b| b.trains.contains(&kind)) {
             p.push(format!("buildings.ron: nothing trains {kind:?}"));
@@ -844,12 +878,265 @@ fn check_values(t: &Tables, defs: &[AbilityDef]) -> Vec<String> {
     }
     for row in &t.buildings {
         for r in &row.researches {
-            if row.kind != t.research_building {
+            if !t.research_buildings.contains(&row.kind) {
                 p.push(format!(
-                    "buildings.ron/{:?}: researches {r:?}, but research.ron names {:?} as the \
-                     research building",
-                    row.kind, t.research_building
+                    "buildings.ron/{:?}: researches {r:?}, but research.ron does not name it as a \
+                     research building (it names {:?})",
+                    row.kind, t.research_buildings
                 ));
+            }
+        }
+    }
+
+    p.extend(check_races(t));
+    p
+}
+
+/// **The race-tree completeness validator.**
+///
+/// A race is a promise that a team can play the whole game with it, and the
+/// failure mode of getting that wrong is not a compile error or a panic — it
+/// is a match where one side simply never builds a second farm, or trains no
+/// army, or cannot reach tier 3. Every one of those is a missing row, and
+/// every one of them is checkable here, at startup, by name.
+///
+/// The list below is exactly "what does a team need in order to play":
+///
+///  1. **A worker**, exactly one, or `race_worker` has no answer.
+///  2. **A placeable hall**, exactly one root, so the opening position and
+///     every expansion are unambiguous.
+///  3. **A full hall ladder** — three rungs, because `hero_slots` and
+///     `TechTier` are read off the rung and a race stuck at tier 1 can field
+///     one hero and no tier-2 content.
+///  4. **Supply beyond the hall**, or the race caps out at 10 supply.
+///  5. **A production building** that trains something, or `check_game_over`
+///     considers the team already dead (it asks `!trainable(kind).is_empty()`).
+///  6. **An army**: at least one non-worker unit that can hit ground, or the
+///     race cannot reach the win condition (destroy every enemy building).
+///  7. **The counter-triangle**, within the race: if it fields `Cavalry` it
+///     must field `AntiCavalry`, and vice versa — a race with a horse and no
+///     spear is a race whose own mirror match has no answer.
+///  8. **Coherent trainers**: a building may only train units of a race that
+///     can build it, and a unit's `requires` must all be buildable by every
+///     race that fields it. Both are the "reachable content" rule the
+///     `nothing trains X` check already states, applied per race.
+///  9. **Hero classes**: at least one, and no more than the tier-3 slot count,
+///     since a class a race cannot train is a slot it can never fill.
+fn check_races(t: &Tables) -> Vec<String> {
+    let mut p = Vec::new();
+    let has_unit = |race: Race, kind: UnitKind| {
+        let list = &t.units[kind as usize].races;
+        list.is_empty() || list.contains(&race)
+    };
+    let has_building = |race: Race, kind: BuildingKind| {
+        let list = &t.buildings[kind as usize].races;
+        list.is_empty() || list.contains(&race)
+    };
+    // Local copies of the derived facts, over the tables being CHECKED rather
+    // than over the global ones — that is what lets the tests break a table
+    // and see this bite.
+    let upgraded_from = |kind: BuildingKind| {
+        t.buildings
+            .iter()
+            .find(|r| r.upgrades_to == Some(kind))
+            .map(|r| r.kind)
+    };
+    let placeable = |kind: BuildingKind| upgraded_from(kind).is_none();
+
+    for race in ALL_RACES {
+        let units: Vec<&UnitRow> = t.units.iter().filter(|r| has_unit(race, r.kind)).collect();
+        let buildings: Vec<&BuildingRow> = t
+            .buildings
+            .iter()
+            .filter(|r| has_building(race, r.kind))
+            .collect();
+        let with_role = |role: UnitRole| -> Vec<UnitKind> {
+            units.iter().filter(|r| r.role == role).map(|r| r.kind).collect()
+        };
+        let b_with_role = |role: BuildingRole| -> Vec<BuildingKind> {
+            buildings
+                .iter()
+                .filter(|r| r.role == role)
+                .map(|r| r.kind)
+                .collect()
+        };
+
+        // 1. exactly one worker
+        let workers = with_role(UnitRole::Worker);
+        if workers.len() != 1 {
+            p.push(format!(
+                "race {race:?}: has {} units with role Worker ({workers:?}), expected exactly 1",
+                workers.len()
+            ));
+        }
+
+        // 2/3. exactly one placeable hall, and a three-rung ladder above it
+        let halls = b_with_role(BuildingRole::Hall);
+        let roots: Vec<BuildingKind> = halls.iter().copied().filter(|k| placeable(*k)).collect();
+        if roots.len() != 1 {
+            p.push(format!(
+                "race {race:?}: has {} PLACEABLE Hall buildings ({roots:?}), expected exactly 1 \
+                 — the opening position and every expansion are placed by kind",
+                roots.len()
+            ));
+        }
+        for &root in &roots {
+            let mut rungs = 1;
+            let mut current = root;
+            while let Some(next) = t.buildings[current as usize].upgrades_to {
+                rungs += 1;
+                current = next;
+                if rungs > ALL_BUILDING_KINDS.len() {
+                    break;
+                }
+            }
+            if rungs < 3 {
+                p.push(format!(
+                    "race {race:?}: hall ladder from {root:?} is {rungs} rung(s) deep, expected 3 \
+                     — TechTier and hero slots are read off the rung"
+                ));
+            }
+            // Every rung of a race's ladder must belong to that race, or the
+            // team tiers up into a building it is not allowed to own.
+            let mut current = root;
+            while let Some(next) = t.buildings[current as usize].upgrades_to {
+                if !has_building(race, next) {
+                    p.push(format!(
+                        "race {race:?}: {current:?} upgrades to {next:?}, which {race:?} may not \
+                         own — a ladder must stay inside its race"
+                    ));
+                    break;
+                }
+                current = next;
+            }
+        }
+
+        // 4. supply beyond the hall
+        if b_with_role(BuildingRole::Supply).is_empty() {
+            p.push(format!(
+                "race {race:?}: no building with role Supply — the race is capped at its hall's \
+                 supply and can never field an army"
+            ));
+        }
+
+        // 5. a production building that actually trains something
+        let production: Vec<BuildingKind> = buildings
+            .iter()
+            .filter(|r| !r.trains.is_empty() && has_building(race, r.kind))
+            .map(|r| r.kind)
+            .collect();
+        if production.is_empty() {
+            p.push(format!("race {race:?}: no building trains anything"));
+        }
+
+        // 6. an army that can reach the win condition
+        let can_fight = units.iter().any(|r| {
+            r.role != UnitRole::Worker
+                && r.stats.can_hit_ground
+                && buildings.iter().any(|b| b.trains.contains(&r.kind))
+        });
+        if !can_fight {
+            p.push(format!(
+                "race {race:?}: no trainable non-worker unit that can hit ground — it cannot \
+                 destroy an enemy building, which is the only win condition"
+            ));
+        }
+
+        // 7. the counter-triangle, inside the race
+        let cavalry = with_role(UnitRole::Cavalry);
+        let shock = with_role(UnitRole::Shock);
+        let anti = with_role(UnitRole::AntiCavalry);
+        if !(cavalry.is_empty() && shock.is_empty()) && anti.is_empty() {
+            p.push(format!(
+                "race {race:?}: fields cavalry ({cavalry:?}{shock:?}) but no AntiCavalry — the \
+                 counter-triangle has to hold in the mirror match too"
+            ));
+        }
+        if !anti.is_empty() && cavalry.is_empty() && shock.is_empty() {
+            p.push(format!(
+                "race {race:?}: fields AntiCavalry ({anti:?}) but no cavalry of its own — the \
+                 counter is drawn on classes, so this is only legal if the other race has one"
+            ));
+        }
+        if with_role(UnitRole::Line).is_empty() {
+            p.push(format!("race {race:?}: no unit with role Line"));
+        }
+        if with_role(UnitRole::Ranged).is_empty() {
+            p.push(format!(
+                "race {race:?}: no unit with role Ranged — nothing it fields could answer a flyer"
+            ));
+        }
+
+        // 9. hero classes
+        let heroes: Vec<UnitKind> = units
+            .iter()
+            .filter(|r| matches!(r.role, UnitRole::HeroMelee | UnitRole::HeroSupport))
+            .map(|r| r.kind)
+            .collect();
+        if heroes.is_empty() {
+            p.push(format!("race {race:?}: no hero class"));
+        }
+        if heroes.len() > 3 {
+            p.push(format!(
+                "race {race:?}: {} hero classes ({heroes:?}), but a Castle grants only 3 slots",
+                heroes.len()
+            ));
+        }
+
+        // one forge per race, since research is shared content
+        let forges: Vec<BuildingKind> = t
+            .research_buildings
+            .iter()
+            .copied()
+            .filter(|&k| has_building(race, k))
+            .collect();
+        if forges.len() != 1 {
+            p.push(format!(
+                "race {race:?}: {} research buildings ({forges:?}), expected exactly 1 — the \
+                 ladders are shared, the forge is not",
+                forges.len()
+            ));
+        }
+    }
+
+    // 8. coherent trainers and gates, checked once over the whole table.
+    for row in &t.buildings {
+        for &unit in &row.trains {
+            let unit_row = &t.units[unit as usize];
+            let reachable = ALL_RACES.into_iter().any(|race| {
+                has_building(race, row.kind) && has_unit(race, unit)
+            });
+            if !reachable {
+                p.push(format!(
+                    "buildings.ron/{:?}: trains {:?}, but no race can both build the trainer and \
+                     field the unit ({:?} vs {:?})",
+                    row.kind, unit, row.races, unit_row.races
+                ));
+            }
+        }
+    }
+    for row in &t.units {
+        for &req in &row.requires {
+            for race in ALL_RACES {
+                if has_unit(race, row.kind) && !has_building(race, req) {
+                    p.push(format!(
+                        "units.ron/{:?}: requires {req:?}, which race {race:?} may not build — \
+                         a gate its own race cannot open is a unit nobody can train",
+                        row.kind
+                    ));
+                }
+            }
+        }
+    }
+    for row in &t.buildings {
+        for &req in &row.requires {
+            for race in ALL_RACES {
+                if has_building(race, row.kind) && !has_building(race, req) {
+                    p.push(format!(
+                        "buildings.ron/{:?}: requires {req:?}, which race {race:?} may not build",
+                        row.kind
+                    ));
+                }
             }
         }
     }
@@ -911,8 +1198,8 @@ pub fn building_abilities(kind: BuildingKind) -> &'static [AbilityDef] {
         .unwrap_or(&[])
 }
 
-pub fn research_building() -> BuildingKind {
-    tables().research_building
+pub fn research_buildings() -> &'static [BuildingKind] {
+    &tables().research_buildings
 }
 
 pub fn research_ladder(kind: ResearchKind) -> (&'static str, &'static str, &'static str) {
@@ -976,7 +1263,7 @@ mod tests {
     fn a_missing_row_is_reported_by_name() {
         let mut problems = Vec::new();
         let rows: Vec<UnitRow> = ron::from_str(
-            r#"[(kind: Worker, name: "Worker", description: "d", requires: [], stats: (
+            r#"[(kind: Worker, name: "Worker", description: "d", role: Worker, requires: [], stats: (
                 cost_gold: 1, cost_lumber: 0, supply: 1, hp: 1.0, damage: 1.0, range: 1.0,
                 attack_cooldown: 1.0, speed: 1.0, train_time: 1.0, projectile: false,
                 vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
@@ -1005,7 +1292,7 @@ mod tests {
     #[test]
     fn a_duplicate_row_is_reported() {
         let mut problems = Vec::new();
-        let one = r#"(kind: Worker, name: "Worker", description: "d", requires: [], stats: (
+        let one = r#"(kind: Worker, name: "Worker", description: "d", role: Worker, requires: [], stats: (
             cost_gold: 1, cost_lumber: 0, supply: 1, hp: 1.0, damage: 1.0, range: 1.0,
             attack_cooldown: 1.0, speed: 1.0, train_time: 1.0, projectile: false,
             vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
@@ -1093,6 +1380,10 @@ mod tests {
                 // The v3 demo row, dev-gated and thrown for the same reason
                 // Slow is: a nuke you cannot aim is a nuke you stand inside.
                 (concat!("Frost", "Nova"), AbilityTarget::Point { range: 9.0 }),
+                // The Horde's caster spell, thrown for the mirror-image
+                // reason: a buff you can only cast on your own feet is a
+                // caster standing in the melee it is buffing.
+                ("Bloodlust", AbilityTarget::Point { range: 8.0 }),
             ],
             "only a genuinely THROWN row should spell out a geometry; every \
              other row must be riding the `Caster` default"
@@ -1564,6 +1855,122 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // v3: races
+    // -----------------------------------------------------------------------
+
+    /// **Every shipped race has a complete tree.** This is the validator that
+    /// the second race exists to justify: a roster is a promise that a team can
+    /// play the whole game with it, and every way of breaking that promise is a
+    /// missing ROW, which means it is checkable here rather than discoverable
+    /// in a match where one side never builds a farm.
+    #[test]
+    fn every_race_has_a_complete_tree() {
+        let tables = load_for_test();
+        assert!(check_races(&tables).is_empty(), "{:?}", check_races(&tables));
+        // ...and the shipped tables really do describe two distinct rosters,
+        // rather than one race and a set of rows nobody can reach.
+        for race in ALL_RACES {
+            let mine: Vec<UnitKind> = ALL_UNIT_KINDS
+                .into_iter()
+                .filter(|&k| crate::shared::race_has_unit(race, k))
+                .collect();
+            assert!(mine.len() >= 8, "{race:?} fields only {} kinds", mine.len());
+        }
+    }
+
+    /// **And it bites.** Each case below is a roster that would produce a
+    /// broken match rather than a crash — the failure mode a startup panic is
+    /// worth having — so each is broken deliberately and the report must name
+    /// it.
+    #[test]
+    fn an_incomplete_race_tree_is_refused_by_name() {
+        // (what we break, how, the phrase the report must contain)
+        type Break = fn(&mut Tables);
+        let cases: Vec<(&str, Break, &str)> = vec![
+            (
+                "a race with no worker",
+                |t| t.units[UnitKind::Peon as usize].races = vec![Race::Kingdom],
+                "role Worker",
+            ),
+            (
+                "a race with two workers",
+                |t| t.units[UnitKind::Peon as usize].races = vec![],
+                "role Worker",
+            ),
+            (
+                "a hall ladder cut short",
+                |t| t.buildings[BuildingKind::Fortress as usize].upgrades_to = None,
+                "rung(s) deep",
+            ),
+            (
+                "a race with no supply building",
+                |t| t.buildings[BuildingKind::Burrow as usize].role = BuildingRole::Defense,
+                "role Supply",
+            ),
+            (
+                // Not "empty the production building": a HALL trains too
+                // (workers and heroes), so a race with an empty WarCamp still
+                // trains *something*. The role a hall cannot cover is the one
+                // worth checking.
+                "a race with no ranged unit",
+                |t| t.units[UnitKind::Headhunter as usize].races = vec![Race::Kingdom],
+                "role Ranged",
+            ),
+            (
+                "a race with cavalry and no answer to it",
+                |t| t.units[UnitKind::Impaler as usize].races = vec![Race::Kingdom],
+                "no AntiCavalry",
+            ),
+            (
+                "a race with two placeable halls",
+                |t| t.buildings[BuildingKind::TownHall as usize].races = vec![],
+                "PLACEABLE Hall",
+            ),
+            (
+                "a unit gated on a building its own race cannot build",
+                |t| t.buildings[BuildingKind::Fortress as usize].races = vec![Race::Kingdom],
+                "may not build",
+            ),
+            (
+                "a race with no forge",
+                |t| t.buildings[BuildingKind::WarMill as usize].races = vec![Race::Kingdom],
+                "research buildings",
+            ),
+        ];
+        for (what, break_it, phrase) in cases {
+            let mut broken = load_for_test();
+            break_it(&mut broken);
+            let problems = check_races(&broken);
+            assert!(
+                problems.iter().any(|m| m.contains(phrase)),
+                "{what}: expected a complaint containing {phrase:?}, got {problems:?}"
+            );
+        }
+    }
+
+    /// The two rosters are DISJOINT except where a row says otherwise, and the
+    /// one shared row is the Shop. A vendor is not a faction trait; a barracks
+    /// is.
+    #[test]
+    fn the_rosters_overlap_only_where_a_row_says_neutral() {
+        let shared: Vec<BuildingKind> = ALL_BUILDING_KINDS
+            .into_iter()
+            .filter(|&k| {
+                ALL_RACES
+                    .into_iter()
+                    .all(|r| crate::shared::race_has_building(r, k))
+            })
+            .collect();
+        assert_eq!(shared, vec![BuildingKind::Shop]);
+        assert!(
+            !ALL_UNIT_KINDS.into_iter().any(|k| ALL_RACES
+                .into_iter()
+                .all(|r| crate::shared::race_has_unit(r, k))),
+            "no unit is neutral today; if one becomes so, say why here"
+        );
+    }
+
     /// A fresh parse of the shipped files, for tests that need to break one.
     fn load_for_test() -> Tables {
         let mut problems = Vec::new();
@@ -1615,7 +2022,7 @@ mod tests {
             unit_autocast: Vec::new(),
             building_abilities: Vec::new(),
             items,
-            research_building: research_file.building,
+            research_buildings: research_file.buildings,
             research_ladders,
             research_steps: research_file.steps,
         }

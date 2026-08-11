@@ -557,6 +557,358 @@ fn setup_economy_assets(
         ],
     );
 
+    // =======================================================================
+    // Horde
+    // =======================================================================
+    // One silhouette rule governs every block below, so the individual blocks
+    // can stay terse. The Kingdom is RECTILINEAR AND VERTICAL: square keeps,
+    // prism roofs, spires, straight shafts — right angles stacked upward. The
+    // Horde is LOW, WIDE AND ANGULAR: squat masses under tapered cone roofs,
+    // slabs pitched off-axis, stakes and totems where the Kingdom puts spires.
+    // The point is a scouting one. A player sweeping the camera over a base
+    // must be able to say "that is not mine" before reading a single shape in
+    // detail, and team tint cannot carry that alone (it only has three
+    // materials and both races use all three). So the races are separated by
+    // POSTURE — height and taper — which survives at any zoom.
+    //
+    // The three hall rungs still have to read as a ladder among themselves, on
+    // the same terms the TownHall -> Keep -> Castle ladder does: each rung is
+    // visibly taller and heavier than the last (4.6 -> 7.0 -> 9.6 to the roof
+    // tip), while every rung stays under its Kingdom opposite number.
+
+    // --- Stronghold: one squat 8-wide mass under a wide conical roof -------
+    // Tier 1. Fills the whole 8.0 footprint but tops out at 4.6, well under the
+    // TownHall's 7.4 spire: the Horde hall sprawls where the Kingdom's climbs.
+    parts.insert(
+        BuildingKind::Stronghold,
+        vec![
+            Part {
+                mesh: meshes.add(Cuboid::new(8.0, 2.2, 8.0)),
+                tf: Transform::from_xyz(0.0, 1.1, 0.0),
+                mat: 0,
+            },
+            // Cone radius 4.0 is exactly half the footprint — the roof reaches
+            // the walls and no further.
+            Part {
+                mesh: meshes.add(Cone::new(4.0, 2.4)),
+                tf: Transform::from_xyz(0.0, 3.4, 0.0),
+                mat: 1,
+            },
+            // Two stakes driven into the roof line, on the diagonal where the
+            // cone has already fallen away from the corners.
+            Part {
+                mesh: meshes.add(Cone::new(0.3, 1.8)),
+                tf: Transform::from_xyz(3.2, 3.1, 3.2),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Cone::new(0.3, 1.8)),
+                tf: Transform::from_xyz(-3.2, 3.1, -3.2),
+                mat: 2,
+            },
+        ],
+    );
+
+    // --- Fortress: the Stronghold grown a tier, ringed with corner stakes ---
+    // Same 8.0 footprint as the Stronghold, for the Keep's reason: an upgrade
+    // must never demand ground the original did not already hold. The stakes
+    // are the tell that this base has teched, the way the Keep's turrets are.
+    {
+        let mut fortress = vec![
+            Part {
+                mesh: meshes.add(Cuboid::new(8.0, 3.0, 8.0)),
+                tf: Transform::from_xyz(0.0, 1.5, 0.0),
+                mat: 0,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(5.6, 1.8, 5.6)),
+                tf: Transform::from_xyz(0.0, 3.9, 0.0),
+                mat: 1,
+            },
+            // Roof overhangs the upper tier by a shade, so the eave line stays
+            // visible from the camera's angle.
+            Part {
+                mesh: meshes.add(Cone::new(3.0, 2.2)),
+                tf: Transform::from_xyz(0.0, 5.9, 0.0),
+                mat: 2,
+            },
+        ];
+        // Stakes stand on the lower roof, outside the upper tier's 2.8 half
+        // width and inside the 4.0 footprint edge.
+        let stake = meshes.add(Cone::new(0.35, 2.6));
+        for (sx, sz) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+            fortress.push(Part {
+                mesh: stake.clone(),
+                tf: Transform::from_xyz(3.2 * sx, 4.3, 3.2 * sz),
+                mat: 2,
+            });
+        }
+        parts.insert(BuildingKind::Fortress, fortress);
+    }
+
+    // --- Hold: skirted earthwork, four corner totems, big tapered roof -----
+    // Tier 3, and the tallest thing the Horde builds at 9.6 — still short of
+    // the Castle's ~12, which is the race read holding even at the top rung.
+    {
+        let mut hold = vec![
+            // Earth skirt at the full 8.0 footprint: the Castle's curtain wall
+            // answered with a rampart rather than masonry.
+            Part {
+                mesh: meshes.add(Cuboid::new(8.0, 1.2, 8.0)),
+                tf: Transform::from_xyz(0.0, 0.6, 0.0),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(7.0, 3.4, 7.0)),
+                tf: Transform::from_xyz(0.0, 2.9, 0.0),
+                mat: 0,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(4.8, 2.2, 4.8)),
+                tf: Transform::from_xyz(0.0, 5.7, 0.0),
+                mat: 1,
+            },
+            Part {
+                mesh: meshes.add(Cone::new(2.8, 2.8)),
+                tf: Transform::from_xyz(0.0, 8.2, 0.0),
+                mat: 2,
+            },
+        ];
+        // Totems on the skirt corners, clear of the 3.5 half width of the main
+        // mass; the spike caps stop exactly at the 4.0 footprint edge.
+        let totem = meshes.add(Cylinder::new(0.38, 4.6));
+        let spike = meshes.add(Cone::new(0.5, 1.4));
+        for (sx, sz) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+            hold.push(Part {
+                mesh: totem.clone(),
+                tf: Transform::from_xyz(3.5 * sx, 3.5, 3.5 * sz),
+                mat: 0,
+            });
+            hold.push(Part {
+                mesh: spike.clone(),
+                tf: Transform::from_xyz(3.5 * sx, 6.5, 3.5 * sz),
+                mat: 2,
+            });
+        }
+        parts.insert(BuildingKind::Hold, hold);
+    }
+
+    // --- WarCamp: low pen under two pitched hide slabs + flank totem -------
+    // The Barracks' opposite: 6.0 of footprint spent on a 2.4-tall pen with a
+    // ridged roof lashed over it, topping out at 4.2 against the Barracks'
+    // 5.9. The one martial building the Horde has should read as a camp.
+    parts.insert(
+        BuildingKind::WarCamp,
+        vec![
+            // 5.4 rather than the full 6.0, so the totem can stand proud of a
+            // wall instead of being swallowed by it.
+            Part {
+                mesh: meshes.add(Cuboid::new(5.4, 2.4, 5.4)),
+                tf: Transform::from_xyz(0.0, 1.2, 0.0),
+                mat: 0,
+            },
+            // Two slabs pitched off-axis, meeting in a ridge over the middle —
+            // the angular answer to the Barracks' flat roof slab.
+            Part {
+                mesh: meshes.add(Cuboid::new(6.0, 0.35, 3.3)),
+                tf: Transform::from_xyz(0.0, 3.3, 1.35)
+                    .with_rotation(Quat::from_rotation_x(0.55)),
+                mat: 1,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(6.0, 0.35, 3.3)),
+                tf: Transform::from_xyz(0.0, 3.3, -1.35)
+                    .with_rotation(Quat::from_rotation_x(-0.55)),
+                mat: 1,
+            },
+            // Totem lashed to the +X flank, where the Barracks flies a banner.
+            Part {
+                mesh: meshes.add(Cylinder::new(0.2, 3.6)),
+                tf: Transform::from_xyz(2.75, 1.8, 1.9),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Sphere::new(0.35)),
+                tf: Transform::from_xyz(2.75, 3.75, 1.9),
+                mat: 2,
+            },
+        ],
+    );
+
+    // --- Burrow: earth mound with a dark mouth and two spears in it --------
+    // A hole in the ground, not a hut: nothing here clears 2.0, where the Farm
+    // reaches 3.6. That silhouette IS the building's rules text — the Burrow
+    // pays supply like a Farm but sits in the dirt and stabs at whatever walks
+    // past, so it must not read as another barn from across the map.
+    parts.insert(
+        BuildingKind::Burrow,
+        vec![
+            // Radius 2.0 fills the 4.0 footprint exactly: all width, no height.
+            Part {
+                mesh: meshes.add(Cylinder::new(2.0, 0.6)),
+                tf: Transform::from_xyz(0.0, 0.3, 0.0),
+                mat: 0,
+            },
+            Part {
+                mesh: meshes.add(Cone::new(1.8, 1.4)),
+                tf: Transform::from_xyz(0.0, 1.3, 0.0),
+                mat: 0,
+            },
+            // The mouth: accent material set into body-toned earth, so it reads
+            // as a shadowed opening rather than a door.
+            Part {
+                mesh: meshes.add(Cuboid::new(1.3, 0.9, 0.8)),
+                tf: Transform::from_xyz(0.0, 0.45, 1.5),
+                mat: 1,
+            },
+            // Two spears angled out of the mouth — the weak attack, made
+            // visible. Tips stop at z 1.71, inside the footprint.
+            Part {
+                mesh: meshes.add(Cone::new(0.14, 2.0)),
+                tf: Transform::from_xyz(0.5, 1.25, 0.9)
+                    .with_rotation(Quat::from_rotation_x(0.95)),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Cone::new(0.14, 2.0)),
+                tf: Transform::from_xyz(-0.5, 1.25, 0.9)
+                    .with_rotation(Quat::from_rotation_x(0.95)),
+                mat: 2,
+            },
+        ],
+    );
+
+    // --- Watchtower: lashed stake tower with an open platform --------------
+    // Footprint is 3, same as the Tower, but the shaft is 0.9 against the
+    // Tower's 1.4 and is braced by two splayed legs instead of standing
+    // straight: a thing hammered together out of stakes, not built out of
+    // stone. combat.rs fires from y = 5.0 (`TOWER_MUZZLE_HEIGHT`), so the
+    // platform sits at 4.75 and the spears go up around it.
+    parts.insert(
+        BuildingKind::Watchtower,
+        vec![
+            Part {
+                mesh: meshes.add(Cuboid::new(0.9, 4.6, 0.9)),
+                tf: Transform::from_xyz(0.0, 2.3, 0.0),
+                mat: 0,
+            },
+            // Splayed legs: feet at x ±1.2, inside the 1.5 footprint edge.
+            Part {
+                mesh: meshes.add(Cuboid::new(0.22, 3.6, 0.22)),
+                tf: Transform::from_xyz(0.7, 1.75, 0.0)
+                    .with_rotation(Quat::from_rotation_z(0.22)),
+                mat: 0,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(0.22, 3.6, 0.22)),
+                tf: Transform::from_xyz(-0.7, 1.75, 0.0)
+                    .with_rotation(Quat::from_rotation_z(-0.22)),
+                mat: 0,
+            },
+            // The firing platform, just under the muzzle height.
+            Part {
+                mesh: meshes.add(Cuboid::new(2.4, 0.3, 2.4)),
+                tf: Transform::from_xyz(0.0, 4.75, 0.0),
+                mat: 1,
+            },
+            Part {
+                mesh: meshes.add(Cone::new(0.18, 1.4)),
+                tf: Transform::from_xyz(0.85, 5.6, 0.85),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Cone::new(0.18, 1.4)),
+                tf: Transform::from_xyz(-0.85, 5.6, -0.85),
+                mat: 2,
+            },
+        ],
+    );
+
+    // --- Spirit Lodge: round hut under a broad conical thatch + totem ------
+    // The exact inverse of the Sanctum it answers: the Sanctum is the narrowest
+    // TALL thing on the field (6.6 to its floating capstone), the Lodge a wide
+    // low cone stopping at 4.9. Both still have to be legible from across the
+    // map for the same reason — seeing one means casters are coming.
+    parts.insert(
+        BuildingKind::SpiritLodge,
+        vec![
+            Part {
+                mesh: meshes.add(Cylinder::new(1.9, 2.0)),
+                tf: Transform::from_xyz(0.0, 1.0, 0.0),
+                mat: 0,
+            },
+            // Radius 2.5 is the whole 5.0 footprint: the thatch overhangs the
+            // hut on every side, which is what makes the shape read as squat.
+            Part {
+                mesh: meshes.add(Cone::new(2.5, 1.8)),
+                tf: Transform::from_xyz(0.0, 2.9, 0.0),
+                mat: 1,
+            },
+            Part {
+                mesh: meshes.add(Cone::new(0.25, 1.1)),
+                tf: Transform::from_xyz(0.0, 4.35, 0.0),
+                mat: 2,
+            },
+            // Fetish pole through the eave — the caster tell at ground level,
+            // where the Sanctum puts a hovering cube overhead.
+            Part {
+                mesh: meshes.add(Cylinder::new(0.2, 3.4)),
+                tf: Transform::from_xyz(2.2, 1.7, 0.0),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Sphere::new(0.35)),
+                tf: Transform::from_xyz(2.2, 3.55, 0.0),
+                mat: 2,
+            },
+        ],
+    );
+
+    // --- WarMill: low forge under a single-pitch roof + leaning stack ------
+    // Same 5.0 footprint and the same job as the Blacksmith, and distinguished
+    // from it exactly the way the Blacksmith is distinguished from the
+    // Workshop — by the stack. The Blacksmith's chimney is broad, vertical and
+    // the tallest thing in a Kingdom base at ~6.0; the WarMill's leans, and
+    // stops at 4.8. Nothing about this building stands up straight.
+    parts.insert(
+        BuildingKind::WarMill,
+        vec![
+            Part {
+                mesh: meshes.add(Cuboid::new(4.2, 2.0, 4.2)),
+                tf: Transform::from_xyz(0.0, 1.0, 0.0),
+                mat: 0,
+            },
+            // One pitched slab instead of a flat roof slab: the whole roof
+            // slopes one way, which is the read at any zoom.
+            Part {
+                mesh: meshes.add(Cuboid::new(4.8, 0.4, 4.6)),
+                tf: Transform::from_xyz(0.0, 2.4, 0.0)
+                    .with_rotation(Quat::from_rotation_x(-0.35)),
+                mat: 1,
+            },
+            // The stack, tipped off vertical and punched through the roof.
+            Part {
+                mesh: meshes.add(Cylinder::new(0.5, 3.2)),
+                tf: Transform::from_xyz(-1.3, 3.3, -1.3)
+                    .with_rotation(Quat::from_rotation_z(0.28)),
+                mat: 2,
+            },
+            Part {
+                mesh: meshes.add(Cuboid::new(1.3, 0.28, 1.3)),
+                tf: Transform::from_xyz(-1.74, 4.84, -1.3)
+                    .with_rotation(Quat::from_rotation_z(0.28)),
+                mat: 1,
+            },
+            // Slag heap spilling out of the far corner, half sunk in the
+            // ground — the Blacksmith's tidy anvil-on-a-stump, gone feral.
+            Part {
+                mesh: meshes.add(Sphere::new(0.45)),
+                tf: Transform::from_xyz(2.0, 0.3, 2.0),
+                mat: 2,
+            },
+        ],
+    );
+
     let mut team_mats: HashMap<Team, [Handle<StandardMaterial>; 3]> = HashMap::new();
     let mut wall_mats: HashMap<Team, [Handle<StandardMaterial>; 3]> = HashMap::new();
     for team in [Team::Human, Team::Claude] {
@@ -1358,6 +1710,7 @@ fn build_sites(
     mut workers: Query<(Entity, &Transform, &Team, &mut BuildSite, Option<&MoveTo>)>,
     // Tech tree: only FINISHED buildings count toward requirements.
     completed: Query<(&Building, &Team), Without<UnderConstruction>>,
+    races: Res<Races>,
 ) {
     let owned = completed_kinds(&completed);
 
@@ -1374,8 +1727,15 @@ fn build_sites(
             // hands: the Barracks that unlocked this Tower may have died while
             // the worker walked over. Unmet -> refuse, exactly like being broke.
             let tech_ok = requirements_met(building_requires(site.kind), owned_by(&owned, *team));
+            // ...and so is the ROSTER, at the same one place money changes
+            // hands. The build card only ever offers a team its own race and
+            // the intent compiler refuses the rest with an error string, but
+            // this is the check that makes those two a convenience rather than
+            // the rule: nothing anywhere can spend a Horde bank on a Barracks.
+            let race_ok = race_has_building(races.get(*team), site.kind);
             let paid = free
                 && tech_ok
+                && race_ok
                 && economies
                     .get_mut(*team)
                     .pay(stats.cost_gold, stats.cost_lumber);
@@ -1444,7 +1804,7 @@ fn harvest_loop(
         // "Dangerous to a worker" means it can actually shoot one. Flyers that
         // strafe the ground count and will chase a crew off a mine like
         // anything else; a hypothetical air-only interceptor would not.
-        .filter(|(_, _, u)| u.kind != UnitKind::Worker && unit_stats(u.kind).can_hit_ground)
+        .filter(|(_, _, u)| !is_worker_kind(u.kind) && unit_stats(u.kind).can_hit_ground)
         .map(|(tf, t, _)| (tf.translation, *t))
         .collect();
 
