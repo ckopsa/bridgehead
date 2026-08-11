@@ -100,6 +100,8 @@ mutation — from either seat — becomes a `shared::Intent` and is applied by
 - **docs/FOG.md** — one rule of knowability, computed once, rendered three times.
 - **docs/TEMPO.md** — why command latency exists and what it taxes.
 - **docs/ARENA.md** — the dogfooding ledger and how a round is run safely.
+- **docs/ITERATION.md** — the loop that produces all of this: roles, decision rules,
+  and the artifacts of iterating on the game.
 - **tools/COMMANDER_BRIEF.md** — the wire protocol as its users read it.
 - **THESIS.md** — why the project exists.
 
