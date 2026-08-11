@@ -1662,6 +1662,16 @@ def parse_when(text, snap=None):
             r"\b(dry|dries|empty|empties|exhausted|depleted|out)\b", t):
         return {"type": "mine_dry"}
 
+    # --- nothing can be trained -------------------------------------------
+    # The other half of "your economy has stopped", and the one arena round 17
+    # asked for by name: BLUE sat at 28/28 supply with 2280 gold banked and
+    # nothing in the snapshot said so out loud. "food" as well as "supply"
+    # because half of RTS says food and the engine says supply, and a
+    # commander should not have to learn which.
+    if re.search(r"\b(supply|food)\b", t) and re.search(
+            r"\b(capped|cap|blocked|block|maxed|max|full|stuck|out)\b", t):
+        return {"type": "supply_capped"}
+
     # --- teching up -------------------------------------------------------
     reached = re.search(r"\b(reach|reached|reaches|hit|hits|get|got|gets|have|has|"
                         r"finish|finished|am|are|is)\b", t)
@@ -1736,6 +1746,8 @@ def name_for(when):
         return "bounty-up"
     if kind == "mine_dry":
         return "mine-dry"
+    if kind == "supply_capped":
+        return "supply-capped"
     if kind == "tier_reached":
         return f"tier{when['tier']}"
     if kind == "unit_count":
@@ -2171,7 +2183,7 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
   whenever / every time / each time       -> REPEATS (45s cooldown by default)
   "... as <name>"   names it;   "... every 90s"   sets the cooldown.
 
-  THE TWELVE PREDICATES (this is the whole list — `shared::TriggerWhen`):
+  THE THIRTEEN PREDICATES (this is the whole list — `shared::TriggerWhen`):
     my base is attacked                 any of your buildings damaged (last 8s)
     my hero drops below 40%             any living hero of yours under that
     squad 2 drops below 50%             that squad's POOLED health under that
@@ -2191,6 +2203,13 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
                                         or the priestess to mean just one
     a bounty appears                    a cache you can see is on the map
     my mine runs dry                    a dry gold mine near one of your halls
+    supply is capped                    no free supply left, COUNTING what is
+                                        already in your production queues — so
+                                        it fires as production stalls, not
+                                        after. "we are supply blocked" and
+                                        "food capped" reach it too. Pair it
+                                        with `build ... Farm` and your economy
+                                        unsticks itself while you read
     we reach tier 2                     your tech tier (1/2/3)
     we have 8 footmen                   your living count of one unit kind
     the clock passes 6 minutes          game time
@@ -2249,7 +2268,7 @@ def report(result, stream):
         # CONDITION is outside `TriggerWhen`. The old watch-the-feed advice is
         # exactly right for that case and nothing else, so it lives here.
         print(f"  deferred {clause!r:<44} -> no predicate matches {cond!r} "
-              f"(see --explain for the eleven); watch `events` for it, then run:",
+              f"(see --explain for the thirteen); watch `events` for it, then run:",
               file=stream)
         print(f"           intent_compile.py --seat <SEAT> --send "
               f"{suggestion!r}" if suggestion else

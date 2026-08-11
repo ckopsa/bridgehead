@@ -2571,7 +2571,7 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
         //
         // This is a PRESET, not an authoring surface, and the asymmetry is
         // real and documented (docs/INTENT.md § Triggers): a commander can
-        // write any of nine predicates against any of the 29 verbs, and the
+        // write any of thirteen predicates against any of the 29 verbs, and the
         // human at the keyboard gets one canned rule plus a readout. What
         // closes most of the gap is that the English compiler speaks the same
         // sentences to the same wire.
@@ -10341,7 +10341,7 @@ mod tests {
     /// second of those is byte-identical to the JSON in COMMANDER_BRIEF.md's
     /// home-guard recipe. This is the fairness invariant applied to the newest
     /// verb in the language: the human's surface is *narrower* (one preset
-    /// against eleven predicates and 29 verbs), but nothing it produces is
+    /// against thirteen predicates and 29 verbs), but nothing it produces is
     /// outside what the wire can say, and nothing the wire says is outside what
     /// the engine will do for the human.
     #[test]

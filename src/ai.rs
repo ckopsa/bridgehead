@@ -1352,10 +1352,11 @@ fn think(
     }
 
     let eco = *economies.get(me);
-    // Free supply, pessimistically counting units already in production.
-    let mut headroom = eco
-        .supply_cap
-        .saturating_sub(eco.supply_used + queued_supply);
+    // Free supply, pessimistically counting units already in production. The
+    // shared definition, because `supply_capped` (trigger.rs) now asks the same
+    // question and a script that disagreed with the predicate about what
+    // "blocked" means would be two economies in one game.
+    let mut headroom = supply_headroom(&eco, queued_supply);
     let mut gold = eco.gold;
     let mut lumber = eco.lumber;
 

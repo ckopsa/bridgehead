@@ -74,6 +74,43 @@
 //! the owner's event feed. Nothing is ever skipped, and a plan never lies about
 //! where it is.
 //!
+//! ## Transitions are announced; states are displayed
+//!
+//! **The retry is a cadence. The announcement is an event. Round 17 conflated
+//! them and lost a match to it.**
+//!
+//! A blocked step re-submits every [`PLAN_RETRY_S`] for a whole minute, and it
+//! should — the dominant refusal is timing, and retrying is how a plan survives
+//! forty gold of bad luck. But every one of those re-submissions used to be
+//! compiled into the same refusal and appended to the seat's `errors` array,
+//! the replay log and the journal afresh. BLUE's `army` plan sat on `cannot
+//! afford Footman (135g 0l)`; `tools/bridge_wait.py` woke on each copy; the
+//! commander's event loop became a fire hose; they escaped it by chaining waits
+//! and went ~100 game seconds without an order, with 2280 gold banked. See
+//! `arena/r17/blue-aar.md`, complaint 1: *"that punished me for using the
+//! feature well."*
+//!
+//! So a plan speaks on **edges**:
+//!
+//!   * once entering `blocked`, with the reason;
+//!   * once more if the reason CHANGES to different words, because that is a
+//!     different problem with a different answer;
+//!   * once as `plan <name> step k/n unblocked` when it recovers;
+//!   * once on `halted`.
+//!
+//! and nothing in between. The condition is not hidden while it is quiet — it
+//! is in [`PlanRun::status`], which every snapshot carries and which reads
+//! `blocked: <why>` for exactly as long as it is true. That is the right
+//! rendering for a *state*: level-triggered, always available, never shouting.
+//! `errors` and the feed are for things that just *happened*.
+//!
+//! Two of those four lines are emitted here; the suppression that makes the
+//! silence real is in intent.rs, where the compiler asks [`Plans::report`] for
+//! a [`PlanVerdict`] and drops a `BlockedAgain` before any channel sees it.
+//! The unblock line has to be here, because `report` runs inside the compiler
+//! where there is no event feed — it leaves `told_blocked` set as the debt, and
+//! the next sweep pays it.
+//!
 //! **What counts as refused is narrower than "produced an error".** The
 //! compiler routinely reports a dead id and orders the survivors anyway —
 //! `own_units` is built that way on purpose — so `move [a,b]` with `b` a corpse
@@ -191,6 +228,30 @@ fn step_one(
     let Some(step) = plan.current().cloned() else {
         return;
     };
+
+    // 0. **The other edge.** A plan that announced a block and is running
+    //    again owes its owner one line, and this is the only place it can be
+    //    said: `Plans::report` learns the news inside the compiler, where
+    //    there is no feed, and leaves `told_blocked` set as the debt.
+    //
+    //    Without it, edge-emission would be a trap rather than a courtesy — a
+    //    commander told once that the army plan is stuck on gold, and never
+    //    told it came unstuck, would have to poll `plans[].status` to find out,
+    //    which is the polling this whole module exists to delete. One line in,
+    //    one line out.
+    //
+    //    First, so it lands before the advance below can announce step k+1:
+    //    "unblocked" then "step 4/8: ..." is the order the two things happened.
+    if plan.told_blocked && matches!(plan.state, PlanState::Running) {
+        plan.told_blocked = false;
+        feed.push(
+            me,
+            now,
+            format!("plan {stamp} unblocked"),
+            EventSeverity::Info,
+            None,
+        );
+    }
 
     // 1. The step has not gone out yet. Send it, and say so — both renderers,
     //    one producer, exactly as a fired trigger does. Without this line a
@@ -329,6 +390,9 @@ mod tests {
             // `TriggerWorld` reads it: a plan step may advance on `enemy_in`,
             // which asks about a named place.
             .init_resource::<Regions>()
+            // Same reason, one predicate along: a step may advance on
+            // `supply_capped`, which asks the ledger.
+            .init_resource::<Economies>()
             .init_resource::<TechTiers>()
             .init_resource::<GameEvents>()
             .add_event::<SubmitIntent>()
@@ -1349,6 +1413,194 @@ mod tests {
         );
         assert!(!now.applied, "nor accepted by its acceptance");
         assert!(!now.submitted, "and it still has its own step 1 to send");
+    }
+
+    /// **Arena round 17, as a test.** A step blocked on money for half a
+    /// minute of retries says so exactly ONCE — on both channels — and says
+    /// exactly one more thing when the money arrives.
+    ///
+    /// The incident: BLUE's `army` plan sat on `cannot afford Footman (135g
+    /// 0l)`, the compiler re-appended that string to the seat's `errors` array
+    /// every `PLAN_RETRY_S`, `bridge_wait` woke on every one of them, and the
+    /// commander escaped the fire hose by chaining waits — going ~100 game
+    /// seconds without an order and losing the match in the gap. The retry
+    /// cadence was never the bug. Re-announcing a verdict the reader already
+    /// had was.
+    ///
+    /// So this asserts the shape rather than a string: one emission per
+    /// TRANSITION, on the seat's `errors` array and on its event feed, with
+    /// the sticky `plans[].status` carrying the condition continuously in
+    /// between — which is what a reader consults, and what makes staying quiet
+    /// honest rather than merely silent.
+    #[test]
+    fn a_step_blocked_for_thirty_seconds_of_retries_is_announced_exactly_once() {
+        let mut app = full_app();
+        // A real Barracks, done, with a real queue — so the refusal below is
+        // the affordability check and not a lookup failure.
+        let barracks = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Human,
+                Transform::from_xyz(0.0, 0.0, 0.0),
+                Health::new(700.0),
+                TrainingQueue::default(),
+            ))
+            .id();
+        // Broke, exactly as BLUE was.
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let eco = economies.get_mut(Team::Human);
+            eco.gold = 0;
+            eco.lumber = 0;
+        }
+
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: serde_json::from_str(&format!(
+                r#"{{"type":"plan_set","name":"army","steps":[
+                     {{"intent":{{"type":"train","building":{},"unit":"Footman"}}}},
+                     {{"intent":{{"type":"posture","id":1,
+                                  "posture":{{"type":"push","x":70.0,"z":70.0}}}}}}]}}"#,
+                barracks.to_bits()
+            ))
+            .expect("parses"),
+            trigger: None,
+            plan: None,
+        });
+        app.update();
+
+        fn blocked_errors(app: &App) -> Vec<String> {
+            app.world()
+                .resource::<IntentErrors>()
+                .get(Team::Human)
+                .iter()
+                .filter(|e| e.contains("cannot afford"))
+                .cloned()
+                .collect()
+        }
+        fn feed_lines(app: &App, needle: &str) -> Vec<String> {
+            app.world()
+                .resource::<GameEvents>()
+                .feed(Team::Human)
+                .iter()
+                .filter(|e| e.message.contains(needle))
+                .map(|e| e.message.clone())
+                .collect()
+        }
+
+        // Thirty seconds of a 4 Hz evaluator: six retries at PLAN_RETRY_S=5,
+        // and 120 sweeps that could each have said something.
+        for _ in 0..120 {
+            advance_clock(&mut app, 0.25);
+            app.update();
+            // The status is readable the WHOLE time — this is the half of the
+            // bargain that makes silence honest. A commander that wants to know
+            // reads it; it is simply not shouted at.
+            assert!(
+                app.world().resource::<Plans>().get(Team::Human)[0]
+                    .status()
+                    .starts_with("blocked: cannot afford Footman"),
+                "the sticky status carries the condition between transitions, got {:?}",
+                app.world().resource::<Plans>().get(Team::Human)[0].status()
+            );
+        }
+
+        assert_eq!(
+            blocked_errors(&app).len(),
+            1,
+            "ONE refusal in the seat's errors array across 30s of retries, got {:?}",
+            blocked_errors(&app)
+        );
+        assert_eq!(
+            feed_lines(&app, "blocked:").len(),
+            1,
+            "and one on the event feed, got {:?}",
+            feed_lines(&app, "blocked:")
+        );
+        assert_eq!(at(&app), 0, "still on the step it cannot afford");
+
+        // The retries never stopped — that half is unchanged, and it is what
+        // lets the plan recover the moment the money lands.
+        let before = app.world().resource::<Plans>().get(Team::Human)[0].last_try;
+        assert!(before > 25.0, "it was still trying at t={before}");
+
+        // The gold arrives.
+        app.world_mut()
+            .resource_mut::<Economies>()
+            .get_mut(Team::Human)
+            .gold = 500;
+        for _ in 0..40 {
+            advance_clock(&mut app, 0.25);
+            app.update();
+        }
+
+        assert_eq!(
+            feed_lines(&app, "unblocked"),
+            vec!["plan army step 1/2 unblocked".to_string()],
+            "one line out, naming the step that came unstuck"
+        );
+        assert_eq!(
+            blocked_errors(&app).len(),
+            1,
+            "and no new refusal was invented on the way out"
+        );
+        assert_eq!(at(&app), 1, "the plan carried on where it stopped");
+        assert!(
+            app.world()
+                .entity(barracks)
+                .get::<TrainingQueue>()
+                .is_some_and(|q| q.queue.contains(&UnitKind::Footman)),
+            "the step it was blocked on really ran"
+        );
+    }
+
+    /// A refusal that CHANGES its words is a different problem, so it is news
+    /// again — the edge-emission rule is about repeats, not about volume.
+    ///
+    /// This is the failure mode that would make the r17 fix worse than the
+    /// bug: a commander told "cannot afford Footman", acting on it, and never
+    /// told that the reason is now "training queue full" would be reading a
+    /// stale diagnosis right up until the plan halted on a different one.
+    #[test]
+    fn a_refusal_that_changes_its_words_is_news_again() {
+        let mut app = plan_app();
+        app.world_mut()
+            .resource_mut::<Plans>()
+            .get_mut(Team::Human)
+            .push(plan(vec![
+                step(stop(), PlanAdvance::OnApplied),
+                step(stop(), PlanAdvance::OnApplied),
+            ]));
+        app.update();
+
+        fn blocked_lines(app: &App) -> Vec<String> {
+            app.world()
+                .resource::<GameEvents>()
+                .feed(Team::Human)
+                .iter()
+                .filter(|e| e.message.contains("blocked:"))
+                .map(|e| e.message.clone())
+                .collect()
+        }
+
+        for _ in 0..8 {
+            refuse(&mut app, "not enough gold");
+            advance_clock(&mut app, 1.0);
+            app.update();
+        }
+        assert_eq!(blocked_lines(&app).len(), 1, "one reason, one line");
+
+        for _ in 0..8 {
+            refuse(&mut app, "the site is blocked");
+            advance_clock(&mut app, 1.0);
+            app.update();
+        }
+        let lines = blocked_lines(&app);
+        assert_eq!(lines.len(), 2, "a new reason is a new line: {lines:?}");
+        assert!(lines[1].contains("the site is blocked"));
     }
 
     /// A step the compiler really refuses, through the real compiler: the plan

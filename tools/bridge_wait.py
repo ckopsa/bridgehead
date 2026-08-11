@@ -4,16 +4,112 @@
 Usage: bridge_wait.py --seat bridge/red [--max 15]
 
 Polls the seat's state.json once a second for up to --max seconds, returning
-EARLY the moment something noteworthy appears: a new event, a new error, or
+EARLY the moment something noteworthy appears: a new event, a NEW error, or
 game over. Prints why it woke. Use instead of a blind sleep so reactions to
 attacks and bounty spawns take ~2s, not a full cycle.
 
 Uses its own marker (separate from bridge_view's) so the two never fight over
 read position: this tool decides WHEN to look, bridge_view decides WHAT is new.
+
+## Novelty, and why `errors` needed its own kind of it
+
+Events were always edge-triggered: the marker remembers the game time `t` of
+the last state this tool woke on, and only events stamped later than that
+count. `errors` had no such test — a non-empty array woke the tool, every call,
+for as long as the array stayed non-empty. That is fine for the case it was
+written for (a batch's refusals, which arrive once and are cleared when the
+next batch lands) and wrong for the case that actually happened.
+
+Arena round 17: a plan step blocked on `cannot afford Footman (135g 0l)` kept
+that string in the seat's `errors` array, so `bridge_wait` returned instantly on
+every call. The commander's loop became a fire hose, they chained waits to get
+away from it, went ~100 game-seconds without issuing an order, and lost. The
+engine side of that is fixed (plan.rs emits transitions, not repeats), but a
+pacing tool that trusts its input to be well-behaved is one bad channel away
+from the same failure. So the novelty test lives here too, and it is the same
+test the events channel already applies, spelled for a channel with no
+timestamps: a **content fingerprint of the error SET**, remembered in the same
+marker file.
+
+  * an identical error, re-emitted or merely still standing → no wake;
+  * any error the last-seen set did not contain → wake;
+  * the set emptying and later refilling with the same error → wake, because
+    the fingerprint of an empty set is not the fingerprint of that error.
+
+A set rather than a list: the same two refusals in the other order is the same
+news. Belt and braces with the engine fix, deliberately — the two defend
+against different mistakes, and the cheap one lives on this side.
 """
+import hashlib
 import json
 import sys
 import time
+
+#: Marker schema version. Bumping it is how a future change to what gets
+#: remembered invalidates stale markers instead of misreading them.
+MARKER_VERSION = 2
+
+
+def fingerprint(errors):
+    """A stable digest of an error SET.
+
+    Empty in, empty out — so "no errors" is a distinguishable state rather
+    than a hash that happens to collide with nothing, and a returning error
+    reads as a change.
+    """
+    unique = sorted({str(e) for e in (errors or [])})
+    if not unique:
+        return ""
+    return hashlib.sha1("\n".join(unique).encode("utf-8")).hexdigest()
+
+
+def read_marker(path):
+    """`(t, errors_fingerprint)` from the marker, tolerantly.
+
+    Accepts the pre-v2 format — a bare float, and nothing else — so a marker
+    written by an older checkout degrades to "events as before, no error
+    memory" rather than to a crash or to a spurious first wake.
+    """
+    try:
+        with open(path) as f:
+            raw = f.read().strip()
+    except Exception:
+        return 0.0, ""
+    if not raw:
+        return 0.0, ""
+    try:
+        loaded = json.loads(raw)
+    except Exception:
+        try:
+            return float(raw), ""
+        except ValueError:
+            return 0.0, ""
+    if isinstance(loaded, dict):
+        try:
+            t = float(loaded.get("t", 0.0))
+        except (TypeError, ValueError):
+            t = 0.0
+        return t, str(loaded.get("errors", ""))
+    try:
+        return float(loaded), ""
+    except (TypeError, ValueError):
+        return 0.0, ""
+
+
+def write_marker(path, t, errors_fp):
+    """Remember both halves, always together.
+
+    Every exit writes the CURRENT error fingerprint, including a wake caused by
+    something else entirely. An error that arrived alongside the event that
+    woke us has been delivered — the commander is about to read the whole
+    snapshot — and announcing it again on the next call would be the repeat
+    this tool exists to stop.
+    """
+    try:
+        with open(path, "w") as f:
+            json.dump({"v": MARKER_VERSION, "t": t, "errors": errors_fp}, f)
+    except Exception:
+        pass
 
 
 def main():
@@ -36,41 +132,32 @@ def main():
         except Exception:
             return None
 
-    def last_seen():
-        try:
-            with open(marker) as f:
-                return float(f.read().strip())
-        except Exception:
-            return 0.0
-
-    def remember(t):
-        try:
-            with open(marker, "w") as f:
-                f.write(str(t))
-        except Exception:
-            pass
-
-    seen = last_seen()
+    seen, seen_errors = read_marker(marker)
     deadline = time.monotonic() + max_wait
     while True:
         s = read()
         if s is not None:
+            errors = s.get("errors") or []
+            errors_fp = fingerprint(errors)
             if s.get("game_over"):
-                remember(s["t"])
+                write_marker(marker, s["t"], errors_fp)
                 print(f"WAKE: game over ({s['game_over']})")
                 return
             fresh = [m for t, m in s.get("events", []) if t > seen]
             if fresh:
-                remember(s["t"])
+                write_marker(marker, s["t"], errors_fp)
                 print(f"WAKE after {max_wait - (deadline - time.monotonic()):.0f}s: " + " | ".join(fresh[-4:]))
                 return
-            if s.get("errors"):
-                remember(s["t"])
-                print("WAKE: command errors — " + " | ".join(s["errors"][:3]))
+            # NEW errors only. A blocked plan step that keeps failing the same
+            # way is a condition, not an event — read it off `plans[].status`
+            # when you next look, and do not let it decide your cadence.
+            if errors and errors_fp != seen_errors:
+                write_marker(marker, s["t"], errors_fp)
+                print("WAKE: new command errors — " + " | ".join(errors[:3]))
                 return
         if time.monotonic() >= deadline:
             if s is not None:
-                remember(s["t"])
+                write_marker(marker, s["t"], fingerprint(s.get("errors") or []))
             print(f"WAKE: quiet cycle ({max_wait:.0f}s)")
             return
         time.sleep(1.0)

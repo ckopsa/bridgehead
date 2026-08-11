@@ -603,6 +603,8 @@ def test_every_predicate_has_a_phrase_that_reaches_it():
             {"type": "bounty_spawned"},
         "when my mine runs dry, squad 1 defends our base":
             {"type": "mine_dry"},
+        "when supply is capped, squad 1 defends our base":
+            {"type": "supply_capped"},
         "when we reach tier 2, squad 1 defends our base":
             {"type": "tier_reached", "tier": 2},
         "when we have 8 footmen, squad 1 pushes their base":
@@ -613,6 +615,26 @@ def test_every_predicate_has_a_phrase_that_reaches_it():
     for directive, want in cases.items():
         got = only(compile_one(directive), "trigger_set")["when"]
         assert got == want, f"{directive!r} -> {got}, wanted {want}"
+
+
+def test_supply_capped_answers_to_the_words_a_commander_actually_uses():
+    """The r17 predicate, and the phrasings that must all reach it.
+
+    BLUE's round-17 complaint named two of these verbatim ("supply blocked",
+    "supply_capped"). A predicate that only answered to the wire spelling would
+    have been no use to the commander who asked for it — and "food" is what
+    half of RTS calls the same resource, so it reaches it too.
+    """
+    phrasings = ["when supply is capped, squad 1 defends our base",
+                 "when we are supply blocked, squad 1 defends our base",
+                 "when I am supply capped, squad 1 defends our base",
+                 "when we hit the supply cap, squad 1 defends our base",
+                 "when we are food capped, squad 1 defends our base"]
+    for p in phrasings:
+        got = only(compile_one(p), "trigger_set")["when"]
+        assert got == {"type": "supply_capped"}, f"{p!r} -> {got}"
+    names = {only(compile_one(p), "trigger_set")["name"] for p in phrasings}
+    assert names == {"supply-capped"}, f"one stable auto-name, got {names}"
 
 
 def test_a_bare_enemy_sighting_defaults_to_one():
@@ -816,7 +838,8 @@ def test_explain_lists_the_whole_vocabulary():
                    "every 90s", "whenever", "my base is attacked",
                    "my hero drops below", "squad 2 drops below",
                    "I see 3 or more siege", "a bounty appears",
-                   "my mine runs dry", "we reach tier 2", "we have 8 footmen",
+                   "my mine runs dry", "supply is capped",
+                   "we reach tier 2", "we have 8 footmen",
                    "the clock passes 6 minutes", "Max 8 armed triggers",
                    # Territory: the two verbs, the built-in vocabulary and the
                    # predicate that reads it. A model that cannot see a place
