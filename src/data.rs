@@ -570,15 +570,22 @@ fn check_values(t: &Tables, defs: &[AbilityDef]) -> Vec<String> {
             p.push(format!("{what}: can hit neither air nor ground"));
         }
         // --- the hero price inversion ------------------------------------
-        // Heroes are free to TRAIN and expensive to REVIVE, and both halves
-        // are load-bearing rather than conventional. A hero row that grew a
-        // training cost back would silently restore the thing five arena
-        // rounds proved wrong (nobody buys a 400g hero in a 7-minute game); a
-        // hero row with no revival price would make death free, which is the
-        // whole mechanism. And `unit_value` — the worth `xp_for_kill` and
-        // `asset_score` read — is `revive_*` for heroes and `cost_*` for
-        // everything else, so a non-hero row carrying a revival price would
-        // be a number nothing reads. All three are checked here.
+        // A team's FIRST hero is free and every hero is expensive to REVIVE,
+        // and both halves are load-bearing rather than conventional. A hero
+        // row that grew a training cost back would silently restore the thing
+        // five arena rounds proved wrong (nobody buys a 400g hero in a
+        // 7-minute game); a hero row with no revival price would make death
+        // free, which is the whole mechanism.
+        //
+        // `revive_gold`/`revive_lumber` therefore carry THREE prices that are
+        // deliberately one number: what a revival costs, what a SECOND hero
+        // class costs to field (`shared::hero_train_cost` — the waiver is one
+        // per team, so only the first hero is ever free), and what the body is
+        // worth (`unit_value`, which `xp_for_kill` and `asset_score` read).
+        // `cost_gold`/`cost_lumber` stay pinned at 0 so there is no second
+        // hero price to disagree with them — and so a non-hero row carrying a
+        // revival price would be a number nothing reads. All three are checked
+        // here.
         let hero = matches!(row.role, UnitRole::HeroMelee | UnitRole::HeroSupport);
         if hero {
             if s.cost_gold != 0 || s.cost_lumber != 0 {

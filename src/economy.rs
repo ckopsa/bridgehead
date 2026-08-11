@@ -2202,10 +2202,18 @@ fn training_queues(
         let mut paid_item = paid_state.covers(front);
 
         let stats = unit_stats(front);
+        // Every hero class this team is holding — living heroes plus whatever
+        // an earlier building in THIS pass has already paid for. One list,
+        // asked twice: `hero_train_cost` prices off it and `hero_slot_check`
+        // gates off it, which is how "the second hero in flight is not free"
+        // and "the second hero in flight fills a slot" stay the same fact.
+        let held = is_hero_kind(front)
+            .then(|| held_by(&hero_committed, *team))
+            .unwrap_or_default();
         // Heroes of either class are priced (and timed) by `hero_train_cost`:
-        // full price for the team's first one, revival price afterwards.
+        // free for the team's first ever, full fare for everything after it.
         let (cost_gold, cost_lumber, train_time) = if is_hero_kind(front) {
-            hero_train_cost(&records, *team, front)
+            hero_train_cost(&records, *team, front, &held)
         } else {
             (stats.cost_gold, stats.cost_lumber, stats.train_time)
         };
@@ -2217,7 +2225,6 @@ fn training_queues(
             // one-hero rule gave it. The slot count is read from the team's
             // LIVE tier, so losing the Keep closes the second slot for FUTURE
             // heroes and never confiscates one already standing.
-            let held = held_by(&hero_committed, *team);
             if hero_slot_check(&held, front, tiers.get(*team)) != HeroSlotVerdict::Ok {
                 queue.queue.pop_front();
                 queue.progress = 0.0;
@@ -2248,6 +2255,28 @@ fn training_queues(
             if is_hero_kind(front) {
                 // Later buildings in this same pass must see the commitment.
                 hero_committed.push((*team, front));
+                // The one purchase in the game whose price depends on the
+                // team's history rather than on a table, logged with the
+                // reason it cost what it cost. A tier-up and a research rung
+                // already announce their price here; a hero is dearer than
+                // either, and "was that one free?" was previously a question
+                // no arena log could answer.
+                let why = if records.get(*team, front).is_some() {
+                    "revival, level preserved"
+                } else if cost_gold == 0 && cost_lumber == 0 {
+                    "free — this team's first hero"
+                } else {
+                    "second hero: the free one is already spent"
+                };
+                info!(
+                    "[{:6.1}s] [{:?}] {} fielded at ({:.0},{:.0}) — \
+                     {cost_gold}g {cost_lumber}l ({why})",
+                    time.elapsed_secs(),
+                    team,
+                    kind_name(front),
+                    tf.translation.x,
+                    tf.translation.z,
+                );
             }
         }
 
@@ -2653,5 +2682,139 @@ mod tests {
         tick(&mut app, HERO_REVIVE_TIME + 1.0);
         assert_eq!(queue_len(&app, hall), 0, "paid, and out it comes");
         assert_eq!((gold(&app, team), lumber(&app, team)), (0, 0));
+    }
+
+    /// **The waiver is one per team, and the pay-point is where that is true.**
+    /// A Keep opens a second slot; it does not open a second free hero. The
+    /// first class is standing (queued, in this harness — see the queue-edge
+    /// test below for why that is the same thing), and the second class is
+    /// charged 400g/100l on both rosters.
+    ///
+    /// This is the spike the bead exists to kill: after the hall ladder started
+    /// granting slots, teching to a Keep quietly posted a fully-levelling
+    /// Priestess to your army for nothing.
+    #[test]
+    fn a_second_hero_class_costs_the_full_fielding_price_on_both_rosters() {
+        for (first, second, race) in [
+            (UnitKind::Hero, UnitKind::Priestess, "Kingdom"),
+            (UnitKind::Warchief, UnitKind::FarSeer, "Horde"),
+        ] {
+            let team = Team::Human;
+            let (mut app, hall) = app_with_hall(team, 1000, 1000);
+            // A Keep's worth of slots, which is the only thing that makes a
+            // second hero legal at all.
+            app.world_mut()
+                .resource_mut::<TechTiers>()
+                .set(team, TechTier::T2);
+
+            queue(&mut app, hall, &[first, second]);
+            tick(&mut app, 0.5);
+            assert_eq!(
+                (gold(&app, team), lumber(&app, team)),
+                (1000, 1000),
+                "{race}: the FIRST hero is still free"
+            );
+
+            // Out comes the first — and in the real frame order it is standing
+            // on the map before `training_queues` runs again (`spawn_units` is
+            // in `SimSet::Movement`, which precedes `SimSet::Economy`), so the
+            // harness puts the body down by hand. Nothing else here needs
+            // units.rs.
+            tick(&mut app, unit_stats(first).train_time + 1.0);
+            assert_eq!(queue_len(&app, hall), 1, "{race}: the first one is out");
+            app.world_mut().spawn((
+                Unit { kind: first },
+                Hero::from_record(None),
+                Health::new(100.0),
+                team,
+                Transform::from_translation(Vec3::ZERO),
+            ));
+
+            // Now the second, at full fare.
+            tick(&mut app, 0.5);
+            let s = unit_stats(second);
+            assert_eq!(
+                (gold(&app, team), lumber(&app, team)),
+                (1000 - s.revive_gold, 1000 - s.revive_lumber),
+                "{race}: the second class pays its own fielding price"
+            );
+            assert_eq!(
+                (gold(&app, team), lumber(&app, team)),
+                (600, 900),
+                "{race}: 400g/100l — the same number its revival costs"
+            );
+            // ...on a fresh hero's clock, not a revival's: nothing was bought
+            // back, so `train_time` is what it takes.
+            tick(&mut app, HERO_REVIVE_TIME + 1.0);
+            assert_eq!(
+                queue_len(&app, hall),
+                1,
+                "{race}: a second hero is TRAINED, not revived — full train time"
+            );
+            tick(&mut app, s.train_time);
+            assert_eq!(queue_len(&app, hall), 0, "{race}: and then it finishes");
+        }
+    }
+
+    /// **The queue edge: a first hero still in training has already spent the
+    /// waiver.** It has no `HeroRecord` — nothing has spawned — so the only
+    /// witness to its existence is the in-flight list, and the price rule reads
+    /// that list for the same reason the slot rule does. Two halls queueing a
+    /// hero each in the same breath must not both come out free.
+    #[test]
+    fn a_hero_still_in_training_already_prices_the_next_one() {
+        let team = Team::Claude;
+        let (mut app, hall_a) = app_with_hall(team, 1000, 1000);
+        app.world_mut()
+            .resource_mut::<TechTiers>()
+            .set(team, TechTier::T2);
+        let hall_b = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::TownHall },
+                team,
+                Transform::from_translation(Vec3::new(20.0, 0.0, 0.0)),
+                TrainingQueue::default(),
+                PaidFront(None),
+            ))
+            .id();
+
+        queue(&mut app, hall_a, &[UnitKind::Hero]);
+        queue(&mut app, hall_b, &[UnitKind::Priestess]);
+        tick(&mut app, 0.5);
+
+        // Both are in flight, neither is alive, and no record exists for
+        // either. Exactly one of them was free.
+        assert!(app.world().resource::<HeroRecords>().list(team).is_empty());
+        assert_eq!(
+            (gold(&app, team), lumber(&app, team)),
+            (600, 900),
+            "one free hero and one at 400g/100l — not two free heroes"
+        );
+        assert!(app.world().get::<PaidFront>(hall_a).unwrap().0.is_some());
+        assert!(app.world().get::<PaidFront>(hall_b).unwrap().0.is_some());
+    }
+
+    /// A team whose only hero is DEAD has still had one. The waiver is spent by
+    /// having fielded a hero, not by having one — so a fresh second class after
+    /// a funeral is full fare, and so is buying the dead one back. There is no
+    /// order of operations that gets a team two free heroes.
+    #[test]
+    fn a_dead_first_hero_leaves_no_freebie_behind() {
+        let team = Team::Human;
+        let (mut app, hall) = app_with_hall(team, 1000, 1000);
+        app.world_mut().resource_mut::<HeroRecords>().set(
+            team,
+            HeroRecord { level: 3, xp: 2.0, kind: UnitKind::Hero },
+        );
+        // Nothing is held — the Champion is dead — so the Priestess is legal
+        // even at a TownHall's single slot. She is not, however, free.
+        queue(&mut app, hall, &[UnitKind::Priestess]);
+        tick(&mut app, 0.5);
+        assert_eq!(
+            (gold(&app, team), lumber(&app, team)),
+            (600, 900),
+            "the team has had a hero; the next one is bought"
+        );
     }
 }

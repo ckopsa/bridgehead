@@ -1218,12 +1218,18 @@ fn compile_intent(
             // writing at all: two halls each queuing a Priestess, or one hall
             // queuing three Champions, are both "in flight" and neither is
             // alive yet.
+            //
+            // The same list prices the hero below: a first hero already in a
+            // queue has no record yet, so `held` is the only thing that knows
+            // the team has spent its one free hero (`shared::hero_train_cost`).
+            let mut held: Vec<UnitKind> = Vec::new();
             if is_hero_kind(kind) {
-                let mut held: Vec<UnitKind> = units
-                    .iter()
-                    .filter(|(_, u, t, _, _)| **t == me && is_hero_kind(u.kind))
-                    .map(|(_, u, _, _, _)| u.kind)
-                    .collect();
+                held.extend(
+                    units
+                        .iter()
+                        .filter(|(_, u, t, _, _)| **t == me && is_hero_kind(u.kind))
+                        .map(|(_, u, _, _, _)| u.kind),
+                );
                 for (_, b_team, _, b_queue, _) in buildings.iter() {
                     if *b_team != me {
                         continue;
@@ -1281,21 +1287,35 @@ fn compile_intent(
                 errors.push(format!("{tag}: training queue full ({MAX_QUEUE})"));
                 return;
             }
-            // Hero classes are priced by `hero_train_cost` (full, then
-            // revival) — every hero kind, not just the Champion: pricing
+            // Hero classes are priced by `hero_train_cost` (free once, then
+            // full fare) — every hero kind, not just the Champion: pricing
             // the Priestess off her raw stats let a seat buy a revival at
             // full price (or worse, a first hero cheaply) depending on the
-            // record. `is_hero_kind` is the same test economy.rs charges by.
+            // record. `is_hero_kind` is the same test economy.rs charges by,
+            // and `held` is the same list economy.rs prices with.
             let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
-                let (g, l, _) = hero_train_cost(records, me, kind);
+                let (g, l, _) = hero_train_cost(records, me, kind, &held);
                 (g, l)
             } else {
                 let s = unit_stats(kind);
                 (s.cost_gold, s.cost_lumber)
             };
             if !economies.get(me).can_afford(cost_gold, cost_lumber) {
+                // A hero that costs anything at all is a hero this team is not
+                // fielding for the first time, and a commander who has read
+                // "heroes are free" needs to be told which rule just charged
+                // them rather than left to re-read the brief.
+                let why = if is_hero_kind(kind) {
+                    if records.get(me, kind).is_some() {
+                        " — reviving a class you have lost"
+                    } else {
+                        " — only your FIRST hero is free"
+                    }
+                } else {
+                    ""
+                };
                 errors.push(format!(
-                    "{tag}: cannot afford {unit} ({cost_gold}g {cost_lumber}l)"
+                    "{tag}: cannot afford {unit} ({cost_gold}g {cost_lumber}l){why}"
                 ));
                 return;
             }
@@ -5458,6 +5478,96 @@ mod tests {
             e.insert(UnderConstruction { remaining: 5.0 });
         }
         e.id()
+    }
+
+    /// **A refusal has to name the rule that refused.** The compiler's only
+    /// job on price is the message (economy.rs is what actually charges), and
+    /// the message a commander gets for their second hero has to distinguish
+    /// three states that all read "cannot afford Priestess" otherwise: the
+    /// waiver already spent, a class being bought back, and an ordinary unit
+    /// that costs what the catalog says it costs.
+    ///
+    /// The specific way this goes wrong without the suffix is documented in
+    /// the arena ledger: a commander reads "your first hero is free", queues
+    /// one, comes back for the second, is told it cannot afford a thing the
+    /// brief called free, and concludes the game is broken rather than that
+    /// the rule has a boundary.
+    #[test]
+    fn a_hero_refusal_names_which_price_rule_charged_it() {
+        let mut app = compiler_app();
+        let hall = spawn_hall_at(
+            &mut app,
+            BuildingKind::Keep,
+            Team::Human,
+            Vec3::new(60.0, 0.0, 60.0),
+            false,
+        );
+        app.world_mut()
+            .entity_mut(hall)
+            .insert(TrainingQueue::default());
+        app.world_mut()
+            .resource_mut::<TechTiers>()
+            .set(Team::Human, TechTier::T2);
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let e = economies.get_mut(Team::Human);
+            e.gold = 0;
+            e.lumber = 0;
+            e.supply_cap = 100;
+        }
+        let train = |app: &mut App, kind: UnitKind| {
+            app.world_mut().send_event(SubmitIntent::ui(
+                Team::Human,
+                Intent::Train {
+                    building: intent_id(hall),
+                    unit: kind_name(kind).to_string(),
+                },
+            ));
+            app.update();
+            drain_errors(app, Team::Human)
+        };
+
+        // Broke, and the first hero goes through anyway: free is free.
+        assert!(
+            train(&mut app, UnitKind::Hero).is_empty(),
+            "a team with no hero and no gold can still field its first"
+        );
+
+        // ...and the second, with the Champion now in flight, is refused with
+        // the rule spelled out.
+        let errs = train(&mut app, UnitKind::Priestess);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains("cannot afford Priestess (400g 100l)")
+                && errs[0].contains("only your FIRST hero is free"),
+            "the refusal must name the boundary it hit: {errs:?}"
+        );
+
+        // A class with a record is refused in the other vocabulary — the money
+        // is the same, the reason a commander must act on is not.
+        app.world_mut().resource_mut::<HeroRecords>().set(
+            Team::Human,
+            HeroRecord { level: 3, xp: 0.0, kind: UnitKind::Priestess },
+        );
+        let errs = train(&mut app, UnitKind::Priestess);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains("reviving a class you have lost"),
+            "a revival is not a first hero and must not be described as one: {errs:?}"
+        );
+
+        // Nothing changes for anything that is not a hero: the bare shape that
+        // plan.rs's `blocked:` status and every arena AAR already parse.
+        let errs = train(&mut app, UnitKind::Worker);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        let worker = unit_stats(UnitKind::Worker);
+        assert!(
+            errs[0].ends_with(&format!(
+                "cannot afford Worker ({}g {}l)",
+                worker.cost_gold, worker.cost_lumber
+            )),
+            "the plain shape every plan-blocked reader already parses: {errs:?}"
+        );
     }
 
     /// **The happy path, and the reason the field exists.** A named hall that

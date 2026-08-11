@@ -75,7 +75,8 @@ Production:
 - `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free; you pay on placement)
 - `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"|...}` (queue cap 7;
   full roster in `catalog.json`). A `train` of a hero is rejected with a reason when your slots
-  are full or you already hold that class.
+  are full, when you already hold that class, or when you cannot afford it — and the refusal
+  says which: `only your FIRST hero is free` vs `reviving a class you have lost`.
 - `{"type":"cancel","building":id,"index":n}` — **refunds in full** whatever had already been
   charged for that item, and nothing when nothing was charged (cancelling your free first
   hero returns 0; cancelling a 400g/100l revival returns 400g/100l).
@@ -284,7 +285,7 @@ a base is raided more than once.
 ```
 
 **2. Hero save** — the hero walks out before it dies. Your hero is a command
-node, a hero slot, and — since it was free to train — the only thing you own
+node, a hero slot, and — if it was your free first one — the only thing you own
 whose whole price is charged at the moment you lose it (400g/100l to bring it
 back). It is the most expensive single event in a match, and it happens inside
 one poll cycle. Arm this before your first fight.
@@ -954,12 +955,16 @@ first), `unlocked` for ACTING.
   the map itself forces a decision. Ceding the middle
   cedes an economy. After the mines die, bounties are the only income on the map.
 - Supply-block = production stalls: build Farms BEFORE you hit the cap.
-- **YOUR FIRST HERO OF EACH CLASS IS FREE. LOSING IT IS NOT.** Training a class you have
-  never fielded costs **0 gold, 0 lumber** — it costs 25 seconds of hall time (the same
-  building that makes your workers) and 5 supply, and nothing else. The bill arrives when it
-  DIES: bringing that class back is **400g/100l**, flat, at every level. So there is no such
-  thing as a hero you cannot afford, and there is such a thing as a hero you cannot afford
-  to lose. **Train one in your opening. There is no argument against it.**
+- **YOUR FIRST HERO IS FREE; THE SECOND CLASS IS 400g/100l ONCE A KEEP STANDS; LOSING
+  EITHER IS 400g/100l MORE.** Your very first hero — whichever class you pick — costs
+  **0 gold, 0 lumber**: 25 seconds of hall time (the same building that makes your workers)
+  and 5 supply, and nothing else. That waiver is **one per team, not one per class**, and it
+  is spent the moment you QUEUE a hero, not when it walks out. Everything after it is full
+  fare: the second class at a Keep, and any class you have lost, both at **400g/100l**, flat,
+  at every level. So there is no such thing as a first hero you cannot afford, and there is
+  such a thing as a hero you cannot afford to lose. **Train one in your opening. There is no
+  argument against it.** The second one is a purchase like any other — weigh it against the
+  three Footmen it costs, and note that a Keep buys you the SLOT, not the hero.
   This is new, and it is new because of you: across arena rounds 17-19 every single winner
   fought hero-less, and in r19 BOTH commanders looked at the old 400g price tag, counted
   three Footmen, and skipped — correctly. The price moved to the place where skipping is not
@@ -976,12 +981,14 @@ first), `unlocked` for ACTING.
   never is. Read `me.hero_slots` / `me.hero_slots_used` in the snapshot before you train:
   used counts living heroes **plus any hero already sitting in a queue**. `me.hero_records`
   lists every class you have ever fielded (with `alive`), and `me.hero_costs` prices each
-  class: `gold`/`lumber` are what queuing it costs you RIGHT NOW (**0/0 until that class has
-  died**), and `revive_gold`/`revive_lumber` are what the next death will cost — carried
-  even while the hero is alive and well, so you can budget for the funeral before it
-  happens. Per class and never discounted by the other: a dead Champion does not make your
-  first Priestess cost anything, and a living Priestess does not make the Champion cheaper to
-  raise. Only two classes ship today, so a Castle's third slot currently has nothing to put
+  class: `gold`/`lumber` are what queuing it costs you RIGHT NOW (**0/0 only while your team
+  has no hero at all** — alive, queued, or dead and awaiting revival), and
+  `revive_gold`/`revive_lumber` are what the next death will cost — carried even while the
+  hero is alive and well, so you can budget for the funeral before it happens. **Read those
+  0s as alternatives, not as a shopping list**: before you field anything, every class prices
+  at 0 because any ONE of them could be your free hero, and the instant you queue one the
+  rest read 400/100 in the next snapshot. Revival stays per class and is never discounted by
+  the other: a dead Champion does not make reviving the Priestess cheaper, and vice versa. Only two classes ship today, so a Castle's third slot currently has nothing to put
   in it.
 - Counter triangle: fortifications stop armies, siege outranges fortifications, fast cavalry
   dives siege. It is all data: catalog `units[].class` says what a unit IS, and
