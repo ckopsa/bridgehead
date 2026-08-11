@@ -713,7 +713,7 @@ maximum. That is a real way to lose a game that still looks winnable on paper.
 
 ## If your seat is `bridge/copilot`: you are a CO-COMMANDER
 
-Everything above still applies — same 29 verbs, same snapshot, same fog, same
+Everything above still applies — same verbs, same snapshot, same fog, same
 `bridge_send.py`. One thing changes, and it is the important one: **you are not
 the faction.** A human is playing this faction with a mouse, and you are sitting
 next to them. Your snapshot's top-level `copilot` block confirms it:

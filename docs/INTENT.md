@@ -209,7 +209,7 @@ player expressing anything, so it stays where it is.
 
 ## The vocabulary
 
-29 verbs, grouped by what they are for. The serde shape **is** the bridge's
+The verbs, grouped by what they are for. The serde shape **is** the bridge's
 historical wire format — tag is `type`, entity ids are `Entity::to_bits`,
 positions are flat `x`/`z` — so `commands.json` parses straight into `Intent`
 with no translation layer. Backward compatibility is not an adapter here; it is
@@ -830,7 +830,7 @@ Verified end-to-end against a live `WC3_BRIDGE=1` seat driven by
   — the diff against master touches none of them.
 - Every historical command shape still parses, including the `caster` alias on
   `cast`, the `use_item` rename and the untagged ability selector
-  (`intent::tests::legacy_wire_commands_parse` covers all 29 verbs and their
+  (`intent::tests::legacy_wire_commands_parse` covers every verb and their
   optional-field forms).
 - `seq` gating, `last_seq`, the 4 Hz poll and the 1 Hz snapshot are untouched.
 - `tools/bridge_send.py`, `tools/bridge_view.py`, `tools/bridge_wait.py` and
@@ -1001,7 +1001,7 @@ with a `sentence()` renderer.*
 `tools/intent_compile.py` compiles a natural-language directive plus a snapshot
 into a batch of `Intent` objects. It is a **tool, not an engine feature**, and
 that placement is the design: the game gains no NLP, no new verb, and no new
-mutation path. What it gains is a shorter way to write the same 29 verbs.
+mutation path. What it gains is a shorter way to write the same verbs.
 
 ```
 "hold the northwest ford, forage mid with the cavalry, retreat at 35%"
@@ -1158,7 +1158,7 @@ answers across a selection. That tally *is* the "did my partner re-task my
 push?" readout; it needed no code at all.
 
 The rung is a **seat**, not the old `Cause::Script`. A co-commander pays the
-same latency, obeys the same fog and speaks the same 29 verbs; the scripted
+same latency, obeys the same fog and speaks the same verbs; the scripted
 `ai.rs` did none of those things at the time, and collapsing the two would have
 made "who moved this unit" unanswerable in exactly the case it is asked.
 (wc3clone-jem later made `ai.rs` do all three, so it became a seat of its own —
@@ -1810,7 +1810,7 @@ the ordinary compiler when its turn comes.
 
 ### The step/advance grammar
 
-A step is `{intent, advance}`. The intent is any of the 29 verbs; the advance
+A step is `{intent, advance}`. The intent is any verb; the advance
 says how the engine knows it is time for the next one. Three forms, and the
 middle one is the seam that matters:
 

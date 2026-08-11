@@ -77,7 +77,7 @@ Win by destroying all enemy buildings.
     floored by `damage_after_armor` so armour is a discount and never an
     immunity. Structures are deliberately excluded from both.
 - `intent.rs` (v2): the **intent compiler** — the single place a player's
-  meaning becomes game state. `shared::Intent` is the vocabulary (25 verbs,
+  meaning becomes game state. `shared::Intent` is the vocabulary (32 verbs today — the enum is the count,
   serde-serializable, wire-identical to the bridge protocol); `ui.rs` compiles
   mouse gestures into it and `bridge.rs` deserializes `commands.json` into it,
   and neither may mutate the world any other way. It is also where fog stops
