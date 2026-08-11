@@ -528,8 +528,8 @@ Verification is a named tier, not a remembered command line:
 
 ```bash
 tools/verify.sh smoke      # it compiles, the tests pass, one short headless match runs to a game over
-tools/verify.sh standard   # smoke + both maps + the bridge protocol verifiers
-tools/verify.sh full       # standard + longer caps, the arena runner path, screenshots where relevant
+tools/verify.sh standard   # smoke + crossings sim + every python suite
+tools/verify.sh full       # standard + 2-seed both-map matrix + determinism pair + the four bridge verifiers
 tools/verify.sh identity   # two seeded fixed-dt runs, fingerprints diffed for byte-identity
 ```
 
