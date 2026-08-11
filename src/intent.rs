@@ -486,7 +486,29 @@ fn apply_intents(
                     .unwrap_or(e)
                     .to_string()
             });
-            deferred.plans.report(submission.team, stamp, why, now);
+            let verdict = deferred.plans.report(submission.team, stamp, why, now);
+            // **Edge, not level** (arena/r17). A blocked step keeps retrying on
+            // `PLAN_RETRY_S` — that part is right and unchanged, because the
+            // refusal is usually timing and the retry is how a plan survives
+            // it. What was wrong was letting each retry re-announce a verdict
+            // the owner already has: twelve identical lines in the seat's
+            // `errors` array across the grace window, twelve in the replay
+            // log, and a `bridge_wait` that never got to sleep. The commander
+            // who lost r17 chained waits to escape the noise and went a
+            // hundred game-seconds without an order.
+            //
+            // So an identical re-refusal stops HERE, before any channel sees
+            // it. Nothing is hidden: `plans[].status` in every snapshot still
+            // reads `blocked: <why>` for as long as it is true, which is the
+            // level-triggered rendering of the same fact and the right one for
+            // a condition that persists. Transitions are announced; states are
+            // displayed.
+            //
+            // A refusal with DIFFERENT words is a different problem and falls
+            // through to every channel as before — `PlanVerdict::Blocked`.
+            if verdict == PlanVerdict::BlockedAgain {
+                continue;
+            }
         }
         log.record(now, &submission, &errors, issuer.max_delay);
         // The same record, kept in memory as well as on disk. The file is the
@@ -2472,7 +2494,14 @@ fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result
             },
             None => Ok(()),
         },
-        TriggerWhen::BaseUnderAttack | TriggerWhen::BountySpawned | TriggerWhen::MineDry => Ok(()),
+        // The unparameterised predicates: nothing to get wrong, so nothing to
+        // check. `supply_capped` joins them — it takes no argument precisely
+        // because "capped" is the engine's own production gate, not a
+        // threshold a commander gets to pick and then mis-tune.
+        TriggerWhen::BaseUnderAttack
+        | TriggerWhen::BountySpawned
+        | TriggerWhen::MineDry
+        | TriggerWhen::SupplyCapped => Ok(()),
     }
 }
 
@@ -3726,6 +3755,35 @@ mod tests {
             .iter()
             .map(|t| t.name.as_str().to_string())
             .collect()
+    }
+
+    /// **`supply_capped` arrives from the wire under the name the tooling
+    /// writes.** The one thing a hand-checked `holds` test cannot prove: that
+    /// the string `tools/intent_compile.py` emits, that `COMMANDER_BRIEF.md`
+    /// prints, and that a commander types are all the same string the enum
+    /// deserializes from — and that `validate_predicate` lets it through
+    /// rather than refusing an arm it has never heard of.
+    #[test]
+    fn supply_capped_arms_from_the_wire_spelling_the_brief_prints() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"supply-capped","repeat":45,
+                "when":{"type":"supply_capped"},"then":{"type":"stop","units":[]}}"#,
+        );
+        let refused = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+        assert!(
+            refused.is_empty(),
+            "the brief's recipe 7 must arm cleanly: {refused:?}"
+        );
+        let armed = &app.world().resource::<Triggers>().get(Team::Human)[0];
+        assert_eq!(armed.when, TriggerWhen::SupplyCapped);
+        assert_eq!(
+            armed.when.phrase(),
+            "we are supply capped",
+            "and it reads back as English in `sentence` and the feed"
+        );
     }
 
     /// **The cap is eight, and re-using a name is free.**

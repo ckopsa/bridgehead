@@ -22,7 +22,10 @@ There is now one list of verbs and one compiler.
 - **`shared::Intent`** — the vocabulary, as one serde-serializable type.
 - **`intent.rs`** — the only thing that turns an `Intent` into game state.
 - **`bridge/intent_log.jsonl`** — every intent anyone issued, as an English
-  sentence plus its serialized form.
+  sentence plus its serialized form. (One exception, added by `wc3clone-vax`
+  and argued in *Transitions are announced*: a blocked plan step re-submitting
+  itself with the identical verdict is the same sentence still failing, not a
+  new one, and the log records the transitions.)
 
 ---
 
@@ -1478,7 +1481,7 @@ pay. Nothing about triggers needed to learn any of that.
 
 ### The predicates, exactly
 
-Nine, and the constraint that produced the list is worth stating: **every one is
+Thirteen, and the constraint that produced the list is worth stating: **every one is
 answerable from state the frame already has, for the arming team, with no new
 bookkeeping.** No event subscriptions, no history, no memo. A predicate that
 needed its own record-keeping would be a predicate whose truth could drift from
@@ -1499,6 +1502,8 @@ what fired it.
 
 | `enemy_army_seen {size, within_s?}` | Your **intel ledger** holds at least `size` enemy troops that were observed as one concurrent force (`FogGrid::army_groups`). Reads MEMORY, unlike `enemy_sighted` — which is the point: an army does not stop existing because your scout died, and a rule that disarmed itself at that moment would disarm itself exactly when the enemy wanted. `within_s` bounds how stale the observation may be. Workers never count toward a force. Carries no region: regions are a different vocabulary, and a predicate that grew its own notion of "where" would be the second implementation this project keeps refusing to write. |
 | `enemy_hero_down {class?}` | An enemy hero class is **currently believed dead** — you watched one die and have not seen it alive since. A *level* predicate over a belief, not an edge over an event; see below. |
+
+| `supply_capped` | `shared::supply_headroom` is zero for you: `supply_cap - (supply_used + queued)`, where `queued` is the supply cost of everything standing in **your production queues**. Counting the queue is what makes it fire *at* the stall rather than a mining trip after it — economy.rs will not pay for a front item whose supply does not fit, so a team with four Footmen queued into two free supply has already stopped producing while its ledger still reads room. **False while `supply_cap` is 0**, which is "no completed supply building yet" rather than "blocked": the cap is recomputed every frame from standing buildings, so a rule without that guard would fire on frame one of every match, for everyone. ui.rs's supply-blocked badge draws the line in the same place. Arena round 17 asked for this one by name — see `arena/r17/blue-aar.md`, complaint 2. |
 
 **What is deliberately missing** is anything about the *enemy's* internals —
 their gold, their tech, their hero's **health**. Not an oversight and not a fog
@@ -1767,7 +1772,7 @@ middle one is the seam that matters:
 | `advance` | means |
 |---|---|
 | omitted / `{"type":"on_applied"}` | as soon as this step is **accepted**. The plain meaning of "then". |
-| `{"type":"when","when":{…}}` | when a **`TriggerWhen` predicate** holds — the *same* predicates triggers use (eleven of them as of the intel bead, and whatever the next one adds), level-triggered, evaluated by the same function at the same 4 Hz. |
+| `{"type":"when","when":{…}}` | when a **`TriggerWhen` predicate** holds — the *same* predicates triggers use (thirteen of them as of the supply bead, and whatever the next one adds), level-triggered, evaluated by the same function at the same 4 Hz. |
 | `{"type":"after","secs":30}` | 30 seconds after this step was accepted. |
 
 *Accepted*, not *completed*: the engine does not wait for the barracks to
@@ -1826,9 +1831,53 @@ plan block on the most ordinary event in the game — a squad member dying betwe
 The compiler therefore reports whether it *reached* anything, and only a step
 that reached nothing blocks. The error still goes to every other channel.
 
-Both states are announced once on the owner's event feed (not once per retry —
-the human's alert stack is six rows) and both carry the reason in the status
-itself, so nothing has to be correlated against `errors`.
+### Transitions are announced; states are displayed
+
+*`wc3clone-vax`, and the sharpest edge any vocabulary in this document has cut
+its own user on.*
+
+Both states carry the reason in the status itself, so nothing has to be
+correlated against `errors`. What they do **not** do is repeat themselves. A
+blocked step is announced exactly **once** — on the transition into `blocked` —
+plus once more if the reason changes to different words, once as
+`plan <name> step k/n unblocked` when it recovers, and once on `halted`. The
+twelve retries in between emit nothing, on any channel: not the seat's `errors`
+array, not the event feed, not the replay log, not the alert stack.
+
+The retry cadence itself is unchanged. `PLAN_RETRY_S` still re-submits the same
+step every five seconds, because the dominant refusal is timing and retrying is
+how a plan survives it. Only the **emission** changed.
+
+This is not a cosmetic preference; it is the mechanism that lost arena round 17.
+BLUE's `army` plan sat on `cannot afford Footman (135g 0l)`. The compiler
+re-appended that string to the seat's `errors` array on every retry,
+`tools/bridge_wait.py` woke on every one of them, and the commander's event loop
+became a fire hose. They escaped it the only way the tooling allowed — chaining
+`bridge_wait` calls — and went ~100 game seconds without issuing an order, with
+2280 gold banked and supply hard capped. The match was decided in that gap. The
+AAR's first complaint reads: *"that punished me for using the feature well."*
+
+The fix is the distinction between an **event** and a **condition**, applied to
+one channel each:
+
+* `events` and `errors` are **edge**-triggered. They interrupt. A thing that is
+  still true is not a new interruption.
+* `plans[].status` is **level**-triggered. It reads `blocked: <why>` in every
+  snapshot for exactly as long as it is true, so nothing is hidden by the
+  silence and a reader who wants to know can always look.
+
+`Plans::report` returns a [`PlanVerdict`] so the compiler can tell the two
+apart — `Blocked` (news) from `BlockedAgain` (the cadence talking) — and a
+`BlockedAgain` submission stops before any channel sees it. `bridge_wait.py`
+independently fingerprints the error **set** and refuses to wake on one it has
+already shown, which is belt and braces on purpose: the engine fix is the right
+one, and the pacing tool should not have been trusting its input to be
+well-behaved either.
+
+The one thing edge-emission owes its reader in return is the **other** edge: a
+plan that announced a block and then recovers says so. Told once that the army
+plan is stuck and never told it came unstuck, a commander would have to poll
+`plans[].status` — which is the polling this whole layer exists to delete.
 
 The verdict reaches the plan through `SubmitIntent::plan` and `Plans::report`,
 in the same frame the step was compiled — not by scraping the error channel for

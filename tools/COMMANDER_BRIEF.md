@@ -15,6 +15,24 @@ co-commander section near the end, which is the only part that differs.
    bash call: `wait ... && view ...`).
 3. Decide. 4. Write commands (see below).
 Repeat until `game_over` is non-null, then stop and report the result.
+
+**Never chain `bridge_wait` calls without a view between them.** Two waits back
+to back is a blind sleep wearing the costume of an event loop: the first one's
+wake is the news, and the second one throws it away unread. One wait, one view,
+one decision — every cycle, even the boring ones. Arena round 17 was lost in a
+~100 game-second gap made of chained waits, with 2280 gold banked and nothing
+built. Waiting is not playing.
+
+**A blocked plan is a decision prompt, not noise to sleep through.** `blocked:
+cannot afford X` in `plans[].status` means your economy cannot pay for the
+sequence you wrote. You are told **once**, when it starts and again if the
+reason changes or when it clears — the retries in between are silent on
+purpose, so the condition lives in `plans[].status` where you can read it
+whenever you like. The two answers are *fix the economy* (workers on gold, a
+Farm, a cheaper step) or `plan_clear` and write a plan you can afford. Sleeping
+until the grace window expires is neither, and it ends with the plan `halted`
+on the step you needed most.
+
 Your units are never fully idle even between your cycles: every army unit auto-joins
 squad 0 (default posture: defend your base). Repoint squad 0 — or set it to
 `forage` — and your army acts continuously without further orders.
@@ -193,7 +211,7 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 
     trigger home-guard fired: squad 1 defends (-70.0, -70.0) within 26
 
-### The twelve predicates
+### The thirteen predicates
 
 | `when` | means |
 |---|---|
@@ -206,6 +224,7 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 | `{"type":"enemy_hero_down"}` | an enemy hero you **watched die** and have not seen alive since. Optional `"class":"Hero"` / `"Priestess"` for just one |
 | `{"type":"bounty_spawned"}` | a cache you can see is on the map |
 | `{"type":"mine_dry"}` | a dry gold mine within 40 of one of your finished halls |
+| `{"type":"supply_capped"}` | no free supply left — `supply_used` + everything already in your training queues has reached `supply_cap`. False while `supply_cap` is 0 (that is "no base yet", not "blocked") |
 | `{"type":"tier_reached","tier":2}` | your tech tier |
 | `{"type":"unit_count","kind":"Footman","count":8}` | your living count of one unit kind |
 | `{"type":"game_time","at":360}` | the match clock, in seconds |
@@ -229,7 +248,7 @@ hero, so no number about one has ever been on anybody's screen — so no
 predicate can read them. That their hero *died in front of you* is a different
 matter, and that one you may have.
 
-### Six recipes worth arming in your first batch
+### Seven recipes worth arming in your first batch
 
 **1. Home guard** — the army comes home when the base burns. Repeating, because
 a base is raided more than once.
@@ -308,7 +327,28 @@ sensor — so keep something with vision near a pass you are counting on. If you
 `region_clear` a region a rule names, that rule goes quiet rather than firing on
 the whole map.
 
-A caution that applies to all six: `then` is frozen when you arm it, so ids init are ids that may die. Prefer `posture` on a **squad** over a list of unit ids
+**7. The supply valve** — the rule that plays for you while you are reading.
+Repeating, because you will hit the cap again at 40, at 60, at 80. Arena round
+17 was lost at 28/28 supply with 2280 gold in the bank: not a fight, not a
+tech choice, just a commander who did not notice a number. This is the number
+noticing itself.
+
+```json
+{"type":"trigger_set","name":"supply-capped","repeat":45,
+ "when":{"type":"supply_capped"},
+ "then":{"type":"build","worker":<worker id>,"kind":"Farm","x":-58.0,"z":-64.0}}
+```
+
+`tools/intent_compile.py` writes it from `whenever we are supply blocked, build
+a farm`. It counts your **queues**, so it fires as production stalls rather
+than a mining trip later — and it stays false while `supply_cap` is 0, so it
+cannot go off before you have a hall. Pick a site with room around it; a build
+that is refused reports into `errors` tagged `trigger:supply-capped`, and the
+repeat means it tries again rather than giving up. `supply_capped` is also a
+legal plan `advance`, so `{"advance":{"type":"when","when":{"type":"supply_capped"}}}`
+means "…then, once we are capped, the next thing".
+
+A caution that applies to all seven: `then` is frozen when you arm it, so ids init are ids that may die. Prefer `posture` on a **squad** over a list of unit ids
 where you can — a squad survives its members. And a trigger whose action is
 refused when it fires reports that in your `errors` array tagged
 `trigger:<name>`, so check there if a rule seems to do nothing.
@@ -341,7 +381,7 @@ Every step writes a line into `events` as it goes out:
 | `advance` | the plan moves on |
 |---|---|
 | omitted (or `{"type":"on_applied"}`) | the moment this step is ACCEPTED — the plain meaning of "then" |
-| `{"type":"when","when":{...}}` | when that condition holds — **any of the eleven trigger predicates above**, including the intel ones |
+| `{"type":"when","when":{...}}` | when that condition holds — **any of the thirteen trigger predicates above**, including the intel ones |
 | `{"type":"after","secs":30}` | 30 seconds after this step was accepted |
 
 "Accepted" means the order was legal and taken, NOT that the building finished.
@@ -362,6 +402,19 @@ trying long enough for your economy to answer. You are told at the *first*
 bounce either way — `blocked:` shows up within a tick — so if the reason is
 permanent ("you have no Sanctum") you can `plan_clear` it immediately rather
 than waiting for the halt.
+
+**You are told on the EDGES, not on every retry.** One line in `events` and one
+entry in `errors` when the step first bounces; one more if the reason *changes*
+to different words; one `plan <name> step k/n unblocked` when it recovers; one
+on `halted`. The twelve retries in between say nothing at all — they are the
+engine trying, not new news, and a channel that repeats itself is a channel you
+learn to skip. The condition itself is never hidden: `plans[].status` reads
+`blocked: <why>` in every snapshot for as long as it is true. Read the status
+to know; the `errors` array is only there to *interrupt* you.
+
+(This is also why `bridge_wait.py` no longer wakes on an error it has already
+shown you. A stuck plan used to wake it every couple of seconds — which is what
+made chaining waits look attractive in round 17, and lost that match.)
 
 A step that reaches SOME of its units is a partial success, not a refusal: if
 one member of a listed squad has died, the survivors are still ordered, the dead
@@ -536,7 +589,7 @@ omitted, exactly as before. The Sorcerer is a caster but **not** a hero, so
 - **Conditionals compile to `trigger_set`**: "strike when their hero falls" arms
   a rule the engine watches at 4 Hz. `when`/`if`/`once`/`after` arm a once-rule;
   `whenever`/`every time` arm a repeating one. Only a condition outside the
-  eleven predicates defers, and then the tool says which condition and prints
+  thirteen predicates defers, and then the tool says which condition and prints
   the command to run when you see it in `events`. Enemy hero *health* is the
   standing example — that one is genuinely unknowable, and it still defers.
 - **Sequences compile too.** Clauses joined by `", then"` become one

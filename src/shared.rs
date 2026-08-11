@@ -6038,6 +6038,28 @@ impl Economy {
     }
 }
 
+/// **Free supply, pessimistically** — what is left of the cap once everything
+/// living AND everything already queued is paid for.
+///
+/// `queued` is the supply cost of every unit standing in one of this team's
+/// production queues, which is the half of the number that is easy to leave
+/// out and expensive to leave out. economy.rs will not pay for a front item
+/// whose supply does not fit (`supply_used + stats.supply > supply_cap`), so a
+/// team with four Footmen queued into two free supply is *already* stalled —
+/// its ledger simply has not been told yet. Anything that asks "may I train?"
+/// has to ask the pessimistic question or it will keep saying yes right up to
+/// the moment production silently stops.
+///
+/// One definition, three callers: the scripted commander's build logic
+/// (ai.rs), the `supply_capped` predicate (trigger.rs), and the HUD. Saturating,
+/// so an over-committed queue reads as zero headroom rather than wrapping into
+/// four billion.
+pub fn supply_headroom(economy: &Economy, queued: u32) -> u32 {
+    economy
+        .supply_cap
+        .saturating_sub(economy.supply_used + queued)
+}
+
 #[derive(Resource, Default)]
 pub struct Economies {
     pub human: Economy,
@@ -6654,6 +6676,27 @@ pub enum TriggerWhen {
     /// run dry (`remaining == 0`). This is what "our mine" means in a game
     /// where mines are neutral: the one your hall was placed to work.
     MineDry,
+    /// We have no free supply left: [`supply_headroom`] is zero, counting
+    /// everything already standing in a production queue.
+    ///
+    /// **The alarm for a commander who has stopped playing.** Arena round 17
+    /// was lost at 28/28 supply with 2280 gold banked — three plain numbers in
+    /// a snapshot full of plain numbers, none of which was going to reach out
+    /// and say *you cannot train anything*. `mine_dry` is the same shape of
+    /// fact about income; this is the one about spending it.
+    ///
+    /// Counting the QUEUE is what makes it armable rather than merely true:
+    /// the engine's own production gate (economy.rs) refuses to pay for a
+    /// front item whose supply will not fit, so a team with four Footmen
+    /// queued into two free supply is already blocked and a predicate that
+    /// waited for the ledger to catch up would fire after the stall instead of
+    /// at it. Same fold, same reason, as `hero_slot_check` counting queued
+    /// classes rather than only living heroes.
+    ///
+    /// A cap of zero is NOT capped — that is "no completed supply building
+    /// yet", which is where every team stands on frame one, and a rule that
+    /// fired there would fire before the match began.
+    SupplyCapped,
     /// Our tech tier has reached `tier` (1, 2 or 3).
     TierReached { tier: u8 },
     /// We field at least `count` living units of `kind`.
@@ -6736,6 +6779,7 @@ impl TriggerWhen {
             },
             TriggerWhen::BountySpawned => "a bounty cache is sighted".to_string(),
             TriggerWhen::MineDry => "a mine at our base runs dry".to_string(),
+            TriggerWhen::SupplyCapped => "we are supply capped".to_string(),
             TriggerWhen::TierReached { tier } => format!("we reach tier {tier}"),
             TriggerWhen::UnitCount { kind, count } => {
                 format!("we field {count} or more {kind}")
@@ -7088,10 +7132,54 @@ pub struct PlanRun {
     pub last_try: f32,
     /// Game time the current step first bounced, `None` if it has not.
     pub blocked_since: Option<f32>,
-    /// Has the owner been told about the current block? One notice per block,
-    /// not one per retry: the human's alert stack is six rows and five copies
-    /// of "not enough gold" would push the match's actual news off it.
+    /// Has the owner been told about the current block?
+    ///
+    /// One notice per block, not one per retry — the human's alert stack is six
+    /// rows and twelve copies of "not enough gold" would push the match's
+    /// actual news off it, and a bridge commander's `bridge_wait` treats a
+    /// fresh line as a reason to stop sleeping.
+    ///
+    /// It doubles as **"an unblock line is owed"**, which is why
+    /// [`Plans::report`] does not clear it on acceptance. A plan that announced
+    /// a block and is now `Running` again has exactly one thing left to say,
+    /// and the flag that remembers the announcement is the same flag that
+    /// remembers the debt. The alternative — a second bool that is always the
+    /// first one's shadow — would let the two disagree.
     pub told_blocked: bool,
+}
+
+/// What [`Plans::report`] did with a verdict, so the compiler knows whether
+/// the refusal it is holding is **news**.
+///
+/// This exists because "the step bounced" and "the step is still bouncing" are
+/// different events that produce an identical error string, and every channel
+/// downstream — the seat's `errors` array, the replay log, the alert stack —
+/// wants only the first. Arena round 17 is the cost of not distinguishing them:
+/// a step blocked on `cannot afford Footman` re-emitted its refusal every
+/// [`PLAN_RETRY_S`], `bridge_wait` woke on each one, and the commander escaped
+/// the resulting fire hose by chaining waits and lost the match in the gap.
+///
+/// The plan's [`PlanRun::status`] carries the condition continuously in the
+/// snapshot, so nothing is hidden by staying quiet between transitions — the
+/// reader can always see `blocked: <why>`; it just is not *told* twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanVerdict {
+    /// No live plan is waiting on this stamp — a plan replaced mid-flight, a
+    /// verdict for a step already left behind, or a halted plan's late news.
+    Ignored,
+    /// Accepted, and it was not blocked. The ordinary case, and silent.
+    Accepted,
+    /// Accepted, and it HAD been blocked. Worth one line: the commander was
+    /// told the plan stopped and is owed the news that it started again.
+    Unblocked,
+    /// Refused, and this is news — the first bounce on this step, or a
+    /// *different* reason from the one already announced. "cannot afford it"
+    /// becoming "the site is blocked" is a different problem with a different
+    /// answer.
+    Blocked,
+    /// Refused again, with the identical reason. **Not news**, and the one
+    /// verdict every emission channel drops on the floor.
+    BlockedAgain,
 }
 
 impl PlanRun {
@@ -7209,13 +7297,25 @@ impl Plans {
     /// `error` is the compiler's own first message for that step, `None` if it
     /// was accepted. Verdicts for a step the plan has already moved off are
     /// ignored — a plan replaced mid-flight must not inherit the old one's news.
-    pub fn report(&mut self, team: Team, stamp: PlanStamp, error: Option<String>, now: f32) {
+    ///
+    /// Returns [`PlanVerdict`] — whether this verdict was **news**. The caller
+    /// is the intent compiler, and what it does with the answer is decide
+    /// whether the error it is holding reaches the seat's channels at all. A
+    /// step refused for the twelfth time with the same words has already been
+    /// reported; saying it again is not honesty, it is a fire hose (arena r17).
+    pub fn report(
+        &mut self,
+        team: Team,
+        stamp: PlanStamp,
+        error: Option<String>,
+        now: f32,
+    ) -> PlanVerdict {
         let Some(plan) = self
             .get_mut(team)
             .iter_mut()
             .find(|p| p.name == stamp.name)
         else {
-            return;
+            return PlanVerdict::Ignored;
         };
         // Three conditions, and the third is the one that makes "replaced
         // mid-flight" safe. `plan_set` is compiled in `SimSet::Intent`, the
@@ -7227,15 +7327,23 @@ impl Plans {
         // sent nothing cannot be the addressee of a verdict, and `Plans::set`
         // always installs a replacement with `submitted: false`.
         if !plan.submitted || plan.step_no() != stamp.step as usize || !plan.live() {
-            return;
+            return PlanVerdict::Ignored;
         }
         match error {
             None => {
+                let was_blocked = matches!(plan.state, PlanState::Blocked(_));
                 plan.applied = true;
                 plan.applied_at = now;
                 plan.blocked_since = None;
-                plan.told_blocked = false;
                 plan.state = PlanState::Running;
+                // `told_blocked` is deliberately NOT cleared here — see its
+                // doc. It is now the plan's memory that it owes an "unblocked"
+                // line, and plan.rs clears it when that line goes out.
+                if was_blocked {
+                    PlanVerdict::Unblocked
+                } else {
+                    PlanVerdict::Accepted
+                }
             }
             Some(why) => {
                 // The clock starts at the FIRST bounce, not this one, so the
@@ -7248,10 +7356,20 @@ impl Plans {
                 // answer, and staying quiet about the second would leave the
                 // owner acting on the first right up until the plan halted on
                 // the other one.
-                if plan.state != PlanState::Blocked(why.clone()) {
+                //
+                // The same comparison now answers the caller's question too:
+                // an identical refusal is the retry cadence talking, not the
+                // world, and it stops here.
+                let same = plan.state == PlanState::Blocked(why.clone());
+                if !same {
                     plan.told_blocked = false;
                 }
                 plan.state = PlanState::Blocked(why);
+                if same {
+                    PlanVerdict::BlockedAgain
+                } else {
+                    PlanVerdict::Blocked
+                }
             }
         }
     }

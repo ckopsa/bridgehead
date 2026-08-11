@@ -153,6 +153,12 @@ type TriggerBuildings<'w, 's> = Query<
 
 type TriggerNodes<'w, 's> = Query<'w, 's, (&'static ResourceNode, &'static Transform)>;
 
+/// Production queues, by owner. Its own query rather than a sixth column on
+/// [`TriggerBuildings`]: only `supply_capped` reads it, and widening the
+/// buildings tuple would re-spell the destructuring in every other arm to buy
+/// nothing.
+type TriggerQueues<'w, 's> = Query<'w, 's, (&'static Team, &'static TrainingQueue)>;
+
 type TriggerBounties<'w, 's> = Query<'w, 's, (&'static Bounty, &'static Transform)>;
 
 /// The read-only world one predicate sweep consults. Bundled because
@@ -164,7 +170,14 @@ pub struct TriggerWorld<'w, 's> {
     buildings: TriggerBuildings<'w, 's>,
     nodes: TriggerNodes<'w, 's>,
     bounties: TriggerBounties<'w, 's>,
+    /// What is standing in production right now — the half of "am I supply
+    /// blocked?" that the ledger has not been told about yet.
+    queues: TriggerQueues<'w, 's>,
     tiers: Res<'w, TechTiers>,
+    /// Read-only, and only ever for the ASKING team's own row: a predicate
+    /// that could read the other side's bank would be fog laundering with
+    /// extra steps.
+    economies: Res<'w, Economies>,
     fog: Res<'w, FogGrids>,
     /// Read-only here. `enemy_in` is the one predicate that asks WHERE, and
     /// the answer is the arming team's own vocabulary — built-ins included, so
@@ -371,6 +384,34 @@ pub fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bo
             })
         }
 
+        // No free supply, counting what is already in the queues. A fold over
+        // state the frame already has, like every arm here: the queues are
+        // components, the ledger is a resource, and nothing is remembered
+        // between sweeps.
+        //
+        // `supply_cap > 0` is the guard that keeps this from being true before
+        // the match starts. The cap is recomputed every frame from completed
+        // supply buildings, so a team with none — frame one, or a team whose
+        // last hall just fell — reads zero cap and zero headroom. That is "you
+        // have no base", not "you are supply blocked", and the answer to it is
+        // not a farm. ui.rs's supply-blocked badge draws the line in the same
+        // place, and two readings of one phrase would be two languages.
+        TriggerWhen::SupplyCapped => {
+            let economy = world.economies.get(me);
+            let queued: u32 = world
+                .queues
+                .iter()
+                .filter(|(team, _)| **team == me)
+                .map(|(_, q)| {
+                    q.queue
+                        .iter()
+                        .map(|kind| unit_stats(*kind).supply)
+                        .sum::<u32>()
+                })
+                .sum();
+            economy.supply_cap > 0 && supply_headroom(economy, queued) == 0
+        }
+
         TriggerWhen::TierReached { tier } => world.tiers.get(me).level() >= u32::from(*tier),
 
         TriggerWhen::UnitCount { kind, count } => {
@@ -478,6 +519,10 @@ mod tests {
             .init_resource::<Triggers>()
             .init_resource::<Regions>()
             .init_resource::<TechTiers>()
+            // `supply_capped` reads the ledger, so `TriggerWorld` needs it —
+            // and defaults to a zero cap, which is exactly the "no base yet"
+            // reading that predicate refuses to fire on.
+            .init_resource::<Economies>()
             .init_resource::<GameEvents>()
             .add_event::<SubmitIntent>()
             .add_systems(Update, evaluate_triggers);
@@ -1234,6 +1279,119 @@ mod tests {
             .map(|s| s.trigger.unwrap().as_str().to_string())
             .collect();
         assert_eq!(names, vec!["tier", "count", "clock"]);
+    }
+
+    /// **`supply_capped` counts the queue, and refuses to fire on an empty
+    /// board.** The predicate arena round 17 asked for, and the two things it
+    /// has to get right to be worth arming.
+    ///
+    /// BLUE lost that match sitting at 28/28 with 2280 gold banked. The number
+    /// was in every snapshot and nothing said it out loud; this is the rule
+    /// that says it. Counting production is what makes it fire AT the stall
+    /// rather than after it: four Footmen queued into two free supply is a
+    /// team that has already stopped, because economy.rs will not pay for a
+    /// front item whose supply does not fit.
+    #[test]
+    fn supply_capped_counts_the_queue_and_ignores_an_empty_board() {
+        let mut app = trigger_app();
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(TriggerWhen::SupplyCapped, stop_intent(), Some(1.0)));
+
+        // Frame one: no supply buildings, so cap is 0 and headroom is 0 — and
+        // the rule must NOT fire. "No base" is not "supply blocked", and a
+        // predicate that could not tell them apart would fire before the match
+        // began, every match, for everyone.
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "a zero cap is 'no economy yet', not 'capped'"
+        );
+
+        // A real economy with room to grow.
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let eco = economies.get_mut(Team::Human);
+            eco.supply_cap = 12;
+            eco.supply_used = 8;
+        }
+        advance(&mut app, 2.0);
+        app.update();
+        assert!(fired(&mut app).is_empty(), "4 free supply is not capped");
+
+        // Four Footmen (2 supply each) queued into 4 free supply. The ledger
+        // still reads 8/12 — nothing has been born — but the team is done
+        // producing, and THAT is the moment worth telling a commander about.
+        let barracks = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Human,
+                Transform::from_xyz(0.0, 0.0, 0.0),
+                Health::new(700.0),
+                TrainingQueue::default(),
+            ))
+            .id();
+        {
+            let mut queue = app
+                .world_mut()
+                .entity_mut(barracks)
+                .into_mut::<TrainingQueue>()
+                .expect("just spawned with one");
+            for _ in 0..2 {
+                queue.queue.push_back(UnitKind::Footman);
+            }
+        }
+        assert_eq!(
+            unit_stats(UnitKind::Footman).supply * 2,
+            4,
+            "the arithmetic this test rests on"
+        );
+        advance(&mut app, 2.0);
+        app.update();
+        assert_eq!(
+            fired(&mut app).len(),
+            1,
+            "queued supply fills the headroom, so the alarm goes off"
+        );
+
+        // The other team's queue is not our problem, and neither is their
+        // ledger: each seat is asked about its own row.
+        let claude_fired = {
+            let mut app2 = trigger_app();
+            app2.world_mut()
+                .resource_mut::<Triggers>()
+                .get_mut(Team::Claude)
+                .push(armed(TriggerWhen::SupplyCapped, stop_intent(), Some(1.0)));
+            {
+                let mut economies = app2.world_mut().resource_mut::<Economies>();
+                let human = economies.get_mut(Team::Human);
+                human.supply_cap = 12;
+                human.supply_used = 12;
+                let claude = economies.get_mut(Team::Claude);
+                claude.supply_cap = 40;
+                claude.supply_used = 10;
+            }
+            app2.update();
+            advance(&mut app2, 2.0);
+            app2.update();
+            fired(&mut app2).len()
+        };
+        assert_eq!(claude_fired, 0, "their cap is theirs; ours is ours");
+
+        // And a farm going up unblocks it: raise the cap and the rule stops
+        // holding, which is what makes it safe to repeat.
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            economies.get_mut(Team::Human).supply_cap = 24;
+        }
+        advance(&mut app, 2.0);
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "the farm finished, so we are not capped any more"
+        );
     }
 
     #[test]
