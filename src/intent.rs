@@ -141,6 +141,9 @@ impl Plugin for IntentPlugin {
             // read by trigger.rs, bridge.rs and ui.rs, and written by exactly
             // two verbs in this file. The writer owns the registration.
             .init_resource::<Triggers>()
+            // And a fifth, on identical reasoning: `Plans` is read by plan.rs,
+            // bridge.rs and ui.rs, and written by exactly two verbs here.
+            .init_resource::<Plans>()
             .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
             // `IntentApply` lives INSIDE `SimSet::Intent`, declared once here
@@ -231,6 +234,22 @@ pub struct IntentTables<'w> {
     nav: Res<'w, NavGrid>,
     fog: Res<'w, FogGrids>,
     team_research: Res<'w, TeamResearch>,
+}
+
+/// The two stores of **deferred** standing policy this compiler writes: armed
+/// triggers and set plans.
+///
+/// Bundled for the reason every other `SystemParam` in this file is bundled —
+/// `apply_intents` sits exactly on Bevy's 16-parameter ceiling — and, like
+/// bridge.rs's `StandingOrders`, the pairing is not arbitrary. Both are written
+/// by exactly two verbs here and by nothing else in the codebase; both are read
+/// by their own evaluator in `SimSet::Think`, by the snapshot and by the HUD;
+/// and both answer the one question "what has this commander told the engine to
+/// do without them".
+#[derive(SystemParam)]
+pub struct DeferredPolicy<'w> {
+    triggers: ResMut<'w, Triggers>,
+    plans: ResMut<'w, Plans>,
 }
 
 /// The events an intent can emit. ui.rs and bridge.rs each used to carry an
@@ -338,7 +357,7 @@ fn apply_intents(
     time: Res<Time>,
     tables: IntentTables,
     mut squad_orders: ResMut<SquadOrders>,
-    mut triggers: ResMut<Triggers>,
+    mut deferred: DeferredPolicy,
     mut ai_controlled: ResMut<AiControlled>,
     mut error_log: ResMut<IntentErrors>,
     // The positive half of the same channel: what each command cost to deliver.
@@ -381,9 +400,18 @@ fn apply_intents(
         // rule is strictly better than hand-answering an alarm at range, which
         // is C4 ("doctrine strictly better than micro at range") landing one
         // rung further out.
-        let mut issuer = match submission.trigger {
-            Some(_) => link.exempt_issuer(now),
-            None => link.issuer(now),
+        //
+        // **A plan step is exempt on the identical argument.** A plan is a
+        // sequence of standing policy the engine executes unattended; its
+        // author reached the units when they SET it, and the step firing four
+        // minutes later is the engine doing what it was told, not a new order
+        // travelling out from a commander. Charging the link per step would
+        // also make a plan strictly worse than typing the same commands by
+        // hand, which inverts C4.
+        let mut issuer = if submission.trigger.is_some() || submission.plan.is_some() {
+            link.exempt_issuer(now)
+        } else {
+            link.issuer(now)
         };
         compile_intent(
             submission.intent.clone(),
@@ -395,6 +423,7 @@ fn apply_intents(
                 source: submission.source,
                 at: now,
                 trigger: submission.trigger,
+                plan: submission.plan,
             },
             &mut errors,
             &mut ai_controlled,
@@ -408,12 +437,30 @@ fn apply_intents(
             // order, and neither seat gets to borrow the other's eyes.
             tables.fog.get(submission.team),
             &mut squad_orders,
-            &mut triggers,
+            &mut deferred.triggers,
+            &mut deferred.plans,
             &mut commands,
             &mut events,
             &mut world,
             &mut issuer,
         );
+        // **The plan's verdict, straight back to the plan.** In the same frame
+        // it submitted, before its evaluator's next sweep — so a step that
+        // bounced blocks the plan rather than being walked past. `errors` is
+        // this step's errors and nothing else's, because the compiler is
+        // per-submission.
+        if let Some(stamp) = submission.plan {
+            // Tag stripped, exactly as `UiNotices::raise` strips it: the tag is
+            // the CHANNEL (`plan:opening#2`), and a status line that read
+            // `blocked: plan:opening#2: not enough gold` would say the plan's
+            // name twice and the reason once.
+            let why = errors.first().map(|e| {
+                e.strip_prefix(&format!("{}: ", submission.tag))
+                    .unwrap_or(e)
+                    .to_string()
+            });
+            deferred.plans.report(submission.team, stamp, why, now);
+        }
         log.record(now, &submission, &errors, issuer.max_delay);
         // The same record, kept in memory as well as on disk. The file is the
         // match's, this is the seats': a co-commander reads its partner's
@@ -438,9 +485,13 @@ fn apply_intents(
             // a click they never made. Same verdict, same words after the
             // colon — only the channel label differs, which is the one thing
             // `IntentSource` and this tag are allowed to decide.
-            let prefix = match submission.trigger {
-                Some(name) => format!("trigger {name} refused"),
-                None => UI_NOTICE_PREFIX.to_string(),
+            let prefix = match (submission.trigger, submission.plan) {
+                (Some(name), _) => format!("trigger {name} refused"),
+                // Names the STEP, not just the plan: with eight of them, "your
+                // plan was refused" would send the player looking through the
+                // whole sequence for the one that bounced.
+                (None, Some(stamp)) => format!("plan {stamp} refused"),
+                (None, None) => UI_NOTICE_PREFIX.to_string(),
             };
             notices.raise(
                 &mut feed,
@@ -517,6 +568,10 @@ fn compile_intent(
     // trigger.rs's evaluator, bridge.rs's snapshot and ui.rs's HUD — same
     // shape, and the same one-writer rule, as `SquadOrders` above it.
     triggers: &mut Triggers,
+    // Every team's plans, on the same one-writer rule as `triggers` beside it:
+    // two verbs here write them, plan.rs's evaluator and the two renderers
+    // read them.
+    plans: &mut Plans,
     commands: &mut Commands,
     events: &mut IntentEvents,
     world: &mut IntentWorld,
@@ -1718,9 +1773,22 @@ fn compile_intent(
             // doctrine and programming, and it is also what makes
             // MAX_TRIGGERS_PER_TEAM an actual bound rather than a starting
             // balance.
-            if matches!(*then, Intent::TriggerSet { .. } | Intent::TriggerClear { .. }) {
+            // The same refusal now covers plans, and it has to: a trigger whose
+            // `then` set a plan whose step armed a trigger would be a cycle, and
+            // the two caps would stop bounding anything. The rule the whole
+            // v3 vocabulary keeps is one sentence — *a deferred action may not
+            // defer another action* — with the single, bounded exception that a
+            // plan STEP may arm a trigger, because a trigger cannot defer
+            // anything further.
+            if matches!(
+                *then,
+                Intent::TriggerSet { .. }
+                    | Intent::TriggerClear { .. }
+                    | Intent::PlanSet { .. }
+                    | Intent::PlanClear { .. }
+            ) {
                 errors.push(format!(
-                    "{tag}: a trigger cannot arm or clear another trigger — \
+                    "{tag}: a trigger cannot arm or clear another trigger or a plan — \
                      triggers are doctrine, not a scripting language"
                 ));
                 return;
@@ -1763,6 +1831,103 @@ fn compile_intent(
                 errors.push(format!("{tag}: {err}"));
             }
         }
+        // -------------------------------------------------------------------
+        // Plans. See docs/INTENT.md § "Plans" and plan.rs.
+        // -------------------------------------------------------------------
+        Intent::PlanSet { name, steps } => {
+            let Some(name) = PlanName::new(&name) else {
+                errors.push(format!(
+                    "{tag}: '{name}' is not a usable plan name — 1..{TRIGGER_NAME_MAX} \
+                     printable ASCII characters"
+                ));
+                return;
+            };
+            if steps.is_empty() {
+                errors.push(format!(
+                    "{tag}: plan {name} has no steps — a plan is a sequence, and \
+                     an empty one is a plan_clear spelled the long way"
+                ));
+                return;
+            }
+            if steps.len() > MAX_PLAN_STEPS {
+                errors.push(format!(
+                    "{tag}: plan {name} has {} steps — the most is {MAX_PLAN_STEPS}. \
+                     A longer sequence is two plans, or a plan and some triggers",
+                    steps.len()
+                ));
+                return;
+            }
+            for (i, step) in steps.iter().enumerate() {
+                let k = i + 1;
+                // A plan may not set or clear a plan. Same line, same reason as
+                // a trigger's: this is where doctrine would turn into a
+                // programming language, and it is what makes MAX_PLANS_PER_TEAM
+                // an actual bound rather than a starting balance.
+                //
+                // Note what IS allowed: a step may `trigger_set`. "Build the
+                // barracks, then arm the home guard" is a real sentence, and it
+                // stays bounded because a trigger's own `then` may not be a
+                // plan or a trigger — so the whole graph is two rungs deep with
+                // a cap on each.
+                if matches!(step.intent, Intent::PlanSet { .. } | Intent::PlanClear { .. }) {
+                    errors.push(format!(
+                        "{tag}: plan {name} step {k} sets or clears a plan — plans are \
+                         doctrine, not a scripting language (a step MAY arm a trigger)"
+                    ));
+                    return;
+                }
+                match &step.advance {
+                    PlanAdvance::OnApplied => {}
+                    PlanAdvance::When { when } => {
+                        if let Err(err) = validate_predicate(when) {
+                            errors.push(format!("{tag}: plan {name} step {k}: {err}"));
+                            return;
+                        }
+                    }
+                    PlanAdvance::AfterSeconds { secs } => {
+                        if !(*secs > 0.0) {
+                            errors.push(format!(
+                                "{tag}: plan {name} step {k}: 'after' must be > 0 seconds, \
+                                 got {secs} (omit advance entirely for 'as soon as it lands')"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+            // NOT checked, for exactly the reason a trigger's `then` is not:
+            // every step but the first describes a world that does not exist
+            // yet. The building step 3 trains from is the one step 1 puts up.
+            // Each step is validated in full by this same compiler at the
+            // moment it runs, and a refusal comes back through `Plans::report`
+            // and blocks the plan where a person can see it.
+            let plan = PlanRun {
+                name,
+                steps,
+                source: mark.source,
+                state: PlanState::Running,
+                at: 0,
+                submitted: false,
+                applied: false,
+                applied_at: 0.0,
+                last_try: 0.0,
+                blocked_since: None,
+                told_blocked: false,
+            };
+            if let Err(err) = plans.set(me, plan) {
+                errors.push(format!("{tag}: {err}"));
+            }
+        }
+        Intent::PlanClear { name } => match name {
+            Some(name) => {
+                if !plans.clear(me, name.trim()) {
+                    errors.push(format!("{tag}: you have no plan named '{name}'"));
+                }
+            }
+            None => {
+                plans.clear_all(me);
+            }
+        },
         Intent::TriggerClear { name } => match name {
             Some(name) => {
                 if !triggers.clear(me, name.trim()) {
@@ -1971,6 +2136,8 @@ impl IntentLog {
                     // bridge t=41`. The join key has to match on both rungs or
                     // it stops being a join.
                     trigger: submission.trigger,
+                    // Same join, one rung along, for a plan step.
+                    plan: submission.plan,
                 }
                 .order(verb)
                 .why()
@@ -2547,6 +2714,7 @@ mod tests {
             tag: "cmd 3".to_string(),
             intent: Intent::Move { units: vec![commanded.to_bits()], x: 0.0, z: 0.0 },
             trigger: None,
+            plan: None,
         });
         // The same sentence, from the seat with a screen.
         app.world_mut().send_event(SubmitIntent::ui(
@@ -2594,6 +2762,7 @@ mod tests {
             tag: "cmd 0".to_string(),
             intent: Intent::Move { units: vec![inside.to_bits()], x: 61.0, z: 61.0 },
             trigger: None,
+            plan: None,
         });
         app.update();
 
@@ -2650,6 +2819,7 @@ mod tests {
                 id: Some(1),
             },
             trigger: None,
+            plan: None,
         });
         app.update();
 
@@ -2950,6 +3120,7 @@ mod tests {
                 target: 999_999,
             },
             trigger: None,
+            plan: None,
         });
         app.update();
 
@@ -3029,6 +3200,17 @@ mod tests {
             r#"{"type":"trigger_set","name":"clock","when":{"type":"game_time","at":360.0},"then":{"type":"stop","units":[1]}}"#,
             r#"{"type":"trigger_clear","name":"home-guard"}"#,
             r#"{"type":"trigger_clear"}"#,
+            // v3 plans. All three advance forms, the terse step, both clears.
+            r#"{"type":"plan_set","name":"opening","steps":[{"intent":{"type":"stop","units":[1]}}]}"#,
+            r#"{"type":"plan_set","name":"boom","steps":[
+                {"intent":{"type":"build","worker":1,"kind":"Barracks","x":-60.0,"z":-60.0},
+                 "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}},
+                {"intent":{"type":"train","building":2,"unit":"Sorcerer"},
+                 "advance":{"type":"after","secs":30.0}},
+                {"intent":{"type":"posture","id":1,"posture":{"type":"push","x":70.0,"z":70.0}},
+                 "advance":{"type":"on_applied"}}]}"#,
+            r#"{"type":"plan_clear","name":"opening"}"#,
+            r#"{"type":"plan_clear"}"#,
         ];
         for case in cases {
             let parsed: Intent = serde_json::from_str(case)
@@ -3250,6 +3432,361 @@ mod tests {
 
         arm(&mut app, Team::Human, r#"{"type":"trigger_clear"}"#);
         assert!(trigger_names(&app, Team::Human).is_empty(), "the whole slate");
+    }
+
+    // -----------------------------------------------------------------------
+    // Plans (docs/INTENT.md § Plans)
+    // -----------------------------------------------------------------------
+
+    fn plan_names(app: &App, team: Team) -> Vec<String> {
+        app.world()
+            .resource::<Plans>()
+            .get(team)
+            .iter()
+            .map(|p| p.name.as_str().to_string())
+            .collect()
+    }
+
+    fn first_error(app: &App, team: Team) -> String {
+        app.world()
+            .resource::<IntentErrors>()
+            .get(team)
+            .first()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// **The caps are two plans of eight steps, and re-using a name is free.**
+    ///
+    /// Same argument as the trigger cap and the same shape of test: a bound has
+    /// to be a bound, and it has to be a bound on *distinct plans*, or a
+    /// commander iterating on one opening would spend the whole allowance on a
+    /// plan they already had.
+    #[test]
+    fn a_team_may_run_two_plans_of_eight_steps_and_replacing_one_is_free() {
+        let mut app = compiler_app();
+        let step = r#"{"intent":{"type":"stop","units":[]}}"#;
+        let eight = vec![step; MAX_PLAN_STEPS].join(",");
+        for name in ["opening", "follow-up"] {
+            arm(
+                &mut app,
+                Team::Human,
+                &format!(r#"{{"type":"plan_set","name":"{name}","steps":[{eight}]}}"#),
+            );
+        }
+        assert_eq!(plan_names(&app, Team::Human), vec!["opening", "follow-up"]);
+        assert!(app.world().resource::<IntentErrors>().get(Team::Human).is_empty());
+
+        arm(
+            &mut app,
+            Team::Human,
+            &format!(r#"{{"type":"plan_set","name":"third","steps":[{step}]}}"#),
+        );
+        let err = first_error(&app, Team::Human);
+        assert!(err.contains(&format!("{MAX_PLANS_PER_TEAM} plans")), "{err}");
+        assert!(err.contains("opening") && err.contains("follow-up"), "it names them: {err}");
+        assert_eq!(plan_names(&app, Team::Human).len(), MAX_PLANS_PER_TEAM);
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+
+        // Nine steps is one too many, and the refusal says so with the number.
+        let nine = vec![step; MAX_PLAN_STEPS + 1].join(",");
+        arm(
+            &mut app,
+            Team::Human,
+            &format!(r#"{{"type":"plan_set","name":"opening","steps":[{nine}]}}"#),
+        );
+        let err = first_error(&app, Team::Human);
+        assert!(err.contains("9 steps") && err.contains("the most is 8"), "{err}");
+        assert_eq!(
+            app.world().resource::<Plans>().get(Team::Human)[0].steps.len(),
+            MAX_PLAN_STEPS,
+            "and the plan it would have replaced is untouched"
+        );
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+
+        // Replacing by name costs no slot and restarts the plan.
+        app.world_mut().resource_mut::<Plans>().get_mut(Team::Human)[0].at = 4;
+        arm(
+            &mut app,
+            Team::Human,
+            &format!(r#"{{"type":"plan_set","name":"opening","steps":[{step}]}}"#),
+        );
+        assert!(app.world().resource::<IntentErrors>().get(Team::Human).is_empty());
+        assert_eq!(plan_names(&app, Team::Human), vec!["opening", "follow-up"]);
+        let p = &app.world().resource::<Plans>().get(Team::Human)[0];
+        assert_eq!((p.steps.len(), p.at), (1, 0), "replaced in place and restarted");
+    }
+
+    /// Plans are per team, like everything else in this compiler.
+    #[test]
+    fn one_teams_plans_are_not_the_others() {
+        let mut app = compiler_app();
+        let step = r#"{"intent":{"type":"stop","units":[]}}"#;
+        for name in ["h1", "h2"] {
+            arm(
+                &mut app,
+                Team::Human,
+                &format!(r#"{{"type":"plan_set","name":"{name}","steps":[{step}]}}"#),
+            );
+        }
+        arm(
+            &mut app,
+            Team::Claude,
+            &format!(r#"{{"type":"plan_set","name":"c0","steps":[{step}]}}"#),
+        );
+        assert_eq!(plan_names(&app, Team::Claude), vec!["c0"]);
+        assert!(app.world().resource::<IntentErrors>().get(Team::Claude).is_empty());
+    }
+
+    /// **A plan cannot set a plan, and a trigger cannot set one either** — but
+    /// a plan step MAY arm a trigger.
+    ///
+    /// That asymmetry is the whole bound and it is worth pinning: the graph is
+    /// exactly two rungs deep (plan -> trigger -> ordinary intent), each rung
+    /// is capped, and no edge points back up. Remove the second refusal and a
+    /// trigger could set a plan whose step re-armed the trigger, forever.
+    #[test]
+    fn the_deferral_graph_is_two_rungs_deep_and_never_points_back_up() {
+        let mut app = compiler_app();
+        for nested in [
+            r#"{"type":"plan_set","name":"outer","steps":[
+                {"intent":{"type":"plan_set","name":"inner","steps":[
+                    {"intent":{"type":"stop","units":[]}}]}}]}"#,
+            r#"{"type":"plan_set","name":"outer","steps":[
+                {"intent":{"type":"plan_clear","name":"whatever"}}]}"#,
+        ] {
+            arm(&mut app, Team::Human, nested);
+            let err = first_error(&app, Team::Human);
+            assert!(err.contains("sets or clears a plan"), "{err}");
+            assert!(plan_names(&app, Team::Human).is_empty(), "nothing was set");
+            app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+        }
+
+        // A TRIGGER may not set a plan either.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"t","when":{"type":"mine_dry"},
+                "then":{"type":"plan_set","name":"p","steps":[
+                    {"intent":{"type":"stop","units":[]}}]}}"#,
+        );
+        let err = first_error(&app, Team::Human);
+        assert!(err.contains("cannot arm or clear another trigger or a plan"), "{err}");
+        assert!(app.world().resource::<Triggers>().get(Team::Human).is_empty());
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+
+        // But a plan step arming a trigger is a real idiom and is accepted.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"opening","steps":[
+                {"intent":{"type":"trigger_set","name":"home-guard",
+                           "when":{"type":"base_under_attack"},
+                           "then":{"type":"stop","units":[]}}}]}"#,
+        );
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "{:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+        assert_eq!(plan_names(&app, Team::Human), vec!["opening"]);
+    }
+
+    /// Advance conditions are validated when the plan is SET, because — exactly
+    /// like a trigger's predicate — every parameter in one is a constant the
+    /// commander typed. The step INTENTS are deliberately not checked; that
+    /// note lives on the arm in `compile_intent`.
+    #[test]
+    fn an_advance_condition_is_validated_when_the_plan_is_set() {
+        let mut app = compiler_app();
+        for (json, expect) in [
+            (
+                r#"{"type":"plan_set","name":"p","steps":[
+                    {"intent":{"type":"stop","units":[]},
+                     "advance":{"type":"when","when":{"type":"tier_reached","tier":9}}}]}"#,
+                "tier must be 1, 2 or 3",
+            ),
+            (
+                r#"{"type":"plan_set","name":"p","steps":[
+                    {"intent":{"type":"stop","units":[]}},
+                    {"intent":{"type":"stop","units":[]},
+                     "advance":{"type":"after","secs":0.0}}]}"#,
+                "'after' must be > 0 seconds",
+            ),
+            (
+                r#"{"type":"plan_set","name":"   ","steps":[
+                    {"intent":{"type":"stop","units":[]}}]}"#,
+                "is not a usable plan name",
+            ),
+            (
+                r#"{"type":"plan_set","name":"p","steps":[]}"#,
+                "has no steps",
+            ),
+        ] {
+            arm(&mut app, Team::Human, json);
+            let err = first_error(&app, Team::Human);
+            assert!(err.contains(expect), "wanted {expect:?} in {err:?}");
+            assert!(plan_names(&app, Team::Human).is_empty());
+            app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+        }
+
+        // A step's INTENT naming things that do not exist yet is accepted —
+        // that is the entire point of writing a sequence in advance.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"p","steps":[
+                {"intent":{"type":"train","building":999999,"unit":"Footman"}},
+                {"intent":{"type":"research","building":999998,"upgrade":"attack"}}]}"#,
+        );
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "a plan may name a world that does not exist yet: {:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+    }
+
+    /// Clearing: one by name, or the whole slate, with the same "there was
+    /// nothing by that name" error triggers give.
+    #[test]
+    fn clearing_names_one_plan_or_all_of_them() {
+        let mut app = compiler_app();
+        let step = r#"{"intent":{"type":"stop","units":[]}}"#;
+        for name in ["a", "b"] {
+            arm(
+                &mut app,
+                Team::Human,
+                &format!(r#"{{"type":"plan_set","name":"{name}","steps":[{step}]}}"#),
+            );
+        }
+        arm(&mut app, Team::Human, r#"{"type":"plan_clear","name":"a"}"#);
+        assert_eq!(plan_names(&app, Team::Human), vec!["b"]);
+        assert!(app.world().resource::<IntentErrors>().get(Team::Human).is_empty());
+
+        arm(&mut app, Team::Human, r#"{"type":"plan_clear","name":"a"}"#);
+        assert!(
+            first_error(&app, Team::Human).contains("you have no plan named 'a'"),
+            "{}",
+            first_error(&app, Team::Human)
+        );
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+
+        arm(&mut app, Team::Human, r#"{"type":"plan_clear"}"#);
+        assert!(plan_names(&app, Team::Human).is_empty());
+        assert!(app.world().resource::<IntentErrors>().get(Team::Human).is_empty());
+    }
+
+    /// **A plan's sentence is the whole sequence**, joined by the word the verb
+    /// is named after. It is what a co-commander's proposal is reviewed on, so
+    /// a step count would not do — the human answering `[Enter]` has to see
+    /// what they are agreeing to on the line they are answering.
+    #[test]
+    fn a_plans_sentence_reads_as_one_english_sequence() {
+        let plan: Intent = serde_json::from_str(
+            r#"{"type":"plan_set","name":"boomer","steps":[
+                {"intent":{"type":"build","worker":7,"kind":"Barracks","x":-60.0,"z":-60.0},
+                 "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}},
+                {"intent":{"type":"train","building":9,"unit":"Sorcerer"},
+                 "advance":{"type":"after","secs":30.0}},
+                {"intent":{"type":"posture","id":2,"posture":{"type":"push","x":70.0,"z":70.0}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.sentence(),
+            "plan boomer (3 steps): worker 7 builds Barracks at (-60.0, -60.0), \
+             then when we reach tier 2: building 9 trains Sorcerer, \
+             then after 30s: squad 2 pushes to (70.0, 70.0)"
+        );
+        // The last step's advance decides when the plan reports itself done, so
+        // it reads as a trailing clause rather than introducing a step that is
+        // not there.
+        let trailing: Intent = serde_json::from_str(
+            r#"{"type":"plan_set","name":"p","steps":[
+                {"intent":{"type":"stop","units":[1]},
+                 "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":6}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            trailing.sentence(),
+            "plan p (1 steps): unit 1 hold position (done when we field 6 or more Footman)"
+        );
+    }
+
+    /// **A plan step is link-exempt**, on the identical argument that exempts a
+    /// trigger: it is engine-executed standing policy whose author paid the
+    /// reach when they wrote it down (docs/TEMPO.md verb table).
+    #[test]
+    fn a_plan_step_pays_no_command_link() {
+        let mut app = compiler_app();
+        // The severed-arm case the other link tests use: no command nodes, so
+        // every DIRECT order to a unit pays the full curve.
+        app.insert_resource(CommandLatency { on: true, ..Default::default() })
+            .insert_resource(CommandNodes { nodes: Vec::new(), ready: true });
+
+        let soldier = |app: &mut App| {
+            app.world_mut()
+                .spawn((
+                    Unit { kind: UnitKind::Footman },
+                    Team::Human,
+                    Transform::from_xyz(60.0, 0.0, 60.0),
+                    Health::new(100.0),
+                    Order::Idle,
+                ))
+                .id()
+        };
+
+        // Spoken by hand: it travels.
+        let by_hand = soldier(&mut app);
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Move {
+                units: vec![by_hand.to_bits()],
+                x: -70.0,
+                z: -70.0,
+            },
+        ));
+        app.update();
+        let pending = app
+            .world()
+            .entity(by_hand)
+            .get::<PendingOrder>()
+            .expect("a hand order from outside the chain of command travels");
+        assert!(pending.link() > 0.0);
+
+        // The identical order as a plan step: it lands in the frame it was
+        // submitted, exactly as a fired trigger's does.
+        let by_plan = soldier(&mut app);
+        app.world_mut().send_event(SubmitIntent::plan_step(
+            Team::Human,
+            IntentSource::Bridge,
+            PlanStamp {
+                name: PlanName::new("opening").unwrap(),
+                step: 2,
+                of: 5,
+            },
+            Intent::Move {
+                units: vec![by_plan.to_bits()],
+                x: -70.0,
+                z: -70.0,
+            },
+        ));
+        app.update();
+        assert!(
+            app.world().entity(by_plan).get::<PendingOrder>().is_none(),
+            "a plan step is engine-executed standing policy and pays nothing"
+        );
+        assert!(
+            matches!(app.world().entity(by_plan).get::<Order>(), Some(Order::Move(_))),
+            "it is already moving"
+        );
+        // And the unit can say which step moved it.
+        let why = app
+            .world()
+            .entity(by_plan)
+            .get::<Provenance>()
+            .expect("a plan step stamps its targets")
+            .why();
+        assert!(why.starts_with("plan:opening step 2/5 move by bridge"), "{why}");
     }
 
     /// **The sentence**, which is what a person reads in `intent_log.jsonl` and
@@ -3522,6 +4059,7 @@ mod tests {
                     ability: Some(AbilitySelector::Id("CallToArms".to_string())),
                 },
                 trigger: None,
+                plan: None,
             });
             app.update();
             assert!(
@@ -3549,6 +4087,7 @@ mod tests {
                     z: None,
                     target: None, hero: caster, ability: None },
                 trigger: None,
+                plan: None,
             });
             app.update();
             app.world()
@@ -3659,6 +4198,7 @@ mod tests {
                 z: mine.z,
             },
             trigger: None,
+            plan: None,
         });
         app.update();
 
@@ -3700,6 +4240,7 @@ mod tests {
                 z: hz,
             },
             trigger: None,
+            plan: None,
         });
         app.update();
         assert!(
@@ -3773,6 +4314,7 @@ mod tests {
             tag: "cmd 1".to_string(),
             intent: serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}")),
             trigger: None,
+            plan: None,
         }
     }
 
@@ -4412,6 +4954,7 @@ mod tests {
                 source: IntentSource::Bridge,
                 tag: "cmd 0".to_string(),
                 trigger: None,
+                plan: None,
                 intent: Intent::UseItem {
                     slot: 0,
                     hero: Some(hero.to_bits()),
@@ -4496,6 +5039,7 @@ mod tests {
             source: IntentSource::Bridge,
             tag: "cmd 0".to_string(),
             trigger: None,
+            plan: None,
             intent: Intent::UseItem {
                 slot: 0,
                 hero: Some(hero.to_bits()),

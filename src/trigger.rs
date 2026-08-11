@@ -63,10 +63,16 @@
 //! ## Determinism inside the set
 //!
 //! `SimSet::Think` also holds doctrine.rs's seven systems, and Bevy leaves two
-//! systems in one set unordered unless something forces an edge. Nothing does
-//! here, and nothing needs to: this system's only writes are `ResMut<Triggers>`
-//! (nobody else touches it), `ResMut<GameEvents>` (no other writer lives in
-//! `Think`) and `EventWriter<SubmitIntent>` (same). Everything it reads is
+//! systems in one set unordered unless something forces an edge. One thing
+//! does: plan.rs's evaluator writes the same two things this system does, and
+//! it declares itself `.before` this one so that a trigger's answer to the
+//! situation at hand lands AFTER a plan's answer to the general case, and
+//! therefore wins. That edge is argued in plan.rs's module docs.
+//!
+//! Against doctrine, nothing forces an edge and nothing needs to: this system's
+//! only writes are `ResMut<Triggers>` (nobody else touches it),
+//! `ResMut<GameEvents>` and `EventWriter<SubmitIntent>` (whose only other
+//! `Think` writer is plan.rs, ordered explicitly). Everything it reads is
 //! read-only, and doctrine's `Order` writes go through `Commands`, which flush
 //! after the set either way. So the two are genuinely commutative rather than
 //! merely usually-fine.
@@ -173,11 +179,17 @@ fn xz_dist(a: Vec3, b: Vec3) -> f32 {
 
 /// Does `when` hold for `me`, right now?
 ///
+/// `pub` because plan.rs asks the same question about the same vocabulary: a
+/// plan step's `advance` condition IS a [`TriggerWhen`], and two evaluators
+/// with two readings of "we reached tier 2" would be two languages. One
+/// definition, two callers — and any predicate a later bead adds here is a plan
+/// advance-condition the moment it lands, with no work in plan.rs.
+///
 /// Every arm is a fold over state the frame already has. Nothing here writes,
 /// remembers, or subscribes: a predicate that needed its own bookkeeping would
 /// be a predicate whose truth could drift from the world, and the whole value
 /// of firing at machine speed is that the world is what fired it.
-fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
+pub fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
     match when {
         // Our own BUILDINGS, damaged inside the window. Buildings only: a
         // skirmish in midfield is not the base being attacked, and a predicate
@@ -304,7 +316,11 @@ fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
 /// "did my rule ever go off?" is answerable from the snapshot rather than from
 /// an absence. A repeating one stamps `last_fired` and goes quiet for its
 /// cooldown.
-fn evaluate_triggers(
+/// `pub` so plan.rs can declare a hard ordering edge against it. Both systems
+/// live in `SimSet::Think` and both write `SubmitIntent` and `GameEvents`, and
+/// Bevy would otherwise leave them unordered — see plan.rs's module docs for
+/// why plans go first and a trigger therefore wins a same-tick tie.
+pub fn evaluate_triggers(
     time: Res<Time>,
     mut triggers: ResMut<Triggers>,
     mut submissions: EventWriter<SubmitIntent>,
@@ -985,6 +1001,7 @@ mod tests {
             )
             .expect("the recipe in COMMANDER_BRIEF.md parses"),
             trigger: None,
+            plan: None,
         });
         app.update();
         assert_eq!(

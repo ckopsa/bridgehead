@@ -11,6 +11,7 @@ mod doctrine;
 mod economy;
 mod hotkeys;
 mod intent;
+mod plan;
 mod shared;
 mod terrain;
 mod trigger;
@@ -144,6 +145,9 @@ fn main() {
         // watches and an intent it submits the moment it holds. Beside
         // DoctrinePlugin because it shares its frame slot and its argument.
         trigger::TriggerPlugin,
+        // Sequenced standing policy. Ordered against TriggerPlugin from inside
+        // plan.rs, where the reasoning for the edge lives.
+        plan::PlanPlugin,
         bounty::BountyPlugin,
     ))
     .run();
@@ -186,6 +190,7 @@ mod tests {
             copilot::CopilotPlugin,
             doctrine::DoctrinePlugin,
             trigger::TriggerPlugin,
+            plan::PlanPlugin,
             bounty::BountyPlugin,
         ))
         .add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));

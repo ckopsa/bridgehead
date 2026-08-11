@@ -647,6 +647,7 @@ a substitution inside `compile_intent`'s order arms and nothing else. The
 | `use_item`, `buy` | exempt |
 | `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt — doctrine IS the fast path |
 | `trigger_set`, `trigger_clear` | exempt — arming a rule is doctrine, and the rule's own firing is too (below) |
+| `plan_set`, `plan_clear` | exempt — writing a sequence down is doctrine, and the plan's own steps are too (below) |
 | `autopilot`, `surrender` | exempt — match level |
 
 The `cast` row was originally not a carve-out but an identity: every caster in
@@ -697,6 +698,27 @@ policy already has its orders and does not need to ask. A trigger is standing
 policy whose condition happened to come true: the commander reached the unit
 when they ARMED it, and charging the link again on firing would price one reach
 twice.
+
+**Plan steps pay nothing either, on the identical argument** (`wc3clone-c5b`,
+v3). A `plan_set` hands the engine a named sequence; when a step's turn comes,
+the engine submits that step's stored intent through the ordinary compiler, and
+that submission is **exempt from the link** whatever verb it carries. Same
+derivation, one rung along: a plan is standing policy the engine executes
+unattended, its author reached the units when they wrote the sequence down, and
+step 4 firing four minutes later is the engine doing what it was told rather
+than a new order travelling out from a commander.
+
+It also has to be exempt for the mechanism's own incentive to survive. If each
+step paid, a five-step plan would cost five links and be *strictly worse* than
+typing the same five commands by hand from the same place — which inverts C4
+("doctrine strictly better than micro at range") at exactly the layer where the
+tempo argument is strongest, because a plan is the one construct that is
+*entirely* decided in advance.
+
+Both rows are selected by the same named constructor: `CommandLink::exempt_issuer`,
+reached when `SubmitIntent` carries either a `trigger` or a `plan` stamp. One
+call site, two rows, and the constructor exists rather than a boolean precisely
+so this table has somewhere to point.
 
 It also extends C4 one rung. "Doctrine is strictly better than micro at range"
 was an argument about *continuous* work; with triggers exempt, *pre-arming a

@@ -586,6 +586,21 @@ struct StateOut {
     /// identical to a v1 one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     triggers: Vec<TriggerOut>,
+    /// **Your plans** (`plan_set`), in the order you set them.
+    ///
+    /// Own team only, and for the same stronger reason `triggers` is: a plan is
+    /// your build order and your follow-up, and reading the opponent's is the
+    /// single most valuable thing a snapshot could leak.
+    ///
+    /// This is the array to read FIRST on a poll where you have a plan running.
+    /// `step` and `status` together answer "is the sequence I wrote still
+    /// happening", which is the only question a plan raises — and a `blocked:`
+    /// or `halted:` status carries the compiler's own words, so you never have
+    /// to go correlate it against `errors`.
+    ///
+    /// Absent when you have none, on the same rule as `command_nodes`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    plans: Vec<PlanOut>,
 
     // --- co-command (copilot seats only) ---------------------------------
     //
@@ -1052,6 +1067,57 @@ struct TriggerOut {
     sentence: String,
 }
 
+/// One plan, as its owner reads it back.
+///
+/// `steps` is the **same JSON you sent**, round-tripped through the `Intent`
+/// and `PlanAdvance` types rather than re-described — the rule `TriggerOut`
+/// follows and for the same reason: a commander should be able to read a plan
+/// out of the snapshot, change one step, and send it back under the same name.
+#[derive(Serialize)]
+struct PlanOut {
+    name: String,
+    /// Which step is being worked, one-based, and how many there are. Two
+    /// fields rather than the string `"2/5"` because a reader that wants to
+    /// branch on progress should not have to parse a fraction.
+    step: usize,
+    of: usize,
+    /// `"running"`, `"done"`, or `"blocked: <why>"` / `"halted: <why>"` with
+    /// the compiler's verbatim refusal. A bare word would be a status you have
+    /// to go research; plans.rs's whole failure design is that you do not.
+    status: String,
+    /// The English of the step it is on right now — the same sentence the
+    /// event feed wrote when the step went out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<String>,
+    /// The whole sequence, editable and re-sendable.
+    steps: Vec<PlanStep>,
+    /// The English of the entire plan, identical to the line the replay log
+    /// wrote when it was set. What a co-commander's proposal is reviewed on.
+    sentence: String,
+}
+
+/// This seat's plans, wire-shaped. A free function rather than an inline map so
+/// the shape a commander parses can be tested without standing up a whole
+/// snapshot — the same reason `resolutions_out` is one.
+fn plans_out(my_plans: &[PlanRun]) -> Vec<PlanOut> {
+    my_plans
+        .iter()
+        .map(|p| PlanOut {
+            name: p.name.as_str().to_string(),
+            step: p.step_no(),
+            of: p.steps.len(),
+            status: p.status(),
+            current: p.current().map(|s| s.intent.sentence()),
+            steps: p.steps.clone(),
+            sentence: Intent::PlanSet {
+                name: p.name.as_str().to_string(),
+                steps: p.steps.clone(),
+            }
+            .sentence(),
+        })
+        .collect()
+}
+
 #[derive(Serialize)]
 struct HeroOut {
     level: u32,
@@ -1296,6 +1362,8 @@ struct SeatVerdicts<'w> {
 struct StandingOrders<'w> {
     squads: Res<'w, SquadOrders>,
     triggers: Res<'w, Triggers>,
+    /// The third kind, sequenced. Same one-writer rule, same two readers.
+    plans: Res<'w, Plans>,
 }
 
 /// The co-command side-channel: the pending proposal queue and the team's
@@ -1368,6 +1436,7 @@ fn write_snapshot(
             &game_over,
             &standing.squads,
             standing.triggers.get(seat.team),
+            standing.plans.get(seat.team),
             *tech.tiers,
             *tech.research,
             &feed,
@@ -1398,6 +1467,8 @@ fn write_seat_snapshot(
     // the whole resource, so this function cannot read the opponent's plans
     // even by accident.
     my_triggers: &[TriggerRule],
+    // This seat's own plans, pre-sliced by team on the same reasoning.
+    my_plans: &[PlanRun],
     tiers: TechTiers,
     team_research: TeamResearch,
     feed: &GameEvents,
@@ -1674,6 +1745,11 @@ fn write_seat_snapshot(
         })
         .collect();
 
+    // Plans, in the order they were set — which is the order they step in, so
+    // it is the order they must be read in. NOT sorted, for the reason the
+    // trigger list is not.
+    let plans = plans_out(my_plans);
+
     // Bounty caches this seat can see, sorted by id so a seat serializes the
     // same order every tick. The two seats' lists now legitimately differ.
     let mut bounty_snaps: Vec<BountySnap> = bounties
@@ -1874,6 +1950,7 @@ fn write_seat_snapshot(
         events,
         command_nodes,
         triggers,
+        plans,
         copilot: copilot_out,
         proposals: proposals_out,
         recent_resolutions: resolutions_out,
@@ -2157,6 +2234,7 @@ fn poll_commands(
                             // A seat speaks for itself. Only trigger.rs sets
                             // this, and only for a rule it is firing.
                             trigger: None,
+                            plan: None,
                         });
                     }
                     Err(err) => intent_errors
@@ -2325,6 +2403,70 @@ mod tests {
             severity: ProposalSeverity::Urgent,
             outcome,
         }
+    }
+
+    /// **A plan, end to end on the wire.** Parsed back out of the JSON rather
+    /// than inspected as Rust, for the reason the veto test below gives: only
+    /// the round trip catches a field that got renamed, skipped, or nested a
+    /// level too deep.
+    ///
+    /// The contract is that `step`/`of`/`status` answer "is the sequence I
+    /// wrote still happening" without any correlation work, and that `steps` is
+    /// the JSON the commander sent — so reading a plan out, changing one step,
+    /// and sending it back under the same name is a legal `plan_set`.
+    #[test]
+    fn a_plan_round_trips_through_the_snapshot_json() {
+        let step = |json: &str| -> PlanStep { serde_json::from_str(json).expect("step parses") };
+        let mut running = PlanRun {
+            name: PlanName::new("boomer").unwrap(),
+            steps: vec![
+                step(
+                    r#"{"intent":{"type":"build","worker":7,"kind":"Barracks","x":-60.0,"z":-60.0},
+                        "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}}"#,
+                ),
+                step(r#"{"intent":{"type":"train","building":9,"unit":"Sorcerer"}}"#),
+            ],
+            source: IntentSource::Bridge,
+            state: PlanState::Running,
+            at: 1,
+            submitted: true,
+            applied: true,
+            applied_at: 12.0,
+            last_try: 12.0,
+            blocked_since: None,
+            told_blocked: false,
+        };
+        let json = serde_json::to_string(&plans_out(std::slice::from_ref(&running))).unwrap();
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0]["name"], "boomer");
+        assert_eq!(back[0]["step"], 2);
+        assert_eq!(back[0]["of"], 2);
+        assert_eq!(back[0]["status"], "running");
+        assert_eq!(back[0]["current"], "building 9 trains Sorcerer");
+        assert!(back[0]["sentence"].as_str().unwrap().starts_with("plan boomer (2 steps): worker 7 builds"));
+
+        // `steps` is what was sent, re-sendable: the terse step keeps its
+        // omitted `advance` implicit and the explicit one keeps its predicate.
+        let steps = back[0]["steps"].as_array().expect("an array of steps");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["intent"]["type"], "build");
+        assert_eq!(steps[0]["advance"]["when"]["tier"], 2);
+        assert_eq!(steps[1]["advance"]["type"], "on_applied");
+        let resent: Intent = serde_json::from_value(serde_json::json!({
+            "type": "plan_set",
+            "name": back[0]["name"],
+            "steps": back[0]["steps"],
+        }))
+        .expect("a plan read out of a snapshot is a legal plan_set");
+        assert_eq!(resent.verb(), "plan_set");
+
+        // A stopped plan carries the compiler's own words in its status, so
+        // nothing has to be correlated against `errors`.
+        running.state = PlanState::Blocked("not enough gold (need 160, have 120)".to_string());
+        let json = serde_json::to_string(&plans_out(std::slice::from_ref(&running))).unwrap();
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0]["status"], "blocked: not enough gold (need 160, have 120)");
     }
 
     /// **The veto reason, end to end on the wire.** The human's answer is

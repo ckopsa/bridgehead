@@ -107,6 +107,13 @@ Triggers (CONTINGENT standing orders — see the section below; this is the shap
 - `{"type":"trigger_set","name":"home-guard","when":{...},"then":{<any intent>},"repeat":30}`
   — the engine watches `when` at 4 Hz and submits `then` itself. `repeat` omitted = fires once.
 - `{"type":"trigger_clear","name":"home-guard"}` — disarm one. Omit `name` to clear all of them.
+Plans (SEQUENCED standing orders — see the section below; this is the shape):
+- `{"type":"plan_set","name":"opening","steps":[{"intent":{<any intent>},"advance":{...}},...]}`
+  — the engine walks the sequence for you, submitting each step when its turn comes. `advance`
+  omitted = "as soon as this one is accepted"; `{"type":"when","when":{<any trigger predicate>}}`
+  = wait for that condition; `{"type":"after","secs":30}` = wait that long. Max 8 steps, max 2
+  plans running, once through (no loops — that is what a trigger's `repeat` is for).
+- `{"type":"plan_clear","name":"opening"}` — drop one. Omit `name` to drop all of them.
 - `{"type":"autopilot","on":true}` — hand your whole faction to the scripted AI (emergency only).
 - `{"type":"surrender"}` — concede the match (opponent wins immediately). The honorable end to a
   hopeless position — no income, no army, no path back. Preferable to dragging out a decided game.
@@ -187,6 +194,115 @@ where you can — a squad survives its members. And a trigger whose action is
 refused when it fires reports that in your `errors` array tagged
 `trigger:<name>`, so check there if a rule seems to do nothing.
 
+## Plans: make the engine run your build order
+
+**This is the second biggest thing you can do about your own latency, and it is
+the one that wins the first six minutes.** A trigger deletes the cost of
+*reacting*. A plan deletes the cost of *transcribing* — the build order you had
+already decided before the match started and were going to feed the engine one
+command per poll, at ten to fifteen seconds a command, while your opponent's
+economy compounded.
+
+A plan is named ordered steps. The engine submits step 1, waits for that step's
+`advance` condition, submits step 2, and so on. Once through, then it is done.
+
+Rules: max **2** plans running, max **8** steps each. Re-using a `name` replaces
+the plan and restarts it from step 1 (free — the cap counts live plans). A plan
+step may arm a `trigger_set`, but a plan may not set another plan. Your plans
+come back in the snapshot's `plans` array with `step`/`of`, `status`, the
+current step's `sentence`, and the whole `steps` list as the JSON you sent — so
+you can read one out, change a number, and send it back under the same name.
+
+Every step writes a line into `events` as it goes out:
+
+    plan opening step 2/5: worker 4294968100 builds Sanctum at (58.0, 66.0)
+
+### The three advance conditions
+
+| `advance` | the plan moves on |
+|---|---|
+| omitted (or `{"type":"on_applied"}`) | the moment this step is ACCEPTED — the plain meaning of "then" |
+| `{"type":"when","when":{...}}` | when that condition holds — **any of the nine trigger predicates above** |
+| `{"type":"after","secs":30}` | 30 seconds after this step was accepted |
+
+"Accepted" means the order was legal and taken, NOT that the building finished.
+To wait for something to finish, use `when` with `tier_reached` or `unit_count`.
+
+### If a step is refused
+
+The plan **blocks on that step and never skips it**. Its `status` becomes
+`blocked: <the exact compiler error>`, it retries the same step every 2s, and
+if it is still refused 10s later the status becomes `halted: <error>` and the
+plan stops for good — on the step that failed. Both are also announced in
+`events`. So a plan is never quietly wrong: it is either running, done, or
+telling you which step it is stuck on and why.
+
+This is why most steps should be robust to timing. "Not enough gold" clears
+itself inside the retry window; "you have no Sanctum" does not.
+
+### THE CANONICAL EXAMPLE: the boomer opening as one plan
+
+Economy first, tech second, army third — sequenced so each step waits for the
+thing it needs. **This is one command instead of six polls.** Substitute your
+own ids from the snapshot.
+
+```json
+{"type":"plan_set","name":"boomer","steps":[
+  {"intent":{"type":"build","worker":<worker A>,"kind":"Barracks","x":-58.0,"z":-58.0}},
+
+  {"intent":{"type":"upgrade","building":<your TownHall>},
+   "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}},
+
+  {"intent":{"type":"build","worker":<worker B>,"kind":"Sanctum","x":-66.0,"z":-58.0},
+   "advance":{"type":"after","secs":40}},
+
+  {"intent":{"type":"template","building":<your Barracks>,"squad":2}},
+
+  {"intent":{"type":"train","building":<your Barracks>,"unit":"Footman"},
+   "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":6}}},
+
+  {"intent":{"type":"posture","id":2,
+             "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}]}
+```
+
+Read it as English — it is exactly what the replay log will write:
+
+> plan boomer (6 steps): worker … builds Barracks at (-58.0, -58.0), then
+> building … upgrades to its next tier, then when we reach tier 2: worker …
+> builds Sanctum at (-66.0, -58.0), then after 40s: building … stamps every unit
+> it trains with squad 2, then building … trains Footman, then when we field 6
+> or more Footman: squad 2 defends (-70.0, -70.0) within 26
+
+Note step 2: the `upgrade` goes out immediately (a plain "then"), and the
+`when tier_reached 2` on it is what makes step 3 **wait for the keep to
+finish** before spending on the Sanctum. The advance-condition of a step governs
+the move to the NEXT step — that is the one thing to get right.
+
+### The idiom for units you do not have yet
+
+**A step's unit ids are frozen when you set the plan.** You cannot write "the 8
+footmen I will have by then" — those units do not exist and have no ids.
+
+The answer is already in the language: **name a SQUAD.** `template` stamps every
+unit a building trains into squad 2; `posture` addresses squad 2 by number and
+resolves its membership when the step runs. Steps 4–6 above are exactly this
+pattern, and it is why they are in the canonical example. Prefer squad-addressed
+steps over id lists everywhere in a plan — a squad survives its members, and a
+plan runs long enough for members to die.
+
+### Plans vs triggers — use both
+
+They are two halves of one sentence and they do not compete for slots.
+
+- A **plan** is what you are going to do. Sequence, once through.
+- A **trigger** is what to do if something happens. Condition, optionally
+  repeating.
+
+A plan step can arm a trigger, which is how you say "once the barracks is up,
+start guarding the base". If a plan step and a trigger both re-task the same
+squad on the same tick, **the trigger wins** — a rule written for the situation
+in front of you beats a sequence written before the match.
+
 ## Speakable strategy: `tools/intent_compile.py`
 
 Everything above is the JSON. You can also just say it:
@@ -239,9 +355,30 @@ omitted, exactly as before. The Sorcerer is a caster but **not** a hero, so
 - Anything it does not know, write by hand. It is a convenience over the schema
   above, never a gate in front of it, and it never guesses: an unresolvable
   place or an unknown noun is a reported error, not a silent whole-army move.
-- Conditionals ("strike when their hero falls") have no verb in this game —
-  there is no trigger system. The tool defers them and prints the command to
-  run when you see the condition in `events`.
+- **Conditionals compile.** `"when my base is attacked, squad 1 defends our
+  base"` becomes one `trigger_set`. `when`/`if`/`once`/`after` arm a once-rule;
+  `whenever`/`every time` arm a repeating one. A condition outside the nine
+  predicates is a reported error naming the ones that exist — never a plain
+  order that quietly runs right now.
+- **Sequences compile too.** Clauses joined by `", then"` become one
+  `plan_set`:
+
+  ```bash
+  python3 tools/intent_compile.py --seat <SEAT> --send \
+    "build a barracks, then when we reach tier 2, build a sanctum, then train 3 sorcerers"
+  ```
+
+  A bare `", then"` is "as soon as that lands"; `", then when <cond>,"` waits on
+  a trigger predicate; `", then after 30s,"` waits a fixed time. Name it with a
+  trailing `as <name>`. **The comma matters**: `focus siege then heroes` is a
+  focus-fire chain inside one clause, not two steps.
+
+  For units you will not have yet, say it with a squad — the tool and the engine
+  agree on this idiom:
+
+  ```bash
+  "the barracks units join squad 2, then when I have 8 footmen, squad 2 pushes their base"
+  ```
 
 **Check the round trip.** Every intent, from either seat, is logged as one
 English sentence in `bridge/intent_log.jsonl`. If the sentence is not what you
@@ -258,6 +395,8 @@ the other cannot.
 |---|---|
 | `order:move by bridge t=123` | you ordered it, at game second 123 |
 | `order:attack by ui t=123` | the *human* ordered it — same verb, other seat |
+| `trigger:home-guard move by bridge t=41` | a rule YOU armed fired and moved it |
+| `plan:opening step 2/5 build by bridge t=41` | step 2 of your 5-step plan ordered it |
 | `posture:push sq1` | squad 1's standing posture is moving it |
 | `policy:retreat t=210` | its retreat threshold fired; it is running home |
 | `template:Barracks#42` | it spawned with that building's doctrine template |
@@ -322,7 +461,7 @@ maximum. That is a real way to lose a game that still looks winnable on paper.
 
 ## If your seat is `bridge/copilot`: you are a CO-COMMANDER
 
-Everything above still applies — same 27 verbs, same snapshot, same fog, same
+Everything above still applies — same 29 verbs, same snapshot, same fog, same
 `bridge_send.py`. One thing changes, and it is the important one: **you are not
 the faction.** A human is playing this faction with a mouse, and you are sitting
 next to them. Your snapshot's top-level `copilot` block confirms it:

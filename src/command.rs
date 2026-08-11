@@ -50,6 +50,8 @@
 //! | `priority`, `retreat`, `leash`, `autocast`, `squad`, `posture`, `template` | exempt | Doctrine. Standing orders ARE the fast path — that is the mechanism, not an exception to it. |
 //! | `trigger_set`, `trigger_clear` | exempt | Arming a rule is doctrine. |
 //! | **anything a trigger fires** | exempt | Whatever verb it carries. A trigger is standing policy whose condition came true, so its author paid the reach when they ARMED it and charging the link again would price one reach twice. Selected by `SubmitIntent::trigger` through [`CommandLink::exempt_issuer`], which is a named constructor rather than a boolean precisely so this row has somewhere to point. It extends C4 one rung: pre-arming a rule is strictly better than hand-answering an alarm at range. |
+//! | `plan_set`, `plan_clear` | exempt | Writing a sequence down is doctrine. |
+//! | **anything a plan step submits** | exempt | Identical argument to the row above, one rung along: a plan is standing policy the engine executes unattended, and its author paid the reach when they wrote the sequence. It also has to be exempt or a five-step plan would cost five links and be strictly worse than typing the same five commands by hand — C4 inverted at the layer where the tempo argument is strongest. Selected by `SubmitIntent::plan` through the same [`CommandLink::exempt_issuer`]. |
 //! | `autopilot`, `surrender` | exempt | Match level, not a unit order. |
 //!
 //! ## The curve
@@ -837,7 +839,7 @@ mod tests {
     /// A reason for an order to carry, minted at speech time — the shape the
     /// compiler hands the issuer (docs/INTENT.md's `why` layer).
     fn test_why() -> Provenance {
-        IntentMark { source: IntentSource::Ui, at: 0.0, trigger: None }.order("move")
+        IntentMark { source: IntentSource::Ui, at: 0.0, trigger: None, plan: None }.order("move")
     }
 
     /// The curve, as a curve: free inside the radius, a step the moment you
@@ -1160,6 +1162,7 @@ mod tests {
                         source: IntentSource::Bridge,
                         at: spoken_at,
                         trigger: None,
+                        plan: None,
                     }
                     .order("attackmove"),
                     ready_at: spoken_at + link,
@@ -1202,6 +1205,7 @@ mod tests {
             source: IntentSource::Bridge,
             at: spoken_at + link,
             trigger: None,
+            plan: None,
         }
         .order("attackmove")
         .why();
