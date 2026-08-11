@@ -1290,10 +1290,37 @@ def parse_when(text):
                           r"burning|threatened)\b", t)):
         return {"type": "base_under_attack"}
 
+    # --- THEIR hero is down -----------------------------------------------
+    # This branch is the one that used to be a deferral, and the distinction it
+    # rests on is worth keeping in view. There is still no reading of an enemy
+    # hero's HEALTH — "strike when their hero is below 30%" is as unanswerable
+    # as it ever was, because no human can select an enemy hero and read a
+    # number off it. What changed is that whether you WATCHED IT DIE is a fact
+    # a human plainly has, and the intel ledger now keeps it. So the honest
+    # predicate is not "their hero is hurt" but "their hero is believed dead",
+    # and that is what these words compile to.
+    #
+    # Above the `not theirs` block so "their hero falls" cannot fall through
+    # into a rule about OUR hero — which is the silent wrong order this whole
+    # tool exists to avoid, and the reason the sentence was refused for so
+    # long.
+    if theirs and re.search(r"\b(hero(?:es)?|champion|priestess)\b", t):
+        if re.search(r"\b(falls?|fell|dies?|died|dying|down|dead|killed|"
+                     r"slain|drops?|goes\s+down)\b", t):
+            when = {"type": "enemy_hero_down"}
+            # Name the class only if they named it. "their hero falls" means
+            # whichever one — a commander who says "hero" is not asking to be
+            # told they should have said "champion".
+            for word, kind in (("champion", "Hero"), ("priestess", "Priestess")):
+                if re.search(rf"\b{word}\b", t):
+                    when["class"] = kind
+                    break
+            return when
+
     # --- a hero is dying --------------------------------------------------
-    # `their hero falls` is deliberately NOT this: the predicate vocabulary has
-    # no reading of an enemy hero's health, and answering it with your own would
-    # be the silent wrong order this whole tool exists to avoid.
+    # OURS. `their hero is below 40%` still reaches no branch and still defers:
+    # enemy hero health is not knowable, and answering it with our own number
+    # would be a rule that fires on the wrong army.
     if not theirs:
         m = re.search(r"\bhero(?:es)?\b.*?(?:below|under|at)\s*(?P<pct>\d+)\s*%", t)
         if m:
@@ -1317,6 +1344,32 @@ def parse_when(text):
     # verb with "cavalry appears", and the noun is the unambiguous half.
     if re.search(r"\b(bounty|bounties|cache|caches|treasure|chest)\b", t):
         return {"type": "bounty_spawned"}
+
+    # --- a body of their troops, from the ledger --------------------------
+    # Above the sighting branch because "army" is a noun the sighting branch
+    # cannot resolve to a class — it would return None and defer a sentence
+    # that is now perfectly expressible.
+    #
+    # The difference from `enemy_sighted` is memory, and it is worth stating
+    # because the two English sentences look alike. `enemy_sighted` is true
+    # only while eyes are ON them; `enemy_army_seen` reads the intel ledger, so
+    # it stays true after the scout that found them is killed — which is
+    # exactly what the scout was killed to prevent.
+    if re.search(r"\b(army|armies|force|forces|host|warband|stack|group|"
+                 r"doomstack|deathball)\b", t):
+        m = re.search(r"(?P<n>\d+)", t)
+        if m:
+            when = {"type": "enemy_army_seen", "size": int(m.group("n"))}
+            # "in the last 30 seconds" / "within 20s" — an optional bound on
+            # how stale the observation may be.
+            w = re.search(r"(?:within|in\s+the\s+last|no\s+older\s+than)\s+"
+                          r"(?P<w>\d+)\s*(?P<unit>s|secs?|seconds?|m|mins?|minutes?)\b", t)
+            if w:
+                secs = int(w.group("w"))
+                if w.group("unit").startswith("m"):
+                    secs *= 60
+                when["within_s"] = float(secs)
+            return when
 
     # --- eyes on the enemy ------------------------------------------------
     rest = None
@@ -1403,6 +1456,18 @@ def name_for(when):
         what = when.get("class", "enemy").lower()
         n = when.get("count", 1)
         return f"{what}-seen" if n <= 1 else f"{n}-{what}-seen"
+    if kind == "enemy_army_seen":
+        return f"army-{when.get('size', 1)}"
+    if kind == "enemy_hero_down":
+        # The class when they named one, so a rule about their Champion and a
+        # rule about their Priestess do not overwrite each other. Spelled with
+        # the CLASS word rather than the wire kind: `Hero` would auto-name to
+        # `hero-down`, one character away from `hero_below`'s `hero-35`, and
+        # the two are about opposite armies.
+        cls = when.get("class")
+        if cls:
+            return {"Hero": "champion-down"}.get(cls, f"{cls.lower()}-down")
+        return "their-hero-down"
     if kind == "bounty_spawned":
         return "bounty-up"
     if kind == "mine_dry":
@@ -1810,11 +1875,19 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
   whenever / every time / each time       -> REPEATS (45s cooldown by default)
   "... as <name>"   names it;   "... every 90s"   sets the cooldown.
 
-  THE NINE PREDICATES (this is the whole list — `shared::TriggerWhen`):
+  THE ELEVEN PREDICATES (this is the whole list — `shared::TriggerWhen`):
     my base is attacked                 any of your buildings damaged (last 8s)
     my hero drops below 40%             any living hero of yours under that
     squad 2 drops below 50%             that squad's POOLED health under that
     I see 3 or more siege               enemy units you can SEE right now
+    an enemy army of 6 is spotted       6+ enemy troops in your INTEL ledger,
+                                        which outlives the scout that found
+                                        them; add "within 30s" to require a
+                                        fresh sighting rather than a remembered
+                                        one. Workers do not count as an army.
+    their hero falls                    an enemy hero you WATCHED DIE and have
+                                        not seen alive since; name the champion
+                                        or the priestess to mean just one
     a bounty appears                    a cache you can see is on the map
     my mine runs dry                    a dry gold mine near one of your halls
     we reach tier 2                     your tech tier (1/2/3)
@@ -1824,8 +1897,11 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
   If your condition is not one of these the tool says so and falls back to the
   old advice — watch `events` (bridge_wait.py wakes you on them) and send the
   action yourself. It will not silently pick a predicate that is nearly right:
-  "strike when their hero falls" defers, because nothing here reads an ENEMY
-  hero's health and answering it with your own is a different order.
+  "strike when their hero is below 30%" still defers, because nothing reads an
+  ENEMY hero's health — you cannot select one, so no number about it is
+  knowable — and answering it with your own is a different order. "when their
+  hero FALLS" is a different question, and that one compiles: whether you
+  watched it die is a fact you have.
 
   A trigger's action is any intent, but exactly ONE. When your phrasing needs
   two ("hold the ford with the cavalry" is membership AND purpose), the
@@ -1872,7 +1948,7 @@ def report(result, stream):
         # CONDITION is outside `TriggerWhen`. The old watch-the-feed advice is
         # exactly right for that case and nothing else, so it lives here.
         print(f"  deferred {clause!r:<44} -> no predicate matches {cond!r} "
-              f"(see --explain for the nine); watch `events` for it, then run:",
+              f"(see --explain for the eleven); watch `events` for it, then run:",
               file=stream)
         print(f"           intent_compile.py --seat <SEAT> --send "
               f"{suggestion!r}" if suggestion else

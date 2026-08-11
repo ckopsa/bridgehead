@@ -23,6 +23,11 @@ EXPECTED_TOP_KEYS = {
     "t", "my_team", "seq_applied", "errors", "game_over", "me", "map",
     "unlocked", "units", "buildings", "squads", "bounties", "mines",
     "trees_near", "events", "fog",
+    # `intel` is ALWAYS present, on the same reasoning as `fog` and unlike the
+    # optional keys below: an absent block and an empty one are different
+    # claims ("this build has no ledger" vs "you have seen nothing"), and a
+    # commander that cannot tell them apart will read silence as safety.
+    "intel",
 }
 
 # Keys that appear only in states this check does not run in, so the assertion
@@ -33,7 +38,11 @@ EXPECTED_TOP_KEYS = {
 #   * triggers is present only once this seat has armed one (`trigger_set`).
 #     Like `command_nodes` and `applied` it is `skip_serializing_if` empty, so
 #     a seat that never speaks the word sends exactly the historical key set.
-OPTIONAL_TOP_KEYS = {"applied", "game_over_reason", "triggers"}
+#   * plans, identically, appears only once this seat has set one (`plan_set`).
+#     Same `skip_serializing_if` rule and the same reason: the v3 vocabulary is
+#     additive, and a commander that never says the word must not be able to
+#     tell it exists from the shape of its snapshot.
+OPTIONAL_TOP_KEYS = {"applied", "game_over_reason", "triggers", "plans"}
 
 
 def upgrade_price(st):

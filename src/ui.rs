@@ -251,6 +251,48 @@ fn plan_line(plans: &Plans) -> String {
     format!("Plans: {}", parts.join("  "))
 }
 
+/// What the player believes about the enemy's heroes, as one line.
+///
+/// The human half of the snapshot's `intel.heroes`, and it must stay the same
+/// claim: **one rule of knowability, rendered twice**. So it reads the same
+/// `FogGrid::hero_intel()` the bridge serialises, and it says the same three
+/// words — a class never seen is omitted here exactly as it is reported
+/// `"unknown"` there, because a HUD line listing every class the player has
+/// never met would be an enemy roster nobody scouted.
+///
+/// What it deliberately cannot say is a level. A human cannot select an enemy
+/// hero (the pickers are own-team only), so there is no gesture that would
+/// ever have shown them one, and printing it here would hand the keyboard an
+/// information right the wire does not have — the asymmetry backwards.
+///
+/// Empty string when nothing has been seen, which is how every other optional
+/// line in this panel disappears.
+fn enemy_hero_line(grid: &FogGrid, now: f32) -> String {
+    let parts: Vec<String> = grid
+        .hero_intel()
+        .iter()
+        .filter(|h| h.status != HeroStatus::Unknown)
+        .map(|h| {
+            let age = h.t_seen.map_or(String::new(), |t| {
+                format!(" {:.0}s ago", (now - t).max(0.0))
+            });
+            match h.status {
+                // No age on a death: you watched it happen, and "seen dying
+                // 40s ago" invites the reader to wonder whether it has since
+                // stopped being dead. It has not; it has possibly been
+                // revived, and that is a different sentence the moment
+                // anybody sees it.
+                HeroStatus::SeenDying => format!("{} down", kind_name(h.kind)),
+                _ => format!("{} alive{age}", kind_name(h.kind)),
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("Their heroes: {}", parts.join("   "))
+}
+
 /// Highest squad id a human gesture will ever mint. Matches the three control
 /// groups; a bridge commander may use any id it likes.
 const MAX_UI_SQUAD: u8 = 3;
@@ -459,6 +501,7 @@ impl Plugin for UiPlugin {
                         apply_fog_tint,
                         update_fog_overlay,
                         sync_building_ghosts,
+                        sync_intel_markers,
                         surrender_hotkey,
                         screenshot_hotkey,
                         scheduled_screenshots,
@@ -805,6 +848,10 @@ enum Slot {
     /// Empty until one is set. See `plan_line` for why the human gets a status
     /// readout and no authoring UI.
     Plans,
+    /// What we believe about the enemy's heroes — the HUD's rendering of the
+    /// snapshot's `intel.heroes`. Empty until one has been laid eyes on, so a
+    /// match where neither hero has been met looks exactly as it always did.
+    EnemyHeroes,
     /// Top bar: how much of this army is inside its own chain of command.
     /// Empty string whenever the mechanic is off.
     Coverage,
@@ -3704,6 +3751,17 @@ fn spawn_selection_panel(console: &mut ChildSpawnerCommands) {
                 Color::srgb(0.85, 0.72, 0.40),
                 Slot::Plans,
             ));
+            // What we know of THEIR heroes. Same argument as the trigger line
+            // — it belongs to the faction rather than to the selection — and
+            // the same self-hiding empty string. Amber rather than the
+            // trigger line's gold: this is the one line in the panel that is
+            // about the opponent, and it should not read as something of ours.
+            c.spawn(text_bundle(
+                "",
+                12.0,
+                Color::srgb(0.88, 0.60, 0.42),
+                Slot::EnemyHeroes,
+            ));
             c.spawn(text_bundle(
                 "Left-click / drag to select.",
                 13.0,
@@ -6369,6 +6427,33 @@ struct MinimapFog;
 #[derive(Component)]
 struct BuildingGhost;
 
+/// A pooled marker on the ground where the player last SAW an enemy unit.
+///
+/// Deliberately a different shape from `BuildingGhost` — a flat tile lying on
+/// the earth rather than a standing box — because the two memories mean
+/// different things. A ghost says *there is a barracks there*; a tile says
+/// *something stood here once*, and confusing the two would be worse than
+/// drawing neither.
+#[derive(Component)]
+struct IntelMarker;
+
+/// How many discrete age-fade materials a last-seen marker picks from.
+///
+/// Four handles, pre-built, swapped by the frame — never one material
+/// repainted. That is the `FogTinted` discipline and it is here for the
+/// identical reason: a `StandardMaterial`'s bind group is rebuilt only when
+/// the material asset changes, so anything repainted in place silently goes on
+/// rendering last time's colour. See `update_fog_overlay`.
+const INTEL_FADE_STEPS: usize = 4;
+
+/// Which fade a sighting of this age wears. Oldest step at the horizon, so a
+/// marker is at its faintest just before the ledger drops it and nothing ever
+/// blinks out at full strength.
+fn intel_fade_step(age: f32) -> usize {
+    let t = (age / SIGHTING_TTL_S).clamp(0.0, 1.0);
+    ((t * INTEL_FADE_STEPS as f32) as usize).min(INTEL_FADE_STEPS - 1)
+}
+
 #[derive(Resource)]
 struct FogAssets {
     /// Shared by the world quad's material and the minimap node — the literal
@@ -6380,6 +6465,10 @@ struct FogAssets {
     fog_mat: Handle<StandardMaterial>,
     ghost_mesh: Handle<Mesh>,
     ghost_mat: Handle<StandardMaterial>,
+    /// A flat tile for the last-seen unit markers.
+    intel_mesh: Handle<Mesh>,
+    /// One material per age band, freshest first. `INTEL_FADE_STEPS` long.
+    intel_mats: Vec<Handle<StandardMaterial>>,
 }
 
 /// Build the fog texture, the quad that wears it, and the minimap node that
@@ -6456,6 +6545,23 @@ fn setup_fog(
         ..default()
     });
 
+    // Last-seen unit markers: a flat amber tile, four pre-built fades deep.
+    // Amber rather than the ghost's dusty red so the two memories are told
+    // apart at a glance, and low enough to read as a mark ON the ground
+    // instead of a thing standing on it.
+    let intel_mesh = meshes.add(Cuboid::new(1.0, 0.12, 1.0));
+    let intel_mats: Vec<Handle<StandardMaterial>> = (0..INTEL_FADE_STEPS)
+        .map(|i| {
+            let t = i as f32 / (INTEL_FADE_STEPS - 1) as f32;
+            materials.add(StandardMaterial {
+                base_color: Color::srgba(0.90, 0.58, 0.28, 0.52 - 0.38 * t),
+                unlit: true,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            })
+        })
+        .collect();
+
     if let Ok(root) = minimap.single() {
         commands.spawn((
             Node {
@@ -6485,6 +6591,8 @@ fn setup_fog(
         fog_mat,
         ghost_mesh,
         ghost_mat,
+        intel_mesh,
+        intel_mats,
     });
 }
 
@@ -6715,6 +6823,80 @@ fn sync_building_ghosts(
     }
 }
 
+/// Pooled ground tiles where the player last saw an enemy unit — the human's
+/// rendering of the snapshot's `intel.sightings`.
+///
+/// Position, age and existence come from the shared ledger, so what the player
+/// sees fading in the fog is precisely what a bridge commander receives as a
+/// sighting record. Same knowability, both renderers — which is the promise
+/// this whole system is arranged to keep, now extended from structures to the
+/// things that move.
+///
+/// Markers under **currently visible** ground are suppressed, on exactly the
+/// rule `FogGrid::ghosts()` applies: sight beats memory, and a "something was
+/// here" tile lying on grass the player is looking at right now is memory
+/// arguing with eyes. Walk the scout on and the tile appears behind it.
+fn sync_intel_markers(
+    mut commands: Commands,
+    time: Res<Time>,
+    fog: Res<FogGrids>,
+    assets: Res<FogAssets>,
+    mut markers: Query<
+        (
+            &mut Transform,
+            &mut Visibility,
+            &mut MeshMaterial3d<StandardMaterial>,
+        ),
+        With<IntelMarker>,
+    >,
+) {
+    let now = time.elapsed_secs();
+    let grid = fog.get(Team::Human);
+    let wanted: Vec<(Vec3, usize)> = if fog.enabled() {
+        grid.sightings()
+            .filter(|s| !grid.sees(s.pos))
+            .map(|s| (s.pos, intel_fade_step(s.age(now))))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut used = 0usize;
+    for (mut tf, mut vis, mut mat) in &mut markers {
+        match wanted.get(used) {
+            Some((pos, step)) => {
+                // Just above the fog quad at 0.16, so a remembered contact is
+                // legible on remembered ground rather than buried under it.
+                tf.translation = Vec3::new(pos.x, 0.20, pos.z);
+                tf.scale = Vec3::new(1.8, 1.0, 1.8);
+                let want = &assets.intel_mats[*step];
+                if mat.0 != *want {
+                    mat.0 = want.clone();
+                }
+                if *vis != Visibility::Inherited {
+                    *vis = Visibility::Inherited;
+                }
+            }
+            None => {
+                if *vis != Visibility::Hidden {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+        used += 1;
+    }
+    // Grow the pool; never shrink it (same discipline as the ghost boxes).
+    for (pos, step) in wanted.iter().skip(used) {
+        commands.spawn((
+            Mesh3d(assets.intel_mesh.clone()),
+            MeshMaterial3d(assets.intel_mats[*step].clone()),
+            Transform::from_xyz(pos.x, 0.20, pos.z).with_scale(Vec3::new(1.8, 1.0, 1.8)),
+            Visibility::Inherited,
+            IntelMarker,
+        ));
+    }
+}
+
 fn update_minimap_bounties(
     hud: Res<HudLayout>,
     mut commands: Commands,
@@ -6827,6 +7009,21 @@ fn update_minimap(
             lighten(ghost.team.color(), -0.35),
         ));
     }
+    // Where enemy UNITS were last seen. Two pixels: smaller than a live
+    // contact (3.0) and far smaller than a structure (6.0), and darkened on
+    // top of that, so a memory can never be misread as a unit standing there.
+    // Suppressed over visible ground for the same reason the world markers
+    // are — sight beats memory.
+    for s in grid.sightings() {
+        if grid.sees(s.pos) {
+            continue;
+        }
+        wanted.push((
+            world_to_minimap(s.pos, hud.minimap_px),
+            2.0,
+            lighten(s.team.color(), -0.25),
+        ));
+    }
 
     // Mutate the pool in place; never despawn.
     let mut used = 0usize;
@@ -6936,6 +7133,10 @@ struct SelectionReasons<'w, 's> {
     /// Every unit on the map — the coverage indicator is about the whole army,
     /// not the part of it that happens to be selected.
     all: Query<'w, 's, (&'static Team, &'static Transform), With<Unit>>,
+    /// The intel ledger, for the enemy-hero line. It rides in this bundle
+    /// rather than as a parameter of its own because `update_hud` is already
+    /// on Bevy's 16-parameter ceiling — see the note on that function.
+    fog: Res<'w, FogGrids>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -7364,6 +7565,10 @@ fn update_hud(
     // and drawn whether or not either exists.
     let triggers_text = trigger_line(&cast.triggers, cast.clock.elapsed_secs());
     let plans_text = plan_line(&cast.plans);
+    // The same grid the snapshot's `intel.heroes` is built from, read for the
+    // same seat this whole file renders for.
+    let enemy_heroes_text =
+        enemy_hero_line(reasons.fog.get(Team::Human), cast.clock.elapsed_secs());
 
     // Hero commands: the ability of a selected caster, one train/revive button
     // per hero class the team's slots have room for, the building's own
@@ -7664,6 +7869,7 @@ fn update_hud(
             Slot::Link => text.0 = link_text.clone(),
             Slot::Triggers => text.0 = triggers_text.clone(),
             Slot::Plans => text.0 = plans_text.clone(),
+            Slot::EnemyHeroes => text.0 = enemy_heroes_text.clone(),
             Slot::Coverage => text.0 = coverage_text.clone(),
             Slot::Overflow => text.0 = overflow_text.clone(),
             Slot::CardLetter(i) => {
@@ -9581,7 +9787,7 @@ mod tests {
     /// second of those is byte-identical to the JSON in COMMANDER_BRIEF.md's
     /// home-guard recipe. This is the fairness invariant applied to the newest
     /// verb in the language: the human's surface is *narrower* (one preset
-    /// against nine predicates and 29 verbs), but nothing it produces is
+    /// against eleven predicates and 29 verbs), but nothing it produces is
     /// outside what the wire can say, and nothing the wire says is outside what
     /// the engine will do for the human.
     #[test]
@@ -9745,6 +9951,67 @@ mod tests {
             .set(Team::Claude, make("theirs", 2, 0, PlanState::Running))
             .unwrap();
         assert!(!plan_line(&plans).contains("theirs"));
+    }
+
+    /// **The hero intel line says only what the human could have seen.**
+    ///
+    /// The renderer half of the one rule: this line and the snapshot's
+    /// `intel.heroes` are built from the same `FogGrid::hero_intel()`, so they
+    /// cannot disagree about what is known. What it must never print is a
+    /// LEVEL — a human cannot select an enemy hero, so no number about one has
+    /// ever been on their screen, and printing it here would hand the keyboard
+    /// an information right the wire does not have.
+    #[test]
+    fn the_enemy_hero_line_reports_belief_and_never_a_level() {
+        let mut grids = FogGrids::test_dark();
+        assert_eq!(
+            enemy_hero_line(grids.get(Team::Human), 100.0),
+            "",
+            "silent until one has been laid eyes on — an unmet roster is not intel"
+        );
+
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::Alive,
+            Vec3::new(4.0, 0.0, 8.0),
+        );
+        let line = enemy_hero_line(grids.get(Team::Human), 40.0);
+        assert_eq!(line, "Their heroes: Hero alive 40s ago");
+        // The class never met stays off the line entirely.
+        assert!(!line.contains("Priestess"));
+
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Priestess,
+            HeroStatus::SeenDying,
+            Vec3::new(4.0, 0.0, 8.0),
+        );
+        let line = enemy_hero_line(grids.get(Team::Human), 40.0);
+        assert_eq!(line, "Their heroes: Hero alive 40s ago   Priestess down");
+        // Nothing a human has no gesture to obtain.
+        for forbidden in ["Lv", "level", "mana", "XP"] {
+            assert!(!line.contains(forbidden), "leaked {forbidden}: {line}");
+        }
+    }
+
+    /// The fade bands a last-seen marker wears, pinned at both ends: a fresh
+    /// sighting is at full strength and one at the horizon is at the faintest
+    /// band, so nothing ever blinks out while still bright.
+    #[test]
+    fn intel_markers_fade_across_the_whole_staleness_horizon() {
+        assert_eq!(intel_fade_step(0.0), 0);
+        assert_eq!(intel_fade_step(SIGHTING_TTL_S - 0.1), INTEL_FADE_STEPS - 1);
+        // Clamped rather than panicking on a record the ledger has not yet
+        // swept: the renderer must never be the thing that crashes.
+        assert_eq!(intel_fade_step(SIGHTING_TTL_S * 4.0), INTEL_FADE_STEPS - 1);
+        // Monotonic — a marker may never get BRIGHTER with age.
+        let mut prev = 0;
+        for i in 0..40 {
+            let step = intel_fade_step(i as f32 * (SIGHTING_TTL_S / 40.0));
+            assert!(step >= prev, "fade went backwards at {i}");
+            prev = step;
+        }
     }
 
     /// The parameterised half of the gap: the coarse [V] writes one fixed

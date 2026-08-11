@@ -531,6 +531,109 @@ mod tests {
         assert_eq!(at(&app), 1);
     }
 
+    /// **The seam, proved on a predicate this file has never heard of.**
+    ///
+    /// `enemy_hero_down` arrived with the intel bead, after plans were written.
+    /// plan.rs needed *no* change to accept it as an advance-condition — not a
+    /// match arm, not a validation case, not a line. That is the whole point of
+    /// `PlanAdvance::When` carrying a `TriggerWhen` rather than defining its own
+    /// condition vocabulary: `trigger::holds` is the only thing that reads the
+    /// enum and `intent::validate_predicate` the only thing that checks it, and
+    /// neither lives here.
+    ///
+    /// This test exists to keep that true. If a future bead adds a predicate by
+    /// special-casing it somewhere plans cannot see, this is what should fail.
+    #[test]
+    fn a_plan_advances_on_a_predicate_a_later_bead_added() {
+        let mut app = plan_app();
+        app.world_mut()
+            .resource_mut::<Plans>()
+            .get_mut(Team::Human)
+            .push(plan(vec![
+                step(
+                    stop(),
+                    PlanAdvance::When {
+                        when: TriggerWhen::EnemyHeroDown { class: None },
+                    },
+                ),
+                step(stop(), PlanAdvance::OnApplied),
+            ]));
+
+        app.update();
+        accept(&mut app);
+        sent(&mut app);
+        for _ in 0..4 {
+            advance_clock(&mut app, 10.0);
+            app.update();
+            assert_eq!(at(&app), 0, "their hero is alive, so the plan holds");
+            assert!(sent(&mut app).is_empty());
+        }
+
+        // The intel ledger learns their hero is down — the same belief the
+        // trigger evaluator reads, written the same way.
+        let mut grids = FogGrids::test_dark();
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::SeenDying,
+            Vec3::new(20.0, 0.0, 20.0),
+        );
+        app.insert_resource(grids);
+
+        advance_clock(&mut app, 1.0);
+        app.update();
+        assert_eq!(at(&app), 1, "and moves the moment the belief changes");
+        assert_eq!(sent(&mut app).len(), 1, "step 2 went out");
+    }
+
+    /// The other half of the same seam, so both new arms are covered rather
+    /// than one standing in for the pair.
+    #[test]
+    fn a_plan_can_also_wait_on_an_enemy_army_sighting() {
+        let mut app = plan_app();
+        app.world_mut()
+            .resource_mut::<Plans>()
+            .get_mut(Team::Human)
+            .push(plan(vec![
+                step(
+                    stop(),
+                    PlanAdvance::When {
+                        when: TriggerWhen::EnemyArmySeen {
+                            size: 4,
+                            within_s: None,
+                        },
+                    },
+                ),
+                step(stop(), PlanAdvance::OnApplied),
+            ]));
+        app.update();
+        accept(&mut app);
+        sent(&mut app);
+        advance_clock(&mut app, 5.0);
+        app.update();
+        assert_eq!(at(&app), 0, "nothing has been seen");
+
+        let mut grids = FogGrids::test_dark();
+        for i in 0..4 {
+            grids.test_sight(
+                Team::Human,
+                Sighting {
+                    id: 9000 + i,
+                    team: Team::Claude,
+                    kind: UnitKind::Footman,
+                    pos: Vec3::new(20.0 + i as f32, 0.0, 20.0),
+                    hp_frac: 1.0,
+                    heading: None,
+                    t_seen: 5.0,
+                },
+            );
+        }
+        app.insert_resource(grids);
+        advance_clock(&mut app, 1.0);
+        app.update();
+        assert_eq!(at(&app), 1, "four of them together is the wait satisfied");
+    }
+
     // -- failure: blocked, retried, halted, never skipped -------------------
 
     #[test]

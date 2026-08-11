@@ -61,9 +61,17 @@
 //! keyboard. The bridge does not decide what is knowable; it renders a
 //! decision made once in shared.rs. Concretely:
 //!
-//!   * enemy `units` appear only while currently visible. They are not
-//!     remembered: an army that walks out of sight is simply gone from the
-//!     snapshot, because a remembered army is a lie a commander would act on.
+//!   * enemy `units` appear only while currently visible, and are never
+//!     remembered *in that array*: an army that walks out of sight is gone
+//!     from `units`, because a remembered army reported in the same shape as a
+//!     seen one is a lie a commander would act on.
+//!   * what it does not do is throw the observation away. The separate
+//!     top-level `intel` block carries the SIGHTINGS LEDGER — every enemy unit
+//!     this seat has seen, each stamped with `t_seen` and `age`, expiring at
+//!     `intel.ttl_s`; the armies those sightings cluster into; and the standing
+//!     of each enemy hero class. Memory is legal, and shaped so that it cannot
+//!     be mistaken for sight: `units[]` has no timestamps and every intel
+//!     record has nothing else.
 //!   * enemy `buildings` appear as themselves while visible, and afterwards as
 //!     REMEMBERED GHOSTS carrying a `last_seen` game-time stamp and the hp/
 //!     queue state observed at that moment. A ghost can be stale — a razed
@@ -551,6 +559,10 @@ struct StateOut {
     /// What this seat can currently know. Read it before concluding anything
     /// from an empty `units` list.
     fog: FogOut,
+    /// What this seat REMEMBERS of the enemy — sightings, the armies they
+    /// cluster into, and the standing of each enemy hero. Every entry carries
+    /// the game time it was observed.
+    intel: IntelOut,
     /// `catalog.json` entry id -> may this seat build/train it right now?
     /// Every unit and building in the catalog appears, whether or not it has
     /// requirements, so a commander can gate its build order on one lookup.
@@ -1246,6 +1258,109 @@ struct FogOut {
     visible: f32,
 }
 
+/// One enemy unit as this seat last observed it.
+///
+/// **Every entry is a MEMORY.** `units[]` is what is on the board now; this is
+/// what was on the board then, and the two are separate arrays specifically so
+/// nothing can read one as the other. `t_seen` and `age` are mandatory, not
+/// optional-when-stale: there is no shape of this record that omits its own
+/// staleness.
+///
+/// Nothing here is knowable that a human could not read off their screen while
+/// the unit stood in their vision — no level, no mana, no orders. See
+/// `shared::Sighting` for the field-by-field argument.
+#[derive(Serialize)]
+struct SightingOut {
+    /// The unit's entity id — the same id `units[].id` carries while it is
+    /// visible, so a commander can tell "the raider I saw" from "a raider".
+    id: u64,
+    kind: &'static str,
+    pos: [f32; 2],
+    /// Health fraction at the moment of observation, 0..1. The bar a watcher
+    /// could see.
+    hp_frac: f32,
+    /// Coarse 8-point heading it was walking when last seen (`"NE"`), absent
+    /// if it was standing still or if this was a first glimpse with nothing to
+    /// measure against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heading: Option<&'static str>,
+    /// Game time of the observation.
+    t_seen: f32,
+    /// Game-seconds since. Derived, and shipped anyway: the arithmetic is
+    /// trivial and getting it wrong is not, and a commander that has to
+    /// subtract before it can discount will sometimes forget to.
+    age: f32,
+}
+
+/// Concurrent sightings read as one body of troops — the aggregate view.
+#[derive(Serialize)]
+struct ArmyGroupOut {
+    /// How many units the group holds. Approximate by nature: it is what was
+    /// seen, never what is there.
+    size: usize,
+    /// `"5 Footman, 3 Archer"`, most numerous first.
+    composition: String,
+    pos: [f32; 2],
+    /// Freshest observation in the group; members may be up to ten seconds
+    /// older, which is what makes them one picture.
+    t_seen: f32,
+    age: f32,
+    /// The public name of the ground it is on — `"near the center ford"`. The
+    /// same phrase the event feed uses, from the same function.
+    place: String,
+}
+
+/// This seat's belief about one enemy hero class.
+#[derive(Serialize)]
+struct HeroIntelOut {
+    /// `"unknown"` — never seen; `"alive"` — seen alive and nothing since says
+    /// otherwise; `"seen-dying"` — you watched it die.
+    ///
+    /// Read `"alive"` as *alive as far as you know*. It is a belief with a
+    /// timestamp, not a fact: a hero that died out of your sight goes on
+    /// reporting `"alive"` here for as long as nobody looks, which is exactly
+    /// the mistake fog of war exists to let you make.
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pos: Option<[f32; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    t_seen: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age: Option<f32>,
+    /// Health fraction when last observed. **No level, no xp, no mana** — a
+    /// human cannot select an enemy hero (ui.rs's pickers are own-team only),
+    /// so no human has ever read those off a screen, and handing them to a
+    /// commander would be an information right with no gesture behind it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hp_frac: Option<f32>,
+}
+
+/// What this seat REMEMBERS of the enemy, as opposed to what it can see.
+///
+/// The counterpart to `fog`: that block says how much of the map is knowable,
+/// this one says what was learned from having known it. Always present, and
+/// deliberately so — an absent `intel` and an empty one are different claims
+/// ("this build has no ledger" vs "you have seen nothing"), on exactly the
+/// reasoning `fog` itself is always present for.
+#[derive(Serialize)]
+struct IntelOut {
+    /// Every enemy unit seen and not yet expired, in id order. Entries are
+    /// dropped after `ttl_s` without a refresh, and immediately when this seat
+    /// watches the unit die.
+    sightings: Vec<SightingOut>,
+    /// The same sightings clustered into forces. Workers are excluded — a
+    /// mining crew is not an army.
+    groups: Vec<ArmyGroupOut>,
+    /// Belief about each enemy hero class, keyed by class name. Always holds
+    /// every class, `"unknown"` included: a missing row and a row saying "no
+    /// idea" are different claims and only one of them is true.
+    heroes: BTreeMap<&'static str, HeroIntelOut>,
+    /// The staleness horizon in game-seconds. Past this a sighting is a rumour
+    /// and the ledger drops it, so an empty `sightings` means "nothing seen
+    /// recently", never "nothing exists".
+    ttl_s: f32,
+}
+
 #[derive(Serialize)]
 struct MineOut {
     id: u64,
@@ -1499,9 +1614,11 @@ fn write_seat_snapshot(
     let (fog_enabled, fog) = fog;
 
     // Our own army, plus whatever of theirs we can see RIGHT NOW. Enemy units
-    // are never remembered: a stale unit position is not information, it is a
-    // decoy, and a commander acting on one has been lied to by its own
-    // interface. Doctrine only for our own units, as before.
+    // are never remembered *here*: a stale unit position reported in this
+    // array would not be information, it would be a decoy, because nothing in
+    // a `UnitOut` says when it was true. The memory lives in `intel` instead,
+    // where every record carries its own age and the reader cannot fail to see
+    // it. Doctrine only for our own units, as before.
     let mut units_out: Vec<UnitOut> = units
         .iter()
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
@@ -1661,6 +1778,58 @@ fn write_seat_snapshot(
         });
     }
     buildings_out.sort_by_key(|b| b.id);
+
+    // --- intel -----------------------------------------------------------
+    // The unit half of memory. Note it does NOT join `units_out` the way the
+    // building ghosts join `buildings_out`, and that asymmetry is the whole
+    // design: a remembered structure is still standing where it was, so it
+    // belongs in the same list as the ones you can see; a remembered army is
+    // somewhere else by now, so putting it there would be the lie
+    // `CellVis::Explored` refuses to tell. It gets its own section, and every
+    // record in it wears the clock.
+    let intel_out = IntelOut {
+        sightings: fog
+            .sightings()
+            .map(|s| SightingOut {
+                id: s.id,
+                kind: kind_name(s.kind),
+                pos: [r1(s.pos.x), r1(s.pos.z)],
+                hp_frac: r1(s.hp_frac * 100.0) / 100.0,
+                heading: s.heading.map(|h| h.as_str()),
+                t_seen: r1(s.t_seen),
+                age: r1(s.age(now)),
+            })
+            .collect(),
+        groups: fog
+            .army_groups()
+            .into_iter()
+            .map(|g| ArmyGroupOut {
+                size: g.size,
+                composition: g.summary(),
+                pos: [r1(g.centroid.x), r1(g.centroid.z)],
+                t_seen: r1(g.t_seen),
+                age: r1((now - g.t_seen).max(0.0)),
+                place: place_name(g.centroid, me),
+            })
+            .collect(),
+        heroes: fog
+            .hero_intel()
+            .iter()
+            .map(|h| {
+                (
+                    kind_name(h.kind),
+                    HeroIntelOut {
+                        status: h.status.as_str(),
+                        pos: h.pos.map(|p| [r1(p.x), r1(p.z)]),
+                        t_seen: h.t_seen.map(r1),
+                        age: h.t_seen.map(|t| r1((now - t).max(0.0))),
+                        hp_frac: h.hp_frac.map(|f| r1(f * 100.0) / 100.0),
+                    },
+                )
+            })
+            .collect(),
+        ttl_s: SIGHTING_TTL_S,
+    };
 
     // Tech state, for this seat only: what its completed buildings unlock.
     let completed: Vec<BuildingKind> = buildings
@@ -1940,6 +2109,7 @@ fn write_seat_snapshot(
             explored: r1(fog.explored_frac()),
             visible: r1(fog.visible_frac()),
         },
+        intel: intel_out,
         unlocked,
         units: units_out,
         buildings: buildings_out,
