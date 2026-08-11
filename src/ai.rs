@@ -1980,8 +1980,15 @@ fn think(
     // Hero slots scale with the hall ladder — 1 at TownHall, 2 at Keep, 3 at
     // Castle, distinct classes only (`hero_slots`). The script fills them in a
     // fixed order: Champion first, Priestess as the second slot a Keep opens.
-    // Revival of a class it has already lost outranks opening a new one — a
-    // level-6 Champion at 250g is the best gold in the game.
+    // Revival of a class it has already lost outranks opening a new one — it
+    // comes back at the level the team already paid for in blood.
+    //
+    // The gold half of this decision is gone: a class this team has never
+    // fielded is FREE (`hero_train_cost`), so there is nothing to save up for
+    // and nothing to weigh it against. What is left to spend is 25 seconds of
+    // hall time and 5 supply, and the script takes that trade the moment a
+    // slot exists — a scripted opponent that skipped free content would be
+    // teaching the human seat the wrong lesson about the game.
     let hero_pick_order = r.heroes(race);
     let mut held_classes: Vec<UnitKind> = army
         .iter()
@@ -1989,7 +1996,6 @@ fn think(
         .map(|u| u.kind)
         .collect();
     held_classes.extend(heroes_queued.iter().copied());
-    let barracks_standing = own_buildings.iter().any(|b| b.kind == r.production);
     let slots_open = (held_classes.len() as u32) < hero_slots(TechTier::from_level(current_tier));
     // Opening an ADDITIONAL slot is a luxury; filling the first one never was.
     let fighters = army.iter().filter(|u| !is_hero_kind(u.kind)).count();
@@ -2005,10 +2011,14 @@ fn think(
                 // it — cheap, and it keeps a level the team already paid for.
                 known
             } else {
-                // A brand-new hero class waits for a Barracks, exactly as the
-                // team's first one always did, and — if it would be the team's
-                // second — for an army that can hold the base while it trains.
-                !known && can_open_another && barracks_standing
+                // A brand-new hero class used to wait for a Barracks, because
+                // 400g out of the opening left the base defended by two
+                // Footmen. Free heroes delete that reason: the hero IS the
+                // early defense, and holding it back only leaves a slot empty.
+                // The second-hero gate stays — that one was never about gold
+                // but about not queueing 25s of hall time and 5 supply behind
+                // an army too small to hold the base while it trains.
+                !known && can_open_another
             }
         })
     };
@@ -2037,6 +2047,12 @@ fn think(
     // production doesn't keep the treasury permanently just below it. Supply is
     // deliberately NOT reserved: army units are what drives the farm trigger,
     // and holding 5 supply back would stall the whole build order.
+    //
+    // This is now a REVIVAL-only ring-fence in practice, and it stays written
+    // as a general one rather than special-cased: `hero_train_cost` of a
+    // never-fielded class is (0, 0), so a first hero reserves nothing without
+    // this code needing to know why. Delete the generality and the day a hero
+    // class is priced again is the day the AI stops being able to afford one.
     let (mut reserve_gold, mut reserve_lumber) = match want_hero {
         Some(kind) => {
             let (g, l, _) = hero_train_cost(records, me, kind);
@@ -3715,6 +3731,86 @@ mod tests {
         think_once(&mut app);
 
         assert_eq!(queued(&mut app, workshop), vec![UnitKind::Catapult]);
+    }
+
+
+    /// **A broke script still opens with a hero.** This is the behavioural
+    /// half of the free-hero change: the old script waited for a Barracks and
+    /// ring-fenced 400 gold before it dared, which meant a scripted opponent
+    /// modelled the same skip five straight arena winners made. With training
+    /// free there is nothing to save for and nothing to wait behind, so a hall
+    /// and an open slot are the entire precondition — zero gold included.
+    #[test]
+    fn the_script_opens_with_a_hero_it_no_longer_has_to_save_for() {
+        let mut app = ai_app();
+        let home = Team::Claude.base_pos();
+        let hall = spawn_building(&mut app, BuildingKind::TownHall, Team::Claude, home);
+        for i in 0..5 {
+            spawn_unit(
+                &mut app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        // No Barracks, and an empty treasury. Under the old economics this
+        // board could not produce a hero for several minutes.
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let claude = economies.get_mut(Team::Claude);
+            claude.gold = 0;
+            claude.lumber = 0;
+        }
+
+        think_once(&mut app);
+
+        assert!(
+            queued(&mut app, hall).iter().any(|k| is_hero_kind(*k)),
+            "a free hero and an open slot: the script must take it immediately, got {:?}",
+            queued(&mut app, hall)
+        );
+    }
+
+    /// ...and the ring-fence survives where it still means something. A class
+    /// with a record costs the revival price, so the script goes back to
+    /// saving up for it — the reserve logic was made general, not deleted.
+    #[test]
+    fn a_revival_is_still_something_the_script_saves_up_for() {
+        let mut app = ai_app();
+        let home = Team::Claude.base_pos();
+        let hall = spawn_building(&mut app, BuildingKind::TownHall, Team::Claude, home);
+        spawn_building(
+            &mut app,
+            BuildingKind::Barracks,
+            Team::Claude,
+            home + Vec3::new(-12.0, 0.0, 0.0),
+        );
+        for i in 0..5 {
+            spawn_unit(
+                &mut app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        // The Champion has died once: it now has a price.
+        app.world_mut().resource_mut::<HeroRecords>().set(
+            Team::Claude,
+            HeroRecord { level: 4, xp: 2.0, kind: UnitKind::Hero },
+        );
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let claude = economies.get_mut(Team::Claude);
+            claude.gold = 10;
+            claude.lumber = 10;
+        }
+
+        think_once(&mut app);
+
+        assert!(
+            !queued(&mut app, hall).iter().any(|k| is_hero_kind(*k)),
+            "10 gold does not buy a revival, and the script must not queue an unpayable one"
+        );
     }
 
     /// The probe knobs, which exist so a headless sim can reach the air branch

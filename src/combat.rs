@@ -2598,6 +2598,97 @@ mod tests {
         assert!(out.a_alive() > 0, "at least one Footman should live");
     }
 
+
+    /// **What is a free hero actually worth?** The v3 hero economics hand
+    /// every team a level-1 hero for 0g/0l, which is a power injection into
+    /// the opening whether or not anybody planned one. This probe puts a
+    /// number on it: how many gold of line infantry does that free body beat?
+    ///
+    /// The answer is the honest way to state the change. It is NOT "a free
+    /// 400g unit" — a Champion at level 1 loses to substantially less than
+    /// 400 gold of Footmen, because a single body has one weapon and takes
+    /// focus fire from every unit facing it. What the team is really handed is
+    /// a durable, levelling command node that is worth roughly two line units
+    /// on the day it appears and much more later.
+    ///
+    /// This is also the guard on the balance claim: if a future edit made the
+    /// free hero beat four Footmen at level 1, the opening would be decided by
+    /// who queued a hero first, and this test is where that shows up.
+    #[test]
+    fn a_free_hero_is_worth_about_two_line_units_on_the_day_it_arrives() {
+        for (hero, line) in [
+            (UnitKind::Hero, UnitKind::Footman),
+            (UnitKind::Warchief, UnitKind::Grunt),
+        ] {
+            let line_gold = unit_stats(line).cost_gold;
+            let mut beaten = 0;
+            for n in 1..=6 {
+                let mut sim = FixedClockSim::new();
+                sim.spawn_duel(hero, 1, line, n);
+                sim.run_until_one_side_falls();
+                if sim.alive(Team::Human) > 0 && sim.alive(Team::Claude) == 0 {
+                    beaten = n;
+                } else {
+                    break;
+                }
+            }
+            let worth = beaten as u32 * line_gold;
+            // Two, three at the outside. One would make the free hero a
+            // curiosity; four or more would make the opening a hero race.
+            assert!(
+                (2..=3).contains(&beaten),
+                "{hero:?} at level 1 beat {beaten}x {line:?} ({worth}g) — a free hero \
+                 that clears {beaten} line units decides the opening on its own"
+            );
+            // ...and it is a bargain against its own REVIVAL price, which is
+            // the number the commander actually pays. That gap is the design:
+            // the hero is cheap to have and expensive to lose.
+            assert!(
+                worth < unit_stats(hero).revive_gold,
+                "{hero:?} beats {worth}g of line units but costs {}g to revive — \
+                 if raw combat worth exceeded the revival fee, dying would be cheap",
+                unit_stats(hero).revive_gold
+            );
+        }
+    }
+
+    /// The other half of the same claim: the free hero's value is in the
+    /// LEVELS, not in the free body. A level-5 Champion beats what a level-1
+    /// Champion loses to — which is why the revival price is charged on death
+    /// (you lose the levels' worth) rather than on training.
+    #[test]
+    fn levels_are_where_a_hero_stops_being_a_line_unit() {
+        let mut level_one = FixedClockSim::new();
+        let (heroes, _) = level_one.spawn_duel(UnitKind::Hero, 1, UnitKind::Footman, 4);
+        level_one.app.world_mut().entity_mut(heroes[0]).insert(Hero {
+            level: 1,
+            xp: 0.0,
+            mana: 100.0,
+        });
+        level_one.run_until_one_side_falls();
+        let one_won = level_one.alive(Team::Human) > 0;
+
+        let mut level_five = FixedClockSim::new();
+        let (heroes, _) = level_five.spawn_duel(UnitKind::Hero, 1, UnitKind::Footman, 4);
+        {
+            let world = level_five.app.world_mut();
+            let mut e = world.entity_mut(heroes[0]);
+            e.insert(Hero { level: 5, xp: 0.0, mana: 100.0 });
+            // What shared.rs::hero_progression does on a real level-up.
+            let max = Hero::max_hp_for(UnitKind::Hero, 5);
+            let mut hp = e.get_mut::<Health>().unwrap();
+            hp.max = max;
+            hp.current = max;
+        }
+        level_five.run_until_one_side_falls();
+        let five_won = level_five.alive(Team::Human) > 0;
+
+        assert!(
+            !one_won && five_won,
+            "the levels have to be the difference: lvl1 won={one_won}, lvl5 won={five_won}"
+        );
+    }
+
     /// The straight duel, for the record: a Footman handles a Spearman easily.
     #[test]
     fn footman_beats_spearman_one_on_one() {

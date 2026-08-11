@@ -569,6 +569,38 @@ fn check_values(t: &Tables, defs: &[AbilityDef]) -> Vec<String> {
         if !s.can_hit_air && !s.can_hit_ground {
             p.push(format!("{what}: can hit neither air nor ground"));
         }
+        // --- the hero price inversion ------------------------------------
+        // Heroes are free to TRAIN and expensive to REVIVE, and both halves
+        // are load-bearing rather than conventional. A hero row that grew a
+        // training cost back would silently restore the thing five arena
+        // rounds proved wrong (nobody buys a 400g hero in a 7-minute game); a
+        // hero row with no revival price would make death free, which is the
+        // whole mechanism. And `unit_value` — the worth `xp_for_kill` and
+        // `asset_score` read — is `revive_*` for heroes and `cost_*` for
+        // everything else, so a non-hero row carrying a revival price would
+        // be a number nothing reads. All three are checked here.
+        let hero = matches!(row.role, UnitRole::HeroMelee | UnitRole::HeroSupport);
+        if hero {
+            if s.cost_gold != 0 || s.cost_lumber != 0 {
+                p.push(format!(
+                    "{what}: heroes train FREE — cost_gold/cost_lumber must be 0, got \
+                     {}g {}l (the price belongs in revive_gold/revive_lumber)",
+                    s.cost_gold, s.cost_lumber
+                ));
+            }
+            if s.revive_gold == 0 && s.revive_lumber == 0 {
+                p.push(format!(
+                    "{what}: a hero must cost something to revive — set revive_gold \
+                     and/or revive_lumber above 0"
+                ));
+            }
+        } else if s.revive_gold != 0 || s.revive_lumber != 0 {
+            p.push(format!(
+                "{what}: only heroes revive — revive_gold/revive_lumber must be 0, got \
+                 {}g {}l",
+                s.revive_gold, s.revive_lumber
+            ));
+        }
         if row.name.trim().is_empty() {
             p.push(format!("{what}: name is empty"));
         }
@@ -1311,6 +1343,91 @@ mod tests {
             problems.iter().any(|m| m.contains("duplicate row for Worker")),
             "{problems:?}"
         );
+    }
+
+
+    /// **The hero price inversion is a data invariant, not a convention.**
+    /// Three ways to break it, all refused with the row named:
+    ///
+    ///   * a hero that costs gold to TRAIN — the regression that would quietly
+    ///     restore what five arena rounds proved wrong;
+    ///   * a hero that costs nothing to REVIVE — free to field and free to
+    ///     lose is a hero with no decision attached to it at all;
+    ///   * a non-hero carrying a revival price, which is a number nothing in
+    ///     the codebase would ever read.
+    #[test]
+    fn a_hero_that_costs_gold_to_train_or_nothing_to_revive_is_refused() {
+        let mut broken = load_for_test();
+        broken.units[UnitKind::Hero as usize].stats.cost_gold = 400;
+        broken.units[UnitKind::Warchief as usize].stats.revive_gold = 0;
+        broken.units[UnitKind::Warchief as usize].stats.revive_lumber = 0;
+        broken.units[UnitKind::Footman as usize].stats.revive_gold = 50;
+        let problems = check_values(&broken, &[]);
+
+        assert!(
+            problems
+                .iter()
+                .any(|m| m.contains("Hero") && m.contains("train FREE")),
+            "a priced hero must be refused: {problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|m| m.contains("Warchief") && m.contains("revive")),
+            "a hero that dies for free must be refused: {problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|m| m.contains("Footman") && m.contains("only heroes revive")),
+            "a non-hero revival price must be refused: {problems:?}"
+        );
+    }
+
+    /// ...and the shipped tables satisfy it, on both rosters. The loop is the
+    /// point: a Kingdom-only edit that forgot the Warchief and the Far Seer
+    /// would pass a spot-check on the Champion.
+    #[test]
+    fn every_shipped_hero_row_is_free_to_train_and_priced_to_revive() {
+        let t = tables();
+        let mut heroes = 0;
+        for row in &t.units {
+            let hero = matches!(row.role, UnitRole::HeroMelee | UnitRole::HeroSupport);
+            if !hero {
+                assert_eq!(
+                    (row.stats.revive_gold, row.stats.revive_lumber),
+                    (0, 0),
+                    "{:?} is not a hero",
+                    row.kind
+                );
+                continue;
+            }
+            heroes += 1;
+            assert_eq!(
+                (row.stats.cost_gold, row.stats.cost_lumber),
+                (0, 0),
+                "{:?} must train free",
+                row.kind
+            );
+            assert!(
+                row.stats.revive_gold > 0,
+                "{:?} must cost something to lose",
+                row.kind
+            );
+            // The catalog text a commander reads must not still be advertising
+            // the old discount-on-revival deal.
+            assert!(
+                !row.description.contains("reduced cost"),
+                "{:?}'s description still sells the old pricing",
+                row.kind
+            );
+            assert!(
+                row.description.to_lowercase().contains("free"),
+                "{:?}'s description must say the first one is free",
+                row.kind
+            );
+        }
+        assert_eq!(heroes, 4, "two hero classes per roster, two rosters");
     }
 
     /// Nonsense numbers are refused with the field named. Vision is the one

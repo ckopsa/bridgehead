@@ -1728,7 +1728,14 @@ impl CmdEntry {
         self.priced(s.cost_gold, s.cost_lumber)
     }
     fn priced(mut self, gold: u32, lumber: u32) -> Self {
-        self.cost = if lumber > 0 {
+        // "0g" is a price tag that reads like a bug. Only one thing in the
+        // game is actually free — your first hero of each class — and a button
+        // that says so is the whole point of the change: the player who never
+        // clicked the 400g hero has to be able to see, without doing any
+        // arithmetic, that it now costs nothing.
+        self.cost = if gold == 0 && lumber == 0 {
+            "Free".to_string()
+        } else if lumber > 0 {
             format!("{}g {}l", gold, lumber)
         } else {
             format!("{}g", gold)
@@ -1834,8 +1841,9 @@ fn research_name(kind: ResearchKind) -> &'static str {
 ///
 ///   * class already standing or already queued -> **hidden** (there is
 ///     nothing to buy);
-///   * class dead but recorded -> shown as a cheaper **"Revive"**;
-///   * class never fielded -> shown at full price;
+///   * class dead but recorded -> shown as **"Revive"** at the revival price,
+///     which is the only price a hero ever has;
+///   * class never fielded -> shown at **"Free"**;
 ///   * ...and any of those is **greyed** when every slot is spoken for, so a
 ///     tier-1 player can SEE the Priestess they would get by teching up rather
 ///     than discovering her existence in the catalog.

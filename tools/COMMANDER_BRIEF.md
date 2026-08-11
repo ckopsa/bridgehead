@@ -76,7 +76,10 @@ Production:
 - `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"|...}` (queue cap 7;
   full roster in `catalog.json`). A `train` of a hero is rejected with a reason when your slots
   are full or you already hold that class.
-- `{"type":"cancel","building":id,"index":n}`  `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}`
+- `{"type":"cancel","building":id,"index":n}` — **refunds in full** whatever had already been
+  charged for that item, and nothing when nothing was charged (cancelling your free first
+  hero returns 0; cancelling a 400g/100l revival returns 400g/100l).
+- `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}`
 - `{"type":"cast","hero":id}` — cast the caster's first available ability (heroes: their class
   ability; a TownHall id works too: CallToArms turns nearby workers into fighters for 40s,
   90s cooldown). Add `"ability":<index>` or `"ability":"Slam"` to pick a specific one — casters
@@ -281,8 +284,10 @@ a base is raided more than once.
 ```
 
 **2. Hero save** — the hero walks out before it dies. Your hero is a command
-node and a hero slot; losing it is the most expensive single event in a match,
-and it happens inside one poll cycle.
+node, a hero slot, and — since it was free to train — the only thing you own
+whose whole price is charged at the moment you lose it (400g/100l to bring it
+back). It is the most expensive single event in a match, and it happens inside
+one poll cycle. Arm this before your first fight.
 
 ```json
 {"type":"trigger_set","name":"hero-save","repeat":45,
@@ -889,7 +894,7 @@ first), `unlocked` for ACTING.
   - Still public and unfiltered: `map`, `mines` (position AND remaining gold), `trees_near`.
     Map geography is not a secret; what the enemy is DOING with it is.
   - You cannot `attack` an id you cannot see or remember — it is rejected as
-    `target N is not visible`. Use `attack_move` to advance into the unknown.
+    `target N is not visible`. Use `attackmove` to advance into the unknown.
   - **Scout deliberately.** Vision radius is per-kind in `catalog.json` (`vision`).
     Raiders see 24 and are the cheapest eyes on the map; Catapults see 14 but shoot 20, so
     unescorted siege is firing blind. Halls see furthest of all and grow with the tier.
@@ -949,18 +954,35 @@ first), `unlocked` for ACTING.
   the map itself forces a decision. Ceding the middle
   cedes an economy. After the mines die, bounties are the only income on the map.
 - Supply-block = production stalls: build Farms BEFORE you hit the cap.
+- **YOUR FIRST HERO OF EACH CLASS IS FREE. LOSING IT IS NOT.** Training a class you have
+  never fielded costs **0 gold, 0 lumber** — it costs 25 seconds of hall time (the same
+  building that makes your workers) and 5 supply, and nothing else. The bill arrives when it
+  DIES: bringing that class back is **400g/100l**, flat, at every level. So there is no such
+  thing as a hero you cannot afford, and there is such a thing as a hero you cannot afford
+  to lose. **Train one in your opening. There is no argument against it.**
+  This is new, and it is new because of you: across arena rounds 17-19 every single winner
+  fought hero-less, and in r19 BOTH commanders looked at the old 400g price tag, counted
+  three Footmen, and skipped — correctly. The price moved to the place where skipping is not
+  an option.
 - Your heroes level from ANY nearby enemy deaths, +HP/+damage per level. THE key units — keep
-  them alive (retreat policy!), near fights (XP), and revive fast when one dies (keeps its
-  level, per class). Two heroes at Keep means two retreat policies and two autocast rules.
+  them alive (retreat policy!) and near fights (XP). Revival preserves the level, and the fee
+  does NOT scale with it, so a level-6 hero bought back for 400g is the best gold in the
+  game — which is exactly why the enemy wants it dead and why `hero-save` (recipe 2 above) is
+  worth arming before your first fight, not after it.
+  Two heroes at Keep means two retreat policies and two autocast rules.
 - **HERO SLOTS SCALE WITH YOUR HALL TIER: TownHall 1, Keep 2, Castle 3.** A second hero is
   one of the two concrete things teching to a Keep buys you (the other is the Arcane Sanctum).
   Heroes must be of **distinct classes** — Champion *and* Priestess is legal, two Champions
   never is. Read `me.hero_slots` / `me.hero_slots_used` in the snapshot before you train:
   used counts living heroes **plus any hero already sitting in a queue**. `me.hero_records`
   lists every class you have ever fielded (with `alive`), and `me.hero_costs` prices each
-  class — full freight for a class you have never played, the cheap revival price for one you
-  have, per class and never discounted by the other. Only two classes ship today, so a
-  Castle's third slot currently has nothing to put in it.
+  class: `gold`/`lumber` are what queuing it costs you RIGHT NOW (**0/0 until that class has
+  died**), and `revive_gold`/`revive_lumber` are what the next death will cost — carried
+  even while the hero is alive and well, so you can budget for the funeral before it
+  happens. Per class and never discounted by the other: a dead Champion does not make your
+  first Priestess cost anything, and a living Priestess does not make the Champion cheaper to
+  raise. Only two classes ship today, so a Castle's third slot currently has nothing to put
+  in it.
 - Counter triangle: fortifications stop armies, siege outranges fortifications, fast cavalry
   dives siege. It is all data: catalog `units[].class` says what a unit IS, and
   `vs_building_mult` / `vs_siege_mult` / `vs_cavalry_mult` say what it eats. The
