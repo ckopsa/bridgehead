@@ -204,8 +204,81 @@ conflicts loudly (both edited the same record) or not at all.
 and put the balance rationale in a `//` comment next to the number it explains —
 the data files carry the design commentary that used to live beside the literals.
 Adding a whole new KIND is: the enum variant, the entry in `ALL_*_KINDS`, the
-mesh/colour arm in `units.rs`, and the record. The loader refuses to start if
-the last one is missing and names the variant.
+mesh/colour arm in `units.rs` (or the `parts` block in `economy.rs` for a
+building), and the record. The loader refuses to start if the last one is
+missing and names the variant.
+
+## Races (v3)
+
+A **race** is a per-team choice of which ROWS of those tables a team may use.
+`WC3_RACE_BLUE` / `WC3_RACE_RED` = `kingdom|horde`, defaulting to `kingdom` on
+both sides — with neither set, the game is byte-for-byte the one that shipped
+before races existed.
+
+It is deliberately **not** a second copy of the rules. Both races share the
+maps, the economy, the upkeep curve, the win condition, the research ladders,
+the item shelf, the status framework, the ability grammar and every formula.
+What a race owns is a **roster**, and the roster is data: every unit and
+building row carries `races` (which rosters may use it — absent means neutral,
+which today is the Shop and nothing else) and `role` (what it is FOR).
+
+**`role` is the load-bearing half.** Before it, a consumer that wanted "the
+cheap melee line" had to name `UnitKind::Footman`, and a second race would have
+meant forking that consumer. `UnitRole` / `BuildingRole` let the engine ask for
+a job instead of a name:
+
+| Question | Before | Now |
+| --- | --- | --- |
+| is this a hero? | `matches!(kind, Hero \| Priestess)` | `unit_role` is `HeroMelee`/`HeroSupport` |
+| is this a worker? | `kind == UnitKind::Worker` | `is_worker_kind` → `role == Worker` |
+| is this a hall? | `upgrade_root(kind) == TownHall` | `building_role(kind) == Hall` |
+| what class is it? | a list of kinds in `TargetClass::of` | derived from the role |
+| what does the AI build? | `BuildingKind::Barracks` | `race_building(race, Production)` |
+
+The last row is why **the counter-triangle holds across races for free**: no
+line of Rust anywhere mentions two races at once. `vs_cavalry_mult` is keyed off
+`TargetClass`, `TargetClass` is keyed off `role`, and both rosters' cavalry
+declare `role: Cavalry` — so a Kingdom Spearman deletes a Horde Wolfrider for
+exactly the reason it deletes a Raider.
+
+**The four accessors everything goes through**: `race_hall(race)` (the opening
+position and every expansion), `race_worker(race)`, `race_unit(race, role)` /
+`race_building(race, role)` (the AI's roster lookup and the build menu).
+
+**Validation** (`data.rs::check_races`, run at startup): every race has exactly
+one worker, exactly one placeable hall with a three-rung ladder that stays
+inside its own race, a supply building, a production building that trains
+something, at least one trainable non-worker that can hit ground (i.e. it can
+reach the win condition), the anti-cavalry leg of its own triangle if it fields
+cavalry, a `Line` and a `Ranged` unit, one to three hero classes, and exactly
+one forge. Cross-race: a building may only train units some race can both build
+the trainer for and field, and no row may be gated on a building its own race
+cannot build.
+
+**What is still per-kind code**, and the honest cost of a race:
+
+- The enum variant, `ALL_*_KINDS`, and the mesh arm — the add-a-kind checklist,
+  paid 18 times (10 units, 8 buildings).
+- The hotkey rows. `Binding` carries an optional `race` so both rosters keep the
+  same build muscle memory ([B] production, [F] supply, [H] hall on either
+  card), and `CardContext::Units` carries the race so the validator checks each
+  race's card separately instead of seeing a collision no player can be shown.
+- `ai.rs`. It maps roles through a `Roster` lookup rather than forking, so
+  Kingdom-vs-Kingdom is unchanged — but two things did not translate cleanly and
+  are documented on `Roster` itself: eight `Option` fields (a race need not have
+  a role — the Horde has no wall and no siege *building*), and the fact that two
+  roles can land on ONE building (the Horde trains siege at its production
+  building and air at its caster building), which grew two "…and if this
+  building ALSO trains X" tails that are dead code for the Kingdom.
+
+**Research is shared, the forge is not.** `research.ron` names one building per
+race (`buildings: [Blacksmith, WarMill]`); the ladders, prices and bonuses are
+one list for everybody. The reasoning is in that file.
+
+**The bridge**: the catalog is one document for the session and every unit and
+building row carries `race` and `role`; each seat's snapshot carries `my_race`.
+A commander either filters the catalog by its race, or ignores kind names
+entirely and plans against `role`, which means the same thing on both sides.
 
 **Load mechanism.** Each table is compiled in with `include_str!` and is the
 default, so `cargo run` works from any working directory and a shipped binary

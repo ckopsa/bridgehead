@@ -17,10 +17,25 @@
 //
 // `requires` is the TECH gate beyond owning the trainer building; the trainer
 // itself is `trains` in buildings.ron.
+//
+// `races` is which rosters may field the row. An ABSENT or empty `races` means
+// NEUTRAL — every race — which is why every Kingdom row below spells its race
+// out: a unit that belongs to nobody belongs to everybody. The loader's
+// race-tree validator (src/data.rs `check_races`) refuses to start if any race
+// is missing a worker, a hall ladder, supply, production, an army that can
+// reach the win condition, or the anti-cavalry leg of its own triangle.
+//
+// `role` is what the row is FOR, race-independently. It is not decoration:
+// `is_hero_kind`, `TargetClass::of` and the scripted commander's roster lookup
+// all read it instead of matching on a kind, which is what makes the
+// counter-triangle hold ACROSS races for free — both rosters' cavalry declare
+// `role: Cavalry`, so both rosters' spears take 5x off them.
 // ---------------------------------------------------------------------------
 [
     (
         kind: Worker,
+        races: [Kingdom],
+        role: Worker,
         name: "Worker",
         description: "Harvests gold/lumber, constructs buildings. Fights poorly.",
         requires: [],
@@ -34,6 +49,8 @@
     ),
     (
         kind: Footman,
+        races: [Kingdom],
+        role: Line,
         name: "Footman",
         description: "Cheap melee line unit. Tanks for archers.",
         requires: [],
@@ -49,6 +66,8 @@
     // behind it are not.
     (
         kind: Archer,
+        races: [Kingdom],
+        role: Ranged,
         name: "Archer",
         description: "Long-range attacker. Fragile; keep behind footmen.",
         requires: [],
@@ -66,6 +85,8 @@
     // needs archers or towers to answer flyers.
     (
         kind: Hero,
+        races: [Kingdom],
+        role: HeroMelee,
         name: "Hero",
         description: "The Champion: melee hero, levels from nearby enemy deaths, AoE Slam ability, revivable at reduced cost with level preserved. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class.",
         requires: [],
@@ -83,6 +104,8 @@
     // flyer, so an all-in siege push is the thing air raiders punish.
     (
         kind: Catapult,
+        races: [Kingdom],
+        role: Siege,
         name: "Catapult",
         description: "Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it.",
         requires: [],
@@ -102,6 +125,8 @@
     // the mid-game flanking tool it was designed as.
     (
         kind: Raider,
+        races: [Kingdom],
+        role: Cavalry,
         name: "Raider",
         description: "Fast cavalry: 2x damage vs Catapults, excels at worker raids and map control. Melts under massed fire.",
         requires: [Workshop],
@@ -118,6 +143,8 @@
     // air.
     (
         kind: Priestess,
+        races: [Kingdom],
+        role: HeroSupport,
         name: "Priestess",
         description: "Support hero: ranged attack, Heal ability (AoE ally healing). Occupies one hero slot — a Keep lets her stand alongside a Champion; revival preserves her own level.",
         requires: [],
@@ -148,6 +175,8 @@
     // into rather than a patrol that hunts you.
     (
         kind: Spearman,
+        races: [Kingdom],
+        role: AntiCavalry,
         name: "Spearman",
         description: "Cheap anti-cavalry line: 5x damage vs Raiders and Knights, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted.",
         requires: [],
@@ -175,6 +204,8 @@
     // being ridden down.
     (
         kind: Sorcerer,
+        races: [Kingdom],
+        role: Caster,
         name: "Sorcerer",
         description: "Tier-2 caster (Arcane Sanctum, requires a Keep): auto-casts Slow, a -40% move and attack speed debuff on every enemy within 8 for 5s. Blunts cavalry charges and covers retreats. Barely fights; keep it behind the line.",
         requires: [],
@@ -208,6 +239,8 @@
     // not the scout, and the light cavalry keeps its one remaining job.
     (
         kind: Knight,
+        races: [Kingdom],
+        role: Shock,
         name: "Knight",
         description: "Requires a Castle. Heavy shock cavalry: 350 hp at speed 9.5, no type bonus, just the best raw stats on the field. Breaks Footman and Archer lines at equal gold. Counter it with Spearmen — the Knight is cavalry, so it takes 5x from a spear, and 270g of Knight loses to 270g of Spearmen. Melee: cannot touch air.",
         requires: [Castle],
@@ -241,12 +274,293 @@
     // Castle-gated and 280 gold: sight this good arrives late.
     (
         kind: GryphonRider,
+        races: [Kingdom],
+        role: Flyer,
         name: "GryphonRider",
         description: "Requires a Castle; trained at the Workshop. Flying: ignores walls, forests and chokepoints entirely, and attacks both ground and air. Melee units and Catapults CANNOT hit it at all — only Archers, the Priestess and Towers can. Counter it with massed Archers: 270g of Archers beats one Gryphon. Sees 26, the widest eye in the game.",
         requires: [Castle],
         stats: (
             cost_gold: 280, cost_lumber: 120, supply: 5, hp: 200.0, damage: 20.0,
             range: 6.0, attack_cooldown: 1.3, speed: 9.0, train_time: 28.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: true, can_hit_air: true, can_hit_ground: true,
+            vision: 26.0,
+        ),
+    ),
+
+    // =======================================================================
+    // THE HORDE
+    // =======================================================================
+    //
+    // The asymmetric counterpart, and the campaign's proof that content is
+    // data: every row below is a row, and the only Rust the roster needed was
+    // the enum variant and the mesh arm that a KIND has always cost.
+    //
+    // The identity, stated once so every number below can be read against it:
+    // **cheaper bodies that arrive sooner out of fewer buildings, and lose the
+    // straight fight at equal supply.** The Horde's whole game is being on the
+    // map first with more of it. Concretely —
+    //
+    //   * Its production is ONE building (the WarCamp) that trains the entire
+    //     martial roster, gated by hall tier rather than by a second and third
+    //     building. It reaches siege without a Workshop and cavalry without
+    //     anything but a Fortress.
+    //   * Its bodies cost less gold and less time, and are worth less per
+    //     body: a Headhunter is 85g against an Archer's 90+30, and it dies to
+    //     one fewer volley.
+    //   * The exception, and the one place the Horde out-stats the Kingdom, is
+    //     the Grunt: tankier than a Footman and slower, which is the trade the
+    //     whole race is written around. A Grunt wins the duel; a Footman wins
+    //     the map.
+    //
+    // Anti-air follows the same ONE rule the Kingdom's roster does — a weapon
+    // that leaves the hand can hit a flyer, a weapon swung by hand cannot. So
+    // Headhunters, Shamans, the FarSeer, the Wyvern and the Watchtower shoot
+    // air; Grunts, Wolfriders, Impalers, Peons and the Warchief cannot, and
+    // the Demolisher is air-blind for exactly the reason the Catapult is.
+
+    // The Horde's worker. Cheaper hit points than a Peasant and a shade
+    // faster: the Horde builds sooner and loses its builders faster, which is
+    // the same sentence as the rest of the race.
+    (
+        kind: Peon,
+        races: [Horde],
+        role: Worker,
+        name: "Peon",
+        description: "Harvests gold/lumber, constructs buildings. Fights poorly.",
+        requires: [],
+        stats: (
+            cost_gold: 75, cost_lumber: 0, supply: 1, hp: 55.0, damage: 5.0,
+            range: 1.8, attack_cooldown: 1.5, speed: 8.5, train_time: 8.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 12.0,
+        ),
+    ),
+    // **The race in one unit.** 165 hp against a Footman's 140, 8.4 dps
+    // against its 10.0, 6.2 speed against its 7.0 — and 125 gold against its
+    // 135. Cheaper, tankier, slower, and it loses the straight duel by a
+    // sliver. At equal GOLD it wins on bodies and hit points; at equal SUPPLY
+    // the Footman is ahead. That is the trade, and it is deliberately narrow:
+    // a line unit that simply won would make the race strictly better, and a
+    // line unit that simply lost would make it unplayable.
+    //
+    // **Why it is the CHEAPEST thing the WarCamp makes**, which is the part
+    // that was learned the hard way. The scripted commander falls back to the
+    // roster'''s `Line` unit whenever the pick it wanted is unaffordable, and
+    // it ring-fences gold for a hero, an expansion and a tier-up. At 145 gold
+    // the Grunt was the most expensive body the Horde could build, so a
+    // reserve squeeze meant the fallback failed too and the WarCamp queued
+    // NOTHING: measured, a Horde sitting on 1343 banked gold with eight army
+    // units on the field while the Kingdom fielded twenty-eight. The Kingdom
+    // never hit this because its 135g Footman sits in the middle of its own
+    // price list. A fallback has to be the floor, not the ceiling.
+    (
+        kind: Grunt,
+        races: [Horde],
+        role: Line,
+        name: "Grunt",
+        description: "Melee line unit: tankier than a Footman, slower, and slightly worse damage. Wins the duel, loses the chase.",
+        requires: [],
+        stats: (
+            cost_gold: 125, cost_lumber: 0, supply: 2, hp: 165.0, damage: 10.5,
+            range: 2.0, attack_cooldown: 1.25, speed: 6.2, train_time: 11.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 15.0,
+        ),
+    ),
+    // The Horde's back rank, and the mirror image of the Archer: 10.6 dps
+    // against 9.3, at 10.5 reach against 14. A Headhunter that reaches an
+    // Archer kills it; an Archer that keeps its distance kills a Headhunter
+    // without being touched. Which of those two happens is a question about
+    // the ground and about whose line breaks first, which is exactly where a
+    // race asymmetry is supposed to live.
+    //
+    // Thrown axes, so it shoots air — the Horde's answer to a Gryphon, and
+    // (with the Watchtower) the only one it has.
+    (
+        kind: Headhunter,
+        races: [Horde],
+        role: Ranged,
+        name: "Headhunter",
+        description: "Ranged line unit: harder hitting than an Archer and much shorter ranged. Thrown axes, so it answers air.",
+        requires: [],
+        stats: (
+            cost_gold: 85, cost_lumber: 20, supply: 2, hp: 75.0, damage: 17.0,
+            range: 10.5, attack_cooldown: 1.6, speed: 7.2, train_time: 11.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
+            vision: 16.0,
+        ),
+    ),
+    // Cavalry, `role: Cavalry`, and therefore `TargetClass::Cavalry` — which
+    // is the entire cross-race counter-triangle in one field. A Kingdom
+    // Spearman's 5x lands on a Wolfrider exactly as hard as on a Raider,
+    // because the multiplier is keyed off the CLASS and the class is keyed off
+    // the ROLE. Nothing anywhere in the engine mentions both races.
+    //
+    // Faster and cheaper than a Raider, with less meat: the raid arrives
+    // sooner and dies quicker. Gated on the Fortress rather than on a
+    // Workshop, because the Horde pays for its tech in TIER and the Kingdom
+    // pays for it in BUILDINGS — same 300-ish gold, different shape.
+    (
+        kind: Wolfrider,
+        races: [Horde],
+        role: Cavalry,
+        name: "Wolfrider",
+        description: "Requires a Fortress. Fast cavalry: 2x damage vs siege engines, excels at worker raids and map control. Cheaper and faster than a Raider, and dies quicker. Counter it with spears — it is cavalry, so a Spearman or an Impaler takes 5x off it.",
+        requires: [Fortress],
+        stats: (
+            cost_gold: 150, cost_lumber: 25, supply: 3, hp: 120.0, damage: 15.0,
+            range: 2.2, attack_cooldown: 1.1, speed: 11.0, train_time: 14.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 2.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 24.0,
+        ),
+    ),
+    // The Horde's spear line — the same 5x, the same deliberate uselessness
+    // at everything else, one point more damage and ten fewer hit points than
+    // a Spearman for five gold less.
+    //
+    // It exists for two reasons, and the second is the important one. The
+    // first is the mirror match: a race with a horse and no answer to a horse
+    // is a race whose own mirror is decided by whoever builds cavalry first,
+    // and the loader refuses such a roster by name. The second is that the
+    // triangle has to hold ACROSS races: an Impaler is the Horde's answer to a
+    // Knight, and 255 gold of Impalers beats 270 gold of Knight, exactly as
+    // 270 gold of Spearmen does.
+    (
+        kind: Impaler,
+        races: [Horde],
+        role: AntiCavalry,
+        name: "Impaler",
+        description: "Cheap anti-cavalry line: 5x damage vs any cavalry, of either race — Raiders, Knights and Wolfriders alike. Slow, and feeble against anything unmounted.",
+        requires: [],
+        stats: (
+            cost_gold: 85, cost_lumber: 0, supply: 2, hp: 150.0, damage: 7.0,
+            range: 2.5, attack_cooldown: 1.75, speed: 5.8, train_time: 9.5, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 5.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 17.0,
+        ),
+    ),
+    // Siege, out of the WarCamp rather than out of a Workshop the Horde does
+    // not have. Gated on the Fortress instead — the "fewer buildings" identity
+    // costs the Horde a hall upgrade where it costs the Kingdom 140g/100l of
+    // masonry, and buys the Horde one less thing to raid.
+    //
+    // 18 range against a Tower's 16 — it still outranges static defense, which
+    // is the entire job. Ground-only for the same reason the Catapult is: a
+    // boulder cannot track a flyer, so an all-in siege push is the thing air
+    // punishes on both sides of the matchup.
+    (
+        kind: Demolisher,
+        races: [Horde],
+        role: Siege,
+        name: "Demolisher",
+        description: "Requires a Fortress. Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it.",
+        requires: [Fortress],
+        stats: (
+            cost_gold: 170, cost_lumber: 110, supply: 3, hp: 120.0, damage: 14.0,
+            range: 18.0, attack_cooldown: 2.8, speed: 5.0, train_time: 20.0, projectile: true,
+            vs_building_mult: 6.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 13.0,
+        ),
+    ),
+    // The tier-2 caster, and the Sorcerer's opposite number in the most
+    // literal sense the effect vocabulary allows: the Kingdom's caster spends
+    // its cooldown making the ENEMY worse, the Horde's spends it making its
+    // OWN army better. Bloodlust is `ApplyStatus(Haste)` plus
+    // `ApplyStatus(DamageBuff)` at `Allies` — two atoms, one row, and no Rust
+    // (see abilities.ron).
+    //
+    // The consequence is a real strategic difference rather than a reskin:
+    // Slow is worth most when you are losing (it covers a retreat), Bloodlust
+    // is worth most when you are winning (it compounds a push). A Horde that
+    // is behind gets nothing out of its caster, which is the correct tax on a
+    // race whose whole plan is to be ahead.
+    (
+        kind: Shaman,
+        races: [Horde],
+        role: Caster,
+        name: "Shaman",
+        description: "Tier-2 caster (Spirit Lodge, requires a Fortress): auto-casts Bloodlust, thrown up to 8 away, giving every ally within 5 of it +20% damage and +25% move speed for 10s. Compounds a push; worthless in a retreat. Barely fights; keep it behind the line.",
+        requires: [],
+        stats: (
+            cost_gold: 115, cost_lumber: 40, supply: 2, hp: 60.0, damage: 9.0,
+            range: 10.0, attack_cooldown: 2.1, speed: 6.2, train_time: 15.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
+            vision: 18.0,
+        ),
+    ),
+    // Horde melee hero. Base (level 1) stats; damage/HP grow per level. A
+    // little more meat and a little less swing than the Champion, and the same
+    // melee air-blindness: a Warchief army that never built a Headhunter is
+    // helpless under a Gryphon.
+    (
+        kind: Warchief,
+        races: [Horde],
+        role: HeroMelee,
+        name: "Warchief",
+        description: "The Warchief: melee hero, levels from nearby enemy deaths, AoE Cleave ability, revivable at reduced cost with level preserved. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class.",
+        requires: [],
+        stats: (
+            cost_gold: 400, cost_lumber: 100, supply: 5, hp: 340.0, damage: 23.0,
+            range: 2.4, attack_cooldown: 1.15, speed: 7.3, train_time: 25.0, projectile: false,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: false, can_hit_ground: true,
+            vision: 20.0,
+        ),
+    ),
+    // Horde support hero. Vision 22 is the one stat where he beats every
+    // non-flyer in the game outright, and it is the whole character: fog is XZ
+    // only, a hero walks, and a Far Seer walking your flank is the cheapest
+    // scouting either race can buy. His bolts track upward, so the support
+    // hero is also this roster's hero answer to air.
+    (
+        kind: FarSeer,
+        races: [Horde],
+        role: HeroSupport,
+        name: "FarSeer",
+        description: "Support hero: ranged attack, Mend ability (AoE ally healing), and the widest eye of any ground unit in the game. Occupies one hero slot — a Fortress lets him stand alongside a Warchief; revival preserves his own level.",
+        requires: [],
+        stats: (
+            cost_gold: 400, cost_lumber: 100, supply: 5, hp: 250.0, damage: 13.0,
+            range: 10.5, attack_cooldown: 1.45, speed: 7.5, train_time: 25.0, projectile: true,
+            vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
+            flying: false, can_hit_air: true, can_hit_ground: true,
+            vision: 22.0,
+        ),
+    ),
+    // The Horde's one tier-3 capstone, and the cleanest thing in this whole
+    // bead: the flying layer — nav-grid exemption, altitude, the
+    // melee-cannot-reach-it rule, the `TargetClass::Air` classification —
+    // is reused as PURE DATA. `flying: true` is the entire implementation.
+    //
+    // Priced against the same target the Gryphon is: 265 gold of Wyvern must
+    // LOSE to 255 gold of Headhunters (three of them: 225 hp and 31.9 dps
+    // against 185 hp and 16.0), so massed ranged stays the answer to air on
+    // both sides of the matchup and a flyer is a scalpel rather than an
+    // autowin.
+    //
+    // The Horde deliberately gets ONE capstone where the Kingdom gets two
+    // (Knight and Gryphon). It has no `Shock` unit at all, which is why an
+    // Impaler is the Horde's answer to a Knight and the Kingdom has no
+    // equivalent problem in reverse — the compensation is that the Horde
+    // reaches its capstone out of a building it already owns.
+    (
+        kind: Wyvern,
+        races: [Horde],
+        role: Flyer,
+        name: "Wyvern",
+        description: "Requires a Hold; trained at the Spirit Lodge. Flying: ignores walls, forests and chokepoints entirely, and attacks both ground and air. Melee units and Demolishers CANNOT hit it at all — only Headhunters, Shamans, the FarSeer and Watchtowers can. Counter it with massed Headhunters. Sees 26, the widest eye in the game.",
+        requires: [Hold],
+        stats: (
+            cost_gold: 265, cost_lumber: 110, supply: 5, hp: 185.0, damage: 20.0,
+            range: 6.5, attack_cooldown: 1.25, speed: 9.5, train_time: 26.0, projectile: true,
             vs_building_mult: 1.0, vs_siege_mult: 1.0, vs_cavalry_mult: 1.0,
             flying: true, can_hit_air: true, can_hit_ground: true,
             vision: 26.0,

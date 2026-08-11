@@ -1720,8 +1720,8 @@ struct ShopState {
 /// share a card with build buttons. The proof was right; it is now
 /// `hotkeys::validate()`, which checks it for every card rather than for the
 /// two the author thought of.
-fn build_cards() -> Vec<(BuildingKind, KeyCode)> {
-    hotkeys::build_order()
+fn build_cards(race: Race) -> Vec<(BuildingKind, KeyCode)> {
+    hotkeys::build_order(race)
 }
 
 /// Ability button caption: the ability's own name, plus the countdown while it
@@ -1766,6 +1766,11 @@ struct CastLookup<'w, 's> {
     research: Res<'w, TeamResearch>,
     /// Forges mid-job, looked up by entity like `cooldowns`.
     researching: Query<'w, 's, &'static Researching>,
+    /// Who each team is playing. The build card is the player's OWN roster, so
+    /// this is read once per frame and handed to `command_entries`. It rides in
+    /// this bundle rather than as its own parameter for the reason the doc
+    /// above gives: both consumers are on the 16-parameter ceiling.
+    races: Res<'w, Races>,
 }
 
 /// Every UNLOCKED ability of a caster, priced and cooled, ready for the card.
@@ -1827,6 +1832,11 @@ fn ability_slots(
 /// only the TownHall answers today ([C CallToArms]).
 fn command_entries(
     page: CardPage,
+    // The selecting team's RACE — which build buttons a worker draws. It is a
+    // parameter rather than a lookup because this whole function is pure and
+    // the tests call it with no World; a race read from a resource here would
+    // put the build card out of their reach.
+    race: Race,
     own_units: usize,
     has_worker: bool,
     // (kind, completed) of the only selected building, when it is the whole selection.
@@ -1854,7 +1864,7 @@ fn command_entries(
     // Builds first: they never yield (see above), so a worker selection always
     // shows the classic layout even when a hero got caught in the drag box.
     if has_worker {
-        for (kind, key) in build_cards() {
+        for (kind, key) in build_cards(race) {
             out.push(
                 CmdEntry::plain(CmdAction::Place(kind), key, building_name(kind))
                     // ...after `priced`: an unmet requirement takes the cost line.
@@ -2436,6 +2446,16 @@ fn unit_name(kind: UnitKind) -> &'static str {
         UnitKind::Sorcerer => "Sorcerer",
         UnitKind::Knight => "Knight",
         UnitKind::GryphonRider => "Gryphon",
+        UnitKind::Peon => "Peon",
+        UnitKind::Grunt => "Grunt",
+        UnitKind::Headhunter => "Headhunter",
+        UnitKind::Wolfrider => "Wolfrider",
+        UnitKind::Impaler => "Impaler",
+        UnitKind::Demolisher => "Demolisher",
+        UnitKind::Shaman => "Shaman",
+        UnitKind::Warchief => "Warchief",
+        UnitKind::FarSeer => "Far Seer",
+        UnitKind::Wyvern => "Wyvern",
     }
 }
 
@@ -2466,6 +2486,14 @@ fn building_name(kind: BuildingKind) -> &'static str {
         BuildingKind::Keep => "Keep",
         BuildingKind::Castle => "Castle",
         BuildingKind::Sanctum => "Sanctum",
+        BuildingKind::Stronghold => "Stronghold",
+        BuildingKind::WarCamp => "War Camp",
+        BuildingKind::Burrow => "Burrow",
+        BuildingKind::Watchtower => "Watchtower",
+        BuildingKind::SpiritLodge => "Spirit Lodge",
+        BuildingKind::WarMill => "War Mill",
+        BuildingKind::Fortress => "Fortress",
+        BuildingKind::Hold => "Hold",
     }
 }
 
@@ -3831,7 +3859,7 @@ fn command_input(
         let idle: Vec<(Entity, Vec3)> = all_units
             .iter()
             .filter(|(_, u, t, o, _, _, _)| {
-                **t == Team::Human && u.kind == UnitKind::Worker && matches!(o, Order::Idle)
+                **t == Team::Human && is_worker_kind(u.kind) && matches!(o, Order::Idle)
             })
             .map(|(e, _, _, _, tf, _, _)| (e, tf.translation))
             .collect();
@@ -3854,7 +3882,7 @@ fn command_input(
     let own_ids = || -> Vec<IntentId> { own_units.iter().map(|(e, _)| intent_id(*e)).collect() };
     let has_worker = sel_units
         .iter()
-        .any(|(_, u, t, ..)| *t == Team::Human && u.kind == UnitKind::Worker);
+        .any(|(_, u, t, ..)| *t == Team::Human && is_worker_kind(u.kind));
     // Every selected own CASTER — anything whose kind has an ability list.
     // Heroes qualify through their tables like everything else, and so does
     // the Sorcerer, which carries no `Hero` component at all.
@@ -4025,8 +4053,10 @@ fn command_input(
         tmpl: single_template,
         home_guard: has_trigger(&cast.triggers, HOME_GUARD),
     };
+    let race = cast.races.get(Team::Human);
     let entries = command_entries(
         ui.page,
+        race,
         own_units.len(),
         has_worker,
         single_building,
@@ -5182,7 +5212,7 @@ fn left_mouse(
                         let mut workers: Vec<(Entity, f32)> = units
                             .iter()
                             .filter(|(_, _, u, t, sel)| {
-                                *sel && **t == Team::Human && u.kind == UnitKind::Worker
+                                *sel && **t == Team::Human && is_worker_kind(u.kind)
                             })
                             .map(|(e, tf, _, _, _)| (e, dist_xz(tf.translation, pos)))
                             .collect();
@@ -5756,7 +5786,7 @@ fn right_mouse(
         let (workers, others): (Vec<_>, Vec<_>) = selected_units
             .iter()
             .copied()
-            .partition(|(_, k, _)| *k == UnitKind::Worker);
+            .partition(|(_, k, _)| is_worker_kind(*k));
         if !workers.is_empty() {
             say(
                 &mut submissions,
@@ -7188,7 +7218,7 @@ fn update_hud(
         .filter(|(_, _, _, t, _, _, _, _, _, _, _, _, _)| **t == Team::Human)
         .count();
     let has_worker = sel_units.iter().any(|(_, u, _, t, _, _, _, _, _, _, _, _, _)| {
-        *t == Team::Human && u.kind == UnitKind::Worker
+        *t == Team::Human && is_worker_kind(u.kind)
     });
     // Same aggregate the input system builds, so caption/highlight and the
     // toggle that a click executes can never disagree.
@@ -7380,8 +7410,10 @@ fn update_hud(
         .filter(|(_, t, _, _, under, _)| **t == Team::Human && !under)
         .map(|(b, ..)| b.kind)
         .collect();
+    let race = cast.races.get(Team::Human);
     let all_entries = command_entries(
         ui.page,
+        race,
         own_units,
         has_worker,
         single_building,
@@ -7835,7 +7867,7 @@ fn hover_feedback(
     // (ground pos, ring radius, material) of the pick target, if any.
     let mut hit: Option<(Vec3, f32, Handle<StandardMaterial>)> = None;
     let mut icon = SystemCursorIcon::Default;
-    let workers_selected = selected.iter().any(|u| u.kind == UnitKind::Worker);
+    let workers_selected = selected.iter().any(|u| is_worker_kind(u.kind));
 
     let pickable = game_over.winner.is_none() && state.placement.is_none() && !state.dragging;
     if pickable {
@@ -8893,6 +8925,10 @@ mod tests {
     /// camera, no renderer. Every gesture below is the production code path.
     fn ui_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<UiState>()
             .init_resource::<Said>()
             .init_resource::<ButtonInput<KeyCode>>()
@@ -8955,6 +8991,10 @@ mod tests {
     #[test]
     fn a_refused_gesture_shows_up_in_the_alert_stack() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<UiState>()
             .init_resource::<Time<Real>>()
             .init_resource::<GameEvents>()
@@ -9027,6 +9067,10 @@ mod tests {
     /// keystroke below goes through the production system.
     fn proposal_app(pending: Vec<crate::copilot::Proposal>) -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<UiState>()
             .init_resource::<Time>()
             .init_resource::<GameOver>()
@@ -9206,6 +9250,10 @@ mod tests {
         use crate::intent::{IntentLog, IntentPlugin};
 
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<UiState>()
             .init_resource::<Time>()
             .init_resource::<ButtonInput<KeyCode>>()
@@ -9935,13 +9983,13 @@ mod tests {
     #[test]
     fn the_doctrine_page_offers_a_way_back() {
         let card = DoctrineCard::default();
-        let orders = command_entries(CardPage::Orders, 2, false, None, HeroCmds::default(), card, &[]);
+        let orders = command_entries(CardPage::Orders, Race::Kingdom, 2, false, None, HeroCmds::default(), card, &[]);
         assert!(
             orders.iter().any(|e| e.action == CmdAction::TogglePage),
             "a unit selection must be able to reach the doctrine page"
         );
         let doctrine =
-            command_entries(CardPage::Doctrine, 2, false, None, HeroCmds::default(), card, &[]);
+            command_entries(CardPage::Doctrine, Race::Kingdom, 2, false, None, HeroCmds::default(), card, &[]);
         assert!(paginate(&doctrine, 0).tiles.len() <= CMD_SLOTS);
         assert_eq!(
             doctrine.last().map(|e| e.action),
@@ -9982,6 +10030,7 @@ mod tests {
         };
         let entries = command_entries(
             CardPage::Orders,
+            Race::Kingdom,
             3,
             true,
             None,
@@ -10036,6 +10085,7 @@ mod tests {
     fn a_worker_card_holds_every_build_button_and_the_page_toggle() {
         let entries = command_entries(
             CardPage::Orders,
+            Race::Kingdom,
             3,
             true,
             None,
@@ -10045,7 +10095,7 @@ mod tests {
         );
         let view = paginate(&entries, 0);
         assert_eq!(view.tiles.len(), CMD_SLOTS, "page one fills the card");
-        for (kind, _) in build_cards() {
+        for (kind, _) in build_cards(Race::Kingdom) {
             assert!(
                 view.tiles.iter().any(|e| e.action == CmdAction::Place(kind)),
                 "{kind:?} must have a button on page one — a building the player \
@@ -10178,6 +10228,7 @@ mod tests {
         for kind in ALL_BUILDING_KINDS {
             let entries = command_entries(
                 CardPage::Orders,
+                Race::Kingdom,
                 0,
                 false,
                 Some((kind, true)),
@@ -10207,6 +10258,7 @@ mod tests {
         // route in for a player at the keyboard.
         let barracks = command_entries(
             CardPage::Orders,
+            Race::Kingdom,
             0,
             false,
             Some((BuildingKind::Barracks, true)),
@@ -10223,6 +10275,7 @@ mod tests {
 
         let workshop = command_entries(
             CardPage::Orders,
+            Race::Kingdom,
             0,
             false,
             Some((BuildingKind::Workshop, true)),
@@ -10304,7 +10357,7 @@ mod tests {
                 };
                 out.push((
                     format!("units (worker: {worker}, hero: {hero}), orders"),
-                    command_entries(CardPage::Orders, 3, worker, None, cmds, doc, &completed),
+                    command_entries(CardPage::Orders, Race::Kingdom, 3, worker, None, cmds, doc, &completed),
                 ));
             }
         }
@@ -10314,6 +10367,7 @@ mod tests {
             "units, doctrine".to_string(),
             command_entries(
                 CardPage::Doctrine,
+                Race::Kingdom,
                 3,
                 false,
                 None,
@@ -10358,6 +10412,7 @@ mod tests {
                 format!("{kind:?}, orders"),
                 command_entries(
                     CardPage::Orders,
+                    Race::Kingdom,
                     0,
                     false,
                     Some((kind, true)),
@@ -10373,6 +10428,7 @@ mod tests {
             "production building, doctrine".to_string(),
             command_entries(
                 CardPage::Doctrine,
+                Race::Kingdom,
                 0,
                 false,
                 Some((BuildingKind::Barracks, true)),
@@ -10570,6 +10626,7 @@ mod tests {
     fn a_hotkey_on_page_two_still_fires_from_page_one() {
         let entries = command_entries(
             CardPage::Orders,
+            Race::Kingdom,
             3,
             true,
             None,
@@ -10656,6 +10713,10 @@ mod tests {
     #[test]
     fn only_a_located_alert_earns_a_ping() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<UiState>()
             .init_resource::<Time<Real>>()
             .init_resource::<GameEvents>()
@@ -10895,6 +10956,10 @@ mod tests {
     #[test]
     fn repainting_the_fog_overlay_republishes_the_material_it_is_worn_by() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.add_plugins(AssetPlugin::default())
             .init_asset::<Image>()
             .init_asset::<Mesh>()
@@ -10931,6 +10996,10 @@ mod tests {
     #[test]
     fn the_fog_texture_carries_all_three_states_from_the_grid() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.add_plugins(AssetPlugin::default())
             .init_asset::<Image>()
             .init_asset::<Mesh>()
@@ -11006,6 +11075,10 @@ mod tests {
     #[test]
     fn a_doodad_wears_the_shade_of_the_cell_it_stands_in() {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.add_plugins(AssetPlugin::default())
             .init_asset::<StandardMaterial>()
             .insert_resource(FogGrids::test_dark())

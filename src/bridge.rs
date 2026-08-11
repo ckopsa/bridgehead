@@ -511,6 +511,17 @@ struct StateOut {
     /// Which faction this snapshot is written for: `"Claude"` or `"Human"`.
     /// Everything below named "my"/"me"/"own" is relative to it.
     my_team: &'static str,
+    /// **Which ROSTER you are playing**: `"kingdom"` or `"horde"`.
+    ///
+    /// The catalog is written once per session and describes both races, with
+    /// every unit and building row carrying its own `race` and `role`. This
+    /// key is what turns that shared document into your build tree: filter the
+    /// catalog by it, or — better — ignore kind names entirely and plan against
+    /// `role`, which means the same thing on both sides of the matchup.
+    ///
+    /// Always present. It reads `"kingdom"` for both seats in a match nobody
+    /// opted into a second race for, which is every match by default.
+    my_race: &'static str,
     seq_applied: u64,
     errors: Vec<String>,
     /// docs/TEMPO.md §3/§4 — **what your last batch cost to deliver.** One
@@ -1273,6 +1284,10 @@ struct SnapshotNeutrals<'w, 's> {
 struct TeamTech<'w> {
     tiers: Res<'w, TechTiers>,
     research: Res<'w, TeamResearch>,
+    /// Which roster each team is playing. Here rather than as its own
+    /// parameter for the reason the doc above gives, and it belongs with the
+    /// other two anyway: all three answer "what content is this team's".
+    races: Res<'w, Races>,
 }
 
 /// What the compiler had to say about the last batch a seat sent: what it
@@ -1370,6 +1385,7 @@ fn write_snapshot(
             standing.triggers.get(seat.team),
             *tech.tiers,
             *tech.research,
+            tech.races.get(seat.team),
             &feed,
             (fog.enabled(), seat_fog),
             verdicts.errors.get(seat.team),
@@ -1400,6 +1416,12 @@ fn write_seat_snapshot(
     my_triggers: &[TriggerRule],
     tiers: TechTiers,
     team_research: TeamResearch,
+    // **Your roster.** The catalog is one document for the whole session and
+    // carries every row of both races, tagged; this is the key that tells a
+    // commander which of those rows are its own. Match it against
+    // `catalog.units[].race` / `catalog.buildings[].race`, or ignore names
+    // entirely and go by `role`.
+    my_race: Race,
     feed: &GameEvents,
     fog: (bool, &FogGrid),
     // Per-command validation errors this team's intents produced, from the
@@ -1752,6 +1774,7 @@ fn write_seat_snapshot(
     let state = StateOut {
         t: now,
         my_team: team_name(me),
+        my_race: my_race.name(),
         seq_applied: seat.last_seq,
         // Batch-level first, then the compiler's per-command verdicts — one
         // flat array of strings, exactly the shape the protocol always had.

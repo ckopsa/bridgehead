@@ -1214,6 +1214,10 @@ mod tests {
     /// approved proposal takes exactly the path a live match takes.
     fn co_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<Economies>()
             .init_resource::<HeroRecords>()

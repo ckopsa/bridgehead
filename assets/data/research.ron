@@ -21,9 +21,27 @@
 // mine it is out-expanding you at.
 // ---------------------------------------------------------------------------
 (
-    // Which building kind runs research. One field so a second forge (or
-    // moving the ladders to another building) is a data change.
-    building: Blacksmith,
+    // **One forge per race, and one price list for all of them.**
+    //
+    // Research is the game's one purchase that buys a *property of the
+    // faction* rather than a thing, and the v1 call on races is that the
+    // property is SHARED: the Horde's WarMill sells the same two ladders at
+    // the same prices for the same +1/+2/+3 that the Kingdom's Blacksmith
+    // does. Only the building differs.
+    //
+    // That is a deliberate line and not laziness. The ladders reach the
+    // simulation as two flat terms applied OUTSIDE every multiplier
+    // (`effective_stats_with`), so a per-race ladder would not be *content* —
+    // it would be a second global balance lever with no counterplay attached
+    // to it, tuned in a file where nobody would think to look for a reason the
+    // Horde's army hits harder. If a race ever earns its own ladder, this
+    // field and the `ladders` list below both grow a `race`, and
+    // `research_building_for(race)` is already the shape the rest of the
+    // engine asks through.
+    //
+    // The loader checks that every race has exactly ONE building here and that
+    // each of them lists every ladder in its `researches`.
+    buildings: [Blacksmith, WarMill],
 
     ladders: [
         (

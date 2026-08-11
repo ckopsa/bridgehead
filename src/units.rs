@@ -154,6 +154,51 @@ struct UnitAssets {
     gryphon_wing: Handle<Mesh>,
     gryphon_tail: Handle<Mesh>,
     gryphon_rider: Handle<Mesh>,
+
+    // ---- Horde ----------------------------------------------------------
+    // The silhouette rule for the whole roster, so every measurement below
+    // can be read against it: **the Horde is WIDER and LOWER than the
+    // Kingdom, and it carries bone where the Kingdom carries steel.** A Grunt
+    // is 0.34 across the barrel against a Footman's 0.28 and stands 1.42
+    // against its 1.48; the Kingdom's accents are `metal_mat` and `gold_mat`,
+    // the Horde's are `bone_mat` and `hide_mat`. At RTS camera distance the
+    // team colour tells you whose it is and the proportions tell you what it
+    // is, which is the only thing a silhouette owes the player.
+    peon_body: Handle<Mesh>,
+    peon_load: Handle<Mesh>,
+    grunt_body: Handle<Mesh>,
+    grunt_spike: Handle<Mesh>,
+    grunt_blade: Handle<Mesh>,
+    headhunter_body: Handle<Mesh>,
+    headhunter_axe: Handle<Mesh>,
+    headhunter_quiver: Handle<Mesh>,
+    wolf_mount: Handle<Mesh>,
+    wolf_leg: Handle<Mesh>,
+    wolf_rider: Handle<Mesh>,
+    wolf_snout: Handle<Mesh>,
+    impaler_body: Handle<Mesh>,
+    impaler_shaft: Handle<Mesh>,
+    impaler_head: Handle<Mesh>,
+    demolisher_body: Handle<Mesh>,
+    demolisher_wheel: Handle<Mesh>,
+    demolisher_ram: Handle<Mesh>,
+    demolisher_panel: Handle<Mesh>,
+    shaman_body: Handle<Mesh>,
+    shaman_staff: Handle<Mesh>,
+    shaman_totem: Handle<Mesh>,
+    warchief_body: Handle<Mesh>,
+    warchief_horn: Handle<Mesh>,
+    warchief_axe: Handle<Mesh>,
+    farseer_body: Handle<Mesh>,
+    farseer_hood: Handle<Mesh>,
+    farseer_staff: Handle<Mesh>,
+    farseer_orb: Handle<Mesh>,
+    wyvern_body: Handle<Mesh>,
+    wyvern_wing: Handle<Mesh>,
+    wyvern_tail: Handle<Mesh>,
+    wyvern_sting: Handle<Mesh>,
+    wyvern_rider: Handle<Mesh>,
+
     head: Handle<Mesh>,
     human_mat: Handle<StandardMaterial>,
     claude_mat: Handle<StandardMaterial>,
@@ -170,6 +215,16 @@ struct UnitAssets {
     /// `StatusKind::Slow`'s ground ring — the unit and the debuff it puts on
     /// the field read as one thing at a glance.
     arcane_mat: Handle<StandardMaterial>,
+    /// Horde trim: bleached bone. Wherever the Kingdom bolts on `metal_mat`,
+    /// the Horde lashes on this.
+    bone_mat: Handle<StandardMaterial>,
+    /// Horde hide/leather — mounts, wings, wagon planks.
+    hide_mat: Handle<StandardMaterial>,
+    /// The Shaman's totem and the FarSeer's orb: green, and deliberately the
+    /// same hue as `StatusKind::Haste`'s ring, for the same reason the
+    /// Sorcerer's orb matches Slow's — the caster and the thing it puts on the
+    /// field read as one object.
+    spirit_mat: Handle<StandardMaterial>,
 }
 
 impl UnitAssets {
@@ -208,6 +263,15 @@ fn setup_unit_assets(
     let arcane_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.55, 0.45, 1.0),
         emissive: LinearRgba::new(0.9, 0.6, 2.4, 1.0),
+        ..default()
+    });
+
+    // Green spirit light, matched to `StatusKind::Haste.tint()` for the same
+    // reason `arcane_mat` matches Slow's: the Shaman's whole output is Haste,
+    // so the caster and the ring it lays down are one object to the eye.
+    let spirit_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.45, 1.0, 0.55),
+        emissive: LinearRgba::new(0.5, 2.2, 0.7, 1.0),
         ..default()
     });
 
@@ -285,6 +349,86 @@ fn setup_unit_assets(
         gryphon_wing: meshes.add(Cuboid::new(1.55, 0.07, 0.62)),
         gryphon_tail: meshes.add(Cone::new(0.16, 0.70)),
         gryphon_rider: meshes.add(Capsule3d::new(0.20, 0.34)),
+
+        // ---- Horde ------------------------------------------------------
+        // Peon: squat and wide (0.30 x 0.44 against the Peasant's 0.26 x
+        // 0.68), bent under a lashed bundle. Total 1.04 — the shortest thing
+        // on the field, and the read is "this is not a soldier" before the
+        // colour has even registered.
+        peon_body: meshes.add(Capsule3d::new(0.30, 0.44)),
+        peon_load: meshes.add(Cuboid::new(0.52, 0.34, 0.30)),
+        // Grunt: a barrel. 0.34 radius is the widest infantry body in the
+        // game, on a body 0.06 SHORTER than a Footman's — tankier and slower,
+        // stated in geometry before it is stated in the stat table. The two
+        // shoulder spikes widen the top of the silhouette further, so a Grunt
+        // line reads as a wall and a Footman line reads as a rank.
+        grunt_body: meshes.add(Capsule3d::new(0.34, 0.74)),
+        grunt_spike: meshes.add(Cone::new(0.11, 0.30)),
+        grunt_blade: meshes.add(Cuboid::new(0.10, 0.46, 0.30)),
+        // Headhunter: the narrowest Horde body, with a thrown weapon held
+        // out and a bundle of spares on the back. Against the Archer's bow —
+        // one long curve — this is two short slabs, which is the whole
+        // "shorter range, harder hit" claim rendered.
+        headhunter_body: meshes.add(Capsule3d::new(0.24, 0.72)),
+        headhunter_axe: meshes.add(Cuboid::new(0.09, 0.34, 0.24)),
+        headhunter_quiver: meshes.add(Cuboid::new(0.20, 0.44, 0.16)),
+        // Wolfrider: the Raider's shape with the beast's head thrust FORWARD
+        // past the rider's knee. Same mounted mass, different posture — the
+        // Raider's mount is a barrel under a man, the wolf is a nose that
+        // happens to have a man on it.
+        wolf_mount: meshes.add(Capsule3d::new(0.30, 0.86)),
+        wolf_leg: meshes.add(Cylinder::new(0.085, 0.40)),
+        wolf_rider: meshes.add(Capsule3d::new(0.23, 0.38)),
+        wolf_snout: meshes.add(Cone::new(0.18, 0.44)),
+        // Impaler: a Spearman built wrong on purpose. The shaft is shorter
+        // (1.30 against 1.75) and thicker, and the head is a broad wedge
+        // rather than a leaf — so a hedge of Impalers reads as SPIKES where a
+        // hedge of Spearmen reads as LINES, and neither can be mistaken for
+        // the other's front rank at a glance.
+        impaler_body: meshes.add(Capsule3d::new(0.28, 0.90)),
+        impaler_shaft: meshes.add(Cylinder::new(0.06, 1.30)),
+        impaler_head: meshes.add(Cone::new(0.16, 0.34)),
+        // Demolisher: a wagon like the Catapult, but its weapon points
+        // FORWARD instead of up. Two big wheels instead of four small ones,
+        // and a ram log along -Z: siege that pushes rather than lobs, which is
+        // a lie about the stats (both are ranged bombardment) and the right
+        // lie, because it is instantly not-a-Catapult from any angle.
+        demolisher_body: meshes.add(Cuboid::new(1.24, 0.50, 1.44)),
+        demolisher_wheel: meshes.add(Cylinder::new(0.34, 0.16)),
+        demolisher_ram: meshes.add(Cylinder::new(0.15, 1.30)),
+        demolisher_panel: meshes.add(Cuboid::new(0.92, 0.44, 0.10)),
+        // Shaman: the Horde's answer to the Sorcerer, and deliberately its
+        // opposite in posture. The Sorcerer carries an untethered orb and no
+        // weapon; the Shaman plants a TOTEM — a staff taller than it is, with
+        // a heavy head. One floats, one is rooted.
+        shaman_body: meshes.add(Capsule3d::new(0.25, 0.86)),
+        shaman_staff: meshes.add(Cylinder::new(0.055, 1.44)),
+        shaman_totem: meshes.add(Cuboid::new(0.26, 0.30, 0.22)),
+        // Warchief: the widest body in the game (0.38), horned, with an axe
+        // shouldered where the Champion carries a greatsword. Same 1.70 as
+        // the Champion so the two hero classes read as peers.
+        warchief_body: meshes.add(Capsule3d::new(0.38, 0.94)),
+        warchief_horn: meshes.add(Cone::new(0.10, 0.34)),
+        warchief_axe: meshes.add(Cuboid::new(0.14, 0.62, 0.42)),
+        // FarSeer: robed like the Priestess and hooded like the Sorcerer, with
+        // an orb at the TOP of the staff rather than beside the shoulder. The
+        // one detail that matters is that his lamp is green, not white: the
+        // support hero of each race is lit in its own caster's colour.
+        farseer_body: meshes.add(Capsule3d::new(0.27, 1.02)),
+        farseer_hood: meshes.add(Cone::new(0.28, 0.42)),
+        farseer_staff: meshes.add(Cuboid::new(0.07, 1.34, 0.07)),
+        farseer_orb: meshes.add(Sphere::new(0.13)),
+        // Wyvern: like the Gryphon, the wingspan IS the silhouette — but
+        // swept back and narrower (1.30 against 1.55 per wing, and tapered by
+        // being thinner front-to-back), with a stinger on the tail. Both
+        // flyers say "you cannot reach this" from the same distance; only one
+        // of them says it with a tail spike.
+        wyvern_body: meshes.add(Capsule3d::new(0.28, 0.90)),
+        wyvern_wing: meshes.add(Cuboid::new(1.30, 0.06, 0.46)),
+        wyvern_tail: meshes.add(Cylinder::new(0.09, 0.90)),
+        wyvern_sting: meshes.add(Cone::new(0.12, 0.34)),
+        wyvern_rider: meshes.add(Capsule3d::new(0.19, 0.32)),
+
         head: meshes.add(Sphere::new(0.20)),
         human_mat: solid(Team::Human.color()),
         claude_mat: solid(Team::Claude.color()),
@@ -294,8 +438,11 @@ fn setup_unit_assets(
         skin_mat: solid(Color::srgb(0.86, 0.72, 0.58)),
         gold_mat,
         robe_mat: solid(Color::srgb(0.88, 0.86, 0.95)),
+        bone_mat: solid(Color::srgb(0.83, 0.80, 0.68)),
+        hide_mat: solid(Color::srgb(0.30, 0.26, 0.18)),
         glow_mat,
         arcane_mat,
+        spirit_mat,
     });
 }
 
@@ -322,6 +469,20 @@ fn unit_height(kind: UnitKind) -> f32 {
         // Measured through the body, not the wings: what makes the Gryphon
         // unmistakable is width and altitude, not height.
         UnitKind::GryphonRider => 1.40,
+
+        // ---- Horde ------------------------------------------------------
+        // Every one of these sits at or below its Kingdom counterpart, which
+        // is the roster's silhouette rule: the Horde is wider and lower.
+        UnitKind::Peon => 1.04,
+        UnitKind::Grunt => 1.42,
+        UnitKind::Headhunter => 1.28,
+        UnitKind::Wolfrider => 1.44,
+        UnitKind::Impaler => 1.46,
+        UnitKind::Demolisher => 1.06,
+        UnitKind::Shaman => 1.36,
+        UnitKind::Warchief => 1.70,
+        UnitKind::FarSeer => 1.58,
+        UnitKind::Wyvern => 1.36,
     }
 }
 
@@ -404,11 +565,25 @@ fn spawn_units(
             // the unit faces, and the beast underneath is a child.
             UnitKind::Knight => assets.knight_rider.clone(),
             UnitKind::GryphonRider => assets.gryphon_rider.clone(),
+            UnitKind::Peon => assets.peon_body.clone(),
+            UnitKind::Grunt => assets.grunt_body.clone(),
+            UnitKind::Headhunter => assets.headhunter_body.clone(),
+            // Same rule as the Raider and the Knight: the ROOT is the rider,
+            // so it wears the team colour and faces where the unit faces.
+            UnitKind::Wolfrider => assets.wolf_rider.clone(),
+            UnitKind::Impaler => assets.impaler_body.clone(),
+            UnitKind::Demolisher => assets.demolisher_body.clone(),
+            UnitKind::Shaman => assets.shaman_body.clone(),
+            UnitKind::Warchief => assets.warchief_body.clone(),
+            UnitKind::FarSeer => assets.farseer_body.clone(),
+            UnitKind::Wyvern => assets.wyvern_rider.clone(),
         };
-        // Everyone wears their team's colour; the catapult is a wooden machine
-        // that merely carries a painted panel (spawned as a child below).
-        let body_mat = match ev.kind {
-            UnitKind::Catapult => assets.wood_mat.clone(),
+        // Everyone wears their team's colour; the siege engines are wooden
+        // machines that merely carry a painted panel (spawned as a child
+        // below). Asked of the ROLE rather than of the kind, so a second
+        // race's siege engine is a wagon for the same reason the first one is.
+        let body_mat = match unit_role(ev.kind) {
+            UnitRole::Siege => assets.wood_mat.clone(),
             _ => team_mat.clone(),
         };
 
@@ -443,6 +618,8 @@ fn spawn_units(
             // not on top of the whole mounted (or airborne) silhouette.
             UnitKind::Knight => 0.50,
             UnitKind::GryphonRider => 0.42,
+            UnitKind::Wolfrider => 0.44,
+            UnitKind::Wyvern => 0.40,
             _ => unit_height(ev.kind) * 0.5 - 0.05,
         };
 
@@ -452,7 +629,7 @@ fn spawn_units(
             None => Order::default(),
             Some(RallyTarget::Ground(p)) => Order::Move(Vec3::new(p.x, 0.0, p.z)),
             Some(RallyTarget::Node(node)) => match nodes.get(node) {
-                Ok(_) if ev.kind == UnitKind::Worker => Order::Harvest(node),
+                Ok(_) if is_worker_kind(ev.kind) => Order::Harvest(node),
                 // Non-workers can't gather — just gather *near* the node.
                 Ok(node_tf) => Order::Move(Vec3::new(
                     node_tf.translation.x,
@@ -513,6 +690,16 @@ fn spawn_units(
                 UnitKind::Sorcerer => "Sorcerer",
                 UnitKind::Knight => "Knight",
                 UnitKind::GryphonRider => "Gryphon Rider",
+                UnitKind::Peon => "Peon",
+                UnitKind::Grunt => "Grunt",
+                UnitKind::Headhunter => "Headhunter",
+                UnitKind::Wolfrider => "Wolfrider",
+                UnitKind::Impaler => "Impaler",
+                UnitKind::Demolisher => "Demolisher",
+                UnitKind::Shaman => "Shaman",
+                UnitKind::Warchief => "Warchief",
+                UnitKind::FarSeer => "Far Seer",
+                UnitKind::Wyvern => "Wyvern Rider",
             }),
         ));
 
@@ -571,8 +758,10 @@ fn spawn_units(
         }
 
         entity.with_children(|parent| {
-            // Head (every kind that is a person — the catapult is a machine).
-            if ev.kind != UnitKind::Catapult {
+            // Head (every kind that is a person — a siege engine is a
+            // machine). Asked of the ROLE, so both races' wagons are headless
+            // without either of them being named.
+            if unit_role(ev.kind) != UnitRole::Siege {
                 parent.spawn((
                     Mesh3d(assets.head.clone()),
                     MeshMaterial3d(assets.skin_mat.clone()),
@@ -799,6 +988,244 @@ fn spawn_units(
                         UnitAccent,
                     ));
                 }
+
+                // ---- Horde ----------------------------------------------
+                UnitKind::Peon => {
+                    // A lashed bundle carried HIGH on the back rather than a
+                    // slung pack: the Peon is bent under its load, and the
+                    // hunch is the silhouette.
+                    parent.spawn((
+                        Mesh3d(assets.peon_load.clone()),
+                        MeshMaterial3d(assets.hide_mat.clone()),
+                        Transform::from_xyz(0.0, 0.24, 0.30)
+                            .with_rotation(Quat::from_rotation_x(-0.22)),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Grunt => {
+                    // Two bone spikes off the shoulders. They add nothing to
+                    // the hitbox and everything to the read: this is the wide
+                    // one.
+                    for x in [-0.34_f32, 0.34] {
+                        parent.spawn((
+                            Mesh3d(assets.grunt_spike.clone()),
+                            MeshMaterial3d(assets.bone_mat.clone()),
+                            Transform::from_xyz(x, 0.30, 0.0)
+                                .with_rotation(Quat::from_rotation_z(-x.signum() * 0.55)),
+                            UnitAccent,
+                        ));
+                    }
+                    // A heavy chopping blade held low at the right hand —
+                    // where the Footman carries a shield on the left, so the
+                    // two lines are mirror images even in which side is armed.
+                    parent.spawn((
+                        Mesh3d(assets.grunt_blade.clone()),
+                        MeshMaterial3d(assets.metal_mat.clone()),
+                        Transform::from_xyz(0.42, -0.06, -0.12)
+                            .with_rotation(Quat::from_rotation_z(0.22)),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Headhunter => {
+                    // The axe in hand, cocked to throw...
+                    parent.spawn((
+                        Mesh3d(assets.headhunter_axe.clone()),
+                        MeshMaterial3d(assets.metal_mat.clone()),
+                        Transform::from_xyz(0.32, 0.26, -0.02)
+                            .with_rotation(Quat::from_rotation_x(-0.45)),
+                        UnitAccent,
+                    ));
+                    // ...and the bundle of spares across the back.
+                    parent.spawn((
+                        Mesh3d(assets.headhunter_quiver.clone()),
+                        MeshMaterial3d(assets.hide_mat.clone()),
+                        Transform::from_xyz(-0.14, 0.10, 0.28)
+                            .with_rotation(Quat::from_rotation_z(0.35)),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Wolfrider => {
+                    // The beast, laid along Z under the rider.
+                    parent.spawn((
+                        Mesh3d(assets.wolf_mount.clone()),
+                        MeshMaterial3d(assets.hide_mat.clone()),
+                        Transform::from_xyz(0.0, -0.16, 0.0)
+                            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                    // Four legs, set narrower than the Raider's horse: a wolf
+                    // runs on a line, a horse runs on a frame.
+                    for (x, z) in [(-0.17, -0.34), (0.17, -0.34), (-0.17, 0.34), (0.17, 0.34)] {
+                        parent.spawn((
+                            Mesh3d(assets.wolf_leg.clone()),
+                            MeshMaterial3d(assets.dark_mat.clone()),
+                            Transform::from_xyz(x, -0.56, z),
+                            UnitAccent,
+                        ));
+                    }
+                    // The snout, thrust forward past the rider's knee and
+                    // levelled along -Z. This is the whole difference from a
+                    // Raider at RTS distance.
+                    parent.spawn((
+                        Mesh3d(assets.wolf_snout.clone()),
+                        MeshMaterial3d(assets.dark_mat.clone()),
+                        Transform::from_xyz(0.0, -0.12, -0.62)
+                            .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Impaler => {
+                    // Short thick shaft, carried ACROSS the body rather than
+                    // shouldered upright — braced, which is what an
+                    // anti-cavalry line actually does with a spear.
+                    parent.spawn((
+                        Mesh3d(assets.impaler_shaft.clone()),
+                        MeshMaterial3d(assets.hide_mat.clone()),
+                        Transform::from_xyz(0.22, 0.30, -0.18)
+                            .with_rotation(Quat::from_rotation_x(-0.65)),
+                        UnitAccent,
+                    ));
+                    // A broad wedge on the business end, angled forward.
+                    parent.spawn((
+                        Mesh3d(assets.impaler_head.clone()),
+                        MeshMaterial3d(assets.bone_mat.clone()),
+                        Transform::from_xyz(0.22, 0.90, -0.70)
+                            .with_rotation(Quat::from_rotation_x(-0.65)),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Demolisher => {
+                    // Two big wheels, axle along X.
+                    for x in [-0.66_f32, 0.66] {
+                        parent.spawn((
+                            Mesh3d(assets.demolisher_wheel.clone()),
+                            MeshMaterial3d(assets.dark_mat.clone()),
+                            Transform::from_xyz(x, -0.22, 0.10).with_rotation(
+                                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                            ),
+                            UnitAccent,
+                        ));
+                    }
+                    // The ram, levelled along -Z and reaching out past the
+                    // front of the chassis.
+                    parent.spawn((
+                        Mesh3d(assets.demolisher_ram.clone()),
+                        MeshMaterial3d(assets.wood_mat.clone()),
+                        Transform::from_xyz(0.0, 0.10, -0.86)
+                            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                    // Team-coloured hide stretched over the frame.
+                    parent.spawn((
+                        Mesh3d(assets.demolisher_panel.clone()),
+                        MeshMaterial3d(team_mat.clone()),
+                        Transform::from_xyz(0.0, 0.20, 0.60),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Shaman => {
+                    // The totem staff, planted upright at the left hand and
+                    // standing well above the head.
+                    parent.spawn((
+                        Mesh3d(assets.shaman_staff.clone()),
+                        MeshMaterial3d(assets.wood_mat.clone()),
+                        Transform::from_xyz(-0.32, 0.34, -0.04),
+                        UnitAccent,
+                    ));
+                    // Its heavy carved head, lit green — the same green as the
+                    // Haste ring Bloodlust lays on the ground.
+                    parent.spawn((
+                        Mesh3d(assets.shaman_totem.clone()),
+                        MeshMaterial3d(assets.spirit_mat.clone()),
+                        Transform::from_xyz(-0.32, 1.10, -0.04),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Warchief => {
+                    // Two horns off the helm, swept back.
+                    for x in [-0.20_f32, 0.20] {
+                        parent.spawn((
+                            Mesh3d(assets.warchief_horn.clone()),
+                            MeshMaterial3d(assets.bone_mat.clone()),
+                            Transform::from_xyz(x, head_y + 0.12, 0.06)
+                                .with_rotation(Quat::from_rotation_z(-x.signum() * 0.75)),
+                            UnitAccent,
+                        ));
+                    }
+                    // The great axe, shouldered on the right where the
+                    // Champion carries its greatsword.
+                    parent.spawn((
+                        Mesh3d(assets.warchief_axe.clone()),
+                        MeshMaterial3d(assets.metal_mat.clone()),
+                        Transform::from_xyz(0.50, 0.26, 0.04)
+                            .with_rotation(Quat::from_rotation_z(-0.34)),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::FarSeer => {
+                    // Pointed hood, like the Sorcerer's rather than the
+                    // Priestess's rounded cowl.
+                    parent.spawn((
+                        Mesh3d(assets.farseer_hood.clone()),
+                        MeshMaterial3d(assets.hide_mat.clone()),
+                        Transform::from_xyz(0.0, head_y + 0.18, 0.0),
+                        UnitAccent,
+                    ));
+                    // The staff...
+                    parent.spawn((
+                        Mesh3d(assets.farseer_staff.clone()),
+                        MeshMaterial3d(assets.wood_mat.clone()),
+                        Transform::from_xyz(0.36, 0.16, -0.04),
+                        UnitAccent,
+                    ));
+                    // ...capped with a green eye rather than a white lamp.
+                    parent.spawn((
+                        Mesh3d(assets.farseer_orb.clone()),
+                        MeshMaterial3d(assets.spirit_mat.clone()),
+                        Transform::from_xyz(0.36, 0.88, -0.04),
+                        UnitAccent,
+                    ));
+                }
+                UnitKind::Wyvern => {
+                    // The beast under the rider.
+                    parent.spawn((
+                        Mesh3d(assets.wyvern_body.clone()),
+                        MeshMaterial3d(assets.hide_mat.clone()),
+                        Transform::from_xyz(0.0, -0.20, 0.05)
+                            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                    // Wings, swept BACK rather than straight out: narrower
+                    // than the Gryphon's and angled, so the two flyers are
+                    // never each other at a glance even though both are "the
+                    // wide thing in the air".
+                    for (x, roll) in [(-0.74_f32, 0.42_f32), (0.74, -0.42)] {
+                        parent.spawn((
+                            Mesh3d(assets.wyvern_wing.clone()),
+                            MeshMaterial3d(assets.hide_mat.clone()),
+                            Transform::from_xyz(x, -0.04, 0.16).with_rotation(
+                                Quat::from_rotation_z(roll) * Quat::from_rotation_y(0.30),
+                            ),
+                            UnitAccent,
+                        ));
+                    }
+                    // A long tail trailing behind...
+                    parent.spawn((
+                        Mesh3d(assets.wyvern_tail.clone()),
+                        MeshMaterial3d(assets.hide_mat.clone()),
+                        Transform::from_xyz(0.0, -0.20, 0.78)
+                            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                    // ...ending in the sting.
+                    parent.spawn((
+                        Mesh3d(assets.wyvern_sting.clone()),
+                        MeshMaterial3d(assets.bone_mat.clone()),
+                        Transform::from_xyz(0.0, -0.20, 1.30)
+                            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                        UnitAccent,
+                    ));
+                }
             }
         });
     }
@@ -866,7 +1293,7 @@ pub(crate) fn handle_teleports(
                 // Teleport, radius > the map) an army move instead of an
                 // economy wipe: workers keep mining. A Town Portal sets it
                 // false and behaves exactly as it always has.
-                if ev.army_only && unit.kind == UnitKind::Worker {
+                if ev.army_only && is_worker_kind(unit.kind) {
                     return false;
                 }
                 Vec2::new(tf.translation.x - origin.x, tf.translation.z - origin.z).length()

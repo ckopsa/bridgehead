@@ -22,6 +22,8 @@
 [
     (
         kind: TownHall,
+        races: [Kingdom],
+        role: Hall,
         name: "TownHall",
         description: "Tier 1 hall. Resource drop-off. Trains Workers and heroes (1 hero slot). Upgrades to a Keep.",
         requires: [],
@@ -39,6 +41,8 @@
     ),
     (
         kind: Barracks,
+        races: [Kingdom],
+        role: Production,
         name: "Barracks",
         description: "Trains Footmen, Archers and Spearmen (Raiders once a Workshop stands, Knights once a Castle does).",
         requires: [],
@@ -56,6 +60,8 @@
     ),
     (
         kind: Farm,
+        races: [Kingdom],
+        role: Supply,
         name: "Farm",
         description: "+6 supply. Build ahead of the cap or production stalls.",
         requires: [],
@@ -73,6 +79,8 @@
     // in towers is never helpless against air.
     (
         kind: Tower,
+        races: [Kingdom],
+        role: Defense,
         name: "Tower",
         description: "Static defense: shoots arrows at enemies in range.",
         requires: [Barracks],
@@ -88,6 +96,8 @@
     ),
     (
         kind: Wall,
+        races: [Kingdom],
+        role: Barrier,
         name: "Wall",
         description: "Cheap blocking segment. No function except HP in the way.",
         requires: [],
@@ -108,6 +118,8 @@
     // scouted a Workshop still does not know which is coming.
     (
         kind: Workshop,
+        races: [Kingdom],
+        role: Siegeworks,
         name: "Workshop",
         description: "Siege works: trains Catapults, and Gryphon Riders once a Castle stands. Both answers to a tower turtle — one knocks the door down, the other flies over it.",
         requires: [Barracks],
@@ -121,6 +133,7 @@
     ),
     (
         kind: Shop,
+        role: Vendor,
         name: "Shop",
         description: "Item vendor: heroes buy consumables here (see catalog items).",
         requires: [],
@@ -148,6 +161,8 @@
     // a structure is FOR, and this one is for hammering.
     (
         kind: Blacksmith,
+        races: [Kingdom],
+        role: Forge,
         name: "Blacksmith",
         description: "Tier 2 forge (requires a Keep). Researches the two team-wide ladders in catalog.research: Attack (+1/+2/+3 flat damage on every UNIT attack) and Armor (+1/+2/+3 flat damage reduction on every UNIT hit taken, never below 1 damage per hit). Bonuses are permanent, retroactive to units already alive, and survive the Blacksmith's death. One research at a time per forge; build a second Blacksmith to run both ladders at once.",
         requires: [Keep],
@@ -177,6 +192,8 @@
     // Strictly increasing, like every other number on this ladder.
     (
         kind: Keep,
+        races: [Kingdom],
+        role: Hall,
         name: "Keep",
         description: "Tier 2 hall: everything the TownHall was, with a deeper HP pool. Opens a SECOND hero slot (distinct classes only) and unlocks tier-2 content such as the Arcane Sanctum. Satisfies tier-1 requirements. Upgrades to a Castle.",
         requires: [],
@@ -190,6 +207,8 @@
     ),
     (
         kind: Castle,
+        races: [Kingdom],
+        role: Hall,
         name: "Castle",
         description: "Tier 3 hall: the top of the ladder. A third hero slot (unusable until a third hero class ships). Satisfies every hall requirement below it.",
         requires: [],
@@ -212,6 +231,8 @@
     // not a watchtower.
     (
         kind: Sanctum,
+        races: [Kingdom],
+        role: Tech,
         name: "Sanctum",
         description: "Arcane Sanctum: trains Sorcerers. Requires a Keep — the first thing a hall upgrade unlocks.",
         requires: [Keep],
@@ -221,6 +242,205 @@
         stats: (
             cost_gold: 150, cost_lumber: 130, hp: 480.0, build_time: 30.0,
             supply_provided: 0, size: 5.0, attack: None, vision: 18.0,
+        ),
+    ),
+
+    // =======================================================================
+    // THE HORDE
+    // =======================================================================
+    //
+    // **Fewer buildings.** The Kingdom needs a Barracks, a Workshop, a Sanctum
+    // and a Blacksmith to reach its whole roster; the Horde needs a WarCamp, a
+    // Spirit Lodge and a WarMill, and it has no Wall at all. The saving is not
+    // a discount — it is the race's shape. The Horde pays for tech in HALL
+    // TIER (Wolfriders and Demolishers want a Fortress, Wyverns want a Hold)
+    // where the Kingdom pays for it in MASONRY, so the Horde's tech spend is
+    // concentrated in one upgradeable building instead of spread across a base
+    // full of raidable ones. It reaches things sooner and has less to lose.
+    //
+    // The ladder below is the SAME mechanic as the Kingdom's, expressed the
+    // same way: three records joined by `upgrades_to`, with `building_tier`,
+    // `is_hall`, `upgrade_cost`, `building_placeable` and `TechTier` all
+    // derived from that one field. Adding it needed no code — `is_hall` was
+    // the one derived fact that still named `TownHall`, and it reads the row's
+    // `role` now.
+
+    (
+        kind: Stronghold,
+        races: [Horde],
+        role: Hall,
+        name: "Stronghold",
+        description: "Tier 1 hall. Resource drop-off. Trains Peons and heroes (1 hero slot). Upgrades to a Fortress.",
+        requires: [],
+        // Same argument as the TownHall's: the whole ladder trains the same
+        // roster, repeated verbatim on the two rungs above so a rung can
+        // diverge later without a code change.
+        trains: [Peon, Warchief, FarSeer],
+        researches: [],
+        upgrades_to: Some(Fortress),
+        stats: (
+            cost_gold: 380, cost_lumber: 200, hp: 1250.0, build_time: 40.0,
+            supply_provided: 10, size: 8.0, attack: None, vision: 24.0,
+        ),
+    ),
+    // **The one martial building.** Five production slots — the whole ground
+    // army out of a single 165g/55l structure, gated by hall tier rather than
+    // by anything a raid can burn down. This is the Horde's identity as a
+    // building: a Kingdom that scouts a Barracks knows it will see Footmen and
+    // Archers, and has to scout AGAIN to learn about the Workshop; a Kingdom
+    // that scouts a WarCamp has learned nothing at all.
+    //
+    // Five and not six: production hotkeys are positional along [Q][W][E][R][T]
+    // and there is no sixth key. That ceiling is why the Wyvern trains at the
+    // Spirit Lodge — a hard constraint that turned into the better design,
+    // since it gives the Horde exactly two things worth raiding instead of one.
+    (
+        kind: WarCamp,
+        races: [Horde],
+        role: Production,
+        name: "WarCamp",
+        description: "Trains Grunts, Headhunters and Impalers (Wolfriders and Demolishers once a Fortress stands). The Horde's entire ground army out of one building.",
+        requires: [],
+        trains: [Grunt, Headhunter, Impaler, Wolfrider, Demolisher],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 165, cost_lumber: 55, hp: 720.0, build_time: 24.0,
+            supply_provided: 0, size: 6.0, attack: None, vision: 17.0,
+        ),
+    ),
+    // **The farm that bites**, and the honest answer to "does the behaviour
+    // vocabulary support it without new code?" — yes, exactly and completely.
+    // `BuildingStats` has carried both `supply_provided` and an optional
+    // `attack` since the beginning, and combat.rs's three emplacement systems
+    // (`ensure_tower_state`, `tower_acquire`, `tower_fire`) gate on
+    // `building_stats(kind).attack.is_some()` rather than on the Tower kind.
+    // A supply building with a weapon is therefore a ROW, and this one is it.
+    //
+    // Deliberately feeble: 4.5 dps at 9 range, ground only. It is not a
+    // defense and must never be one — what it buys is that an unescorted
+    // Wolfrider-style worker raid into a Horde base gets chipped, so the Horde
+    // can afford to spend on aggression instead of on Watchtowers. Priced 10g
+    // and 5l above a Farm for the privilege, and 70 hp thicker because a hole
+    // in the ground is harder to knock over than a barn.
+    //
+    // `can_hit_air: false` on purpose: a burrow is a pit with a spear in it.
+    // If it shot air the Horde would have a free anti-air net stapled to its
+    // supply curve, and the Watchtower — and the whole reason a Gryphon is
+    // worth 280 gold — would stop mattering.
+    (
+        kind: Burrow,
+        races: [Horde],
+        role: Supply,
+        name: "Burrow",
+        description: "+6 supply, and stabs at ground enemies that come within 9. Feeble on purpose — it punishes an unescorted worker raid, it does not hold a line, and it cannot touch air.",
+        requires: [],
+        trains: [],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 80, cost_lumber: 20, hp: 420.0, build_time: 14.0,
+            supply_provided: 6, size: 4.0,
+            attack: Some((damage: 9.0, range: 9.0, cooldown: 2.0, can_hit_air: false)),
+            vision: 13.0,
+        ),
+    ),
+    // The Horde's real static defense, and the same bargain the Tower makes:
+    // sees 20 against a 16 attack range, so it never shoots at something the
+    // team cannot also see, and it shoots air because static defense is the
+    // one thing a flyer cannot walk around.
+    (
+        kind: Watchtower,
+        races: [Horde],
+        role: Defense,
+        name: "Watchtower",
+        description: "Static defense: hurls spears at enemies in range, air included.",
+        requires: [WarCamp],
+        trains: [],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 115, cost_lumber: 70, hp: 520.0, build_time: 24.0,
+            supply_provided: 0, size: 3.0,
+            attack: Some((damage: 15.0, range: 16.0, cooldown: 1.25, can_hit_air: true)),
+            vision: 20.0,
+        ),
+    ),
+    // The Horde's tier-2 building, doing the work the Kingdom splits between a
+    // Sanctum and a Workshop: it trains the caster AND the flyer. Same
+    // argument the Workshop's own comment makes — one 145g/120l investment,
+    // two answers, and a Kingdom that scouted it still does not know which is
+    // coming.
+    (
+        kind: SpiritLodge,
+        races: [Horde],
+        role: Tech,
+        name: "SpiritLodge",
+        description: "Spirit Lodge: trains Shamans, and Wyverns once a Hold stands. Requires a Fortress — the first thing a hall upgrade unlocks.",
+        requires: [Fortress],
+        trains: [Shaman, Wyvern],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 145, cost_lumber: 120, hp: 500.0, build_time: 28.0,
+            supply_provided: 0, size: 5.0, attack: None, vision: 18.0,
+        ),
+    ),
+    // The Horde's forge. It runs the SAME two ladders the Blacksmith does, at
+    // the same prices, for the same bonuses — research is shared content and
+    // the building that sells it is not. See research.ron's `buildings` field
+    // and the note there about why that is the honest v1 line.
+    //
+    // Trains nothing, so — exactly like the Blacksmith — it does not count as
+    // a production building for the win condition. A Horde down to one WarMill
+    // has already lost.
+    (
+        kind: WarMill,
+        races: [Horde],
+        role: Forge,
+        name: "WarMill",
+        description: "Tier 2 forge (requires a Fortress). Researches the same two team-wide ladders the Blacksmith does: Attack and Armor. Bonuses are permanent, retroactive to units already alive, and survive the WarMill's death. One research at a time per forge.",
+        requires: [Fortress],
+        trains: [],
+        researches: [Attack, Armor],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 135, cost_lumber: 75, hp: 580.0, build_time: 23.0,
+            supply_provided: 0, size: 5.0, attack: None, vision: 14.0,
+        ),
+    ),
+    // Tier 2/3 halls, on exactly the terms the Keep and Castle are: `cost_*`
+    // and `build_time` are the price of the UPGRADE STEP, footprint stays 8.0
+    // so a packed base can always tier up, and HP and vision climb with the
+    // rung.
+    (
+        kind: Fortress,
+        races: [Horde],
+        role: Hall,
+        name: "Fortress",
+        description: "Tier 2 hall: everything the Stronghold was, with a deeper HP pool. Opens a SECOND hero slot (distinct classes only) and unlocks tier-2 content — the Spirit Lodge, the WarMill, Wolfriders and Demolishers. Satisfies tier-1 requirements. Upgrades to a Hold.",
+        requires: [],
+        trains: [Peon, Warchief, FarSeer],
+        researches: [],
+        upgrades_to: Some(Hold),
+        stats: (
+            cost_gold: 320, cost_lumber: 160, hp: 1750.0, build_time: 40.0,
+            supply_provided: 10, size: 8.0, attack: None, vision: 28.0,
+        ),
+    ),
+    (
+        kind: Hold,
+        races: [Horde],
+        role: Hall,
+        name: "Hold",
+        description: "Tier 3 hall: the top of the Horde ladder, and the gate on the Wyvern. A third hero slot (unusable until a third Horde hero class ships). Satisfies every hall requirement below it.",
+        requires: [],
+        trains: [Peon, Warchief, FarSeer],
+        researches: [],
+        upgrades_to: None,
+        stats: (
+            cost_gold: 480, cost_lumber: 240, hp: 2250.0, build_time: 50.0,
+            supply_provided: 10, size: 8.0, attack: None, vision: 32.0,
         ),
     ),
 ]

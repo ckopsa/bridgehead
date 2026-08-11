@@ -666,7 +666,7 @@ fn auto_cast_abilities(
                                             && health.current < health.max * HOT_FRAC))
                             }
                             AbilityTargets::OwnWorkers => {
-                                *other_team == team && other_unit.kind == UnitKind::Worker
+                                *other_team == team && is_worker_kind(other_unit.kind)
                             }
                         },
                     }
@@ -764,7 +764,7 @@ fn default_squad_autonomy(
     // human with a mouse keeps full authority: their idle units stay exactly
     // where they were put.
     for (entity, unit, team, health, why) in &strays {
-        if unit.kind == UnitKind::Worker
+        if is_worker_kind(unit.kind)
             || health.current <= 0.0
             || !machine_driven(&ai, &external, *team)
         {
@@ -1133,6 +1133,10 @@ mod tests {
     /// at the keyboard, which is exactly the case the old gate refused to serve.
     fn world() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<SquadOrders>()
             .init_resource::<FogGrids>()

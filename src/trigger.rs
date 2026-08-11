@@ -371,6 +371,10 @@ mod tests {
     /// be testing the clock.
     fn trigger_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<Triggers>()
             .init_resource::<TechTiers>()
@@ -389,6 +393,10 @@ mod tests {
     /// `SimSet::Think` → `SimSet::Intent` means in the real schedule.
     fn full_app() -> App {
         let mut app = App::new();
+        // Races: `CorePlugin` supplies this in a real match; a hand-built
+        // test app must too, or any system reading it panics inside Bevy's
+        // worker pool and the test HANGS rather than fails.
+        app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<Triggers>()
             .init_resource::<Economies>()
