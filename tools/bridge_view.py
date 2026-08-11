@@ -54,6 +54,14 @@ def main():
         f"gold={me['gold']} lumber={me['lumber']} "
         f"supply={me['supply_used']}/{me['supply_cap']}"
     )
+    # The two ends of a match's life, side by side. The hold is the louder of
+    # the two because it is the one a commander can do something about.
+    if s.get("waiting_for") is not None:
+        waiting = s["waiting_for"]
+        print(
+            f"MATCH NOT STARTED — held at t=0, waiting for: {' '.join(waiting) or '(nobody)'}"
+        )
+        print("  send '[{\"type\":\"ready\"}]' once you have read the map and set your opening")
     if s.get("game_over"):
         print(f"GAME OVER: {s['game_over']} wins")
     for e in s.get("errors", []):

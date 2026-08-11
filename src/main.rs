@@ -201,6 +201,332 @@ mod tests {
         app.update();
         app.update();
     }
+
+    // -----------------------------------------------------------------------
+    // The ready handshake (wc3clone-t0d)
+    // -----------------------------------------------------------------------
+
+    /// Seconds of `Time<Real>` each test frame advances. A hand-driven clock,
+    /// for the reason `WC3_FIXED_DT` exists: the whole claim below is about
+    /// what the clock did, and a wall-clock delta would make the numbers a
+    /// property of the CI box.
+    const TEST_DT: f64 = 0.05;
+
+    /// The real game, whole, on a hand-driven clock — the same composition
+    /// `the_whole_game_schedules_without_a_cycle` builds, because an inertness
+    /// claim is only worth as much as the number of systems it was tested
+    /// against. `WC3_BRIDGE` is never set in tests (env is process-global and
+    /// the suite runs in parallel), so `bridge_startup` early-returns and the
+    /// `ReadyGate` handed in here is the only thing that gates.
+    fn handshake_app(gate: shared::ReadyGate) -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::transform::TransformPlugin,
+            bevy::asset::AssetPlugin::default(),
+        ))
+        .init_asset::<Mesh>()
+        .init_asset::<StandardMaterial>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .init_resource::<ButtonInput<MouseButton>>()
+        .add_plugins((
+            shared::CorePlugin,
+            intent::IntentPlugin,
+            command::CommandPlugin,
+            terrain::TerrainPlugin { headless: true },
+            units::UnitsPlugin,
+            combat::CombatPlugin,
+            economy::EconomyPlugin,
+            ai::AiPlugin,
+            bridge::BridgePlugin,
+            copilot::CopilotPlugin,
+            doctrine::DoctrinePlugin,
+            trigger::TriggerPlugin,
+            plan::PlanPlugin,
+            bounty::BountyPlugin,
+        ));
+        // After the plugins, so it overwrites `CorePlugin`'s `init_resource`
+        // default rather than being overwritten by it.
+        app.insert_resource(gate);
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f64(TEST_DT),
+        ));
+        app
+    }
+
+    fn gate_of(seats: &[(&'static str, shared::Team)], timeout: f32) -> shared::ReadyGate {
+        shared::ReadyGate {
+            seats: seats
+                .iter()
+                .map(|(name, team)| shared::ReadySeat {
+                    name,
+                    team: *team,
+                    ready: false,
+                })
+                .collect(),
+            timeout,
+            ..Default::default()
+        }
+    }
+
+    /// A cheap fingerprint of everything that is supposed to stand still: the
+    /// two banks, and every unit's and building's position and health.
+    fn world_state(app: &mut App) -> Vec<String> {
+        let mut out = Vec::new();
+        let economies = app.world().resource::<shared::Economies>();
+        for team in [shared::Team::Human, shared::Team::Claude] {
+            let e = economies.get(team);
+            out.push(format!(
+                "{team:?} gold={} lumber={} supply={}/{}",
+                e.gold, e.lumber, e.supply_used, e.supply_cap
+            ));
+        }
+        let mut units: Vec<String> = app
+            .world_mut()
+            .query::<(Entity, &Transform, &shared::Health)>()
+            .iter(app.world())
+            .map(|(e, tf, hp)| {
+                format!(
+                    "{:?} {:.4},{:.4},{:.4} hp={:.4}",
+                    e, tf.translation.x, tf.translation.y, tf.translation.z, hp.current
+                )
+            })
+            .collect();
+        units.sort();
+        out.extend(units);
+        out
+    }
+
+    /// **A held match is inert.** The hold is a paused `Time<Virtual>`, and the
+    /// claim that buys is total: not "the clock reads zero" but "no accumulator
+    /// in the sim advanced". Worker mining, construction, training queues,
+    /// spawns, doctrine, the scripted AI's macro decisions — all of them
+    /// integrate a virtual delta, so all of them integrate zero.
+    ///
+    /// Two hundred frames at a hand-driven 0.05s: ten game-seconds of world if
+    /// the pause failed, which is enough for five workers to have walked to a
+    /// mine and banked gold. The economies and the transforms are compared
+    /// byte-for-byte against the opening position.
+    #[test]
+    fn a_held_match_is_inert() {
+        let mut app = handshake_app(gate_of(
+            &[("red", shared::Team::Claude), ("blue", shared::Team::Human)],
+            600.0,
+        ));
+        // Frame one builds the world (`initial_spawns` is `Startup`), so the
+        // baseline is taken after it — otherwise this would only prove the
+        // world is empty, which it is, before anything has spawned.
+        app.update();
+        let opening = world_state(&mut app);
+        assert!(
+            opening.len() > 4,
+            "the opening position should have spawned units and halls, got {opening:?}"
+        );
+
+        for _ in 0..200 {
+            app.update();
+        }
+
+        assert_eq!(
+            app.world().resource::<Time>().elapsed_secs(),
+            0.0,
+            "the game clock moved while the match was held"
+        );
+        assert!(
+            app.world().resource::<Time<Virtual>>().is_paused(),
+            "virtual time should still be paused"
+        );
+        assert_eq!(
+            world_state(&mut app),
+            opening,
+            "the world moved while the match was held"
+        );
+        // ...and the real clock DID advance, which is what lets the bridge keep
+        // writing snapshots and reading commands through the hold. A test that
+        // froze both clocks would prove inertness by proving nothing ran.
+        let real = app.world().resource::<Time<Real>>().elapsed_secs();
+        assert!(
+            real > 9.0,
+            "real time should have advanced through the hold, got {real}"
+        );
+        assert!(
+            app.world().resource::<shared::ReadyGate>().holding(),
+            "nobody readied, so the match should still be held"
+        );
+
+        // THE POSITIVE CONTROL, and the half of this test that makes the other
+        // half mean anything. An inert world is also what a broken harness
+        // produces — no terrain, no nav grid, nothing spawned, a schedule that
+        // silently does not run. So: release the same app, step it the same
+        // number of frames, and require that it moves. If this assertion ever
+        // fails the one above is worthless, and they fail together.
+        app.world_mut().send_event(shared::MatchReady {
+            team: shared::Team::Claude,
+        });
+        app.world_mut().send_event(shared::MatchReady {
+            team: shared::Team::Human,
+        });
+        app.update();
+        for _ in 0..200 {
+            app.update();
+        }
+        assert!(
+            app.world().resource::<Time>().elapsed_secs() > 9.0,
+            "the released clock should have run ten seconds"
+        );
+        assert_ne!(
+            world_state(&mut app),
+            opening,
+            "the world did not move even after the hold was released — this \
+             harness cannot detect motion, so the inertness claim above is empty"
+        );
+    }
+
+    /// **The last seat to speak starts the match**, and it starts from t=0 —
+    /// the whole point of the hold. Red readies, the match stays held; blue
+    /// readies, the clock runs.
+    #[test]
+    fn the_last_seat_to_ready_starts_the_match() {
+        let mut app = handshake_app(gate_of(
+            &[("red", shared::Team::Claude), ("blue", shared::Team::Human)],
+            600.0,
+        ));
+        app.update();
+
+        app.world_mut().send_event(shared::MatchReady {
+            team: shared::Team::Claude,
+        });
+        app.update();
+        let gate = app.world().resource::<shared::ReadyGate>();
+        assert!(gate.holding(), "one seat of two readied — still held");
+        assert_eq!(gate.waiting_for(), vec!["blue"], "red has been heard");
+        assert_eq!(app.world().resource::<Time>().elapsed_secs(), 0.0);
+
+        app.world_mut().send_event(shared::MatchReady {
+            team: shared::Team::Human,
+        });
+        app.update();
+        let gate = app.world().resource::<shared::ReadyGate>();
+        assert!(gate.started, "both seats readied — the match should start");
+        assert!(!gate.started_by_timeout, "this was a handshake, not a timeout");
+        assert!(gate.waiting_for().is_empty());
+        assert!(!app.world().resource::<Time<Virtual>>().is_paused());
+        // The clock is released on the frame the last seat speaks, so it is
+        // still reading zero: play begins at t=0 for both sides, which is the
+        // fairness claim the whole mechanism exists to make.
+        assert_eq!(
+            app.world().resource::<Time>().elapsed_secs(),
+            0.0,
+            "the match must begin at t=0, not at the wall time the seats took"
+        );
+
+        // Both feeds carry the same line — neither side has to infer the start
+        // from the other's behaviour.
+        let feed = app.world().resource::<shared::GameEvents>();
+        for team in [shared::Team::Human, shared::Team::Claude] {
+            assert!(
+                feed.feed(team).iter().any(|e| e.message.contains("match start")),
+                "{team:?} was never told the match started"
+            );
+        }
+
+        // ...and now it runs.
+        for _ in 0..20 {
+            app.update();
+        }
+        let t = app.world().resource::<Time>().elapsed_secs();
+        assert!(t > 0.9 && t < 1.1, "the clock should run from 0, got t={t}");
+    }
+
+    /// **A dead seat cannot hang a match.** The timeout is the whole reason an
+    /// unattended arena round can use this mechanic at all: an agent that
+    /// crashes before it connects costs the round its opening, not its
+    /// existence. The start is recorded as a timeout so the log, the feed and
+    /// any after-action report agree about how this match began.
+    #[test]
+    fn a_dead_seat_cannot_hang_the_match() {
+        // One second of wall clock = 20 frames at TEST_DT.
+        let mut app = handshake_app(gate_of(
+            &[("red", shared::Team::Claude), ("blue", shared::Team::Human)],
+            1.0,
+        ));
+        app.update();
+        app.world_mut().send_event(shared::MatchReady {
+            team: shared::Team::Claude,
+        });
+        app.update();
+        assert!(app.world().resource::<shared::ReadyGate>().holding());
+
+        for _ in 0..25 {
+            app.update();
+        }
+        let gate = app.world().resource::<shared::ReadyGate>();
+        assert!(gate.started, "the timeout should have started the match");
+        assert!(
+            gate.started_by_timeout,
+            "a timeout start must not be recorded as a clean handshake"
+        );
+        let feed = app.world().resource::<shared::GameEvents>();
+        let line = feed
+            .feed(shared::Team::Claude)
+            .iter()
+            .find(|e| e.message.contains("match start"))
+            .map(|e| e.message.clone())
+            .expect("the feed should carry a match start line");
+        assert!(
+            line.contains("timeout") && line.contains("blue"),
+            "the note must name the timeout and the silent seat, got {line:?}"
+        );
+    }
+
+    /// **Scripted and autopilot seats are born ready.** A faction in the
+    /// scripted AI's hands has no map to read, so it gates nothing — otherwise
+    /// `WC3_BRIDGE=red` (one commander against the scripted AI) could never
+    /// start, and a commander could hang a match by autopiloting and walking
+    /// away. Checked live rather than at startup, so the release works whenever
+    /// the handback happens.
+    #[test]
+    fn a_scripted_seat_is_born_ready() {
+        // The gate lists both sides, but only Human has a live commander:
+        // `AiControlled` defaults to Claude-is-scripted.
+        let mut app = handshake_app(gate_of(
+            &[("red", shared::Team::Claude), ("blue", shared::Team::Human)],
+            600.0,
+        ));
+        app.update();
+        let gate = app.world().resource::<shared::ReadyGate>();
+        assert!(gate.holding(), "the human seat has not readied yet");
+        assert_eq!(
+            gate.waiting_for(),
+            vec!["blue"],
+            "the scripted side should already be ready"
+        );
+
+        app.world_mut().send_event(shared::MatchReady {
+            team: shared::Team::Human,
+        });
+        app.update();
+        assert!(app.world().resource::<shared::ReadyGate>().started);
+        assert_eq!(app.world().resource::<Time>().elapsed_secs(), 0.0);
+    }
+
+    /// **No bridge seat, no handshake.** The default that keeps every existing
+    /// sim, every fingerprint run and the whole determinism harness byte-identical:
+    /// an empty gate never holds, and the clock runs from the first frame.
+    #[test]
+    fn a_match_with_no_bridged_seat_is_never_held() {
+        let mut app = handshake_app(shared::ReadyGate::default());
+        app.update();
+        assert!(!app.world().resource::<shared::ReadyGate>().holding());
+        assert!(!app.world().resource::<Time<Virtual>>().is_paused());
+        for _ in 0..20 {
+            app.update();
+        }
+        assert!(
+            app.world().resource::<Time>().elapsed_secs() > 0.9,
+            "an ungated match must run from the first frame"
+        );
+    }
 }
 
 /// Headless runs terminate themselves: shortly after a decisive game over, or

@@ -52,6 +52,7 @@
 //! |---|---|---|
 //! | **direct** | `squad` `posture` `template` `priority` `retreat` `leash` `autocast` | doctrine is *advice-shaped already* |
 //! | **propose** | every unit order, all production, all spending, `autopilot`, `surrender` | irreversible, or spends what is not the proposer's |
+//! | **neither** | `ready` | not a third tier so much as a verb from before the match: it is a statement about the *clock*, not about the army, and it is intercepted in `bridge.rs::poll_commands` ahead of the copilot branch. Routing it here would ask a player to approve their partner's willingness to begin — and would hold the match at t=0 until they did. See `shared::ReadyGate`. |
 //!
 //! The line is drawn where **the cost of being wrong** is. Vetoing a posture is
 //! trivial: you set another one, and the squad re-tasks within a second — a

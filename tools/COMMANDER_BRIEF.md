@@ -8,6 +8,11 @@ a human is playing this side with you. Read all of this first, then the
 co-commander section near the end, which is the only part that differs.
 
 ## The loop (event-driven — do not blind-sleep)
+0. **`python3 tools/bridge_send.py --seat <SEAT> '[{"type":"ready"}]'`** — send this
+   when you have read the map and set your opening. **The match clock does not
+   start until every bridged seat has.** Until then your snapshot carries
+   `waiting_for: ["red","blue"]` and `match_started: false`, `t` stays at 0, and
+   nothing in the world moves — no mining, no building, no spawns.
 1. `python3 tools/bridge_wait.py --seat <SEAT> --max 15` — blocks up to 15s but WAKES EARLY
    (~1-2s) the moment an event fires (attacks, losses, bounty spawns, your command errors)
    or the game ends. It prints why it woke.
@@ -15,6 +20,18 @@ co-commander section near the end, which is the only part that differs.
    bash call: `wait ... && view ...`).
 3. Decide. 4. Write commands (see below).
 Repeat until `game_over` is non-null, then stop and report the result.
+
+**Read the map before you say `ready` — that is what the time is for, and your
+opponent gets exactly the same amount of it.** You may look at everything and
+send your whole opening batch *before* readying; those orders compile at t=0 and
+your units act on the very first live frame. This is legal for both sides
+equally, which is the entire point: the engine used to start the clock at
+process start, so whichever commander connected second simply forfeited the
+opening (arena round 9: Red's first order landed at t=41s). Now nobody does.
+Dawdling is not an advantage either — you are only holding up a match that
+starts for both of you at once, and `WC3_READY_TIMEOUT` (default 120s wall)
+starts it without you if you go quiet. Say `ready` once you have a plan.
+`ready` is idempotent, never refused, and costs no chain-of-command latency.
 
 **Never chain `bridge_wait` calls without a view between them.** Two waits back
 to back is a blind sleep wearing the costume of an event loop: the first one's
@@ -138,6 +155,9 @@ Plans (SEQUENCED standing orders — see the section below; this is the shape):
 - `{"type":"autopilot","on":true}` — hand your whole faction to the scripted AI (emergency only).
 - `{"type":"surrender"}` — concede the match (opponent wins immediately). The honorable end to a
   hopeless position — no income, no army, no path back. Preferable to dragging out a decided game.
+- `{"type":"ready"}` — start the clock (see step 0 of the loop). The one verb that is legal
+  *before* the match exists. Idempotent and never refused, so re-sending it after a reconnect
+  costs you nothing.
 
 ## Territory: name the ground once, then speak in names
 

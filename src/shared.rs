@@ -7411,7 +7411,7 @@ impl std::fmt::Display for PlanStamp {
 /// Everything a player can mean.
 ///
 /// Grouped by what it is for: unit orders, production, the doctrine layer that
-/// runs at machine speed for whoever set it, abilities and items, and the two
+/// runs at machine speed for whoever set it, abilities and items, and the three
 /// match-level statements. Adding a verb here is adding it to *both* seats at
 /// once, which is the point.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -7781,6 +7781,12 @@ pub enum Intent {
     },
     /// Concede: the opponent wins immediately.
     Surrender,
+    /// **I have read the map and I am ready to begin.** The one verb that is
+    /// legal *before* the match exists — see [`ReadyGate`]. Idempotent: saying
+    /// it twice is saying it once, and saying it after the clock has started is
+    /// a no-op rather than an error, because a commander that reconnects and
+    /// re-sends its opening should not be punished for a stale first line.
+    Ready,
 }
 
 /// The `retreat` piece of a `template` intent.
@@ -7881,6 +7887,7 @@ impl Intent {
             Intent::PlanClear { .. } => "plan_clear",
             Intent::Autopilot { .. } => "autopilot",
             Intent::Surrender => "surrender",
+            Intent::Ready => "ready",
         }
     }
 
@@ -8229,6 +8236,7 @@ impl Intent {
                 }
             }
             Intent::Surrender => "surrender the match".to_string(),
+            Intent::Ready => "declare ready to begin".to_string(),
         }
     }
 }
@@ -8781,6 +8789,17 @@ pub struct Surrender {
     pub team: Team,
 }
 
+/// A seat says it has read the map and is ready to begin. Written by the
+/// intent compiler from [`Intent::Ready`]; CorePlugin's `ready_gate` resolves
+/// it against [`ReadyGate`] and, once every gating seat has spoken, starts the
+/// match clock. Modelled on [`Surrender`] deliberately: both are match-level
+/// statements a seat makes about the match rather than about its units, and
+/// both reach the engine as an event so the compiler arm stays two lines.
+#[derive(Event, Debug)]
+pub struct MatchReady {
+    pub team: Team,
+}
+
 /// Ask a caster (hero or ability building) to cast. Written by ui.rs
 /// (hotkey/button), ai.rs, doctrine.rs and bridge.rs; combat.rs validates
 /// (alive, unlocked, mana, cooldown) and executes the AoE.
@@ -8937,6 +8956,272 @@ pub fn machine_driven(ai: &AiControlled, external: &ExternallyCommanded, team: T
             Team::Human => ai.human,
             Team::Claude => ai.claude,
         }
+}
+
+// ---------------------------------------------------------------------------
+// The ready handshake — bridged seats start simultaneously
+// ---------------------------------------------------------------------------
+
+/// `WC3_READY=0` turns the handshake off entirely and restores the pre-t0d
+/// behaviour: the clock runs from process start and a commander plays whatever
+/// is left of the opening by the time it connects.
+pub const READY_ENV: &str = "WC3_READY";
+
+/// `WC3_READY_TIMEOUT=180` — how long, in WALL seconds, the engine will hold
+/// the match waiting for a seat that may never speak.
+///
+/// Measured on `Time<Real>`, which is the same clock bridge.rs paces its
+/// snapshot writes and command polls off. That pairing is the point: the
+/// timeout runs on the clock the commander's own experience runs on, so "two
+/// minutes" means two minutes' worth of the snapshots it is actually reading.
+///
+/// **Under `WC3_FIXED_DT` that is not the wall clock.** The fixed tick drives
+/// `Time<Real>` as well as `Time<Virtual>` (see [`fixed_time_strategy`]), so a
+/// headless run stepping as fast as it can burns "real" seconds far faster
+/// than a person does, and a bridged fixed-dt run will time out long before a
+/// human-scale agent could answer. Set the timeout in TICKS' worth of seconds
+/// there, or leave the fixed tick to the determinism harness, which has no
+/// bridge seat and so never holds at all.
+pub const READY_TIMEOUT_ENV: &str = "WC3_READY_TIMEOUT";
+
+/// Two minutes: long enough to spawn a commander agent and let it read the map
+/// and the brief, short enough that a dead seat costs one coffee rather than
+/// one afternoon.
+pub const READY_TIMEOUT_DEFAULT: f32 = 120.0;
+
+/// Is the handshake mechanic switched on at all? Off only for an explicit
+/// `WC3_READY=0`/`false`. Note this is *not* the same question as "is the match
+/// being held" — a run with no bridge seat has the mechanic enabled and nothing
+/// to gate on, which is exactly why pure-scripted sims are byte-untouched.
+pub fn ready_handshake_enabled() -> bool {
+    !matches!(
+        std::env::var(READY_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+/// The configured hold timeout in wall seconds, or the default. A value of 0
+/// (or a negative one) means "do not wait at all", which is a legitimate thing
+/// to ask for in a smoke test.
+pub fn ready_timeout_from_env() -> f32 {
+    std::env::var(READY_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|t| t.is_finite() && *t >= 0.0)
+        .unwrap_or(READY_TIMEOUT_DEFAULT)
+}
+
+/// One gating seat and whether it has spoken yet.
+#[derive(Debug, Clone)]
+pub struct ReadySeat {
+    /// The seat's directory name — `red`, `blue`, `copilot`. This is the name
+    /// that appears in the snapshot's `waiting_for` and in the log, because it
+    /// is the name the operator typed into `WC3_BRIDGE` and the name on the
+    /// commander's own seat directory. Teams are an engine-side noun.
+    pub name: &'static str,
+    pub team: Team,
+    pub ready: bool,
+}
+
+/// **The match does not start until every externally-commanded seat says it is
+/// ready.**
+///
+/// The problem this exists for: the sim clock used to run from process start,
+/// but commander agents connect seconds to minutes apart — in arena round 9
+/// Red's first order landed at t=41s, against an opponent that had been playing
+/// since t=0. The opening is part of the game, and a game whose opening one
+/// side simply misses is not a fair one. So the engine holds at t=0, keeps
+/// writing snapshots (both sides get to read the map and plan), and starts the
+/// clock for everyone at the same instant.
+///
+/// **Which seats gate.** Every seat in `WC3_BRIDGE`, including a `copilot`
+/// seat. A copilot is a commanding seat — it writes orders that reach units,
+/// its trust policy only decides whether they go direct or via a proposal — so
+/// starting the match before it has read the map reproduces the exact unfairness
+/// this mechanism removes, one rung down. Seats that are NOT in `WC3_BRIDGE`
+/// are not in this list at all, which is what "scripted AI seats are born
+/// ready" means concretely: a scripted opponent has nothing to wait for.
+///
+/// **Autopilot is born ready too**, and that check is live rather than
+/// startup-only (`ready_gate` re-derives it every frame): a seat whose faction
+/// is currently in the scripted AI's hands cannot meaningfully read a map, and
+/// letting it gate would mean a commander could hang a match by autopiloting
+/// and disconnecting.
+///
+/// **Nothing gameplay-relevant runs while held.** The hold is a paused
+/// `Time<Virtual>`, so every accumulator in the sim integrates zero: harvest
+/// timers, build progress, projectile flight, `on_timer` gates, the headless
+/// time cap. The bridge's own snapshot and poll timers run on `Time<Real>` and
+/// are unaffected, which is the property that makes the whole design work —
+/// the world is photographed and orders are read while the world itself is
+/// still. Pinned by `a_held_match_is_inert`.
+///
+/// **Orders sent before `ready` are legal**, for both sides equally. They
+/// compile at t=0 and their units act on the first live frame. That is not a
+/// loophole, it is the planning time the hold exists to give: the etiquette is
+/// symmetric because the hold is.
+#[derive(Resource, Default)]
+pub struct ReadyGate {
+    /// The gating seats, in `WC3_BRIDGE` order. Empty means nothing gates and
+    /// the match runs exactly as it always did.
+    pub seats: Vec<ReadySeat>,
+    /// Has the clock been started? Once true this resource is inert and the
+    /// snapshot keys disappear again.
+    pub started: bool,
+    /// Wall seconds to wait before starting anyway.
+    pub timeout: f32,
+    /// Wall seconds waited so far.
+    pub waited: f32,
+    /// Did the timeout start the match rather than the last seat? Recorded so
+    /// the log line, the feed entry and any after-action report all say the
+    /// same thing about how this match began.
+    pub started_by_timeout: bool,
+}
+
+impl ReadyGate {
+    /// Is the match being held right now?
+    pub fn holding(&self) -> bool {
+        !self.started && !self.seats.is_empty()
+    }
+
+    /// The seats still owed a `ready`, by name. Empty while not holding.
+    pub fn waiting_for(&self) -> Vec<&'static str> {
+        if !self.holding() {
+            return Vec::new();
+        }
+        self.seats
+            .iter()
+            .filter(|s| !s.ready)
+            .map(|s| s.name)
+            .collect()
+    }
+}
+
+/// Stop the clock before the first frame runs.
+///
+/// A `Startup` system rather than a run condition or a first-frame check,
+/// because "held at t=0" has to mean t=0 exactly: by the time an `Update`
+/// system could notice, the frame's movement, economy and combat have already
+/// integrated one delta. bridge.rs fills `ReadyGate` in its own `Startup`
+/// system and orders itself `.before(ReadyGateHold)`.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ReadyGateHold;
+
+fn hold_for_ready(gate: Res<ReadyGate>, mut vtime: ResMut<Time<Virtual>>) {
+    if !gate.holding() {
+        return;
+    }
+    vtime.pause();
+    info!(
+        "{READY_ENV}: match HELD at t=0 — waiting for {} to send {{\"type\":\"ready\"}} \
+         (auto-start after {:.0}s wall)",
+        gate.waiting_for().join(" "),
+        gate.timeout
+    );
+}
+
+/// Collect `ready` statements, and start the match when they are all in — or
+/// when the timeout says a missing seat has had long enough.
+///
+/// `SimSet::Upkeep`, alongside the win check, and for the same reason: both are
+/// per-frame questions about the *match* rather than about any unit, and both
+/// have to run after `SimSet::Intent` so a statement submitted this frame is
+/// resolved this frame rather than next.
+fn ready_gate(
+    real: Res<Time<Real>>,
+    mut vtime: ResMut<Time<Virtual>>,
+    mut gate: ResMut<ReadyGate>,
+    mut readies: EventReader<MatchReady>,
+    ai: Res<AiControlled>,
+    mut feed: ResMut<GameEvents>,
+) {
+    if !gate.holding() {
+        // Idempotent past the start line: a reconnecting commander that
+        // re-sends its opening batch says `ready` again and is not punished.
+        readies.clear();
+        return;
+    }
+
+    for ev in readies.read() {
+        // `bypass_change_detection` is not needed; we already hold `ResMut`.
+        let Some(seat) = gate.seats.iter_mut().find(|s| s.team == ev.team) else {
+            continue;
+        };
+        if seat.ready {
+            continue;
+        }
+        seat.ready = true;
+        let name = seat.name;
+        let still = gate.waiting_for();
+        if still.is_empty() {
+            info!("{READY_ENV}: {name} is ready — every seat is in");
+        } else {
+            info!(
+                "{READY_ENV}: {name} is ready — still waiting for {}",
+                still.join(" ")
+            );
+        }
+    }
+
+    // A faction in the scripted AI's hands is ready by construction, checked
+    // live so a mid-hold `autopilot` releases the match rather than freezing it.
+    for seat in &mut gate.seats {
+        let autopiloted = match seat.team {
+            Team::Human => ai.human,
+            Team::Claude => ai.claude,
+        };
+        if autopiloted && !seat.ready {
+            seat.ready = true;
+            info!(
+                "{READY_ENV}: {} is on autopilot — born ready, not gating",
+                seat.name
+            );
+        }
+    }
+
+    gate.waited += real.delta_secs();
+    let all_in = gate.seats.iter().all(|s| s.ready);
+    let timed_out = gate.waited >= gate.timeout;
+    if !all_in && !timed_out {
+        return;
+    }
+
+    gate.started = true;
+    gate.started_by_timeout = !all_in;
+    // The missing seats have to be named while `holding()` is still true;
+    // afterwards `waiting_for()` is empty by definition.
+    let absent: Vec<&'static str> = gate
+        .seats
+        .iter()
+        .filter(|s| !s.ready)
+        .map(|s| s.name)
+        .collect();
+    vtime.unpause();
+
+    let note = if all_in {
+        "match start — every seat readied, the clock runs from t=0".to_string()
+    } else {
+        format!(
+            "match start — {:.0}s ready timeout expired without {}; starting anyway",
+            gate.timeout,
+            absent.join(" ")
+        )
+    };
+    info!("{READY_ENV}: {note}");
+    // Pushed to BOTH feeds, which is not the asymmetry `GameEvents::push`
+    // warns about: the start of the match is a global fact that both sides
+    // know by construction, not intel about the opponent. Both sides must see
+    // the same line or the handshake is not observably fair.
+    for team in [Team::Human, Team::Claude] {
+        feed.push(team, 0.0, note.clone(), EventSeverity::Info, None);
+    }
+    // Flush the feed now rather than up to a second later, so `match start` is
+    // in the very next snapshot each commander reads.
+    feed.force = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -9194,6 +9479,8 @@ impl Plugin for CorePlugin {
             .add_event::<CastAbility>()
             .add_event::<XpDrop>()
             .add_event::<Surrender>()
+            .add_event::<MatchReady>()
+            .init_resource::<ReadyGate>()
             .add_event::<BountyClaim>()
             .add_event::<BuyItem>()
             .add_event::<UseItem>()
@@ -9209,6 +9496,10 @@ impl Plugin for CorePlugin {
                 Startup,
                 (initial_spawns, apply_env_speed, log_fog_mode, log_seed),
             )
+            // Last thing at startup, after bridge.rs has filled `ReadyGate`
+            // (it orders itself `.before(ReadyGateHold)`): stopping the clock
+            // has to happen before the first `Update` frame integrates a delta.
+            .add_systems(Startup, hold_for_ready.in_set(ReadyGateHold))
             .add_systems(
                 Update,
                 (
@@ -9236,6 +9527,11 @@ impl Plugin for CorePlugin {
                 // unordered inside one set would move the race rather than
                 // remove it. The order is the old declaration order.
                 (
+                    // First in the phase: whether the match has started at all
+                    // is prior to every other question asked here, and the
+                    // frame it releases the clock on is the frame the rest of
+                    // this chain should already be reading as live.
+                    ready_gate,
                     award_xp,
                     hero_progression,
                     regen_health,

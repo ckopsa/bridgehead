@@ -302,6 +302,50 @@ trigger is *contingent*, a plan is *sequenced* — and the third one is the word
 |---|---|
 | `autopilot` | `{on:true}` — hand this faction to the scripted AI |
 | `surrender` | `{}` |
+| `ready` | `{}` — I have read the map; start the clock (see § The ready handshake) |
+
+### The ready handshake
+
+The sim clock used to run from process start. Commander agents connect seconds
+to minutes apart — in arena round 9 Red's first order landed at **t=41s**,
+against an opponent that had been playing since zero. The opening is part of
+the game, and a game whose opening one side simply misses is not a fair one.
+
+So: **when any bridged seat is configured, the engine holds the match at t=0**
+until every such seat has sent `{"type":"ready"}`.
+
+- **Which seats gate.** Every seat named by `WC3_BRIDGE`, `copilot` included —
+  a copilot writes orders that reach units, so starting before it has read the
+  map reproduces the same unfairness one rung down. Seats that are *not* in
+  `WC3_BRIDGE` are not in the list: **scripted AI seats are born ready**, and
+  so is any seat whose faction is currently on `autopilot` (checked live, so a
+  commander cannot hang a match by autopiloting and walking away).
+- **Nothing moves while held.** The hold is a paused `Time<Virtual>`, so every
+  accumulator in the sim integrates zero — harvesting, construction, training,
+  spawns, doctrine, the headless time cap. The bridge's snapshot and command
+  timers run on `Time<Real>` and are unaffected: **snapshots keep being
+  written**, which is the point. Both commanders get to read the map and write
+  an opening before either of them plays it.
+- **Planning before `ready` is legal**, for both sides equally. Orders sent
+  during the hold compile at t=0 and their units act on the first live frame.
+  The etiquette is symmetric because the hold is.
+- **The snapshot says so.** While held it carries `waiting_for: ["red","blue"]`
+  (the seats still owed a `ready`) and `match_started: false`. Both keys vanish
+  the instant the clock starts, so a snapshot's historical key set is exactly
+  what it always was for the whole live match.
+- **`ready` is idempotent** and never refused: saying it twice, or after the
+  clock has started, is a no-op rather than an error.
+- **`WC3_READY_TIMEOUT`** (default 120 wall seconds) starts the match anyway if
+  a seat never speaks, so a crashed agent costs a round its opening rather than
+  its existence. The start is announced as a timeout in the log and in the
+  `match start` feed line both sides receive. It is measured on `Time<Real>` —
+  the same clock the bridge writes snapshots on — which under `WC3_FIXED_DT` is
+  the fixed tick rather than the wall clock; a bridged fixed-dt run needs the
+  timeout set in ticks' worth of seconds. The determinism harness has no bridge
+  seat and never holds, so it is unaffected.
+- **`WC3_READY=0`** disables the mechanic entirely and restores the old
+  behaviour. Runs with no bridged seat are untouched either way — the
+  determinism fingerprints for both maps are byte-identical across this change.
 
 ### Where a cast lands (v3)
 
@@ -1172,6 +1216,7 @@ set of rules to drift.
 |---|---|---|
 | **direct** | `squad` `posture` `template` `priority` `retreat` `leash` `autocast` | doctrine is *advice-shaped already* |
 | **propose** | every unit order, all production, all spending, `autopilot`, `surrender` | irreversible, or spends what is not the proposer's |
+| **neither** | `ready` | a statement about the clock, not the army — intercepted before the negotiation exists. See § The ready handshake |
 
 The line sits where **the cost of being wrong** is. Vetoing a posture is
 trivial — you set another and the squad re-tasks within a second, because a

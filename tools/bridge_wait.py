@@ -132,8 +132,18 @@ def main():
         except Exception:
             return None
 
+    # The seat's own name, as it appears in a held snapshot's `waiting_for`:
+    # `bridge/red` -> `red`.
+    me = seat.rsplit("/", 1)[-1]
+
     seen, seen_errors = read_marker(marker)
     deadline = time.monotonic() + max_wait
+    # Did we see the match being held during THIS call? The pre-match hold is
+    # the one condition where the event channel cannot speak for itself: the
+    # game clock is frozen at 0, so `t > seen` is false for every event in the
+    # snapshot including `match start` itself. Tracking the hold in-process is
+    # what lets the start still wake a commander early.
+    was_held = False
     while True:
         s = read()
         if s is not None:
@@ -142,6 +152,29 @@ def main():
             if s.get("game_over"):
                 write_marker(marker, s["t"], errors_fp)
                 print(f"WAKE: game over ({s['game_over']})")
+                return
+            # --- the ready handshake (docs/INTENT.md) -----------------------
+            waiting = s.get("waiting_for")
+            if waiting is not None:
+                was_held = True
+                if me in waiting:
+                    # The engine is waiting on US, and no amount of sleeping
+                    # fixes that. This is the one wake that is an instruction
+                    # rather than news, and it must be immediate: every second
+                    # spent here is a second the OTHER commander spends reading
+                    # the map, which is precisely the asymmetry the handshake
+                    # exists to remove.
+                    print(
+                        "WAKE: the match has not started — send "
+                        "'[{\"type\":\"ready\"}]' when you have read the map and "
+                        f"set your opening (waiting for: {' '.join(waiting)})"
+                    )
+                    return
+                # We have been heard; the hold is somebody else's. Keep
+                # waiting — this is a real quiet cycle, not a busy loop.
+            elif was_held:
+                write_marker(marker, s.get("t", 0.0), errors_fp)
+                print("WAKE: match started — the clock is running from t=0")
                 return
             fresh = [m for t, m in s.get("events", []) if t > seen]
             if fresh:
@@ -158,7 +191,18 @@ def main():
         if time.monotonic() >= deadline:
             if s is not None:
                 write_marker(marker, s["t"], fingerprint(s.get("errors") or []))
-            print(f"WAKE: quiet cycle ({max_wait:.0f}s)")
+            waiting = (s or {}).get("waiting_for")
+            if waiting:
+                # Named rather than folded into "quiet cycle": a commander that
+                # has readied and is waiting on its opponent should be able to
+                # tell that from a match that is simply uneventful, or it will
+                # start hunting for a bug in its own loop.
+                print(
+                    f"WAKE: still held at t=0 after {max_wait:.0f}s — "
+                    f"waiting for: {' '.join(waiting)}"
+                )
+            else:
+                print(f"WAKE: quiet cycle ({max_wait:.0f}s)")
             return
         time.sleep(1.0)
 

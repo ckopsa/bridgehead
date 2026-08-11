@@ -1821,6 +1821,16 @@ fn compile_intent(
             info!("bridge: {:?} seat surrenders", me);
             commands.send_event(Surrender { team: me });
         }
+        Intent::Ready => {
+            // Deliberately unconditional and deliberately silent about
+            // whether it changed anything: `ready` is idempotent, and a seat
+            // that says it twice — or says it after the clock has started —
+            // gets the same answer as one that says it once. `ready_gate`
+            // (shared.rs) owns the decision and does the announcing; this arm
+            // only carries the statement across the compiler, the same way
+            // `surrender` does.
+            commands.send_event(MatchReady { team: me });
+        }
         Intent::Priority {
             units: ids,
             classes,
@@ -3099,6 +3109,7 @@ mod tests {
             .init_resource::<AiControlled>()
             .init_resource::<GameEvents>()
             .add_event::<CastAbility>()
+            .add_event::<MatchReady>()
             .add_event::<BuyItem>()
             .add_event::<UseItem>()
             .add_event::<UpgradeBuilding>()
@@ -3683,6 +3694,9 @@ mod tests {
             r#"{"type":"use_item","slot":0}"#,
             r#"{"type":"autopilot","on":true}"#,
             r#"{"type":"surrender"}"#,
+            // The third match-level statement (wc3clone-t0d). A unit variant
+            // like `surrender`, so the whole wire shape is the tag.
+            r#"{"type":"ready"}"#,
             r#"{"type":"priority","units":[1],"classes":["Hero","Siege"]}"#,
             r#"{"type":"priority","units":[1]}"#,
             r#"{"type":"retreat","units":[1],"below":0.35,"x":1.0,"z":2.0}"#,
@@ -4872,6 +4886,56 @@ mod tests {
             .resource_mut::<Events<CastAbility>>()
             .drain()
             .collect()
+    }
+
+    /// **`ready` travels from the wire to the gate** — `wc3clone-t0d`. The one
+    /// verb that is legal before the match exists still goes the ordinary way:
+    /// JSON, `Intent`, compiler, event. Nothing about the handshake is a side
+    /// channel, which is why it gets a sentence and a journal line like every
+    /// other statement a seat makes.
+    #[test]
+    fn the_ready_verb_travels_from_the_wire_to_the_gate() {
+        let mut app = compiler_app();
+
+        app.world_mut()
+            .send_event(from_the_wire(Team::Human, r#"{"type":"ready"}"#));
+        app.update();
+
+        let readies: Vec<MatchReady> = app
+            .world_mut()
+            .resource_mut::<Events<MatchReady>>()
+            .drain()
+            .collect();
+        assert_eq!(readies.len(), 1, "one statement, one event");
+        assert_eq!(readies[0].team, Team::Human);
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "`ready` is never refused"
+        );
+
+        // Idempotent on the wire: saying it twice is two events, and the gate
+        // (shared.rs `ready_gate`) is what makes the second one a no-op. The
+        // compiler deliberately does not know whether the match has started —
+        // that is exactly the knowledge that would make this arm need a
+        // resource it has no business holding.
+        app.world_mut()
+            .send_event(from_the_wire(Team::Human, r#"{"type":"ready"}"#));
+        app.world_mut()
+            .send_event(from_the_wire(Team::Claude, r#"{"type":"ready"}"#));
+        app.update();
+        let readies: Vec<MatchReady> = app
+            .world_mut()
+            .resource_mut::<Events<MatchReady>>()
+            .drain()
+            .collect();
+        assert_eq!(readies.len(), 2);
+        // A seat only ever speaks for itself — the team on the event is the
+        // team on the submission, never the one it names.
+        assert_eq!(readies[1].team, Team::Claude);
+
+        // The half a person reads.
+        assert_eq!(Intent::Ready.verb(), "ready");
+        assert_eq!(Intent::Ready.sentence(), "declare ready to begin");
     }
 
     /// **The wire carries the aim.** A commander's coordinates survive the

@@ -57,6 +57,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -325,6 +326,76 @@ def collect_snapshots(seats: list[dict], out_dir: Path) -> list[str]:
     return kept
 
 
+def record_readies(waiting: list[str], last, by_side: dict, now: float) -> None:
+    """Attribute a `ready` to every seat that just left the waiting list.
+
+    Split out of the polling loop below so the part that decides what reaches
+    the ledger is a pure function of two observations, and can be tested
+    without a thread, a clock or a file.
+
+    A seat we never saw waiting gets nothing — `last is None` on the first
+    observation, so a seat that was already ready before our first poll is not
+    credited with a wait it may not have had. Omission over invention.
+    """
+    for side in set(last or []) - set(waiting):
+        seat = by_side.get(side)
+        if seat is not None:
+            seat["ready_wait_s"] = round(now, 1)
+
+
+def watch_handshake(seats: list[dict], started: float, stop) -> None:
+    """Follow the ready handshake and record when each seat spoke.
+
+    docs/INTENT.md, "The ready handshake": a bridged seat holds the match at
+    t=0 until every such seat sends `{"type":"ready"}`. That wait is the one
+    interesting thing that happens before the match, and it is invisible in the
+    engine log's game-time timeline — it happens entirely at t=0 — so it has to
+    be measured on the wall clock from out here.
+
+    Runs on a thread because the headless launch below blocks in
+    `subprocess.run` until the engine exits; there is no other seam from which
+    to watch a file while that call owns the main thread.
+
+    Writes `ready_wait_s` onto the seat dicts as a side effect. Seats we never
+    observed waiting simply do not get the key — see `build_record` for why
+    that is omission rather than a null.
+    """
+    watched = [s for s in seats if s["kind"] != "scripted"]
+    if not watched:
+        return
+    # `waiting_for` is a global fact, identically present in every seat's
+    # snapshot, so the first readable one answers for all of them.
+    paths = [Path(s["dir"]) / "state.json" for s in watched]
+    by_side = {s["side"]: s for s in seats}
+    held, last = False, None
+    while not stop.wait(0.5):
+        snap = None
+        for path in paths:
+            try:
+                snap = json.loads(path.read_text())
+                break
+            except (OSError, json.JSONDecodeError):
+                continue
+        if snap is None:
+            continue
+        now = time.monotonic() - started
+        waiting = snap.get("waiting_for")
+        if waiting is None:
+            if held:
+                print(f"  match started at wall {now:.0f}s", flush=True)
+            return
+        if not held:
+            print(f"  match held at t=0 (the clock starts when every seat readies)", flush=True)
+        held = True
+        if waiting != last:
+            # Everyone who just left the list said the word between the last
+            # poll and this one; the wall clock at this poll is the honest
+            # resolution we have, and it is a half-second.
+            record_readies(waiting, last, by_side, now)
+            print(f"  waiting for seats: {' '.join(waiting)}", flush=True)
+            last = waiting
+
+
 def build_record(args, seats: list[dict], env: dict, verdict: dict) -> dict:
     rec = arena.skeleton(args.id, args.hypothesis)
     rec["date"] = time.strftime("%Y-%m-%d")
@@ -341,11 +412,18 @@ def build_record(args, seats: list[dict], env: dict, verdict: dict) -> dict:
     # `prompt` only appears on seats that have one: an absent briefing is not a
     # fact anybody is missing, and a null here would clutter every scripted
     # round's `unknown` list with something nobody wants to know.
+    #
+    # `ready_wait_s` follows exactly that precedent (docs/INTENT.md, "The ready
+    # handshake"): wall seconds from launch until this seat sent `ready`, and
+    # ABSENT — never null — on a seat that never waited. A scripted seat is born
+    # ready and a round from before the handshake existed never had the key at
+    # all; emitting `null` for either would put a line in `unknown` claiming we
+    # failed to learn something there was nothing to learn.
     rec["seats"] = [
         {
             k: v
             for k, v in s.items()
-            if k in ("seat", "team", "kind", "persona", "prompt")
+            if k in ("seat", "team", "kind", "persona", "prompt", "ready_wait_s")
             and not (k == "prompt" and v is None)
         }
         for s in seats
@@ -473,8 +551,21 @@ def main(argv: list[str] | None = None) -> int:
     launch.update(env)
     launch.pop("WC3_INTENT_LOG", None)
     timeout = (args.cap / max(args.speed, 0.01) + 180) if args.cap else 3600
+    # The handshake budget, on top. The engine holds at t=0 until every bridged
+    # seat readies, and that hold is wall time the game cap knows nothing about
+    # — the game clock is frozen throughout it. Without this term a round whose
+    # commanders take their full thinking time gets killed for "outliving its
+    # wall timeout" while it is still doing exactly what it was told to.
+    if commander_seats:
+        timeout += float(launch.get("WC3_READY_TIMEOUT", 120.0))
     started = time.monotonic()
     print(f"\nlaunching (wall timeout {timeout:.0f}s)...", flush=True)
+
+    stop_watch = threading.Event()
+    watcher = threading.Thread(
+        target=watch_handshake, args=(seats, started, stop_watch), daemon=True
+    )
+    watcher.start()
 
     log = ""
     if args.windowed:
@@ -512,6 +603,9 @@ def main(argv: list[str] | None = None) -> int:
                 log = log.decode("utf8", "replace")
             print("warning: the engine outlived its wall timeout", file=sys.stderr)
         verdict = read_log(log)
+
+    stop_watch.set()
+    watcher.join(timeout=2.0)
 
     wall = time.monotonic() - started
     log_path = out_dir / "engine.log"

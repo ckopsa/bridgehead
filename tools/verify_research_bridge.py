@@ -70,6 +70,24 @@ def wait_for(pred, what, timeout=180.0):
     raise SystemExit(f"FAIL: timed out waiting for {what}\nlast me={last.get('me')}")
 
 
+def start_match():
+    """Clear the ready handshake if the engine is holding the match at t=0.
+
+    A bridged seat now gates the start (docs/INTENT.md, "The ready handshake"):
+    the world is spawned and photographed, but the clock does not move until
+    every seat says the word. Every check below wants a running clock, so say
+    it. Harmless against an engine built before the handshake — `ready` is then
+    an unrecognized verb that lands in `errors` and is cleared by the next
+    batch, and `waiting_for` is never there to begin with.
+    """
+    st = read_state()
+    if "waiting_for" not in st:
+        return st
+    print(f"  held at t=0, waiting for {st['waiting_for']} — sending ready")
+    send([{"type": "ready"}])
+    return wait_for(lambda s: "waiting_for" not in s, "the match to start")
+
+
 def errors_after(prev_seq):
     """The errors attached to the batch we just sent."""
     st = wait_for(lambda s: s["seq_applied"] > prev_seq, "the batch to apply")
@@ -122,7 +140,7 @@ def main():
 
 
 def run_checks():
-    st = wait_for(lambda s: True, "the first snapshot")
+    st = start_match()
     me = st["me"]
 
     print("\n[1] catalog exports the research ladders")
