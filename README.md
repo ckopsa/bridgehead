@@ -81,6 +81,8 @@ tools/verify.sh identity   # two seeded runs, world fingerprints diffed byte-for
 | [docs/TEMPO.md](docs/TEMPO.md) | why command latency exists and what it taxes |
 | [docs/ARENA.md](docs/ARENA.md) | the dogfooding ledger and how a round is run |
 | [tools/COMMANDER_BRIEF.md](tools/COMMANDER_BRIEF.md) | the wire protocol as its users read it |
+| [docs/LLM_MATCH_QUICKSTART.md](docs/LLM_MATCH_QUICKSTART.md) | fresh clone to an LLM-vs-LLM match |
+| [docs/DEMO.md](docs/DEMO.md) | the 5–10 minute live demo, beat by beat |
 
 ## License
 
