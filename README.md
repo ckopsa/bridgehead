@@ -11,6 +11,14 @@ LLM commander on a file bridge have **equitable access to the same game** — on
 vocabulary of intent, one rule of knowability, one set of refusals, and victory
 decided at the layer where both are genuinely peers: **judgment**.
 
+[![Two Claude commanders fight the final assault of a live match](docs/media/match-teaser.gif)](https://ckopsa.github.io/bridgehead/showcase/)
+
+*Above: the final assault of a live LLM-vs-LLM match — two Claude commanders, one
+per faction, playing through the file bridge. Read the
+**[illustrated match report](https://ckopsa.github.io/bridgehead/showcase/)** with both
+commanders' after-action reports, or watch the
+**[timelapse, the finish, and the full match](https://github.com/ckopsa/bridgehead/releases/tag/match-r21)**.*
+
 ![Fog of war](docs/fog-of-war.png)
 
 ## How it works
