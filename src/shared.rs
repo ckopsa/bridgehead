@@ -74,10 +74,14 @@ pub fn asset_score(
     units: impl Iterator<Item = UnitKind>,
     buildings: impl Iterator<Item = BuildingKind>,
 ) -> u32 {
+    // `unit_value`, not `unit_stats`, for the same reason `building_value`
+    // appears below: a hero's cost fields are 0 (training is free) and its
+    // worth is what bringing it back costs. Summing the raw row would score a
+    // hero army as owning nothing.
     let unit_value: u32 = units
         .map(|k| {
-            let s = unit_stats(k);
-            s.cost_gold + s.cost_lumber
+            let (gold, lumber) = unit_value(k);
+            gold + lumber
         })
         .sum();
     // `building_value`, not `building_stats`, so a Keep counts as the hall
@@ -660,6 +664,51 @@ pub struct UnitStats {
     /// scout). Exported in the catalog, so a commander can plan around it the
     /// same way the player reads it off the minimap.
     pub vision: f32,
+
+    // --- heroes only ------------------------------------------------------
+    /// What it costs to bring THIS hero class back after it dies.
+    ///
+    /// Heroes are the one kind whose price is not `cost_gold`/`cost_lumber`:
+    /// the first fielding of a class is **free** (its cost fields are 0, and
+    /// the validator insists on it) and the bill arrives on DEATH instead.
+    /// Five straight arena rounds were won by commanders who looked at 400g
+    /// for a hero, counted three Footmen, and skipped it — so the price moved
+    /// to the place where skipping is not an option.
+    ///
+    /// Zero on every non-hero row, and `> 0` on every hero row; both halves
+    /// are checked by data.rs's validator, so `unit_value` and
+    /// `hero_train_cost` can read this without a branch on race or tier.
+    ///
+    /// The revival *time* is not here: `HERO_REVIVE_TIME` is one number shared
+    /// by every class because no design wants a Far Seer to come back slower
+    /// than a Warchief, whereas the revival PRICE is exactly the per-class
+    /// balance knob this bead exists to turn.
+    #[serde(default)]
+    pub revive_gold: u32,
+    #[serde(default)]
+    pub revive_lumber: u32,
+}
+
+/// **What a unit is WORTH**, as opposed to what it costs you to queue one.
+///
+/// For everything except a hero these are the same number and this is
+/// `cost_gold`/`cost_lumber` with extra steps. For a hero they diverge on
+/// purpose: training is free, so the cost fields are 0, and a worth of zero
+/// would quietly break the two places that ask "how much did that body
+/// represent" — `xp_for_kill` (killing the enemy's Champion would grant no
+/// experience at all) and `asset_score` (a hero army would settle a timeout
+/// as though it owned nothing).
+///
+/// The answer for a hero is its REPLACEMENT cost, which is exactly what
+/// `building_value` already does one type over: a thing is worth what it
+/// takes to have it standing again.
+pub fn unit_value(kind: UnitKind) -> (u32, u32) {
+    let s = unit_stats(kind);
+    if is_hero_kind(kind) {
+        (s.revive_gold, s.revive_lumber)
+    } else {
+        (s.cost_gold, s.cost_lumber)
+    }
 }
 
 /// How high above the ground plane flying units are drawn and held. Chosen to
@@ -1482,6 +1531,18 @@ pub struct CatalogUnit {
     pub role: &'static str,
     pub cost_gold: u32,
     pub cost_lumber: u32,
+    /// **Heroes only, and the reason a hero's cost above reads 0/0.** Your
+    /// first hero of a class is free to train; this is what putting it back on
+    /// the map costs after it dies, with its level preserved. Omitted entirely
+    /// for every non-hero row, where it would always be zero.
+    ///
+    /// It is also what the hero is WORTH: the experience an enemy gains for
+    /// killing it, and what it contributes to the material score that settles
+    /// a timeout, are both counted off this number rather than off the zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revive_gold: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revive_lumber: Option<u32>,
     pub supply: u32,
     pub hp: f32,
     pub damage: f32,
@@ -1878,6 +1939,8 @@ pub fn game_catalog() -> Catalog {
                     role: role_name(unit_role(k)),
                     cost_gold: s.cost_gold,
                     cost_lumber: s.cost_lumber,
+                    revive_gold: is_hero_kind(k).then_some(s.revive_gold),
+                    revive_lumber: is_hero_kind(k).then_some(s.revive_lumber),
                     supply: s.supply,
                     hp: s.hp,
                     damage: s.damage,
@@ -2622,9 +2685,10 @@ pub fn hero_ability_radius() -> f32 {
 pub fn hero_ability_damage() -> f32 {
     hero_slam().power()
 }
-/// Reviving a fallen hero (level preserved) is cheaper and faster than the
-/// first training. See `hero_train_cost`.
-pub const HERO_REVIVE_COST_GOLD: u32 = 250;
+/// Reviving a fallen hero (level preserved) is FASTER than the first training
+/// and — since v3 — the only time a hero costs anything at all. The price
+/// itself lives per class in `revive_gold`/`revive_lumber`; this is just the
+/// clock. See `hero_train_cost`.
 pub const HERO_REVIVE_TIME: f32 = 15.0;
 
 /// Per-entity hero state. Lives on `UnitKind::Hero` units (units.rs inserts it
@@ -3670,8 +3734,12 @@ const XP_COST_PER_STEP: u32 = 20;
 pub fn xp_for_kill(unit: Option<UnitKind>, building: Option<BuildingKind>) -> f32 {
     let cost = match (unit, building) {
         (Some(kind), _) => {
-            let s = unit_stats(kind);
-            s.cost_gold + s.cost_lumber
+            // `unit_value`: a hero trains for free, so its cost fields are 0
+            // and its worth is its revival price. Reading the row directly
+            // would make the enemy Champion — the most valuable kill on the
+            // map — worth no experience whatsoever.
+            let (gold, lumber) = unit_value(kind);
+            gold + lumber
         }
         (_, Some(kind)) => {
             let (gold, lumber) = building_value(kind);
@@ -3800,17 +3868,60 @@ pub fn hero_slot_check(held: &[UnitKind], kind: UnitKind, tier: TechTier) -> Her
     HeroSlotVerdict::Ok
 }
 
-/// Gold/lumber/time to put a hero of `kind` in a training queue right now:
-/// full price for a class this team has never fielded, revival price once a
-/// record for THAT CLASS exists.
+/// Gold/lumber/time to put a hero of `kind` in a training queue right now.
+/// **Your first hero of a class is free; losing it is not.**
+///
+///   * a class this team has NEVER fielded — `(0, 0, train_time)`. Free, not
+///     instant: the 25 seconds and the 5 supply are unchanged, and they are
+///     paid at the hall, which is also the building that makes workers. The
+///     opening cost of a hero is a worker line that stalls, not a treasury
+///     that empties.
+///   * a class with a record (i.e. one that has died) — the row's
+///     `revive_gold`/`revive_lumber` at `HERO_REVIVE_TIME`.
+///
+/// **Why this way round.** v2 charged 400g/100l up front and discounted the
+/// revival to 250g. Arena rounds 17 through 19 produced five straight winners
+/// who never fielded a hero, and in r19 BOTH commanders skipped deliberately:
+/// 400 gold is three Footmen or a third Barracks *now*, against experience
+/// that pays off past the ten-minute mark in a game that ends around seven.
+/// The skip was correct, which made the hero optional content nobody opted
+/// into. Free-to-field makes the hero guaranteed content; a costly death makes
+/// keeping it alive the actual decision.
+///
+/// **Flat, not level-scaled.** A level-5 death costs exactly what a level-1
+/// death costs, and that is deliberate:
+///
+///   * scaling the bill with level punishes precisely the play this change
+///     rewards. The commander who nursed a hero to level 5 would get the
+///     largest invoice, and the one who let it idle in the base would pay
+///     least — an anti-incentive aimed at hero preservation, which is the
+///     strategic event we are trying to create.
+///   * the "a better hero should cost more" intuition is already satisfied on
+///     the other side of the ledger: revival PRESERVES the level. A flat price
+///     therefore buys back more the higher the hero was, so preserving levels
+///     makes each revival a *better* deal, not a worse one. The gradient
+///     exists; it just lives in the benefit rather than the fee.
+///   * it keeps one number on the wire. `hero_costs` can say "400g/100l if it
+///     dies" instead of teaching every commander a formula it would then have
+///     to re-derive at every level-up.
+///
+/// The counter-argument, for the record: a flat fee means a snowballing hero
+/// gets cheaper in relative terms as the match goes on, so a team that is
+/// already ahead re-fields its level-6 Champion for the price of a level-1
+/// one. If arena rounds show hero-snowball dominance rather than hero-loss
+/// drama, level scaling is the lever to reach for — and this comment is where
+/// the argument for it starts.
 ///
 /// Per class, not per team: with two heroes allowed, a team that has a level-6
-/// Champion in the field must still pay full price for its first Priestess,
-/// and reviving the Champion must not be discounted by the Priestess existing.
+/// Champion in the field still gets its first Priestess free, and reviving the
+/// Champion is not made free by the Priestess never having died.
 pub fn hero_train_cost(records: &HeroRecords, team: Team, kind: UnitKind) -> (u32, u32, f32) {
     let base = unit_stats(kind);
     match records.get(team, kind) {
-        Some(_) => (HERO_REVIVE_COST_GOLD, 0, HERO_REVIVE_TIME),
+        Some(_) => (base.revive_gold, base.revive_lumber, HERO_REVIVE_TIME),
+        // Read out of the table rather than written as a literal `0`: the
+        // validator guarantees hero cost fields ARE zero, and going through the
+        // row keeps units.ron the single place the number lives.
         None => (base.cost_gold, base.cost_lumber, base.train_time),
     }
 }
@@ -6035,6 +6146,17 @@ impl Economy {
         } else {
             false
         }
+    }
+    /// Hand a payment back. The counterpart to `pay`, and used in exactly one
+    /// place: economy.rs returning the price of a queue item that was
+    /// cancelled after it had already been charged for.
+    ///
+    /// Deliberately NOT capped at any ceiling — a refund is money the team
+    /// already had, so refusing it would be a way to destroy resources by
+    /// buying and cancelling. `saturating_add` only guards the arithmetic.
+    pub fn refund(&mut self, gold: u32, lumber: u32) {
+        self.gold = self.gold.saturating_add(gold);
+        self.lumber = self.lumber.saturating_add(lumber);
     }
 }
 
@@ -11447,6 +11569,57 @@ mod tests {
         assert_eq!(best_cast_focus(caster, range, radius, &edge).unwrap().2, 1);
     }
 
+
+    /// **A commander reading the catalog must not think a hero costs 400.**
+    /// The catalog is the only documentation either seat gets, so the cost
+    /// fields have to say the true thing (zero) and the revival price has to
+    /// be there beside them — a 0g row with no second number would read as an
+    /// oversight, or worse, as a hero with no downside at all.
+    ///
+    /// `revive_gold`/`revive_lumber` are hero-only and omitted elsewhere: a
+    /// Footman row carrying `revive_gold: 0` would invite the question of what
+    /// reviving a Footman does.
+    #[test]
+    fn the_catalog_prices_a_hero_at_zero_and_publishes_what_losing_it_costs() {
+        let catalog = game_catalog();
+        let mut heroes = 0;
+        for row in &catalog.units {
+            let is_hero = row.role.starts_with("Hero");
+            if !is_hero {
+                assert_eq!(
+                    (row.revive_gold, row.revive_lumber),
+                    (None, None),
+                    "{}: only heroes publish a revival price",
+                    row.id
+                );
+                assert!(
+                    row.cost_gold > 0 || row.cost_lumber > 0,
+                    "{}: everything except a hero costs something to train",
+                    row.id
+                );
+                continue;
+            }
+            heroes += 1;
+            assert_eq!(
+                (row.cost_gold, row.cost_lumber),
+                (0, 0),
+                "{}: the catalog must show training as free",
+                row.id
+            );
+            assert_eq!(
+                (row.revive_gold, row.revive_lumber),
+                (Some(400), Some(100)),
+                "{}: ...and must show what losing it costs",
+                row.id
+            );
+            // Free is not instant, and the catalog is where a commander finds
+            // out: 25 seconds at the hall that also makes your workers.
+            assert!(row.train_time >= 25.0, "{}: {}s", row.id, row.train_time);
+            assert!(row.supply > 0, "{}: a free hero still eats supply", row.id);
+        }
+        assert_eq!(heroes, 4, "two hero classes per roster, two rosters");
+    }
+
     /// The catalog is the commander's only documentation, so geometry has to
     /// be *in* it — an ability whose target shape you cannot read is one you
     /// can only aim by trial and error.
@@ -13187,12 +13360,15 @@ mod tests {
             // 5-XP steps, so the numbers stay readable in a combat log.
             assert_eq!(xp % 5.0, 0.0, "{kind:?} grants a ragged {xp} XP");
         }
-        // Monotone in cost: pricier is always worth at least as much.
+        // Monotone in WORTH: a body worth more is always worth at least as
+        // much experience. `unit_value`, not the raw row, because a hero's
+        // cost fields are 0 — it trains free — and sorting heroes to the
+        // bottom of the table would assert the opposite of the design.
         let mut rows: Vec<(UnitKind, u32, f32)> = ALL_UNIT_KINDS
             .iter()
             .map(|&k| {
-                let s = unit_stats(k);
-                (k, s.cost_gold + s.cost_lumber, xp_for_kill(Some(k), None))
+                let (gold, lumber) = unit_value(k);
+                (k, gold + lumber, xp_for_kill(Some(k), None))
             })
             .collect();
         rows.sort_by_key(|r| r.1);
@@ -13215,6 +13391,32 @@ mod tests {
         assert_eq!(xp_for_kill(Some(UnitKind::Raider), None), 50.0);
         assert_eq!(xp_for_kill(Some(UnitKind::Knight), None), 80.0);
         assert_eq!(xp_for_kill(Some(UnitKind::GryphonRider), None), 100.0);
+
+        // **Heroes train for free and are still the richest kill on the map.**
+        // The regression this guards is precise: `xp_for_kill` used to read
+        // `cost_gold + cost_lumber` off the row, and the day hero training
+        // became free that expression became 0 — killing the enemy Champion,
+        // the single most valuable thing either side owns, would have granted
+        // no experience at all. Worth is the REVIVAL price, so the number is
+        // unchanged from the era when 400g/100l was what you paid up front.
+        for hero in ALL_UNIT_KINDS.iter().copied().filter(|&k| is_hero_kind(k)) {
+            assert_eq!(unit_stats(hero).cost_gold, 0, "{hero:?} trains free");
+            assert_eq!(
+                xp_for_kill(Some(hero), None),
+                125.0,
+                "{hero:?} is the richest kill on the map (500 worth / 20 * 5)"
+            );
+            let dearest = ALL_UNIT_KINDS
+                .iter()
+                .copied()
+                .filter(|&k| !is_hero_kind(k))
+                .map(|k| xp_for_kill(Some(k), None))
+                .fold(0.0f32, f32::max);
+            assert!(
+                xp_for_kill(Some(hero), None) > dearest,
+                "{hero:?} must out-pay every line unit"
+            );
+        }
     }
 
     /// Structures pay too, and the hall ladder never pays *less* for a taller
@@ -13236,9 +13438,126 @@ mod tests {
         assert!(xp_for_kill(None, Some(BuildingKind::Wall)) < hall / 10.0);
     }
 
+
+    /// **The whole inversion, per class, on both rosters.** A hero this team
+    /// has never fielded is free to queue; the same class with a record costs
+    /// the revival price. Written as a loop over every hero kind because the
+    /// bug it guards against is the boring one: a Kingdom-only edit that left
+    /// the Warchief and the Far Seer priced the old way, which is exactly the
+    /// shape the previous hero-pricing bug took (the Priestess was priced off
+    /// her raw stats while the Champion went through `hero_train_cost`).
+    #[test]
+    fn every_hero_class_on_both_rosters_is_free_first_and_costly_to_revive() {
+        for hero in ALL_UNIT_KINDS.iter().copied().filter(|&k| is_hero_kind(k)) {
+            let races = unit_races(hero);
+            let s = unit_stats(hero);
+
+            for team in [Team::Human, Team::Claude] {
+                let mut records = HeroRecords::default();
+
+                let (gold, lumber, time) = hero_train_cost(&records, team, hero);
+                assert_eq!(
+                    (gold, lumber),
+                    (0, 0),
+                    "{hero:?} ({races:?}) must be FREE the first time"
+                );
+                assert_eq!(
+                    time, s.train_time,
+                    "{hero:?} is free, not instant — the train time is the row's"
+                );
+                assert!(s.supply > 0, "{hero:?} still costs supply");
+
+                records.set(team, HeroRecord { level: 1, xp: 0.0, kind: hero });
+                let (gold, lumber, time) = hero_train_cost(&records, team, hero);
+                assert_eq!(
+                    (gold, lumber),
+                    (s.revive_gold, s.revive_lumber),
+                    "{hero:?} revival is the row's revive cost"
+                );
+                assert_eq!((gold, lumber), (400, 100), "{hero:?}: 400g/100l flat");
+                assert_eq!(time, HERO_REVIVE_TIME);
+
+                // The OTHER team's ledger is untouched by this one's death.
+                assert_eq!(
+                    hero_train_cost(&records, team.enemy(), hero),
+                    (0, 0, s.train_time),
+                    "{hero:?}: one team's loss is not the other's bill"
+                );
+            }
+        }
+    }
+
+    /// **The revival fee is flat — it does not scale with the level it buys
+    /// back.** This is the design decision the bead turned on, so it is
+    /// asserted rather than left to the data: scaling the price with level
+    /// would hand the largest invoice to the commander who kept a hero alive
+    /// longest, which is an anti-incentive aimed squarely at the behaviour the
+    /// free-hero change exists to reward. The gradient lives on the other side
+    /// — revival preserves the level, so a flat fee buys back *more* the
+    /// higher the hero was.
+    #[test]
+    fn the_revival_price_is_flat_across_every_level() {
+        let team = Team::Human;
+        for hero in ALL_UNIT_KINDS.iter().copied().filter(|&k| is_hero_kind(k)) {
+            let prices: Vec<_> = [1, 2, 5, 10, 99]
+                .into_iter()
+                .map(|level| {
+                    let mut records = HeroRecords::default();
+                    records.set(
+                        team,
+                        HeroRecord { level, xp: level as f32 * 10.0, kind: hero },
+                    );
+                    hero_train_cost(&records, team, hero)
+                })
+                .collect();
+            assert!(
+                prices.windows(2).all(|w| w[0] == w[1]),
+                "{hero:?}: the revival fee moved with the level: {prices:?}"
+            );
+        }
+    }
+
+    /// A hero's WORTH and a hero's PRICE are different questions, and the
+    /// answer to the first must never be zero. `unit_value` is what
+    /// `xp_for_kill` and `asset_score` read; if it followed `cost_gold` down
+    /// to zero, killing the enemy Champion would grant nothing and a hero
+    /// army would settle a timeout as if it owned nothing.
+    #[test]
+    fn a_free_hero_is_still_worth_its_replacement_cost() {
+        for kind in ALL_UNIT_KINDS {
+            let s = unit_stats(kind);
+            let (gold, lumber) = unit_value(kind);
+            if is_hero_kind(kind) {
+                assert_eq!((s.cost_gold, s.cost_lumber), (0, 0), "{kind:?} trains free");
+                assert_eq!(
+                    (gold, lumber),
+                    (s.revive_gold, s.revive_lumber),
+                    "{kind:?} is worth what replacing it costs"
+                );
+                assert!(gold + lumber > 0, "{kind:?} must not be worth nothing");
+            } else {
+                assert_eq!(
+                    (gold, lumber),
+                    (s.cost_gold, s.cost_lumber),
+                    "{kind:?}: for everything else, worth IS cost"
+                );
+            }
+        }
+
+        // The timeout tiebreaker sees the hero, and sees it as the most
+        // valuable body on the field.
+        let bank = Economy::default();
+        let with_hero = asset_score(&bank, [UnitKind::Hero].into_iter(), [].into_iter());
+        let with_knight = asset_score(&bank, [UnitKind::Knight].into_iter(), [].into_iter());
+        assert!(
+            with_hero > with_knight && with_hero >= 500,
+            "a hero must outweigh the priciest line unit: {with_hero} vs {with_knight}"
+        );
+    }
+
     /// Records are per CLASS now, and so is the price: a team fielding a
-    /// level-6 Champion still pays full freight for its first Priestess, and
-    /// reviving the Champion is not discounted by the Priestess existing.
+    /// level-6 Champion still gets its first Priestess FREE, and reviving the
+    /// Champion is not made free by the Priestess having never died.
     #[test]
     fn hero_records_and_prices_are_per_class() {
         let mut records = HeroRecords::default();
@@ -13261,7 +13580,7 @@ mod tests {
         );
         assert_eq!(
             hero_train_cost(&records, team, UnitKind::Hero),
-            (HERO_REVIVE_COST_GOLD, 0, HERO_REVIVE_TIME),
+            (base.revive_gold, base.revive_lumber, HERO_REVIVE_TIME),
         );
         let priestess = unit_stats(UnitKind::Priestess);
         assert_eq!(

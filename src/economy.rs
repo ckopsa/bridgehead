@@ -987,9 +987,51 @@ struct RememberedNode {
 #[derive(Component)]
 struct CarryVisual(Entity);
 
-/// True once the front item of a building's `TrainingQueue` has been paid for.
-#[derive(Component)]
-struct PaidFront(bool);
+/// **What this building has already paid for at the front of its queue**, if
+/// anything.
+///
+/// This was a bare `bool` — "the front item is paid" — and the bool was a bug
+/// with two faces. A `cancel` of the front item removes the item and leaves
+/// the flag standing, so the NEXT thing in the queue inherited a payment it
+/// never made: queue a Footman, let it pay, cancel it, and the Champion behind
+/// it trained for free *and* skipped the hero-slot check, because both gates
+/// live behind `if !paid_front`. The mirror of that bug is the money: a
+/// cancelled item's gold was never handed back, because nothing recorded how
+/// much had been spent or on what.
+///
+/// Recording the KIND and the AMOUNT fixes both at once and keeps economy.rs
+/// the single owner of every payment — intent.rs still only edits the queue,
+/// exactly as `cancel` always did, and this system notices on the next tick
+/// that what it paid for is no longer at the front and gives the money back.
+///
+/// The amount is stored rather than recomputed on purpose: a hero's price
+/// depends on whether its class has a record, and a hero that DIED while its
+/// revival sat in a queue would otherwise be refunded at a different price
+/// from the one it was charged.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+struct PaidFront(Option<PaidItem>);
+
+/// One paid-for, not-yet-delivered queue item.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PaidItem {
+    kind: UnitKind,
+    gold: u32,
+    lumber: u32,
+}
+
+impl PaidFront {
+    /// The payment standing against `front`, if this building's paid item IS
+    /// what is at the front of its queue now.
+    ///
+    /// Compared by KIND, not by identity: cancelling one of two queued Footmen
+    /// leaves a Footman at the front, and the payment rightly carries to it —
+    /// one Footman was bought and one Footman is being built. It is only when
+    /// the front becomes a DIFFERENT kind (or nothing at all) that a purchase
+    /// has been abandoned.
+    fn covers(&self, front: UnitKind) -> Option<PaidItem> {
+        self.0.filter(|item| item.kind == front)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -1124,7 +1166,7 @@ fn spawn_buildings(
         if is_production(ev.kind) {
             commands
                 .entity(root)
-                .insert((TrainingQueue::default(), PaidFront(false)));
+                .insert((TrainingQueue::default(), PaidFront(None)));
         }
 
         nav.set_blocked_rect(pos, stats.size, true);
@@ -1364,7 +1406,7 @@ fn upgrade_progress(
             if !is_production(from) {
                 commands
                     .entity(entity)
-                    .try_insert((TrainingQueue::default(), PaidFront(false)));
+                    .try_insert((TrainingQueue::default(), PaidFront(None)));
             }
         } else {
             commands
@@ -2047,6 +2089,7 @@ fn training_queues(
     mut commands: Commands,
     nav: Res<NavGrid>,
     mut economies: ResMut<Economies>,
+    mut feed: ResMut<GameEvents>,
     records: Res<HeroRecords>,
     // How many heroes each team may field: `hero_slots` of its live tier.
     tiers: Res<TechTiers>,
@@ -2097,7 +2140,10 @@ fn training_queues(
         .collect();
     for (_, _, team, _, queue, paid, _, _) in buildings.iter() {
         let Some(&front) = queue.queue.front() else { continue };
-        if is_hero_kind(front) && paid.is_some_and(|p| p.0) {
+        // `covers`, not a bare flag: a payment left over from a CANCELLED hero
+        // must not keep that class's slot hostage. It is refunded below, and
+        // it holds nothing in the meantime.
+        if is_hero_kind(front) && paid.is_some_and(|p| p.covers(front).is_some()) {
             hero_committed.push((*team, front));
         }
     }
@@ -2117,15 +2163,43 @@ fn training_queues(
         if upgrading.is_some() {
             continue;
         }
-        let mut paid_front = paid.map(|p| p.0).unwrap_or(false);
+        let paid_state = paid.map(|p| *p).unwrap_or(PaidFront(None));
+        let front = queue.queue.front().copied();
 
-        let Some(&front) = queue.queue.front() else {
-            queue.progress = 0.0;
-            if paid_front {
-                commands.entity(entity).try_insert(PaidFront(false));
+        // **Refund an abandoned purchase.** Whatever we paid for is either
+        // still at the front of the queue or it has been cancelled out from
+        // under us; in the second case the money goes back to the treasury
+        // before anything else happens this tick. This is the ONLY refund path
+        // in the game, and it is here rather than in intent.rs's `cancel`
+        // because economy.rs owns every payment in both directions.
+        //
+        // What comes back is what went out, which for a hero is the number
+        // that matters: cancelling your free first Champion refunds 0, and
+        // cancelling a revival refunds the whole revival price.
+        if let Some(item) = paid_state.0.filter(|i| front != Some(i.kind)) {
+            if item.gold > 0 || item.lumber > 0 {
+                economies.get_mut(*team).refund(item.gold, item.lumber);
+                feed.push(
+                    *team,
+                    time.elapsed_secs(),
+                    format!(
+                        "{} cancelled — {}g {}l refunded",
+                        kind_name(item.kind),
+                        item.gold,
+                        item.lumber
+                    ),
+                    EventSeverity::Info,
+                    Some(flat(tf.translation)),
+                );
             }
+            commands.entity(entity).try_insert(PaidFront(None));
+        }
+
+        let Some(front) = front else {
+            queue.progress = 0.0;
             continue;
         };
+        let mut paid_item = paid_state.covers(front);
 
         let stats = unit_stats(front);
         // Heroes of either class are priced (and timed) by `hero_train_cost`:
@@ -2136,7 +2210,7 @@ fn training_queues(
             (stats.cost_gold, stats.cost_lumber, stats.train_time)
         };
 
-        if is_hero_kind(front) && !paid_front {
+        if is_hero_kind(front) && paid_item.is_none() {
             // THE hero-slot rule, asked in the one place it lives. Both
             // refusals — a duplicate class, and a full slate — drop the item
             // unpaid so the queue keeps moving, exactly the treatment the old
@@ -2153,7 +2227,7 @@ fn training_queues(
 
         // Pay the moment this item becomes the active front item. If we can't
         // afford it (or supply is blocked) the item simply waits in the queue.
-        if !paid_front {
+        if paid_item.is_none() {
             // Tech gate: an item whose requirements aren't met yet WAITS at the
             // front of the queue (like an unaffordable one) instead of being
             // dropped, so finishing the missing building resumes production.
@@ -2167,9 +2241,10 @@ fn training_queues(
             if !economies.get_mut(*team).pay(cost_gold, cost_lumber) {
                 continue;
             }
-            paid_front = true;
+            let item = PaidItem { kind: front, gold: cost_gold, lumber: cost_lumber };
+            paid_item = Some(item);
             queue.progress = 0.0;
-            commands.entity(entity).try_insert(PaidFront(true));
+            commands.entity(entity).try_insert(PaidFront(Some(item)));
             if is_hero_kind(front) {
                 // Later buildings in this same pass must see the commitment.
                 hero_committed.push((*team, front));
@@ -2180,7 +2255,7 @@ fn training_queues(
         if queue.progress >= train_time {
             queue.queue.pop_front();
             queue.progress = 0.0;
-            commands.entity(entity).try_insert(PaidFront(false));
+            commands.entity(entity).try_insert(PaidFront(None));
 
             let size = building_stats(building.kind).size;
             let pos = free_spawn_spot(&nav, flat(tf.translation), size, is_flying_kind(front));
@@ -2321,4 +2396,262 @@ fn free_spawn_spot(nav: &NavGrid, center: Vec3, size: f32, flying: bool) -> Vec3
         }
     }
     fallback
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the training queue's payment ledger
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A world with one hall that can train, and a treasury we can read.
+    /// `training_queues` is the only system under test — spawning is observed
+    /// through the `SpawnUnitEvent` it writes, so nothing here needs units.rs,
+    /// rendering, or a nav grid with real terrain.
+    fn app_with_hall(team: Team, gold: u32, lumber: u32) -> (App, Entity) {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<Economies>()
+            .init_resource::<HeroRecords>()
+            .init_resource::<TechTiers>()
+            .init_resource::<NavGrid>()
+            .init_resource::<GameEvents>()
+            .add_event::<SpawnUnitEvent>()
+            .add_systems(Update, training_queues);
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let e = economies.get_mut(team);
+            e.gold = gold;
+            e.lumber = lumber;
+            e.supply_cap = 100;
+            e.supply_used = 0;
+        }
+        let hall = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::TownHall },
+                team,
+                Transform::from_translation(Vec3::ZERO),
+                TrainingQueue::default(),
+                PaidFront(None),
+            ))
+            .id();
+        (app, hall)
+    }
+
+    /// Advance the world by `secs`, in one tick.
+    fn tick(app: &mut App, secs: f32) {
+        let mut time = app.world_mut().resource_mut::<Time>();
+        time.advance_by(std::time::Duration::from_secs_f32(secs));
+        app.update();
+    }
+
+    fn queue(app: &mut App, hall: Entity, kinds: &[UnitKind]) {
+        let mut q = app.world_mut().get_mut::<TrainingQueue>(hall).unwrap();
+        for &k in kinds {
+            q.queue.push_back(k);
+        }
+    }
+
+    fn cancel(app: &mut App, hall: Entity, index: usize) {
+        // Exactly what intent.rs's `cancel` verb does: edit the queue and
+        // nothing else. Every consequence is economy.rs's to work out.
+        let mut q = app.world_mut().get_mut::<TrainingQueue>(hall).unwrap();
+        q.queue.remove(index);
+        if index == 0 {
+            q.progress = 0.0;
+        }
+    }
+
+    fn queue_len(app: &App, hall: Entity) -> usize {
+        app.world().get::<TrainingQueue>(hall).unwrap().queue.len()
+    }
+    fn gold(app: &App, team: Team) -> u32 {
+        app.world().resource::<Economies>().get(team).gold
+    }
+    fn lumber(app: &App, team: Team) -> u32 {
+        app.world().resource::<Economies>().get(team).lumber
+    }
+
+    /// **Your first hero of a class is free.** Not discounted, not deferred:
+    /// the treasury is untouched, and the 25 seconds are still spent.
+    #[test]
+    fn a_first_hero_trains_free_and_still_takes_its_full_time() {
+        for (hero, race) in [(UnitKind::Hero, "Kingdom"), (UnitKind::Warchief, "Horde")] {
+            let team = Team::Human;
+            let (mut app, hall) = app_with_hall(team, 0, 0);
+            queue(&mut app, hall, &[hero]);
+
+            // Zero gold, zero lumber, and it starts anyway.
+            tick(&mut app, 0.5);
+            assert_eq!(gold(&app, team), 0, "{race}: a free hero costs no gold");
+            assert_eq!(lumber(&app, team), 0, "{race}: and no lumber");
+            assert!(
+                app.world().get::<PaidFront>(hall).unwrap().0.is_some(),
+                "{race}: free still means PAID — the item is committed"
+            );
+
+            // Free is not instant. The train time is the row's, untouched.
+            let train_time = unit_stats(hero).train_time;
+            tick(&mut app, train_time - 2.0);
+            assert_eq!(queue_len(&app, hall), 1, "{race}: free is not instant");
+            tick(&mut app, 3.0);
+            assert_eq!(queue_len(&app, hall), 0, "{race}: and it does finish");
+        }
+    }
+
+    /// ...and the bill arrives on death. A class with a record costs its
+    /// revival price, in gold AND lumber, on both rosters.
+    #[test]
+    fn reviving_a_recorded_hero_costs_the_revival_price_in_full() {
+        for hero in [
+            UnitKind::Hero,
+            UnitKind::Priestess,
+            UnitKind::Warchief,
+            UnitKind::FarSeer,
+        ] {
+            let team = Team::Claude;
+            let (mut app, hall) = app_with_hall(team, 1000, 1000);
+            // A record is what "this class has died at least once" means.
+            app.world_mut().resource_mut::<HeroRecords>().set(
+                team,
+                HeroRecord { level: 5, xp: 3.0, kind: hero },
+            );
+            queue(&mut app, hall, &[hero]);
+            tick(&mut app, 0.5);
+
+            let s = unit_stats(hero);
+            assert_eq!(gold(&app, team), 1000 - s.revive_gold, "{hero:?} revival gold");
+            assert_eq!(gold(&app, team), 600, "{hero:?} revival is 400g flat");
+            assert_eq!(lumber(&app, team), 1000 - s.revive_lumber, "{hero:?} lumber");
+            assert_eq!(lumber(&app, team), 900, "{hero:?} revival is 100l flat");
+        }
+    }
+
+    /// **Cancelling a free hero refunds nothing, because nothing was paid.**
+    /// The interesting half is that the treasury must not GAIN either — a
+    /// zero-price item is still a paid item, and a refund path that handed
+    /// back "the catalog price" would mint gold on every cancel.
+    #[test]
+    fn cancelling_a_free_hero_refunds_nothing() {
+        let team = Team::Human;
+        let (mut app, hall) = app_with_hall(team, 500, 500);
+        queue(&mut app, hall, &[UnitKind::Hero]);
+        tick(&mut app, 0.5);
+        assert_eq!(gold(&app, team), 500, "nothing was paid");
+
+        cancel(&mut app, hall, 0);
+        tick(&mut app, 0.5);
+        assert_eq!(gold(&app, team), 500, "so nothing comes back");
+        assert_eq!(lumber(&app, team), 500);
+        assert!(app.world().get::<PaidFront>(hall).unwrap().0.is_none());
+    }
+
+    /// **Cancelling a revival refunds the revival price**, exactly and once.
+    /// This is now the largest single refundable purchase in the game, and the
+    /// r18 ledger records a commander queueing a hero and cancelling it
+    /// mid-push for line units — so it is a button that gets pressed.
+    #[test]
+    fn cancelling_a_revival_refunds_the_whole_revival_price() {
+        let team = Team::Human;
+        let (mut app, hall) = app_with_hall(team, 500, 500);
+        app.world_mut().resource_mut::<HeroRecords>().set(
+            team,
+            HeroRecord { level: 4, xp: 1.0, kind: UnitKind::Hero },
+        );
+        queue(&mut app, hall, &[UnitKind::Hero]);
+        tick(&mut app, 0.5);
+        assert_eq!((gold(&app, team), lumber(&app, team)), (100, 400), "charged");
+
+        cancel(&mut app, hall, 0);
+        tick(&mut app, 0.5);
+        assert_eq!(
+            (gold(&app, team), lumber(&app, team)),
+            (500, 500),
+            "the whole revival price comes back"
+        );
+        // ...and only once, however many ticks pass.
+        tick(&mut app, 5.0);
+        assert_eq!((gold(&app, team), lumber(&app, team)), (500, 500), "not twice");
+    }
+
+    /// **A cancelled payment is never inherited by the next item in the
+    /// queue.** This was a live exploit: `PaidFront` was a bare bool, so
+    /// cancelling a paid Footman left the flag standing and whatever came next
+    /// trained for free — and, because the hero-slot check also sits behind
+    /// `if !paid_front`, a hero sliding into that slot skipped the slot rule
+    /// on the way past.
+    #[test]
+    fn a_cancelled_payment_does_not_buy_the_next_item() {
+        let team = Team::Human;
+        let footman = unit_stats(UnitKind::Footman).cost_gold;
+        let (mut app, hall) = app_with_hall(team, 500, 500);
+        app.world_mut().resource_mut::<HeroRecords>().set(
+            team,
+            HeroRecord { level: 6, xp: 9.0, kind: UnitKind::Hero },
+        );
+        queue(&mut app, hall, &[UnitKind::Footman, UnitKind::Hero]);
+        tick(&mut app, 0.5);
+        assert_eq!(gold(&app, team), 500 - footman, "the Footman paid");
+
+        cancel(&mut app, hall, 0);
+        tick(&mut app, 0.5);
+        // Footman money back, then the revival charged on its own merits.
+        assert_eq!(
+            gold(&app, team),
+            100,
+            "the Champion must buy its own revival, not ride the Footman's receipt"
+        );
+        assert_eq!(lumber(&app, team), 400);
+    }
+
+    /// Cancelling one of two identical queued units is not an abandoned
+    /// purchase — one body was bought and one body is being built, so the
+    /// receipt carries across and no refund is due.
+    #[test]
+    fn cancelling_one_of_two_identical_units_carries_the_receipt() {
+        let team = Team::Human;
+        let cost = unit_stats(UnitKind::Footman).cost_gold;
+        let (mut app, hall) = app_with_hall(team, 500, 500);
+        queue(&mut app, hall, &[UnitKind::Footman, UnitKind::Footman]);
+        tick(&mut app, 0.5);
+        assert_eq!(gold(&app, team), 500 - cost);
+
+        cancel(&mut app, hall, 0);
+        tick(&mut app, 0.5);
+        assert_eq!(
+            gold(&app, team),
+            500 - cost,
+            "one paid, one building — refunding here would make units free"
+        );
+    }
+
+    /// A broke team cannot revive, and that is the whole mechanism: the hero
+    /// waits at the front of the queue instead of being dropped, so income
+    /// resumes it. The free FIRST hero, by contrast, never waits for anything.
+    #[test]
+    fn a_revival_waits_for_money_that_a_first_hero_never_needed() {
+        let team = Team::Human;
+        let (mut app, hall) = app_with_hall(team, 0, 0);
+        app.world_mut().resource_mut::<HeroRecords>().set(
+            team,
+            HeroRecord { level: 2, xp: 0.0, kind: UnitKind::Hero },
+        );
+        queue(&mut app, hall, &[UnitKind::Hero]);
+        tick(&mut app, 30.0);
+        assert_eq!(queue_len(&app, hall), 1, "no money, no revival — but still queued");
+        assert!(app.world().get::<PaidFront>(hall).unwrap().0.is_none());
+
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let e = economies.get_mut(team);
+            e.gold = 400;
+            e.lumber = 100;
+        }
+        tick(&mut app, HERO_REVIVE_TIME + 1.0);
+        assert_eq!(queue_len(&app, hall), 0, "paid, and out it comes");
+        assert_eq!((gold(&app, team), lumber(&app, team)), (0, 0));
+    }
 }

@@ -853,13 +853,16 @@ struct MeOut {
     hero_slots: u32,
     hero_slots_used: u32,
     /// One entry per hero CLASS you have ever fielded, whether or not that
-    /// hero is currently alive. `alive` false means it is dead and revivable
-    /// at `cost` (cheaper, and it keeps `level`).
+    /// hero is currently alive. `alive` false means it is dead and can be
+    /// bought back at that class's `revive_gold`/`revive_lumber`, keeping the
+    /// `level` printed here.
     hero_records: Vec<HeroRecordOut>,
-    /// What each hero class would cost you to put in a queue RIGHT NOW: full
-    /// price for a class you have never fielded, revival price for one you
-    /// have. Every class is listed, including ones your slots have no room
-    /// for — `hero_slots_used` vs `hero_slots` is the gate, not this.
+    /// What each hero class costs you to put in a queue RIGHT NOW, and what it
+    /// will cost when it dies. **Your first hero of a class is free** — 0g 0l,
+    /// paid only in 25 seconds of hall time and 5 supply — and the price
+    /// appears the moment you have one to lose. Every class is listed,
+    /// including ones your slots have no room for; `hero_slots_used` vs
+    /// `hero_slots` is the gate, not this.
     hero_costs: Vec<HeroCostOut>,
     /// Team-wide research: one entry per ladder in `catalog.research`, always
     /// present and always both ladders, so a commander can read a level off a
@@ -922,12 +925,23 @@ struct HeroRecordOut {
 #[derive(Serialize)]
 struct HeroCostOut {
     kind: &'static str,
+    /// What queuing this class costs you RIGHT NOW. **Zero until the class
+    /// dies**: your first hero of each class is free.
     gold: u32,
     lumber: u32,
+    /// Seconds in the queue — the part that is never free. A first hero is
+    /// 25s of hall time you are not spending on workers; a revival is faster.
     time: f32,
-    /// True when this is the (cheaper) revival price of a hero you already
-    /// opened a record for.
+    /// True when `gold`/`lumber` above are a REVIVAL price, i.e. this class
+    /// has died at least once and comes back at its recorded level.
     revive: bool,
+    /// What this class will cost the NEXT time it dies — the same numbers
+    /// whether it is currently free, alive, or already dead, because the
+    /// revival fee is flat rather than scaled by level. Carried alongside
+    /// `gold`/`lumber` so a commander can budget for a hero's death BEFORE it
+    /// happens instead of discovering the price at the funeral.
+    revive_gold: u32,
+    revive_lumber: u32,
 }
 
 #[derive(Serialize)]
@@ -2128,12 +2142,15 @@ fn write_seat_snapshot(
                 .filter(|k| is_hero_kind(*k))
                 .map(|k| {
                     let (gold, lumber, time) = hero_train_cost(records, me, k);
+                    let (revive_gold, revive_lumber) = unit_value(k);
                     HeroCostOut {
                         kind: kind_name(k),
                         gold,
                         lumber,
                         time,
                         revive: records.get(me, k).is_some(),
+                        revive_gold,
+                        revive_lumber,
                     }
                 })
                 .collect(),
