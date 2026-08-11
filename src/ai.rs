@@ -3,12 +3,45 @@
 //! spectating: launch with `WC3_AI_BOTH=1`, or press F9 at runtime.
 //!
 //! A macro-focused RTS AI that plays strictly through the same primitives the
-//! human UI uses: it writes `Order` components on its own units, pushes
-//! `UnitKind`s onto its own buildings' `TrainingQueue`, and issues
-//! `Order::Build` on its workers. It never spawns anything, never touches
-//! `Health`, and only *reads* `Economies` (economy.rs does all the paying).
-//! Because of that, sharing a team with the player is harmless: the AI simply
-//! reassigns whatever it finds idle on its next tick.
+//! human UI uses — and, since wc3clone-jem, through the *identical* ones.
+//!
+//! ## The third seat
+//!
+//! This file mutates nothing. Its entire output is `SubmitIntent` events with
+//! `IntentSource::Script`: the same `shared::Intent` values ui.rs compiles out
+//! of a right-click and bridge.rs deserializes out of `commands.json`, read by
+//! the same `intent.rs` compiler, in the same frame. It used to write `Order`
+//! components, push `TrainingQueue`s and send `UpgradeBuilding`/`StartResearch`
+//! /`BuyItem`/`UseItem`/`CastAbility` directly, which made the fairness
+//! invariant a claim with a footnote attached. There is no footnote now.
+//!
+//! What that buys, concretely:
+//!
+//!   * **Validation.** The script is refused by the same rules a commander is
+//!     — fog, ownership, tech gates, affordability, hero slots, queue caps. It
+//!     cannot place a building on ground a player would be told is blocked.
+//!   * **The replay.** `WC3_INTENT_LOG` now records all three authors. A sim
+//!     against the scripted baseline is readable as a match transcript rather
+//!     than as one commander talking into a silence.
+//!   * **Provenance.** Its units answer `order:attackmove by script t=…`,
+//!     which joins against the log by exactly the rule everyone else joins by.
+//!   * **Latency.** The compiler prices the link (docs/TEMPO.md §3). ai.rs no
+//!     longer reaches for `OrderIssuer` itself to stay honest — it is honest
+//!     because it has no other way to act.
+//!
+//! **Planning is not acting.** The ring-fences, reserves, cadences and site
+//! choices below stay exactly where they are: deciding what to want is this
+//! file's job, and doing it is the compiler's. The one place the two touch is
+//! build placement, which snaps to the compiler's nav lattice *before* the
+//! script vets the ground — see `think`'s build section.
+//!
+//! **Rejection is normal.** A think tick states what it wants against the
+//! world it saw; the compiler judges it against the world as it is. When the
+//! two disagree the intent is refused, the refusal goes to the debug log (not
+//! to any seat's error channel — see `intent::apply_intents`), and the script
+//! re-thinks a second later. Nothing latches on a rejection: every optimistic
+//! bookkeeping flag below (`pending_build` above all) re-arms itself from what
+//! the world actually looks like on the next tick.
 //!
 //! Everything runs from one `ai_think` system on a ~1s timer, which runs the
 //! same `think` body once per AI-controlled team against that team's own
@@ -16,7 +49,7 @@
 //! the team being thought for. All difficulty knobs live in the const block
 //! below.
 
-use crate::command::{CommandLink, OrderIssuer};
+use crate::intent::snap_footprint;
 use crate::shared::*;
 // The map's published geography. Read-only, and the same three facts a bridge
 // commander is handed in every snapshot (`map.chokepoints`) — the scripted AI
@@ -408,10 +441,22 @@ impl Plugin for AiPlugin {
             .add_systems(
                 Update,
                 // Chained and boxed into `SimSet::AiThink`, which sits between
-                // the fog recompute and doctrine: the scripted commander plans
-                // from this frame's visibility and writes the `SquadOrders`
-                // that doctrine executes later in the SAME frame, rather than
-                // racing it and landing next frame half the time.
+                // the fog recompute and the compiler: the scripted commander
+                // plans from this frame's visibility, and the `SubmitIntent`s
+                // it writes are drained by `apply_intents` in `SimSet::Intent`
+                // — four sets later, the SAME frame. Nothing is deferred by a
+                // tick.
+                //
+                // **The one thing that did move** (wc3clone-jem): the script's
+                // actions used to land in `AiThink`, i.e. BEFORE doctrine.rs
+                // ran in `SimSet::Think`, so a squad posture or a retreat
+                // trigger could overwrite an order the script had given in the
+                // same frame. They land in `SimSet::Intent` now, after
+                // doctrine — which is precisely where a human's right-click
+                // and a bridge command have always landed. The script lost a
+                // privilege rather than gaining one, and it only bites on a
+                // faction that is under autopilot *and* still carrying
+                // doctrine a player set before handing it over.
                 (seed_machine_autocast, ai_think)
                     .chain()
                     .in_set(SimSet::AiThink)
@@ -453,7 +498,7 @@ type HeroPolicyQuery<'w, 's> = Query<
 /// is written.
 fn seed_machine_autocast(
     ai_controlled: Res<AiControlled>,
-    mut commands: Commands,
+    mut intents: EventWriter<SubmitIntent>,
     heroes: HeroPolicyQuery,
 ) {
     for (entity, unit, team, health, policy) in &heroes {
@@ -471,10 +516,6 @@ fn seed_machine_autocast(
         {
             continue;
         }
-        let mut next = policy.cloned().unwrap_or_default();
-        for (index, min) in &wanted {
-            next.set(*index, *min);
-        }
         // One line per hero (so, per revive): the standing doctrine a
         // machine-driven team just acquired, by ability name rather than slot.
         let list = abilities_of_unit(unit.kind);
@@ -489,7 +530,26 @@ fn seed_machine_autocast(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        commands.entity(entity).try_insert(next);
+        // One `autocast` intent per rule — the verb is per-slot for exactly
+        // this reason ("a hero told to auto-heal does not thereby stop
+        // auto-slamming"), so the script edits the rules it owns and leaves
+        // anything else on the policy alone, which is what the direct
+        // `AutoCastPolicy::set` loop this replaced did by hand.
+        //
+        // Idempotent through the compiler as well as before it: the check
+        // above skips a hero whose policy already matches, and the compiler's
+        // writes flush at the end of `SimSet::Intent`, so the next frame reads
+        // the applied policy and says nothing.
+        for (index, min) in &wanted {
+            intents.write(SubmitIntent::script(
+                *team,
+                Intent::Autocast {
+                    units: vec![intent_id(entity)],
+                    min_enemies: Some(*min),
+                    ability: Some(AbilitySelector::Index(*index)),
+                },
+            ));
+        }
     }
 }
 
@@ -768,7 +828,11 @@ type BuildingQuery<'w, 's> = Query<
         &'static Team,
         &'static Transform,
         Option<&'static UnderConstruction>,
-        Option<&'static mut TrainingQueue>,
+        // Read-only since wc3clone-jem: the script asks for a unit with an
+        // `Intent::Train` and the compiler does the pushing, so this column is
+        // now purely "how deep is the queue" — one of the facts the decision
+        // is made from, not a thing being written.
+        Option<&'static TrainingQueue>,
         Option<&'static Upgrading>,
         Option<&'static Researching>,
     ),
@@ -776,25 +840,92 @@ type BuildingQuery<'w, 's> = Query<
 
 type NodeQuery<'w, 's> = Query<'w, 's, (Entity, &'static ResourceNode, &'static Transform)>;
 
-/// Every event the scripted commander can send, in one parameter.
+/// **Everything the scripted commander can do**, which is: say something.
 ///
-/// Bundled rather than listed because Bevy caps a system's parameter list and
-/// `ai_think` had reached it — but also because this IS the AI's whole output
-/// surface. The script mutates nothing directly except `Order` components; each
-/// field below is one of the five things it is allowed to ASK the engine for,
-/// through the identical event the player's hotkey sends.
-#[derive(bevy::ecs::system::SystemParam)]
-struct AiEvents<'w> {
-    /// Hero abilities (the Champion's Slam).
-    casts: EventWriter<'w, CastAbility>,
-    /// Hall tier-ups.
-    upgrades: EventWriter<'w, UpgradeBuilding>,
-    /// Blacksmith research rungs.
-    research: EventWriter<'w, StartResearch>,
-    /// Shop purchases.
-    buys: EventWriter<'w, BuyItem>,
-    /// Spending a consumable out of the hero's inventory.
-    uses: EventWriter<'w, UseItem>,
+/// One channel, one verb list, one compiler. Wrapped in a struct rather than
+/// passed as a bare `EventWriter` so the team is carried alongside it — a
+/// brain must never be able to speak for the faction it is playing against,
+/// and the way to guarantee that is to make `me` un-passable at the call site.
+///
+/// The counter is for the report a sim run is read for: how much the script
+/// actually says per tick is a number this bead had to measure, and measuring
+/// it anywhere else means reconstructing it from the log.
+struct Voice<'a, 'w> {
+    intents: &'a mut EventWriter<'w, SubmitIntent>,
+    me: Team,
+    said: u32,
+}
+
+impl Voice<'_, '_> {
+    /// State one intent, on behalf of this brain's team.
+    ///
+    /// Nothing comes back. A refusal is not an exception the caller handles:
+    /// the compiler logs it, the brain re-thinks in a second, and every
+    /// optimistic assumption made around this call (money spent, a build slot
+    /// claimed) is re-derived from the world next tick rather than trusted.
+    fn say(&mut self, intent: Intent) {
+        self.said += 1;
+        self.intents.write(SubmitIntent::script(self.me, intent));
+    }
+
+    /// **One sentence for a whole group**, skipped when the group is empty.
+    ///
+    /// For the verbs where naming twelve units and naming one twelve times are
+    /// indistinguishable in the world: `harvest` names a node and `return`
+    /// names nowhere, so neither passes through `ground_order`'s formation
+    /// spread and neither can be changed by how it is phrased. Those get the
+    /// phrasing a commander would use, which is also the cheaper one.
+    ///
+    /// The verbs where the phrasing *does* change the world — `move` and
+    /// `attackmove` — deliberately do not come through here. See `say_each`.
+    ///
+    /// The empty check earns its keep: "nobody needs re-tasking this tick" is
+    /// the common case, and a sentence with an empty `units` list is a line in
+    /// the replay saying nothing happened.
+    fn say_group(&mut self, group: Vec<IntentId>, make: impl FnOnce(Vec<IntentId>) -> Intent) {
+        if group.is_empty() {
+            return;
+        }
+        self.say(make(group));
+    }
+
+    /// **A ground order, one unit per sentence** — and the one place this bead
+    /// deliberately did NOT batch.
+    ///
+    /// `Intent::Move` / `Intent::AttackMove` are the only verbs whose *result*
+    /// depends on how many units are named: `intent::ground_order` spreads a
+    /// group over `formation_offset`, so "these twenty units attack-move to X"
+    /// puts twenty units on a 2.6-spaced grid around X, while twenty
+    /// single-unit sentences put all twenty on X itself. Every other verb the
+    /// script uses is geometry-free — `harvest` names a node, `return` names
+    /// nowhere — which is why those *are* batched a few lines up.
+    ///
+    /// The scripted commander has always converged its waves on a single
+    /// point, and that is a **tuning decision**, not a spelling one. Measured
+    /// on this bead (wc3clone-jem), batching the military branches made the
+    /// baseline roughly 40% more lethal — `crossings` fell from ~7.6min to
+    /// ~4.75min, out of the documented 5–12min band — because a spread line
+    /// engages with more of itself at once. That is a real improvement to how
+    /// the script fights, and it would have arrived here disguised as
+    /// plumbing, silently invalidating every balance number keyed to the
+    /// scripted baseline (docs/TEMPO.md's 45-run sweep among them). So the
+    /// script keeps saying what it always said.
+    ///
+    /// **Nothing is privileged by this.** A human can order units one at a
+    /// time, and a commander on the wire can send twenty one-unit `move`s;
+    /// the compiler validates each identically and charges each unit its own
+    /// link either way (`ground_order` already prices per member). Declining
+    /// the formation is a tactic available to all three seats, not a private
+    /// door — which is exactly the test this file now has to pass.
+    ///
+    /// Giving the script the formation is a live option for whoever next
+    /// retunes the baseline. It is a balance bead, and it should be measured
+    /// as one.
+    fn say_each(&mut self, group: Vec<IntentId>, make: impl Fn(Vec<IntentId>) -> Intent) {
+        for id in group {
+            self.say(make(vec![id]));
+        }
+    }
 }
 
 /// **The scripted commander's roster lookup — one kind per ROLE.**
@@ -918,19 +1049,21 @@ fn ai_think(
     records: Res<HeroRecords>,
     nav: Res<NavGrid>,
     fog: Res<FogGrids>,
-    mut commands: Commands,
-    mut events: AiEvents,
+    // The whole output surface (see `Voice`). docs/TEMPO.md §3 — "the scripted
+    // AI pays latency too, or autopilot becomes a cheat and C1 is violated at
+    // the third seat" — used to be satisfied here by reaching for the same
+    // `OrderIssuer` the compiler uses. It is satisfied structurally now: the
+    // script has no way to issue an order except by asking the compiler to,
+    // and the compiler prices every one of them.
+    mut intents: EventWriter<SubmitIntent>,
     team_research: Res<TeamResearch>,
     units: UnitQuery,
-    mut buildings: BuildingQuery,
+    buildings: BuildingQuery,
     nodes: NodeQuery,
+    // Which roster each team is playing. The one race-dependent input the
+    // script has: everything below reaches for a ROLE and this resolves it to
+    // a kind (see `Roster`).
     races: Res<Races>,
-    // docs/TEMPO.md §3: THE SCRIPTED AI PAYS LATENCY TOO. It is the third
-    // seat, and "if autopilot is exempt it becomes a cheat and C1 is violated
-    // at the third seat" is the spike's own wording. ai.rs does not go through
-    // the intent compiler (a known, documented asymmetry — docs/INTENT.md), so
-    // it reaches the same mechanism through the same helper the compiler uses.
-    link: CommandLink,
 ) {
     if game_over.winner.is_some() {
         return;
@@ -950,6 +1083,11 @@ fn ai_think(
         }
         // Each brain sees only its own state; `me` decides every position.
         let brain = state.brain_mut(team);
+        let mut voice = Voice {
+            intents: &mut intents,
+            me: team,
+            said: 0,
+        };
         think(
             team,
             races.get(team),
@@ -959,14 +1097,18 @@ fn ai_think(
             &records,
             &nav,
             fog.get(team),
-            &mut commands,
-            &mut events,
-            &mut link.issuer(now),
+            &mut voice,
             &team_research,
             &units,
-            &mut buildings,
+            &buildings,
             &nodes,
         );
+        // The log-volume number this bead was asked for, available without
+        // parsing anything: `RUST_LOG=debug` on a sim prints one of these per
+        // team per second and the total is the intent log's growth rate.
+        if voice.said > 0 {
+            debug!("[ai {team:?}] said {} intent(s) this tick", voice.said);
+        }
     }
 }
 
@@ -986,16 +1128,14 @@ fn think(
     // scripted commander plans from the same picture a bridge commander is
     // sent and the same one the player is shown.
     fog: &FogGrid,
-    commands: &mut Commands,
-    events: &mut AiEvents,
-    // Every unit order below is issued through this, exactly as a human's
-    // right-click and a bridge commander's `move` are. See the `Order::` sites
-    // in this function: each one names the unit's own position, so the script
-    // pays the same distance-to-command-node cost anybody else does.
-    issuer: &mut OrderIssuer,
+    // The only way out of this function. Every decision below ends in a
+    // `voice.say(...)`, exactly as a human's right-click and a bridge
+    // commander's `move` end in a `SubmitIntent` — same verbs, same compiler,
+    // same validation, same link, same replay log.
+    voice: &mut Voice,
     team_research: &TeamResearch,
     units: &UnitQuery,
-    buildings: &mut BuildingQuery,
+    buildings: &BuildingQuery,
     nodes: &NodeQuery,
 ) {
     let r = Roster::of(race);
@@ -1259,14 +1399,17 @@ fn think(
         if w.tag != Tag::Move {
             let a = (w.entity.index() % 8) as f32 * std::f32::consts::TAU / 8.0;
             let safe = base + Vec3::new(a.cos(), 0.0, a.sin()) * 6.0;
-            issuer.issue(
-                commands,
-                me,
-                w.pos,
-                w.entity,
-                Order::Move(safe),
-                script("flee", now),
-            );
+            // One worker per sentence, not a group: each is sent to a
+            // different spoke of the same ring, so there is no shared
+            // destination to batch on. Guarded by `tag != Move` above, which
+            // is what keeps a base under siege from restating the same
+            // scatter every second.
+            voice.say(Intent::Move {
+                units: vec![intent_id(w.entity)],
+                x: Some(safe.x),
+                z: Some(safe.z),
+                region: None,
+            });
         }
     }
 
@@ -1478,18 +1621,39 @@ fn think(
                         .find(|p| nav.rect_is_free(*p, footprint)),
                     _ => pick_site(nav, anchor, footprint),
                 };
+                // **Speak the compiler's lattice.** `Intent::Build` snaps the
+                // site so a footprint's edges land on nav-cell boundaries —
+                // the same snap the human's placement ghost shows — and THEN
+                // checks the ground. A site the script vetted before the snap
+                // is a site the compiler might refuse a cell later, so the
+                // script snaps first and vets the snapped point.
+                //
+                // The vet does not have to be repeated: every picker above
+                // clears `stats.size + BUILD_PADDING`, the padding is one full
+                // cell of slack on each side, and the snap moves the centre by
+                // at most half a cell per axis — so the snapped footprint is
+                // strictly inside ground already known to be free. That is why
+                // this is a `map` and not a `filter`, and why routing build
+                // through the compiler costs the script no placements.
+                let site = site.map(|p| snap_footprint(p, stats.size));
                 if let Some(site) = site {
                     if let Some(builder) = pick_builder(&workers, &fleeing, site) {
                         // Exempt from link latency, exactly as a human's or a
-                        // commander's `build` is — same row of command.rs's
-                        // verb table, same reason (the worker walks there
-                        // anyway). It still carries its reason.
-                        issuer.issue_instant(
-                            commands,
-                            builder,
-                            Order::Build { kind, pos: site },
-                            script("build", now),
-                        );
+                        // commander's `build` is — because it is now literally
+                        // the same arm of the same compiler, rather than this
+                        // file remembering to call `issue_instant`.
+                        voice.say(Intent::Build {
+                            worker: intent_id(builder),
+                            kind: building_name(kind).to_string(),
+                            x: Some(site.x),
+                            z: Some(site.z),
+                            region: None,
+                        });
+                        // Optimistic, and safe to be: if the compiler refuses
+                        // the placement the worker never picks up an
+                        // `Order::Build`, so next tick's `still_building`
+                        // check clears this slot and the expansion ring-fence
+                        // with it, and the build order simply retries.
                         brain.pending_build = Some(builder);
                         busy_worker = Some(builder);
                         // economy.rs pays at placement; assume it lands.
@@ -1638,8 +1802,8 @@ fn think(
                     if payable && gold >= cost_gold && lumber >= cost_lumber {
                         gold -= cost_gold;
                         lumber -= cost_lumber;
-                        events.upgrades.write(UpgradeBuilding {
-                            building: hall.entity,
+                        voice.say(Intent::Upgrade {
+                            building: intent_id(hall.entity),
                         });
                         info!(
                             "[ai {me:?}] teching up: {} -> {} at ({:.0},{:.0}) for \
@@ -1713,9 +1877,12 @@ fn think(
                 if spare && lumber >= step.cost_lumber {
                     gold -= step.cost_gold;
                     lumber -= step.cost_lumber;
-                    events.research.write(StartResearch {
-                        building: forge.entity,
-                        kind,
+                    voice.say(Intent::Research {
+                        building: intent_id(forge.entity),
+                        // The ladder id the catalog publishes, which is what
+                        // `parse_research_kind` reads and what a commander
+                        // would have typed.
+                        upgrade: kind.id().to_string(),
                     });
                     info!(
                         "[ai {me:?}] researching {} {} at ({:.0},{:.0}) for {}g {}l (army {})",
@@ -1740,6 +1907,19 @@ fn think(
     }
 
     // --- put idle workers back on resources ----------------------------------
+    //
+    // Collected before it is spoken, so a crew sent to one patch is ONE
+    // sentence ("harvest that mine with these four") instead of four. That is
+    // how a commander on the wire would say it, and `harvest` is one of the
+    // verbs where the two phrasings are indistinguishable in the world — it
+    // names a node, not a point, so there is no formation to spread. See
+    // `Voice::say_group` and, for the verbs where it is NOT free, `say_each`.
+    //
+    // `Vec` rather than a map, keyed by first appearance: the order sentences
+    // come out in has to be a function of the world and nothing else, or
+    // `WC3_SEED` stops reproducing a match.
+    let mut haulers: Vec<IntentId> = Vec::new();
+    let mut crews: Vec<(Entity, Vec<IntentId>)> = Vec::new();
     for w in &workers {
         if !w.free() {
             continue;
@@ -1753,14 +1933,7 @@ fn think(
         if w.carrying {
             // Stranded with a full load (e.g. after a failed drop-off):
             // deliver it; economy.rs resumes the remembered node afterwards.
-            issuer.issue(
-                commands,
-                me,
-                w.pos,
-                w.entity,
-                Order::ReturnResources,
-                script("haul", now),
-            );
+            haulers.push(intent_id(w.entity));
             continue;
         }
         brain.harvest_counter = brain.harvest_counter.wrapping_add(1);
@@ -1773,15 +1946,18 @@ fn think(
         let node = nearest_node(nodes, w.pos, first)
             .or_else(|| nearest_node(nodes, w.pos, other_resource(first)));
         if let Some(node) = node {
-            issuer.issue(
-                commands,
-                me,
-                w.pos,
-                w.entity,
-                Order::Harvest(node),
-                script("harvest", now),
-            );
+            match crews.iter_mut().find(|(n, _)| *n == node) {
+                Some((_, crew)) => crew.push(intent_id(w.entity)),
+                None => crews.push((node, vec![intent_id(w.entity)])),
+            }
         }
+    }
+    voice.say_group(haulers, |units| Intent::Return { units });
+    for (node, crew) in crews {
+        voice.say(Intent::Harvest {
+            units: crew,
+            target: intent_id(node),
+        });
     }
 
     // --- spread the gold line across the mines we hold -----------------------
@@ -1794,7 +1970,7 @@ fn think(
     let mut shift_skip: Vec<Entity> = fleeing.clone();
     shift_skip.extend(busy_worker);
     shift_skip.extend(brain.pending_build);
-    rebalance_mines(me, &mines, &workers, &shift_skip, nodes, commands, now, issuer);
+    rebalance_mines(&mines, &workers, &shift_skip, nodes, voice);
 
     // --- training ------------------------------------------------------------
     let mut worker_count = workers.len();
@@ -1922,9 +2098,13 @@ fn think(
                     if engaged { ", in a fight" } else { "" },
                     if marching { ", marching out" } else { "" },
                 );
-                events.uses.write(UseItem {
-                    hero: hero.entity,
+                voice.say(Intent::UseItem {
                     slot,
+                    // `hero` named explicitly rather than left to the
+                    // compiler's lowest-living-id default: the script picked
+                    // THIS hero's bag when it read the inventory, and a team
+                    // with two heroes must not drink out of the other one's.
+                    hero: Some(intent_id(hero.entity)),
                     // The scripted AI does not pick a hall. `None` is the
                     // nearest one, which is exactly what it got before the
                     // field existed — the baseline this ladder measures
@@ -1941,10 +2121,10 @@ fn think(
                         "[ai {me:?}] hero buys {} for {}g (bank {gold}g after)",
                         def.name, def.cost_gold
                     );
-                    events.buys.write(BuyItem {
-                        shop: shop.entity,
-                        hero: hero.entity,
-                        item: id,
+                    voice.say(Intent::Buy {
+                        shop: intent_id(shop.entity),
+                        item: def.name.to_string(),
+                        hero: Some(intent_id(hero.entity)),
                     });
                 } else {
                     brain.item_pending = true;
@@ -2171,10 +2351,17 @@ fn think(
         }
     }
 
+    // One `train` per item, because that is what the verb is: a commander who
+    // wants two Footmen says it twice, and giving the script a plural the
+    // other seats do not have would be exactly the kind of quiet privilege
+    // this bead exists to remove. The compiler re-checks the tech gate, the
+    // hero slots, the queue cap and the price — all of which the loop above
+    // already respected, which is why this is a conversion and not a nerf.
     for (entity, kind) in orders {
-        if let Ok((_, _, _, _, _, Some(mut queue), _, _)) = buildings.get_mut(entity) {
-            queue.queue.push_back(kind);
-        }
+        voice.say(Intent::Train {
+            building: intent_id(entity),
+            unit: kind_name(kind).to_string(),
+        });
     }
 
     // --- military ------------------------------------------------------------
@@ -2194,33 +2381,55 @@ fn think(
             .filter(|e| e.distance(*pos) <= slam_radius)
             .count();
         if nearby >= SLAM_MIN_TARGETS {
-            // Through the issuer like everything else the script orders. A
-            // hero IS a command node, so this computes zero and fires in the
-            // same frame it always did — but routing it here means the day the
-            // script learns to hand-fire a Sorcerer, the third seat pays for
-            // that reach automatically instead of quietly not paying.
-            // `None` aim: the Slam is caster-centred, so there is nothing to
-            // point it at. The day the script hand-fires a targeted ability it
-            // can pass a `CastTarget` here, or pass `None` and let the engine's
-            // auto-pick aim it — the same rule the auto-caster uses.
-            issuer.issue_cast(commands, &mut events.casts, me, hero.pos, hero.entity, None, None);
+            // `ability: None` — slot 0, which is what the script has always
+            // fired; and no aim, because the Slam is caster-centred and there
+            // is nothing to point it at. The day the script hand-fires a
+            // targeted ability it fills in `x`/`z` or `target`, or omits both
+            // and lets the compiler's auto-pick aim it, which is the same rule
+            // the auto-caster obeys and the same sentence a commander writes.
+            //
+            // A hero IS a command node, so the link the compiler charges here
+            // computes zero and the cast fires in the frame it always did.
+            voice.say(Intent::Cast {
+                hero: intent_id(hero.entity),
+                ability: None,
+                x: None,
+                z: None,
+                target: None,
+            });
         }
     }
 
     let rally = base + (-base.normalize_or_zero()) * RALLY_DIST;
 
+    // Every military branch below states one `attackmove` PER UNIT, all of
+    // them naming the same point — the geometry the script has always had.
+    // `Voice::say_each` carries the full reasoning; the short version is that
+    // batching these would hand the group to `formation_offset` and make the
+    // scripted baseline measurably more lethal, which is a balance change and
+    // has no business arriving inside a plumbing bead.
+    //
+    // Three of the four branches are already self-quieting: `wave` stragglers
+    // and the `rally` gather speak only for units that are idle, so an army in
+    // contact and an army that has arrived both say nothing. `defend` is the
+    // one that restates itself every tick, for as long as an enemy is actually
+    // inside the base.
+    let all: Vec<IntentId> = army.iter().map(|u| intent_id(u.entity)).collect();
+    let free_units = |army: &[UnitInfo]| -> Vec<IntentId> {
+        army.iter()
+            .filter(|u| u.free())
+            .map(|u| intent_id(u.entity))
+            .collect()
+    };
+
     if let Some(threat_pos) = threat {
         // Defense overrides everything, wave or not.
-        for u in &army {
-            issuer.issue(
-                commands,
-                me,
-                u.pos,
-                u.entity,
-                Order::AttackMove(threat_pos),
-                script("defend", now),
-            );
-        }
+        voice.say_each(all, |units| Intent::AttackMove {
+            units,
+            x: Some(threat_pos.x),
+            z: Some(threat_pos.z),
+            region: None,
+        });
         return;
     }
 
@@ -2232,31 +2441,24 @@ fn think(
             let centroid = army.iter().fold(Vec3::ZERO, |a, u| a + u.pos) / army.len() as f32;
             brain.wave_target = wave_objective(me, fog, nav, &enemy_buildings, centroid);
             brain.wave_started = now;
-            for u in &army {
-                issuer.issue(
-                    commands,
-                    me,
-                    u.pos,
-                    u.entity,
-                    Order::AttackMove(brain.wave_target),
-                    script("wave", now),
-                );
-            }
-        } else {
-            // Stragglers rejoin the push.
             let target = brain.wave_target;
-            for u in &army {
-                if u.free() {
-                    issuer.issue(
-                        commands,
-                        me,
-                        u.pos,
-                        u.entity,
-                        Order::AttackMove(target),
-                        script("wave", now),
-                    );
-                }
-            }
+            voice.say_each(all, |units| Intent::AttackMove {
+                units,
+                x: Some(target.x),
+                z: Some(target.z),
+                region: None,
+            });
+        } else {
+            // Stragglers rejoin the push. Only the free ones, so a wave in
+            // contact says nothing at all — the quiet branch, and the one the
+            // army spends most of a push in.
+            let target = brain.wave_target;
+            voice.say_each(free_units(&army), |units| Intent::AttackMove {
+                units,
+                x: Some(target.x),
+                z: Some(target.z),
+                region: None,
+            });
         }
     } else if army.len() >= brain.next_wave_size {
         brain.wave_active = true;
@@ -2264,30 +2466,27 @@ fn think(
         brain.wave_target = wave_objective(me, fog, nav, &enemy_buildings, base);
         brain.next_wave_size = (brain.next_wave_size + WAVE_SIZE_STEP).min(WAVE_SIZE_CAP);
         let target = brain.wave_target;
-        for u in &army {
-            issuer.issue(
-                commands,
-                me,
-                u.pos,
-                u.entity,
-                Order::AttackMove(target),
-                script("wave", now),
-            );
-        }
+        voice.say_each(all, |units| Intent::AttackMove {
+            units,
+            x: Some(target.x),
+            z: Some(target.z),
+            region: None,
+        });
     } else {
-        // Gather at the rally point while the army builds up.
-        for u in &army {
-            if u.free() && u.pos.distance(rally) > RALLY_ARRIVE_DIST {
-                issuer.issue(
-                    commands,
-                    me,
-                    u.pos,
-                    u.entity,
-                    Order::AttackMove(rally),
-                    script("rally", now),
-                );
-            }
-        }
+        // Gather at the rally point while the army builds up. Whoever is free
+        // and not there yet — which empties out as they arrive, and with it
+        // this branch's sentence.
+        let waiting: Vec<IntentId> = army
+            .iter()
+            .filter(|u| u.free() && u.pos.distance(rally) > RALLY_ARRIVE_DIST)
+            .map(|u| intent_id(u.entity))
+            .collect();
+        voice.say_each(waiting, |units| Intent::AttackMove {
+            units,
+            x: Some(rally.x),
+            z: Some(rally.z),
+            region: None,
+        });
     }
 }
 
@@ -2295,16 +2494,17 @@ fn think(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// The scripted baseline's answer to "why are you doing that?".
-///
-/// `ai.rs` is not a seat (docs/INTENT.md: it writes `Order`s directly rather
-/// than submitting intents), so its orders get their own rung of the chain
-/// rather than borrowing a player's. That distinction is not cosmetic: under
-/// `autopilot` these units belong to a human's faction, and the panel should
-/// say the autopilot moved them, not that the human did.
-fn script(what: &'static str, now: f32) -> Provenance {
-    Provenance::new(Cause::Script { what }, now)
-}
+// NOTE: `fn script(what, now) -> Provenance` used to live here, minting a
+// `Cause::Script { what }` rung of its own because "ai.rs is not a seat". It
+// is one now, so the compiler stamps its orders `order:<verb> by script`
+// alongside `by ui` and `by bridge`, and units under autopilot still answer
+// that the autopilot moved them — through the ordinary rung rather than a
+// bespoke one. What that costs is the free-text `what` ("wave", "flee",
+// "rally") on the unit; what it buys is that a panel, a snapshot and the
+// replay log describe a script order in the identical words they describe a
+// player's, which is the point of the whole exercise. The reasoning behind a
+// script order still exists — in this file's `info!` lines and in the intent
+// log's sentence.
 
 /// Ground-plane projection — mines and buildings sit at y=0, units do not.
 fn flat(v: Vec3) -> Vec3 {
@@ -2714,16 +2914,12 @@ fn post_of(posts: &[&MineInfo], worker: &UnitInfo, nodes: &NodeQuery) -> Option<
 
 /// Even out the crews across every mine we can actually deliver from, a couple
 /// of workers per tick, and only while the gap is worth walking for.
-#[allow(clippy::too_many_arguments)]
 fn rebalance_mines(
-    me: Team,
     mines: &[MineInfo],
     workers: &[UnitInfo],
     skip: &[Entity],
     nodes: &NodeQuery,
-    commands: &mut Commands,
-    now: f32,
-    issuer: &mut OrderIssuer,
+    voice: &mut Voice,
 ) {
     // A mine with no finished hall near it is not a posting: sending workers
     // there would just make them haul their load back to the old base.
@@ -2772,16 +2968,17 @@ fn rebalance_mines(
             .partial_cmp(&xz_dist(*b, target.pos))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    for (worker, pos) in pool.into_iter().take(quota) {
-        issuer.issue(
-            commands,
-            me,
-            pos,
-            worker,
-            Order::Harvest(target.entity),
-            script("harvest", now),
-        );
-    }
+    // The shift, as one sentence: same destination, same tick, so it is one
+    // order given to two workers rather than two orders that happen to agree.
+    let shift: Vec<IntentId> = pool
+        .into_iter()
+        .take(quota)
+        .map(|(worker, _)| intent_id(worker))
+        .collect();
+    voice.say_group(shift, |units| Intent::Harvest {
+        units,
+        target: intent_id(target.entity),
+    });
 }
 
 fn other_resource(kind: ResourceKind) -> ResourceKind {
@@ -3157,6 +3354,14 @@ mod tests {
     /// A world with the scripted commander in it and nothing else: no fog to
     /// walk through, no economy ticking, no units.rs to execute the orders.
     /// One `app.update()` past the think timer is exactly one thought.
+    ///
+    /// **The compiler is part of the harness now** (wc3clone-jem). The script
+    /// states intents and mutates nothing, so a test that ran `ai_think` alone
+    /// would watch a world where nothing ever happens. Running the real
+    /// `apply_intents` after it is not a concession to the refactor — it is
+    /// what makes these assertions stronger than they were, because a Tower in
+    /// the world now proves the placement survived validation as well as
+    /// intention.
     fn ai_app() -> App {
         let mut app = App::new();
         // Races: `CorePlugin` supplies this in a real match; a hand-built
@@ -3169,6 +3374,11 @@ mod tests {
             .init_resource::<HeroRecords>()
             .init_resource::<NavGrid>()
             .init_resource::<TeamResearch>()
+            // Everything `apply_intents` reads beyond what the script already
+            // needed, and the five event channels it writes.
+            .init_resource::<TechTiers>()
+            .init_resource::<SquadOrders>()
+            .init_resource::<GameEvents>()
             .add_event::<CastAbility>()
             .add_event::<UpgradeBuilding>()
             .add_event::<StartResearch>()
@@ -3183,7 +3393,16 @@ mod tests {
                 nodes: vec![(Team::Claude, Team::Claude.base_pos(), DEFAULT_HALL_RADIUS)],
                 ready: true,
             })
-            .add_systems(Update, ai_think);
+            .add_plugins(crate::intent::IntentPlugin)
+            // Explicit, because these two sets are only ordered by `SIM_ORDER`
+            // in the real schedule and this app does not install it. Thinking
+            // and compiling in the same frame IS the shipped frame order
+            // (`SimSet::AiThink` sits four sets ahead of `SimSet::Intent`), so
+            // pinning it here is a restatement, not a fixture.
+            .add_systems(Update, ai_think.before(crate::intent::IntentApply));
+        // A unit test must depend on neither `WC3_INTENT_LOG` nor the
+        // filesystem, and must leave no file behind.
+        app.insert_resource(crate::intent::IntentLog::disabled());
         // Claude only, so the assertions below can name one brain.
         app.insert_resource(AiControlled { human: false, claude: true });
         // Lit, not dark: the subject is what the script does about a flyer it
@@ -3775,6 +3994,9 @@ mod tests {
             .init_resource::<NavGrid>()
             .init_resource::<FogGrids>()
             .init_resource::<TeamResearch>()
+            .init_resource::<TechTiers>()
+            .init_resource::<SquadOrders>()
+            .init_resource::<GameEvents>()
             .add_event::<CastAbility>()
             .add_event::<UpgradeBuilding>()
             .add_event::<StartResearch>()
@@ -3785,7 +4007,9 @@ mod tests {
                 nodes: vec![(Team::Claude, Team::Claude.base_pos(), DEFAULT_HALL_RADIUS)],
                 ready: true,
             })
-            .add_systems(Update, ai_think);
+            .add_plugins(crate::intent::IntentPlugin)
+            .add_systems(Update, ai_think.before(crate::intent::IntentApply));
+        app.insert_resource(crate::intent::IntentLog::disabled());
         app
     }
 
@@ -3814,10 +4038,15 @@ mod tests {
 
     /// **All three seats pay.** docs/TEMPO.md §3 requires it in as many words —
     /// "the scripted AI pays latency too, or autopilot becomes a cheat and C1
-    /// is violated at the third seat". `ai.rs` does not speak through the
-    /// intent compiler, so this is the test that keeps it honest: an order the
-    /// script gives a unit standing on the far side of the map is held in
-    /// transit exactly like a human's or a commander's would be.
+    /// is violated at the third seat". This used to be the test that kept an
+    /// exception honest, because `ai.rs` reached for `OrderIssuer` by hand and
+    /// nothing but this assertion stopped somebody deleting the call.
+    ///
+    /// It now tests something better: the script speaks through the compiler
+    /// like everyone else, so an order it gives a unit on the far side of the
+    /// map is held in transit *because there is no other path it could have
+    /// taken*. `WC3_COMMAND_LATENCY=1` reaches the third seat through the same
+    /// `ground_order` arm that prices the first two.
     #[test]
     fn the_scripted_ai_pays_latency_like_everybody_else() {
         let mut app = ai_world(true);
@@ -3844,6 +4073,30 @@ mod tests {
         );
     }
 
+    /// **The script does not ride the trigger exemption.**
+    ///
+    /// `wc3clone-pec` gave `apply_intents` a second issuer: anything carrying
+    /// `SubmitIntent::trigger` gets `CommandLink::exempt_issuer` and pays
+    /// nothing, because a rule's author paid the reach when they armed it.
+    /// That is a correct rule and a live hazard for this seat — a scripted
+    /// think tick submitting with `trigger: Some(..)` would be autopilot
+    /// commanding at zero latency, which is docs/TEMPO.md §3's cheat by
+    /// another door.
+    ///
+    /// Pinned at the field rather than at the timing, because the field is
+    /// what decides it and a timing assertion would pass for the wrong reason
+    /// on a unit that happened to be standing on a command node.
+    #[test]
+    fn the_script_never_claims_the_trigger_link_exemption() {
+        let spoken = SubmitIntent::script(Team::Claude, Intent::Return { units: vec![] });
+        assert!(
+            spoken.trigger.is_none(),
+            "a scripted decision is a commander deciding now, not a rule firing — \
+             it pays the link like the other two seats"
+        );
+        assert_eq!(spoken.source, IntentSource::Script);
+    }
+
     /// The off-flag identity at the third seat: with `WC3_COMMAND_LATENCY`
     /// unset the scripted AI writes `Order`s exactly where it always did, and
     /// no `PendingOrder` can exist anywhere.
@@ -3864,6 +4117,129 @@ mod tests {
                 Some(Order::AttackMove(_))
             ),
             "with latency off the script's order must land in the same frame it always did"
+        );
+    }
+
+    // -- The third seat (wc3clone-jem) -------------------------------------
+
+    /// **The whole bead in one assertion.** A thought becomes a `SubmitIntent`
+    /// with `IntentSource::Script`, the compiler validates and applies it in
+    /// the same frame, the unit it moved answers `order:attackmove by script`,
+    /// and the sentence is in the journal that feeds the replay — all of it
+    /// through the code path `ui` and `bridge` use, with nothing in it that
+    /// knows the script is special.
+    ///
+    /// The provenance string is the load-bearing part. It is the join key
+    /// between the intent log and a snapshot's `units[].why`, so a replay of a
+    /// scripted match can now be read the same way a replay of a played one
+    /// is: every order in it names an author, and there are three of them.
+    #[test]
+    fn a_script_order_flows_through_the_compiler_and_says_so() {
+        let mut app = ai_world(false);
+        let soldier = spawn_far_soldier(&mut app);
+
+        think_once(&mut app);
+
+        let why = app
+            .world()
+            .entity(soldier)
+            .get::<Provenance>()
+            .expect("an order the compiler applied carries the reason it applied it")
+            .why();
+        assert!(
+            why.starts_with("order:attackmove by script t="),
+            "a scripted order must read like every other seat's: got {why:?}"
+        );
+
+        // ...and the same sentence is in the record both seats and the replay
+        // read, attributed to the third seat rather than to nobody.
+        let journal = app.world().resource::<IntentJournal>();
+        let spoken = journal.get(Team::Claude);
+        assert!(
+            spoken
+                .iter()
+                .any(|e| e.source == IntentSource::Script && e.verb == "attackmove" && e.ok),
+            "the script's sentence never reached the journal: {:?}",
+            spoken.iter().map(|e| (e.source, e.verb)).collect::<Vec<_>>()
+        );
+    }
+
+    /// **A refusal is the script's problem and nobody else's.**
+    ///
+    /// The compiler may now say no to the scripted commander — a dead target,
+    /// a site that filled up, a price that moved. Two things have to be true
+    /// when it does. The refusal must be recorded (the journal entry says
+    /// `ok: false`, and the intent log carries the string), and it must NOT be
+    /// posted to the team's error channel: bridge.rs ships that list to
+    /// whichever seat is reading, and a commander handed failures it did not
+    /// cause would be debugging the autopilot instead of playing.
+    #[test]
+    fn a_refused_script_intent_stays_out_of_the_seats_error_channel() {
+        let mut app = ai_world(false);
+        // An id nothing has ever had: the shape of every rejection the script
+        // can actually hit — it named something the world no longer agrees is
+        // there.
+        app.world_mut().send_event(SubmitIntent::script(
+            Team::Claude,
+            Intent::Train {
+                building: 999_999_999,
+                unit: "Footman".to_string(),
+            },
+        ));
+        app.update();
+
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Claude).is_empty(),
+            "a script rejection must not be posted to a seat's error channel"
+        );
+        let journal = app.world().resource::<IntentJournal>();
+        assert!(
+            journal
+                .get(Team::Claude)
+                .iter()
+                .any(|e| e.source == IntentSource::Script && e.verb == "train" && !e.ok),
+            "the refusal still has to be on the record"
+        );
+    }
+
+    /// **No wedge.** The one piece of optimistic bookkeeping a rejection could
+    /// strand is the build slot: `pending_build` is claimed at the moment the
+    /// intent is spoken, and if the compiler refuses the placement the worker
+    /// never picks up an `Order::Build` to clear it with.
+    ///
+    /// It clears itself from the world instead of from the assumption — the
+    /// slot is released the moment no worker is actually building — and it
+    /// releases the expansion ring-fence with it, so a refused hall cannot
+    /// quietly halt army production for the rest of the match.
+    #[test]
+    fn a_build_that_never_landed_releases_the_slot_and_the_ring_fence() {
+        let mut app = ai_world(false);
+        let idler = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Worker },
+                Team::Claude,
+                Transform::from_translation(Team::Claude.base_pos()),
+                Order::Idle,
+                Health::new(100.0),
+            ))
+            .id();
+        {
+            let mut state = app.world_mut().resource_mut::<AiState>();
+            state.claude.pending_build = Some(idler);
+            state.claude.expansion_pending = true;
+        }
+
+        think_once(&mut app);
+
+        let state = app.world().resource::<AiState>();
+        assert_eq!(
+            state.claude.pending_build, None,
+            "a build that never became an Order must not hold the slot forever"
+        );
+        assert!(
+            !state.claude.expansion_pending,
+            "nor keep the expansion down payment ring-fenced behind it"
         );
     }
 }

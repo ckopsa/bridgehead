@@ -48,9 +48,13 @@ unit stands in" means one thing in this codebase.
 | `Explored` | seen before, not now | remembered | **hidden** | remembered as ghosts |
 | `Visible` | in sight of a living unit or building, right now | shown | shown | shown live |
 
-Units are deliberately **not** remembered. An army is not furniture; a remembered army is
-a lie that gets people killed, and a commander acting on a stale unit position has been
-deceived by its own interface. Buildings are remembered because they do not move.
+Units are deliberately **not** remembered *in this table*. An army is not furniture, and a
+commander acting on a stale unit position **reported as a current one** has been deceived
+by its own interface. Buildings are remembered because they do not move.
+
+That was for a long time the whole argument, and it was half of one. See **[Intel](#intel--sightings-as-durable-queryable-knowledge)**:
+the observation is now kept, in a separate ledger where every record wears its own age and
+nothing in it can be misread as a live contact.
 
 ### Vision is radial, and terrain does not block it
 
@@ -144,6 +148,188 @@ intelligence. Covered by `a_hall_that_tiers_up_behind_the_fog_keeps_its_stale_gh
 backing map holds everything ever seen, including things visible right now; without that
 filter every renderer would draw a scouted base twice — once live, once as its own ghost.
 "Ghost" means *memory standing in for sight*, so sight wins.
+
+## Intel — sightings as durable, queryable knowledge
+
+*The memory model above stops at structures. This is the half it was missing.*
+
+![The human's view of the intel ledger](intel-last-seen.png)
+
+*The same one rule, in three of its renderings at once. On the ground at the top left, three
+**amber tiles** where enemy units were last seen — flat marks on the earth, deliberately not
+the standing translucent boxes a remembered building wears, and the one furthest into the
+fog is dimmer because it is older. In the alert stack, the feed's aggregate line: `enemy
+army spotted: ~4 (2 Archer, 1 Footman, 1 Hero) at (-21, -29)`. Bottom right, the HUD's
+`Their heroes: Hero alive 8s ago` — a belief with its age attached, never a level. And on
+the minimap, the same sightings as 2px dots, smaller and darker than a live contact's. A
+bridge commander reading `intel` at this instant receives exactly these facts and no
+others.*
+
+"A remembered army is a lie" was the right instinct pointed at the wrong thing. A player
+who watches six footmen cross the centre ford does not forget it a quarter of a second
+later; they remember a stale fact **as** a stale fact and discount it, and that discount is
+most of what scouting skill *is*. The lie was never the memory. It was reporting a memory
+in the same shape as a sighting, so that nothing downstream could tell them apart.
+
+So `units[]` is untouched — it still reports only what is visible this instant — and the
+observation is kept in a **separate ledger** with a timestamp welded to every entry. The
+two cannot be confused, structurally rather than by convention: `units[]` records have no
+`t_seen` and every intel record has nothing else.
+
+The ledger lives in `FogGrid` beside `ghosts`, is written by `update_fog` in the same pass,
+off the same cells, at the same 4 Hz. **The only line that inserts a sighting is guarded by
+the identical `vis_at(..).sees()` the building ghosts are guarded by**, so fog-honesty is
+inherited rather than re-derived — a unit that has never stood in a visible cell cannot
+appear, and there is no second code path that could put it there.
+
+### What a sighting stores, and why exactly that
+
+| field | how a human knows it |
+|---|---|
+| `kind` | the model is on screen |
+| `pos` | it is standing there |
+| `hp_frac` | health bars are children of their owner, so an enemy that renders renders its bar |
+| `heading` | they watched it move, across two consecutive fog ticks |
+| `t_seen` | the clock |
+
+Deliberately **absent**: level, xp, mana, inventory, squad, orders, abilities. The test is
+not "is this about the enemy" but "**could a human have obtained it**", and the answer here
+is settled by one fact about the interface: `ui.rs`'s pickers are own-team only — both the
+rubber-band and the plain click `continue` on `*team != Team::Human`. No enemy is ever
+loaded into the panel that prints `Lv 4`, so no human has ever read an enemy hero's level
+off a screen, so no commander gets one. A field the wire had and the keyboard could not
+obtain would be the asymmetry this document exists to close, running backwards.
+
+`heading` is a coarse 8-point compass reading (`N` is `+Z`, matching the minimap's up) and
+it is `None` more often than not, honestly: a unit standing still has no heading, and a
+**first glimpse** has none either, because a heading is a difference between two
+observations. Re-acquiring the same raider a minute later on the far side of the map also
+yields `None` — the straight line between two distant observations is a line nobody watched
+it travel.
+
+### Expiry: the one place unit memory differs from building memory
+
+Three ways out of the ledger, and the differences from `ghosts` are all downstream of the
+fact that units move.
+
+1. **The rumour horizon.** A sighting unrefreshed for `SIGHTING_TTL_S` (**90 game-seconds**)
+   is dropped. Buildings are remembered forever because they do not move; a unit's position
+   decays into fiction at walking pace, and 90s is about the time an army needs to cross
+   this map twice. Past that the record has no remaining power to say where anything *is*,
+   only that it existed and once passed through — so it is a rumour, and the ledger does
+   not keep rumours.
+2. **Watched dying.** If the unit stood in our vision at the **previous** recompute and is
+   absent from the world at this one, we saw it die and the record goes at once.
+3. There is deliberately **no** "we looked and the spot was empty" removal — which *is* the
+   building rule. A ghost claims the barracks is standing there, so walking onto the rubble
+   refutes it. A sighting claims only that a unit was there **at `t_seen`**, and walking
+   onto the spot refutes nothing the timestamp had not already said. Watching an army march
+   off is not amnesia: the marker stays where you last saw it, wearing the heading you
+   watched it leave on, which is the fact worth keeping.
+
+Rule 2 is stricter than the ghost rule on purpose, and the difference is a real
+fog-honesty bug avoided. The ghost test — *gone, and we can see the spot it was* — is
+**wrong for something that moves**: a hero that walked out of our sight and died half a map
+away would be reported as watched-dying by a scout still staring at the empty grass it
+left, which is intelligence nobody observed. Requiring that it was visible *one tick ago*
+closes it, because a quarter of a second is not enough to leave our vision **and** die
+somewhere we cannot see. Entities are despawned centrally by `apply_death` and by nothing
+else, so "absent from the world" means dead rather than bookkeeping.
+`a_unit_that_leaves_our_sight_and_dies_elsewhere_is_not_seen_dying` fails if this weakens.
+
+### Armies: the aggregate is computed where it is read
+
+The ledger's grain is wrong for the question people actually ask. Nobody wants eleven rows;
+they want *there is an army of eleven at the ford*. `FogGrid::army_groups()` clusters
+sightings by **single-link agglomeration** — two join a group when they are within
+`GROUP_RADIUS` (18) of each other **and** were observed within `GROUP_WINDOW_S` (10s) of
+each other.
+
+Both halves are load-bearing. Without the distance test the whole map is one army. Without
+the **time** test a footman glimpsed at the ford eighty seconds ago merges with an archer
+standing there now, and the ledger reports a two-unit force that existed at no instant — an
+aggregate that is a lie assembled out of two honest facts, which is the failure this whole
+section is arranged against.
+
+Clustering happens **where it is read** rather than being stored, so there is one truth and
+every summary is derived from the current one. It is O(n²) over a bounded ledger and
+deliberately not clever. Workers are excluded: a mining crew is not an army, and
+`enemy_army_seen` firing on one would be the same false alarm `base_under_attack` refuses to
+raise for a skirmish in midfield. They stay *in the ledger* — five workers on a hillside is
+exactly how you find an expansion — they just do not constitute a force.
+
+### Heroes: belief, not bookkeeping
+
+Per enemy hero **class** (not entity — a class is what survives a death, and heroes revive
+through `HeroRecords`), one of three states, and there is no fourth because there is no
+fourth thing an observer can honestly be in:
+
+| status | means |
+|---|---|
+| `unknown` | never laid eyes on it. **Not** "they have no hero" — those are the same empty observation, and conflating them is the mistake the `fog` block prevents for terrain |
+| `alive` | seen alive, nothing since says otherwise. Read it as *alive as far as you know*: it may have died two minutes ago somewhere nobody was looking, and this will go on saying `alive`. That is not a bug in the belief, it is the belief |
+| `seen-dying` | we **watched it die**. Witnessed, not inferred from an absence |
+
+The belief is **revocable**: see the hero alive again after a revive and the status returns
+to `alive`. A latched "dead forever" would be the interface lying on the enemy's behalf.
+
+### Rendered twice, as everything here is
+
+| renderer | what it does with the ledger |
+|---|---|
+| `bridge.rs` | the top-level `intel: {sightings, groups, heroes, ttl_s}` block, own-seat |
+| `ui.rs` (world) | `sync_intel_markers` — pooled amber tiles on the ground where units were last seen, in four pre-built age fades |
+| `ui.rs` (minimap) | 2px darkened dots, smaller than a live contact's 3px and a structure's 6px |
+| `ui.rs` (HUD) | `enemy_hero_line` — the `Their heroes:` line, from the same `hero_intel()` the snapshot serialises |
+| `shared.rs` (event feed) | `enemy army spotted: ~8 (5 Footman, 3 Archer) near the center ford` |
+
+The world markers are a **flat tile**, not a standing box, precisely because a ghost means
+*there is a barracks there* and a tile means *something stood here once*. Both are
+suppressed over currently-visible ground, on the rule `FogGrid::ghosts()` already applies:
+sight beats memory. Age fading uses **four pre-built material handles swapped by the
+frame**, never one material repainted — that is the `FogTinted` discipline, designing out
+the bind-group staleness trap documented under `update_fog_overlay` rather than defending
+against it.
+
+The event line is rate-limited **by place rather than by group identity**, and that is the
+only way it could work: a group has no stable id — it is re-clustered from scratch every
+time anyone asks, and one casualty renumbers it — so suppressing by identity would suppress
+nothing. What a reader means by "I already know about that army" is "I already know about an
+army *there*", and ground holds still. A group must also have been observed within
+`ARMY_EVENT_FRESH_S` to be *spotted* rather than merely remembered, or a ninety-second-old
+rumour would be announced as news the moment its patch of ground came off cooldown.
+
+### What the ledger unlocks
+
+Two `TriggerWhen` arms, and they are the only two predicates in the language that read
+memory rather than the world — which means they inherit fog-honesty from the ledger instead
+of re-deriving it. Neither arm touches `world.units` at all, which is the structural version
+of that claim.
+
+- **`enemy_army_seen {size, within_s?}`** — differs from `enemy_sighted` exactly by memory.
+  `enemy_sighted` is true only while eyes are on them, so it goes false the moment your
+  scout dies, which is what the scout was killed for. This one stays true. `within_s` is how
+  a commander asks for a *current* army rather than a *known* one. It carries no region:
+  regions are a different vocabulary and a predicate that grew its own notion of "where"
+  would be the second implementation this project keeps refusing to write.
+- **`enemy_hero_down {class?}`** — a **level** predicate, "as far as we know their hero is
+  down", not an edge on a death event. Armed `once` it fires on the first sweep after the
+  belief takes hold and disarms, which is the edge behaviour "when their hero falls" means —
+  obtained without an edge-detection latch nobody can inspect. Armed repeating it re-fires
+  while the belief stands, which reads as "keep pressing while they have no hero" and is why
+  the level form was kept rather than special-cased.
+
+And it kills a deferral that had stood since the compiler shipped. `tools/intent_compile.py`
+now compiles **"strike when their hero falls"** for real. What it still refuses is the
+neighbouring sentence, *"strike when their hero is below 30%"* — and keeping those apart is
+the point. Enemy hero **health** is unknowable (you cannot select one); enemy hero **death**
+is the most public thing that can happen on a battlefield. Not *is this about the enemy*,
+but *could a human have seen it*.
+
+Under `WC3_FOG=0` the ledger stays **empty**, exactly as `ghosts` does and for the same
+reason: `update_fog` returns before it writes anything, live sight supersedes memory
+entirely, and an intel section would be a second staler copy of a board already fully
+reported.
 
 ## What stays omniscient, and why
 
@@ -274,7 +460,8 @@ be.
 
 | Field | Change |
 |---|---|
-| `units[]` | enemies only while **currently visible**; never remembered |
+| `units[]` | enemies only while **currently visible**; never remembered *here* — the memory is `intel` |
+| `intel` | **new** object: `{sightings[], groups[], heroes{}, ttl_s}`. What this seat REMEMBERS of the enemy, every record stamped with `t_seen` and `age`. Always present, on the same reasoning as `fog` |
 | `buildings[]` | enemies live while visible; otherwise appended as **remembered ghosts** |
 | `buildings[].last_seen` | **new**, optional. Present *only* on ghosts — game time of the observation. Its presence is exactly the "this is memory, not observation" flag. Ghosts carry empty `queue`/`progress` and no `ability_cd`: a production queue is a live thing, and remembering one would be inventing intelligence rather than preserving it |
 | `bounties[]` | only while visible — the two seats' lists now legitimately differ |

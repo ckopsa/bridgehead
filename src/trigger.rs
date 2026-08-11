@@ -63,10 +63,16 @@
 //! ## Determinism inside the set
 //!
 //! `SimSet::Think` also holds doctrine.rs's seven systems, and Bevy leaves two
-//! systems in one set unordered unless something forces an edge. Nothing does
-//! here, and nothing needs to: this system's only writes are `ResMut<Triggers>`
-//! (nobody else touches it), `ResMut<GameEvents>` (no other writer lives in
-//! `Think`) and `EventWriter<SubmitIntent>` (same). Everything it reads is
+//! systems in one set unordered unless something forces an edge. One thing
+//! does: plan.rs's evaluator writes the same two things this system does, and
+//! it declares itself `.before` this one so that a trigger's answer to the
+//! situation at hand lands AFTER a plan's answer to the general case, and
+//! therefore wins. That edge is argued in plan.rs's module docs.
+//!
+//! Against doctrine, nothing forces an edge and nothing needs to: this system's
+//! only writes are `ResMut<Triggers>` (nobody else touches it),
+//! `ResMut<GameEvents>` and `EventWriter<SubmitIntent>` (whose only other
+//! `Think` writer is plan.rs, ordered explicitly). Everything it reads is
 //! read-only, and doctrine's `Order` writes go through `Commands`, which flush
 //! after the set either way. So the two are genuinely commutative rather than
 //! merely usually-fine.
@@ -160,6 +166,11 @@ pub struct TriggerWorld<'w, 's> {
     bounties: TriggerBounties<'w, 's>,
     tiers: Res<'w, TechTiers>,
     fog: Res<'w, FogGrids>,
+    /// Read-only here. `enemy_in` is the one predicate that asks WHERE, and
+    /// the answer is the arming team's own vocabulary — built-ins included, so
+    /// "5 enemies in the center ford" is armable in the first second of a
+    /// match with nothing named first.
+    regions: Res<'w, Regions>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +184,17 @@ fn xz_dist(a: Vec3, b: Vec3) -> f32 {
 
 /// Does `when` hold for `me`, right now?
 ///
+/// `pub` because plan.rs asks the same question about the same vocabulary: a
+/// plan step's `advance` condition IS a [`TriggerWhen`], and two evaluators
+/// with two readings of "we reached tier 2" would be two languages. One
+/// definition, two callers — and any predicate a later bead adds here is a plan
+/// advance-condition the moment it lands, with no work in plan.rs.
+///
 /// Every arm is a fold over state the frame already has. Nothing here writes,
 /// remembers, or subscribes: a predicate that needed its own bookkeeping would
 /// be a predicate whose truth could drift from the world, and the whole value
 /// of firing at machine speed is that the world is what fired it.
-fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
+pub fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
     match when {
         // Our own BUILDINGS, damaged inside the window. Buildings only: a
         // skirmish in midfield is not the base being attacked, and a predicate
@@ -239,6 +256,84 @@ fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
                 })
                 .count();
             seen as u32 >= (*count).max(1)
+        }
+
+        // The territorial `enemy_sighted`. TWO filters, and both are load
+        // bearing:
+        //
+        //   * the arming team's own `FogGrid::sees` — a region is ground you
+        //     are WATCHING, not ground you are told about, so an army walking
+        //     unseen through your named pass does not trip the rule. That is
+        //     the same knowability rule `enemy_sighted` obeys, applied to a
+        //     smaller piece of the map, and it is what keeps a region from
+        //     becoming a free sensor.
+        //   * the circle itself, on XZ.
+        //
+        // A region cleared after arming makes this go QUIET rather than fall
+        // back to the whole map: an unresolvable name is not a bigger question,
+        // it is no question. The compiler refuses unknown names at arm time, so
+        // reaching here with one means the commander cleared the region out
+        // from under their own rule — and firing a defence of nowhere would be
+        // strictly worse than not firing.
+        TriggerWhen::EnemyIn {
+            region,
+            class,
+            count,
+        } => {
+            let Some(shape) = world.regions.find(me, region) else {
+                return false;
+            };
+            let want = class.as_deref().and_then(parse_target_class);
+            if class.is_some() && want.is_none() {
+                return false;
+            }
+            let fog = world.fog.get(me);
+            let seen = world
+                .units
+                .iter()
+                .filter(|(unit, team, tf, _, _, _)| {
+                    **team == me.enemy()
+                        && fog.sees(tf.translation)
+                        && shape.contains(tf.translation)
+                        && want.is_none_or(|w| TargetClass::of(Some(unit.kind), false) == Some(w))
+                })
+                .count();
+            seen as u32 >= (*count).max(1)
+        }
+
+        // INTEL, not sight. The only two predicates in this file that read the
+        // ledger rather than the world, and they are fog-honest a step further
+        // out than the rest: the ledger itself cannot contain anything this
+        // team did not observe, so a predicate over it inherits the property
+        // instead of re-deriving it. There is no `world.units` access in
+        // either arm, which is the structural version of that claim.
+        TriggerWhen::EnemyArmySeen { size, within_s } => {
+            let fog = world.fog.get(me);
+            fog.army_groups().iter().any(|g| {
+                g.size as u32 >= (*size).max(1)
+                    && within_s.is_none_or(|w| (now - g.t_seen).max(0.0) <= w)
+            })
+        }
+
+        // A LEVEL predicate: "their hero is currently believed dead". See the
+        // doc on `TriggerWhen::EnemyHeroDown` for why it is not an edge, and
+        // what a once vs. a repeating rule does with it.
+        TriggerWhen::EnemyHeroDown { class } => {
+            let want = class.as_deref().and_then(parse_unit_kind);
+            // An unparseable or non-hero class is refused by the compiler at
+            // set time, so reaching here with one is impossible; believing
+            // nothing is the safe answer if it ever happens.
+            if class.is_some() && !want.is_some_and(is_hero_kind) {
+                return false;
+            }
+            let fog = world.fog.get(me);
+            let down = |h: &HeroIntel| h.status == HeroStatus::SeenDying;
+            match want {
+                // A named class asks about exactly one belief, so ask for it
+                // rather than scanning and filtering.
+                Some(kind) => fog.hero_intel_of(kind).is_some_and(down),
+                None => fog.hero_intel().iter().any(down),
+            }
         }
 
         // Fog-honest for the same reason and through the same call the
@@ -304,7 +399,11 @@ fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
 /// "did my rule ever go off?" is answerable from the snapshot rather than from
 /// an absence. A repeating one stamps `last_fired` and goes quiet for its
 /// cooldown.
-fn evaluate_triggers(
+/// `pub` so plan.rs can declare a hard ordering edge against it. Both systems
+/// live in `SimSet::Think` and both write `SubmitIntent` and `GameEvents`, and
+/// Bevy would otherwise leave them unordered — see plan.rs's module docs for
+/// why plans go first and a trigger therefore wins a same-tick tie.
+pub fn evaluate_triggers(
     time: Res<Time>,
     mut triggers: ResMut<Triggers>,
     mut submissions: EventWriter<SubmitIntent>,
@@ -377,6 +476,7 @@ mod tests {
         app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<Triggers>()
+            .init_resource::<Regions>()
             .init_resource::<TechTiers>()
             .init_resource::<GameEvents>()
             .add_event::<SubmitIntent>()
@@ -399,6 +499,7 @@ mod tests {
         app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<Triggers>()
+            .init_resource::<Regions>()
             .init_resource::<Economies>()
             .init_resource::<HeroRecords>()
             .init_resource::<TechTiers>()
@@ -676,6 +777,253 @@ mod tests {
         advance(&mut app, 5.0);
         app.update();
         assert_eq!(fired(&mut app).len(), 1);
+    }
+
+    // -- intel: predicates that read MEMORY rather than sight --------------
+
+    fn sighting(id: u64, kind: UnitKind, x: f32, t_seen: f32) -> Sighting {
+        Sighting {
+            id,
+            team: Team::Claude,
+            kind,
+            pos: Vec3::new(x, 0.0, 0.0),
+            hp_frac: 1.0,
+            heading: None,
+            t_seen,
+        }
+    }
+
+    /// The difference between `enemy_sighted` and `enemy_army_seen` in one
+    /// test: an army standing in the dark fires NEITHER, and an army recorded
+    /// in the ledger fires only the second — which is what makes it survive
+    /// the death of the scout that found it.
+    #[test]
+    fn enemy_army_seen_reads_the_ledger_not_the_board() {
+        let mut app = trigger_app();
+        // Four enemies really standing there, and no vision of them at all.
+        for i in 0..4 {
+            app.world_mut().spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Claude,
+                Transform::from_translation(Vec3::new(20.0 + i as f32, 0.0, 20.0)),
+                Health::new(100.0),
+            ));
+        }
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyArmySeen {
+                    size: 3,
+                    within_s: None,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "an army nobody has ever seen is an army no rule may react to"
+        );
+
+        // Now the same four are in this team's ledger — scouted at t=0 by a
+        // rider that is long since dead. The board has not changed.
+        let mut grids = FogGrids::test_dark();
+        for i in 0..4u64 {
+            grids.test_sight(Team::Human, sighting(i, UnitKind::Footman, i as f32, 0.0));
+        }
+        app.insert_resource(grids);
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(
+            fired(&mut app).len(),
+            1,
+            "what we know outlives what we can see — that is the whole feature"
+        );
+    }
+
+    #[test]
+    fn enemy_army_seen_counts_the_group_and_honours_a_staleness_bound() {
+        let mut app = trigger_app();
+        let mut grids = FogGrids::test_dark();
+        // Three together, seen at t=0.
+        for i in 0..3u64 {
+            grids.test_sight(Team::Human, sighting(i, UnitKind::Footman, i as f32, 0.0));
+        }
+        // A fourth, far away — a separate group, so no group reaches four.
+        grids.test_sight(Team::Human, sighting(9, UnitKind::Footman, 90.0, 0.0));
+        app.insert_resource(grids);
+
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyArmySeen {
+                    size: 4,
+                    within_s: None,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "four scattered units are not a force of four"
+        );
+
+        // Three IS enough, and the sighting is 30s old.
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)[0]
+            .when = TriggerWhen::EnemyArmySeen {
+            size: 3,
+            within_s: None,
+        };
+        advance(&mut app, 30.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1, "a known army, however old");
+
+        // The same rule, now demanding a sighting from the last ten seconds.
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)[0]
+            .when = TriggerWhen::EnemyArmySeen {
+            size: 3,
+            within_s: Some(10.0),
+        };
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "35s of memory is not a current army; `within_s` is how you say so"
+        );
+    }
+
+    /// `enemy_hero_down` is a LEVEL predicate over a belief, not an edge over
+    /// an event. `Unknown` and `Alive` are both "not down", and only a death
+    /// this team WATCHED sets the belief.
+    #[test]
+    fn enemy_hero_down_fires_on_the_belief_and_only_on_the_belief() {
+        let mut app = trigger_app();
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyHeroDown { class: None },
+                stop_intent(),
+                Some(1.0),
+            ));
+
+        // Unknown: never met. NOT the same as dead, and the commonest way to
+        // get this wrong would be to treat an empty belief as a true one.
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "never having seen their hero is not knowing it is dead"
+        );
+
+        // Alive.
+        let mut grids = FogGrids::test_dark();
+        grids.test_hero_intel(Team::Human, UnitKind::Hero, HeroStatus::Alive, Vec3::ZERO);
+        app.insert_resource(grids);
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(fired(&mut app).is_empty(), "alive is not down");
+
+        // Watched it die.
+        let mut grids = FogGrids::test_dark();
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::SeenDying,
+            Vec3::ZERO,
+        );
+        app.insert_resource(grids);
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1, "we watched it fall");
+    }
+
+    #[test]
+    fn enemy_hero_down_can_name_one_class() {
+        let mut app = trigger_app();
+        let mut grids = FogGrids::test_dark();
+        // Their Champion is down; their Priestess is alive and well.
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::SeenDying,
+            Vec3::ZERO,
+        );
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Priestess,
+            HeroStatus::Alive,
+            Vec3::ZERO,
+        );
+        app.insert_resource(grids);
+
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyHeroDown {
+                    class: Some("Priestess".to_string()),
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "a rule about their Priestess must not fire on their Champion"
+        );
+
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)[0]
+            .when = TriggerWhen::EnemyHeroDown {
+            class: Some("Hero".to_string()),
+        };
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1);
+    }
+
+    /// The documented once-vs-repeating interaction, pinned. The predicate
+    /// stays TRUE for as long as the belief stands, so a `once` rule fires
+    /// exactly one time (the edge a commander means by "when their hero
+    /// falls") and a repeating one keeps going while they have no hero.
+    #[test]
+    fn a_once_rule_on_a_standing_belief_still_fires_exactly_once() {
+        let mut app = trigger_app();
+        let mut grids = FogGrids::test_dark();
+        grids.test_hero_intel(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::SeenDying,
+            Vec3::ZERO,
+        );
+        app.insert_resource(grids);
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyHeroDown { class: None },
+                stop_intent(),
+                None,
+            ));
+
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1);
+        for _ in 0..4 {
+            advance(&mut app, 30.0);
+            app.update();
+            assert!(
+                fired(&mut app).is_empty(),
+                "the belief still holds, but the rule is spent"
+            );
+        }
     }
 
     // -- the other predicates ---------------------------------------------
@@ -993,6 +1341,7 @@ mod tests {
             )
             .expect("the recipe in COMMANDER_BRIEF.md parses"),
             trigger: None,
+            plan: None,
         });
         app.update();
         assert_eq!(
@@ -1041,5 +1390,379 @@ mod tests {
         // Sanity: the soldier is still ours and still in squad 1 — the posture
         // executor takes it from here.
         assert_eq!(*app.world().entity(soldier).get::<SquadId>().unwrap(), SquadId(1));
+    }
+
+    // -- enemy_in: the territorial predicate -------------------------------
+
+    /// Put a region on the evaluator's world the way a commander does not —
+    /// directly — because these tests are about the PREDICATE. The compiler's
+    /// half (arm-time name validation) is tested in intent.rs.
+    fn name_region(app: &mut App, team: Team, name: &str, center: Vec3, radius: f32) {
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .set(team, Region::new(name, center, radius))
+            .expect("the test's own region is legal");
+    }
+
+    fn enemy_at(app: &mut App, spot: Vec3, kind: UnitKind) {
+        app.world_mut().spawn((
+            Unit { kind },
+            Team::Claude,
+            Transform::from_translation(spot),
+            Health::new(100.0),
+        ));
+    }
+
+    /// **Both filters, and neither is optional.** An enemy inside the circle
+    /// but unseen does not count; an enemy seen but outside it does not count.
+    /// The rule only fires on bodies that are in the place AND visible, which
+    /// is what makes a region a piece of ground you are watching rather than a
+    /// free sensor bolted to the map.
+    #[test]
+    fn enemy_in_counts_only_what_is_both_inside_and_seen() {
+        let mut app = trigger_app();
+        name_region(&mut app, Team::Human, "north-pass", Vec3::new(-60.0, 0.0, 60.0), 20.0);
+        // One enemy inside the circle, one far outside it.
+        enemy_at(&mut app, Vec3::new(-58.0, 0.0, 62.0), UnitKind::Footman);
+        enemy_at(&mut app, Vec3::new(60.0, 0.0, -60.0), UnitKind::Footman);
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyIn {
+                    region: "north-pass".to_string(),
+                    class: None,
+                    count: 1,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+
+        // Dark: the enemy is standing in the pass and the rule does not know.
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "unseen is unknown, for a territorial rule exactly as for any other"
+        );
+
+        // Light the map and the IDENTICAL world fires it. The only thing that
+        // changed is what the arming team was shown.
+        app.insert_resource(FogGrids::test_revealed());
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1, "seen and inside is known");
+
+        // Two enemies are visible and only ONE is in the pass, so a threshold
+        // of two must stay quiet — proof the circle is really filtering rather
+        // than the fog doing all the work.
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)[0]
+            .when = TriggerWhen::EnemyIn {
+            region: "north-pass".to_string(),
+            class: None,
+            count: 2,
+        };
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "the enemy across the map is not in the pass"
+        );
+    }
+
+    /// The boundary is the circle's own `contains`, so a body exactly on the
+    /// edge is in and one just past it is out. Asserted because "roughly near"
+    /// is the failure mode a commander would never be able to debug.
+    #[test]
+    fn enemy_in_measures_the_circle_and_not_a_neighbourhood() {
+        let mut app = trigger_app();
+        app.insert_resource(FogGrids::test_revealed());
+        name_region(&mut app, Team::Human, "ring", Vec3::ZERO, 10.0);
+        // Exactly on the rim.
+        enemy_at(&mut app, Vec3::new(10.0, 0.0, 0.0), UnitKind::Footman);
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyIn {
+                    region: "ring".to_string(),
+                    class: None,
+                    count: 1,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1, "the rim is inside");
+
+        // A second world, a whisker further out.
+        let mut app = trigger_app();
+        app.insert_resource(FogGrids::test_revealed());
+        name_region(&mut app, Team::Human, "ring", Vec3::ZERO, 10.0);
+        enemy_at(&mut app, Vec3::new(10.5, 0.0, 0.0), UnitKind::Footman);
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyIn {
+                    region: "ring".to_string(),
+                    class: None,
+                    count: 1,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert!(fired(&mut app).is_empty(), "just outside is outside");
+    }
+
+    /// The class filter is the one `enemy_sighted` uses, so "5 siege in
+    /// north-pass" means what it says.
+    #[test]
+    fn enemy_in_counts_only_the_named_class() {
+        let mut app = trigger_app();
+        app.insert_resource(FogGrids::test_revealed());
+        name_region(&mut app, Team::Human, "ring", Vec3::ZERO, 20.0);
+        for _ in 0..3 {
+            enemy_at(&mut app, Vec3::new(2.0, 0.0, 2.0), UnitKind::Footman);
+        }
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyIn {
+                    region: "ring".to_string(),
+                    class: Some("Siege".to_string()),
+                    count: 1,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert!(fired(&mut app).is_empty(), "three footmen are not a siege train");
+
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)[0]
+            .when = TriggerWhen::EnemyIn {
+            region: "ring".to_string(),
+            class: Some("Footman".to_string()),
+            count: 3,
+        };
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1);
+    }
+
+    /// A region cleared out from under an armed rule makes it go QUIET rather
+    /// than fall back to the whole map. An unresolvable name is no question,
+    /// not a bigger one.
+    #[test]
+    fn a_rule_whose_region_was_forgotten_stops_asking() {
+        let mut app = trigger_app();
+        app.insert_resource(FogGrids::test_revealed());
+        name_region(&mut app, Team::Human, "ring", Vec3::ZERO, 20.0);
+        enemy_at(&mut app, Vec3::new(1.0, 0.0, 1.0), UnitKind::Footman);
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::EnemyIn {
+                    region: "ring".to_string(),
+                    class: None,
+                    count: 1,
+                },
+                stop_intent(),
+                Some(1.0),
+            ));
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1, "armed and true");
+
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .clear(Team::Human, "ring");
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "no place, no question — firing a defence of nowhere is worse than not firing"
+        );
+    }
+
+    /// A region is per-team, so the two seats' identically-named circles are
+    /// different ground and each rule reads its OWN.
+    #[test]
+    fn each_seat_reads_its_own_vocabulary() {
+        let mut app = trigger_app();
+        app.insert_resource(FogGrids::test_revealed());
+        // Both teams name "the-spot", at opposite corners.
+        name_region(&mut app, Team::Human, "the-spot", Vec3::new(-70.0, 0.0, -70.0), 15.0);
+        name_region(&mut app, Team::Claude, "the-spot", Vec3::new(70.0, 0.0, 70.0), 15.0);
+        // One Claude unit sitting in the HUMAN's spot.
+        enemy_at(&mut app, Vec3::new(-70.0, 0.0, -70.0), UnitKind::Footman);
+        for team in [Team::Human, Team::Claude] {
+            app.world_mut()
+                .resource_mut::<Triggers>()
+                .get_mut(team)
+                .push(armed(
+                    TriggerWhen::EnemyIn {
+                        region: "the-spot".to_string(),
+                        class: None,
+                        count: 1,
+                    },
+                    stop_intent(),
+                    Some(1.0),
+                ));
+        }
+        app.update();
+        let fired = fired(&mut app);
+        assert_eq!(fired.len(), 1, "exactly one seat's rule is true");
+        assert_eq!(
+            fired[0].team,
+            Team::Human,
+            "the human's spot is the one with an enemy standing in it"
+        );
+    }
+
+    /// The predicate reads as English, with the place in it. This is the line
+    /// that lands in the event feed and the snapshot when the rule fires.
+    #[test]
+    fn enemy_in_says_where() {
+        assert_eq!(
+            TriggerWhen::EnemyIn {
+                region: "north-pass".to_string(),
+                class: None,
+                count: 5,
+            }
+            .phrase(),
+            "5 or more enemies are seen in north-pass"
+        );
+        assert_eq!(
+            TriggerWhen::EnemyIn {
+                region: "mid".to_string(),
+                class: Some("Siege".to_string()),
+                count: 1,
+            }
+            .phrase(),
+            "any enemy Siege are seen in mid"
+        );
+    }
+
+    /// **The whole loop, territorially.** Name a pass, arm a watch on it, walk
+    /// an army in, and the squad is defending it before anybody at either
+    /// keyboard has read an event — through the real compiler, in the frame the
+    /// rule fired, with a sentence a person can read.
+    #[test]
+    fn five_enemies_enter_the_pass_and_the_squad_is_already_there() {
+        let mut app = full_app();
+        app.insert_resource(FogGrids::test_revealed());
+        let pass = Vec3::new(-60.0, 0.0, 60.0);
+
+        // Squad 2, out in midfield doing something else.
+        let soldier = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_xyz(0.0, 0.0, 0.0),
+                Health::new(100.0),
+                SquadId(2),
+                Order::Idle,
+            ))
+            .id();
+
+        // Both sentences through the wire, exactly as COMMANDER_BRIEF.md
+        // spells them.
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: serde_json::from_str(
+                r#"{"type":"region_set","name":"north-pass","x":-60.0,"z":60.0,"radius":20.0}"#,
+            )
+            .expect("the recipe parses"),
+            trigger: None,
+            plan: None,
+        });
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 1".to_string(),
+            intent: serde_json::from_str(
+                r#"{"type":"trigger_set","name":"pass-watch",
+                    "when":{"type":"enemy_in","region":"north-pass","count":5},
+                    "then":{"type":"posture","id":2,
+                            "posture":{"type":"defend","region":"north-pass"}},
+                    "repeat":30.0}"#,
+            )
+            .expect("the recipe in COMMANDER_BRIEF.md parses"),
+            trigger: None,
+            plan: None,
+        });
+        app.update();
+        assert_eq!(app.world().resource::<Triggers>().get(Team::Human).len(), 1, "armed");
+        assert!(
+            !app.world()
+                .resource::<SquadOrders>()
+                .0
+                .contains_key(&(Team::Human, 2)),
+            "and nothing has happened yet — a trigger is not its action"
+        );
+
+        // Four is not five: the rule is armed and the world is not yet its
+        // condition.
+        for i in 0..4 {
+            app.world_mut().spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Claude,
+                Transform::from_translation(pass + Vec3::new(i as f32, 0.0, 0.0)),
+                Health::new(100.0),
+            ));
+        }
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<SquadOrders>()
+                .0
+                .contains_key(&(Team::Human, 2)),
+            "four in the pass is not the rule the commander wrote"
+        );
+
+        // The fifth arrives.
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Footman },
+            Team::Claude,
+            Transform::from_translation(pass + Vec3::new(4.0, 0.0, 0.0)),
+            Health::new(100.0),
+        ));
+        advance(&mut app, 5.0);
+        app.update();
+
+        match app.world().resource::<SquadOrders>().0.get(&(Team::Human, 2)) {
+            Some(SquadPosture::Defend { pos, radius }) => {
+                assert_eq!(*pos, pass, "the squad is defending the pass it was named for");
+                assert_eq!(*radius, 20.0, "at the region's own radius");
+            }
+            other => panic!("expected squad 2 to be defending the pass, got {other:?}"),
+        }
+        // ...and it said so, in English, with the place named rather than
+        // spelled in floats.
+        assert!(
+            app.world()
+                .resource::<GameEvents>()
+                .feed(Team::Human)
+                .iter()
+                .any(|e| e.message == "trigger pass-watch fired: squad 2 defends north-pass"),
+            "feed was {:?}",
+            app.world()
+                .resource::<GameEvents>()
+                .feed(Team::Human)
+                .iter()
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(*app.world().entity(soldier).get::<SquadId>().unwrap(), SquadId(2));
     }
 }

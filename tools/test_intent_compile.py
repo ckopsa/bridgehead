@@ -96,10 +96,21 @@ def test_bases_and_middle():
 
 def test_mines_are_named_by_direction_and_not_stolen_by_chokes():
     s = snap()
-    # "northwest" appears in "northwest ford"; the mine noun must win, and
-    # pick the mine nearest that direction rather than the ford at it.
-    assert ic.resolve_place("the northwest mine", s) == (-58.0, 58.0)
-    assert ic.resolve_place("the southeast mine", s) == (58.0, -58.0)
+    # "northwest" appears in "northwest ford"; the mine noun must win, and pick
+    # the mine at that direction rather than the ford at it.
+    #
+    # NOTE the two spellings resolve through DIFFERENT machinery now, and
+    # deliberately. `the northwest mine` is a name in the map's own vocabulary
+    # (`map.places`), so it resolves to the map's circle — the identical
+    # coordinates the engine gives for `{"region":"northwest mine"}`, which is
+    # the point: the tool and the engine must not disagree about where a word
+    # points. The fuzzy picker below still owns every phrasing that is a
+    # description rather than a name.
+    nw = [p for p in s.places if p["name"] == "northwest mine"][0]
+    assert ic.resolve_place("the northwest mine", s) == tuple(nw["pos"])
+    se = [p for p in s.places if p["name"] == "southeast mine"][0]
+    assert ic.resolve_place("the southeast mine", s) == tuple(se["pos"])
+    # Descriptions, not names: still the picker, still against the LIVE nodes.
     assert ic.resolve_place("the contested mine", s) == (22.0, 52.0)
     assert ic.resolve_place("the nearest bounty", s) == (6.0, -12.0)
 
@@ -199,33 +210,41 @@ def test_forage_mid_with_cavalry_names_only_the_cavalry():
 
 
 def test_the_headline_directive():
-    """THESIS.md's example, end to end.
+    """THESIS.md's example, end to end — and it no longer defers.
 
-    Two clauses compile; the conditional one is deferred with the exact
-    follow-up command — and it is still deferred now that `trigger_set` EXISTS,
-    which is the interesting half. "their hero falls" is not deferred because
-    the language lacks a `when`; it is deferred because the predicate
-    vocabulary has no reading of an ENEMY hero's health, and answering it with
-    your own would be a different order carried out silently.
+    This test is the ledger of what the intel bead bought. All three clauses
+    compile now: "strike when their hero falls" was deferred for as long as the
+    engine had no honest reading of an enemy hero, and the sightings ledger is
+    that reading. Whether you WATCHED THEIR HERO DIE is a fact a human plainly
+    has — they were looking at it — so the predicate exists and the sentence
+    arms a rule instead of printing advice.
+
+    What is still refused is the neighbouring sentence about enemy hero
+    HEALTH; see `test_enemy_hero_health_still_defers_because_it_is_unknowable`.
+    The line between them is the whole point: not "is this about the enemy" but
+    "could a human have seen it".
     """
     result = compile_one("hold the west, forage mid with cavalry, "
                          "strike when their hero falls")
-    assert verbs(result) == ["squad", "posture", "squad", "posture"]
-    hold_squad, hold, forage_squad, forage = result.intents
+    assert verbs(result) == ["squad", "posture", "squad", "posture",
+                             "squad", "trigger_set"]
+    hold_squad, hold, forage_squad, forage, strike_squad, trigger = result.intents
     assert hold["posture"]["type"] == "defend"
     assert (hold["posture"]["x"], hold["posture"]["z"]) == ic.COMPASS["west"]
     assert forage["posture"]["type"] == "forage"
     # Distinct squads: the cavalry leaves the holding force for the forage job.
     assert hold["id"] != forage["id"]
     assert set(forage_squad["units"]) == {4294968130, 4294968131, 4294968132}
-    assert len(result.deferred) == 1
-    clause, condition, suggestion = result.deferred[0]
-    assert condition == "their hero falls"
-    # The action, ready to re-run the moment the event feed shows the trigger.
-    assert suggestion == "strike"
-    assert only(compile_one(suggestion), "posture")["posture"] == {
-        "type": "push", "x": -70.0, "z": -70.0
+    # The conditional: the membership is established NOW, the purpose waits.
+    assert trigger["when"] == {"type": "enemy_hero_down"}
+    assert trigger["name"] == "their-hero-down"
+    assert trigger["then"] == {
+        "type": "posture", "id": strike_squad["id"],
+        "posture": {"type": "push", "x": -70.0, "z": -70.0},
     }
+    # A once-trigger: "when" fires exactly one time and disarms.
+    assert "repeat" not in trigger
+    assert not result.errors and not result.deferred
 
 
 def test_escort_targets_a_unit_and_never_itself():
@@ -576,6 +595,10 @@ def test_every_predicate_has_a_phrase_that_reaches_it():
             {"type": "squad_below", "id": 2, "frac": 0.4},
         "when I see 3 or more siege, squad 1 defends our base":
             {"type": "enemy_sighted", "class": "Siege", "count": 3},
+        "when an enemy army of 6 is spotted, squad 1 defends our base":
+            {"type": "enemy_army_seen", "size": 6},
+        "when their hero falls, squad 1 pushes their base":
+            {"type": "enemy_hero_down"},
         "when a bounty appears, squad 1 forages mid":
             {"type": "bounty_spawned"},
         "when my mine runs dry, squad 1 defends our base":
@@ -598,16 +621,75 @@ def test_a_bare_enemy_sighting_defaults_to_one():
     assert t["when"] == {"type": "enemy_sighted", "class": "Cavalry", "count": 1}
 
 
-def test_an_unreadable_condition_defers_instead_of_guessing():
-    """The refusal that matters most. Nothing in `TriggerWhen` reads an ENEMY
-    hero's health, and the nearest predicate that exists reads YOUR OWN — so a
-    tool that reached for it would arm a rule meaning the opposite."""
+def test_strike_when_their_hero_falls_compiles():
+    """The sentence this tool was named after, finally armed.
+
+    `enemy_hero_down` is a LEVEL predicate — "their hero is currently believed
+    dead" — so a `when` (once) rule fires on the first sweep after the death is
+    witnessed and then disarms, which is the edge behaviour the English means.
+    """
     result = compile_one("strike when their hero falls")
+    trigger = only(result, "trigger_set")
+    assert trigger["when"] == {"type": "enemy_hero_down"}
+    assert trigger["then"]["posture"] == {"type": "push", "x": -70.0, "z": -70.0}
+    assert not result.deferred and not result.errors
+
+
+def test_a_named_hero_class_narrows_the_predicate_and_its_name():
+    """Two hero classes exist, so "their priestess" and "their champion" are
+    different rules and must not overwrite each other in the eight slots."""
+    champion = only(compile_one("when their champion dies, squad 2 pushes their base"),
+                    "trigger_set")
+    assert champion["when"] == {"type": "enemy_hero_down", "class": "Hero"}
+    # NOT "hero-down": that is one character from `hero_below`'s "hero-35", and
+    # the two are rules about opposite armies.
+    assert champion["name"] == "champion-down"
+    priestess = only(compile_one("when their priestess is killed, squad 1 pushes their base"),
+                     "trigger_set")
+    assert priestess["when"] == {"type": "enemy_hero_down", "class": "Priestess"}
+    assert priestess["name"] == "priestess-down"
+    assert champion["name"] != priestess["name"]
+
+
+def test_enemy_hero_health_still_defers_because_it_is_unknowable():
+    """The refusal that survived, and the reason it is a different question.
+
+    A human cannot select an enemy hero — ui.rs's pickers skip anything that is
+    not theirs — so no number about one has ever been on anybody's screen. That
+    a hero DIED is visible; that it is at 30% is not. The compiler must keep
+    telling those two apart, or the intel bead would have been an excuse to
+    hand a commander the enemy's health bars.
+    """
+    result = compile_one("strike when their hero is below 30%")
     assert not result.intents
     assert len(result.deferred) == 1
     _, condition, suggestion = result.deferred[0]
-    assert condition == "their hero falls"
+    assert condition == "their hero is below 30%"
     assert suggestion == "strike"
+
+
+def test_an_enemy_army_reads_the_ledger_and_can_bound_its_staleness():
+    """`enemy_army_seen` differs from `enemy_sighted` by MEMORY: it stays true
+    after the scout that found the army is killed, which is exactly what the
+    scout was killed to prevent. `within_s` is how a commander asks for a
+    current army rather than a known one."""
+    plain = only(compile_one("when an enemy army of 6 is spotted, squad 1 defends our base"),
+                 "trigger_set")
+    assert plain["when"] == {"type": "enemy_army_seen", "size": 6}
+    assert plain["name"] == "army-6"
+    bounded = only(
+        compile_one("whenever we know of an enemy force of 8 within 30s, "
+                    "squad 2 defends our base"),
+        "trigger_set")
+    assert bounded["when"] == {"type": "enemy_army_seen", "size": 8, "within_s": 30.0}
+    # "whenever" is the repeating connector.
+    assert bounded["repeat"] == ic.DEFAULT_REPEAT_S
+
+
+def test_minutes_are_accepted_as_a_staleness_bound():
+    t = only(compile_one("when an enemy army of 5 is seen within 2 minutes, "
+                         "squad 1 defends our base"), "trigger_set")
+    assert t["when"]["within_s"] == 120.0
 
 
 def test_a_multi_intent_action_sends_the_setup_and_defers_the_purpose():
@@ -657,6 +739,8 @@ KNOWN_VERBS = {
     "cast", "buy", "use_item",
     "priority", "retreat", "leash", "autocast", "squad", "posture", "template",
     "trigger_set", "trigger_clear",
+    "region_set", "region_clear",
+    "plan_set", "plan_clear",
     "autopilot", "surrender",
 }
 POSTURE_TYPES = {"defend", "push", "escort", "forage"}
@@ -733,7 +817,126 @@ def test_explain_lists_the_whole_vocabulary():
                    "my hero drops below", "squad 2 drops below",
                    "I see 3 or more siege", "a bounty appears",
                    "my mine runs dry", "we reach tier 2", "we have 8 footmen",
-                   "the clock passes 6 minutes", "Max 8 armed triggers"):
+                   "the clock passes 6 minutes", "Max 8 armed triggers",
+                   # Territory: the two verbs, the built-in vocabulary and the
+                   # predicate that reads it. A model that cannot see a place
+                   # name cannot speak one.
+                   "region_set", "region_clear", "name <place>",
+                   "our base", "their base", "mid", "Max 8 regions",
+                   "enemy_in", "5 or more enemies in",
+                   # The intel predicates, and the refusal that survived beside
+                   # them — a model must be able to see BOTH, or it will guess
+                   # that enemy hero health is available because enemy hero
+                   # death is.
+                   "an enemy army of 6 is spotted", "their hero falls",
+                   "within 30s", "ENEMY hero's health"):
+        assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
+
+
+# ---------------------------------------------------------------------------
+# Plans: "X, then Y, then Z"
+# ---------------------------------------------------------------------------
+
+
+def test_a_then_chain_becomes_one_plan():
+    """The headline. Three clauses joined by ", then" are ONE plan_set, not
+    three orders sent now — which is the whole point: the engine walks it."""
+    r = compile_one("build a barracks, then when we reach tier 2, build a sanctum, "
+                    "then train 2 sorcerers")
+    assert verbs(r) == ["plan_set"], verbs(r)
+    plan = r.intents[0]
+    kinds = [s["intent"]["type"] for s in plan["steps"]]
+    assert kinds == ["build", "build", "train", "train"], kinds
+    # The condition governs the step BEFORE it: the plan waits on the barracks
+    # step until tier 2, then puts up the sanctum.
+    assert plan["steps"][0]["advance"] == {
+        "type": "when", "when": {"type": "tier_reached", "tier": 2}}
+    assert "advance" not in plan["steps"][1], "a bare ', then' is the default"
+    assert plan["steps"][0]["intent"]["kind"] == "Barracks"
+    assert plan["steps"][1]["intent"]["kind"] == "Sanctum"
+
+
+def test_a_bare_then_chain_is_all_default_advances():
+    r = compile_one("build a barracks, then train 2 footmen")
+    plan = only(r, "plan_set")
+    assert all("advance" not in s for s in plan["steps"])
+    assert plan["name"] == "plan-build", plan["name"]
+
+
+def test_an_after_step_is_a_fixed_wait():
+    r = compile_one("push mid, then after 60s, push their base")
+    plan = only(r, "plan_set")
+    afters = [s.get("advance") for s in plan["steps"] if s.get("advance")]
+    assert afters == [{"type": "after", "secs": 60.0}], afters
+    # "after 2 minutes" is the same wait spelled the way people say it.
+    plan = only(compile_one("push mid, then after 2 minutes, push their base"), "plan_set")
+    assert [s["advance"] for s in plan["steps"] if "advance" in s] == [
+        {"type": "after", "secs": 120.0}]
+
+
+def test_a_focus_chain_is_not_a_plan():
+    """The comma is the disambiguation and it has to hold. 'focus siege then
+    heroes' is ONE clause with a priority chain in it; splitting it would turn
+    one correct order into two wrong ones."""
+    r = compile_one("focus siege then heroes")
+    assert verbs(r) == ["priority"], verbs(r)
+    assert only(r, "priority")["classes"] == ["Siege", "Hero"]
+
+
+def test_a_plan_can_be_named_and_the_derived_name_is_stable():
+    r = compile_one("build a barracks, then train 2 footmen as opener")
+    assert only(r, "plan_set")["name"] == "opener"
+    # Unnamed, the same directive twice derives the same name, so re-issuing it
+    # REPLACES the plan instead of spending the other of the two slots.
+    a = only(compile_one("build a barracks, then train 2 footmen"), "plan_set")["name"]
+    b = only(compile_one("build a barracks, then train 2 footmen"), "plan_set")["name"]
+    assert a == b == "plan-build"
+
+
+def test_the_squad_idiom_is_how_a_plan_names_units_it_does_not_have_yet():
+    """A step's units are frozen when the plan is set, so a step cannot name
+    soldiers that do not exist. The late-binding selector the language already
+    has is the SQUAD: a template stamps membership, and the posture step
+    resolves that membership when it runs."""
+    r = compile_one("the barracks units join squad 2, "
+                    "then when I have 8 footmen, squad 2 pushes their base")
+    plan = only(r, "plan_set")
+    kinds = [s["intent"]["type"] for s in plan["steps"]]
+    assert kinds[-1] == "posture" and "template" in kinds, kinds
+    # The wait is on the step before the push, and it is a unit COUNT — the
+    # plan waits for the army to exist rather than naming it.
+    waits = [s["advance"] for s in plan["steps"] if "advance" in s]
+    assert waits == [{"type": "when", "kind": "Footman", "count": 8}] or \
+        waits == [{"type": "when", "when": {"type": "unit_count",
+                                            "kind": "Footman", "count": 8}}], waits
+    # The push names the squad, never a unit list.
+    assert plan["steps"][-1]["intent"]["id"] == 2
+    assert "units" not in plan["steps"][-1]["intent"]
+
+
+def test_an_unknown_step_condition_is_an_error_not_a_guess():
+    """Same rule as the trigger layer: a condition outside the vocabulary is
+    refused by name. A plan that advanced on the wrong thing would be worse
+    than one that never compiled."""
+    r = compile_one("build a barracks, then when the sky falls, train 4 footmen")
+    assert not r.intents
+    assert any("not a condition the engine can watch" in why for _, why in r.errors), r.errors
+
+
+def test_a_plan_is_refused_when_it_is_too_long_or_shaped_like_a_trigger():
+    r = compile_one("train 9 footmen, then push mid")
+    assert not r.intents
+    assert any("steps" in why and "8" in why for _, why in r.errors), r.errors
+
+    # A condition cannot open a plan — that shape is a trigger, and the tool
+    # says which word to use rather than compiling something else.
+    r = compile_one("when we reach tier 2, build a sanctum, then train 2 sorcerers")
+    assert any("cannot open with a condition" in why for _, why in r.errors), r.errors
+
+
+def test_explain_documents_the_plan_grammar():
+    for phrase in ("PLANS", ", then", "then when <cond>", "then after <n>s",
+                   "at most 8 steps", "THE COMMA MATTERS"):
         assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
 
 
@@ -766,6 +969,261 @@ def _run():
     print(f"{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 
+
+
+# ---------------------------------------------------------------------------
+# Territory: named places and regions
+# ---------------------------------------------------------------------------
+
+
+def region_snap(*regions):
+    """The fixture seat with some ground already named."""
+    s = snap()
+    s.regions = [
+        {"name": n, "pos": list(pos), "radius": r} for (n, pos, r) in regions
+    ]
+    return s
+
+
+def test_the_maps_own_vocabulary_is_speakable_with_nothing_armed():
+    s = snap()
+    assert s.regions == [], "the fixture seat has named nothing"
+    # ...and every built-in still resolves, because they are map facts.
+    for name in ("mid", "our base", "their base", "center ford",
+                 "northwest ford", "southeast mine"):
+        assert ic.resolve_place(name, s) is not None, name
+    assert ic.resolve_place("center ford", s) == CENTER_FORD
+    assert ic.resolve_place("our base", s) == MY_BASE
+    assert ic.resolve_place("their base", s) == THEIR_BASE
+
+
+def test_a_named_region_resolves_and_survives_spelling():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    for spelling in ("north-pass", "north pass", "NORTH-PASS",
+                     "north_pass", "the north-pass"):
+        assert ic.resolve_place(spelling, s) == NW_FORD, spelling
+
+
+def test_a_name_beats_the_heuristics_it_contains():
+    """A commander who named ground "west" means THAT ground, not the compass."""
+    s = region_snap(("west", (10.0, -10.0), 20.0))
+    assert ic.resolve_place("west", s) == (10.0, -10.0)
+    # The compass is still there for everything that is not a name.
+    assert ic.resolve_place("the east", s) == (65.0, 0.0)
+
+
+def test_a_user_region_goes_on_the_wire_by_name():
+    """The late-binding rule: a region can MOVE, so the engine resolves it."""
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["squad 2 defends north-pass"], s)
+    posture = only(result, "posture")["posture"]
+    assert posture == {"type": "defend", "region": "north-pass"}, posture
+    # No radius: the region's own becomes the ring, at the engine's one
+    # resolution point. A sentence with no numbers in it at either end.
+    assert "radius" not in posture
+    assert "x" not in posture and "z" not in posture
+
+
+def test_a_built_in_place_is_resolved_here_because_it_cannot_move():
+    s = snap()
+    result = ic.compile_directives(["squad 2 defends the center ford"], s)
+    posture = only(result, "posture")["posture"]
+    assert (posture["x"], posture["z"]) == CENTER_FORD
+    assert "region" not in posture
+
+
+def test_an_explicit_radius_still_wins_over_the_regions_own():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["squad 2 defends north-pass within 30"], s)
+    posture = only(result, "posture")["posture"]
+    assert posture["region"] == "north-pass"
+    assert posture["radius"] == 30.0
+
+
+def test_hold_with_units_names_the_region_too():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["hold north-pass with everything"], s)
+    assert verbs(result) == ["squad", "posture"]
+    assert only(result, "posture")["posture"]["region"] == "north-pass"
+
+
+def test_naming_ground_is_the_deterministic_form_only():
+    s = snap()
+    result = ic.compile_directives(['name the southeast ford "south-gate" radius 18'], s)
+    assert only(result, "region_set") == {
+        "type": "region_set", "name": "south-gate",
+        "x": SE_FORD[0], "z": SE_FORD[1], "radius": 18.0,
+    }
+    # The `as` spelling, and the default radius.
+    result = ic.compile_directives(["name mid as the-middle"], snap())
+    region = only(result, "region_set")
+    assert region["name"] == "the-middle"
+    assert (region["x"], region["z"]) == CENTER_FORD
+    assert region["radius"] == ic.DEFAULT_REGION_RADIUS
+    # The LOOSE spelling is deliberately not a rule: "call this the perimeter"
+    # is ambiguous between a name and a place phrase this very file resolves.
+    result = ic.compile_directives(["call this the perimeter"], snap())
+    assert result.intents == []
+
+
+def test_a_region_may_not_be_named_over_a_built_in():
+    result = ic.compile_directives(['name our base "mid"'], snap())
+    assert result.intents == []
+    assert result.errors and "built-in" in result.errors[0][1]
+
+
+def test_a_region_radius_is_checked_against_the_engines_bounds():
+    for bad in (1, 200):
+        result = ic.compile_directives([f'name mid "x" radius {bad}'], snap())
+        assert result.intents == [], bad
+        assert result.errors and "outside" in result.errors[0][1]
+
+
+def test_a_region_named_in_a_directive_is_usable_later_in_it():
+    """The batch applies in order, so clause two can name what clause one made.
+
+    A compiler that refused the later clause would be disagreeing with the
+    machine it is writing for.
+    """
+    result = ic.compile_directives(
+        ['name the center ford "the-gate" radius 12', "squad 3 defends the-gate"],
+        snap(),
+    )
+    assert verbs(result) == ["region_set", "posture"]
+    assert only(result, "posture")["posture"] == {
+        "type": "defend", "region": "the-gate",
+    }
+
+
+def test_forgetting_ground_is_one_or_all():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["forget region north-pass"], s)
+    assert only(result, "region_clear") == {
+        "type": "region_clear", "name": "north-pass",
+    }
+    result = ic.compile_directives(["forget all regions"], region_snap(("a", NW_FORD, 20.0)))
+    assert only(result, "region_clear") == {"type": "region_clear"}
+
+
+def test_a_forgotten_region_stops_resolving_in_the_same_directive():
+    result = ic.compile_directives(
+        ["forget region north-pass", "squad 2 defends north-pass"],
+        region_snap(("north-pass", NW_FORD, 20.0)),
+    )
+    assert verbs(result) == ["region_clear"]
+    assert result.errors and "cannot resolve place" in result.errors[0][1]
+
+
+def test_here_is_the_armys_centre_of_mass():
+    s = snap()
+    army = [u for u in s.own_units() if u.get("kind") != ic.WORKER_KIND]
+    assert army, "the fixture has an army to be the centre of"
+    want = (
+        round(sum(float(u["pos"][0]) for u in army) / len(army), 4),
+        round(sum(float(u["pos"][1]) for u in army) / len(army), 4),
+    )
+    got = ic.resolve_place("here", s)
+    assert abs(got[0] - want[0]) < 1e-3 and abs(got[1] - want[1]) < 1e-3, (got, want)
+
+
+def test_the_region_verbs_are_in_the_wire_vocabulary():
+    """Every verb this tool can emit must be one the engine accepts."""
+    emitted = set()
+    for text, s in [
+        ('name mid "m"', snap()),
+        ("forget all regions", region_snap(("a", NW_FORD, 20.0))),
+    ]:
+        for intent in ic.compile_directives([text], s).intents:
+            emitted.add(intent["type"])
+    assert emitted == {"region_set", "region_clear"}
+
+
+def test_enemies_entering_a_named_place_is_the_territorial_predicate():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(
+        ["when 5 or more enemies enter north-pass, squad 2 defends north-pass"], s)
+    trigger = only(result, "trigger_set")
+    assert trigger["when"] == {
+        "type": "enemy_in", "region": "north-pass", "count": 5,
+    }
+    assert trigger["then"]["posture"] == {"type": "defend", "region": "north-pass"}
+    # Fires once by default; `whenever` repeats, like every other predicate.
+    assert "repeat" not in trigger
+    result = ic.compile_directives(
+        ["whenever enemies are in north-pass, squad 1 defends north-pass"], s)
+    assert only(result, "trigger_set").get("repeat")
+
+
+def test_a_class_inside_a_place_is_kept_and_an_unknown_one_defers():
+    s = snap()
+    trigger = only(
+        ic.compile_directives(
+            ["when 3 enemy siege enter the center ford, squad 1 defends mid"], s),
+        "trigger_set")
+    assert trigger["when"] == {
+        "type": "enemy_in", "region": "center ford", "count": 3, "class": "Siege",
+    }
+    # A noun that is not a class must NOT be silently dropped — "5 catapults in
+    # north-pass" and "5 of anything in north-pass" are different rules.
+    assert ic.parse_when("3 enemy wyverns enter the center ford", s) is None
+
+
+def test_a_place_the_seat_cannot_name_defers_rather_than_guessing():
+    s = snap()
+    assert ic.parse_when("5 enemies enter the mushroom kingdom", s) is None
+    # ...and with no snapshot at all the predicate is simply unavailable,
+    # rather than resolving against a vocabulary that is not there.
+    assert ic.parse_when("5 enemies enter north-pass") is None
+
+
+def test_the_built_in_places_need_nothing_armed_to_be_watched():
+    """A map place is a map fact: watchable in the first second of a match."""
+    s = snap()
+    assert s.regions == []
+    assert ic.parse_when("5 enemies enter the center ford", s) == {
+        "type": "enemy_in", "region": "center ford", "count": 5,
+    }
+
+
+def test_a_plan_step_may_advance_on_enemies_reaching_a_named_place():
+    """The seam between plans and territory, spoken as one sentence.
+
+    `PlanAdvance::When` carries the whole predicate vocabulary, so a place the
+    same directive just NAMED is available to a later step's advance condition.
+    Both halves have to be wired for this to work: the step parser needs the
+    snapshot (or `enemy_in` is invisible to it), and `region_set` has to publish
+    the new name into the rest of the directive.
+    """
+    r = ic.compile_directives([
+        'name the northwest ford "north-pass" radius 20, '
+        'then hold north-pass with everything, '
+        'then when 5 or more enemies enter north-pass, squad 2 pushes their base'
+    ], snap())
+    assert not r.errors, r.errors
+    assert verbs(r) == ["plan_set"], verbs(r)
+    steps = only(r, "plan_set")["steps"]
+    # The region is named by the plan's first step...
+    assert steps[0]["intent"]["type"] == "region_set"
+    assert steps[0]["intent"]["name"] == "north-pass"
+    # ...used by a later step's posture, by NAME...
+    holding = [st for st in steps
+               if st["intent"].get("posture", {}).get("region") == "north-pass"]
+    assert holding, [st["intent"] for st in steps]
+    # ...and watched by that step's advance condition.
+    advance = holding[0]["advance"]
+    assert advance == {
+        "type": "when",
+        "when": {"type": "enemy_in", "region": "north-pass", "count": 5},
+    }, advance
+
+
+def test_a_plan_step_advance_still_refuses_a_place_the_seat_cannot_name():
+    """The seam does not become a hole: an unnameable place still defers."""
+    r = ic.compile_directives(
+        ["push mid, then when 5 enemies enter the mushroom kingdom, push their base"],
+        snap())
+    assert r.intents == []
+    assert r.errors and "not a condition the engine can watch" in r.errors[0][1]
 
 if __name__ == "__main__":
     sys.exit(_run())

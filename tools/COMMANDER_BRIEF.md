@@ -29,7 +29,10 @@ says command 3 was accepted but took 1.8s to reach the units it named — see
 
 ## Command reference
 Unit orders (ids from state):
-- `{"type":"move"|"attackmove","units":[ids],"x":..,"z":..}`
+- `{"type":"move"|"attackmove","units":[ids],"x":..,"z":..}` — or
+  `{"type":"move","units":[ids],"region":"north-pass"}`. **Every verb below that
+  takes `x`/`z` also takes `"region":"<name>"` instead**; see *Territory*.
+
 - `{"type":"attack","units":[ids],"target":enemy_id}`
 - `{"type":"harvest","units":[worker_ids],"target":node_id}` (mines AND trees — tree ids in `trees_near`)
 - `{"type":"return","units":[worker_ids]}`  `{"type":"stop","units":[ids]}`  `{"type":"follow","units":[ids],"target":own_id}`
@@ -107,9 +110,67 @@ Triggers (CONTINGENT standing orders — see the section below; this is the shap
 - `{"type":"trigger_set","name":"home-guard","when":{...},"then":{<any intent>},"repeat":30}`
   — the engine watches `when` at 4 Hz and submits `then` itself. `repeat` omitted = fires once.
 - `{"type":"trigger_clear","name":"home-guard"}` — disarm one. Omit `name` to clear all of them.
+Plans (SEQUENCED standing orders — see the section below; this is the shape):
+- `{"type":"plan_set","name":"opening","steps":[{"intent":{<any intent>},"advance":{...}},...]}`
+  — the engine walks the sequence for you, submitting each step when its turn comes. `advance`
+  omitted = "as soon as this one is accepted"; `{"type":"when","when":{<any trigger predicate>}}`
+  = wait for that condition; `{"type":"after","secs":30}` = wait that long. Max 8 steps, max 2
+  plans running, once through (no loops — that is what a trigger's `repeat` is for).
+- `{"type":"plan_clear","name":"opening"}` — drop one. Omit `name` to drop all of them.
 - `{"type":"autopilot","on":true}` — hand your whole faction to the scripted AI (emergency only).
 - `{"type":"surrender"}` — concede the match (opponent wins immediately). The honorable end to a
   hopeless position — no income, no army, no path back. Preferable to dragging out a decided game.
+
+## Territory: name the ground once, then speak in names
+
+Your snapshot hands you two vocabularies of named circles. Anywhere a verb takes
+`x`/`z`, send `"region":"<name>"` instead and the engine resolves it when the
+command arrives.
+
+**`map.places`** — the map's own names. Read-only, public (your opponent reads
+the same list), and live from second zero with nothing armed:
+
+| name | what |
+|---|---|
+| `our base` / `their base` | the two starting halls. Seat-relative: same words in both snapshots, different coordinates |
+| `mid` | the map centre, where bounties spawn |
+| `northwest mine`, `southeast mine`, … | one per gold mine, named for its compass corner |
+| `northwest ford`, `center ford`, … | one per chokepoint. Empty on `open`; three on `crossings` |
+
+**`regions`** — circles YOU named, up to **8**. These are doctrine, not
+information: they appear in your snapshot only, and naming ground tells your
+opponent nothing.
+
+```json
+{"type":"region_set","name":"north-pass","x":-60.0,"z":60.0,"radius":20.0}
+{"type":"region_clear","name":"north-pass"}      // or {} for all of them
+```
+
+Re-using a name **moves** that circle rather than spending a slot. Radius must
+be 4..60. You may not take a name `map.places` already owns.
+
+**What each verb does with a region:**
+
+| verb | region means |
+|---|---|
+| `move` / `attackmove` / `build` / `rally` | go to / build at the centre |
+| `posture` `defend` | centre is the anchor **and the region's own radius is the ring** — omit `radius` and stop carrying the number around |
+| `posture` `push` | push to the centre (a push has no radius) |
+| `posture` `forage` | the centre is the muster point |
+| `leash` | anchor at the centre; omit `radius` and the region's own is the leash |
+| `retreat` | fall back to the centre |
+
+**Why bother.** Two reasons, and the second is the one that wins matches:
+
+1. Your log becomes readable. `squad 2 defends north-pass` instead of
+   `squad 2 defends (-60.0, 60.0) within 20`.
+2. **The engine resolves the name, not you.** A standing order or an armed rule
+   that says `north-pass` keeps meaning *the pass* — so one `region_set` moving
+   the circle re-aims every posture and every trigger that mentions it. That is
+   one command instead of five, at zero polls.
+
+A name you have not defined is refused with the list of names you do have, so a
+typo costs you one error line rather than a silent order to the map's centre.
 
 ## Triggers: make the engine react for you
 
@@ -132,7 +193,7 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 
     trigger home-guard fired: squad 1 defends (-70.0, -70.0) within 26
 
-### The nine predicates
+### The twelve predicates
 
 | `when` | means |
 |---|---|
@@ -140,16 +201,35 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 | `{"type":"hero_below","frac":0.35}` | any of your living heroes under that fraction |
 | `{"type":"squad_below","id":1,"frac":0.5}` | squad 1's POOLED health under that (false if the squad is empty) |
 | `{"type":"enemy_sighted","class":"Siege","count":3}` | you can SEE that many enemies now (`class` optional; fog-honest) |
+| `{"type":"enemy_in","region":"north-pass","count":5}` | you can see that many enemies **inside a named place** (`class` optional; fog-honest both ways — see *Territory*) |
+| `{"type":"enemy_army_seen","size":6}` | your **intel ledger** holds 6+ enemy troops seen as one force. Optional `"within_s":30` demands a fresh sighting rather than a remembered one. Workers never count |
+| `{"type":"enemy_hero_down"}` | an enemy hero you **watched die** and have not seen alive since. Optional `"class":"Hero"` / `"Priestess"` for just one |
 | `{"type":"bounty_spawned"}` | a cache you can see is on the map |
 | `{"type":"mine_dry"}` | a dry gold mine within 40 of one of your finished halls |
 | `{"type":"tier_reached","tier":2}` | your tech tier |
 | `{"type":"unit_count","kind":"Footman","count":8}` | your living count of one unit kind |
 | `{"type":"game_time","at":360}` | the match clock, in seconds |
 
-There is nothing here about the enemy's gold, tech or hero health — the snapshot
-does not carry those for either seat, so no predicate can.
+`enemy_army_seen` vs `enemy_sighted` is the difference between memory and
+sight. `enemy_sighted` is true only while you have eyes on them, so it goes
+false the moment your scout dies — which is what the scout was killed for.
+`enemy_army_seen` reads the ledger and stays true.
 
-### Three recipes worth arming in your first batch
+`enemy_hero_down` is a **level** predicate, not an edge: it means "as far as I
+know, their hero is down". Arm it `once` (no `repeat`) and it fires on the
+first sweep after you witness the death and then disarms, which is what "when
+their hero falls" means. Give it a `repeat` and it re-fires for as long as the
+belief stands — "keep pressing while they have no hero" — which is a different
+and equally legitimate order. If you see the hero alive again after a revive
+the belief flips back and a re-armed rule can fire on the next death you watch.
+
+There is still nothing here about the enemy's gold, their tech, or their hero's
+**health**. Those are facts no human can obtain — you cannot select an enemy
+hero, so no number about one has ever been on anybody's screen — so no
+predicate can read them. That their hero *died in front of you* is a different
+matter, and that one you may have.
+
+### Six recipes worth arming in your first batch
 
 **1. Home guard** — the army comes home when the base burns. Repeating, because
 a base is raided more than once.
@@ -181,11 +261,225 @@ only need telling the first time.
  "then":{"type":"build","worker":<worker id>,"kind":"TownHall","x":0.0,"z":-60.0}}
 ```
 
-A caution that applies to all three: `then` is frozen when you arm it, so ids in
-it are ids that may die. Prefer `posture` on a **squad** over a list of unit ids
+**4. The counter-punch** — the sentence this whole layer was named after. Their
+hero is the most expensive thing on their side of the map; the window after it
+dies is the one moment their army is worth less than yours. Once, because you
+only get to spend that window once.
+
+```json
+{"type":"trigger_set","name":"their-hero-down",
+ "when":{"type":"enemy_hero_down"},
+ "then":{"type":"posture","id":1,
+         "posture":{"type":"push","x":-70.0,"z":-70.0}}}
+```
+
+`tools/intent_compile.py` writes exactly that from `strike when their hero
+falls` — arm the squad first (`squad 1 is the army`) or let the tool mint one.
+
+**5. The doorbell** — react to a force you scouted, not to one you can still
+see. Repeating, because an army that is answered comes back.
+
+```json
+{"type":"trigger_set","name":"army-6","repeat":45,
+ "when":{"type":"enemy_army_seen","size":6,"within_s":30},
+ "then":{"type":"posture","id":1,
+         "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}
+```
+
+**6. Hold the pass** — the territorial rule, and the one that most repays a
+region. It answers a question you would otherwise have to ask every poll ("is
+anything at my ford yet?") and it answers it four times a second.
+
+```json
+{"type":"region_set","name":"north-pass","x":-60.0,"z":60.0,"radius":20.0}
+{"type":"trigger_set","name":"pass-watch","repeat":30,
+ "when":{"type":"enemy_in","region":"north-pass","count":5},
+ "then":{"type":"posture","id":2,
+         "posture":{"type":"defend","region":"north-pass"}}}
+```
+
+Read that action: no coordinates and no radius. The squad defends the circle at
+the circle's own size, and if you later decide the pass is somewhere else, ONE
+`region_set` moves both the rule and the posture it fires.
+
+`enemy_in` is fog-honest in both directions: it counts only enemies you can see
+AND that are inside the shape. A region is ground you are *watching*, not a
+sensor — so keep something with vision near a pass you are counting on. If you
+`region_clear` a region a rule names, that rule goes quiet rather than firing on
+the whole map.
+
+A caution that applies to all six: `then` is frozen when you arm it, so ids init are ids that may die. Prefer `posture` on a **squad** over a list of unit ids
 where you can — a squad survives its members. And a trigger whose action is
 refused when it fires reports that in your `errors` array tagged
 `trigger:<name>`, so check there if a rule seems to do nothing.
+
+## Plans: make the engine run your build order
+
+**This is the second biggest thing you can do about your own latency, and it is
+the one that wins the first six minutes.** A trigger deletes the cost of
+*reacting*. A plan deletes the cost of *transcribing* — the build order you had
+already decided before the match started and were going to feed the engine one
+command per poll, at ten to fifteen seconds a command, while your opponent's
+economy compounded.
+
+A plan is named ordered steps. The engine submits step 1, waits for that step's
+`advance` condition, submits step 2, and so on. Once through, then it is done.
+
+Rules: max **2** plans running, max **8** steps each. Re-using a `name` replaces
+the plan and restarts it from step 1 (free — the cap counts live plans). A plan
+step may arm a `trigger_set`, but a plan may not set another plan. Your plans
+come back in the snapshot's `plans` array with `step`/`of`, `status`, the
+current step's `sentence`, and the whole `steps` list as the JSON you sent — so
+you can read one out, change a number, and send it back under the same name.
+
+Every step writes a line into `events` as it goes out:
+
+    plan opening step 2/5: worker 4294968100 builds Sanctum at (58.0, 66.0)
+
+### The three advance conditions
+
+| `advance` | the plan moves on |
+|---|---|
+| omitted (or `{"type":"on_applied"}`) | the moment this step is ACCEPTED — the plain meaning of "then" |
+| `{"type":"when","when":{...}}` | when that condition holds — **any of the eleven trigger predicates above**, including the intel ones |
+| `{"type":"after","secs":30}` | 30 seconds after this step was accepted |
+
+"Accepted" means the order was legal and taken, NOT that the building finished.
+To wait for something to finish, use `when` with `tier_reached` or `unit_count`.
+
+### If a step is refused
+
+The plan **blocks on that step and never skips it**. Its `status` becomes
+`blocked: <the exact compiler error>`, it retries the same step every 5s, and
+if it is still refused a minute later the status becomes `halted: <error>` and
+the plan stops for good — on the step that failed. Both are also announced in
+`events`. So a plan is never quietly wrong: it is either running, done, or
+telling you which step it is stuck on and why.
+
+The minute is deliberate: the commonest refusal a plan meets is "cannot afford
+it yet", and money arrives on a scale of tens of seconds, so the engine keeps
+trying long enough for your economy to answer. You are told at the *first*
+bounce either way — `blocked:` shows up within a tick — so if the reason is
+permanent ("you have no Sanctum") you can `plan_clear` it immediately rather
+than waiting for the halt.
+
+A step that reaches SOME of its units is a partial success, not a refusal: if
+one member of a listed squad has died, the survivors are still ordered, the dead
+id is still reported in `errors`, and the plan carries on. Only a step that
+reaches nothing blocks.
+
+### THE CANONICAL EXAMPLE: the boomer opening as one plan
+
+Economy first, workers second, tech third, army buildings last — sequenced so
+each step waits for the thing it needs. **This is one command instead of six
+polls.** Every id in it exists on your very first snapshot (five workers, a
+TownHall, the mines and trees arrays), which is the point: send it before you
+have done anything else.
+
+This exact plan has been run against a live seat and completes in about a
+minute of game time. It is not a sketch.
+
+```json
+{"type":"plan_set","name":"boomer","steps":[
+  {"intent":{"type":"harvest","units":[<worker A>,<worker B>,<worker C>],
+             "target":<your nearest mine>}},
+
+  {"intent":{"type":"harvest","units":[<worker D>,<worker E>],
+             "target":<a tree from trees_near>}},
+
+  {"intent":{"type":"train","building":<your TownHall>,"unit":"Worker"}},
+
+  {"intent":{"type":"train","building":<your TownHall>,"unit":"Worker"},
+   "advance":{"type":"when","when":{"type":"unit_count","kind":"Worker","count":7}}},
+
+  {"intent":{"type":"upgrade","building":<your TownHall>},
+   "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}},
+
+  {"intent":{"type":"build","worker":<worker A>,"kind":"Barracks","x":-58.0,"z":-58.0}}]}
+```
+
+Read it as English — it is exactly what the replay log will write:
+
+> plan boomer (6 steps): 3 units harvest node …, then 2 units harvest node …,
+> then building … trains Worker, then building … trains Worker, then when we
+> field 7 or more Worker: building … upgrades to its next tier, then when we
+> reach tier 2: worker … builds Barracks at (-58.0, -58.0)
+
+and here is what the engine actually wrote while running it:
+
+```
+[    3.3] plan boomer step 1/6: 3 units harvest node 4294967365
+[    3.5] plan boomer step 2/6: 2 units harvest node 4294967775
+[    3.8] plan boomer step 3/6: building 4294968193 trains Worker
+[    4.0] plan boomer step 4/6: building 4294968193 trains Worker
+[   19.8] plan boomer step 5/6: building 4294968193 upgrades to its next tier
+[   59.8] plan boomer step 6/6: worker 4294968174 builds Barracks at (58.0, 58.0)
+[   60.0] plan boomer complete (6 steps)
+```
+
+Four things to copy from this, because all four are easy to get wrong:
+
+- **The advance-condition of a step governs the move to the NEXT step.** The
+  `when tier_reached 2` sits on the `upgrade` step, and what it does is make the
+  *Barracks* wait for the Keep to finish.
+- **`train` queues ONE unit.** Two workers is two steps. A single `train` step
+  under `unit_count >= 7` is a plan that waits forever — and it will sit there
+  reporting `running`, perfectly honestly, because nothing checks a wait against
+  a world that will never satisfy it.
+- **Harvest FIRST, and harvest lumber too.** The first version of this example
+  skipped the wood and halted on `cannot afford Keep (320g 160l)` — with plenty
+  of gold and 150 of the 160 lumber. A plan spends real resources on a real
+  clock; if nothing is mining, the tech steps cannot pay.
+- **Put the cheap, always-legal steps early.** Steps that just re-task units
+  (`harvest`, `posture`, `squad`, `template`) cannot be refused for money, so a
+  plan that opens with them starts earning while the expensive steps wait.
+
+### The idiom for units you do not have yet
+
+**A step's unit ids are frozen when you set the plan.** You cannot write "the 8
+footmen I will have by then" — those units do not exist and have no ids.
+
+The answer is already in the language: **name a SQUAD.** `template` stamps every
+unit a building trains into squad 2; `posture` addresses squad 2 by number and
+resolves its membership when the step runs:
+
+```json
+{"type":"plan_set","name":"army","steps":[
+  {"intent":{"type":"template","building":<your Barracks>,"squad":2}},
+  {"intent":{"type":"train","building":<your Barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<your Barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<your Barracks>,"unit":"Footman"},
+   "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":3}}},
+  {"intent":{"type":"posture","id":2,
+             "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}]}
+```
+
+Prefer squad-addressed steps over id lists everywhere in a plan — a squad
+survives its members, and a plan runs long enough for members to die. (A step
+that names a list and loses one member to a corpse is a *partial* success: the
+survivors are ordered, the dead id is reported in `errors`, and the plan carries
+on. Only a step that reaches nothing blocks.)
+
+**Why this is a SECOND plan and not steps 7–11 of the first one.** The Barracks
+does not exist yet when you set `boomer` — step 1 is what builds it — so it has
+no id for a `train` step to name. Squads close this gap for units, because
+membership is late-bound by number; there is no equivalent handle for buildings.
+So: send `boomer` on your first poll, and send `army` on the poll after the
+Barracks shows up in your snapshot. Two plans is exactly the cap, and this is
+what the cap is for.
+
+### Plans vs triggers — use both
+
+They are two halves of one sentence and they do not compete for slots.
+
+- A **plan** is what you are going to do. Sequence, once through.
+- A **trigger** is what to do if something happens. Condition, optionally
+  repeating.
+
+A plan step can arm a trigger, which is how you say "once the barracks is up,
+start guarding the base". If a plan step and a trigger both re-task the same
+squad on the same tick, **the trigger wins** — a rule written for the situation
+in front of you beats a sequence written before the match.
 
 ## Speakable strategy: `tools/intent_compile.py`
 
@@ -239,9 +533,31 @@ omitted, exactly as before. The Sorcerer is a caster but **not** a hero, so
 - Anything it does not know, write by hand. It is a convenience over the schema
   above, never a gate in front of it, and it never guesses: an unresolvable
   place or an unknown noun is a reported error, not a silent whole-army move.
-- Conditionals ("strike when their hero falls") have no verb in this game —
-  there is no trigger system. The tool defers them and prints the command to
-  run when you see the condition in `events`.
+- **Conditionals compile to `trigger_set`**: "strike when their hero falls" arms
+  a rule the engine watches at 4 Hz. `when`/`if`/`once`/`after` arm a once-rule;
+  `whenever`/`every time` arm a repeating one. Only a condition outside the
+  eleven predicates defers, and then the tool says which condition and prints
+  the command to run when you see it in `events`. Enemy hero *health* is the
+  standing example — that one is genuinely unknowable, and it still defers.
+- **Sequences compile too.** Clauses joined by `", then"` become one
+  `plan_set`:
+
+  ```bash
+  python3 tools/intent_compile.py --seat <SEAT> --send \
+    "build a barracks, then when we reach tier 2, build a sanctum, then train 3 sorcerers"
+  ```
+
+  A bare `", then"` is "as soon as that lands"; `", then when <cond>,"` waits on
+  a trigger predicate; `", then after 30s,"` waits a fixed time. Name it with a
+  trailing `as <name>`. **The comma matters**: `focus siege then heroes` is a
+  focus-fire chain inside one clause, not two steps.
+
+  For units you will not have yet, say it with a squad — the tool and the engine
+  agree on this idiom:
+
+  ```bash
+  "the barracks units join squad 2, then when I have 8 footmen, squad 2 pushes their base"
+  ```
 
 **Check the round trip.** Every intent, from either seat, is logged as one
 English sentence in `bridge/intent_log.jsonl`. If the sentence is not what you
@@ -258,11 +574,13 @@ the other cannot.
 |---|---|
 | `order:move by bridge t=123` | you ordered it, at game second 123 |
 | `order:attack by ui t=123` | the *human* ordered it — same verb, other seat |
+| `trigger:home-guard move by bridge t=41` | a rule YOU armed fired and moved it |
+| `plan:opening step 2/5 build by bridge t=41` | step 2 of your 5-step plan ordered it |
 | `posture:push sq1` | squad 1's standing posture is moving it |
 | `policy:retreat t=210` | its retreat threshold fired; it is running home |
 | `template:Barracks#42` | it spawned with that building's doctrine template |
 | `rally:Barracks#42` | it spawned onto that building's rally point |
-| `script:wave` | the scripted AI is driving it (you are on `autopilot`) |
+| `order:attackmove by script t=123` | the scripted AI ordered it (you are on `autopilot`) — the third seat, same verbs, same compiler |
 | `instinct:auto-enroll` | nobody assigned it, so the engine pooled it in squad 0 |
 | `idle` | nothing to do — it has no reason at all |
 
@@ -322,7 +640,7 @@ maximum. That is a real way to lose a game that still looks winnable on paper.
 
 ## If your seat is `bridge/copilot`: you are a CO-COMMANDER
 
-Everything above still applies — same 27 verbs, same snapshot, same fog, same
+Everything above still applies — same 29 verbs, same snapshot, same fog, same
 `bridge_send.py`. One thing changes, and it is the important one: **you are not
 the faction.** A human is playing this faction with a mouse, and you are sitting
 next to them. Your snapshot's top-level `copilot` block confirms it:
@@ -487,8 +805,9 @@ first), `unlocked` for ACTING.
   - **An empty `units` list means "I have no information", not "there are no enemies."**
     Check the top-level `fog` object (`enabled`, `explored`, `visible`) before drawing any
     conclusion from silence. `explored: 0.1` means you have looked at a tenth of the map.
-  - Enemy **units** appear only while you can see them, and are never remembered. An army
-    that leaves your sight is simply gone from the snapshot — it has NOT died.
+  - Enemy **units** appear in `units` only while you can see them. An army that leaves
+    your sight is gone from `units` — it has NOT died. But it is not forgotten: see
+    **INTEL** below, which is where the memory of it lives.
   - Enemy **buildings** you have scouted stay in `buildings` as remembered ghosts carrying
     `last_seen` (game time of the sighting). A ghost may be stale: the building may have
     been destroyed, or upgraded to a higher tier, since. `last_seen` present == memory;
@@ -501,6 +820,42 @@ first), `unlocked` for ACTING.
   - **Scout deliberately.** Vision radius is per-kind in `catalog.json` (`vision`).
     Raiders see 24 and are the cheapest eyes on the map; Catapults see 14 but shoot 20, so
     unescorted siege is firing blind. Halls see furthest of all and grow with the tier.
+- **INTEL — what you REMEMBER of them (`intel`).** Fog decides what you can see; this is
+  what you learned from having seen it. Always present. Nothing in it was inferred,
+  deduced, or handed to you: every entry is something one of your units was looking at.
+  - `intel.sightings[]` — every enemy unit you have seen and not yet forgotten:
+    `{id, kind, pos, hp_frac, heading?, t_seen, age}`. **Every record carries its age**,
+    which is the whole reason this is a separate array from `units` — a memory reported
+    in the same shape as a sighting is a decoy. `heading` is a coarse compass point
+    (`"NE"`) and is absent when the unit was standing still or when you only glimpsed it
+    once: a heading is a difference between two looks.
+  - Entries **expire**. A sighting is dropped `intel.ttl_s` (90s) after its last refresh,
+    because a ninety-second-old unit position is not a stale fact but a wrong one. It is
+    also dropped the instant you **watch the unit die**. It is NOT dropped merely because
+    you walked back and found the spot empty — the record only ever claimed the unit was
+    there *at `t_seen`*, and it still was.
+  - So: an empty `sightings` means "nothing seen recently", never "nothing exists". Read
+    `age` before you act. A 5s-old sighting is a target; a 70s-old one is a rumour that
+    tells you where they *were going*, not where they are.
+  - `intel.groups[]` — the same sightings clustered into forces:
+    `{size, composition, pos, t_seen, age, place}`, e.g. `~8 (5 Footman, 3 Archer)` near
+    the center ford. Units cluster only if they were seen close together **in space and
+    in time**, so a group is a picture that existed at some instant. Workers are excluded:
+    a mining crew is not an army. `place` is the public name of the ground.
+  - `intel.heroes` — one entry per enemy hero class, always all of them:
+    `status` is `"unknown"` (never met), `"alive"` (seen alive, nothing since says
+    otherwise) or `"seen-dying"` (you watched it die), plus where and when.
+    **Read `"alive"` as *alive as far as you know*** — a hero that died out of your sight
+    goes on reporting `"alive"` for as long as nobody looks. `"unknown"` is not `"they
+    have no hero"`.
+  - There is **no level, xp, mana, inventory or squad** on any of this, ever. A human
+    cannot select an enemy unit, so none of those has been on anybody's screen. What you
+    get is what a player watching the same fight would have: existence, kind, place,
+    health bar, which way it was walking, and when.
+  - The human at the keyboard sees the identical ledger — faded markers where units were
+    last seen, on the map and the minimap, and a "Their heroes:" line. Same knowability,
+    both renderers.
+  - Two predicates read it: `enemy_army_seen` and `enemy_hero_down`. See Triggers above.
 - Map ±100. Your base corner and the enemy's are opposite. **Read `map` in your snapshot**:
   it names the layout, summarises what the ground does to a plan, and lists every `chokes`
   entry — the only gaps through impassable terrain. On a map with chokes, walls/towers at a

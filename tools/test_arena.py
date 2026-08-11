@@ -218,8 +218,18 @@ def test_the_committed_ledger_validates():
 def test_the_backfilled_series_matches_the_history_it_came_from():
     """The one number the whole prose history agrees on: after round 10 the
     standings were Rusher 6, Boomer 3, one draw. If the backfill reproduces it,
-    the ten records are at least mutually consistent with the story."""
-    tally = arena.series(arena.load(LEDGER))
+    the ten records are at least mutually consistent with the story.
+
+    Scoped to the FIRST TEN ROUNDS, which is what the claim was always about.
+    It used to tally the whole ledger, so every round played after the backfill
+    moved a number that is supposed to be a fact about history: r11/r12 pushed
+    rusher to 7 and turned this into a standing failure, and a scripted round
+    adds a column the assertion never mentioned. The backfill is a fixed set of
+    records and the check that guards it should be too."""
+    backfilled = [r for r in arena.load(LEDGER)
+                  if r["id"] in {f"r{n}" for n in range(1, 11)}]
+    assert len(backfilled) == 10, [r["id"] for r in backfilled]
+    tally = arena.series(backfilled)
     assert tally["rusher"] == 6, tally
     assert tally["boomer"] == 3, tally
     assert tally["draws"] == 1, tally

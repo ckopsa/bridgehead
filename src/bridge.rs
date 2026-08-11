@@ -61,9 +61,17 @@
 //! keyboard. The bridge does not decide what is knowable; it renders a
 //! decision made once in shared.rs. Concretely:
 //!
-//!   * enemy `units` appear only while currently visible. They are not
-//!     remembered: an army that walks out of sight is simply gone from the
-//!     snapshot, because a remembered army is a lie a commander would act on.
+//!   * enemy `units` appear only while currently visible, and are never
+//!     remembered *in that array*: an army that walks out of sight is gone
+//!     from `units`, because a remembered army reported in the same shape as a
+//!     seen one is a lie a commander would act on.
+//!   * what it does not do is throw the observation away. The separate
+//!     top-level `intel` block carries the SIGHTINGS LEDGER — every enemy unit
+//!     this seat has seen, each stamped with `t_seen` and `age`, expiring at
+//!     `intel.ttl_s`; the armies those sightings cluster into; and the standing
+//!     of each enemy hero class. Memory is legal, and shaped so that it cannot
+//!     be mistaken for sight: `units[]` has no timestamps and every intel
+//!     record has nothing else.
 //!   * enemy `buildings` appear as themselves while visible, and afterwards as
 //!     REMEMBERED GHOSTS carrying a `last_seen` game-time stamp and the hp/
 //!     queue state observed at that moment. A ghost can be stale — a razed
@@ -562,6 +570,10 @@ struct StateOut {
     /// What this seat can currently know. Read it before concluding anything
     /// from an empty `units` list.
     fog: FogOut,
+    /// What this seat REMEMBERS of the enemy — sightings, the armies they
+    /// cluster into, and the standing of each enemy hero. Every entry carries
+    /// the game time it was observed.
+    intel: IntelOut,
     /// `catalog.json` entry id -> may this seat build/train it right now?
     /// Every unit and building in the catalog appears, whether or not it has
     /// requirements, so a commander can gate its build order on one lookup.
@@ -597,6 +609,34 @@ struct StateOut {
     /// identical to a v1 one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     triggers: Vec<TriggerOut>,
+    /// **This seat's own named regions**, in the order they were set.
+    ///
+    /// Own-team only, and that is doctrine rather than bookkeeping: a region is
+    /// a decision about which ground matters, and handing the enemy a list of
+    /// the places you have decided to watch would be the single most valuable
+    /// intelligence leak in the protocol. The map's built-in names are the
+    /// public half and live in `map.places`, where both seats see the same
+    /// list.
+    ///
+    /// Skipped when empty, so a snapshot from a seat that has never named
+    /// ground is byte-shape identical to a v2 one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    regions: Vec<RegionOut>,
+    /// **Your plans** (`plan_set`), in the order you set them.
+    ///
+    /// Own team only, and for the same stronger reason `triggers` is: a plan is
+    /// your build order and your follow-up, and reading the opponent's is the
+    /// single most valuable thing a snapshot could leak.
+    ///
+    /// This is the array to read FIRST on a poll where you have a plan running.
+    /// `step` and `status` together answer "is the sequence I wrote still
+    /// happening", which is the only question a plan raises — and a `blocked:`
+    /// or `halted:` status carries the compiler's own words, so you never have
+    /// to go correlate it against `errors`.
+    ///
+    /// Absent when you have none, on the same rule as `command_nodes`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    plans: Vec<PlanOut>,
 
     // --- co-command (copilot seats only) ---------------------------------
     //
@@ -754,6 +794,32 @@ struct MapOut {
     /// Gaps in the impassable terrain — empty on a map that has none. Armies,
     /// workers and expansions can only cross here.
     chokes: Vec<ChokeOut>,
+    /// **The map's own vocabulary**: every name both seats may speak without
+    /// arming anything — the two bases, `mid`, the four mines, and one entry
+    /// per ford. Any of these is legal wherever a verb takes `x`/`z`, as
+    /// `"region":"<name>"`.
+    ///
+    /// Public and neutral like everything else in this struct, with one honest
+    /// asymmetry: `our base` and `their base` are seat-relative, so the two
+    /// snapshots disagree about which coordinates those two names carry. That
+    /// is the point of the aliases — the WORDS are shared, and each seat reads
+    /// them from where it is standing.
+    places: Vec<RegionOut>,
+}
+
+/// A named circle of ground, in the seat's own words.
+///
+/// One shape for both kinds of name — the map's built-ins in `map.places` and
+/// the seat's own in `regions` — because a commander should not need to know
+/// which kind a name is before using it. The only difference is which array it
+/// arrived in, and that is exactly the difference: one is a map fact, the other
+/// is your doctrine.
+#[derive(Serialize)]
+struct RegionOut {
+    name: String,
+    /// Centre on the ground plane.
+    pos: [f32; 2],
+    radius: f32,
 }
 
 #[derive(Serialize)]
@@ -1063,6 +1129,57 @@ struct TriggerOut {
     sentence: String,
 }
 
+/// One plan, as its owner reads it back.
+///
+/// `steps` is the **same JSON you sent**, round-tripped through the `Intent`
+/// and `PlanAdvance` types rather than re-described — the rule `TriggerOut`
+/// follows and for the same reason: a commander should be able to read a plan
+/// out of the snapshot, change one step, and send it back under the same name.
+#[derive(Serialize)]
+struct PlanOut {
+    name: String,
+    /// Which step is being worked, one-based, and how many there are. Two
+    /// fields rather than the string `"2/5"` because a reader that wants to
+    /// branch on progress should not have to parse a fraction.
+    step: usize,
+    of: usize,
+    /// `"running"`, `"done"`, or `"blocked: <why>"` / `"halted: <why>"` with
+    /// the compiler's verbatim refusal. A bare word would be a status you have
+    /// to go research; plans.rs's whole failure design is that you do not.
+    status: String,
+    /// The English of the step it is on right now — the same sentence the
+    /// event feed wrote when the step went out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<String>,
+    /// The whole sequence, editable and re-sendable.
+    steps: Vec<PlanStep>,
+    /// The English of the entire plan, identical to the line the replay log
+    /// wrote when it was set. What a co-commander's proposal is reviewed on.
+    sentence: String,
+}
+
+/// This seat's plans, wire-shaped. A free function rather than an inline map so
+/// the shape a commander parses can be tested without standing up a whole
+/// snapshot — the same reason `resolutions_out` is one.
+fn plans_out(my_plans: &[PlanRun]) -> Vec<PlanOut> {
+    my_plans
+        .iter()
+        .map(|p| PlanOut {
+            name: p.name.as_str().to_string(),
+            step: p.step_no(),
+            of: p.steps.len(),
+            status: p.status(),
+            current: p.current().map(|s| s.intent.sentence()),
+            steps: p.steps.clone(),
+            sentence: Intent::PlanSet {
+                name: p.name.as_str().to_string(),
+                steps: p.steps.clone(),
+            }
+            .sentence(),
+        })
+        .collect()
+}
+
 #[derive(Serialize)]
 struct HeroOut {
     level: u32,
@@ -1191,6 +1308,109 @@ struct FogOut {
     visible: f32,
 }
 
+/// One enemy unit as this seat last observed it.
+///
+/// **Every entry is a MEMORY.** `units[]` is what is on the board now; this is
+/// what was on the board then, and the two are separate arrays specifically so
+/// nothing can read one as the other. `t_seen` and `age` are mandatory, not
+/// optional-when-stale: there is no shape of this record that omits its own
+/// staleness.
+///
+/// Nothing here is knowable that a human could not read off their screen while
+/// the unit stood in their vision — no level, no mana, no orders. See
+/// `shared::Sighting` for the field-by-field argument.
+#[derive(Serialize)]
+struct SightingOut {
+    /// The unit's entity id — the same id `units[].id` carries while it is
+    /// visible, so a commander can tell "the raider I saw" from "a raider".
+    id: u64,
+    kind: &'static str,
+    pos: [f32; 2],
+    /// Health fraction at the moment of observation, 0..1. The bar a watcher
+    /// could see.
+    hp_frac: f32,
+    /// Coarse 8-point heading it was walking when last seen (`"NE"`), absent
+    /// if it was standing still or if this was a first glimpse with nothing to
+    /// measure against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heading: Option<&'static str>,
+    /// Game time of the observation.
+    t_seen: f32,
+    /// Game-seconds since. Derived, and shipped anyway: the arithmetic is
+    /// trivial and getting it wrong is not, and a commander that has to
+    /// subtract before it can discount will sometimes forget to.
+    age: f32,
+}
+
+/// Concurrent sightings read as one body of troops — the aggregate view.
+#[derive(Serialize)]
+struct ArmyGroupOut {
+    /// How many units the group holds. Approximate by nature: it is what was
+    /// seen, never what is there.
+    size: usize,
+    /// `"5 Footman, 3 Archer"`, most numerous first.
+    composition: String,
+    pos: [f32; 2],
+    /// Freshest observation in the group; members may be up to ten seconds
+    /// older, which is what makes them one picture.
+    t_seen: f32,
+    age: f32,
+    /// The public name of the ground it is on — `"near the center ford"`. The
+    /// same phrase the event feed uses, from the same function.
+    place: String,
+}
+
+/// This seat's belief about one enemy hero class.
+#[derive(Serialize)]
+struct HeroIntelOut {
+    /// `"unknown"` — never seen; `"alive"` — seen alive and nothing since says
+    /// otherwise; `"seen-dying"` — you watched it die.
+    ///
+    /// Read `"alive"` as *alive as far as you know*. It is a belief with a
+    /// timestamp, not a fact: a hero that died out of your sight goes on
+    /// reporting `"alive"` here for as long as nobody looks, which is exactly
+    /// the mistake fog of war exists to let you make.
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pos: Option<[f32; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    t_seen: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age: Option<f32>,
+    /// Health fraction when last observed. **No level, no xp, no mana** — a
+    /// human cannot select an enemy hero (ui.rs's pickers are own-team only),
+    /// so no human has ever read those off a screen, and handing them to a
+    /// commander would be an information right with no gesture behind it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hp_frac: Option<f32>,
+}
+
+/// What this seat REMEMBERS of the enemy, as opposed to what it can see.
+///
+/// The counterpart to `fog`: that block says how much of the map is knowable,
+/// this one says what was learned from having known it. Always present, and
+/// deliberately so — an absent `intel` and an empty one are different claims
+/// ("this build has no ledger" vs "you have seen nothing"), on exactly the
+/// reasoning `fog` itself is always present for.
+#[derive(Serialize)]
+struct IntelOut {
+    /// Every enemy unit seen and not yet expired, in id order. Entries are
+    /// dropped after `ttl_s` without a refresh, and immediately when this seat
+    /// watches the unit die.
+    sightings: Vec<SightingOut>,
+    /// The same sightings clustered into forces. Workers are excluded — a
+    /// mining crew is not an army.
+    groups: Vec<ArmyGroupOut>,
+    /// Belief about each enemy hero class, keyed by class name. Always holds
+    /// every class, `"unknown"` included: a missing row and a row saying "no
+    /// idea" are different claims and only one of them is true.
+    heroes: BTreeMap<&'static str, HeroIntelOut>,
+    /// The staleness horizon in game-seconds. Past this a sighting is a rumour
+    /// and the ledger drops it, so an empty `sightings` means "nothing seen
+    /// recently", never "nothing exists".
+    ttl_s: f32,
+}
+
 #[derive(Serialize)]
 struct MineOut {
     id: u64,
@@ -1311,6 +1531,13 @@ struct SeatVerdicts<'w> {
 struct StandingOrders<'w> {
     squads: Res<'w, SquadOrders>,
     triggers: Res<'w, Triggers>,
+    /// The third store on the same rule: written only by the intent compiler's
+    /// two `region_*` verbs, read here and in the HUD, and it answers the same
+    /// question about a different noun — what ground has this commander decided
+    /// to name.
+    regions: Res<'w, Regions>,
+    /// The third kind, sequenced. Same one-writer rule, same two readers.
+    plans: Res<'w, Plans>,
 }
 
 /// The co-command side-channel: the pending proposal queue and the team's
@@ -1383,6 +1610,8 @@ fn write_snapshot(
             &game_over,
             &standing.squads,
             standing.triggers.get(seat.team),
+            standing.regions.get(seat.team),
+            standing.plans.get(seat.team),
             *tech.tiers,
             *tech.research,
             tech.races.get(seat.team),
@@ -1414,6 +1643,9 @@ fn write_seat_snapshot(
     // the whole resource, so this function cannot read the opponent's plans
     // even by accident.
     my_triggers: &[TriggerRule],
+    my_regions: &[Region],
+    // This seat's own plans, pre-sliced by team on the same reasoning.
+    my_plans: &[PlanRun],
     tiers: TechTiers,
     team_research: TeamResearch,
     // **Your roster.** The catalog is one document for the whole session and
@@ -1450,9 +1682,11 @@ fn write_seat_snapshot(
     let (fog_enabled, fog) = fog;
 
     // Our own army, plus whatever of theirs we can see RIGHT NOW. Enemy units
-    // are never remembered: a stale unit position is not information, it is a
-    // decoy, and a commander acting on one has been lied to by its own
-    // interface. Doctrine only for our own units, as before.
+    // are never remembered *here*: a stale unit position reported in this
+    // array would not be information, it would be a decoy, because nothing in
+    // a `UnitOut` says when it was true. The memory lives in `intel` instead,
+    // where every record carries its own age and the reader cannot fail to see
+    // it. Doctrine only for our own units, as before.
     let mut units_out: Vec<UnitOut> = units
         .iter()
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
@@ -1613,6 +1847,58 @@ fn write_seat_snapshot(
     }
     buildings_out.sort_by_key(|b| b.id);
 
+    // --- intel -----------------------------------------------------------
+    // The unit half of memory. Note it does NOT join `units_out` the way the
+    // building ghosts join `buildings_out`, and that asymmetry is the whole
+    // design: a remembered structure is still standing where it was, so it
+    // belongs in the same list as the ones you can see; a remembered army is
+    // somewhere else by now, so putting it there would be the lie
+    // `CellVis::Explored` refuses to tell. It gets its own section, and every
+    // record in it wears the clock.
+    let intel_out = IntelOut {
+        sightings: fog
+            .sightings()
+            .map(|s| SightingOut {
+                id: s.id,
+                kind: kind_name(s.kind),
+                pos: [r1(s.pos.x), r1(s.pos.z)],
+                hp_frac: r1(s.hp_frac * 100.0) / 100.0,
+                heading: s.heading.map(|h| h.as_str()),
+                t_seen: r1(s.t_seen),
+                age: r1(s.age(now)),
+            })
+            .collect(),
+        groups: fog
+            .army_groups()
+            .into_iter()
+            .map(|g| ArmyGroupOut {
+                size: g.size,
+                composition: g.summary(),
+                pos: [r1(g.centroid.x), r1(g.centroid.z)],
+                t_seen: r1(g.t_seen),
+                age: r1((now - g.t_seen).max(0.0)),
+                place: place_name(g.centroid, me),
+            })
+            .collect(),
+        heroes: fog
+            .hero_intel()
+            .iter()
+            .map(|h| {
+                (
+                    kind_name(h.kind),
+                    HeroIntelOut {
+                        status: h.status.as_str(),
+                        pos: h.pos.map(|p| [r1(p.x), r1(p.z)]),
+                        t_seen: h.t_seen.map(r1),
+                        age: h.t_seen.map(|t| r1((now - t).max(0.0))),
+                        hp_frac: h.hp_frac.map(|f| r1(f * 100.0) / 100.0),
+                    },
+                )
+            })
+            .collect(),
+        ttl_s: SIGHTING_TTL_S,
+    };
+
     // Tech state, for this seat only: what its completed buildings unlock.
     let completed: Vec<BuildingKind> = buildings
         .iter()
@@ -1677,6 +1963,17 @@ fn write_seat_snapshot(
     // in, so it is the order they must be read in. NOT sorted, unlike every
     // other list here: sorting would hide the one thing about the list that is
     // load-bearing.
+    // This seat's own named ground, in the order it was named. Not sorted, for
+    // the same reason the trigger list is not: the order is the commander's.
+    let regions: Vec<RegionOut> = my_regions
+        .iter()
+        .map(|r| RegionOut {
+            name: r.name.clone(),
+            pos: [r1(r.center.x), r1(r.center.z)],
+            radius: r1(r.radius),
+        })
+        .collect();
+
     let triggers: Vec<TriggerOut> = my_triggers
         .iter()
         .map(|t| TriggerOut {
@@ -1695,6 +1992,11 @@ fn write_seat_snapshot(
             .sentence(),
         })
         .collect();
+
+    // Plans, in the order they were set — which is the order they step in, so
+    // it is the order they must be read in. NOT sorted, for the reason the
+    // trigger list is not.
+    let plans = plans_out(my_plans);
 
     // Bounty caches this seat can see, sorted by id so a seat serializes the
     // same order every tick. The two seats' lists now legitimately differ.
@@ -1872,6 +2174,14 @@ fn write_seat_snapshot(
             name: map.id(),
             summary: map.summary(),
             available: crate::terrain::MapKind::ALL.iter().map(|m| m.id()).collect(),
+            places: crate::shared::builtin_places(seat.team)
+                .into_iter()
+                .map(|r| RegionOut {
+                    name: r.name,
+                    pos: [r1(r.center.x), r1(r.center.z)],
+                    radius: r1(r.radius),
+                })
+                .collect(),
             chokes: map
                 .chokepoints()
                 .into_iter()
@@ -1887,6 +2197,7 @@ fn write_seat_snapshot(
             explored: r1(fog.explored_frac()),
             visible: r1(fog.visible_frac()),
         },
+        intel: intel_out,
         unlocked,
         units: units_out,
         buildings: buildings_out,
@@ -1897,6 +2208,8 @@ fn write_seat_snapshot(
         events,
         command_nodes,
         triggers,
+        regions,
+        plans,
         copilot: copilot_out,
         proposals: proposals_out,
         recent_resolutions: resolutions_out,
@@ -2180,6 +2493,7 @@ fn poll_commands(
                             // A seat speaks for itself. Only trigger.rs sets
                             // this, and only for a rule it is firing.
                             trigger: None,
+                            plan: None,
                         });
                     }
                     Err(err) => intent_errors
@@ -2348,6 +2662,70 @@ mod tests {
             severity: ProposalSeverity::Urgent,
             outcome,
         }
+    }
+
+    /// **A plan, end to end on the wire.** Parsed back out of the JSON rather
+    /// than inspected as Rust, for the reason the veto test below gives: only
+    /// the round trip catches a field that got renamed, skipped, or nested a
+    /// level too deep.
+    ///
+    /// The contract is that `step`/`of`/`status` answer "is the sequence I
+    /// wrote still happening" without any correlation work, and that `steps` is
+    /// the JSON the commander sent — so reading a plan out, changing one step,
+    /// and sending it back under the same name is a legal `plan_set`.
+    #[test]
+    fn a_plan_round_trips_through_the_snapshot_json() {
+        let step = |json: &str| -> PlanStep { serde_json::from_str(json).expect("step parses") };
+        let mut running = PlanRun {
+            name: PlanName::new("boomer").unwrap(),
+            steps: vec![
+                step(
+                    r#"{"intent":{"type":"build","worker":7,"kind":"Barracks","x":-60.0,"z":-60.0},
+                        "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}}"#,
+                ),
+                step(r#"{"intent":{"type":"train","building":9,"unit":"Sorcerer"}}"#),
+            ],
+            source: IntentSource::Bridge,
+            state: PlanState::Running,
+            at: 1,
+            submitted: true,
+            applied: true,
+            applied_at: 12.0,
+            last_try: 12.0,
+            blocked_since: None,
+            told_blocked: false,
+        };
+        let json = serde_json::to_string(&plans_out(std::slice::from_ref(&running))).unwrap();
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0]["name"], "boomer");
+        assert_eq!(back[0]["step"], 2);
+        assert_eq!(back[0]["of"], 2);
+        assert_eq!(back[0]["status"], "running");
+        assert_eq!(back[0]["current"], "building 9 trains Sorcerer");
+        assert!(back[0]["sentence"].as_str().unwrap().starts_with("plan boomer (2 steps): worker 7 builds"));
+
+        // `steps` is what was sent, re-sendable: the terse step keeps its
+        // omitted `advance` implicit and the explicit one keeps its predicate.
+        let steps = back[0]["steps"].as_array().expect("an array of steps");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["intent"]["type"], "build");
+        assert_eq!(steps[0]["advance"]["when"]["tier"], 2);
+        assert_eq!(steps[1]["advance"]["type"], "on_applied");
+        let resent: Intent = serde_json::from_value(serde_json::json!({
+            "type": "plan_set",
+            "name": back[0]["name"],
+            "steps": back[0]["steps"],
+        }))
+        .expect("a plan read out of a snapshot is a legal plan_set");
+        assert_eq!(resent.verb(), "plan_set");
+
+        // A stopped plan carries the compiler's own words in its status, so
+        // nothing has to be correlated against `errors`.
+        running.state = PlanState::Blocked("not enough gold (need 160, have 120)".to_string());
+        let json = serde_json::to_string(&plans_out(std::slice::from_ref(&running))).unwrap();
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0]["status"], "blocked: not enough gold (need 160, have 120)");
     }
 
     /// **The veto reason, end to end on the wire.** The human's answer is
