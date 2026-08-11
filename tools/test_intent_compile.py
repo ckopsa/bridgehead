@@ -1184,5 +1184,46 @@ def test_the_built_in_places_need_nothing_armed_to_be_watched():
         "type": "enemy_in", "region": "center ford", "count": 5,
     }
 
+
+def test_a_plan_step_may_advance_on_enemies_reaching_a_named_place():
+    """The seam between plans and territory, spoken as one sentence.
+
+    `PlanAdvance::When` carries the whole predicate vocabulary, so a place the
+    same directive just NAMED is available to a later step's advance condition.
+    Both halves have to be wired for this to work: the step parser needs the
+    snapshot (or `enemy_in` is invisible to it), and `region_set` has to publish
+    the new name into the rest of the directive.
+    """
+    r = ic.compile_directives([
+        'name the northwest ford "north-pass" radius 20, '
+        'then hold north-pass with everything, '
+        'then when 5 or more enemies enter north-pass, squad 2 pushes their base'
+    ], snap())
+    assert not r.errors, r.errors
+    assert verbs(r) == ["plan_set"], verbs(r)
+    steps = only(r, "plan_set")["steps"]
+    # The region is named by the plan's first step...
+    assert steps[0]["intent"]["type"] == "region_set"
+    assert steps[0]["intent"]["name"] == "north-pass"
+    # ...used by a later step's posture, by NAME...
+    holding = [st for st in steps
+               if st["intent"].get("posture", {}).get("region") == "north-pass"]
+    assert holding, [st["intent"] for st in steps]
+    # ...and watched by that step's advance condition.
+    advance = holding[0]["advance"]
+    assert advance == {
+        "type": "when",
+        "when": {"type": "enemy_in", "region": "north-pass", "count": 5},
+    }, advance
+
+
+def test_a_plan_step_advance_still_refuses_a_place_the_seat_cannot_name():
+    """The seam does not become a hole: an unnameable place still defers."""
+    r = ic.compile_directives(
+        ["push mid, then when 5 enemies enter the mushroom kingdom, push their base"],
+        snap())
+    assert r.intents == []
+    assert r.errors and "not a condition the engine can watch" in r.errors[0][1]
+
 if __name__ == "__main__":
     sys.exit(_run())

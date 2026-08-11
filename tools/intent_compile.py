@@ -1891,7 +1891,14 @@ def compile_plan(parts, directive, ctx):
         else:
             m = WHEN_STEP.match(part)
             if m:
-                when = parse_when(m.group("cond"))
+                # The snapshot goes in for the same reason it does at the
+                # trigger call site: `enemy_in` names a PLACE, and a plan step
+                # that advances on one has to be able to resolve it. Without
+                # this a sequence could say "when their hero falls" but not
+                # "when 5 of them are in north-pass", which would make the
+                # predicate vocabulary mean two different things depending on
+                # which construct asked.
+                when = parse_when(m.group("cond"), ctx.snap)
                 if when is None:
                     ctx.result.fail(directive,
                                     f"step {i + 1}: {m.group('cond').strip()!r} is not a "
