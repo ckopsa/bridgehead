@@ -47,6 +47,99 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Build & Test
+
+**Dev profile only — never `--release`.** Deps are already built at `opt-level = 3`
+in dev, so release buys nothing and costs half an hour. `cargo test` builds the
+test harness, **not** the binary: run `cargo build` before any live check or you
+will verify a stale binary.
+
+```bash
+cargo build          # the binary — required before running the game
+cargo test           # the Rust test suite
+python3 -m pytest tools/   # the tooling tests (tools/test_*.py)
+```
+
+Verification is a named tier (`tools/verify.sh`, composing the raw commands
+documented in tools/BUILDER_BRIEF.md Appendix A):
+
+```bash
+tools/verify.sh smoke      # compiles, tests pass, one short headless match reaches game over
+tools/verify.sh standard   # + both maps + the four bridge protocol verifiers
+tools/verify.sh full       # + longer caps, the arena runner path, screenshots
+tools/verify.sh identity   # two seeded fixed-dt runs, fingerprints diffed byte-for-byte
+```
+
+Say which tier you ran. `identity` is the cheap proof for any
+"no behaviour change" claim — reach for it on every refactor.
+
+A headless match by hand:
+
+```bash
+cargo build && WC3_HEADLESS=1 WC3_AI_BOTH=1 WC3_SPEED=16 WC3_MAX_GAME_SECS=900 \
+  WC3_MAP=crossings ./target/debug/wc3clone
+```
+
+## Architecture Overview
+
+A Warcraft-3-style 3D RTS in Rust + **Bevy 0.16** (pinned), built so that a human
+at a mouse and an LLM commander on a file bridge play the *same game* — one
+vocabulary, one rule of knowability, one set of refusals. `src/shared.rs` is the
+integrator contract every module speaks through; each other file in `src/` owns
+one concern (`intent.rs` the compiler, `units.rs` movement, `combat.rs` damage,
+`economy.rs` money and construction, `ui.rs` the human seat, `bridge.rs` the LLM
+seat, `ai.rs` the scripted one, `data.rs` the RON stat tables). Every player
+mutation — from either seat — becomes a `shared::Intent` and is applied by
+`intent::apply_intents`; every gameplay system runs inside a phase of
+`shared::SIM_ORDER`, which makes a match reproducible from a seed.
+
+- **DESIGN.md** — the module contract, the frame order, the data-file rules, and
+  the Bevy 0.16 idioms that keep you off stale APIs. Read this first.
+- **docs/INTENT.md** — the intent vocabulary, the fairness invariant, triggers,
+  plans, territory, co-command, and the rules for error messages that teach.
+- **docs/FOG.md** — one rule of knowability, computed once, rendered three times.
+- **docs/TEMPO.md** — why command latency exists and what it taxes.
+- **docs/ARENA.md** — the dogfooding ledger and how a round is run safely.
+- **tools/COMMANDER_BRIEF.md** — the wire protocol as its users read it.
+- **THESIS.md** — why the project exists.
+
+## Conventions & Patterns
+
+**Implementation agents: read `tools/BUILDER_BRIEF.md` first.** It is the standing
+half of your instructions — worktree and process isolation, the `cp -a
+--reflink=always` target copy, the build rules, every code invariant, the merge
+traps that have actually broken this build, and the verification litany. Your
+bead only needs to tell you what is different this time.
+
+The four rules that must survive even a skim:
+
+1. **Your worktree is yours; the main checkout is not, and the process table is
+   shared.** Never build, check out, or launch the game in the main repo — live
+   matches run there. Kill only by exact owned PID (never `pkill -f`), and
+   bracket pgrep patterns (`'[t]arget/debug/wc3clone'`) so a waiter cannot match
+   itself and livelock.
+2. **One choke point per rule — extend it, never bypass it.** Player mutation is
+   `Intent` → `apply_intents` and nothing else; `effective_stats` is the one stat
+   law; `resolve_places` the one name resolver; `apply_atom` the one effect
+   applier; `Economies::pay` the one spender. A second path is a divergence with
+   a schedule. And the compiler validates only to produce good *messages* — the
+   system that spends the resource is what makes a rule true.
+3. **Determinism is structural.** Every gameplay system goes in a named `SimSet`;
+   collections on gameplay paths are `BTreeMap`s (`HashMap` reseeds per process);
+   any root entity spawned *or* teleported during `Update` must seed its own
+   `GlobalTransform::from(transform)` in the same statement.
+4. **Data and wire are append-only.** Stat tables are rows in `assets/data/*.ron`
+   (tables move, scalars stay) because interleaved `match` arms merge silently;
+   snapshot and command keys are additive only, with `skip_serializing_if`, and
+   the historical key sets are pinned by tests.
+
+Do not commit `.beads/`, do not push, and do not mutate the tracker — the
+orchestrator owns all three. Every commit carries
+`Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
+
+> **This file mirrors CLAUDE.md.** Substantive edits to the sections above must be
+> applied to both.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
 
