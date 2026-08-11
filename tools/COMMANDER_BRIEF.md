@@ -231,52 +231,89 @@ To wait for something to finish, use `when` with `tier_reached` or `unit_count`.
 ### If a step is refused
 
 The plan **blocks on that step and never skips it**. Its `status` becomes
-`blocked: <the exact compiler error>`, it retries the same step every 2s, and
-if it is still refused 10s later the status becomes `halted: <error>` and the
-plan stops for good — on the step that failed. Both are also announced in
+`blocked: <the exact compiler error>`, it retries the same step every 5s, and
+if it is still refused a minute later the status becomes `halted: <error>` and
+the plan stops for good — on the step that failed. Both are also announced in
 `events`. So a plan is never quietly wrong: it is either running, done, or
 telling you which step it is stuck on and why.
 
-This is why most steps should be robust to timing. "Not enough gold" clears
-itself inside the retry window; "you have no Sanctum" does not.
+The minute is deliberate: the commonest refusal a plan meets is "cannot afford
+it yet", and money arrives on a scale of tens of seconds, so the engine keeps
+trying long enough for your economy to answer. You are told at the *first*
+bounce either way — `blocked:` shows up within a tick — so if the reason is
+permanent ("you have no Sanctum") you can `plan_clear` it immediately rather
+than waiting for the halt.
+
+A step that reaches SOME of its units is a partial success, not a refusal: if
+one member of a listed squad has died, the survivors are still ordered, the dead
+id is still reported in `errors`, and the plan carries on. Only a step that
+reaches nothing blocks.
 
 ### THE CANONICAL EXAMPLE: the boomer opening as one plan
 
-Economy first, tech second, army third — sequenced so each step waits for the
-thing it needs. **This is one command instead of six polls.** Substitute your
-own ids from the snapshot.
+Economy first, workers second, tech third, army buildings last — sequenced so
+each step waits for the thing it needs. **This is one command instead of six
+polls.** Every id in it exists on your very first snapshot (five workers, a
+TownHall, the mines and trees arrays), which is the point: send it before you
+have done anything else.
+
+This exact plan has been run against a live seat and completes in about a
+minute of game time. It is not a sketch.
 
 ```json
 {"type":"plan_set","name":"boomer","steps":[
-  {"intent":{"type":"build","worker":<worker A>,"kind":"Barracks","x":-58.0,"z":-58.0}},
+  {"intent":{"type":"harvest","units":[<worker A>,<worker B>,<worker C>],
+             "target":<your nearest mine>}},
+
+  {"intent":{"type":"harvest","units":[<worker D>,<worker E>],
+             "target":<a tree from trees_near>}},
+
+  {"intent":{"type":"train","building":<your TownHall>,"unit":"Worker"}},
+
+  {"intent":{"type":"train","building":<your TownHall>,"unit":"Worker"},
+   "advance":{"type":"when","when":{"type":"unit_count","kind":"Worker","count":7}}},
 
   {"intent":{"type":"upgrade","building":<your TownHall>},
    "advance":{"type":"when","when":{"type":"tier_reached","tier":2}}},
 
-  {"intent":{"type":"build","worker":<worker B>,"kind":"Sanctum","x":-66.0,"z":-58.0},
-   "advance":{"type":"after","secs":40}},
-
-  {"intent":{"type":"template","building":<your Barracks>,"squad":2}},
-
-  {"intent":{"type":"train","building":<your Barracks>,"unit":"Footman"},
-   "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":6}}},
-
-  {"intent":{"type":"posture","id":2,
-             "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}]}
+  {"intent":{"type":"build","worker":<worker A>,"kind":"Barracks","x":-58.0,"z":-58.0}}]}
 ```
 
 Read it as English — it is exactly what the replay log will write:
 
-> plan boomer (6 steps): worker … builds Barracks at (-58.0, -58.0), then
-> building … upgrades to its next tier, then when we reach tier 2: worker …
-> builds Sanctum at (-66.0, -58.0), then after 40s: building … stamps every unit
-> it trains with squad 2, then building … trains Footman, then when we field 6
-> or more Footman: squad 2 defends (-70.0, -70.0) within 26
+> plan boomer (6 steps): 3 units harvest node …, then 2 units harvest node …,
+> then building … trains Worker, then building … trains Worker, then when we
+> field 7 or more Worker: building … upgrades to its next tier, then when we
+> reach tier 2: worker … builds Barracks at (-58.0, -58.0)
 
-Note step 2: the `upgrade` goes out immediately (a plain "then"), and the
-`when tier_reached 2` on it is what makes step 3 **wait for the keep to
-finish** before spending on the Sanctum. The advance-condition of a step governs
-the move to the NEXT step — that is the one thing to get right.
+and here is what the engine actually wrote while running it:
+
+```
+[    3.3] plan boomer step 1/6: 3 units harvest node 4294967365
+[    3.5] plan boomer step 2/6: 2 units harvest node 4294967775
+[    3.8] plan boomer step 3/6: building 4294968193 trains Worker
+[    4.0] plan boomer step 4/6: building 4294968193 trains Worker
+[   19.8] plan boomer step 5/6: building 4294968193 upgrades to its next tier
+[   59.8] plan boomer step 6/6: worker 4294968174 builds Barracks at (58.0, 58.0)
+[   60.0] plan boomer complete (6 steps)
+```
+
+Four things to copy from this, because all four are easy to get wrong:
+
+- **The advance-condition of a step governs the move to the NEXT step.** The
+  `when tier_reached 2` sits on the `upgrade` step, and what it does is make the
+  *Barracks* wait for the Keep to finish.
+- **`train` queues ONE unit.** Two workers is two steps. A single `train` step
+  under `unit_count >= 7` is a plan that waits forever — and it will sit there
+  reporting `running`, perfectly honestly, because nothing checks a wait against
+  a world that will never satisfy it.
+- **Harvest FIRST, and harvest lumber too.** The first version of this example
+  skipped the wood and halted on `cannot afford Keep (320g 160l)` — with plenty
+  of gold and 150 of the 160 lumber. A plan spends real resources on a real
+  clock; if nothing is mining, the tech steps cannot pay.
+- **Put the cheap, always-legal steps early.** Steps that just re-task units
+  (`harvest`, `posture`, `squad`, `template`) cannot be refused for money, so a
+  plan that opens with them starts earning while the expensive steps wait.
 
 ### The idiom for units you do not have yet
 
@@ -285,10 +322,32 @@ footmen I will have by then" — those units do not exist and have no ids.
 
 The answer is already in the language: **name a SQUAD.** `template` stamps every
 unit a building trains into squad 2; `posture` addresses squad 2 by number and
-resolves its membership when the step runs. Steps 4–6 above are exactly this
-pattern, and it is why they are in the canonical example. Prefer squad-addressed
-steps over id lists everywhere in a plan — a squad survives its members, and a
-plan runs long enough for members to die.
+resolves its membership when the step runs:
+
+```json
+{"type":"plan_set","name":"army","steps":[
+  {"intent":{"type":"template","building":<your Barracks>,"squad":2}},
+  {"intent":{"type":"train","building":<your Barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<your Barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<your Barracks>,"unit":"Footman"},
+   "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":3}}},
+  {"intent":{"type":"posture","id":2,
+             "posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":26.0}}}]}
+```
+
+Prefer squad-addressed steps over id lists everywhere in a plan — a squad
+survives its members, and a plan runs long enough for members to die. (A step
+that names a list and loses one member to a corpse is a *partial* success: the
+survivors are ordered, the dead id is reported in `errors`, and the plan carries
+on. Only a step that reaches nothing blocks.)
+
+**Why this is a SECOND plan and not steps 7–11 of the first one.** The Barracks
+does not exist yet when you set `boomer` — step 1 is what builds it — so it has
+no id for a `train` step to name. Squads close this gap for units, because
+membership is late-bound by number; there is no equivalent handle for buildings.
+So: send `boomer` on your first poll, and send `army` on the poll after the
+Barracks shows up in your snapshot. Two plans is exactly the cap, and this is
+what the cap is for.
 
 ### Plans vs triggers — use both
 

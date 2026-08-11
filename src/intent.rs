@@ -384,6 +384,9 @@ fn apply_intents(
     let mut notice_budget = UI_NOTICE_BURST;
     for submission in batch {
         let mut errors: Vec<String> = Vec::new();
+        // See `compile_intent`'s `reached` parameter. Per submission, because
+        // "did THIS sentence do anything" is the question a plan step asks.
+        let mut reached = false;
         // One issuer per sentence, so `max_delay` reports what THIS intent
         // cost — a group order spread across the map is logged with the worst
         // link any of its units pays.
@@ -443,6 +446,7 @@ fn apply_intents(
             &mut events,
             &mut world,
             &mut issuer,
+            &mut reached,
         );
         // **The plan's verdict, straight back to the plan.** In the same frame
         // it submitted, before its evaluator's next sweep — so a step that
@@ -450,11 +454,17 @@ fn apply_intents(
         // this step's errors and nothing else's, because the compiler is
         // per-submission.
         if let Some(stamp) = submission.plan {
+            // **Refused, or merely partial?** A step that reached some of its
+            // units did what it could and the plan carries on; the errors still
+            // reach every other channel. Only a step that reached nothing is a
+            // refusal, and only a refusal blocks. See `compile_intent`'s
+            // `reached`.
+            //
             // Tag stripped, exactly as `UiNotices::raise` strips it: the tag is
             // the CHANNEL (`plan:opening#2`), and a status line that read
             // `blocked: plan:opening#2: not enough gold` would say the plan's
             // name twice and the reason once.
-            let why = errors.first().map(|e| {
+            let why = errors.first().filter(|_| !reached).map(|e| {
                 e.strip_prefix(&format!("{}: ", submission.tag))
                     .unwrap_or(e)
                     .to_string()
@@ -583,6 +593,18 @@ fn compile_intent(
     // verbs keep writing straight through: standing orders are the fast path,
     // and that asymmetry IS the mechanism.
     issuer: &mut OrderIssuer,
+    // **Did this intent reach anything at all?** Written only by the group-unit
+    // paths, and read by exactly one caller: the plan evaluator's verdict.
+    //
+    // It exists because `errors` alone cannot answer "was this refused?".
+    // `own_units` deliberately reports each dead id and returns the survivors,
+    // so `move [a,b]` with `b` a corpse *moves a* and still pushes an error.
+    // Every other channel wants that error; a plan wants to know whether to
+    // carry on, and a plan that blocked — and eventually halted — because one
+    // member of a squad had died would stop for the most ordinary event in the
+    // game. Errors with `reached` are a partial success; errors without it are
+    // a refusal.
+    reached: &mut bool,
 ) {
     // Named locally so the arms below read exactly as they did when this was
     // one interface's private applier.
@@ -606,6 +628,7 @@ fn compile_intent(
                 Vec3::new(x, 0.0, z),
                 false,
                 issuer,
+                reached,
             );
         }
         Intent::AttackMove { units: ids, x, z } => {
@@ -620,6 +643,7 @@ fn compile_intent(
                 Vec3::new(x, 0.0, z),
                 true,
                 issuer,
+                reached,
             );
         }
         Intent::Attack { units: ids, target } => {
@@ -657,7 +681,7 @@ fn compile_intent(
             // target: what is slow is reaching your own soldier, not reaching
             // the enemy. The reason travels with the order and is re-timed to
             // its arrival — see `command::dispatch_pending`.
-            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
+            for (entity, pos) in own_units(&ids, units, me, tag, errors, reached) {
                 issuer.issue(
                     commands,
                     me,
@@ -678,7 +702,11 @@ fn compile_intent(
                     return;
                 }
             };
-            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
+            // `reached` is recomputed rather than inherited from `own_units`:
+            // every survivor can still be skipped here for not being a worker,
+            // and a `harvest` that ordered nobody is a refusal, not a partial.
+            let mut sent = 0usize;
+            for (entity, pos) in own_units(&ids, units, me, tag, errors, &mut false) {
                 // Only workers can gather; anyone else would just stand there.
                 if !is_worker(units, entity) {
                     errors.push(format!(
@@ -687,6 +715,7 @@ fn compile_intent(
                     ));
                     continue;
                 }
+                sent += 1;
                 issuer.issue(
                     commands,
                     me,
@@ -696,9 +725,10 @@ fn compile_intent(
                     mark.order("harvest"),
                 );
             }
+            *reached |= sent > 0;
         }
         Intent::Return { units: ids } => {
-            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
+            for (entity, pos) in own_units(&ids, units, me, tag, errors, reached) {
                 issuer.issue(
                     commands,
                     me,
@@ -723,7 +753,7 @@ fn compile_intent(
                     return;
                 }
             };
-            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
+            for (entity, pos) in own_units(&ids, units, me, tag, errors, reached) {
                 if entity == leader {
                     continue; // a unit following itself would deadlock its own order
                 }
@@ -743,7 +773,7 @@ fn compile_intent(
             // order like any other — "halt" travels down the same wire as
             // "advance", which is what stops latency from being escapable by
             // spamming stop.
-            for (entity, pos) in own_units(&ids, units, me, tag, errors) {
+            for (entity, pos) in own_units(&ids, units, me, tag, errors, reached) {
                 issuer.issue(commands, me, pos, entity, Order::Move(pos), mark.order("stop"));
             }
         }
@@ -1497,7 +1527,7 @@ fn compile_intent(
                     return;
                 }
             };
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors, reached) {
                 let mut ec = commands.entity(entity);
                 if parsed.is_empty() {
                     ec.try_remove::<TargetPriority>();
@@ -1528,7 +1558,7 @@ fn compile_intent(
                 errors.push(format!("{tag}: retreat needs a rally x/z"));
                 return;
             }
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors, reached) {
                 let mut ec = commands.entity(entity);
                 match rally {
                     Some(rally) if !clear => {
@@ -1556,7 +1586,7 @@ fn compile_intent(
                 errors.push(format!("{tag}: leash needs an anchor x/z"));
                 return;
             }
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors, reached) {
                 let mut ec = commands.entity(entity);
                 match anchor {
                     Some(anchor) if !clear => {
@@ -1574,7 +1604,11 @@ fn compile_intent(
             ability,
         } => {
             let min_enemies = min_enemies.unwrap_or(0);
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
+            // Recomputed for the same reason `harvest` recomputes it: a
+            // selection of non-casters reaches real units and still does
+            // nothing, which is a refusal rather than a partial success.
+            let mut set = 0usize;
+            for (entity, _) in own_units(&ids, units, me, tag, errors, &mut false) {
                 // Any CASTER can auto-cast — heroes were merely the only ones
                 // that existed when this verb was written. The gate is "does
                 // this kind have an ability list", which is the same question
@@ -1617,10 +1651,12 @@ fn compile_intent(
                 } else {
                     ec.try_insert(next);
                 }
+                set += 1;
             }
+            *reached |= set > 0;
         }
         Intent::Squad { units: ids, id } => {
-            for (entity, _) in own_units(&ids, units, me, tag, errors) {
+            for (entity, _) in own_units(&ids, units, me, tag, errors, reached) {
                 let mut ec = commands.entity(entity);
                 match id {
                     Some(id) => {
@@ -2308,6 +2344,10 @@ fn own_units(
     me: Team,
     tag: &str,
     errors: &mut Vec<String>,
+    // Set when this call reached at least one real unit. See `Reached` — a
+    // group order that lost one member to a corpse still ORDERED the rest, and
+    // the difference matters to exactly one caller.
+    reached: &mut bool,
 ) -> Vec<(Entity, Vec3)> {
     if ids.is_empty() {
         errors.push(format!("{tag}: no units given"));
@@ -2320,6 +2360,7 @@ fn own_units(
             None => errors.push(format!("{tag}: unit {id} not found/not yours")),
         }
     }
+    *reached |= !out.is_empty();
     out
 }
 
@@ -2350,8 +2391,9 @@ fn ground_order(
     ground: Vec3,
     attack_move: bool,
     issuer: &mut OrderIssuer,
+    reached: &mut bool,
 ) {
-    let group = own_units(ids, units, me, tag, errors);
+    let group = own_units(ids, units, me, tag, errors, reached);
     let count = group.len();
     for (i, (entity, pos)) in group.into_iter().enumerate() {
         let p = clamp_to_map(ground + formation_offset(i, count));

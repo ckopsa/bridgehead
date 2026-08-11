@@ -5127,20 +5127,31 @@ pub enum PlanState {
 
 /// How long a blocked plan keeps retrying its refused step before giving up.
 ///
-/// Ten seconds is long enough to cover the honest reasons a step bounces — the
-/// gold is 40 short, the worker that was going to build it is mid-walk, the
-/// building finishes construction next tick — and short enough that a plan
-/// wedged on something permanent (a Sanctum at tier 1) says so while its owner
-/// still has time to answer.
-pub const PLAN_BLOCK_GRACE_S: f32 = 10.0;
+/// **A minute, and the number was raised from ten seconds by watching a plan
+/// die.** The canonical opening in tools/COMMANDER_BRIEF.md reached its
+/// `upgrade` step with 180 of the 320 gold a Keep costs, blocked correctly,
+/// and then *halted* — while the income that would have paid for it was
+/// twenty seconds away. Ten seconds is the right window for the reason it was
+/// picked (a worker mid-walk, a building one tick from done) and the wrong one
+/// for the reason plans actually exist: **economic sequencing, where the
+/// dominant refusal is "not yet affordable" and money arrives on a scale of
+/// tens of seconds.**
+///
+/// Halting late costs nothing, which is what makes the long window safe. The
+/// owner is told at the *first* bounce — the status becomes
+/// `blocked: <why>` within a tick and an event line goes out — so this constant
+/// governs only how long the engine keeps *trying* before it stops. A commander
+/// who wants it dead sooner sends `plan_clear`.
+pub const PLAN_BLOCK_GRACE_S: f32 = 60.0;
 
 /// How often a blocked plan re-submits its refused step.
 ///
-/// Not every sweep: retrying at 4 Hz would put forty copies of the same
-/// refusal into the error channel and the replay log inside the grace window,
-/// and a channel that floods is a channel nobody reads. Five attempts is plenty
-/// to catch "the money arrived".
-pub const PLAN_RETRY_S: f32 = 2.0;
+/// Not every sweep: retrying at 4 Hz would put 240 copies of the same refusal
+/// into the error channel and the replay log inside the grace window, and a
+/// channel that floods is a channel nobody reads. Five seconds gives twelve
+/// attempts across the window — enough that a step waiting on income retries
+/// several times per mining trip, few enough to read.
+pub const PLAN_RETRY_S: f32 = 5.0;
 
 /// One plan, as the engine holds it.
 ///
@@ -5242,6 +5253,14 @@ impl Plans {
     /// of about how much is running unattended. Finished plans stay readable in
     /// the list; the oldest one is evicted to make room.
     pub fn set(&mut self, team: Team, plan: PlanRun) -> Result<(), String> {
+        // A plan with no steps can never finish — nothing to submit, nothing to
+        // advance — so it would sit `running` and hold one of the two slots for
+        // the rest of the match. The compiler refuses this with a better
+        // message; this is the same refusal at the door of the store, so no
+        // caller can install one by construction.
+        if plan.steps.is_empty() {
+            return Err("a plan needs at least one step".to_string());
+        }
         let list = self.get_mut(team);
         if let Some(slot) = list.iter_mut().find(|p| p.name == plan.name) {
             *slot = plan;
@@ -5291,7 +5310,16 @@ impl Plans {
         else {
             return;
         };
-        if plan.step_no() != stamp.step as usize || !plan.live() {
+        // Three conditions, and the third is the one that makes "replaced
+        // mid-flight" safe. `plan_set` is compiled in `SimSet::Intent`, the
+        // same set as this verdict and ahead of it in the batch whenever the
+        // replacement came from a seat — so a fresh `PlanRun` can be sitting
+        // under the old one's name when the old step's verdict arrives. Name
+        // and step number do NOT tell them apart (both are "opening", both are
+        // on step 1). `submitted` does, and unconditionally: a plan that has
+        // sent nothing cannot be the addressee of a verdict, and `Plans::set`
+        // always installs a replacement with `submitted: false`.
+        if !plan.submitted || plan.step_no() != stamp.step as usize || !plan.live() {
             return;
         }
         match error {
@@ -5308,6 +5336,14 @@ impl Plans {
                 // rather than how long since the last retry.
                 plan.blocked_since.get_or_insert(now);
                 plan.applied = false;
+                // A refusal that CHANGES is news. "cannot afford it" becoming
+                // "the site is blocked" is a different problem with a different
+                // answer, and staying quiet about the second would leave the
+                // owner acting on the first right up until the plan halted on
+                // the other one.
+                if plan.state != PlanState::Blocked(why.clone()) {
+                    plan.told_blocked = false;
+                }
                 plan.state = PlanState::Blocked(why);
             }
         }

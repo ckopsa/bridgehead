@@ -74,6 +74,16 @@
 //! the owner's event feed. Nothing is ever skipped, and a plan never lies about
 //! where it is.
 //!
+//! **What counts as refused is narrower than "produced an error".** The
+//! compiler routinely reports a dead id and orders the survivors anyway —
+//! `own_units` is built that way on purpose — so `move [a,b]` with `b` a corpse
+//! *moves a* and still pushes an error. Treating that as a refusal made a plan
+//! block on the most ordinary event in the game, retry an order it had already
+//! carried out, and then halt a sequence that was running correctly. So
+//! `compile_intent` reports whether it **reached** anything, and only a step
+//! that reached nothing blocks. The error still goes to every other channel;
+//! what changes is whether the plan stops for it.
+//!
 //! ## Once through
 //!
 //! A plan does not loop. Repetition is a trigger's `repeat`, and a construct
@@ -233,6 +243,13 @@ fn step_one(
     //    actually run?" has to be answerable from the snapshot.
     plan.at += 1;
     if plan.at >= plan.steps.len() {
+        // PIN it to the last real index rather than leaving it one past the
+        // end. `PlanRun::at` is public and documented as "the last index once
+        // the plan is finished"; `step_no()` and `current()` clamp, but a
+        // reader that indexed `steps[plan.at]` on a done plan would panic, and
+        // an invariant that only holds because every reader remembers to clamp
+        // is not an invariant.
+        plan.at = plan.steps.len() - 1;
         plan.state = PlanState::Done;
         feed.push(
             me,
@@ -610,7 +627,7 @@ mod tests {
         refuse(&mut app, "you have no Sanctum");
 
         // Walk past the grace window, refusing every retry.
-        for _ in 0..12 {
+        for _ in 0..((PLAN_BLOCK_GRACE_S as usize) + 4) {
             advance_clock(&mut app, 1.0);
             app.update();
             refuse(&mut app, "you have no Sanctum");
@@ -919,6 +936,13 @@ mod tests {
             app.world().resource::<Plans>().get(Team::Human)[0].status(),
             "done"
         );
+        // `at` is PINNED to the last real index, not left one past the end:
+        // it is a public field documented that way, and `steps[at]` on a
+        // finished plan must not be a panic waiting for a future reader.
+        let finished = &app.world().resource::<Plans>().get(Team::Human)[0];
+        assert_eq!(finished.at, finished.steps.len() - 1);
+        assert_eq!(finished.step_no(), 3, "and it still reads as step 3/3");
+        assert!(finished.current().is_some());
         assert!(
             app.world()
                 .resource::<GameEvents>()
@@ -928,6 +952,146 @@ mod tests {
             "and said so"
         );
         assert!(errs(&app).is_empty(), "nothing was refused along the way");
+    }
+
+    /// **A step that lost one unit is a partial success, not a refusal.**
+    ///
+    /// The regression this pins is the worst one plans can have. `own_units`
+    /// reports every dead id AND returns the survivors, so a step that says
+    /// `move [alive, dead]` really does move `alive` — and still produces an
+    /// error. Treating "any error" as "refused" made a plan block on the most
+    /// ordinary event in the game (a squad member dying between `plan_set` and
+    /// the step), re-issue the same order five times, and then halt a sequence
+    /// that was in fact running correctly.
+    #[test]
+    fn a_step_that_reached_some_of_its_units_is_not_a_refusal() {
+        let mut app = full_app();
+        let alive = app
+            .world_mut()
+            .spawn((
+                Unit {
+                    kind: UnitKind::Footman,
+                },
+                Team::Human,
+                Transform::from_xyz(0.0, 0.0, 0.0),
+                Health::new(100.0),
+                Order::Idle,
+            ))
+            .id();
+        // An id that is well-formed and simply is not ours — exactly what a
+        // dead squad member's id becomes.
+        let ghost = 424242u64;
+
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: serde_json::from_str(&format!(
+                r#"{{"type":"plan_set","name":"opening","steps":[
+                     {{"intent":{{"type":"move","units":[{},{ghost}],
+                                  "x":-70.0,"z":-70.0}}}},
+                     {{"intent":{{"type":"posture","id":1,
+                                  "posture":{{"type":"push","x":70.0,"z":70.0}}}}}}]}}"#,
+                alive.to_bits()
+            ))
+            .expect("parses"),
+            trigger: None,
+            plan: None,
+        });
+        app.update();
+        advance_clock(&mut app, 0.5);
+        app.update();
+
+        // The survivor really was ordered...
+        assert!(
+            matches!(app.world().entity(alive).get::<Order>(), Some(Order::Move(_))),
+            "the living unit was moved"
+        );
+        // ...the error was still reported, because every other channel wants it...
+        assert!(
+            app.world()
+                .resource::<IntentErrors>()
+                .get(Team::Human)
+                .iter()
+                .any(|e| e.contains("424242")),
+            "the dead id is still named on the error channel"
+        );
+        // ...and the plan carried on rather than blocking.
+        assert_eq!(
+            state(&app),
+            PlanState::Running,
+            "a step that did what it could must not block the plan"
+        );
+        advance_clock(&mut app, 0.5);
+        app.update();
+        assert_eq!(at(&app), 1, "and it advanced");
+
+        // The contrast: a step that reached NOBODY is a real refusal.
+        let mut app = full_app();
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: serde_json::from_str(
+                r#"{"type":"plan_set","name":"opening","steps":[
+                     {"intent":{"type":"move","units":[424242],"x":-70.0,"z":-70.0}},
+                     {"intent":{"type":"posture","id":1,
+                                "posture":{"type":"push","x":70.0,"z":70.0}}}]}"#,
+            )
+            .expect("parses"),
+            trigger: None,
+            plan: None,
+        });
+        app.update();
+        advance_clock(&mut app, 0.5);
+        app.update();
+        assert!(
+            matches!(state(&app), PlanState::Blocked(_)),
+            "reaching nobody is a refusal, got {:?}",
+            state(&app)
+        );
+    }
+
+    /// **A plan replaced mid-flight does not inherit the old one's verdict.**
+    ///
+    /// `plan_set` and a plan step's verdict are compiled in the same set, and a
+    /// replacement arrives with the same name on the same step number — so name
+    /// and step cannot tell the two apart. `submitted` can: a plan that has
+    /// sent nothing cannot be the addressee of a verdict.
+    #[test]
+    fn a_replaced_plan_does_not_inherit_the_old_ones_verdict() {
+        let mut plans = Plans::default();
+        let mut first = plan(vec![
+            step(stop(), PlanAdvance::OnApplied),
+            step(stop(), PlanAdvance::OnApplied),
+        ]);
+        first.name = name("opening");
+        first.submitted = true;
+        plans.set(Team::Human, first).unwrap();
+
+        let stamp = PlanStamp {
+            name: name("opening"),
+            step: 1,
+            of: 2,
+        };
+        // The commander replaces it — same name, same length, so the stamp
+        // still "matches" on everything but the one field that counts.
+        let mut second = plan(vec![
+            step(stop(), PlanAdvance::OnApplied),
+            step(stop(), PlanAdvance::OnApplied),
+        ]);
+        second.name = name("opening");
+        plans.set(Team::Human, second).unwrap();
+
+        plans.report(Team::Human, stamp, Some("stale news".into()), 5.0);
+        let now = &plans.get(Team::Human)[0];
+        assert_eq!(
+            now.state,
+            PlanState::Running,
+            "the fresh plan must not be blocked by the old plan's refusal"
+        );
+        assert!(!now.applied, "nor accepted by its acceptance");
+        assert!(!now.submitted, "and it still has its own step 1 to send");
     }
 
     /// A step the compiler really refuses, through the real compiler: the plan

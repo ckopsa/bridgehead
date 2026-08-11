@@ -1588,9 +1588,26 @@ can be refused. The engine has three options and only one is defensible:
   would make plans useless for exactly the economic sequencing they exist for.
 * **Block, retry, then halt.** What it does. The plan stops advancing, its
   status becomes `blocked: <the compiler's own error, verbatim>`, it re-submits
-  the same step every 2s, and if it is still refused after 10s it becomes
-  `halted: <error>` and stops for good — **on the step that failed**, which is
-  where a reader needs to find it.
+  the same step every `PLAN_RETRY_S` (5s), and if it is still refused after
+  `PLAN_BLOCK_GRACE_S` (60s) it becomes `halted: <error>` and stops for good —
+  **on the step that failed**, which is where a reader needs to find it.
+
+The grace window was **ten seconds until the canonical opening was run against a
+live seat and died of it**: the plan reached its `upgrade` step short on lumber,
+blocked correctly, and halted twenty seconds before the income that would have
+paid for it arrived. Ten seconds is right for the reason it was chosen (a worker
+mid-walk) and wrong for the reason plans exist — economic sequencing, where the
+dominant refusal is "not affordable yet" and money moves on a scale of tens of
+seconds. Halting later costs nothing, because the *owner* is told at the first
+bounce; the constant governs only how long the engine keeps trying.
+
+**A step that reached some of its targets is a partial success, not a refusal.**
+`own_units` reports every dead id and returns the survivors, so `move [a,b]`
+with `b` a corpse really does move `a`. Treating "any error" as "refused" made a
+plan block on the most ordinary event in the game — a squad member dying between
+`plan_set` and the step — and then halt a sequence that was running correctly.
+The compiler therefore reports whether it *reached* anything, and only a step
+that reached nothing blocks. The error still goes to every other channel.
 
 Both states are announced once on the owner's event feed (not once per retry —
 the human's alert stack is six rows) and both carry the reason in the status
@@ -1659,12 +1676,20 @@ resolves when the step executes. So the idiom is:
 ```json
 {"type":"plan_set","name":"army","steps":[
   {"intent":{"type":"template","building":<barracks>,"squad":2}},
+  {"intent":{"type":"train","building":<barracks>,"unit":"Footman"}},
+  {"intent":{"type":"train","building":<barracks>,"unit":"Footman"}},
   {"intent":{"type":"train","building":<barracks>,"unit":"Footman"},
-   "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":8}}},
+   "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":3}}},
   {"intent":{"type":"posture","id":2,"posture":{"type":"push","x":70,"z":70}}}]}
 ```
 
-Step 3 moves whoever is in squad 2 when it runs. **No new selector was
+Note the three separate `train` steps: `train` queues **one** unit, so a
+`unit_count` wait must be for a number the plan actually produces. A single
+`train` step under `count: 8` is a plan that waits forever, and the engine will
+not warn you — it is `running`, correctly, on a step whose condition is simply
+never going to hold.
+
+The last step moves whoever is in squad 2 when it runs. **No new selector was
 invented**, and that is the decision rather than an omission: a `{"squad":2}`
 form of every unit-taking verb would be a second way to spell membership, and
 this document exists because two spellings of one language is two languages. The
@@ -1747,6 +1772,21 @@ answering has to see what they are agreeing to on the line they are answering.
 - **A step still cannot name a unit that does not exist.** Answered by the squad
   idiom above rather than solved. The residue is real: a plan cannot say "the
   *specific* Catapult I am about to build".
+- **And there is no squad idiom for BUILDINGS**, which is the sharper half of
+  the same gap and worth stating plainly: a step cannot name a building the
+  plan itself is about to put up. "Build a Barracks, then train Footmen at it"
+  is unspellable in one plan, because step 1 mints the id that step 3 would
+  need. Squads close this for units because membership is late-bound by number;
+  buildings have no such handle. The working idiom is two plans — an economic
+  opening now, an army plan set on the poll after the Barracks appears in your
+  snapshot — and that is what tools/COMMANDER_BRIEF.md ships as the canonical
+  pair. A `{"building":{"kind":"Barracks","nth":0}}` selector would close it and
+  was deliberately not invented here: it is a second way to name a building, and
+  the argument against inventing one is the argument this whole document makes.
+- **A plan whose wait can never be satisfied is indistinguishable from one that
+  is merely early.** `unit_count >= 8` behind a single `train` step (which
+  queues one unit) is `running` forever, honestly and uselessly. Nothing
+  type-checks a plan against the world it will meet.
 - **Nothing watches for a plan whose premise died.** A plan waiting on
   `unit_count` for an army whose barracks was razed waits forever, `running`,
   and nothing tells you. The status is honest but passive.
