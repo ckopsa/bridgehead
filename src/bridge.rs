@@ -915,11 +915,16 @@ struct MeOut {
     /// `level` printed here.
     hero_records: Vec<HeroRecordOut>,
     /// What each hero class costs you to put in a queue RIGHT NOW, and what it
-    /// will cost when it dies. **Your first hero of a class is free** — 0g 0l,
-    /// paid only in 25 seconds of hall time and 5 supply — and the price
-    /// appears the moment you have one to lose. Every class is listed,
-    /// including ones your slots have no room for; `hero_slots_used` vs
-    /// `hero_slots` is the gate, not this.
+    /// will cost when it dies. **Your FIRST hero is free** — 0g 0l, paid only
+    /// in 25 seconds of hall time and 5 supply — and that waiver is one per
+    /// team, not one per class.
+    ///
+    /// Read the numbers, not the rule: with no hero yet, EVERY class prices at
+    /// 0 because any one of them could be the free one, and the instant you
+    /// queue one the rest jump to 400g/100l in the next snapshot. They are
+    /// alternatives, not a shopping list. Every class is listed, including ones
+    /// your slots have no room for; `hero_slots_used` vs `hero_slots` is the
+    /// gate, not this.
     hero_costs: Vec<HeroCostOut>,
     /// Team-wide research: one entry per ladder in `catalog.research`, always
     /// present and always both ladders, so a commander can read a level off a
@@ -982,11 +987,13 @@ struct HeroRecordOut {
 #[derive(Serialize)]
 struct HeroCostOut {
     kind: &'static str,
-    /// What queuing this class costs you RIGHT NOW. **Zero until the class
-    /// dies**: your first hero of each class is free.
+    /// What queuing this class costs you RIGHT NOW. **Zero only while your
+    /// team has no hero at all** — alive, queued, or dead and awaiting
+    /// revival. After that this is 400g/100l whether the class is new to you
+    /// or coming back.
     gold: u32,
     lumber: u32,
-    /// Seconds in the queue — the part that is never free. A first hero is
+    /// Seconds in the queue — the part that is never free. A fresh hero is
     /// 25s of hall time you are not spending on workers; a revival is faster.
     time: f32,
     /// True when `gold`/`lumber` above are a REVIVAL price, i.e. this class
@@ -2135,6 +2142,15 @@ fn write_seat_snapshot(
         .filter(|k| is_hero_kind(*k))
         .collect();
     let hero_slots_used = (my_hero_classes.len() + queued_hero_classes.len()) as u32;
+    // The same two lists, concatenated, are what prices a hero: the one free
+    // hero is spent by anything alive OR in flight, so `hero_costs` below
+    // starts charging the moment the first one is queued rather than the
+    // moment it walks out of the hall.
+    let my_held_heroes: Vec<UnitKind> = my_hero_classes
+        .iter()
+        .copied()
+        .chain(queued_hero_classes.iter().copied())
+        .collect();
 
     let map = crate::terrain::active_map();
     // All four co-command keys appear together or not at all — including as
@@ -2219,7 +2235,8 @@ fn write_seat_snapshot(
                 .copied()
                 .filter(|k| is_hero_kind(*k))
                 .map(|k| {
-                    let (gold, lumber, time) = hero_train_cost(records, me, k);
+                    let (gold, lumber, time) =
+                        hero_train_cost(records, me, k, &my_held_heroes);
                     let (revive_gold, revive_lumber) = unit_value(k);
                     HeroCostOut {
                         kind: kind_name(k),

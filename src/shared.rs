@@ -3868,16 +3868,70 @@ pub fn hero_slot_check(held: &[UnitKind], kind: UnitKind, tier: TechTier) -> Her
     HeroSlotVerdict::Ok
 }
 
+/// How long a hero of `kind` sits in the queue: a fresh one takes the row's
+/// `train_time`, a revival takes `HERO_REVIVE_TIME`. Split out of
+/// `hero_train_cost` because the clock is the half of the answer that depends
+/// on nothing but the record — the progress bar in ui.rs wants only this, and
+/// asking it through the money function would mean handing that call site a
+/// `held` list it has no reason to compute (and every reason to get wrong).
+pub fn hero_train_time(records: &HeroRecords, team: Team, kind: UnitKind) -> f32 {
+    match records.get(team, kind) {
+        Some(_) => HERO_REVIVE_TIME,
+        None => unit_stats(kind).train_time,
+    }
+}
+
 /// Gold/lumber/time to put a hero of `kind` in a training queue right now.
-/// **Your first hero of a class is free; losing it is not.**
+/// **Your FIRST hero is free — once. Every hero after it is 400g/100l.**
 ///
-///   * a class this team has NEVER fielded — `(0, 0, train_time)`. Free, not
-///     instant: the 25 seconds and the 5 supply are unchanged, and they are
-///     paid at the hall, which is also the building that makes workers. The
-///     opening cost of a hero is a worker line that stalls, not a treasury
-///     that empties.
+/// `held` is the same slice `hero_slot_check` takes: every hero class this
+/// team is holding, alive on the map *or* sitting in any of its queues. Ask
+/// both functions with the same list — the slot rule and the price rule read
+/// the same fact about the team, and a caller that computed "held" one way for
+/// one and another way for the other is the divergence this parameter exists
+/// to prevent.
+///
+///   * this team has NEVER had a hero — no record of any class, nothing in
+///     flight — `(0, 0, train_time)`. Free, not instant: the 25 seconds and
+///     the 5 supply are unchanged, and they are paid at the hall, which is
+///     also the building that makes workers. The opening cost of a hero is a
+///     worker line that stalls, not a treasury that empties.
 ///   * a class with a record (i.e. one that has died) — the row's
 ///     `revive_gold`/`revive_lumber` at `HERO_REVIVE_TIME`.
+///   * any other hero — a second class, fielded fresh by a team that already
+///     has one — the row's `revive_gold`/`revive_lumber` at the row's
+///     `train_time`. Full fare, on the same clock as any fresh hero.
+///
+/// **Why the second class is priced off `revive_*`.** The fielding price and
+/// the revival price are the same number by design — 400g/100l, one price for
+/// "have a hero standing that you did not have a moment ago", whether it is
+/// new or bought back. Rather than resurrect the `cost_gold`/`cost_lumber`
+/// fields (which the loader pins at 0, and which `unit_value` deliberately
+/// ignores for heroes so that killing one is worth something), the rule reads
+/// `revive_gold`/`revive_lumber` for both. One number per class in
+/// `units.ron`, which is also what a commander reads on the wire: the price
+/// printed under "what it costs when it dies" is the same price they will pay
+/// to field the second one.
+///
+/// **Why only the first is free.** Free-to-field exists to make the hero
+/// guaranteed content rather than a 400g gamble nobody took (see the arena
+/// history below). One free hero does that. A second free hero did something
+/// else: with hero slots scaling on the hall ladder, reaching a Keep silently
+/// posted a fully-levelling Priestess to your army for nothing, so the tier-2
+/// reward stopped being "a decision widens" and became "a free power spike
+/// arrives". The opening is the moment that needed de-risking; a mid-game
+/// second hero is a purchase like any other, and it should compete with the
+/// three Footmen it costs.
+///
+/// **The queue edge.** A first hero still IN TRAINING counts as held, so the
+/// second class prices at full fare the instant the first is queued — you
+/// cannot queue both in the same breath and have both come out free. This is
+/// `hero_slot_check`'s precedent applied to money: that function counts queued
+/// heroes against the slot ceiling for exactly the same reason (two halls each
+/// queuing a hero are both in flight and neither is alive yet), and a price
+/// rule that counted only bodies would be the one hole left in a wall that is
+/// otherwise built. Asserted by
+/// `a_first_hero_still_in_the_queue_already_prices_the_second`.
 ///
 /// **Why this way round.** v2 charged 400g/100l up front and discounted the
 /// revival to 250g. Arena rounds 17 through 19 produced five straight winners
@@ -3912,18 +3966,32 @@ pub fn hero_slot_check(held: &[UnitKind], kind: UnitKind, tier: TechTier) -> Her
 /// drama, level scaling is the lever to reach for — and this comment is where
 /// the argument for it starts.
 ///
-/// Per class, not per team: with two heroes allowed, a team that has a level-6
-/// Champion in the field still gets its first Priestess free, and reviving the
-/// Champion is not made free by the Priestess never having died.
-pub fn hero_train_cost(records: &HeroRecords, team: Team, kind: UnitKind) -> (u32, u32, f32) {
+/// Revival stays per class, not per team: a team that lost a Champion and a
+/// Priestess owes 400g/100l for each of them, and buying one back does not
+/// make the other cheaper. It is only the *freebie* that is per team, because
+/// it is not a discount on a class — it is the one-time waiver that gets your
+/// first hero onto the field.
+pub fn hero_train_cost(
+    records: &HeroRecords,
+    team: Team,
+    kind: UnitKind,
+    held: &[UnitKind],
+) -> (u32, u32, f32) {
     let base = unit_stats(kind);
-    match records.get(team, kind) {
-        Some(_) => (base.revive_gold, base.revive_lumber, HERO_REVIVE_TIME),
-        // Read out of the table rather than written as a literal `0`: the
-        // validator guarantees hero cost fields ARE zero, and going through the
-        // row keeps units.ron the single place the number lives.
-        None => (base.cost_gold, base.cost_lumber, base.train_time),
+    let time = hero_train_time(records, team, kind);
+    if records.get(team, kind).is_some() {
+        // This class has stood before and is being bought back.
+        return (base.revive_gold, base.revive_lumber, time);
     }
+    // The waiver: no record of ANY class, and nothing in flight. Read out of
+    // the table rather than written as a literal `0` — the validator
+    // guarantees hero cost fields ARE zero, and going through the row keeps
+    // units.ron the single place the number lives.
+    if records.list(team).is_empty() && held.is_empty() {
+        return (base.cost_gold, base.cost_lumber, time);
+    }
+    // A fresh hero for a team that already has (or has had) one.
+    (base.revive_gold, base.revive_lumber, time)
 }
 
 /// What a building's rally point points at. Set by ui.rs, read by economy.rs
@@ -13735,13 +13803,13 @@ mod tests {
     }
 
 
-    /// **The whole inversion, per class, on both rosters.** A hero this team
-    /// has never fielded is free to queue; the same class with a record costs
-    /// the revival price. Written as a loop over every hero kind because the
-    /// bug it guards against is the boring one: a Kingdom-only edit that left
-    /// the Warchief and the Far Seer priced the old way, which is exactly the
-    /// shape the previous hero-pricing bug took (the Priestess was priced off
-    /// her raw stats while the Champion went through `hero_train_cost`).
+    /// **The whole inversion, per class, on both rosters.** A team's FIRST
+    /// hero is free to queue; the same class with a record costs the revival
+    /// price. Written as a loop over every hero kind because the bug it guards
+    /// against is the boring one: a Kingdom-only edit that left the Warchief
+    /// and the Far Seer priced the old way, which is exactly the shape the
+    /// previous hero-pricing bug took (the Priestess was priced off her raw
+    /// stats while the Champion went through `hero_train_cost`).
     #[test]
     fn every_hero_class_on_both_rosters_is_free_first_and_costly_to_revive() {
         for hero in ALL_UNIT_KINDS.iter().copied().filter(|&k| is_hero_kind(k)) {
@@ -13751,7 +13819,7 @@ mod tests {
             for team in [Team::Human, Team::Claude] {
                 let mut records = HeroRecords::default();
 
-                let (gold, lumber, time) = hero_train_cost(&records, team, hero);
+                let (gold, lumber, time) = hero_train_cost(&records, team, hero, &[]);
                 assert_eq!(
                     (gold, lumber),
                     (0, 0),
@@ -13764,7 +13832,7 @@ mod tests {
                 assert!(s.supply > 0, "{hero:?} still costs supply");
 
                 records.set(team, HeroRecord { level: 1, xp: 0.0, kind: hero });
-                let (gold, lumber, time) = hero_train_cost(&records, team, hero);
+                let (gold, lumber, time) = hero_train_cost(&records, team, hero, &[]);
                 assert_eq!(
                     (gold, lumber),
                     (s.revive_gold, s.revive_lumber),
@@ -13775,12 +13843,101 @@ mod tests {
 
                 // The OTHER team's ledger is untouched by this one's death.
                 assert_eq!(
-                    hero_train_cost(&records, team.enemy(), hero),
+                    hero_train_cost(&records, team.enemy(), hero, &[]),
                     (0, 0, s.train_time),
                     "{hero:?}: one team's loss is not the other's bill"
                 );
             }
         }
+    }
+
+    /// **The waiver is one per team, not one per class.** With a hero already
+    /// standing (or already dead) the NEXT class is full fare — the same
+    /// 400g/100l its own revival would cost — and it is fielded on a fresh
+    /// hero's clock rather than a revival's, because nothing is being bought
+    /// back. This is the rule the tier-slot ladder needed: reaching a Keep
+    /// buys the *right* to a second hero, not the hero.
+    #[test]
+    fn only_the_first_hero_is_free_and_the_second_class_pays_full_fare() {
+        let team = Team::Human;
+        let heroes: Vec<UnitKind> = ALL_UNIT_KINDS
+            .iter()
+            .copied()
+            .filter(|&k| is_hero_kind(k))
+            .collect();
+
+        for &first in &heroes {
+            for &second in heroes.iter().filter(|&&k| k != first) {
+                // Both classes must be fieldable by one team for the pairing to
+                // mean anything — the rosters are per race.
+                if !unit_races(first).iter().any(|r| unit_races(second).contains(r)) {
+                    continue;
+                }
+                let s = unit_stats(second);
+
+                // (a) hero #1 alive: it holds a slot AND has a record.
+                let mut records = HeroRecords::default();
+                records.set(team, HeroRecord { level: 3, xp: 0.0, kind: first });
+                assert_eq!(
+                    hero_train_cost(&records, team, second, &[first]),
+                    (s.revive_gold, s.revive_lumber, s.train_time),
+                    "{second:?} after a living {first:?}: full fare, fresh clock"
+                );
+
+                // (b) hero #1 dead: no body held, but the team has had a hero,
+                // and that is what the waiver is spent on.
+                assert_eq!(
+                    hero_train_cost(&records, team, second, &[]),
+                    (s.revive_gold, s.revive_lumber, s.train_time),
+                    "{second:?} after a DEAD {first:?}: the waiver is already spent"
+                );
+
+                // ...and the freebie is still there for a team that has done
+                // neither. Nothing about `first` leaks across the line.
+                assert_eq!(
+                    hero_train_cost(&HeroRecords::default(), team, second, &[]),
+                    (0, 0, s.train_time),
+                    "{second:?} for a team with no hero at all: free"
+                );
+            }
+        }
+    }
+
+    /// **The queue edge, decided the way `hero_slot_check` decides it.** A
+    /// first hero sitting in a training queue has no record yet — nothing has
+    /// spawned — so only the `held` list knows it exists. It counts. Two heroes
+    /// queued in the same breath must not both come out free, and the slot rule
+    /// already counts in-flight heroes for the same reason.
+    #[test]
+    fn a_first_hero_still_in_the_queue_already_prices_the_second() {
+        let team = Team::Human;
+        let (first, second) = (UnitKind::Hero, UnitKind::Priestess);
+        let records = HeroRecords::default();
+        let s = unit_stats(second);
+
+        // Nothing anywhere: the next hero is the free one.
+        assert_eq!(
+            hero_train_cost(&records, team, first, &[]),
+            (0, 0, unit_stats(first).train_time)
+        );
+        // The Champion is queued and not yet born. No record exists — the
+        // in-flight list is the only witness, and it is enough.
+        assert_eq!(
+            hero_train_cost(&records, team, second, &[first]),
+            (s.revive_gold, s.revive_lumber, s.train_time),
+            "a queued first hero must already have spent the waiver"
+        );
+        // Same list, same answer as the slot rule reading it: both functions
+        // are asked with one slice on purpose.
+        assert_eq!(
+            hero_slot_check(&[first], second, TechTier::T2),
+            HeroSlotVerdict::Ok,
+            "the slot rule lets it through; it is the PRICE that changed"
+        );
+        assert_eq!(
+            hero_slot_check(&[first], first, TechTier::T2),
+            HeroSlotVerdict::DuplicateClass
+        );
     }
 
     /// **The revival fee is flat — it does not scale with the level it buys
@@ -13803,7 +13960,7 @@ mod tests {
                         team,
                         HeroRecord { level, xp: level as f32 * 10.0, kind: hero },
                     );
-                    hero_train_cost(&records, team, hero)
+                    hero_train_cost(&records, team, hero, &[])
                 })
                 .collect();
             assert!(
@@ -13851,15 +14008,17 @@ mod tests {
         );
     }
 
-    /// Records are per CLASS now, and so is the price: a team fielding a
-    /// level-6 Champion still gets its first Priestess FREE, and reviving the
-    /// Champion is not made free by the Priestess having never died.
+    /// Records are per CLASS, and so is REVIVAL: a team that has lost both
+    /// heroes owes for each of them separately, and buying the Champion back
+    /// does not make the Priestess cheaper. What is *not* per class is the
+    /// one-time waiver — a team with a level-6 Champion has already had its
+    /// free hero, so the first Priestess is full fare.
     #[test]
     fn hero_records_and_prices_are_per_class() {
         let mut records = HeroRecords::default();
         let team = Team::Human;
 
-        let (g, l, t) = hero_train_cost(&records, team, UnitKind::Hero);
+        let (g, l, t) = hero_train_cost(&records, team, UnitKind::Hero, &[]);
         let base = unit_stats(UnitKind::Hero);
         assert_eq!(
             (g, l, t),
@@ -13875,18 +14034,18 @@ mod tests {
             },
         );
         assert_eq!(
-            hero_train_cost(&records, team, UnitKind::Hero),
+            hero_train_cost(&records, team, UnitKind::Hero, &[UnitKind::Hero]),
             (base.revive_gold, base.revive_lumber, HERO_REVIVE_TIME),
         );
         let priestess = unit_stats(UnitKind::Priestess);
         assert_eq!(
-            hero_train_cost(&records, team, UnitKind::Priestess),
+            hero_train_cost(&records, team, UnitKind::Priestess, &[UnitKind::Hero]),
             (
-                priestess.cost_gold,
-                priestess.cost_lumber,
+                priestess.revive_gold,
+                priestess.revive_lumber,
                 priestess.train_time
             ),
-            "a Champion's record must not discount a first Priestess",
+            "a Champion on the field spends the team's one free hero",
         );
 
         // Both classes coexist, upsert keeps one record each, and the other

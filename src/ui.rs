@@ -1841,9 +1841,10 @@ fn research_name(kind: ResearchKind) -> &'static str {
 ///
 ///   * class already standing or already queued -> **hidden** (there is
 ///     nothing to buy);
-///   * class dead but recorded -> shown as **"Revive"** at the revival price,
-///     which is the only price a hero ever has;
-///   * class never fielded -> shown at **"Free"**;
+///   * class dead but recorded -> shown as **"Revive"** at the revival price;
+///   * class never fielded -> shown at **"Free"** if this team has never had a
+///     hero at all, and at the 400g/100l fielding price if it has (one waiver
+///     per team, spent by the first hero — `shared::hero_train_cost`);
 ///   * ...and any of those is **greyed** when every slot is spoken for, so a
 ///     tier-1 player can SEE the Priestess they would get by teching up rather
 ///     than discovering her existence in the catalog.
@@ -1872,6 +1873,18 @@ impl HeroTrain {
         let label = if revival { "Revive" } else { unit_name(kind) };
         Some((gold, lumber, label, verdict == HeroSlotVerdict::Ok))
     }
+
+    /// What clicking that button spends. The click path asks the CARD rather
+    /// than re-deriving the price, so the number the player was looking at is
+    /// the number they are charged — the two used to call `hero_train_cost`
+    /// separately, which was fine only while the price depended on nothing the
+    /// two call sites could disagree about. It now depends on `held`.
+    fn price(&self, kind: UnitKind) -> Option<(u32, u32)> {
+        self.costs
+            .iter()
+            .find(|(k, ..)| *k == kind)
+            .map(|&(_, gold, lumber, _)| (gold, lumber))
+    }
 }
 
 /// Build the hero card state for one team from the world.
@@ -1889,7 +1902,11 @@ fn hero_train_state(
             .copied()
             .filter(|k| is_hero_kind(*k))
             .map(|k| {
-                let (gold, lumber, _) = hero_train_cost(records, Team::Human, k);
+                // Priced against the same `held` list the slot check reads, so
+                // the card shows 0 only while the team's one free hero is
+                // genuinely unspent — queue a Champion and the Priestess button
+                // reprices to 400g/100l on the very next frame.
+                let (gold, lumber, _) = hero_train_cost(records, Team::Human, k, &held);
                 (k, gold, lumber, records.get(Team::Human, k).is_some())
             })
             .collect(),
@@ -5253,8 +5270,12 @@ fn command_input(
                 // is NOT allowed is queuing into scaffolding (`uc`, above).
                 let _ = upgrading;
                 let (cost_gold, cost_lumber) = if is_hero_kind(kind) {
-                    let (g, l, _) = hero_train_cost(&records, Team::Human, kind);
-                    (g, l)
+                    // The card's own number (see `HeroTrain::price`), not a
+                    // second derivation of it.
+                    let Some(price) = hero_train.price(kind) else {
+                        continue;
+                    };
+                    price
                 } else {
                     let s = unit_stats(kind);
                     (s.cost_gold, s.cost_lumber)
@@ -7937,7 +7958,10 @@ fn update_hud(
                     }
                     if let Some(front) = queue.queue.front() {
                         let train = if is_hero_kind(*front) {
-                            hero_train_cost(&records, Team::Human, *front).2
+                            // Only the clock, so only the clock is asked for:
+                            // this panel has no business computing a `held`
+                            // list to get a number that does not depend on one.
+                            hero_train_time(&records, Team::Human, *front)
                         } else {
                             unit_stats(*front).train_time
                         }

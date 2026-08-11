@@ -1983,12 +1983,16 @@ fn think(
     // Revival of a class it has already lost outranks opening a new one — it
     // comes back at the level the team already paid for in blood.
     //
-    // The gold half of this decision is gone: a class this team has never
-    // fielded is FREE (`hero_train_cost`), so there is nothing to save up for
-    // and nothing to weigh it against. What is left to spend is 25 seconds of
-    // hall time and 5 supply, and the script takes that trade the moment a
-    // slot exists — a scripted opponent that skipped free content would be
-    // teaching the human seat the wrong lesson about the game.
+    // The gold half of this decision is gone FOR THE FIRST HERO ONLY: the
+    // team's first hero is free (`hero_train_cost`), so there is nothing to
+    // save up for and nothing to weigh it against, and the script takes that
+    // trade the moment a slot exists — a scripted opponent that skipped free
+    // content would be teaching the human seat the wrong lesson about the
+    // game. The SECOND hero is 400g/100l like anything else, so it goes back
+    // through the budget: the affordability check below and the ring-fence
+    // under it both read `hero_train_cost`, which is why neither needed to
+    // learn the new rule. Nothing here special-cases "free" — the price is
+    // just zero sometimes.
     let hero_pick_order = r.heroes(race);
     let mut held_classes: Vec<UnitKind> = army
         .iter()
@@ -2013,11 +2017,13 @@ fn think(
             } else {
                 // A brand-new hero class used to wait for a Barracks, because
                 // 400g out of the opening left the base defended by two
-                // Footmen. Free heroes delete that reason: the hero IS the
-                // early defense, and holding it back only leaves a slot empty.
-                // The second-hero gate stays — that one was never about gold
-                // but about not queueing 25s of hall time and 5 supply behind
-                // an army too small to hold the base while it trains.
+                // Footmen. The free FIRST hero deletes that reason: the hero
+                // IS the early defense, and holding it back only leaves a slot
+                // empty. The second-hero gate stays, and now it guards two
+                // things at once — 25s of hall time and 5 supply behind an
+                // army too small to hold the base, AND 400g that the army
+                // wants. `can_open_another` is the army test; the gold test is
+                // the affordability check plus the ring-fence below.
                 !known && can_open_another
             }
         })
@@ -2027,7 +2033,7 @@ fn think(
         .flatten();
 
     if let Some(hero_kind) = want_hero {
-        let (hero_gold, hero_lumber, _) = hero_train_cost(records, me, hero_kind);
+        let (hero_gold, hero_lumber, _) = hero_train_cost(records, me, hero_kind, &held_classes);
         let hero_supply = unit_stats(hero_kind).supply;
         // Hero training and revival happen at any finished rung of the hall
         // ladder — a team that teched to Keep must not lose its hero.
@@ -2048,14 +2054,15 @@ fn think(
     // deliberately NOT reserved: army units are what drives the farm trigger,
     // and holding 5 supply back would stall the whole build order.
     //
-    // This is now a REVIVAL-only ring-fence in practice, and it stays written
-    // as a general one rather than special-cased: `hero_train_cost` of a
-    // never-fielded class is (0, 0), so a first hero reserves nothing without
-    // this code needing to know why. Delete the generality and the day a hero
-    // class is priced again is the day the AI stops being able to afford one.
+    // It covers revivals AND the second hero, and it is written as a general
+    // ring-fence rather than special-cased on either: `hero_train_cost` of a
+    // team's first-ever hero is (0, 0), so that one reserves nothing without
+    // this code needing to know why. The generality is load-bearing — it was
+    // written when only revivals cost anything, and it is the reason the
+    // second-hero price needed no change here at all.
     let (mut reserve_gold, mut reserve_lumber) = match want_hero {
         Some(kind) => {
-            let (g, l, _) = hero_train_cost(records, me, kind);
+            let (g, l, _) = hero_train_cost(records, me, kind, &held_classes);
             (g, l)
         }
         None => (0, 0),
@@ -3810,6 +3817,107 @@ mod tests {
         assert!(
             !queued(&mut app, hall).iter().any(|k| is_hero_kind(*k)),
             "10 gold does not buy a revival, and the script must not queue an unpayable one"
+        );
+    }
+
+    /// A Keep, a Champion already standing, and however many Footmen the caller
+    /// wants — the board on which the second hero is a decision.
+    fn board_with_a_keep_and_a_hero(fighters: usize, gold: u32, lumber: u32) -> (App, Entity) {
+        let mut app = ai_app();
+        let home = Team::Claude.base_pos();
+        let keep = spawn_building(&mut app, BuildingKind::Keep, Team::Claude, home);
+        // The script reads its tier off its own halls, but intent.rs reads the
+        // `TechTiers` resource — which a real match keeps in step with the
+        // buildings and this hand-built app does not. Without this the second
+        // hero is refused for having no SLOT and the test would pass while
+        // proving nothing about its PRICE.
+        app.world_mut()
+            .resource_mut::<TechTiers>()
+            .set(Team::Claude, TechTier::T2);
+        spawn_building(
+            &mut app,
+            BuildingKind::Barracks,
+            Team::Claude,
+            home + Vec3::new(-12.0, 0.0, 0.0),
+        );
+        for i in 0..5 {
+            spawn_unit(
+                &mut app,
+                UnitKind::Worker,
+                Team::Claude,
+                home + Vec3::new(3.0 + i as f32, 0.0, 3.0),
+            );
+        }
+        for i in 0..fighters {
+            spawn_unit(
+                &mut app,
+                UnitKind::Footman,
+                Team::Claude,
+                home + Vec3::new(-3.0 - i as f32, 0.0, 3.0),
+            );
+        }
+        // The first hero, alive and holding one of the Keep's two slots. It has
+        // never died, so there is no record — the second hero's price comes
+        // from the team having a hero at all, which is the rule under test.
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Hero },
+            Team::Claude,
+            Transform::from_translation(home),
+            Order::Idle,
+            Health::new(600.0),
+            Hero { level: 1, xp: 0.0, mana: 80.0 },
+        ));
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let claude = economies.get_mut(Team::Claude);
+            claude.gold = gold;
+            claude.lumber = lumber;
+        }
+        (app, keep)
+    }
+
+    /// **The script budgets for its second hero.** Under the free-for-every-
+    /// first-of-a-class rule the Priestess was a 0g item, so the moment a Keep
+    /// opened the second slot the script queued her out of an empty treasury.
+    /// She costs 400g/100l now, and the affordability check the script already
+    /// had is what stops it — the same check that has always governed
+    /// revivals, reading the same function.
+    #[test]
+    fn the_script_will_not_queue_a_second_hero_it_cannot_pay_for() {
+        // Army enough to want one, money nowhere near enough to have one.
+        let (mut app, keep) = board_with_a_keep_and_a_hero(SECOND_HERO_MIN_ARMY, 150, 400);
+        think_once(&mut app);
+        assert!(
+            !queued(&mut app, keep).iter().any(|k| is_hero_kind(*k)),
+            "150 gold does not buy a second hero: {:?}",
+            queued(&mut app, keep)
+        );
+
+        // ...and with the price in the bank it takes the slot.
+        let (mut app, keep) = board_with_a_keep_and_a_hero(SECOND_HERO_MIN_ARMY, 1000, 400);
+        think_once(&mut app);
+        let q = queued(&mut app, keep);
+        assert!(
+            q.iter().any(|k| is_hero_kind(*k) && *k != UnitKind::Hero),
+            "a paid-for second slot is still worth filling: {q:?}"
+        );
+    }
+
+    /// ...and the army gate comes FIRST. `SECOND_HERO_MIN_ARMY` is not about
+    /// gold — it is about not putting 25 seconds of hall time and 5 supply
+    /// ahead of an army too small to hold the base while it trains — so a rich
+    /// script with three Footmen still does not open a second slot. Both gates
+    /// have to hold: money alone must not buy the decision.
+    #[test]
+    fn a_second_hero_waits_for_an_army_even_when_the_gold_is_there() {
+        let (mut app, keep) = board_with_a_keep_and_a_hero(SECOND_HERO_MIN_ARMY - 3, 2000, 2000);
+        think_once(&mut app);
+        assert!(
+            !queued(&mut app, keep)
+                .iter()
+                .any(|k| is_hero_kind(*k) && *k != UnitKind::Hero),
+            "a second hero ahead of an army is the spike this gate exists for: {:?}",
+            queued(&mut app, keep)
         );
     }
 
