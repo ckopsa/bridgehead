@@ -218,8 +218,14 @@ def test_the_committed_ledger_validates():
 def test_the_backfilled_series_matches_the_history_it_came_from():
     """The one number the whole prose history agrees on: after round 10 the
     standings were Rusher 6, Boomer 3, one draw. If the backfill reproduces it,
-    the ten records are at least mutually consistent with the story."""
-    tally = arena.series(arena.load(LEDGER))
+    the ten records are at least mutually consistent with the story.
+
+    Pinned to the BACKFILLED rounds only — the live series keeps growing, and a
+    test that froze the whole ledger would fail the moment round 12 was played
+    (it did). The claim under test is about the reconstruction, not the future.
+    """
+    backfilled = [r for r in arena.load(LEDGER) if r["provenance"] == "backfilled"]
+    tally = arena.series(backfilled)
     assert tally["rusher"] == 6, tally
     assert tally["boomer"] == 3, tally
     assert tally["draws"] == 1, tally
