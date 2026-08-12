@@ -38,6 +38,7 @@ use std::sync::LazyLock;
 
 use crate::shared::{
     AlarmKind, AlarmTuning, ALL_ALARM_KINDS,
+    mine_place_name, CatalogPlaybook, CommandTemplate, TriggerWhen, GOLD_MINE_POSITIONS,
     normalize_name, status_probe_enabled, upgrade_root, AbilityDef,
     AbilityTarget, AbilityTargets, Effect, EffectAtom, EffectSchedule,
     BuildingKind, BuildingRole,
@@ -65,6 +66,7 @@ const ITEMS_RON: &str = include_str!("../assets/data/items.ron");
 const RESEARCH_RON: &str = include_str!("../assets/data/research.ron");
 const STANCES_RON: &str = include_str!("../assets/data/stances.ron");
 const ALARMS_RON: &str = include_str!("../assets/data/alarms.ron");
+const PLAYBOOKS_RON: &str = include_str!("../assets/data/playbooks.ron");
 
 /// Read one table's text: the override file if `BH_DATA_DIR` names a
 /// directory containing it, otherwise the compiled-in copy.
@@ -344,6 +346,10 @@ pub struct Tables {
     stances: Vec<StanceDef>,
     /// Slot-indexed by `AlarmKind as usize`, like every other table here.
     alarms: Vec<AlarmRow>,
+    /// The declarative game-plans, in file order. NOT slot-indexed — a playbook
+    /// answers to no enum, which is the point: adding one is an edit to a data
+    /// file and nothing else, and a build that ships none is legal.
+    playbooks: Vec<CatalogPlaybook>,
 }
 
 static TABLES: LazyLock<Tables> = LazyLock::new(load);
@@ -415,6 +421,7 @@ fn load() -> Tables {
     let research_file: ResearchFile = parse("research.ron", RESEARCH_RON);
     let stance_rows: Vec<StanceDef> = parse("stances.ron", STANCES_RON);
     let alarm_rows: Vec<AlarmRow> = parse("alarms.ron", ALARMS_RON);
+    let playbooks: Vec<CatalogPlaybook> = parse("playbooks.ron", PLAYBOOKS_RON);
 
     // Slotting first: every later check assumes a full table, and a missing
     // row is the failure this whole exercise exists to make loud.
@@ -621,8 +628,10 @@ fn load() -> Tables {
         research_steps: research_file.steps,
         stances,
         alarms,
+        playbooks,
     };
 
+    problems.extend(check_playbooks(&tables.playbooks));
     problems.extend(check_values(&tables, &defs));
     if !problems.is_empty() {
         panic!("{}", report(&problems));
@@ -642,6 +651,311 @@ fn report(problems: &[String]) -> String {
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Playbooks
+// ---------------------------------------------------------------------------
+
+/// The predicates a playbook step may use, and the whole reason the list is
+/// shorter than [`TriggerWhen`]'s fourteen arms.
+///
+/// A playbook is **rendered**, not executed. `tools/affordances.py` computes
+/// "you are here" by evaluating these predicates against the seat's own
+/// `state.json`, and the answer it gives has to be the answer
+/// `trigger::holds` would give — one rule of knowability, computed once,
+/// rendered twice (docs/FOG.md). So the vocabulary is exactly the arms a
+/// snapshot can answer:
+///
+/// | arm | what the view reads |
+/// | --- | --- |
+/// | `game_time` | `t` |
+/// | `unit_count` | own `units[]` |
+/// | `tier_reached` | `me.tier` |
+/// | `hero_below` / `hero_above` | own `units[].hero` and hp |
+/// | `squad_below` | own `units[].squad` and hp |
+/// | `enemy_sighted` / `enemy_in` | the enemy bodies the snapshot already shows |
+/// | `enemy_army_seen` / `enemy_hero_down` | `intel` |
+/// | `bounty_spawned` | `bounties[]` |
+/// | `mine_dry` | `mines[]` against own completed halls |
+/// | `supply_capped` | `me.supply_*` plus own `buildings[].queue` |
+///
+/// The one arm left out is `base_under_attack`, and it is left out because the
+/// snapshot carries no `LastDamaged`: the view would have to guess, and a
+/// pointer that moves on a guess is worse than a pointer that refuses to exist.
+/// Say the same thing with `enemy_in` on `our base`, which the snapshot *can*
+/// answer, and which names the place as a bonus.
+const PLAYBOOK_PREDICATES: [&str; 13] = [
+    "hero_below",
+    "hero_above",
+    "squad_below",
+    "enemy_sighted",
+    "enemy_in",
+    "enemy_army_seen",
+    "enemy_hero_down",
+    "bounty_spawned",
+    "mine_dry",
+    "supply_capped",
+    "tier_reached",
+    "unit_count",
+    "game_time",
+];
+
+/// Wire keys that can only ever hold an entity id. Refused outright in a
+/// playbook template, with the selector channel named in the message.
+const ID_ONLY_KEYS: [&str; 5] = ["units", "worker", "building", "hero", "caster"];
+
+/// The `"type"` word of a predicate, as the wire spells it.
+fn predicate_id(when: &TriggerWhen) -> &'static str {
+    match when {
+        TriggerWhen::BaseUnderAttack => "base_under_attack",
+        TriggerWhen::HeroBelow { .. } => "hero_below",
+        TriggerWhen::HeroAbove { .. } => "hero_above",
+        TriggerWhen::SquadBelow { .. } => "squad_below",
+        TriggerWhen::EnemySighted { .. } => "enemy_sighted",
+        TriggerWhen::EnemyIn { .. } => "enemy_in",
+        TriggerWhen::EnemyArmySeen { .. } => "enemy_army_seen",
+        TriggerWhen::EnemyHeroDown { .. } => "enemy_hero_down",
+        TriggerWhen::BountySpawned => "bounty_spawned",
+        TriggerWhen::MineDry => "mine_dry",
+        TriggerWhen::SupplyCapped => "supply_capped",
+        TriggerWhen::TierReached { .. } => "tier_reached",
+        TriggerWhen::UnitCount { .. } => "unit_count",
+        TriggerWhen::GameTime { .. } => "game_time",
+    }
+}
+
+/// Ground a playbook may name: the places EVERY map has.
+///
+/// `builtin_places` also serves the fords, and the fords differ per map — a
+/// playbook is one file read on `open` and on `crossings` alike, so a step that
+/// named `center ford` would silently go quiet on half the maps this game ships.
+/// (`mid` is the centre on both, and on `crossings` the centre ford sits inside
+/// it, which is why the shipped playbook stages there.) A seat's own `regions`
+/// are not candidates either, and for a sharper reason: they are the
+/// commander's private words, invented mid-match, and content shipped in the
+/// binary cannot know them.
+fn universal_places() -> Vec<String> {
+    let mut out = vec![
+        "our base".to_string(),
+        "their base".to_string(),
+        "mid".to_string(),
+    ];
+    out.extend(GOLD_MINE_POSITIONS.into_iter().map(mine_place_name));
+    out
+}
+
+/// Every problem in the playbook library, in the voice the rest of this
+/// validator uses: name the row, name the field, name the fix.
+///
+/// Pure over the parsed rows so a test can prove each refusal bites by handing
+/// it a deliberately broken copy — the same standard `check_values` holds.
+pub fn check_playbooks(books: &[CatalogPlaybook]) -> Vec<String> {
+    let mut p = Vec::new();
+    let places = universal_places();
+    let mut seen_books: Vec<&str> = Vec::new();
+
+    for book in books {
+        let bid = book.id.as_str();
+        if bid.trim().is_empty() {
+            p.push("playbooks.ron: a playbook has no id".to_string());
+        }
+        if seen_books.contains(&bid) {
+            p.push(format!(
+                "playbooks.ron: two playbooks are called {bid:?} — the id is what a \
+                 commander declares, so it has to name one plan"
+            ));
+        }
+        seen_books.push(bid);
+        if book.label.trim().is_empty() || book.pitch.trim().is_empty() {
+            p.push(format!("playbooks.ron: {bid} needs a label and a one-line pitch"));
+        }
+        if !matches!(book.race.as_str(), "kingdom" | "horde") {
+            p.push(format!(
+                "playbooks.ron: {bid} is written for race {:?}; the two rosters are \
+                 \"kingdom\" and \"horde\"",
+                book.race
+            ));
+        }
+        if book.steps.is_empty() {
+            p.push(format!("playbooks.ron: {bid} has no steps"));
+        }
+
+        let mut seen_steps: Vec<&str> = Vec::new();
+        for (i, step) in book.steps.iter().enumerate() {
+            let sid = step.id.as_str();
+            let where_ = format!("{bid} step {} ({sid})", i + 1);
+            if sid.trim().is_empty() {
+                p.push(format!("playbooks.ron: {bid} step {} has no id", i + 1));
+            }
+            if seen_steps.contains(&sid) {
+                p.push(format!("playbooks.ron: {bid} has two steps called {sid:?}"));
+            }
+            seen_steps.push(sid);
+            if step.title.trim().is_empty() {
+                p.push(format!("playbooks.ron: {where_} has no title"));
+            }
+            // THE ANCHORING CONSTRAINT, enforced at load. A step with no exits
+            // renders as an instruction, and an instruction is what a small
+            // model cannot walk away from (arena/LADDER.md r28). Three is the
+            // ceiling because a fork with six branches is a menu again.
+            if step.exits.is_empty() {
+                p.push(format!(
+                    "playbooks.ron: {where_} has no exits — every step must render as a \
+                     FORK, never an instruction, so it needs 1-3 authored alternatives \
+                     beside its own action"
+                ));
+            }
+            if step.exits.len() > 3 {
+                p.push(format!(
+                    "playbooks.ron: {where_} offers {} exits; 3 is the ceiling, because a \
+                     fork a commander has to read twice is the open-ended question this \
+                     whole file exists to close",
+                    step.exits.len()
+                ));
+            }
+            // A `why` is the step's reason, and a reason is the thing that
+            // survives contact with a model good enough to disagree. The length
+            // floor is crude on purpose: it catches "economy" and "push now",
+            // which are labels wearing a reason's clothes.
+            if step.why.trim().len() < 30 {
+                p.push(format!(
+                    "playbooks.ron: {where_}'s `why` is {} characters — it has to carry the \
+                     REASON, in a sentence, the way a refusal message does",
+                    step.why.trim().len()
+                ));
+            }
+
+            for (field, when) in [
+                ("entry", &step.entry),
+                ("gate", &step.gate),
+                ("fail_when", &step.fail_when),
+            ] {
+                check_playbook_predicate(&where_, field, when, &places, &mut p);
+            }
+            check_playbook_template(&where_, "action", &step.action, &mut p);
+
+            for (j, exit) in step.exits.iter().enumerate() {
+                let ewhere = format!("{where_} exit {}", j + 1);
+                if exit.title.trim().is_empty() {
+                    p.push(format!("playbooks.ron: {ewhere} has no title"));
+                }
+                if exit.why.trim().len() < 20 {
+                    p.push(format!(
+                        "playbooks.ron: {ewhere}'s `why` is {} characters — an exit nobody \
+                         is given a reason to take is an exit nobody takes",
+                        exit.why.trim().len()
+                    ));
+                }
+                check_playbook_template(&ewhere, "command", &exit.command, &mut p);
+            }
+        }
+    }
+    p
+}
+
+/// One predicate field of one step: in the playbook vocabulary, and naming
+/// ground every map has.
+fn check_playbook_predicate(
+    where_: &str,
+    field: &str,
+    when: &TriggerWhen,
+    places: &[String],
+    p: &mut Vec<String>,
+) {
+    let id = predicate_id(when);
+    if !PLAYBOOK_PREDICATES.contains(&id) {
+        p.push(format!(
+            "playbooks.ron: {where_}'s `{field}` is `{id}`, which the document cannot \
+             answer from a seat's own snapshot — a playbook may use: {}",
+            PLAYBOOK_PREDICATES.join(", ")
+        ));
+    }
+    if let TriggerWhen::EnemyIn { region, .. } = when {
+        if !places.iter().any(|x| x == region) {
+            p.push(format!(
+                "playbooks.ron: {where_}'s `{field}` watches {region:?}, which is not ground \
+                 every map has — a shipped playbook may name: {}",
+                places.join(", ")
+            ));
+        }
+    }
+}
+
+/// One command template: written in selectors and place names, never in bodies.
+///
+/// The rule this enforces is the one that made late-bound selectors a hard
+/// dependency of the whole affordance layer: a playbook is authored once and
+/// read at t=600, so an entity id in it is a corpse with a schedule. Two checks,
+/// because ids arrive two ways — as a key that can only hold one, and as a
+/// number too large to be anything else.
+fn check_playbook_template(
+    where_: &str,
+    field: &str,
+    template: &CommandTemplate,
+    p: &mut Vec<String>,
+) {
+    fn walk(where_: &str, field: &str, path: &str, v: &serde_json::Value, p: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    let here = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    if ID_ONLY_KEYS.contains(&k.as_str()) {
+                        p.push(format!(
+                            "playbooks.ron: {where_}'s `{field}` names bodies at `{here}` — a \
+                             playbook is read hundreds of seconds after it was written, so it \
+                             speaks in `select` phrases (`my hero`, `all army`, `idle Barracks`) \
+                             and never in ids"
+                        ));
+                    }
+                    walk(where_, field, &here, child, p);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    walk(where_, field, &format!("{path}[{i}]"), child, p);
+                }
+            }
+            serde_json::Value::Number(n) => {
+                // Entity ids in this engine are Bevy entity bits, comfortably
+                // past four billion. Nothing a command legitimately carries —
+                // a squad number, a radius, a cooldown, a coordinate — is
+                // anywhere near four thousand, which is the same floor
+                // tools/test_affordances.py's id sweep uses.
+                if n.as_f64().is_some_and(|x| x > 4096.0) {
+                    p.push(format!(
+                        "playbooks.ron: {where_}'s `{field}` carries {n} at `{path}`, which is \
+                         the size of an entity id — say it with a selector or a place name"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    match &template.0 {
+        serde_json::Value::Object(map) => {
+            if !map.contains_key("type") {
+                p.push(format!(
+                    "playbooks.ron: {where_}'s `{field}` has no \"type\" — every command on \
+                     this wire names its verb first"
+                ));
+            }
+        }
+        other => p.push(format!(
+            "playbooks.ron: {where_}'s `{field}` is {other}, not a command object"
+        )),
+    }
+    walk(where_, field, "", &template.0, p);
+}
+
+/// The declarative game-plans, in file order. Empty is legal — a build that
+/// ships no playbooks publishes no `playbooks` key and every reader degrades.
+pub fn playbooks() -> &'static [CatalogPlaybook] {
+    &tables().playbooks
+}
 
 /// Every value check the tables have to pass. Pure over already-slotted
 /// tables so the tests can prove it bites by handing it a deliberately broken
@@ -2294,6 +2608,243 @@ mod tests {
                 |kind| format!("{kind:?}"),
                 &mut Vec::new(),
             ),
+            playbooks: parse::<Vec<CatalogPlaybook>>("playbooks.ron", PLAYBOOKS_RON),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Playbooks
+    //
+    // The loader is the only engine code behind this feature, so these tests
+    // are the whole of its correctness: the shipped library is clean, and each
+    // refusal that keeps it clean actually bites.
+    // -----------------------------------------------------------------------
+
+    fn shipped_books() -> Vec<CatalogPlaybook> {
+        parse::<Vec<CatalogPlaybook>>("playbooks.ron", PLAYBOOKS_RON)
+    }
+
+    fn one_book() -> CatalogPlaybook {
+        shipped_books().into_iter().next().expect("a shipped playbook")
+    }
+
+    fn template(json: &str) -> CommandTemplate {
+        CommandTemplate(serde_json::from_str(json).expect("valid json"))
+    }
+
+    #[test]
+    fn the_shipped_playbooks_load_and_pass_their_own_validator() {
+        let books = shipped_books();
+        assert!(!books.is_empty(), "playbooks.ron parsed to nothing");
+        let problems = check_playbooks(&books);
+        assert!(problems.is_empty(), "{}", report(&problems));
+        // The library the document advertises is the library the file holds.
+        assert_eq!(playbooks().len(), books.len());
+    }
+
+    /// **The anchoring constraint, as a property of the shipped content.**
+    /// docs/AFFORDANCES.md § Playbooks: a step with no exits renders as an
+    /// instruction, and an instruction is the thing arena/LADDER.md's r28 Haiku
+    /// could not walk away from. Asserted here rather than only in the
+    /// validator so that deleting the validator does not silently make it true.
+    #[test]
+    fn every_shipped_step_is_a_fork_with_a_reason_on_every_branch() {
+        for book in shipped_books() {
+            assert!(!book.steps.is_empty(), "{} has no steps", book.id);
+            for step in &book.steps {
+                let where_ = format!("{}/{}", book.id, step.id);
+                assert!(
+                    (1..=3).contains(&step.exits.len()),
+                    "{where_} offers {} exits",
+                    step.exits.len()
+                );
+                assert!(step.why.trim().len() >= 30, "{where_} has no reason");
+                for exit in &step.exits {
+                    assert!(!exit.title.trim().is_empty(), "{where_} exit has no title");
+                    assert!(exit.why.trim().len() >= 20, "{where_} exit has no reason");
+                }
+            }
+        }
+    }
+
+    /// Every predicate a shipped step uses is one the document can answer from
+    /// a seat's own snapshot. The python half of this pair is
+    /// `tools/test_affordances.py`'s
+    /// `test_the_shipped_playbook_only_uses_predicates_this_view_can_answer`;
+    /// between them the two vocabularies cannot drift without one failing.
+    #[test]
+    fn every_shipped_predicate_is_in_the_playbook_vocabulary() {
+        for book in shipped_books() {
+            for step in &book.steps {
+                for when in [&step.entry, &step.gate, &step.fail_when] {
+                    assert!(
+                        PLAYBOOK_PREDICATES.contains(&predicate_id(when)),
+                        "{}/{} uses {}",
+                        book.id,
+                        step.id,
+                        predicate_id(when)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_step_with_no_exits_is_refused_and_the_refusal_says_why() {
+        let mut book = one_book();
+        book.steps[0].exits.clear();
+        let problems = check_playbooks(&[book]);
+        assert!(
+            problems.iter().any(|m| m.contains("no exits")
+                && m.contains("FORK, never an instruction")),
+            "an exitless step must be refused in words: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_predicate_the_document_cannot_answer_is_refused_by_name() {
+        let mut book = one_book();
+        book.steps[0].fail_when = TriggerWhen::BaseUnderAttack;
+        let problems = check_playbooks(&[book]);
+        assert!(
+            problems
+                .iter()
+                .any(|m| m.contains("base_under_attack") && m.contains("a playbook may use")),
+            "an unanswerable predicate must be refused, naming the ones that work: \
+             {problems:?}"
+        );
+    }
+
+    /// Ground the playbook may not name, and the two ways to get it wrong: a
+    /// place no map has, and a place only ONE map has. The second is the
+    /// dangerous one — a step watching `center ford` works perfectly on
+    /// `crossings` and goes silently quiet on `open`.
+    #[test]
+    fn a_region_that_is_not_on_every_map_is_refused() {
+        for name in ["center ford", "the-perimiter"] {
+            let mut book = one_book();
+            book.steps[0].entry = TriggerWhen::EnemyIn {
+                region: name.to_string(),
+                class: None,
+                count: 2,
+            };
+            let problems = check_playbooks(&[book]);
+            assert!(
+                problems
+                    .iter()
+                    .any(|m| m.contains(name) && m.contains("not ground every map has")),
+                "{name} must be refused: {problems:?}"
+            );
+        }
+        // ...and every place that IS universal passes, including the four mine
+        // names, which are derived rather than typed.
+        for name in universal_places() {
+            let mut book = one_book();
+            book.steps[0].entry = TriggerWhen::EnemyIn {
+                region: name.clone(),
+                class: None,
+                count: 2,
+            };
+            assert!(
+                !check_playbooks(&[book]).iter().any(|m| m.contains("every map has")),
+                "{name} is a built-in place and must be accepted"
+            );
+        }
+    }
+
+    /// An entity id in a template is the r21/r23 staleness failure class,
+    /// automated one level further out: a playbook is authored once and read
+    /// hundreds of seconds later. Two ways in, both closed.
+    #[test]
+    fn an_entity_id_in_a_template_is_refused_however_it_arrives() {
+        let mut book = one_book();
+        book.steps[0].action = template(r#"{"type":"move","units":[41,42],"region":"mid"}"#);
+        let problems = check_playbooks(&[book]);
+        assert!(
+            problems.iter().any(|m| m.contains("names bodies at `units`")
+                && m.contains("`select` phrases")),
+            "an id-only key must be refused, naming the channel that works: {problems:?}"
+        );
+
+        let mut book = one_book();
+        book.steps[0].exits[0].command =
+            template(r#"{"type":"attack","select":"all army","target":4294968174}"#);
+        let problems = check_playbooks(&[book]);
+        assert!(
+            problems
+                .iter()
+                .any(|m| m.contains("4294968174") && m.contains("size of an entity id")),
+            "a bare id must be refused wherever it sits: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_template_that_is_not_a_command_is_refused() {
+        let mut book = one_book();
+        book.steps[0].action = template(r#"{"select":"workers","kind":"Farm"}"#);
+        assert!(
+            check_playbooks(&[book])
+                .iter()
+                .any(|m| m.contains("has no \"type\"")),
+            "a verb-less template is not a command"
+        );
+        let mut book = one_book();
+        book.steps[0].exits[0].command = template("\"stance turtle\"");
+        assert!(
+            check_playbooks(&[book])
+                .iter()
+                .any(|m| m.contains("not a command object")),
+            "a string is not a command"
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_and_a_missing_reason_are_both_refused() {
+        let mut book = one_book();
+        let first = book.steps[0].clone();
+        book.steps.push(first);
+        book.steps[1].why = "economy".to_string();
+        let problems = check_playbooks(&[book.clone(), book]);
+        assert!(
+            problems.iter().any(|m| m.contains("two steps called")),
+            "a duplicate step id must be refused: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|m| m.contains("two playbooks are called")),
+            "a duplicate playbook id must be refused: {problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|m| m.contains("`why`") && m.contains("carry the REASON")),
+            "a label wearing a reason's clothes must be refused: {problems:?}"
+        );
+    }
+
+    /// The catalog half: additive, `type`-first, and absent entirely when there
+    /// is nothing to publish. `skip_serializing_if` is what keeps a build with
+    /// no playbooks writing byte-identically to the pre-playbook one.
+    #[test]
+    fn the_catalog_publishes_the_library_verb_first_and_skips_an_empty_one() {
+        let catalog = crate::shared::game_catalog();
+        assert_eq!(catalog.playbooks.len(), shipped_books().len());
+        let json = serde_json::to_string(&catalog.playbooks[0]).expect("serializes");
+        assert!(
+            json.contains("{\"type\":\""),
+            "every command must lead with its verb: {}",
+            &json[..200.min(json.len())]
+        );
+        assert!(!json.contains("4294967"), "no entity ids reach the wire");
+
+        // An empty library writes no key at all.
+        let bare = crate::shared::Catalog {
+            playbooks: Vec::new(),
+            ..catalog
+        };
+        let json = serde_json::to_string(&bare).expect("serializes");
+        assert!(
+            !json.contains("\"playbooks\""),
+            "an empty library must be absent, not an empty array"
+        );
     }
 }

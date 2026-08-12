@@ -2010,6 +2010,162 @@ pub struct CatalogPredicate {
     pub fields: Vec<CatalogPredicateField>,
 }
 
+// ---------------------------------------------------------------------------
+// Playbooks — strategy as catalog content
+//
+// A playbook is a declarative game-plan: an ordered list of steps, each one a
+// fact-shaped place to be, a command to send from there, a fact that says you
+// may move on, and — the part that makes it safe — a fact that says the step is
+// DEAD plus two or three authored ways out of it.
+//
+// THREE PROPERTIES, and each one is a refusal the design makes on purpose:
+//
+//   * **The engine does not execute a playbook.** There is no playbook system,
+//     no playbook component and no playbook `Intent`. A commander enacts a step
+//     by sending the step's own command, through `apply_intents`, like any other
+//     intent. That is why `assets/data/playbooks.ron` can carry strategy without
+//     the engine acquiring an opinion: the engine only *publishes* it.
+//   * **It ships through the catalog**, so both seats discover it identically —
+//     the bridge seat reads `catalog.json` and the human seat's HUD reads the
+//     same rows. Strategy as content, symmetric, the way the wiki build order is
+//     symmetric.
+//   * **Every step is a FORK, never an instruction.** `exits` and `fail_when`
+//     are first-class fields and the loader refuses a step without them. The
+//     reason is arena/LADDER.md's r28: told to trust the document, a small model
+//     did exactly and only what the document said. A plan a model cannot abandon
+//     is r21's one-long-wrong-continue rebuilt one level up, so the document
+//     never serves "do this" — it serves "here are your three live options and
+//     the numbers under each", and *choose* is a thing a weak model can do.
+// ---------------------------------------------------------------------------
+
+/// A JSON command template, as a playbook authors it.
+///
+/// A newtype over `serde_json::Value` for exactly one reason: **the verb
+/// leads.** serde_json without `preserve_order` keeps an object in a `BTreeMap`,
+/// so a template authored `{"type":"train", …}` would be served with `type`
+/// sorted into the middle of its own arguments — and the first key is how a
+/// commander scanning a folded line finds out what the command *is*. So `type`
+/// is written first and everything after it in map order, which is
+/// deterministic and therefore renders the same page from the same file every
+/// time.
+///
+/// `#[serde(transparent)]` on the read side so a step's `action` is written as a
+/// plain RON map (`{"type": "train", …}`) rather than as a newtype wrapper. One
+/// representation: what a playbook writes is what a commander sends.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(transparent)]
+pub struct CommandTemplate(pub serde_json::Value);
+
+impl Serialize for CommandTemplate {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        VerbFirst(&self.0).serialize(s)
+    }
+}
+
+/// One JSON value, written with any `type` key first, recursively.
+struct VerbFirst<'a>(&'a serde_json::Value);
+
+impl Serialize for VerbFirst<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            serde_json::Value::Object(map) => {
+                let mut m = s.serialize_map(Some(map.len()))?;
+                if let Some(v) = map.get("type") {
+                    m.serialize_entry("type", &VerbFirst(v))?;
+                }
+                for (k, v) in map {
+                    if k != "type" {
+                        m.serialize_entry(k, &VerbFirst(v))?;
+                    }
+                }
+                m.end()
+            }
+            serde_json::Value::Array(items) => {
+                let mut a = s.serialize_seq(Some(items.len()))?;
+                for v in items {
+                    a.serialize_element(&VerbFirst(v))?;
+                }
+                a.end()
+            }
+            other => other.serialize(s),
+        }
+    }
+}
+
+/// One authored way out of a step — the counter-punch move, generalized.
+///
+/// Written at leisure, before the anchoring exists. A deviation a commander has
+/// to invent under time pressure is a deviation a small model does not make;
+/// one printed beside the step, with its own reason, is a choice.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlaybookExit {
+    /// What this alternative IS, in a handful of words. Rendered as the option's
+    /// title on its one line.
+    pub title: String,
+    /// The complete command. Same rules as a step's `action`: selectors and
+    /// place names, never an entity id.
+    pub command: CommandTemplate,
+    /// One sentence carrying the reason, written like a refusal message — a rule
+    /// with a reason survives contact and a bare rule does not.
+    pub why: String,
+}
+
+/// One step of a playbook.
+///
+/// Read the four predicates as four different questions, because the view asks
+/// them separately:
+///
+///   * `entry` — is this step OPEN? A step whose entry is false is one you have
+///     arrived at early; the fork says so and the exits are how you spend the
+///     wait.
+///   * `gate` — may you move ON? The view's "you are here" pointer is the first
+///     step in the list whose gate does not hold, which makes the pointer a fact
+///     about the snapshot rather than a bookmark: lose the army and the pointer
+///     walks back to the step that builds one.
+///   * `fail_when` — is this step DEAD? When it holds, the step re-renders
+///     INVALIDATED with the broken assumption named and the exits on top.
+///     Anchoring is broken by interrupts, never by disclaimers.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlaybookStep {
+    /// Stable within its playbook; how a report names a step.
+    pub id: String,
+    /// The step in a handful of words, for the section heading.
+    pub title: String,
+    /// "You are here" — a fog-legal predicate saying the step is open.
+    pub entry: TriggerWhen,
+    /// The command that ENACTS the step. Sent by the commander, through the one
+    /// compiler; the engine never sends it.
+    pub action: CommandTemplate,
+    /// The fact that says this step is done and the next one is live.
+    pub gate: TriggerWhen,
+    /// ONE authored sentence carrying the step's reason.
+    pub why: String,
+    /// The fog-legal predicate that says the step's own assumption has broken.
+    pub fail_when: TriggerWhen,
+    /// Two or three authored alternatives. The loader refuses an empty list:
+    /// a step with no exits is an instruction, and this file does not serve
+    /// instructions.
+    pub exits: Vec<PlaybookExit>,
+}
+
+/// One declarative game-plan, as `assets/data/playbooks.ron` writes it and the
+/// catalog publishes it — the same type, because nothing about a playbook is
+/// derived. It is content end to end.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CatalogPlaybook {
+    /// What a commander declares in its prefs file to follow this plan.
+    pub id: String,
+    pub label: String,
+    /// One line: what this plan is trying to do, and to whom.
+    pub pitch: String,
+    /// `"kingdom"` or `"horde"` — which roster the steps are written for. The
+    /// catalog is one document for both races and a commander matches against
+    /// its own `my_race`, exactly as it does for `units[].race`.
+    pub race: String,
+    pub steps: Vec<PlaybookStep>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct Catalog {
     pub units: Vec<CatalogUnit>,
@@ -2031,6 +2187,16 @@ pub struct Catalog {
     /// [`TriggerWhen`] declares them, which is the order
     /// tools/COMMANDER_BRIEF.md's table lists them in.
     pub predicates: Vec<CatalogPredicate>,
+    /// The declarative game-plans, from `assets/data/playbooks.ron`.
+    ///
+    /// Additive and `skip_serializing_if` empty, like every wire key before it:
+    /// a build with no playbook file writes the catalog it always wrote, and a
+    /// document rendered beside an older `catalog.json` simply has no library to
+    /// advertise. The engine never reads these back — they are content it
+    /// publishes and a commander enacts one step at a time through the ordinary
+    /// intent path.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub playbooks: Vec<CatalogPlaybook>,
 }
 
 /// The `when` schema, as one table.
@@ -2309,6 +2475,10 @@ pub fn game_catalog() -> Catalog {
             buildings: SELECTOR_BUILDING_NAMES.split(", ").collect(),
         },
         predicates: catalog_predicates(),
+        // Straight out of the data file, validated at load. Cloned rather than
+        // borrowed because `Catalog` is an owned wire value that outlives the
+        // call — the same shape every other table here takes.
+        playbooks: crate::data::playbooks().to_vec(),
     }
 }
 
