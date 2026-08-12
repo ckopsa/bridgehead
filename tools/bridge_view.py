@@ -204,33 +204,50 @@ def _squad_props(sid, sq, members, smap):
 def _alarm_props(raw):
     """Normalize one alarm.
 
-    `alarms[]` is being added by a parallel bead (AFFORDANCES.md item 4) and
-    this renderer predates its exact shape on purpose: a string, or a dict
-    under any of the obvious spellings, all render. An alarm names its running
-    default (AFFORDANCES.md: "every alarm names its running default"), so that
-    field is pulled out where it exists and the DEFAULT line defers to it.
+    The shipped shape (src/bridge.rs `AlarmOut`) is
+    `{id, fact, running_default, since_t, severity, eta_s?}`, and `fact` /
+    `running_default` are the two fields the design makes mandatory: what
+    happened, and what is already being done about it. This renderer was
+    written before that bead landed and stays tolerant of the other obvious
+    spellings — a string, or a dict under any of them, all render — because a
+    digest that goes blank on an unfamiliar key is worse than one that prints
+    the wrong noun.
+
+    `eta_s` rides along where it exists: the recall ETA is the whole reason
+    "multiple places under attack" is answerable at LLM latency at all.
     """
     if isinstance(raw, str):
         return {"text": raw, "default": None}
     if not isinstance(raw, dict):
         return {"text": str(raw), "default": None}
     text = (
-        raw.get("text")
+        raw.get("fact")
+        or raw.get("text")
         or raw.get("message")
         or raw.get("title")
         or raw.get("why")
         or raw.get("reason")
         or raw.get("kind")
         or raw.get("name")
+        or raw.get("id")
         or "alarm"
     )
-    kind = raw.get("kind") or raw.get("name")
-    if kind and kind != text:
-        text = "{}: {}".format(kind, text)
+    # The kind is a prefix, not a replacement — except when it IS the whole
+    # text, which is what an alarm carrying nothing but an id comes down to.
+    # The ETA rides in the prefix rather than the tail on purpose: this line
+    # is truncated to the digest's width, and "when does the recall land" is
+    # the half of a two-front alarm a commander cannot reconstruct.
+    kind = raw.get("kind") or raw.get("name") or raw.get("id")
+    eta = raw.get("eta_s")
+    head = kind if kind and kind != text else None
+    if eta is not None:
+        head = "{} [ETA {:.0f}s]".format(head, eta) if head else "[ETA {:.0f}s]".format(eta)
+    if head:
+        text = "{}: {}".format(head, text)
     return {
         "text": text,
         "default": raw.get("default") or raw.get("running_default") or raw.get("doing"),
-        "since": raw.get("since", raw.get("t")),
+        "since": raw.get("since", raw.get("since_t", raw.get("t"))),
     }
 
 
