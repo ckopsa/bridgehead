@@ -1000,6 +1000,11 @@ fn intent_pos(resolved: &Intent) -> Option<Vec3> {
 /// property (`overrides your move on 4 unit(s), 6s ago` was already a
 /// measurement); selectors just make it visible, because a phrase can change
 /// what it means while a list of ids cannot.
+///
+/// **And one level down**, through [`preview_deferred`]: a proposed `plan_set`
+/// or `trigger_set` carries intents of its own, which the resolver deliberately
+/// does not descend into, so a five-step opening used to preview as scoping
+/// nothing at all.
 fn conflict_tags(
     me: Team,
     intents: &[Intent],
@@ -1055,6 +1060,10 @@ fn conflict_tags(
         if pos.is_none() {
             pos = intent_pos(intent);
         }
+        // One level down. `resolve_places` stops at the top-level intent, so a
+        // proposed plan or trigger scopes to nothing above and the human is
+        // told a five-step opening reaches nobody.
+        preview_deferred(intent, bind, &mut tags);
         match scope {
             Scope::Squad(id) => {
                 if let Some(old) = squad_orders.0.get(&(me, id)) {
@@ -1148,6 +1157,86 @@ fn conflict_tags(
         );
     }
     Preview { tags, pos }
+}
+
+/// **The preview, one level down.** What a proposed `plan_set` or `trigger_set`
+/// would scope to, step by step.
+///
+/// `resolve_places` deliberately does not recurse into a plan's steps or a
+/// trigger's `then`, and that rule is right for the *compiler*: the action is
+/// validated when it runs, against the world that runs it, which is what lets an
+/// armed rule keep naming *my hero* and *the perimeter* instead of freezing an
+/// id and a coordinate. But it does not transfer to the **preview**, where the
+/// question is not "what should this mean later" but "what am I agreeing to".
+/// A human handed
+///
+/// ```text
+/// copilot proposes #3: the standard boomer opening
+///   plan opening (5 steps): worker 'workers' builds Farm at … ; …
+/// ```
+///
+/// with no tags at all reads a batch that overrides nothing and re-tasks nobody,
+/// while step 3 is about to take the whole army. That is exactly the misreading
+/// the top-level recursion was written to fix, one rung further in.
+///
+/// **Preview only, and through the same one resolver.** Nothing is written back,
+/// nothing is cached, and the plan the compiler eventually stores is the plan
+/// that was proposed — phrases and all. What comes out is dated `as of now` for
+/// the same reason every other tag here is: a step resolves again when its turn
+/// comes, which may be minutes later, and saying otherwise would promise
+/// something the engine never made.
+///
+/// Two rungs, which is the whole graph: a plan step may arm a trigger, and a
+/// trigger's `then` may not defer anything further (docs/INTENT.md § "The
+/// deferral graph is two rungs deep").
+fn preview_deferred(intent: &Intent, bind: &LateBind, tags: &mut Vec<String>) {
+    match intent {
+        Intent::PlanSet { steps, .. } => {
+            // Only the steps that could ever run. A longer sequence is refused
+            // outright by the compiler, and previewing step 12 of a plan that
+            // will never have one would describe a world nobody is agreeing to.
+            for (i, step) in steps.iter().take(MAX_PLAN_STEPS).enumerate() {
+                let k = i + 1;
+                preview_one(&step.intent, bind, tags, &format!("step {k}"));
+                if let Intent::TriggerSet { then, .. } = &step.intent {
+                    preview_one(then, bind, tags, &format!("step {k}'s trigger"));
+                }
+            }
+        }
+        Intent::TriggerSet { then, .. } => preview_one(then, bind, tags, "its action"),
+        _ => {}
+    }
+}
+
+/// One deferred intent, asked the same question the batch above it was asked.
+///
+/// Says something only when there is something to say: a step that names ids
+/// rather than roles is already as legible as its sentence, and a tag repeating
+/// the count would be noise on a panel a human is reading in order to press one
+/// key.
+fn preview_one(sub: &Intent, bind: &LateBind, tags: &mut Vec<String>, label: &str) {
+    match crate::intent::resolve_places(sub.clone(), bind) {
+        Ok(resolved) => {
+            if let (Scope::Units(before), Scope::Units(after)) =
+                (scope_of(sub), scope_of(&resolved))
+            {
+                if before != after {
+                    push_unique(
+                        tags,
+                        format!("{label} would reach {} unit(s) as of now", after.len()),
+                    );
+                }
+            }
+        }
+        // NOT phrased as "this would refuse", the way a top-level command's
+        // failure is. A deferred step that cannot resolve yet is the normal,
+        // intended case — a chain is written before the ground it names is
+        // scouted — and the compiler arms it with a `chain holds at step k`
+        // notice rather than a refusal. The tag says the same thing the setter
+        // will be told, so the reviewer is not warned about something that is
+        // going to be fine.
+        Err(why) => push_unique(tags, format!("{label} does not resolve yet: {why}")),
+    }
 }
 
 fn push_unique(tags: &mut Vec<String>, tag: String) {
@@ -1912,6 +2001,106 @@ mod tests {
                 "as of now this would refuse: move: 'all army' matches none of \
                  your units right now — nothing was ordered"
             ]
+        );
+    }
+
+    /// **The same misreading, one level down.** A proposed plan carries intents
+    /// the resolver does not descend into, so a five-step opening previewed as
+    /// scoping nothing at all — the reviewer was shown an empty conflict list
+    /// for a sequence whose step 2 takes the entire army.
+    #[test]
+    fn a_proposed_plans_steps_preview_what_each_one_would_reach() {
+        let mut app = co_app();
+        for _ in 0..3 {
+            footman(&mut app, Vec3::ZERO);
+        }
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"the opening","commands":[
+                 {"type":"plan_set","name":"opening","steps":[
+                   {"intent":{"type":"squad","select":"all army","id":1}},
+                   {"intent":{"type":"stop","units":[41,42]}},
+                   {"intent":{"type":"move","select":"all army","x":-70.0,"z":-70.0}}]}]}"#,
+        );
+        let conflicts = &pending(&app)[0].conflicts;
+        assert!(
+            conflicts.contains(&"step 1 would reach 3 unit(s) as of now".to_string()),
+            "got {conflicts:?}"
+        );
+        assert!(
+            conflicts.contains(&"step 3 would reach 3 unit(s) as of now".to_string()),
+            "got {conflicts:?}"
+        );
+        assert!(
+            !conflicts.iter().any(|c| c.starts_with("step 2")),
+            "a step that names ids is already as legible as its sentence: {conflicts:?}"
+        );
+    }
+
+    /// A step that cannot resolve YET is the normal case for a chain, not a
+    /// warning — the compiler arms it with `chain holds at step k` rather than
+    /// refusing it — so the tag says so in those terms and does not tell the
+    /// reviewer the batch would be refused.
+    #[test]
+    fn a_step_that_cannot_resolve_yet_previews_as_pending_not_as_refused() {
+        let mut app = co_app();
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"secure it when we find it","commands":[
+                 {"type":"plan_set","name":"later","steps":[
+                   {"intent":{"type":"stance","squad":1,"stance":"secure",
+                              "target":"their-expansion"}}]}]}"#,
+        );
+        let conflicts = &pending(&app)[0].conflicts;
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.starts_with("step 1 does not resolve yet:")
+                    && c.contains("no region named 'their-expansion'")),
+            "got {conflicts:?}"
+        );
+        assert!(
+            !conflicts.iter().any(|c| c.contains("would refuse")),
+            "a chain step is not a refusal: {conflicts:?}"
+        );
+    }
+
+    /// A trigger's `then` gets the same look, and so does a trigger armed by a
+    /// plan step — the two rungs the deferral graph actually has.
+    #[test]
+    fn a_proposed_triggers_action_previews_too_at_both_rungs() {
+        let mut app = co_app();
+        for _ in 0..2 {
+            footman(&mut app, Vec3::ZERO);
+        }
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"home guard","commands":[
+                 {"type":"trigger_set","name":"guard",
+                  "when":{"type":"base_under_attack"},
+                  "then":{"type":"move","select":"all army","x":0.0,"z":0.0}}]}"#,
+        );
+        assert!(
+            pending(&app)[0]
+                .conflicts
+                .contains(&"its action would reach 2 unit(s) as of now".to_string()),
+            "got {:?}",
+            pending(&app)[0].conflicts
+        );
+
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"open then guard","commands":[
+                 {"type":"plan_set","name":"opening","steps":[
+                   {"intent":{"type":"trigger_set","name":"guard",
+                              "when":{"type":"base_under_attack"},
+                              "then":{"type":"move","select":"all army",
+                                      "x":0.0,"z":0.0}}}]}]}"#,
+        );
+        let conflicts = &pending(&app)[1].conflicts;
+        assert!(
+            conflicts.contains(&"step 1's trigger would reach 2 unit(s) as of now".to_string()),
+            "got {conflicts:?}"
         );
     }
 

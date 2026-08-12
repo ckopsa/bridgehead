@@ -1371,6 +1371,29 @@ never gave — `move all army to north-pass` reads identically at two units and
 at twenty. The second is the empty case, which must be said out loud for the
 same reason the compiler refuses it out loud rather than moving nobody.
 
+**And one level down** (`wc3clone-e2i`). `resolve_places` deliberately stops at
+the top-level intent — a plan's steps and a trigger's `then` are validated when
+they *run*, which is what lets an armed rule keep naming *my hero* instead of
+freezing an id. That rule is right for the compiler and does not transfer to the
+preview, where the question is not "what should this mean later" but "what am I
+agreeing to". A proposed five-step opening previewed as scoping **nothing at
+all**, while step 3 was about to take the whole army — the same misreading the
+paragraph above fixed for direct orders, one rung in. So each step, and each
+trigger a step arms, is run through the same resolver and reported beside the
+rest:
+
+```
+ ! step 1 would reach 5 unit(s) as of now
+ ! step 3 does not resolve yet: no region named 'their-expansion' - known places: …
+```
+
+A step that names ids says nothing — its sentence is already the whole story.
+A step that cannot resolve *yet* is phrased as pending rather than as a refusal,
+because that is what it is: the compiler arms such a plan with `chain holds at
+step k` (§ *Arm time and late binding*), and warning a reviewer about something
+that is going to be fine is how a channel gets ignored. Nothing is written back,
+so apply-time behaviour is byte-for-byte what it was.
+
 Both are dated, and so is the whole list by implication. **The preview resolves
 at arrival; approval resolves again, up to 20 seconds later, and what lands is
 the second answer.** A list of ids cannot change meaning in that window; a
