@@ -49,11 +49,21 @@ BASES = {"Claude": (70.0, 70.0), "Human": (-70.0, -70.0)}
 # is the hard ceiling that keeps a fifteen-squad late game from quietly turning
 # the digest back into the thing it replaced. Sections trim themselves against
 # it in `render_digest`, cheapest information first.
-MAX_LINES = 18
+#
+# 18 → 19 with the acceptance notes (wc3clone-b9m). One line, and only in the
+# state where the engine has an advisory about a command this seat actually
+# sent — which is exactly the state in which a commander should be reading one
+# more line. The notes section collapses to a single summary before the ceiling
+# is reached, so the nineteenth line is the most it can ever cost.
+MAX_LINES = 19
 #: Events shown, newest last. Five is AFFORDANCES.md's number.
 EVENT_LINES = 5
 #: Squad lines before the rest collapse into a "+N more" tail.
 SQUAD_LINES = 4
+#: Acceptance notes shown before the rest collapse into a count. Three, because
+#: a note exists only for a command that contradicted something and a batch with
+#: four of those has a bigger problem than the fourth line.
+NOTE_LINES = 3
 
 # A building is PRODUCTION — the thing the win condition counts — when it
 # trains something (`shared::check_game_over` asks `!trainable(kind).is_empty()`).
@@ -451,6 +461,12 @@ def digest(state, catalog=None):
             "game_over_reason": state.get("game_over_reason"),
             "waiting_for": state.get("waiting_for"),
             "errors": list(state.get("errors") or []),
+            # The advisory half of the acknowledgement — what the engine
+            # ACCEPTED and then noticed about (wc3clone-b9m). Absent from any
+            # snapshot in which nobody over-committed, so `or []` is the whole
+            # compatibility story, exactly as with every other optional key
+            # this digest reads.
+            "notes": list(state.get("notes") or []),
         },
     }
     props["default"] = running_default(props)
@@ -552,6 +568,37 @@ def render_digest(props):
             " (" + st["game_over_reason"] + ")" if st["game_over_reason"] else ""))
     if st["errors"]:
         head.append(_trunc("ERRORS {}: {}".format(len(st["errors"]), st["errors"][-1])))
+    # Beside the errors, and deliberately NOT among them. A note is the echo of
+    # a command that was ACCEPTED; filing it under ERRORS would teach a
+    # commander that the engine refuses pushes, which is the one thing it must
+    # never be read as. Every note gets its own line rather than only the last:
+    # `errors` prints its tail because a bad batch can produce dozens, but a
+    # note exists only for a command that contradicted something, so the list is
+    # short by construction and each line is about a different command.
+    #
+    # This is the whole point of the feature at the digest level. r25-r29
+    # (arena/LADDER.md, Finding 5) established that every tier reads THIS
+    # fifteen-line page at loop cadence and the 380-line action render once, so
+    # a fact that is not here is a fact that is not read.
+    #
+    # Rendered at DEFAULT's width rather than the digest's, and for DEFAULT's
+    # reason: a clause lost off the end is the fact the line exists to deliver.
+    # The gate clause comes first in the string, so a 110-column truncation
+    # would routinely eat the staleness half — which is the half r26 lost to.
+    #
+    # A section of its own rather than more `head`, because it is the one thing
+    # here that can be COLLAPSED without being lost: see the trim below.
+    notes = st.get("notes") or []
+    note_lines = [_trunc("NOTE {}".format(n), 240) for n in notes[:NOTE_LINES]]
+    if len(notes) > NOTE_LINES:
+        note_lines.append(
+            "NOTE +{} more accepted-with-a-note in state.notes".format(len(notes) - NOTE_LINES)
+        )
+    note_summary = [
+        "NOTE {} accepted command{} contradict a readiness fact — see state.notes".format(
+            len(notes), "" if len(notes) == 1 else "s"
+        )
+    ]
 
     a = props["army"]
     # Most numerous first, and only the head of the list: a composition is read
@@ -651,12 +698,20 @@ def render_digest(props):
     # a clause lost off the end is a squad it did not know was still marching.
     default = [_trunc("DEFAULT if you say nothing: " + props["default"], 240)]
 
-    lines = head + body + alarms + events + default
+    assemble = lambda: head + note_lines + body + alarms + events + default  # noqa: E731
+    lines = assemble()
     # Trim to the ceiling, cheapest information first: events are the only
     # section a commander can recover from the full snapshot at no cost.
     while len(lines) > MAX_LINES and events:
         events.pop(0)
-        lines = head + body + alarms + events + default
+        lines = assemble()
+    # Then the notes, and they COLLAPSE rather than disappear. Every one of them
+    # is verbatim in `state.notes`, so the expensive thing to lose is not the
+    # text but the knowledge that there is any; one line keeps that and costs
+    # three. A note is never trimmed to nothing while one exists.
+    if len(lines) > MAX_LINES and len(note_lines) > 1:
+        note_lines = note_summary
+        lines = assemble()
     return lines
 
 
@@ -770,6 +825,11 @@ def full_view(s, path):
         print(f"GAME OVER: {_game_over_phrase(s['game_over'])}")
     for e in s.get("errors", []):
         print(f"ERR: {e}")
+    # A distinct prefix, immediately under the refusals and never mixed into
+    # them: `NOTE` is what the engine accepted and then remarked on. See
+    # `render_digest` for why the two must not share a channel.
+    for n in s.get("notes", []):
+        print(f"NOTE: {n}")
 
     # --- alarms ---
     # Above everything else in the readout, and printed with its running

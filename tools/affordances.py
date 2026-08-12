@@ -91,7 +91,14 @@ from bridge_view import dist, load_catalog  # noqa: E402
 #: that no longer has to leave the document to find out what an arm takes writes
 #: different commands — so the ledger has to be able to tell the two scaffolds
 #: apart.
-DOC_VERSION = "affordance-doc/1.3"
+#: `1.4` — wc3clone-b9m: the push gates and the staleness threshold now come
+#: from `catalog.gates` instead of from this module's constants, and every
+#: reading of the intel ledger past that threshold carries the engine's verdict
+#: in the engine's own words. The action SET did not change and no template
+#: moved, but the readiness ANNOTATIONS did, and a round played against a
+#: document that names the threshold is not the same round as one played against
+#: a document that only implies it. The ledger has to be able to tell them apart.
+DOC_VERSION = "affordance-doc/1.4"
 
 # ---------------------------------------------------------------------------
 # Engine constants this view mirrors
@@ -129,6 +136,63 @@ PUSH_MIN_UNITS = 6
 #: A hero below this is the most expensive casualty in the game walking into a
 #: fight (COMMANDER_BRIEF, "Hero save").
 PUSH_HERO_FRAC = 0.80
+#: How old this seat's picture of the enemy may be before committing to it is
+#: worth saying out loud, in game-seconds. Half the sighting TTL — past the
+#: horizon the ledger drops the record entirely and the EMPTY reading takes over.
+COMMIT_INTEL_STALE_S = 45.0
+#: The rumour horizon (`shared::SIGHTING_TTL_S`), stated so the empty-ledger
+#: sentence can name the window it is empty over.
+SIGHTING_TTL_S = 90.0
+
+
+def gates(catalog):
+    """`(min_units, hero_frac, stale_s, ttl_s)` — the four thresholds, from the
+    engine if it published them.
+
+    Since wc3clone-b9m the engine measures the SAME three numbers when it writes
+    an acceptance note into `state.json`'s `notes` array, so a commander that
+    over-commits is told at the decision moment as well as in this document. Two
+    renderings of one rule that can disagree is the failure docs/FOG.md is
+    written against — nothing errors, the two channels simply say different
+    things about the same squad — so the engine publishes them as
+    `catalog.gates` and this reads them from there.
+
+    The module constants above survive as the fallback for a document rendered
+    beside a `catalog.json` written before that block existed, on exactly the
+    reasoning `STANCE_FALLBACK` gives. They are the same numbers today; the
+    point is that when one of them moves, it moves once.
+    """
+    g = (catalog or {}).get("gates") or {}
+    return (
+        g.get("push_min_units", PUSH_MIN_UNITS),
+        g.get("push_hero_frac", PUSH_HERO_FRAC),
+        g.get("intel_stale_s", COMMIT_INTEL_STALE_S),
+        g.get("sighting_ttl_s", SIGHTING_TTL_S),
+    )
+
+
+def freshest_enemy_age(state):
+    """Game-seconds since this seat last laid eyes on anything of theirs, or
+    `None` if it never has.
+
+    The mirror of `shared::FogGrid::freshest_enemy_age`, read off the same two
+    ledgers the engine reads and computed the same way: the freshest of the unit
+    sightings and the hero beliefs. Both halves are needed and for the same
+    reason — `sightings` is dropped after the TTL, so on its own it can never
+    report an age past ninety, and `heroes` keeps its `t_seen` forever, so it is
+    the half that can say four hundred seconds.
+
+    Fog-legal by construction: `intel` is this seat's own memory and the only
+    place either number comes from.
+    """
+    intel = state.get("intel") or {}
+    ages = [s["age"] for s in (intel.get("sightings") or []) if s.get("age") is not None]
+    ages += [
+        h["age"]
+        for h in (intel.get("heroes") or {}).values()
+        if h.get("age") is not None
+    ]
+    return min(ages) if ages else None
 
 # ---------------------------------------------------------------------------
 # Vocabularies, served from the catalog when there is one
@@ -314,15 +378,18 @@ def squad_headcount(state, sid):
     return record.get("members", 0)
 
 
-def push_gate_facts(state, props, sid):
+def push_gate_facts(state, props, sid, catalog=None):
     """The three push gates, each as a comparison with both numbers on it.
 
     Returns `(ready, reason)`. `reason` is written whether or not the gates
     hold: "precondition truth + reason" is one channel, and a link that only
     explains itself when it is refusing teaches nothing on the cycle you needed
-    it. Read every clause as a fact — the thresholds are this document's
-    (DOC_VERSION), and the commander is free to disagree and send it anyway.
+    it. Read every clause as a fact — the thresholds are the ENGINE's since
+    wc3clone-b9m (`catalog.gates`, see `gates`), the same three it measures an
+    acceptance note against, and the commander is free to disagree and send it
+    anyway.
     """
+    min_units, hero_frac, _, _ = gates(catalog)
     members = squad_members(state, sid)
     if not members and squad_headcount(state, sid):
         # A snapshot old enough to predate `units[].squad` still reports the
@@ -338,10 +405,10 @@ def push_gate_facts(state, props, sid):
     if not members:
         bad.append("squad {} has no members — a stance on an empty squad installs "
                    "doctrine on nobody".format(sid))
-    elif len(members) < PUSH_MIN_UNITS:
-        bad.append("size {}/{}".format(len(members), PUSH_MIN_UNITS))
+    elif len(members) < min_units:
+        bad.append("size {}/{}".format(len(members), min_units))
     else:
-        good.append("size {}/{}".format(len(members), PUSH_MIN_UNITS))
+        good.append("size {}/{}".format(len(members), min_units))
 
     if outside > 0:
         bad.append(
@@ -357,9 +424,9 @@ def push_gate_facts(state, props, sid):
         if frac is None:
             continue
         clause = "{} at {:.0f}%, gate is {:.0f}%".format(
-            h.get("kind", "hero"), 100.0 * frac, 100.0 * PUSH_HERO_FRAC
+            h.get("kind", "hero"), 100.0 * frac, 100.0 * hero_frac
         )
-        (bad if frac < PUSH_HERO_FRAC else good).append(clause)
+        (bad if frac < hero_frac else good).append(clause)
     if not heroes and members:
         good.append("no hero in the squad, so no hero gate")
 
@@ -393,34 +460,52 @@ def stance_facts(state, props, sid):
     return True, "squad {} holds {} units, pooled strength {}".format(sid, len(members), strength)
 
 
-def intel_note(state):
+def intel_note(state, catalog=None):
     """The staleness line — red's loss at t=490, written down.
 
     Reads the `intel` ledger and nothing else, so it can only report what this
     seat watched with its own eyes and has not yet forgotten. An EMPTY ledger
     is the loudest reading of the three and gets the loudest sentence: red read
     current sight as ground truth and walked into seventeen troops.
+
+    Since wc3clone-b9m each reading also carries the ENGINE's staleness verdict
+    when the picture is past `catalog.gates.intel_stale_s` — the identical
+    sentence the acceptance note appends to a commitment sent on that picture.
+    The two channels say it in the same words on purpose: a commander that sees
+    "past the 45s threshold" here and then reads it again in the echo of its own
+    `stance push` is being told one thing twice, not two things once.
     """
     intel = state.get("intel")
     if intel is None:
         return None
+    _, _, stale_s, _ = gates(catalog)
+    age = freshest_enemy_age(state)
+    # One clause, appended to whichever of the three readings applies. The
+    # comparison carries both numbers, like every other readiness fact here.
+    verdict = (
+        "  [{:.0f}s old, past the {:.0f}s threshold the engine notes a commitment "
+        "against]".format(age, stale_s)
+        if age is not None and age > stale_s
+        else ""
+    )
     ttl = intel.get("ttl_s")
     groups = intel.get("groups") or []
     if groups:
         g = max(groups, key=lambda x: x.get("size", 0))
-        return "last seen: {} troops ({}) {}, {:.0f}s ago — not since".format(
+        return "last seen: {} troops ({}) {}, {:.0f}s ago — not since{}".format(
             g.get("size", "?"),
             g.get("composition", "composition unknown"),
             g.get("place", "somewhere"),
             g.get("age", 0.0),
+            verdict,
         )
     sightings = intel.get("sightings") or []
     if sightings:
         freshest = min(s.get("age", 0.0) for s in sightings)
         return (
             "no enemy FORCE in your ledger — {} loose sighting{}, freshest {:.0f}s old. "
-            "A body of troops you have not seen is not a body of troops that is not there".format(
-                len(sightings), "" if len(sightings) == 1 else "s", freshest
+            "A body of troops you have not seen is not a body of troops that is not there{}".format(
+                len(sightings), "" if len(sightings) == 1 else "s", freshest, verdict
             )
         )
     horizon = " (nothing seen in the last {:.0f}s)".format(ttl) if ttl else ""
@@ -529,7 +614,7 @@ def stance_actions(state, props, catalog):
     r21/r23 staleness failure class, automated.
     """
     table = stance_table(catalog)
-    intel = intel_note(state)
+    intel = intel_note(state, catalog)
     out = []
     for sq in state.get("squads") or []:
         sid = sq.get("id")
@@ -567,7 +652,7 @@ def stance_actions(state, props, catalog):
                 )
 
             if word == "push":
-                ready, reason = push_gate_facts(state, props, sid)
+                ready, reason = push_gate_facts(state, props, sid, catalog)
             else:
                 ready, reason = stance_facts(state, props, sid)
 

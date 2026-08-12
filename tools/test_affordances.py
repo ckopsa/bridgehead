@@ -122,10 +122,10 @@ def test_the_document_has_the_five_top_level_sections():
 def test_the_document_carries_its_own_version():
     """AFFORDANCES.md constraint 3: the scaffold's version travels with the
     result, or the ledger cannot tell model from model+scaffold."""
-    # `1.3`: r25's steady-production recipe fix — a served template that never
-    # compiled now does, which changes what a trusting commander arms. The
-    # major half is the document's SHAPE and has not moved.
-    assert affordances.DOC_VERSION == "affordance-doc/1.3"
+    # `1.4`: wc3clone-b9m — the gates come from `catalog.gates` and the intel
+    # readings name the staleness threshold the engine notes a commitment
+    # against. The action set did not move; the readiness annotations did.
+    assert affordances.DOC_VERSION == "affordance-doc/1.4"
     assert doc()["doc_version"] == affordances.DOC_VERSION
     assert run("--doc-version").strip() == affordances.DOC_VERSION
     assert subprocess.run(
@@ -267,6 +267,100 @@ def test_a_snapshot_with_no_ledger_at_all_gets_no_intel_line():
     assert affordances.intel_note(s) is None
     d = affordances.document(s, catalog())
     assert all("intel" not in a for a in d["actions"])
+
+
+# -- one set of numbers, two renderings (wc3clone-b9m) -----------------------
+
+
+def test_the_gates_come_from_the_catalog_when_the_engine_publishes_them():
+    """The engine writes an acceptance note against `catalog.gates`; this
+    document annotates its `push` links against the same block. Two renderings
+    of one rule that can disagree is the failure docs/FOG.md is written
+    against — nothing errors, they just say different things about one squad.
+
+    Both directions are asserted: a published block WINS, and a catalog written
+    before the block existed falls back to the module constants rather than
+    raising, exactly as `STANCE_FALLBACK` does.
+    """
+    cat = catalog()
+    assert "gates" not in cat, "the fixture predates the block — that is the fallback case"
+    assert affordances.gates(cat) == (
+        affordances.PUSH_MIN_UNITS,
+        affordances.PUSH_HERO_FRAC,
+        affordances.COMMIT_INTEL_STALE_S,
+        affordances.SIGHTING_TTL_S,
+    )
+    assert affordances.gates(None) == affordances.gates({})
+
+    # An engine that moved the size gate moves this document with it.
+    cat["gates"] = {
+        "push_min_units": 3,
+        "push_hero_frac": 0.5,
+        "intel_stale_s": 20.0,
+        "sighting_ttl_s": 90.0,
+    }
+    s = load(ARMED)
+    props = bridge_view.digest(s, cat)
+    sid = s["squads"][0]["id"]
+    _, reason = affordances.push_gate_facts(s, props, sid, cat)
+    assert "/3" in reason, "the served gate must be the engine's: {}".format(reason)
+    assert "/6" not in reason, "the module constant must not survive a published one"
+
+
+def test_a_stale_picture_names_the_threshold_the_engine_notes_against():
+    """The document and the echo say it in the same words.
+
+    A commander that reads "past the 45s threshold" here and then reads it
+    again in the echo of its own `stance push` is being told one thing twice,
+    which is the point: the annotation was already right at r26/r27 and it was
+    the READING that failed, not the fact.
+    """
+    s = load(ARMED)
+    s["intel"] = {
+        "sightings": [{"id": 1, "age": 190.0}],
+        "groups": [{"size": 11, "composition": "8 Footman, 3 Archer",
+                    "place": "near the center ford", "age": 190.0}],
+        "heroes": {},
+        "ttl_s": 90.0,
+    }
+    note = affordances.intel_note(s, catalog())
+    assert "190s ago" in note, "the reading itself is unchanged: {}".format(note)
+    assert "190s old, past the 45s threshold" in note, note
+
+    # ...and a fresh picture names no threshold at all. A line that fires on
+    # every cycle is a line a commander learns to skip.
+    s["intel"]["sightings"][0]["age"] = 12.0
+    s["intel"]["groups"][0]["age"] = 12.0
+    fresh = affordances.intel_note(s, catalog())
+    assert "threshold" not in fresh, fresh
+
+
+def test_the_freshest_age_reads_both_ledgers_the_way_the_engine_does():
+    """`shared::FogGrid::freshest_enemy_age`, mirrored.
+
+    Both halves are load-bearing. `sightings` is dropped after the TTL, so on
+    its own it can never report an age past ninety; `heroes` keeps its `t_seen`
+    forever, so it is the only half that can say four hundred seconds.
+    """
+    assert affordances.freshest_enemy_age({}) is None
+    assert affordances.freshest_enemy_age(
+        {"intel": {"sightings": [], "groups": [], "heroes": {}}}
+    ) is None
+    # Hero-only memory: an age the sightings ledger could never express.
+    assert affordances.freshest_enemy_age(
+        {"intel": {"sightings": [], "heroes": {"Hero": {"status": "alive", "age": 400.0}}}}
+    ) == 400.0
+    # The freshest of the two wins, whichever ledger it is in.
+    both = {"intel": {
+        "sightings": [{"id": 1, "age": 70.0}, {"id": 2, "age": 30.0}],
+        "heroes": {"Hero": {"status": "alive", "age": 400.0}},
+    }}
+    assert affordances.freshest_enemy_age(both) == 30.0
+    # A hero never seen carries no `age` key and must not be read as age zero.
+    assert affordances.freshest_enemy_age(
+        {"intel": {"sightings": [{"id": 1, "age": 55.0}],
+                   "heroes": {"Hero": {"status": "unknown"}}}}
+    ) == 55.0
 
 
 # -- fog-legality ------------------------------------------------------------
