@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -401,10 +402,15 @@ def test_the_digest_leaves_no_marker_behind():
     with tempfile.TemporaryDirectory() as tmp:
         state = Path(tmp) / "state.json"
         shutil.copy(EARLY, state)
-        marker = Path("/tmp/claude-1000/bridge_last_t_" + str(state).replace("/", "_"))
-        marker.unlink(missing_ok=True)
-        run("--digest", str(state))
-        assert not marker.exists(), "the digest must not fight bridge_wait for a read position"
+        marker_dir = Path(tmp) / "markers"
+        out = subprocess.run(
+            [sys.executable, str(TOOL), "--digest", str(state)],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "BH_MARKER_DIR": str(marker_dir)},
+        )
+        assert out.returncode == 0, out.stderr
+        leftovers = list(marker_dir.glob("*")) if marker_dir.exists() else []
+        assert not leftovers, "the digest must not fight bridge_wait for a read position"
 
 
 def _run():

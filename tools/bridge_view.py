@@ -33,6 +33,10 @@ import re
 import sys
 from collections import Counter, defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from markers import marker_path  # noqa: E402
+
 BASES = {"Claude": (70.0, 70.0), "Human": (-70.0, -70.0)}
 
 # --- digest constants -------------------------------------------------------
@@ -573,7 +577,7 @@ def full_view(s, path):
 
     # Events newer than my previous read; one marker per seat so parallel
     # commanders don't clobber each other's read position.
-    marker = "/tmp/claude-1000/bridge_last_t_" + path.replace("/", "_")
+    marker = marker_path("bridge_last_t", path)
     last_t = 0.0
     try:
         with open(marker) as f:
