@@ -133,7 +133,7 @@
 //! act*, and whether the plan still fits the board after those seconds is the
 //! question the proposal loop actually raises.
 
-use crate::intent::IntentApply;
+use crate::intent::{IntentApply, LateBind};
 use crate::shared::*;
 use bevy::prelude::*;
 use serde::Deserialize;
@@ -721,9 +721,17 @@ fn ingest_wire(
     mut submissions: EventWriter<SubmitIntent>,
     squad_orders: Res<SquadOrders>,
     // The team's own named geography, so a proposal that says "push to
-    // north-pass" still has somewhere for `[Space]` to fly to.
+    // north-pass" still has somewhere for `[Space]` to fly to — and, since the
+    // conflict preview resolves the batch, the same names the compiler would
+    // look up on approval.
     regions: Res<Regions>,
     units: CopilotUnits,
+    // What the one resolver is allowed to see, so the preview can expand a
+    // `"select"` phrase by asking it rather than by learning the vocabulary a
+    // second time. Read-only, and read only for the preview: nothing here is
+    // submitted, and no resolved id is kept.
+    nav: Res<NavGrid>,
+    bind_world: crate::intent::LateBindWorld,
 ) {
     let now = time.elapsed_secs();
     let policy = copilot.policy;
@@ -817,7 +825,14 @@ fn ingest_wire(
         let id = copilot.next_id;
         copilot.next_id += 1;
         let sentences: Vec<String> = intents.iter().map(Intent::sentence).collect();
-        let conflicts = conflict_tags(team, &intents, &squad_orders, &units, now);
+        let conflicts = conflict_tags(
+            team,
+            &intents,
+            &squad_orders,
+            &units,
+            now,
+            &LateBind::new(team, &regions, &nav, &bind_world),
+        );
         let pos = intents
             .iter()
             .find_map(|i| intent_pos(i, team, &regions));
@@ -865,15 +880,14 @@ fn ingest_wire(
 
 /// Which of the issuer's own units a verb is about.
 ///
-/// **A proposal carrying a `select` phrase scopes to nothing here, and that is
-/// deliberate.** A proposal is held UNRESOLVED — it has not been through the
-/// compiler and may never be — so the only honest way to expand `"all army"`
-/// into ids would be to resolve it *here*, which is a second resolution path
-/// and the one thing docs/INTENT.md forbids. The cost is a narrower conflict
-/// preview for selector-written proposals (the reviewer is told the batch
-/// overrides nothing rather than told what it overrides); the fix, when it is
-/// worth a bead, is to route the preview through `intent::resolve_places`
-/// rather than to teach this function the vocabulary a second time.
+/// **It reads a RESOLVED intent.** A proposal arrives holding phrases —
+/// `"select":"all army"` — and a phrase names no ids, so this function used to
+/// scope a selector-written batch to nobody and the human was told it
+/// overrides nothing while it was in fact about to take the whole army. The
+/// fix is not to teach this function the selector vocabulary a second time; it
+/// is `conflict_tags` running the batch through `intent::resolve_places` first,
+/// so what this matches on is a copy of the intent with its roles already
+/// expanded into ids by the one resolver.
 enum Scope {
     Units(Vec<IntentId>),
     Squad(u8),
@@ -971,21 +985,68 @@ fn intent_pos(intent: &Intent, team: Team, regions: &Regions) -> Option<Vec3> {
 /// the note is arguing about. (A tag can therefore go stale during the 20s
 /// window; the sentences cannot, and approval re-validates everything against
 /// the live world anyway.)
+///
+/// **Roles are expanded here, through the one resolver, and the expansion is a
+/// PREVIEW.** `bind` is the same [`intent::LateBind`] the compiler builds, so
+/// `"select":"all army"` becomes the ids it stands for by the identical rule
+/// that will expand it again on approval — no second vocabulary, no second
+/// spelling of the empty-match refusal. But the two resolutions happen at
+/// different moments, and between them units die, join squads and are trained,
+/// so the answers can honestly differ. That is why every tag this expansion
+/// produces is dated `as of now`: the reviewer is reading a scope measured at
+/// arrival, not a promise about approval. The advisory list has always had this
+/// property (`overrides your move on 4 unit(s), 6s ago` was already a
+/// measurement); selectors just make it visible, because a phrase can change
+/// what it means while a list of ids cannot.
 fn conflict_tags(
     me: Team,
     intents: &[Intent],
     squad_orders: &SquadOrders,
     units: &CopilotUnits,
     now: f32,
+    bind: &LateBind,
 ) -> Vec<String> {
     let mut tags: Vec<String> = Vec::new();
     let mut squads_touched: Vec<u8> = Vec::new();
     // Human orders this batch would overwrite: verb -> how many units, and the
     // freshest one, because "4 seconds ago" is the part that stings.
     let mut overridden: Vec<(&'static str, usize, f32)> = Vec::new();
+    // Distinct own units the batch reaches by NAMING A ROLE rather than by
+    // listing ids — the blast radius the sentences alone do not give a size to.
+    // `"move all army to the ford"` reads the same whether the army is two
+    // units or twenty.
+    let mut reached_by_role: Vec<IntentId> = Vec::new();
 
     for intent in intents {
-        match scope_of(intent) {
+        // The one resolver, asked a question instead of told to act. An `Err`
+        // here is the refusal this command would earn if the human approved it
+        // this instant — an unknown phrase, a role that currently matches
+        // nobody, a region this seat cannot name. Worth saying: a reviewer
+        // about to spend a keystroke on a batch that would refuse is exactly
+        // the person who wants to know.
+        let resolved = match crate::intent::resolve_places(intent.clone(), bind) {
+            Ok(resolved) => resolved,
+            Err(why) => {
+                push_unique(&mut tags, format!("as of now this would refuse: {why}"));
+                continue;
+            }
+        };
+        // Anything the resolver added to the unit channel came from a role:
+        // the ids the co-commander wrote are the ids that survive resolution.
+        let scope = scope_of(&resolved);
+        if let (Scope::Units(before), Scope::Units(after)) = (scope_of(intent), &scope) {
+            if &before != after {
+                for id in after {
+                    if !reached_by_role.contains(id) {
+                        reached_by_role.push(*id);
+                    }
+                }
+            }
+        }
+        // Everything below weighs the RESOLVED batch, which is the one the
+        // human would be approving.
+        let intent = &resolved;
+        match scope {
             Scope::Squad(id) => {
                 if let Some(old) = squad_orders.0.get(&(me, id)) {
                     let new = match intent {
@@ -1049,6 +1110,18 @@ fn conflict_tags(
         }
     }
 
+    // First line of the readout when a role was named, because it is the size
+    // of the thing being agreed to. `move all army to the ford` reads the same
+    // at two units and at twenty, and the number is the part a human weighs.
+    if !reached_by_role.is_empty() {
+        tags.insert(
+            0,
+            format!(
+                "the roles named reach {} unit(s) as of now",
+                reached_by_role.len()
+            ),
+        );
+    }
     squads_touched.sort_unstable();
     for squad in squads_touched {
         let posture = squad_orders
@@ -1761,6 +1834,115 @@ mod tests {
         assert_eq!(
             pending(&app)[0].conflicts,
             vec!["changes squad 2: push -> defend"]
+        );
+    }
+
+    /// **The bug this bead is about (`wc3clone-brq`).** A proposal written with
+    /// a role — `"select":"all army"` — used to scope to nobody, so the human
+    /// was shown an empty conflict list and approved a batch that took the
+    /// whole army. The preview now runs the batch through the one resolver, so
+    /// a phrase is weighed exactly as the ids it stands for would be.
+    #[test]
+    fn a_selector_proposal_previews_the_units_it_would_actually_take() {
+        let mut app = co_app();
+        // Three footmen the human put in squad 1, gave a push, and right-
+        // clicked. None of them is named by the proposal below.
+        for _ in 0..3 {
+            let unit = footman(&mut app, Vec3::ZERO);
+            app.world_mut().entity_mut(unit).insert((
+                SquadId(1),
+                Provenance::new(
+                    Cause::Order { verb: "move", source: IntentSource::Ui },
+                    0.0,
+                ),
+            ));
+        }
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 1), SquadPosture::Push { pos: Vec3::ZERO });
+
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"the ford is open","commands":[
+                 {"type":"move","select":"all army","x":-70.0,"z":-70.0}]}"#,
+        );
+
+        let conflicts = &pending(&app)[0].conflicts;
+        assert_eq!(
+            conflicts[0], "the roles named reach 3 unit(s) as of now",
+            "the size of the thing being agreed to leads the readout: {conflicts:?}"
+        );
+        assert!(
+            conflicts.iter().any(|c| c == "re-tasks squad 1 (push)"),
+            "got {conflicts:?}"
+        );
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.starts_with("overrides your move on 3 unit(s)")),
+            "got {conflicts:?}"
+        );
+    }
+
+    /// A role that currently matches nobody previews as nobody, in the
+    /// resolver's own words — the same sentence approval would refuse with.
+    /// Silence here would read as "this disturbs nothing", which is true and
+    /// deeply misleading: it does nothing at all.
+    #[test]
+    fn a_selector_that_matches_nobody_previews_as_such() {
+        let mut app = co_app();
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"push with what we have","commands":[
+                 {"type":"move","select":"all army","x":-70.0,"z":-70.0}]}"#,
+        );
+        assert_eq!(
+            pending(&app)[0].conflicts,
+            vec![
+                "as of now this would refuse: move: 'all army' matches none of \
+                 your units right now — nothing was ordered"
+            ]
+        );
+    }
+
+    /// **Preview and apply are two moments, and the tags say so.** The scope is
+    /// measured when the proposal arrives; the order is resolved again when the
+    /// human approves. Between them the army can change — here two of the three
+    /// die — and the two answers legitimately differ. The tag is dated `as of
+    /// now` for exactly this reason: it is advice about a board, not a promise
+    /// about an outcome, and what actually lands is whatever the one compiler
+    /// resolves at approval time.
+    #[test]
+    fn the_preview_is_dated_because_approval_resolves_again() {
+        let mut app = co_app();
+        let squad: Vec<Entity> = (0..3).map(|_| footman(&mut app, Vec3::ZERO)).collect();
+
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"take the ford","commands":[
+                 {"type":"move","select":"all army","x":-70.0,"z":-70.0}]}"#,
+        );
+        assert_eq!(
+            pending(&app)[0].conflicts,
+            vec!["the roles named reach 3 unit(s) as of now"],
+            "three, as of the moment it arrived"
+        );
+
+        // The fight the co-commander was worried about happens.
+        app.world_mut().despawn(squad[0]);
+        app.world_mut().despawn(squad[1]);
+        app.world_mut().send_event(ProposalVerdict::approve(1));
+        app.update();
+
+        assert!(
+            matches!(app.world().entity(squad[2]).get::<Order>(), Some(Order::Move(_))),
+            "approval re-resolves 'all army' against the world as it is THEN"
+        );
+        assert!(
+            errors(&app).is_empty(),
+            "a survivor is still an army: {:?}",
+            errors(&app)
         );
     }
 
