@@ -431,6 +431,43 @@ def test_a_real_stanced_squad_says_where_it_is_staging():
     assert "stage (near mid)" in line
 
 
+def test_the_squad_line_says_whether_the_push_is_actually_advancing():
+    """`squads[].status` (wc3clone-6wa), on the line a commander actually reads.
+
+    r22 set `posture:push` and its army oscillated in front of the crossings
+    fords for four hundred game seconds. Every digest of that match rendered
+    "SQUAD 1 push (near mid) · 12 units · str …" — the same line it would have
+    rendered for a squad walking straight at the objective. The status is the
+    only thing that separates them, so it belongs on the line and directly
+    behind the posture it qualifies.
+    """
+    s = load(ARMED)
+    sq = [x for x in s["squads"] if x["id"] == 1][0]
+    sq["status"] = "gathering"
+    props = bridge_view.digest(s)
+    stanced = [x for x in props["squads"] if x["id"] == 1][0]
+    assert stanced["status"] == "gathering"
+    line = [ln for ln in bridge_view.render_digest(props)
+            if ln.startswith("SQUAD 1")][0]
+    assert "stage (near mid), gathering" in line, line
+
+    sq["status"] = "pressing on"
+    line = [ln for ln in bridge_view.render_digest(bridge_view.digest(s))
+            if ln.startswith("SQUAD 1")][0]
+    assert "stage (near mid), pressing on" in line, line
+
+
+def test_a_squad_with_no_status_renders_exactly_as_it_always_did():
+    """The key is absent on a defend ring, an escort, and every snapshot older
+    than the feature. None of those may grow a stray comma."""
+    props = bridge_view.digest(load(ARMED))
+    for sq in props["squads"]:
+        assert sq["status"] is None
+    for line in bridge_view.render_digest(props):
+        if line.startswith("SQUAD ") or line.startswith("LOOSE "):
+            assert ", None" not in line and ", " not in line.split(" · ")[0], line
+
+
 def test_a_stance_with_no_ground_under_it_is_still_a_bare_word():
     """A squad whose only record is the stance has no anchor to name, and an
     empty parenthesis would be the renderer inventing punctuation."""

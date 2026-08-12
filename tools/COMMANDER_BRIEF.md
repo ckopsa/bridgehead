@@ -172,7 +172,15 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
   `min_enemies:0` clears just that rule.
 - `{"type":"squad","units":[ids],"id":1}` then `{"type":"posture","id":1,"posture":{"type":"defend","x":..,"z":..,"radius":18}}`
   (`"push"` with x/z, `"escort"` with `"unit":id`, or `"forage"` with x/z muster) — squads
-  re-task themselves every second and ADVANCE COHESIVELY: a strung-out Push/Forage squad gathers before pressing on, so slow units set the pace and you arrive as one force. Defend postures are REACTIVE: enemies entering the radius
+  re-task themselves every second and ADVANCE COHESIVELY: a strung-out Push/Forage squad gathers before pressing on, so slow units set the pace and you arrive as one force.
+  **Watch `squads[].status` for which of those two it is doing** — `"gathering"` means the
+  squad is walking BACKWARDS to a regroup point behind its front, `"pressing on"` means it is
+  walking at the objective. Same posture, opposite directions, and the key is the only thing in
+  the snapshot that tells them apart. A gather that stops making progress gives up on its
+  stragglers after about twelve seconds and presses on by itself, so a squad stuck on
+  `"gathering"` is one whose tail keeps being refilled faster than it closes: stop training into
+  it, or split the front off into its own squad. Absent on postures that are not walking
+  anywhere (a defend ring, an escort, a forager with no treasure in sight). Defend postures are REACTIVE: enemies entering the radius
   pull the whole squad onto them. FORAGE squads continuously hunt the nearest bounty cache
   (attack-moving, so they fight what they meet) and hold at the muster point when none are up —
   the set-and-forget way to own the midfield. Squad 0 exists automatically (all army units
@@ -239,13 +247,20 @@ Three things worth knowing:
    `secure`'s 30 whatever size you drew the circle. That is what makes a preset a
    preset. Use `posture` when you want to pick the number yourself — the full
    vocabulary stays open and nothing here can be expressed only as a stance.
-3. **It applies to the squad's members as they stand.** The posture is per-squad
-   and covers anyone who joins later; the leash, threshold and focus list land on
-   whoever is in the squad *now*, exactly as `leash`/`retreat`/`priority` do.
-   Re-send the stance after reinforcing, or use `template` to stamp new units at
-   the barracks. Sending `squad` and `stance` **in the same batch works** — the
-   stance sees the enrolment the line above it made — so the natural opening
-   `[{"type":"squad",...},{"type":"stance",...}]` does what it looks like.
+3. **Reinforcements inherit it.** A stance belongs to the *squad*, not to the
+   bodies that were standing in it when you sent the word: enrol a unit into a
+   stanced squad and it arrives wearing the posture, the leash, the threshold and
+   the focus list. That holds however it got there — a `squad` command, a
+   `template` at the barracks, or the engine's own enrolment into squad 0 — and
+   moving a unit between two stanced squads swaps the whole bundle, exactly as
+   switching a squad's word does. So you can stance an empty squad and train into
+   it, and sending `squad` and `stance` **in the same batch works** too — the
+   stance sees the enrolment the line above it made.
+
+   The limit: a squad you tasked with `posture` rather than a stance has no word
+   to hand down, and `leash`/`retreat`/`priority` name units rather than squads,
+   so joiners there are left as they are. If you want doctrine to follow the
+   squad, use a stance.
 
 **Silence continues a stance.** Nothing in the engine ever clears one — not a
 poll you skipped, not a fight, not a wipe. Your next snapshot echoes it back as

@@ -221,6 +221,15 @@ def _squad_props(sid, sq, members, smap):
         # not have to strip a parenthesis off it.
         "stance": stance or posture,
         "stance_phrase": phrase,
+        # What doctrine is doing about that posture right now: "gathering" or
+        # "pressing on" (src/bridge.rs `SquadOut::status`, wc3clone-6wa). The
+        # posture is where the squad is going; this is whether it is going
+        # there. r22's push oscillated in front of a ford for four hundred
+        # seconds and every digest of it read "push (mid) · 12 units · moving",
+        # because nothing in the snapshot could tell an advance from a regroup.
+        # Absent on postures that raise no such question, and on every snapshot
+        # written before the key existed — hence `.get`.
+        "status": sq.get("status"),
         # A snapshot always carries the count on the squad record; the unit
         # rosters are what we sum strength from. They agree, except on a
         # snapshot old enough to predate `units[].squad`, where the count is
@@ -541,11 +550,17 @@ def render_digest(props):
         if not sq["units"]:
             body.append(_trunc("{} {} · EMPTY".format(name, sq["stance_phrase"])))
             continue
+        # The status rides directly behind the posture, because it qualifies
+        # it: "push (mid), gathering" and "push (mid), pressing on" are two
+        # different armies, and before wc3clone-6wa this line rendered them
+        # identically. Omitted when the snapshot has nothing to say, so a
+        # defend ring reads exactly as it always did.
         body.append(
             _trunc(
-                "{} {} · {} units · str {}{} · {}".format(
+                "{} {}{} · {} units · str {}{} · {}".format(
                     name,
                     sq["stance_phrase"],
+                    ", " + sq["status"] if sq.get("status") else "",
                     sq["units"],
                     sq["strength"],
                     " hp {:.0f}%".format(100.0 * sq["hp_frac"]) if sq["hp_frac"] is not None else "",

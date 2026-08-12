@@ -277,7 +277,7 @@ stance can never acquire a behaviour the individual verbs lack. Its numbers are
 rows in `assets/data/stances.ron`; its five *words* are a `StanceKind` enum,
 because a fixed vocabulary both seats and the arena ledger speak is identity.
 
-Four properties are the design, and each answers a failure the arena produced
+Five properties are the design, and each answers a failure the arena produced
 (docs/AFFORDANCES.md § Stances; arena rounds r21–r23):
 
 1. **The default is persistence.** Nothing in the engine ever clears a stance.
@@ -299,12 +299,31 @@ Four properties are the design, and each answers a failure the arena produced
    its own commander had just told to defend would be the one lie this feature
    cannot afford.
 
+5. **A stance belongs to the squad, so late joiners inherit all of it**
+   (wc3clone-bol). Until that bead the per-unit half landed on the members *as
+   they stood* and only the posture covered a reinforcement, so a commander who
+   stanced squad 1 and then trained into it fielded one squad wearing two
+   doctrines — invisible except as half an army failing to break off. The choke
+   point is the `SquadId` component and not any of its three writers (the
+   `squad` verb, `template` stamping at spawn in units.rs, doctrine.rs's
+   enrolment into `DEFAULT_SQUAD`): `intent::stamp_stance_on_joiners` watches
+   `Changed<SquadId>` and replays `stamp_stance`, the same applier the arm uses.
+   Moving between two stanced squads therefore swaps the bundle whole, by
+   property 3. Note that this keeps doctrine.rs's module contract intact — it
+   enrols by writing `SquadId`, exactly as before, and the doctrine components
+   stay written by `intent.rs` alone.
+
 Two deliberate limits. A named region supplies the stance's **centre and not its
 radius** (unlike `posture defend`): a preset whose numbers moved with its target
 would not be a preset, and `posture` remains for anyone who wants to pick the
-number. And the per-unit half lands on the squad's members *as they stand*,
-exactly as `leash`/`retreat`/`priority` do — the posture covers later joiners
-because it is per-squad; the rest is what `template` is for.
+number. And **only a stance is inherited**: a squad tasked by hand with
+`posture` has no per-squad doctrine to hand down, because `leash`, `retreat` and
+`priority` name *units* — a selection may span squads or contain unsquadded
+units — so there is no squad-level fact for a joiner to read. Making them
+uniform would mean inventing per-squad state their own vocabulary does not have.
+The stance is the one doctrine this engine holds per squad, which is exactly why
+it is the one a joiner can inherit; `template` remains the tool for stamping a
+building's output when you want doctrine without a stance.
 
 The vocabulary is fixed rather than commander-assembled, which is the whole
 economy of the thing: commander-defined bundles would make the decision surface
