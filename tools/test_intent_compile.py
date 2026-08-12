@@ -7,11 +7,19 @@ Plain asserts, no pytest features, so the file runs either way — an agent with
 no venv should still be able to check the compiler before sending an army
 somewhere on its say-so.
 
-The fixture (`fixtures/state_crossings.json`) is a real-shaped `state.json` for
-the Claude seat on the `crossings` map at ~3:34, with three named fords, two
-barracks, a shop with one locked rung, five mines and one visible bounty. Every
-place-name test below is therefore a test of the SNAPSHOT vocabulary, not of a
-hardcoded table: change the map and these tests change with it.
+The fixture (`fixtures/legacy_crossings.json`) is the Claude seat on the
+`crossings` map at ~3:34, with three named fords, two barracks, a shop with one
+locked rung, five mines and one visible bounty. Every place-name test below is
+therefore a test of the SNAPSHOT vocabulary, not of a hardcoded table: change
+the map and these tests change with it.
+
+**It is a LEGACY fixture and not a sample of the current wire.** It predates
+`intel`, `my_race`, `alarms` and everything after them, so it is a specimen of
+what old snapshots looked like, kept because reading one is a thing this tool
+must still do. `tools/verify_intent_bridge.py` is what pins the CURRENT
+top-level key set, against a live seat; nothing here should be read as "this is
+what a snapshot looks like". Fixtures captured from recent matches live beside
+it as `digest_*.json` / `doc_*.json`.
 """
 
 import json
@@ -23,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import intent_compile as ic  # noqa: E402
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "fixtures", "state_crossings.json")
+                       "fixtures", "legacy_crossings.json")
 
 CHAMPION = 4294968150
 PRIESTESS = 4294968151

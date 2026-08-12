@@ -12,8 +12,11 @@ would be expensive to discover in an arena round:
   and `digest()` does not mutate the dict it is handed.
 * **It degrades.** Every key it reads was added at some point, so a snapshot
   from before that point must still render. The repo's oldest fixture
-  (`state_crossings.json`, no `intel`, no `my_race`) is the real specimen and
-  the empty dict is the paranoid one.
+  (`legacy_crossings.json`, no `intel`, no `my_race`) is the real specimen and
+  the empty dict is the paranoid one. That fixture is named for the job: it is
+  a specimen of an OLD wire, never a sample of the current one, and the rename
+  from `state_crossings.json` was because the old name invited exactly that
+  misreading.
 * **It stays short.** Fifteen lines that grow to fifty in a late game is the
   problem it was written to fix, so the ceiling is asserted against a snapshot
   built to blow it.
@@ -48,7 +51,7 @@ LIVE = [FIX / "digest_open_mid.json", FIX / "digest_crossings_mid.json"]
 #: t=8s: five workers, no army, nothing scouted.
 EARLY = FIX / "digest_open_early.json"
 #: The pre-`intel`, pre-`my_race` snapshot this repo has always carried.
-LEGACY = FIX / "state_crossings.json"
+LEGACY = FIX / "legacy_crossings.json"
 
 
 def load(path):
@@ -164,7 +167,7 @@ def test_no_line_runs_away():
 
 
 def test_a_snapshot_that_predates_every_optional_key_still_renders():
-    """`state_crossings.json` has no `intel`, no `my_race`, no `alarms`."""
+    """`legacy_crossings.json` has no `intel`, no `my_race`, no `alarms`."""
     s = load(LEGACY)
     assert "intel" not in s and "my_race" not in s, "fixture is no longer the old shape"
     props = bridge_view.digest(s)
