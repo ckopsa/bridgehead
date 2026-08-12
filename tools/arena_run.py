@@ -180,6 +180,26 @@ def running_engines(binary: Path) -> list[tuple[int, str]]:
     """
     want = binary.name
     found = []
+    if not Path("/proc").exists():
+        # macOS has no /proc; `ps -o comm=` prints the executable path itself,
+        # which keeps the same guarantee — we match the process, not a command
+        # line that merely mentions the binary.
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,comm="], capture_output=True, text=True
+        ).stdout
+        for line in out.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            pid_s, comm = parts
+            if not pid_s.isdigit():
+                continue
+            pid = int(pid_s)
+            if pid in (os.getpid(), os.getppid()):
+                continue
+            if Path(comm).name == want:
+                found.append((pid, comm[:120]))
+        return found
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
