@@ -231,6 +231,10 @@ const POLL_INTERVAL: f32 = 0.25;
 /// How many trees to include in the snapshot (there are hundreds).
 const TREES_NEAR: usize = 12;
 
+/// What `game_over` says when the match was decided and nobody won. The only
+/// value of that key that is not a team name; see the field's doc comment.
+const DRAW_NAME: &str = "draw";
+
 
 // ---------------------------------------------------------------------------
 // Plugin & state
@@ -328,6 +332,13 @@ struct Seat {
     errors: Vec<String>,
     /// Write a snapshot on the next tick regardless of the timer.
     force_snapshot: bool,
+    /// Has this seat's `state.json` on disk been written *since* the match was
+    /// decided — i.e. does the file a commander is polling carry `game_over`?
+    ///
+    /// Meaningless until there is a verdict, which is why nothing reads it
+    /// except through the two places that already know there is one:
+    /// `Seat::publishes_now` and `Bridge::awaiting_verdict`.
+    verdict_published: bool,
     /// (mtime, len) of this seat's `commands.json` when it was last read, so an
     /// unchanged file is not re-parsed four times a second.
     last_stat: Option<(std::time::SystemTime, u64)>,
@@ -348,8 +359,44 @@ impl Seat {
             last_seq: 0,
             errors: Vec::new(),
             force_snapshot: true,
+            verdict_published: false,
             last_stat: None,
         }
+    }
+
+    /// Does this seat publish a snapshot this frame? Three reasons, and the
+    /// third is the one that is not about time:
+    ///
+    /// 1. the wall-clock timer came due (`SNAPSHOT_INTERVAL`);
+    /// 2. something asked for one — a batch was just applied, a seat just
+    ///    opened (`force_snapshot`);
+    /// 3. **the match has been decided and this seat has not said so yet.**
+    ///
+    /// (3) exists because the verdict is not a tick of the clock and must not
+    /// be delivered like one. `headless_exit` quits ~5 GAME seconds after a
+    /// match is decided; at `BH_SPEED=16` that is a third of a wall second,
+    /// less than one `SNAPSHOT_INTERVAL`, so the last file a commander ever
+    /// read was routinely a mid-match snapshot with `game_over: null` — and
+    /// the poll loop this protocol documents ("repeat until `game_over` is
+    /// non-null", tools/COMMANDER_BRIEF.md) never terminated. Arena round 23
+    /// hit exactly this; `arena_run.py` reads the verdict out of `engine.log`
+    /// to work around it, which a commander cannot do.
+    ///
+    /// The flag is set on the frame the write is *attempted*, not on a
+    /// successful write: one attempt per seat is the promise. A write that
+    /// fails has failed for a reason that will still be true next frame, and
+    /// retrying at frame rate would bury the error it logged under sixty
+    /// copies of itself — while holding the exit open (`awaiting_verdict`)
+    /// for as long as it kept failing.
+    fn publishes_now(&mut self, delta: std::time::Duration, decided: bool) -> bool {
+        let due = self.snapshot_timer.tick(delta).just_finished();
+        let owed_verdict = decided && !self.verdict_published;
+        if !due && !self.force_snapshot && !owed_verdict {
+            return false;
+        }
+        self.force_snapshot = false;
+        self.verdict_published |= decided;
+        true
     }
 }
 
@@ -368,8 +415,39 @@ fn seat_dir(team: Team, role: SeatRole) -> &'static str {
 /// The open seats. Empty means the bridge is inactive and every system
 /// early-returns before touching the filesystem.
 #[derive(Resource, Default)]
-struct Bridge {
+pub struct Bridge {
     seats: Vec<Seat>,
+}
+
+impl Bridge {
+    /// Is some seat still owed the verdict-carrying snapshot?
+    ///
+    /// Only meaningful once `GameOver` is decided — before that no seat has
+    /// published a verdict and this answers `true` for every open seat, which
+    /// is why its one caller (`main::check_decided`) asks it from inside
+    /// `if let Some(winner) = game_over.winner`. With the bridge off there are
+    /// no seats and the answer is `false`, so an unbridged run exits exactly
+    /// when it always did.
+    ///
+    /// This is the second half of the guarantee `Seat::publishes_now` makes:
+    /// that one gets the write onto the disk, this one keeps the process alive
+    /// until it is there, so the ordering of two systems inside `SimSet::Feed`
+    /// is not load-bearing.
+    pub fn awaiting_verdict(&self) -> bool {
+        self.seats.iter().any(|seat| !seat.verdict_published)
+    }
+}
+
+/// One open commander seat and nothing else — for the exit-ordering test in
+/// `main.rs`, which needs a seat to exist without an env var (process-global,
+/// and the suite runs in parallel) or a filesystem. `Seat` and all of its
+/// protocol state stay private; the only question the result can be asked from
+/// outside this file is `awaiting_verdict`.
+#[cfg(test)]
+pub fn one_unpublished_seat() -> Bridge {
+    Bridge {
+        seats: vec![Seat::new(Team::Claude, SeatRole::Commander)],
+    }
 }
 
 fn bridge_enabled(bridge: Res<Bridge>) -> bool {
@@ -609,11 +687,27 @@ struct StateOut {
     /// and `t` begins to move.
     #[serde(skip_serializing_if = "Option::is_none")]
     match_started: Option<bool>,
+    /// **Who won, once anybody has** — a bare team name, `"draw"`, or null
+    /// while the match is live. The poll loop every commander is given
+    /// (tools/COMMANDER_BRIEF.md: "repeat until `game_over` is non-null")
+    /// terminates on this key and nothing else, which is why a drawn match has
+    /// to say *something* here: `wc3clone-j84` was a capped round that ended
+    /// with the process gone and this key still null, and four commander
+    /// agents sat polling a file nobody would ever write again.
+    ///
+    /// `"draw"` is the one value that is not a team, added rather than
+    /// modelled as an absent winner *on the wire* precisely because absence is
+    /// what "still playing" already means here. The ledger keeps ARENA.md's
+    /// spelling — a draw is a `winner: null` round with
+    /// `game_over_reason: "score"` — and `arena_run.py` translates at the
+    /// boundary.
     game_over: Option<&'static str>,
-    /// **Which win it was**: `"razed"` (the loser has no production buildings
-    /// left) or `"surrender"`. Round-9's winner could not tell the two apart —
-    /// a conceded match and a fought-out one call for completely different
-    /// AARs, and `game_over` alone never distinguished them.
+    /// **Which ending it was**: `"razed"` (the loser has no production
+    /// buildings left), `"surrender"`, or `"score"` (the time cap expired and
+    /// the referee counted assets — see `shared::GameOverReason::Score`).
+    /// Round-9's winner could not tell the first two apart — a conceded match
+    /// and a fought-out one call for completely different AARs, and
+    /// `game_over` alone never distinguished them.
     ///
     /// Deliberately a SIBLING key rather than turning `game_over` into
     /// `{winner, reason}`. `game_over` is read as a team name or null by
@@ -1771,12 +1865,13 @@ fn write_snapshot(
 ) {
     let now = r1(time.elapsed_secs());
     let delta = real.delta();
+    // The verdict is a reason to write, not merely something a write reports;
+    // see `Seat::publishes_now`.
+    let decided = match_state.over.decided();
     for seat in &mut bridge.seats {
-        let due = seat.snapshot_timer.tick(delta).just_finished();
-        if !due && !seat.force_snapshot {
+        if !seat.publishes_now(delta, decided) {
             continue;
         }
-        seat.force_snapshot = false;
         // The seat's own team's fog — the whole point of a per-seat snapshot.
         let seat_fog = fog.get(seat.team);
         // The co-command block, for the one role that has one. An ordinary
@@ -2327,7 +2422,7 @@ fn write_seat_snapshot(
         // exactly as it has always been.
         waiting_for: ready.holding().then(|| ready.waiting_for()),
         match_started: ready.holding().then_some(false),
-        game_over: game_over.winner.map(team_name),
+        game_over: game_over_name(&game_over),
         game_over_reason: game_over.reason.map(GameOverReason::name),
         me: MeOut {
             gold: eco.gold,
@@ -2698,7 +2793,7 @@ fn poll_commands(
         // batch being acknowledged, never the one before it.
         intent_applied.get_mut(seat.team).clear();
 
-        if game_over.winner.is_some() {
+        if game_over.decided() {
             seat.errors
                 .push("batch: game over — commands ignored".to_string());
         } else {
@@ -2777,6 +2872,20 @@ fn team_name(team: Team) -> &'static str {
     match team {
         Team::Human => "Human",
         Team::Claude => "Claude",
+    }
+}
+
+/// The `game_over` key: the winner's team name, `DRAW_NAME` if the match was
+/// decided and nobody won, `None` while it is still being played.
+///
+/// One function rather than an expression at the call site because "what does
+/// the wire say the match ended as" is a fact `Seat::publishes_now` is holding
+/// the process open to deliver; a second spelling of it somewhere else is how
+/// a seat ends up published with a verdict the engine does not think it has.
+fn game_over_name(over: &GameOver) -> Option<&'static str> {
+    match over.winner {
+        Some(team) => Some(team_name(team)),
+        None => over.drawn.then_some(DRAW_NAME),
     }
 }
 
@@ -2900,6 +3009,107 @@ mod tests {
             assert_eq!(map["Worker"], true, "{hall:?} must still train workers");
             assert_eq!(map["Priestess"], true);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The last snapshot of a match (wc3clone-0i9)
+    // -----------------------------------------------------------------------
+
+    /// **A decided match owes every seat one more write.** The bug this pins:
+    /// the snapshot timer runs on wall time (1s) while `headless_exit` quits
+    /// ~5 GAME seconds after the verdict, which at `BH_SPEED=16` is a third of
+    /// a wall second — so the last `state.json` on disk said `game_over: null`
+    /// and a commander polling it (the documented loop) waited forever.
+    ///
+    /// The frames here are 16ms, so the timer is nowhere near due at any point
+    /// in this test: every `true` below is the verdict's doing, not the clock's.
+    #[test]
+    fn the_verdict_forces_one_more_snapshot_on_a_seat_the_timer_would_skip() {
+        let frame = std::time::Duration::from_millis(16);
+        let mut seat = Seat::new(Team::Claude, SeatRole::Commander);
+
+        assert!(
+            seat.publishes_now(frame, false),
+            "a fresh seat writes once immediately (force_snapshot), so a \
+             commander has something to read before the first tick"
+        );
+        assert!(
+            !seat.publishes_now(frame, false),
+            "and then goes quiet until the timer or an event says otherwise"
+        );
+
+        assert!(
+            seat.publishes_now(frame, true),
+            "the frame the match is decided: the verdict is the reason to write"
+        );
+        assert!(
+            !seat.publishes_now(frame, true),
+            "but only once — a decided match must not write at frame rate for \
+             the five game-seconds before the process exits"
+        );
+    }
+
+    /// The other half of the guarantee: the exit waits for that write. Two
+    /// seats, because the failure that matters is the asymmetric one — red
+    /// gets its verdict, blue does not, and only one of the two commanders
+    /// hangs.
+    #[test]
+    fn the_bridge_awaits_the_verdict_until_every_seat_has_been_told() {
+        let frame = std::time::Duration::from_millis(16);
+        let mut bridge = Bridge {
+            seats: vec![
+                Seat::new(Team::Claude, SeatRole::Commander),
+                Seat::new(Team::Human, SeatRole::Commander),
+            ],
+        };
+        assert!(bridge.awaiting_verdict(), "nobody has been told anything yet");
+
+        bridge.seats[0].publishes_now(frame, true);
+        assert!(
+            bridge.awaiting_verdict(),
+            "red knows and blue does not — the match may not end here"
+        );
+
+        bridge.seats[1].publishes_now(frame, true);
+        assert!(!bridge.awaiting_verdict(), "both seats carry the verdict");
+
+        assert!(
+            !Bridge::default().awaiting_verdict(),
+            "and with no seat open the bridge holds nothing up: an unbridged \
+             run exits exactly when it always did"
+        );
+    }
+
+    /// **What `game_over` says, in all four states** — `wc3clone-j84`. The key
+    /// a commander's poll loop terminates on: null while the match is live, a
+    /// bare team name when somebody won (`verify_r9_legibility.py` asserts
+    /// exactly that and must keep passing), and `"draw"` — the one value that
+    /// is not a team — when the cap ended it dead even.
+    #[test]
+    fn the_game_over_key_names_the_winner_a_draw_or_nothing() {
+        let live = GameOver::default();
+        assert_eq!(game_over_name(&live), None, "a live match says nothing");
+
+        let mut razed = GameOver::default();
+        razed.decide(Team::Claude, GameOverReason::Razed);
+        assert_eq!(game_over_name(&razed), Some("Claude"));
+
+        let mut on_score = GameOver::default();
+        on_score.decide(Team::Human, GameOverReason::Score);
+        assert_eq!(
+            game_over_name(&on_score),
+            Some("Human"),
+            "a score verdict still names its winner like any other ending"
+        );
+
+        let mut drawn = GameOver::default();
+        drawn.decide_draw(GameOverReason::Score);
+        assert_eq!(
+            game_over_name(&drawn),
+            Some(DRAW_NAME),
+            "a draw must say SOMETHING: null is the value the poll loop waits on"
+        );
+        assert_eq!(DRAW_NAME, "draw");
     }
 
     // -----------------------------------------------------------------------

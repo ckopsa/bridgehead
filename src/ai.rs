@@ -1066,7 +1066,7 @@ fn ai_think(
     // a kind (see `Roster`).
     races: Res<Races>,
 ) {
-    if game_over.winner.is_some() {
+    if game_over.decided() {
         return;
     }
     if !state.timer.tick(time.delta()).just_finished() {

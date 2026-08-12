@@ -177,6 +177,117 @@ def test_an_unrecognised_noun_is_not_silently_the_whole_army():
 
 
 # ---------------------------------------------------------------------------
+# Selectors — the roles the ENGINE resolves, not this tool
+# ---------------------------------------------------------------------------
+
+
+def test_the_four_roles_compile_to_selector_phrases():
+    """The whole bead in one table: an English role goes on the wire AS a role.
+
+    The phrases are `shared::parse_selector`'s, spelled exactly — the engine
+    folds case and dashes, but a tool that writes the canonical spelling is a
+    tool whose output reads the same in the log as in the brief.
+    """
+    cases = {
+        "the army": "all army", "army": "all army", "everything": "all army",
+        "everyone": "all army", "troops": "all army", None: "all army",
+        "workers": "workers", "the workers": "workers", "peons": "workers",
+        "the hero": "my hero", "heroes": "my hero",
+        "squad 2": "squad 2", "squad2": "squad 2",
+    }
+    for phrase, want in cases.items():
+        assert ic.selector_phrase(phrase) == want, phrase
+
+
+def test_a_kind_word_has_no_role_and_keeps_its_ids():
+    """The honest half. The engine has no selector called "cavalry", and
+    inventing one here would be this tool speaking a language the game does
+    not — so a kind phrase still compiles to a frozen list, and says so."""
+    for phrase in ("the cavalry", "the siege", "footmen", "the champion",
+                   "the priestess", "sorcerers", "casters", "archers"):
+        assert ic.selector_phrase(phrase) is None, phrase
+    squad = [i for i in compile_one("hold mid with the cavalry").intents
+             if i["type"] == "squad"][0]
+    assert set(squad["units"]) == {4294968130, 4294968131, 4294968132}
+    assert "select" not in squad
+
+
+def test_a_selector_phrase_and_its_ids_can_never_disagree():
+    """`selector_phrase` and `resolve_units` answer the same question in two
+    vocabularies. If they drift, the tool reports one selection and sends
+    another — so the property is checked rather than trusted."""
+    s = snap()
+    live = {u["id"]: u for u in s.own_units()}
+    expected = {
+        "all army": {i for i, u in live.items() if u["kind"] != ic.WORKER_KIND},
+        "workers": {i for i, u in live.items() if u["kind"] == ic.WORKER_KIND},
+        "my hero": {CHAMPION, PRIESTESS},
+        "squad 0": {i for i, u in live.items() if u.get("squad") == 0},
+    }
+    for phrase in ("the army", "everything", "workers", "peons", "the hero",
+                   "heroes", "squad 0"):
+        role = ic.selector_phrase(phrase)
+        assert set(ic.resolve_units(phrase, s)) == expected[role], phrase
+
+
+def test_a_selection_sends_one_channel_and_never_both():
+    """The engine's rule is that a selector outranks the `units` beside it and
+    the ids are not even reported. Sending both would put a claim in the
+    command that nothing acts on — a lie in the log."""
+    for directive in ("retreat at 35%", "focus siege", "hold mid",
+                      "harvest gold", "autocast at 3", "send the army to mid"):
+        for intent in compile_one(directive).intents:
+            assert not ("select" in intent and "units" in intent), intent
+
+
+def test_the_send_verb_is_the_shortest_sentence_that_shows_a_selector():
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    assert ic.compile_directives(["send the army to north-pass"], s).intents == [
+        {"type": "move", "select": "all army", "region": "north-pass"}]
+    # A walk is a walk: the aggressive reading is `push`, which is a posture.
+    assert only(compile_one("send the workers to our base"), "move")["select"] \
+        == "workers"
+    # An unknown noun is still refused rather than silently becoming everybody.
+    assert compile_one("send the wizards to mid").errors
+
+
+def test_an_armed_rule_names_the_role_so_it_stays_live():
+    """The reason any of this exists. A trigger's `then` is compiled now and
+    submitted later; ids in it are ids that die, and red-r23 lost a hero to a
+    hero-save rule armed against a corpse."""
+    trigger = only(compile_one("when my hero drops below 30%, "
+                               "retreat at 40% with the hero"), "trigger_set")
+    assert trigger["then"] == {"type": "retreat", "select": "my hero",
+                               "below": 0.4, "x": MY_BASE[0], "z": MY_BASE[1]}
+    # ...and the membership half of a two-intent action, sent now, says it too.
+    result = compile_one("whenever a bounty appears, forage mid with everything")
+    assert result.intents[0] == {"type": "squad", "select": "all army", "id": 1}
+
+
+def test_a_rules_build_step_names_the_worker_role_not_a_worker():
+    """Blue-r23 armed a farm trigger against one worker id and a fixed point.
+    The worker can die; the point can be blocked. Both are late-bound when the
+    clause is the action of a RULE — and only then, because an order you send
+    this second is better off with the nearest free worker this tool can see.
+    """
+    armed = only(compile_one("whenever we are supply blocked, build a farm"),
+                 "trigger_set")["then"]
+    assert armed["select"] == "workers" and "worker" not in armed
+    assert armed["site"] == "nearest legal site"
+
+    plan = only(compile_one("build a barracks, then train 2 footmen"), "plan_set")
+    assert plan["steps"][0]["intent"]["select"] == "workers"
+
+    # Sent now: a specific worker, chosen for being nearest, as before.
+    now = only(compile_one("build a farm"), "build")
+    assert now["worker"] in (4294968100, 4294968101, 4294968102)
+    assert "select" not in now
+    # ...but the SITE is still a landmark rather than a decision, so the engine
+    # may move the footprint instead of reporting `site blocked` forever.
+    assert now["site"] == "nearest legal site"
+
+
+# ---------------------------------------------------------------------------
 # Doctrine verbs — the ones that win matches
 # ---------------------------------------------------------------------------
 
@@ -187,7 +298,12 @@ def test_hold_compiles_to_squad_then_defend_posture():
     squad, posture = result.intents
     assert squad["id"] == posture["id"] == 1, "squad 0 is the engine's pool; allocate above it"
     assert posture["posture"] == {"type": "defend", "x": -60.0, "z": 60.0, "radius": 18.0}
-    assert 4294968100 not in squad["units"]
+    # WAS: `assert 4294968100 not in squad["units"]` — the worker was absent
+    # from a frozen list. It is absent for a better reason now: the clause
+    # named a ROLE, "all army" is the engine's word for the fighting units,
+    # and the phrase is what travels. Same set, resolved by the engine.
+    assert squad["select"] == "all army"
+    assert "units" not in squad
 
 
 def test_hold_takes_an_explicit_radius():
@@ -269,12 +385,22 @@ def test_an_ambiguous_hero_is_refused_with_the_words_that_fix_it():
 
 def test_list_verbs_are_not_ambiguous_and_take_every_hero():
     """The other half of the policy: "both heroes" is a perfectly good answer
-    to a verb whose payload is a list, so those must NOT refuse."""
+    to a verb whose payload is a list, so those must NOT refuse.
+
+    WAS: `set(intent["units"]) == {CHAMPION, PRIESTESS}`. "the hero" is the
+    engine's `my hero` selector — every living hero of the seat — so the two
+    heroes are still both named, by the phrase rather than by their ids. That
+    is the upgrade: a hero that dies and is revived with a new id is still
+    covered by an autocast rule armed this way.
+    """
     for phrase, verb in (("autocast at 3 with the hero", "autocast"),
                          ("retreat at 30% with the hero", "retreat"),
                          ("focus siege with the hero", "priority")):
         intent = only(compile_one(phrase), verb)
-        assert set(intent["units"]) == {CHAMPION, PRIESTESS}, phrase
+        assert intent["select"] == "my hero", phrase
+        assert "units" not in intent, phrase
+    # ...and the phrase means exactly the set the ids used to be.
+    assert set(ic.resolve_units("the hero", snap())) == {CHAMPION, PRIESTESS}
 
 
 def test_squad_retask_keeps_the_squads_existing_job():
@@ -323,7 +449,12 @@ def test_retreat_and_focus():
     retreat = only(compile_one("retreat at 35%"), "retreat")
     assert retreat["below"] == 0.35
     assert (retreat["x"], retreat["z"]) == MY_BASE
-    assert 4294968100 not in retreat["units"]
+    # WAS: `assert 4294968100 not in retreat["units"]`. The default selection
+    # is the army, and the army is a role — a retreat policy set this way
+    # covers the footman trained after it was set, which is the whole point of
+    # a POLICY.
+    assert retreat["select"] == "all army"
+    assert "units" not in retreat
 
     retreat = only(compile_one("fall back at 40% to the center ford"), "retreat")
     assert retreat["below"] == 0.4
@@ -346,9 +477,132 @@ def test_leash_and_autocast():
     assert leash["units"] == [4294968140]
     assert (leash["x"], leash["z"], leash["radius"]) == (70.0, 70.0, 25.0)
 
+    # WAS: `set(autocast["units"]) == {CHAMPION, PRIESTESS}`. Same two heroes,
+    # named by the role that outlives their entity ids.
     autocast = only(compile_one("autocast at 3"), "autocast")
-    assert set(autocast["units"]) == {CHAMPION, PRIESTESS}
+    assert autocast["select"] == "my hero"
     assert autocast["min_enemies"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Stances — one word for a whole doctrine
+# ---------------------------------------------------------------------------
+
+
+def test_a_squad_takes_a_stance_by_saying_the_word():
+    """WAS — and this is why the sentence was worth adding rather than merely
+    nice: "squad 1 turtles at our base" reached `squad-retask`, which read
+    "turtles at our base" as a PLACE, resolved it to our base on the word
+    "base", found squad 1 had no job to keep, and emitted
+    `posture push` AT OUR OWN HALL. A silent wrong order that read as a clean
+    compile — the exact failure this tool exists to prevent.
+    """
+    result = compile_one("squad 1 turtles at our base")
+    assert result.intents == [{"type": "stance", "squad": 1, "stance": "turtle",
+                               "x": MY_BASE[0], "z": MY_BASE[1]}]
+    # One intent, which is what makes a stance the natural action half of a
+    # trigger: a whole doctrine deferred without deferring a membership change.
+    assert verbs(result) == ["stance"]
+
+
+def test_the_bare_stance_verbs_are_the_four_that_are_only_stances():
+    cases = {
+        "squad 1 turtles at our base": "turtle",
+        "squad 2 stages at mid": "stage",
+        "squad 2 secures the northwest ford": "secure",
+        "squad 3 harasses their base": "harass",
+        # ...and the participles a commander types under time pressure.
+        "squad 4 securing the center ford": "secure",
+    }
+    for directive, want in cases.items():
+        assert only(compile_one(directive), "stance")["stance"] == want, directive
+
+
+def test_push_keeps_its_posture_meaning_and_the_stance_has_a_longer_spelling():
+    """The one real seam between the two doctrine vocabularies.
+
+    `push` and `defend` are stance words AND posture words. "squad 2 pushes
+    their base" has meant `posture push` since squads existed and is pinned
+    three tests up; COMMANDER_BRIEF is equally clear that the hand-tuned verbs
+    must stay reachable ("nothing here can be expressed only as a stance"). So
+    the bare verb keeps the older meaning and the preset gets the explicit
+    spelling, rather than one of the two becoming unsayable.
+    """
+    assert verbs(compile_one("squad 2 pushes their base")) == ["posture"]
+    for directive in ("squad 2 takes the push stance at their base",
+                      "put squad 2 on push at their base",
+                      "stance push for squad 2 at their base"):
+        stance = only(compile_one(directive), "stance")
+        assert stance == {"type": "stance", "squad": 2, "stance": "push",
+                          "x": THEIR_BASE[0], "z": THEIR_BASE[1]}, directive
+
+
+def test_a_stance_can_be_ordered_by_naming_the_job_first():
+    """The mirror of hold/push/forage: name the job and the ground, say who
+    with. A squad by number is re-tasked; units are enrolled first, which is
+    the same two-sentence shape `posture_clause` emits."""
+    assert compile_one("harass their base with squad 3").intents == [
+        {"type": "stance", "squad": 3, "stance": "harass",
+         "x": THEIR_BASE[0], "z": THEIR_BASE[1]}]
+
+    result = compile_one("harass their base with the cavalry")
+    assert verbs(result) == ["squad", "stance"]
+    squad, stance = result.intents
+    assert set(squad["units"]) == {4294968130, 4294968131, 4294968132}
+    assert stance["squad"] == squad["id"]
+    # A role rides as a role here too.
+    result = compile_one("secure the center ford with everything")
+    assert result.intents[0] == {"type": "squad", "select": "all army", "id": 1}
+
+
+def test_a_stance_with_no_ground_carries_no_anchor_at_all():
+    """The engine's default anchor is your own base, which is what `turtle`
+    means anyway — and writing the hall's coordinates out here would freeze a
+    position that a second hall can move."""
+    stance = only(compile_one("squad 3 stages"), "stance")
+    assert stance == {"type": "stance", "squad": 3, "stance": "stage"}
+    assert "x" not in stance and "target" not in stance
+
+
+def test_a_named_region_is_a_stance_target_by_name():
+    """Late-bound ground, on the same rule as every other verb — spelled
+    `target`, which is the word COMMANDER_BRIEF's stance section uses and an
+    alias of `region` on the wire."""
+    s = region_snap(("north-pass", NW_FORD, 20.0))
+    result = ic.compile_directives(["squad 2 secures north-pass"], s)
+    assert only(result, "stance") == {"type": "stance", "squad": 2,
+                                      "stance": "secure", "target": "north-pass"}
+    # No radius, ever: a stance's ring is the stance's, not the region's, and
+    # sending the circle's number would quietly make the preset not a preset.
+    assert "radius" not in only(result, "stance")
+
+
+def test_an_unknown_stance_word_is_refused_with_all_five_named():
+    for directive in ("put squad 1 on bunker",
+                      "squad 1 takes the bunker stance",
+                      "stance bunker for squad 1"):
+        result = compile_one(directive)
+        assert result.intents == [], directive
+        reason = result.errors[0][1]
+        assert "no stance called 'bunker'" in reason, directive
+        for word in ic.STANCES:
+            assert word in reason, (directive, word)
+
+
+def test_a_stance_is_a_whole_doctrine_a_trigger_can_arm():
+    trigger = only(compile_one("when my base is attacked, squad 1 turtles"),
+                   "trigger_set")
+    assert trigger["when"] == {"type": "base_under_attack"}
+    assert trigger["then"] == {"type": "stance", "squad": 1, "stance": "turtle"}
+
+
+def test_a_stance_sentence_does_not_steal_a_repoint():
+    """`squad N <place>` keeps a squad's job and only moves it. The loose
+    stance spellings must not read a place name as a stance word."""
+    posture = only(compile_one("squad 0 the center ford"), "posture")
+    assert posture["posture"]["type"] == "defend"
+    move = only(compile_one("move squad 0 to mid"), "move")
+    assert move["select"] == "squad 0"
 
 
 def test_template_stamps_every_matching_building():
@@ -436,10 +690,14 @@ def test_build_falls_through_from_train_and_picks_the_nearest_worker():
 
 def test_explicit_coordinates_are_never_nudged():
     """A landmark is an anchor the tool may improve on; a coordinate is a
-    decision, and relocating it would be the tool overruling the commander."""
+    decision, and relocating it would be the tool overruling the commander —
+    which is now also why typed coordinates get NO `site` selector: that key is
+    permission to move the footprint, and this sentence never gave it.
+    """
     for phrase in ("build a tower at (-40, 20)", "build a tower at -40, 20"):
         build = only(compile_one(phrase), "build")
         assert (build["x"], build["z"]) == (-40.0, 20.0), phrase
+        assert "site" not in build, phrase
 
 
 def test_two_builds_in_one_directive_do_not_collide():
@@ -467,11 +725,33 @@ def test_a_default_build_site_avoids_buildings_that_already_stand():
 
 
 def test_harvest_only_ever_names_workers():
+    """WAS: a frozen worker list and a frozen NODE id (`target == 4294968300`,
+    the mine nearest our hall; `4294968400`, the nearest tree).
+
+    Both halves are late-bound now, and the node is the sharper of the two: a
+    memorised tree gets chopped down, and a repeating "harvest lumber" trigger
+    that named one would send workers to a stump for the rest of the match.
+    `target_select` is measured from the workers being sent, when the order
+    compiles.
+    """
     harvest = only(compile_one("harvest gold"), "harvest")
-    assert set(harvest["units"]) == {4294968100, 4294968101, 4294968102}
-    assert harvest["target"] == 4294968300  # the mine nearest our hall
+    assert harvest["select"] == "workers"
+    assert harvest["target_select"] == "nearest mine"
+    assert "target" not in harvest and "units" not in harvest
     lumber = only(compile_one("harvest lumber"), "harvest")
-    assert lumber["target"] == 4294968400
+    assert lumber["target_select"] == "nearest tree"
+    # The phrase still means our three workers and nobody else.
+    assert set(ic.resolve_units("workers", snap())) == {
+        4294968100, 4294968101, 4294968102}
+
+
+def test_harvest_with_a_mixed_selection_still_filters_to_workers():
+    """A phrase that is not the worker ROLE has to be spent into ids to be
+    filtered at all — only workers can gather, and intent.rs answers anyone
+    else with one error per unit."""
+    result = compile_one("harvest gold with the cavalry")
+    assert result.intents == []
+    assert result.errors and "no workers" in result.errors[0][1]
 
 
 def test_tier_up_and_research():
@@ -759,13 +1039,19 @@ KNOWN_VERBS = {
     "move", "attackmove", "attack", "harvest", "return", "follow", "stop",
     "build", "train", "upgrade", "cancel", "research", "rally",
     "cast", "buy", "use_item",
-    "priority", "retreat", "leash", "autocast", "squad", "posture", "template",
+    "priority", "retreat", "leash", "autocast", "squad", "posture", "stance",
+    "template",
     "trigger_set", "trigger_clear",
     "region_set", "region_clear",
     "plan_set", "plan_clear",
     "autopilot", "surrender",
 }
 POSTURE_TYPES = {"defend", "push", "escort", "forage"}
+# `shared::SELECTOR_NAMES`, spelled out. A phrase outside this set is refused
+# by the engine with the whole list, so emitting one is emitting an error.
+SELECTOR_PHRASES = {"my hero", "all army", "all units", "workers",
+                    "nearest tree", "nearest mine", "nearest legal site"} | {
+    f"squad {n}" for n in range(256)}
 
 
 def test_every_emitted_intent_is_a_known_verb_and_json_serialisable():
@@ -779,6 +1065,8 @@ def test_every_emitted_intent_is_a_known_verb_and_json_serialisable():
         "research armor", "buy a town portal for the priestess",
         "scout the southeast ford", "use slot 1 for the champion",
         "squad 0 pushes their base", "stand down squad 3",
+        "squad 5 turtles at our base", "harass their base with squad 6",
+        "send the army to mid",
     ]
     result = ic.compile_directives(directives, snap())
     assert not result.errors, result.errors
@@ -786,6 +1074,12 @@ def test_every_emitted_intent_is_a_known_verb_and_json_serialisable():
         assert intent["type"] in KNOWN_VERBS, intent
         if intent["type"] == "posture" and intent.get("posture"):
             assert intent["posture"]["type"] in POSTURE_TYPES, intent
+        if intent["type"] == "stance":
+            assert intent["stance"] in ic.STANCES, intent
+        # A selector is a PHRASE the engine parses, never an invented one.
+        for key in ("select", "target_select", "site"):
+            if key in intent:
+                assert intent[key] in SELECTOR_PHRASES, intent
         # Ids stay integers: `Entity::to_bits` round-trips only as a number.
         for key in ("units", "target", "building", "worker", "shop", "unit", "hero"):
             value = intent.get(key)
@@ -955,6 +1249,30 @@ def test_a_plan_is_refused_when_it_is_too_long_or_shaped_like_a_trigger():
     # says which word to use rather than compiling something else.
     r = compile_one("when we reach tier 2, build a sanctum, then train 2 sorcerers")
     assert any("cannot open with a condition" in why for _, why in r.errors), r.errors
+
+
+def test_explain_documents_the_stance_grammar():
+    """A model reading --explain is the only reader some of these get. A stance
+    it cannot see is a stance it cannot use, and the seam around `push` is the
+    part it would otherwise get wrong twice."""
+    for phrase in ("STANCES", "squad 1 turtles at our base",
+                   "harass their base with squad 3",
+                   "put squad 2 on push at the northwest ford",
+                   "stance turtle for squad 1",
+                   "ONE SEAM WORTH KNOWING",
+                   "An unknown stance word is refused with all five named"):
+        assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
+    for word in ic.STANCES:
+        assert word in ic.EXPLAIN, word
+
+
+def test_explain_documents_the_selector_layer():
+    for phrase in ("ROLES ARE SENT AS ROLES", '"select":"all army"',
+                   '"select":"workers"', '"select":"my hero"',
+                   '"select":"squad <n>"', "target_select",
+                   "nearest legal site", "send <units> to <place>",
+                   "compiles to ids"):
+        assert phrase in ic.EXPLAIN, f"--explain never mentions {phrase!r}"
 
 
 def test_explain_documents_the_plan_grammar():

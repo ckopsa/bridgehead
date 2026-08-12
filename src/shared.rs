@@ -7012,6 +7012,28 @@ pub enum TriggerWhen {
     BaseUnderAttack,
     /// Any of our own living heroes is below `frac` of max health.
     HeroBelow { frac: f32 },
+    /// **Every** living hero we own is at or above `frac` of max health, and we
+    /// own at least one. "My hero is healed", as a wait-condition.
+    ///
+    /// This is NOT `not hero_below`, and the difference is the whole reason it
+    /// is a named predicate rather than a negation operator (docs/INTENT.md
+    /// refuses `and`/`or`/`not` — a boolean algebra is where doctrine stops
+    /// being doctrine). Two departures, both deliberate:
+    ///
+    ///   * **A dead hero is not a healed hero.** With no living hero this is
+    ///     false, exactly as `hero_below` is. A chain that said "turtle until
+    ///     the hero is healed, then commit" must not commit the moment the hero
+    ///     dies — which is precisely what a negation would do, at the worst
+    ///     available instant.
+    ///   * **All, not any.** `hero_below` asks about "whichever one is dying"
+    ///     because that is the useful reading of *save my hero*; the useful
+    ///     reading of *wait until my heroes are ready* is the whole roster, or
+    ///     a fresh second hero would release a chain over the corpse-adjacent
+    ///     first one.
+    ///
+    /// So with at least one hero alive the two really are complements, and with
+    /// none alive both are false — which is the honest answer to both questions.
+    HeroAbove { frac: f32 },
     /// The living members of our squad `id` hold, in total, less than `frac` of
     /// their combined max health. False for a squad with no living members —
     /// a squad that is gone cannot be "hurt", and firing a rescue at a corpse
@@ -7185,6 +7207,9 @@ impl TriggerWhen {
             TriggerWhen::BaseUnderAttack => "the base is attacked".to_string(),
             TriggerWhen::HeroBelow { frac } => {
                 format!("a hero drops below {} health", pct(*frac))
+            }
+            TriggerWhen::HeroAbove { frac } => {
+                format!("every living hero is back above {} health", pct(*frac))
             }
             TriggerWhen::SquadBelow { id, frac } => {
                 format!("squad {id} drops below {} health", pct(*frac))
@@ -9782,7 +9807,7 @@ pub struct SpawnBuildingEvent {
 // ---------------------------------------------------------------------------
 
 /// How a match ended. Round-9 AAR (`wc3clone-azo`): the winner could not tell
-/// which win they had got. The engine recognises exactly two endings and has
+/// which win they had got. The engine recognises exactly two *wins* and has
 /// always known which one it took — it just never said.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GameOverReason {
@@ -9790,6 +9815,20 @@ pub enum GameOverReason {
     Razed,
     /// The loser conceded.
     Surrender,
+    /// **The time cap ran out and the referee counted the assets.**
+    /// `BH_MAX_GAME_SECS` stops an unattended run; `asset_score` says who was
+    /// ahead when it did (`main::headless_exit`).
+    ///
+    /// Named apart from the two wins on purpose, and docs/ARENA.md's ledger
+    /// vocabulary has said so since round 10: this is a referee's opinion, not
+    /// a win the game recognises, so a round decided this way is recorded
+    /// `decisive: false` and can never be quoted as a conquest. It is a
+    /// *verdict* nonetheless — a decided match, delivered down the same
+    /// channel as the other two, because the alternative is what
+    /// `wc3clone-j84` was filed for: a capped match that ends with
+    /// `game_over: null` and a commander polling a file that will never
+    /// change again.
+    Score,
 }
 
 impl GameOverReason {
@@ -9798,20 +9837,32 @@ impl GameOverReason {
         match self {
             GameOverReason::Razed => "razed",
             GameOverReason::Surrender => "surrender",
+            GameOverReason::Score => "score",
         }
     }
 }
 
 /// The verdict, once there is one. Named fields rather than the old
 /// `GameOver(Option<Team>)` tuple so the reason cannot be added at one call
-/// site and forgotten at the other: `decide` is the only way to set either,
-/// and it takes both.
+/// site and forgotten at the other: `decide` and `decide_draw` are the only
+/// ways to set any of it, and each takes everything it sets.
 #[derive(Resource, Default)]
 pub struct GameOver {
-    /// `Some(winner)` once decided.
+    /// `Some(winner)` once somebody has won. **`None` is not "still playing"**
+    /// — a drawn match is decided and names nobody. Ask `decided()` whether
+    /// the match is over; ask this only who won it.
     pub winner: Option<Team>,
-    /// Always `Some` exactly when `winner` is.
+    /// Always `Some` exactly when the match is `decided()`.
     pub reason: Option<GameOverReason>,
+    /// **Decided, with no winner.** Only `GameOverReason::Score` can produce
+    /// one today: two teams dead even on assets when the cap expired.
+    ///
+    /// A separate flag rather than a sentinel team, for the reason
+    /// docs/ARENA.md gives the ledger ("a draw is an absent winner, not a
+    /// sentinel team. Round 2 is the reason") — a fake winner is a lie every
+    /// downstream reader inherits, and `winner` is read by the HUD banner, the
+    /// snapshot and the arena record.
+    pub drawn: bool,
 }
 
 impl GameOver {
@@ -9819,6 +9870,22 @@ impl GameOver {
     pub fn decide(&mut self, winner: Team, reason: GameOverReason) {
         self.winner = Some(winner);
         self.reason = Some(reason);
+    }
+
+    /// Record a decided match that nobody won.
+    pub fn decide_draw(&mut self, reason: GameOverReason) {
+        self.drawn = true;
+        self.reason = Some(reason);
+    }
+
+    /// **Is the match over?** The question every gate in the game is actually
+    /// asking when it stops taking input, stops the scripted commander, or
+    /// draws a banner. It was spelled `winner.is_some()` everywhere until a
+    /// draw became possible, at which point that spelling quietly meant
+    /// "somebody won" instead — one choke point, so a draw cannot end the
+    /// match in the snapshot and leave the UI still accepting orders.
+    pub fn decided(&self) -> bool {
+        self.winner.is_some() || self.drawn
     }
 }
 
@@ -11221,7 +11288,7 @@ fn check_game_over(
     mut surrenders: EventReader<Surrender>,
     buildings: Query<(&Building, &Team)>,
 ) {
-    if game_over.winner.is_some() {
+    if game_over.decided() {
         surrenders.clear();
         return;
     }
@@ -14208,6 +14275,62 @@ mod tests {
         assert_eq!(GameOver::default().reason, None);
         assert_eq!(GameOverReason::Razed.name(), "razed");
         assert_eq!(GameOverReason::Surrender.name(), "surrender");
+    }
+
+    /// **A drawn match is decided and names nobody** — `wc3clone-j84`. The cap
+    /// can end a match dead even, and the two questions "is it over" and "who
+    /// won" stopped having the same answer the moment it could: every gate in
+    /// the game asks `decided()`, and only the things that print a name ask
+    /// `winner`.
+    #[test]
+    fn a_draw_is_decided_and_names_nobody() {
+        let mut over = GameOver::default();
+        assert!(!over.decided(), "an undecided match is not over");
+
+        over.decide_draw(GameOverReason::Score);
+        assert!(over.decided(), "a draw ENDS the match");
+        assert_eq!(over.winner, None, "and it names no winner (docs/ARENA.md)");
+        assert_eq!(over.reason, Some(GameOverReason::Score));
+        assert!(over.drawn);
+
+        // A win is still a win, and still decided.
+        let mut over = GameOver::default();
+        over.decide(Team::Claude, GameOverReason::Score);
+        assert!(over.decided());
+        assert_eq!(over.winner, Some(Team::Claude));
+        assert!(!over.drawn, "somebody won; this was no draw");
+
+        // The wire name the ledger, the HUD and the headless log all print.
+        // docs/ARENA.md's `END_REASONS` has listed it since round 10.
+        assert_eq!(GameOverReason::Score.name(), "score");
+    }
+
+    /// The match-over gate is one question with one answer. A draw that ended
+    /// the match for the snapshot but not for `check_game_over` would let a
+    /// late raze overwrite a verdict two commanders had already been handed.
+    #[test]
+    fn a_decided_draw_stops_the_game_over_check() {
+        let mut app = App::new();
+        app.init_resource::<Races>();
+        app.init_resource::<Time>()
+            .init_resource::<GameOver>()
+            .add_event::<Surrender>()
+            .add_systems(Update, check_game_over);
+        app.world_mut()
+            .resource_mut::<GameOver>()
+            .decide_draw(GameOverReason::Score);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(20));
+        // Human owns no production building, which on any undecided frame is a
+        // raze verdict for Claude.
+        app.world_mut()
+            .spawn((Building { kind: BuildingKind::Barracks }, Team::Claude));
+        app.update();
+
+        let over = app.world().resource::<GameOver>();
+        assert_eq!(over.winner, None, "the draw stands");
+        assert_eq!(over.reason, Some(GameOverReason::Score));
     }
 
     /// **The team that took the cache is told it took the cache** —

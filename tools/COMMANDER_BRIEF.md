@@ -29,6 +29,20 @@ co-commander section near the end, which is the only part that differs.
 3. Decide. 4. Write commands (see below).
 Repeat until `game_over` is non-null, then stop and report the result.
 
+**How a match can end**, so you know what you are polling for. `game_over` is a
+team name — `"Human"` or `"Claude"` — or the literal `"draw"`, and `game_over_reason`
+beside it says which ending it was:
+
+| `game_over_reason` | What happened |
+| --- | --- |
+| `razed` | the loser has no production buildings left |
+| `surrender` | the loser conceded |
+| `score` | **the match hit its time cap** and the referee counted assets — bank plus the gold-and-lumber worth of everything still standing. Ahead on that total wins; exactly level is `game_over: "draw"`. |
+
+A capped match is not a stalemate you can wait out: it is scored, so being ahead
+on assets when the clock runs out is a real way to win and being behind is a
+real way to lose. Every ladder round runs under a cap.
+
 **Read the map before you say `ready` — that is what the time is for, and your
 opponent gets exactly the same amount of it.** You may look at everything and
 send your whole opening batch *before* readying; those orders compile at t=0 and
@@ -86,7 +100,8 @@ Unit orders (ids from state):
   outrank the frozen form beside them.
 
 - `{"type":"attack","units":[ids],"target":enemy_id}`
-- `{"type":"harvest","units":[worker_ids],"target":node_id}` (mines AND trees — tree ids in `trees_near`)
+- `{"type":"harvest","units":[worker_ids],"target":node_id}` (mines AND trees — tree ids in `trees_near`;
+  a mine with `"remaining": 0` is refused — say `"target_select":"nearest mine"` instead)
 - `{"type":"return","units":[worker_ids]}`  `{"type":"stop","units":[ids]}`  `{"type":"follow","units":[ids],"target":own_id}`
 Production:
 - `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free; you pay on placement)
@@ -443,12 +458,13 @@ array with `status` (`armed`/`cooling`/`spent`), `last_fired`, and the English
 
     trigger home-guard fired: squad 1 defends (-70.0, -70.0) within 26
 
-### The thirteen predicates
+### The fourteen predicates
 
 | `when` | means |
 |---|---|
 | `{"type":"base_under_attack"}` | any of YOUR buildings damaged in the last 8s |
 | `{"type":"hero_below","frac":0.35}` | any of your living heroes under that fraction |
+| `{"type":"hero_above","frac":0.8}` | **every** living hero of yours at or above that fraction, and you have at least one. "My hero is healed" — the wait-condition half of the pair, and **not** the negation of `hero_below`: with no hero alive this is **false**, so a chain waiting on it never advances over a corpse |
 | `{"type":"squad_below","id":1,"frac":0.5}` | squad 1's POOLED health under that (false if the squad is empty) |
 | `{"type":"enemy_sighted","class":"Siege","count":3}` | you can SEE that many enemies now (`class` optional; fog-honest) |
 | `{"type":"enemy_in","region":"north-pass","count":5}` | you can see that many enemies **inside a named place** (`class` optional; fog-honest both ways — see *Territory*) |
@@ -615,7 +631,7 @@ Every step writes a line into `events` as it goes out:
 | `advance` | the plan moves on |
 |---|---|
 | omitted (or `{"type":"on_applied"}`) | the moment this step is ACCEPTED — the plain meaning of "then" |
-| `{"type":"when","when":{...}}` | when that condition holds — **any of the thirteen trigger predicates above**, including the intel ones |
+| `{"type":"when","when":{...}}` | when that condition holds — **any of the fourteen trigger predicates above**, including the intel ones |
 | `{"type":"after","secs":30}` | 30 seconds after this step was accepted |
 
 "Accepted" means the order was legal and taken, NOT that the building finished.
@@ -765,6 +781,99 @@ membership is late-bound by number; there is no equivalent handle for buildings.
 So: send `boomer` on your first poll, and send `army` on the poll after the
 Barracks shows up in your snapshot. Two plans is exactly the cap, and this is
 what the cap is for.
+
+### Chains: a plan whose steps are stances
+
+**There is no `stance_plan` verb, because there does not need to be.** A *chain*
+is an ordinary plan whose steps are `stance` sentences and whose `advance`
+conditions are the waits you would otherwise have spent a poll discovering:
+
+> turtle until the hero is healed, then secure the northwest mine
+
+```json
+{"type":"plan_set","name":"hold","steps":[
+  {"intent":{"type":"stance","squad":1,"stance":"turtle"},
+   "advance":{"type":"when","when":{"type":"hero_above","frac":0.8}}},
+
+  {"intent":{"type":"stance","squad":1,"stance":"secure",
+             "target":"northwest mine"}}]}
+```
+
+Two steps, **zero entity ids, zero coordinates**. `squad 1` is late-bound by
+number, so it means whoever is in the squad when the step runs; `northwest mine`
+is late-bound by name against `map.places`, so it is armable on your opening
+poll with nothing named first. Both stances are re-decided by the engine at
+sim-tick speed for as long as they stand — a chain is not a script that runs and
+finishes, it is a sequence of *doctrines* with a condition between them.
+
+This is the **pre-armed policy** tier, and it is where you should be spending
+your thinking. An alarm asks you to re-decide at LLM latency; a chain is the
+answer you gave earlier, when there was no clock on it. "If my push meets a
+dozen defenders, break contact to the staging anchor" is a decision you can make
+in your first minute and have executed in your twentieth:
+
+```json
+{"type":"region_set","name":"staging","x":-30.0,"z":-30.0,"radius":20.0}
+
+{"type":"plan_set","name":"probe","steps":[
+  {"intent":{"type":"stance","squad":1,"stance":"push","target":"their base"},
+   "advance":{"type":"when","when":{"type":"enemy_in","region":"their base","count":12}}},
+
+  {"intent":{"type":"stance","squad":1,"stance":"stage","target":"staging"}}]}
+```
+
+**A target you have not scouted yet still arms.** That is the point of deciding
+at leisure: the ground you will want may not have a name yet. The engine checks
+each step's target when you set the plan and *tells* you, without refusing
+anything:
+
+    cmd 2: chain holds at step 2: no region named 'their-expansion' - known
+    places: our base, their base, mid, northwest mine, … — plan hold is armed
+    anyway; the step resolves when its turn comes, and blocks there if it
+    still cannot
+
+Read that as **armed, holding** — not rejected. Your plan is in the `plans`
+array and step 1 is already running. If you name the ground (`region_set`)
+before that step's turn, it resolves and nothing was ever wrong. If you do not,
+the step blocks exactly like any other refused step — `status` reads
+`blocked: no region named 'their-expansion' - known places: …`, it retries every
+5s, it recovers the moment you name the region (with a `plan … unblocked` line),
+and it halts after a minute if you never do. Nothing is ever skipped.
+
+Here is a real seat doing exactly that — the chain armed in the same batch as
+`ready`, held for the 25 seconds its hero took to train, then run:
+
+```
+[    0.0] cmd 3: chain holds at step 2: no region named 'their-expansion' - known
+          places: our base, their base, mid, … — plan hold is armed anyway
+[    3.0] plan hold step 1/2: squad 1 takes the turtle stance: defends … within 14,
+          leashed to 20, retreat below 45% to its anchor, focus Siege > Cavalry
+          ... plans[0].status = "running" for 24 game seconds; the hero is training
+[   27.0] plan hold step 2/2: squad 1 takes the secure stance: defends
+          their-expansion within 30, leashed to 38, retreat below 35% …
+[   27.0] plan hold step 2/2 blocked: no region named 'their-expansion' - known places: …
+          >> the commander sends region_set their-expansion
+[   31.0] plan hold step 2/2 unblocked
+[   31.0] plan hold complete (2 steps)
+          squads[1] = {"posture":"defend@(40.0,-40.0)r=30","members":1,"stance":"secure"}
+```
+
+Note what step 1's wait was really doing: this seat had **no hero at all** when
+the chain was armed, and `hero_above` is false for an empty roster. "Turtle
+until the hero is healed" and "turtle until the hero exists" are the same
+sentence, which is what you want — the chain will not commit over a corpse
+either.
+
+Three things a chain does NOT do, all of them on purpose:
+
+- **It does not loop.** Once through, then `done`. Repetition is a trigger's
+  `repeat`.
+- **It does not outrank a trigger.** If a chain step and a trigger re-task the
+  same squad on the same tick, the trigger wins — a rule written for the
+  situation in front of you beats a sequence written before the match.
+- **It does not hold the squad still while it waits.** The stance from the
+  previous step is *running* the whole time. Silence between steps is the
+  doctrine you already set, not a gap.
 
 ### Plans vs triggers — use both
 
@@ -929,10 +1038,15 @@ documented above, and writes the batch with the next `seq` (exactly like
 `bridge_send.py`). It prints what it understood, per clause, to stderr:
 
 ```
-  ok       'hold the northwest ford'   -> squad 1 defends (-60.0, 60.0) with 7 unit(s)
+  ok       'hold the northwest ford'   -> squad 1 defends (-60.0, 60.0) with all army (7 right now)
   ok       'forage mid with the cavalry'-> squad 2 forages (0.0, 0.0) with 3 unit(s)
-  ok       'retreat at 35%'            -> 10 unit(s) fall back to (70.0, 70.0) below 35%
+  ok       'retreat at 35%'            -> all army (10 right now) fall back to (70.0, 70.0) below 35%
 ```
+
+Two of those name a **role** and one names a kind, and the difference is on the
+wire: a role compiles to `"select":"all army"`, a kind to a list of ids. The
+count in the confirmation is a fact about right now; the phrase is what was
+sent.
 
 Why bother when you can write JSON? Because the phrases are shorter than the
 ids, and because places have names: `mid`, `our base`, `their base`, `the
@@ -962,6 +1076,21 @@ in `buy`'s optional `hero` field for you; with only one hero alive it is
 omitted, exactly as before. The Sorcerer is a caster but **not** a hero, so
 `the hero` never sweeps it up — use `sorcerers`.
 
+- **It speaks selectors, so your standing orders stay live.** Four English
+  words are engine roles and go on the wire as roles: `the army` /
+  `everything` → `"select":"all army"`, `workers` → `"select":"workers"`,
+  `the hero` → `"select":"my hero"`, `squad 2` → `"select":"squad 2"`.
+  `harvest gold` says `"target_select":"nearest mine"` rather than memorising a
+  node, and a `build` at a landmark (not at typed coordinates) adds
+  `"site":"nearest legal site"`. A phrase naming KINDS — `the cavalry`, `the
+  siege`, `the champion` — has no role to become and still compiles to ids, so
+  say it with a squad when it has to outlive the units in it.
+- **Stances have sentences too**: `squad 1 turtles at our base`, `squad 2
+  secures north-pass`, `harass their base with squad 3`, and for the two words
+  that are also postures, the longer spelling — `put squad 2 on push at the
+  northwest ford` or `squad 2 takes the push stance at north-pass`. Bare
+  `squad 2 pushes their base` still means `posture push`, so both vocabularies
+  stay reachable. An unknown stance word is refused with all five named.
 - `--explain` prints the full vocabulary. **Read it once**; it is the list of
   idioms that compile deterministically.
 - Anything it does not know, write by hand. It is a convenience over the schema
@@ -1248,7 +1377,9 @@ first), `unlocked` for ACTING.
     absent == you are looking at it right now.
   - `bounties` lists only caches you can SEE. Treasure you have no eyes on is invisible.
   - Still public and unfiltered: `map`, `mines` (position AND remaining gold), `trees_near`.
-    Map geography is not a secret; what the enemy is DOING with it is.
+    Map geography is not a secret; what the enemy is DOING with it is. A mined-out
+    mine **stays** in `mines` reading `"remaining": 0` — a dry mine is still a place,
+    and it is the thing `mine_dry` watches for. (Felled trees leave `trees_near`.)
   - You cannot `attack` an id you cannot see or remember — it is rejected as
     `target N is not visible`. Use `attackmove` to advance into the unknown.
   - **Scout deliberately.** Vision radius is per-kind in `catalog.json` (`vision`).

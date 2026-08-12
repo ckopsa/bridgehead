@@ -1446,6 +1446,21 @@ fn compile_intent(
                     return;
                 }
             };
+            // A mined-out gold mine stays on the board as geography (economy.rs:
+            // `mine_dry`, the income alarm and `mines[].remaining` all need a dry
+            // mine they can look at), so its id still resolves. Say so here
+            // rather than let it through: `harvest_loop` would silently
+            // re-target the crew to the nearest live node, and a worker doing
+            // something you did not ask for is worse than a refusal that names
+            // the way to ask for it.
+            if nodes.get(node).is_ok_and(|(_, n, _)| n.remaining == 0) {
+                errors.push(format!(
+                    "{tag}: resource node {target} is empty — use target_select \
+                     \"nearest mine\" (or \"nearest tree\") for the closest one \
+                     with anything left in it"
+                ));
+                return;
+            }
             // `reached` is recomputed rather than inherited from `own_units`:
             // every survivor can still be skipped here for not being a worker,
             // and a `harvest` that ordered nobody is a refusal, not a partial.
@@ -2950,6 +2965,47 @@ fn compile_intent(
                         }
                     }
                 }
+                // **Per-step readiness: teaching, and never a gate.**
+                //
+                // A chain — a plan whose steps are stances — is written to be
+                // armed before the world it names exists: "turtle until the
+                // hero is healed, then secure the northwest mine" is set at
+                // leisure, and the northwest mine may be a region this seat has
+                // not scouted, let alone named, yet. Refusing that plan would
+                // refuse exactly the sentence the feature is for
+                // (docs/AFFORDANCES.md § Chains), so nothing below this comment
+                // returns.
+                //
+                // What a commander IS owed is to be told which steps cannot be
+                // resolved *yet*, at the moment they arm, rather than at 3 a.m.
+                // when the sequence stopped at step 2. So we dry-run the ONE
+                // resolver against the world as it stands — no second notion of
+                // what "resolvable" means, and the refusal is in the resolver's
+                // own words, which is the same string the step will block with
+                // if the name is still unknown when its turn comes.
+                //
+                // Some of what this reports is permanent rather than pending (a
+                // step with no x/z at all will never resolve). That is fine and
+                // deliberately not sorted into two messages here: the resolver's
+                // sentence already says which of the two it is, and a second
+                // classifier would be a second opinion about the first one.
+                if let Err(err) = resolve_places(
+                    step.intent.clone(),
+                    &LateBind {
+                        me,
+                        regions,
+                        units,
+                        squads,
+                        nodes,
+                        nav,
+                    },
+                ) {
+                    errors.push(format!(
+                        "{tag}: chain holds at step {k}: {err} — plan {name} is armed \
+                         anyway; the step resolves when its turn comes, and blocks \
+                         there if it still cannot"
+                    ));
+                }
             }
             // NOT checked, for exactly the reason a trigger's `then` is not:
             // every step but the first describes a world that does not exist
@@ -3089,6 +3145,7 @@ fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result
     }
     match when {
         TriggerWhen::HeroBelow { frac: f } => frac("hero_below", *f),
+        TriggerWhen::HeroAbove { frac: f } => frac("hero_above", *f),
         TriggerWhen::SquadBelow { frac: f, .. } => frac("squad_below", *f),
         TriggerWhen::EnemySighted { class, count } => {
             if *count == 0 {
@@ -4896,6 +4953,133 @@ mod tests {
             "a plan may name a world that does not exist yet: {:?}",
             app.world().resource::<IntentErrors>().get(Team::Human)
         );
+    }
+
+    /// **A chain is a plan whose steps are stances, and nothing here had to
+    /// learn a new verb to say so.** The compiler takes the sentence
+    /// `docs/AFFORDANCES.md` § Chains describes — turtle until the hero is
+    /// healed, then secure the northwest mine — with no `stance_plan`, no
+    /// second plan machinery, and no arm-time refusal.
+    #[test]
+    fn a_chain_is_a_plan_whose_steps_are_stances() {
+        let mut app = compiler_app();
+        // `northwest mine` is the MAP's own word, live from second zero with
+        // nothing named first — so this chain is armable on the opening poll.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"hold","steps":[
+                {"intent":{"type":"stance","squad":1,"stance":"turtle"},
+                 "advance":{"type":"when","when":{"type":"hero_above","frac":0.8}}},
+                {"intent":{"type":"stance","squad":1,"stance":"secure",
+                           "target":"northwest mine"}}]}"#,
+        );
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "a chain over ground this seat can name is unremarkable: {:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+        assert_eq!(plan_names(&app, Team::Human), vec!["hold"]);
+        let sentence = Intent::PlanSet {
+            name: "hold".to_string(),
+            steps: app.world().resource::<Plans>().get(Team::Human)[0].steps.clone(),
+        }
+        .sentence();
+        assert!(
+            sentence.contains("squad 1 takes the turtle stance")
+                && sentence.contains("when every living hero is back above 80% health")
+                && sentence.contains("squad 1 takes the secure stance"),
+            "the chain reads as one English sentence: {sentence}"
+        );
+    }
+
+    /// **Teaching-only validation of a late-bound target.** A chain step whose
+    /// ground has not been named yet ARMS — that is the whole point of a policy
+    /// decided at leisure — and the seat is told, at arm time, which step is
+    /// holding and why. docs/AFFORDANCES.md § Chains: *"it arms and reports
+    /// 'chain holds at step 1: target unresolvable until scouted'"*.
+    #[test]
+    fn a_chain_step_that_cannot_resolve_yet_arms_and_says_which_step_holds() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"hold","steps":[
+                {"intent":{"type":"stance","squad":1,"stance":"turtle"},
+                 "advance":{"type":"when","when":{"type":"hero_above","frac":0.8}}},
+                {"intent":{"type":"stance","squad":1,"stance":"secure",
+                           "target":"their-expansion"}}]}"#,
+        );
+        assert_eq!(
+            plan_names(&app, Team::Human),
+            vec!["hold"],
+            "armed. An unscouted target must never cost a commander the plan"
+        );
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+        assert_eq!(errors.len(), 1, "one line, about the one step: {errors:?}");
+        assert!(
+            errors[0].contains("chain holds at step 2")
+                && errors[0].contains("no region named 'their-expansion'")
+                && errors[0].contains("known places")
+                && errors[0].contains("armed"),
+            "it names the step, the resolver's own reason, the menu of places, \
+             and the fact that it armed anyway: {}",
+            errors[0]
+        );
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+
+        // The same notice for the OTHER late-bound channel, so the rule is
+        // about resolvability rather than about regions.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"push","steps":[
+                {"intent":{"type":"attackmove","select":"all army","x":0.0,"z":0.0}}]}"#,
+        );
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+        assert!(
+            errors[0].contains("chain holds at step 1")
+                && errors[0].contains("matches none of your units right now"),
+            "{errors:?}"
+        );
+        assert!(plan_names(&app, Team::Human).contains(&"push".to_string()));
+    }
+
+    /// The wait-condition half. `hero_above` is judged at arm time like every
+    /// other predicate parameter, and it reaches plans through the one seam —
+    /// `PlanAdvance::When` carries a whole `TriggerWhen`, so a predicate added
+    /// for chains is a trigger predicate too, for free and in both directions.
+    #[test]
+    fn hero_above_is_a_predicate_like_any_other_at_arm_time() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"p","steps":[
+                {"intent":{"type":"stop","units":[]},
+                 "advance":{"type":"when","when":{"type":"hero_above","frac":0.0}}}]}"#,
+        );
+        let err = first_error(&app, Team::Human);
+        assert!(
+            err.contains("hero_above must be a health fraction in (0,1]"),
+            "{err}"
+        );
+        assert!(plan_names(&app, Team::Human).is_empty());
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+
+        // And as a trigger, with no work anywhere for it to be one.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"rejoin","when":{"type":"hero_above","frac":0.9},
+                "then":{"type":"stance","squad":1,"stance":"push","target":"mid"}}"#,
+        );
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "{:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+        assert_eq!(trigger_names(&app, Team::Human), vec!["rejoin"]);
     }
 
     /// Clearing: one by name, or the whole slate, with the same "there was
@@ -7946,6 +8130,37 @@ mod tests {
             errors[0].contains("no mine left on the map"),
             "{}",
             errors[0]
+        );
+    }
+
+    /// **A dry mine is a place, not a job.** economy.rs keeps a mined-out gold
+    /// mine on the board — `mine_dry`, the income alarm and `mines[].remaining`
+    /// all need a dry mine they can look at, and blue-r23's expand trigger never
+    /// fired because the node was despawned in the same statement that emptied
+    /// it. The cost of keeping it is that its id still resolves, so `harvest`
+    /// owes the commander a refusal that names the way to ask again: without one
+    /// the harvest loop would silently re-aim the crew at a node nobody named.
+    #[test]
+    fn harvesting_a_dry_mine_is_refused_and_names_the_selector() {
+        let mut app = compiler_app();
+        let worker = spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        let dry = spawn_node(&mut app, ResourceKind::Gold, Vec3::new(5.0, 0.0, 0.0), 0);
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"harvest","units":[{}],"target":{}}}"#,
+                worker.to_bits(),
+                dry.to_bits()
+            ),
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("is empty"), "{}", errors[0]);
+        assert!(errors[0].contains("nearest mine"), "{}", errors[0]);
+        assert!(
+            matches!(order_of(&app, worker), Order::Idle),
+            "a refused harvest orders nobody"
         );
     }
 
