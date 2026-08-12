@@ -1,0 +1,3216 @@
+{
+  "cases": [
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-0:turtle"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "stage",
+        "target": "home",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "stage",
+        "target": "home",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-0:stage"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "secure",
+        "target": "home",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "secure",
+        "target": "home",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-0:secure"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "harass",
+        "target": "home",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "harass",
+        "target": "home",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-0:harass"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-1:turtle"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "stage",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "stage",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-1:stage"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "secure",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "secure",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-1:secure"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "harass",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "harass",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-1:harass"
+    },
+    {
+      "as_printed": {
+        "name": "home-guard",
+        "type": "trigger_clear"
+      },
+      "filled": {
+        "name": "home-guard",
+        "type": "trigger_clear"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "trigger_clear:home-guard"
+    },
+    {
+      "as_printed": {
+        "name": "hero-save",
+        "type": "trigger_clear"
+      },
+      "filled": {
+        "name": "hero-save",
+        "type": "trigger_clear"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "trigger_clear:hero-save"
+    },
+    {
+      "as_printed": {
+        "name": "north-pass",
+        "type": "region_clear"
+      },
+      "filled": {
+        "name": "north-pass",
+        "type": "region_clear"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "region_clear:north-pass"
+    },
+    {
+      "as_printed": {
+        "name": "home",
+        "type": "region_clear"
+      },
+      "filled": {
+        "name": "home",
+        "type": "region_clear"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "region_clear:home"
+    },
+    {
+      "as_printed": {
+        "name": "opening",
+        "type": "plan_clear"
+      },
+      "filled": {
+        "name": "opening",
+        "type": "plan_clear"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "plan_clear:opening"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "push",
+        "target": "home",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "push",
+        "target": "home",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-0:push"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "push",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "push",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "stance:squad-1:push"
+    },
+    {
+      "as_printed": {
+        "squad": null,
+        "stance": null,
+        "target": null,
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "turtle",
+        "target": null,
+        "type": "stance"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [
+        "target"
+      ],
+      "rel": "stance"
+    },
+    {
+      "as_printed": {
+        "id": null,
+        "select": "all army",
+        "type": "squad"
+      },
+      "filled": {
+        "id": 0,
+        "select": "all army",
+        "type": "squad"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "squad"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "repeat": null,
+        "then": null,
+        "type": "trigger_set",
+        "when": null
+      },
+      "filled": {
+        "name": "home-guard",
+        "repeat": null,
+        "then": {
+          "select": "all army",
+          "type": "stop"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [
+        "repeat"
+      ],
+      "rel": "trigger_set"
+    },
+    {
+      "as_printed": {
+        "name": "home-guard",
+        "repeat": 30.0,
+        "then": {
+          "squad": 1,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "filled": {
+        "name": "home-guard",
+        "repeat": 30.0,
+        "then": {
+          "squad": 1,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "trigger_set:home-guard"
+    },
+    {
+      "as_printed": {
+        "name": "hero-save",
+        "repeat": 45.0,
+        "then": {
+          "region": "home",
+          "select": "my hero",
+          "type": "move",
+          "units": []
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": 0.35,
+          "type": "hero_below"
+        }
+      },
+      "filled": {
+        "name": "hero-save",
+        "repeat": 45.0,
+        "then": {
+          "region": "home",
+          "select": "my hero",
+          "type": "move",
+          "units": []
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": 0.35,
+          "type": "hero_below"
+        }
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "trigger_set:hero-save"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "radius": null,
+        "type": "region_set",
+        "x": null,
+        "z": null
+      },
+      "filled": {
+        "name": "north-pass",
+        "radius": 4.0,
+        "type": "region_set",
+        "x": 1.0,
+        "z": 1.0
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "region_set"
+    },
+    {
+      "as_printed": {
+        "name": "north-pass",
+        "radius": 20.0,
+        "type": "region_set",
+        "x": -60.0,
+        "z": 60.0
+      },
+      "filled": {
+        "name": "north-pass",
+        "radius": 20.0,
+        "type": "region_set",
+        "x": -60.0,
+        "z": 60.0
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "region_set:north-pass"
+    },
+    {
+      "as_printed": {
+        "name": "home",
+        "radius": 26.0,
+        "type": "region_set",
+        "x": 70.0,
+        "z": 70.0
+      },
+      "filled": {
+        "name": "home",
+        "radius": 26.0,
+        "type": "region_set",
+        "x": 70.0,
+        "z": 70.0
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "region_set:home"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "steps": null,
+        "type": "plan_set"
+      },
+      "filled": {
+        "name": "opening",
+        "steps": [
+          {
+            "intent": {
+              "select": "all army",
+              "type": "stop"
+            }
+          }
+        ],
+        "type": "plan_set"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "plan_set"
+    },
+    {
+      "as_printed": {
+        "name": "opening",
+        "steps": [
+          {
+            "advance": {
+              "secs": 300.0,
+              "type": "after"
+            },
+            "intent": {
+              "kind": "Farm",
+              "region": "home",
+              "select": "workers",
+              "site": "nearest legal site",
+              "type": "build"
+            }
+          },
+          {
+            "advance": {
+              "type": "when",
+              "when": {
+                "tier": 3,
+                "type": "tier_reached"
+              }
+            },
+            "intent": {
+              "region": "mid",
+              "squad": 1,
+              "stance": "stage",
+              "type": "stance"
+            }
+          }
+        ],
+        "type": "plan_set"
+      },
+      "filled": {
+        "name": "opening",
+        "steps": [
+          {
+            "advance": {
+              "secs": 300.0,
+              "type": "after"
+            },
+            "intent": {
+              "kind": "Farm",
+              "region": "home",
+              "select": "workers",
+              "site": "nearest legal site",
+              "type": "build"
+            }
+          },
+          {
+            "advance": {
+              "type": "when",
+              "when": {
+                "tier": 3,
+                "type": "tier_reached"
+              }
+            },
+            "intent": {
+              "region": "mid",
+              "squad": 1,
+              "stance": "stage",
+              "type": "stance"
+            }
+          }
+        ],
+        "type": "plan_set"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "plan_set:opening"
+    },
+    {
+      "as_printed": {
+        "kind": null,
+        "region": null,
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "filled": {
+        "kind": "TownHall",
+        "region": "our base",
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "build"
+    },
+    {
+      "as_printed": {
+        "select": "idle TownHall",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle TownHall",
+        "type": "train",
+        "unit": "Worker"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "train:TownHall"
+    },
+    {
+      "as_printed": {
+        "select": "my Barracks",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "my Barracks",
+        "type": "train",
+        "unit": "Footman"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "train:Barracks"
+    },
+    {
+      "as_printed": {
+        "select": "idle Workshop",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Workshop",
+        "type": "train",
+        "unit": "Catapult"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "train:Workshop"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my TownHall",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my TownHall",
+        "type": "rally"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "rally:TownHall"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Barracks",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Barracks",
+        "type": "rally"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "rally:Barracks"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Workshop",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Workshop",
+        "type": "rally"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "rally:Workshop"
+    },
+    {
+      "as_printed": {
+        "select": "my TownHall",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my TownHall",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:TownHall"
+    },
+    {
+      "as_printed": {
+        "select": "my Barracks",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Barracks",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Barracks"
+    },
+    {
+      "as_printed": {
+        "select": "my Workshop",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Workshop",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Workshop"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Barracks",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Barracks",
+        "type": "cancel"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "cancel:Barracks"
+    },
+    {
+      "as_printed": {
+        "name": "home-guard",
+        "repeat": 30,
+        "then": {
+          "squad": null,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "filled": {
+        "name": "home-guard",
+        "repeat": 30,
+        "then": {
+          "squad": 0,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "recipe:home-guard"
+    },
+    {
+      "as_printed": {
+        "name": "hero-save",
+        "repeat": 45,
+        "then": {
+          "region": null,
+          "select": "my hero",
+          "type": "move"
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": null,
+          "type": "hero_below"
+        }
+      },
+      "filled": {
+        "name": "hero-save",
+        "repeat": 45,
+        "then": {
+          "region": "our base",
+          "select": "my hero",
+          "type": "move"
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": 0.05,
+          "type": "hero_below"
+        }
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "recipe:hero-save"
+    },
+    {
+      "as_printed": {
+        "name": "expand",
+        "then": {
+          "kind": "TownHall",
+          "region": "southeast mine",
+          "select": "workers",
+          "site": "nearest legal site",
+          "type": "build"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "mine_dry"
+        }
+      },
+      "filled": {
+        "name": "expand",
+        "then": {
+          "kind": "TownHall",
+          "region": "southeast mine",
+          "select": "workers",
+          "site": "nearest legal site",
+          "type": "build"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "mine_dry"
+        }
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "recipe:expand"
+    },
+    {
+      "as_printed": {
+        "name": "their-hero-down",
+        "then": {
+          "squad": null,
+          "stance": "push",
+          "target": null,
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "enemy_hero_down"
+        }
+      },
+      "filled": {
+        "name": "their-hero-down",
+        "then": {
+          "squad": 0,
+          "stance": "push",
+          "target": null,
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "enemy_hero_down"
+        }
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [
+        "then.target"
+      ],
+      "rel": "recipe:counter-punch"
+    },
+    {
+      "as_printed": {
+        "name": "steady-production",
+        "repeat": 20,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": null
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0,
+          "type": "game_time"
+        }
+      },
+      "filled": {
+        "name": "steady-production",
+        "repeat": 20,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": "Worker"
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0,
+          "type": "game_time"
+        }
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "recipe:steady-production"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my TownHall",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my TownHall",
+        "type": "cancel"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "cancel:TownHall"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Workshop",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Workshop",
+        "type": "cancel"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "cancel:Workshop"
+    },
+    {
+      "as_printed": {
+        "select": "my Barracks",
+        "squad": 1,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Barracks",
+        "squad": 1,
+        "type": "template"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:0"
+    },
+    {
+      "as_printed": {
+        "id": 1,
+        "select": "all army",
+        "type": "squad"
+      },
+      "filled": {
+        "id": 1,
+        "select": "all army",
+        "type": "squad"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:1"
+    },
+    {
+      "as_printed": {
+        "region": "our base",
+        "select": "my Barracks",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Barracks",
+        "type": "rally"
+      },
+      "fixture": "doc_open_armed.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:2"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-0:turtle"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "stage",
+        "target": "home",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "stage",
+        "target": "home",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-0:stage"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "secure",
+        "target": "home",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "secure",
+        "target": "home",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-0:secure"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "harass",
+        "target": "home",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "harass",
+        "target": "home",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-0:harass"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-1:turtle"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "stage",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "stage",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-1:stage"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "secure",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "secure",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-1:secure"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "harass",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "harass",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-1:harass"
+    },
+    {
+      "as_printed": {
+        "name": "home-guard",
+        "type": "trigger_clear"
+      },
+      "filled": {
+        "name": "home-guard",
+        "type": "trigger_clear"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "trigger_clear:home-guard"
+    },
+    {
+      "as_printed": {
+        "name": "hero-save",
+        "type": "trigger_clear"
+      },
+      "filled": {
+        "name": "hero-save",
+        "type": "trigger_clear"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "trigger_clear:hero-save"
+    },
+    {
+      "as_printed": {
+        "name": "north-pass",
+        "type": "region_clear"
+      },
+      "filled": {
+        "name": "north-pass",
+        "type": "region_clear"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "region_clear:north-pass"
+    },
+    {
+      "as_printed": {
+        "name": "home",
+        "type": "region_clear"
+      },
+      "filled": {
+        "name": "home",
+        "type": "region_clear"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "region_clear:home"
+    },
+    {
+      "as_printed": {
+        "name": "opening",
+        "type": "plan_clear"
+      },
+      "filled": {
+        "name": "opening",
+        "type": "plan_clear"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "plan_clear:opening"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "push",
+        "target": "home",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "push",
+        "target": "home",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-0:push"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "push",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "push",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "stance:squad-1:push"
+    },
+    {
+      "as_printed": {
+        "squad": null,
+        "stance": null,
+        "target": null,
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "turtle",
+        "target": null,
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [
+        "target"
+      ],
+      "rel": "stance"
+    },
+    {
+      "as_printed": {
+        "id": null,
+        "select": "all army",
+        "type": "squad"
+      },
+      "filled": {
+        "id": 0,
+        "select": "all army",
+        "type": "squad"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "squad"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "repeat": null,
+        "then": null,
+        "type": "trigger_set",
+        "when": null
+      },
+      "filled": {
+        "name": "home-guard",
+        "repeat": null,
+        "then": {
+          "select": "all army",
+          "type": "stop"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [
+        "repeat"
+      ],
+      "rel": "trigger_set"
+    },
+    {
+      "as_printed": {
+        "name": "home-guard",
+        "repeat": 30.0,
+        "then": {
+          "squad": 1,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "filled": {
+        "name": "home-guard",
+        "repeat": 30.0,
+        "then": {
+          "squad": 1,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "trigger_set:home-guard"
+    },
+    {
+      "as_printed": {
+        "name": "hero-save",
+        "repeat": 45.0,
+        "then": {
+          "region": "home",
+          "select": "my hero",
+          "type": "move",
+          "units": []
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": 0.35,
+          "type": "hero_below"
+        }
+      },
+      "filled": {
+        "name": "hero-save",
+        "repeat": 45.0,
+        "then": {
+          "region": "home",
+          "select": "my hero",
+          "type": "move",
+          "units": []
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": 0.35,
+          "type": "hero_below"
+        }
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "trigger_set:hero-save"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "radius": null,
+        "type": "region_set",
+        "x": null,
+        "z": null
+      },
+      "filled": {
+        "name": "north-pass",
+        "radius": 4.0,
+        "type": "region_set",
+        "x": 1.0,
+        "z": 1.0
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "region_set"
+    },
+    {
+      "as_printed": {
+        "name": "north-pass",
+        "radius": 20.0,
+        "type": "region_set",
+        "x": -60.0,
+        "z": 60.0
+      },
+      "filled": {
+        "name": "north-pass",
+        "radius": 20.0,
+        "type": "region_set",
+        "x": -60.0,
+        "z": 60.0
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "region_set:north-pass"
+    },
+    {
+      "as_printed": {
+        "name": "home",
+        "radius": 26.0,
+        "type": "region_set",
+        "x": 70.0,
+        "z": 70.0
+      },
+      "filled": {
+        "name": "home",
+        "radius": 26.0,
+        "type": "region_set",
+        "x": 70.0,
+        "z": 70.0
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "region_set:home"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "steps": null,
+        "type": "plan_set"
+      },
+      "filled": {
+        "name": "opening",
+        "steps": [
+          {
+            "intent": {
+              "select": "all army",
+              "type": "stop"
+            }
+          }
+        ],
+        "type": "plan_set"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "plan_set"
+    },
+    {
+      "as_printed": {
+        "name": "opening",
+        "steps": [
+          {
+            "advance": {
+              "secs": 300.0,
+              "type": "after"
+            },
+            "intent": {
+              "kind": "Farm",
+              "region": "home",
+              "select": "workers",
+              "site": "nearest legal site",
+              "type": "build"
+            }
+          },
+          {
+            "advance": {
+              "type": "when",
+              "when": {
+                "tier": 3,
+                "type": "tier_reached"
+              }
+            },
+            "intent": {
+              "region": "mid",
+              "squad": 1,
+              "stance": "stage",
+              "type": "stance"
+            }
+          }
+        ],
+        "type": "plan_set"
+      },
+      "filled": {
+        "name": "opening",
+        "steps": [
+          {
+            "advance": {
+              "secs": 300.0,
+              "type": "after"
+            },
+            "intent": {
+              "kind": "Farm",
+              "region": "home",
+              "select": "workers",
+              "site": "nearest legal site",
+              "type": "build"
+            }
+          },
+          {
+            "advance": {
+              "type": "when",
+              "when": {
+                "tier": 3,
+                "type": "tier_reached"
+              }
+            },
+            "intent": {
+              "region": "mid",
+              "squad": 1,
+              "stance": "stage",
+              "type": "stance"
+            }
+          }
+        ],
+        "type": "plan_set"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "plan_set:opening"
+    },
+    {
+      "as_printed": {
+        "kind": null,
+        "region": null,
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "filled": {
+        "kind": "TownHall",
+        "region": "our base",
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "build"
+    },
+    {
+      "as_printed": {
+        "select": "idle TownHall",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle TownHall",
+        "type": "train",
+        "unit": "Worker"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "train:TownHall"
+    },
+    {
+      "as_printed": {
+        "select": "idle Barracks",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Barracks",
+        "type": "train",
+        "unit": "Footman"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "train:Barracks"
+    },
+    {
+      "as_printed": {
+        "select": "idle Workshop",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Workshop",
+        "type": "train",
+        "unit": "Catapult"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "train:Workshop"
+    },
+    {
+      "as_printed": {
+        "select": "idle Keep",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Keep",
+        "type": "train",
+        "unit": "Worker"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "train:Keep"
+    },
+    {
+      "as_printed": {
+        "select": "idle Sanctum",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Sanctum",
+        "type": "train",
+        "unit": "Sorcerer"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "train:Sanctum"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my TownHall",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my TownHall",
+        "type": "rally"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "rally:TownHall"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Barracks",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Barracks",
+        "type": "rally"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "rally:Barracks"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Workshop",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Workshop",
+        "type": "rally"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "rally:Workshop"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Keep",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Keep",
+        "type": "rally"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "rally:Keep"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Sanctum",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Sanctum",
+        "type": "rally"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "rally:Sanctum"
+    },
+    {
+      "as_printed": {
+        "select": "my TownHall",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my TownHall",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:TownHall"
+    },
+    {
+      "as_printed": {
+        "select": "my Barracks",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Barracks",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Barracks"
+    },
+    {
+      "as_printed": {
+        "select": "my Workshop",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Workshop",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Workshop"
+    },
+    {
+      "as_printed": {
+        "select": "my Keep",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Keep",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Keep"
+    },
+    {
+      "as_printed": {
+        "select": "my Sanctum",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Sanctum",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Sanctum"
+    },
+    {
+      "as_printed": {
+        "name": "home-guard",
+        "repeat": 30,
+        "then": {
+          "squad": null,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "filled": {
+        "name": "home-guard",
+        "repeat": 30,
+        "then": {
+          "squad": 0,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "recipe:home-guard"
+    },
+    {
+      "as_printed": {
+        "name": "hero-save",
+        "repeat": 45,
+        "then": {
+          "region": null,
+          "select": "my hero",
+          "type": "move"
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": null,
+          "type": "hero_below"
+        }
+      },
+      "filled": {
+        "name": "hero-save",
+        "repeat": 45,
+        "then": {
+          "region": "our base",
+          "select": "my hero",
+          "type": "move"
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": 0.05,
+          "type": "hero_below"
+        }
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "recipe:hero-save"
+    },
+    {
+      "as_printed": {
+        "name": "expand",
+        "then": {
+          "kind": "TownHall",
+          "region": "southeast mine",
+          "select": "workers",
+          "site": "nearest legal site",
+          "type": "build"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "mine_dry"
+        }
+      },
+      "filled": {
+        "name": "expand",
+        "then": {
+          "kind": "TownHall",
+          "region": "southeast mine",
+          "select": "workers",
+          "site": "nearest legal site",
+          "type": "build"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "mine_dry"
+        }
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "recipe:expand"
+    },
+    {
+      "as_printed": {
+        "name": "their-hero-down",
+        "then": {
+          "squad": null,
+          "stance": "push",
+          "target": null,
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "enemy_hero_down"
+        }
+      },
+      "filled": {
+        "name": "their-hero-down",
+        "then": {
+          "squad": 0,
+          "stance": "push",
+          "target": null,
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "enemy_hero_down"
+        }
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [
+        "then.target"
+      ],
+      "rel": "recipe:counter-punch"
+    },
+    {
+      "as_printed": {
+        "name": "steady-production",
+        "repeat": 20,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": null
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0,
+          "type": "game_time"
+        }
+      },
+      "filled": {
+        "name": "steady-production",
+        "repeat": 20,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": "Worker"
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0,
+          "type": "game_time"
+        }
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "recipe:steady-production"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my TownHall",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my TownHall",
+        "type": "cancel"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "cancel:TownHall"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Barracks",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Barracks",
+        "type": "cancel"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "cancel:Barracks"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Workshop",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Workshop",
+        "type": "cancel"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "cancel:Workshop"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Keep",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Keep",
+        "type": "cancel"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "cancel:Keep"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Sanctum",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Sanctum",
+        "type": "cancel"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "cancel:Sanctum"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "stage",
+        "target": "mid",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "stage",
+        "target": "mid",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:0"
+    },
+    {
+      "as_printed": {
+        "squad": 1,
+        "stance": "harass",
+        "target": "their base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 1,
+        "stance": "harass",
+        "target": "their base",
+        "type": "stance"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:1"
+    },
+    {
+      "as_printed": {
+        "region": "mid",
+        "select": "my hero",
+        "type": "move"
+      },
+      "filled": {
+        "region": "mid",
+        "select": "my hero",
+        "type": "move"
+      },
+      "fixture": "doc_open_alarm.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:2"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "stance:squad-0:turtle"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "stage",
+        "target": "our base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "stage",
+        "target": "our base",
+        "type": "stance"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "stance:squad-0:stage"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "push",
+        "target": "our base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "push",
+        "target": "our base",
+        "type": "stance"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "stance:squad-0:push"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "secure",
+        "target": "our base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "secure",
+        "target": "our base",
+        "type": "stance"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "stance:squad-0:secure"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "harass",
+        "target": "our base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "harass",
+        "target": "our base",
+        "type": "stance"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "stance:squad-0:harass"
+    },
+    {
+      "as_printed": {
+        "squad": null,
+        "stance": null,
+        "target": null,
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "turtle",
+        "target": null,
+        "type": "stance"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [
+        "target"
+      ],
+      "rel": "stance"
+    },
+    {
+      "as_printed": {
+        "id": null,
+        "select": "all army",
+        "type": "squad"
+      },
+      "filled": {
+        "id": 0,
+        "select": "all army",
+        "type": "squad"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "squad"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "repeat": null,
+        "then": null,
+        "type": "trigger_set",
+        "when": null
+      },
+      "filled": {
+        "name": "pinned",
+        "repeat": null,
+        "then": {
+          "select": "all army",
+          "type": "stop"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [
+        "repeat"
+      ],
+      "rel": "trigger_set"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "radius": null,
+        "type": "region_set",
+        "x": null,
+        "z": null
+      },
+      "filled": {
+        "name": "pinned",
+        "radius": 4.0,
+        "type": "region_set",
+        "x": 1.0,
+        "z": 1.0
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "region_set"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "steps": null,
+        "type": "plan_set"
+      },
+      "filled": {
+        "name": "pinned",
+        "steps": [
+          {
+            "intent": {
+              "select": "all army",
+              "type": "stop"
+            }
+          }
+        ],
+        "type": "plan_set"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "plan_set"
+    },
+    {
+      "as_printed": {
+        "kind": null,
+        "region": null,
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "filled": {
+        "kind": "TownHall",
+        "region": "our base",
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "build"
+    },
+    {
+      "as_printed": {
+        "select": "my TownHall",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "my TownHall",
+        "type": "train",
+        "unit": "Worker"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "train:TownHall"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my TownHall",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my TownHall",
+        "type": "rally"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "rally:TownHall"
+    },
+    {
+      "as_printed": {
+        "select": "my TownHall",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my TownHall",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:TownHall"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my TownHall",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my TownHall",
+        "type": "cancel"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "cancel:TownHall"
+    },
+    {
+      "as_printed": {
+        "name": "home-guard",
+        "repeat": 30,
+        "then": {
+          "squad": null,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "filled": {
+        "name": "home-guard",
+        "repeat": 30,
+        "then": {
+          "squad": 0,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "recipe:home-guard"
+    },
+    {
+      "as_printed": {
+        "name": "hero-save",
+        "repeat": 45,
+        "then": {
+          "region": null,
+          "select": "my hero",
+          "type": "move"
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": null,
+          "type": "hero_below"
+        }
+      },
+      "filled": {
+        "name": "hero-save",
+        "repeat": 45,
+        "then": {
+          "region": "our base",
+          "select": "my hero",
+          "type": "move"
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": 0.05,
+          "type": "hero_below"
+        }
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "recipe:hero-save"
+    },
+    {
+      "as_printed": {
+        "name": "expand",
+        "then": {
+          "kind": "TownHall",
+          "region": "northwest mine",
+          "select": "workers",
+          "site": "nearest legal site",
+          "type": "build"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "mine_dry"
+        }
+      },
+      "filled": {
+        "name": "expand",
+        "then": {
+          "kind": "TownHall",
+          "region": "northwest mine",
+          "select": "workers",
+          "site": "nearest legal site",
+          "type": "build"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "mine_dry"
+        }
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "recipe:expand"
+    },
+    {
+      "as_printed": {
+        "name": "their-hero-down",
+        "then": {
+          "squad": null,
+          "stance": "push",
+          "target": null,
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "enemy_hero_down"
+        }
+      },
+      "filled": {
+        "name": "their-hero-down",
+        "then": {
+          "squad": 0,
+          "stance": "push",
+          "target": null,
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "enemy_hero_down"
+        }
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [
+        "then.target"
+      ],
+      "rel": "recipe:counter-punch"
+    },
+    {
+      "as_printed": {
+        "name": "steady-production",
+        "repeat": 20,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": null
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0,
+          "type": "game_time"
+        }
+      },
+      "filled": {
+        "name": "steady-production",
+        "repeat": 20,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": "Worker"
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0,
+          "type": "game_time"
+        }
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "recipe:steady-production"
+    },
+    {
+      "as_printed": {
+        "kind": "Farm",
+        "region": "our base",
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "filled": {
+        "kind": "Farm",
+        "region": "our base",
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:0"
+    },
+    {
+      "as_printed": {
+        "select": "my TownHall",
+        "type": "train",
+        "unit": "Hero"
+      },
+      "filled": {
+        "select": "my TownHall",
+        "type": "train",
+        "unit": "Hero"
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:1"
+    },
+    {
+      "as_printed": {
+        "name": "worker-pulse",
+        "repeat": 18.0,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": "Worker"
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0.0,
+          "type": "game_time"
+        }
+      },
+      "filled": {
+        "name": "worker-pulse",
+        "repeat": 18.0,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": "Worker"
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0.0,
+          "type": "game_time"
+        }
+      },
+      "fixture": "digest_open_early.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:2"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "turtle",
+        "type": "stance"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "stance:squad-0:turtle"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "stage",
+        "target": "our base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "stage",
+        "target": "our base",
+        "type": "stance"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "stance:squad-0:stage"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "push",
+        "target": "our base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "push",
+        "target": "our base",
+        "type": "stance"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "stance:squad-0:push"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "secure",
+        "target": "our base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "secure",
+        "target": "our base",
+        "type": "stance"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "stance:squad-0:secure"
+    },
+    {
+      "as_printed": {
+        "squad": 0,
+        "stance": "harass",
+        "target": "our base",
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "harass",
+        "target": "our base",
+        "type": "stance"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "stance:squad-0:harass"
+    },
+    {
+      "as_printed": {
+        "squad": null,
+        "stance": null,
+        "target": null,
+        "type": "stance"
+      },
+      "filled": {
+        "squad": 0,
+        "stance": "turtle",
+        "target": null,
+        "type": "stance"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [
+        "target"
+      ],
+      "rel": "stance"
+    },
+    {
+      "as_printed": {
+        "id": null,
+        "select": "all army",
+        "type": "squad"
+      },
+      "filled": {
+        "id": 0,
+        "select": "all army",
+        "type": "squad"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "squad"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "repeat": null,
+        "then": null,
+        "type": "trigger_set",
+        "when": null
+      },
+      "filled": {
+        "name": "pinned",
+        "repeat": null,
+        "then": {
+          "select": "all army",
+          "type": "stop"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [
+        "repeat"
+      ],
+      "rel": "trigger_set"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "radius": null,
+        "type": "region_set",
+        "x": null,
+        "z": null
+      },
+      "filled": {
+        "name": "pinned",
+        "radius": 4.0,
+        "type": "region_set",
+        "x": 1.0,
+        "z": 1.0
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "region_set"
+    },
+    {
+      "as_printed": {
+        "name": null,
+        "steps": null,
+        "type": "plan_set"
+      },
+      "filled": {
+        "name": "pinned",
+        "steps": [
+          {
+            "intent": {
+              "select": "all army",
+              "type": "stop"
+            }
+          }
+        ],
+        "type": "plan_set"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "plan_set"
+    },
+    {
+      "as_printed": {
+        "kind": null,
+        "region": null,
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "filled": {
+        "kind": "TownHall",
+        "region": "our base",
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "build"
+    },
+    {
+      "as_printed": {
+        "select": "idle TownHall",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle TownHall",
+        "type": "train",
+        "unit": "Worker"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "train:TownHall"
+    },
+    {
+      "as_printed": {
+        "select": "idle Barracks",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Barracks",
+        "type": "train",
+        "unit": "Footman"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "train:Barracks"
+    },
+    {
+      "as_printed": {
+        "select": "idle Workshop",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Workshop",
+        "type": "train",
+        "unit": "Catapult"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "train:Workshop"
+    },
+    {
+      "as_printed": {
+        "select": "idle Keep",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Keep",
+        "type": "train",
+        "unit": "Worker"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "train:Keep"
+    },
+    {
+      "as_printed": {
+        "select": "idle Sanctum",
+        "type": "train",
+        "unit": null
+      },
+      "filled": {
+        "select": "idle Sanctum",
+        "type": "train",
+        "unit": "Sorcerer"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "train:Sanctum"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my TownHall",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my TownHall",
+        "type": "rally"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "rally:TownHall"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Barracks",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Barracks",
+        "type": "rally"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "rally:Barracks"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Workshop",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Workshop",
+        "type": "rally"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "rally:Workshop"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Keep",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Keep",
+        "type": "rally"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "rally:Keep"
+    },
+    {
+      "as_printed": {
+        "region": null,
+        "select": "my Sanctum",
+        "type": "rally"
+      },
+      "filled": {
+        "region": "our base",
+        "select": "my Sanctum",
+        "type": "rally"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "rally:Sanctum"
+    },
+    {
+      "as_printed": {
+        "select": "my TownHall",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my TownHall",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:TownHall"
+    },
+    {
+      "as_printed": {
+        "select": "my Barracks",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Barracks",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Barracks"
+    },
+    {
+      "as_printed": {
+        "select": "my Workshop",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Workshop",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Workshop"
+    },
+    {
+      "as_printed": {
+        "select": "my Keep",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Keep",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Keep"
+    },
+    {
+      "as_printed": {
+        "select": "my Sanctum",
+        "squad": null,
+        "type": "template"
+      },
+      "filled": {
+        "select": "my Sanctum",
+        "squad": null,
+        "type": "template"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [
+        "squad"
+      ],
+      "rel": "template:Sanctum"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Barracks",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Barracks",
+        "type": "cancel"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "cancel:Barracks"
+    },
+    {
+      "as_printed": {
+        "name": "home-guard",
+        "repeat": 30,
+        "then": {
+          "squad": null,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "filled": {
+        "name": "home-guard",
+        "repeat": 30,
+        "then": {
+          "squad": 0,
+          "stance": "turtle",
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "base_under_attack"
+        }
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "recipe:home-guard"
+    },
+    {
+      "as_printed": {
+        "name": "hero-save",
+        "repeat": 45,
+        "then": {
+          "region": null,
+          "select": "my hero",
+          "type": "move"
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": null,
+          "type": "hero_below"
+        }
+      },
+      "filled": {
+        "name": "hero-save",
+        "repeat": 45,
+        "then": {
+          "region": "our base",
+          "select": "my hero",
+          "type": "move"
+        },
+        "type": "trigger_set",
+        "when": {
+          "frac": 0.05,
+          "type": "hero_below"
+        }
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "recipe:hero-save"
+    },
+    {
+      "as_printed": {
+        "name": "expand",
+        "then": {
+          "kind": "TownHall",
+          "region": "northwest mine",
+          "select": "workers",
+          "site": "nearest legal site",
+          "type": "build"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "mine_dry"
+        }
+      },
+      "filled": {
+        "name": "expand",
+        "then": {
+          "kind": "TownHall",
+          "region": "northwest mine",
+          "select": "workers",
+          "site": "nearest legal site",
+          "type": "build"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "mine_dry"
+        }
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "recipe:expand"
+    },
+    {
+      "as_printed": {
+        "name": "their-hero-down",
+        "then": {
+          "squad": null,
+          "stance": "push",
+          "target": null,
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "enemy_hero_down"
+        }
+      },
+      "filled": {
+        "name": "their-hero-down",
+        "then": {
+          "squad": 0,
+          "stance": "push",
+          "target": null,
+          "type": "stance"
+        },
+        "type": "trigger_set",
+        "when": {
+          "type": "enemy_hero_down"
+        }
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [
+        "then.target"
+      ],
+      "rel": "recipe:counter-punch"
+    },
+    {
+      "as_printed": {
+        "name": "steady-production",
+        "repeat": 20,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": null
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0,
+          "type": "game_time"
+        }
+      },
+      "filled": {
+        "name": "steady-production",
+        "repeat": 20,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": "Worker"
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0,
+          "type": "game_time"
+        }
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "recipe:steady-production"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my TownHall",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my TownHall",
+        "type": "cancel"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "cancel:TownHall"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Workshop",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Workshop",
+        "type": "cancel"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "cancel:Workshop"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Keep",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Keep",
+        "type": "cancel"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "cancel:Keep"
+    },
+    {
+      "as_printed": {
+        "index": null,
+        "select": "my Sanctum",
+        "type": "cancel"
+      },
+      "filled": {
+        "index": 0,
+        "select": "my Sanctum",
+        "type": "cancel"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "cancel:Sanctum"
+    },
+    {
+      "as_printed": {
+        "name": "worker-pulse",
+        "repeat": 18.0,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": "Worker"
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0.0,
+          "type": "game_time"
+        }
+      },
+      "filled": {
+        "name": "worker-pulse",
+        "repeat": 18.0,
+        "then": {
+          "select": "idle TownHall",
+          "type": "train",
+          "unit": "Worker"
+        },
+        "type": "trigger_set",
+        "when": {
+          "at": 0.0,
+          "type": "game_time"
+        }
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:0"
+    },
+    {
+      "as_printed": {
+        "kind": "Farm",
+        "region": "our base",
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "filled": {
+        "kind": "Farm",
+        "region": "our base",
+        "select": "workers",
+        "site": "nearest legal site",
+        "type": "build"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:1"
+    },
+    {
+      "as_printed": {
+        "select": "my TownHall",
+        "type": "train",
+        "unit": "Hero"
+      },
+      "filled": {
+        "select": "my TownHall",
+        "type": "train",
+        "unit": "Hero"
+      },
+      "fixture": "legacy_crossings.json",
+      "optional": [],
+      "rel": "playbook:standard-kingdom:2"
+    }
+  ],
+  "doc_version": "affordance-doc/2.2",
+  "note": "GENERATED \u2014 `python3 tools/test_affordances.py --write-wire-cases`. Every form tools/affordances.py prints, with only the fields it marks REQUIRED filled in. `intent::parse_command` must take every `filled` command: that is wc3clone-2su4's one rule, pinned on both sides of the wire out of one artifact."
+}

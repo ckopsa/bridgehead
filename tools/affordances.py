@@ -141,7 +141,19 @@ from bridge_view import dist, load_catalog  # noqa: E402
 #: says the tiers differ in judgment, which is exactly what a playbook supplies.
 #: The section is a FORK and never an instruction (docs/AFFORDANCES.md
 #: § Playbooks), so it cannot be compared against 2.0 as "the same page".
-DOC_VERSION = "affordance-doc/2.1"
+#: `2.2` — the forms stop lying about their own holes (wc3clone-2su4). Every
+#: field now carries `required`, and the render says which of the three things a
+#: hole is: engine-filled, yours-and-REQUIRED, or optional-and-null-means-
+#: omitted. The old annotation — "leave null — this one is yours" — read as
+#: permission on both of the last two, and r34 blue took it: it sent
+#: `recipe:home-guard` back with `"squad": null` and got serde's *invalid type:
+#: null, expected u8*, then armed `recipe:expand` with `then.region` null and
+#: spent the rule's one fire, 322 seconds later, on a refusal. `recipe:expand`
+#: now ships that hole pre-filled from `mines[]` (`expansion_place`), so the
+#: recipe a trusting commander arms verbatim actually takes a second base. A
+#: fixed recipe changes what a trusting commander arms — the `1.3` argument
+#: exactly — so the rounds either side of it must not claim one scaffold.
+DOC_VERSION = "affordance-doc/2.2"
 
 # ---------------------------------------------------------------------------
 # Sections: what a declared focus can expand, and how the collapsed render
@@ -409,6 +421,71 @@ def place_name_at(pos, state):
     return best[1] if best else None
 
 
+def expansion_place(state, catalog):
+    """The mine this seat would expand TO, as a name a `region` field takes.
+
+    A FACT, in the sense docs/AFFORDANCES.md guard 1 means: of the gold mines
+    the snapshot publishes (`mines[]` is unfiltered map geography — bridge.rs's
+    module docstring), keep the ones with gold left, drop the ones a finished
+    hall of ours already works, and take the nearest to our own base. Every
+    clause is read off the snapshot; none of them is an opinion about when to
+    expand or whether to.
+
+    "Already works" is `MINE_HOME_RADIUS` — the same radius `mine_dry` and the
+    income alarm use, so the mine that FIRES the `expand` rule is by
+    construction not the mine the rule is sent to. That distinction is the
+    whole reason this function exists rather than "nearest legal site to the
+    mine that triggered": the trigger fires on a hole in the ground with no
+    gold in it, and a second TownHall beside it would be 385 gold spent on
+    nothing. A default that fires and does the wrong thing is worse than a hole
+    that refuses in words.
+
+    Returns `None` when nothing qualifies — every mine dry, or all of them
+    already ours. Then the field goes back to being the commander's, which is
+    the honest answer: this document does not invent a default it cannot read.
+
+    A NAME and never a coordinate: `intent::resolve_places` looks it up at FIRE
+    time, so a rule armed at t=0 aims at the same hole in the ground at t=322
+    even though everything else about the match has moved.
+    """
+    mines = [m for m in state.get("mines") or [] if (m.get("remaining") or 0) > 0
+             and m.get("pos")]
+    if not mines:
+        return None
+    home = None
+    for p in (state.get("map") or {}).get("places") or []:
+        if p.get("name") == "our base" and p.get("pos"):
+            home = p["pos"]
+    if not home:
+        return None
+    # A hall is a building that turns out Workers — read off the catalog rather
+    # than a kind list, so a race whose hall is called something else, and a
+    # tier-up that renames it, are both covered by the same sentence.
+    hall_kinds = {
+        b.get("id")
+        for b in (catalog or {}).get("buildings") or []
+        if "Worker" in (b.get("trains") or [])
+    }
+    halls = [
+        b.get("pos")
+        for b in own_buildings(state)
+        if b.get("done") and b.get("kind") in hall_kinds and b.get("pos")
+    ]
+    free = [
+        m for m in mines
+        if not any(dist(m["pos"], h) <= MINE_HOME_RADIUS for h in halls)
+    ]
+    if not free:
+        return None
+    # `(distance, name)` so a symmetric map — where the two neutral expansions
+    # are exactly equidistant from either base — still renders the same page
+    # twice. A document that picked a different mine on each render would be a
+    # worse fact than no fact.
+    named = [(dist(m["pos"], home), place_name_at(m["pos"], state)) for m in free]
+    named = sorted((d, n) for d, n in named if n)
+    return named[0][1] if named else None
+
+
 def posture_anchor(posture):
     """The `(x, z)` a squad's posture string is anchored on, or None.
 
@@ -626,7 +703,7 @@ def link(rel, title, ready, reason, command, intel=None, cost=None, note=None,
     return a
 
 
-def field(path, ftype, note, domain=None, rng=None, default=None):
+def field(path, ftype, note, domain=None, rng=None, default=None, required=True):
     """One FORM field.
 
     `default` is present on every field and is `null` wherever the answer is a
@@ -634,8 +711,27 @@ def field(path, ftype, note, domain=None, rng=None, default=None):
     engine fact or from the commander's own earlier declaration, because a
     default that encodes strategy makes the arena measure the form's author.
     Everything else ships empty.
+
+    `required` says which kind of empty it is, and it exists because r34 blue
+    could not tell. The document printed `then.squad` and `repeat` with the same
+    `null` and the same annotation — "leave null — this one is yours" — but the
+    wire takes one of them empty and refuses the other, so the seat sent a
+    `home-guard` rule back exactly as printed and got serde's *invalid type:
+    null, expected u8* for its trouble. A hole a commander must fill and a hole
+    it may leave are different facts, and a form that renders them identically
+    is a form whose own convention is a trap.
+
+    THE RULE THIS FIELD PINS (`test_a_printed_template_is_sendable_once_only_
+    your_own_fields_are_filled`): fill every `required` hole, leave every other
+    one exactly as printed, and the result must be a command the wire takes.
     """
-    f = {"path": path, "type": ftype, "note": note, "default": default}
+    f = {
+        "path": path,
+        "type": ftype,
+        "note": note,
+        "default": default,
+        "required": bool(required),
+    }
     if domain is not None:
         f["domain"] = domain
     if rng is not None:
@@ -785,9 +881,11 @@ def stance_form(state, catalog):
             field(
                 "target",
                 "place",
-                "the anchor. Omit for your own base. The stance's ring is its own — a "
-                "named region's radius is ignored here.",
+                "the anchor. Leave it null for your own base — on this wire a null key "
+                "is an omitted key. The stance's ring is its own: a named region's "
+                "radius is ignored here.",
                 domain=place_domain(state),
+                required=False,
             ),
         ],
         note="`x`/`z` are accepted instead of `target` if you would rather give numbers.",
@@ -860,7 +958,10 @@ def trigger_forms(state, catalog):
                                         "`\"select\"` phrase over a list of unit ids — a frozen "
                                         "id becomes a corpse. Legal phrases: "
                         + ", ".join(selector_vocabulary(catalog)["units"]) + "."),
-                field("repeat", "number", "cooldown in game seconds. Omit and the rule fires once."),
+                field("repeat", "number",
+                      "cooldown in game seconds. Leave it null and the rule fires once — a "
+                      "null key is an omitted key on this wire.",
+                      required=False),
             ],
             ready=room,
             reason=slots
@@ -887,7 +988,8 @@ def trigger_forms(state, catalog):
                     field("when", "predicate", "as armed; change and re-send.",
                           domain=predicates, default=t.get("when")),
                     field("then", "intent", "as armed; change and re-send.", default=t.get("then")),
-                    field("repeat", "number", "as armed.", default=t.get("repeat")),
+                    field("repeat", "number", "as armed; null means it fires once.",
+                          default=t.get("repeat"), required=False),
                 ],
                 reason="status {}{}".format(
                     t.get("status", "?"),
@@ -1381,9 +1483,11 @@ def template_forms(state, catalog):
                         "squad",
                         "integer",
                         "enrol every new unit into this squad, so it inherits the squad's "
-                        "stance the moment it walks out.",
+                        "stance the moment it walks out. Left null it is unset — which, "
+                        "with no other piece sent, REMOVES the template.",
                         domain=squads or None,
                         rng=(0, 255),
+                        required=False,
                     ),
                 ],
                 reason="{} finished {}, {} already carrying a template".format(
@@ -1468,6 +1572,9 @@ def cancel_forms(state, catalog):
 def recipe_forms(state, catalog):
     places = place_domain(state)
     squads = [str(sq.get("id")) for sq in state.get("squads") or [] if sq.get("id") is not None]
+    #: The one hole in `recipe:expand` that r34 blue left in it. See
+    #: `expansion_place` for why this is a fact and not a strategy.
+    expand_to = expansion_place(state, catalog)
     unlocked = state.get("unlocked") or {}
     producers = producer_kinds(state, catalog)
     hall = next(
@@ -1534,13 +1641,22 @@ def recipe_forms(state, catalog):
                     "type": "build",
                     "select": "workers",
                     "kind": "TownHall",
-                    "region": None,
+                    "region": expand_to,
                     "site": "nearest legal site",
                 },
             },
-            [field("then.region", "place", "which mine to go to.", domain=places)],
+            [field("then.region", "place",
+                   "which mine to go to." if expand_to is None else
+                   "which mine to go to. Pre-filled with the nearest mine that still has "
+                   "gold and that no hall of yours already works — a fact off `mines[]`, "
+                   "not a plan. Name another and it obeys.",
+                   domain=places, default=expand_to)],
             reason="fires once, which is right: you only need telling the first time. "
-                   "`nearest legal site` is why this cannot loop on 'site blocked'.",
+                   "`nearest legal site` is why this cannot loop on 'site blocked'."
+                   + ("" if expand_to else
+                      " NOTHING IS PRE-FILLED: every mine is either dry or already yours, "
+                      "so `then.region` is a hole you must fill or the rule will spend its "
+                      "one fire on a refusal."),
             note="a TownHall costs {}{}. The trigger is free to arm; the gold is charged when "
                  "it fires.".format(
                      hall_price,
@@ -1560,7 +1676,10 @@ def recipe_forms(state, catalog):
             },
             [
                 field("then.squad", "integer", "which squad goes.", domain=squads or None),
-                field("then.target", "place", "what it commits to.", domain=places),
+                field("then.target", "place",
+                      "what it commits to. Null anchors the push on your own base, which "
+                      "is a legal sentence and almost never the one you mean here.",
+                      domain=places, required=False),
             ],
             reason="`enemy_hero_down` is what you WATCHED, not what is true — a hero that died "
                    "out of your sight is not in this predicate. Once, because you only get to "
@@ -2431,9 +2550,16 @@ def render_action(a, width=100):
                 f["path"],
                 f["type"],
                 " range {}..{}".format(*f["range"]) if f.get("range") else "",
+                # Three annotations, not two. "The engine filled this",
+                # "you MUST fill this" and "you MAY fill this" are three
+                # different instructions, and the old rendering gave the last
+                # two the same words — which is how r34 blue sent `home-guard`
+                # back with `"squad": null` still in it. See `field`.
                 " default={}".format(json.dumps(f["default"]))
                 if f["default"] is not None
-                else " (leave null — this one is yours)",
+                else " (REQUIRED — yours to fill; the null is a hole, not a value)"
+                if f.get("required", True)
+                else " (optional — leave it null and the key is simply omitted)",
             )
             out.append(pad + head)
             out += [pad + "    " + x for x in _wrap(f["note"], width, "  ")]
@@ -2512,7 +2638,14 @@ def collapse_action(a):
         bits.append(_compact(a["command"]))
     else:
         bits.append(_compact(a["template"]))
-        open_fields = [f["path"] for f in a.get("fields") or [] if f.get("default") is None]
+        # The REQUIRED holes only. An optional one left as printed is a legal
+        # command (the wire reads a null key as an omitted key), so folding it
+        # onto this line as something you must do would be the fold telling a
+        # different story from the form — and the form is right.
+        open_fields = [
+            f["path"] for f in a.get("fields") or []
+            if f.get("default") is None and f.get("required", True)
+        ]
         if open_fields:
             bits.append("you fill: " + ", ".join(open_fields))
     if a.get("slots"):
