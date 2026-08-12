@@ -189,6 +189,11 @@ pub struct AlarmWorld<'w, 's> {
     /// What each squad is currently for — the continuous half of the running
     /// default, and the thing "continue" actually means.
     squads: Res<'w, SquadOrders>,
+    /// ...and the WORD the commander used for it, when there was one. Read
+    /// only to say the running default in the vocabulary the commander wrote
+    /// it in; the posture beside it is still what doctrine.rs executes, and
+    /// this module decides nothing from either.
+    stances: Res<'w, SquadStances>,
     /// The contingent half. Read to NAME the reflex that already answered,
     /// never to decide anything: a trigger's own evaluator owns whether it
     /// fires.
@@ -211,7 +216,7 @@ fn xz_dist(a: Vec3, b: Vec3) -> f32 {
 struct SquadLine {
     id: u8,
     members: usize,
-    /// `"holds defend near our base"` — reads after "squad 1".
+    /// `"holds the turtle stance near our base"` — reads after "squad 1".
     phrase: String,
     /// Where the posture is pointed, when it is pointed anywhere.
     point: Option<Vec3>,
@@ -238,19 +243,48 @@ fn squad_lines(me: Team, world: &AlarmWorld) -> Vec<SquadLine> {
     counts
         .into_iter()
         .map(|(id, (members, sum))| {
-            let (phrase, point) = match world.squads.0.get(&(me, id)) {
-                Some(SquadPosture::Defend { pos, .. }) => {
-                    (format!("holds defend {}", place_name(*pos, me)), Some(*pos))
+            let point = match world.squads.0.get(&(me, id)) {
+                Some(SquadPosture::Defend { pos, .. }) | Some(SquadPosture::Push { pos }) => {
+                    Some(*pos)
                 }
-                Some(SquadPosture::Push { pos }) => {
-                    (format!("pushes {}", place_name(*pos, me)), Some(*pos))
-                }
-                Some(SquadPosture::Escort { .. }) => ("escorts".to_string(), None),
-                Some(SquadPosture::Forage { muster }) => (
-                    format!("forages, mustering {}", place_name(*muster, me)),
-                    Some(*muster),
+                Some(SquadPosture::Forage { muster }) => Some(*muster),
+                Some(SquadPosture::Escort { .. }) | None => None,
+            };
+            // **The word first, when the commander used one.** A stance is a
+            // whole doctrine — anchor, ring, leash, retreat threshold, focus
+            // list — and "holds defend near our base" describes one fifth of
+            // what `turtle` installed. Worse, it is not the sentence the
+            // commander typed, so a running default that reads back "continue
+            // holding defend" while the snapshot's `stances` block says
+            // `turtle` is two vocabularies for one fact, which is the drift
+            // this codebase spends its length refusing.
+            //
+            // The stance word implies its own posture (a push stance pushes),
+            // so the place is all the phrase still owes the reader. Where the
+            // squad has been hand-tasked out of its stance, `SquadStances` has
+            // no entry — the `posture` verb clears it — and the raw posture is
+            // exactly the right thing to say, because a raw posture is exactly
+            // what it now has.
+            let phrase = match (world.stances.0.get(&(me, id)), point) {
+                (Some(kind), Some(pos)) => format!(
+                    "holds the {} stance {}",
+                    kind.word(),
+                    place_name(pos, me)
                 ),
-                None => ("has no posture".to_string(), None),
+                (Some(kind), None) => format!("holds the {} stance", kind.word()),
+                (None, _) => match world.squads.0.get(&(me, id)) {
+                    Some(SquadPosture::Defend { pos, .. }) => {
+                        format!("holds defend {}", place_name(*pos, me))
+                    }
+                    Some(SquadPosture::Push { pos }) => {
+                        format!("pushes {}", place_name(*pos, me))
+                    }
+                    Some(SquadPosture::Escort { .. }) => "escorts".to_string(),
+                    Some(SquadPosture::Forage { muster }) => {
+                        format!("forages, mustering {}", place_name(*muster, me))
+                    }
+                    None => "has no posture".to_string(),
+                },
             };
             SquadLine {
                 id,
@@ -795,6 +829,7 @@ mod tests {
             .init_resource::<Alarms>()
             .init_resource::<GameEvents>()
             .init_resource::<SquadOrders>()
+            .init_resource::<SquadStances>()
             .init_resource::<Triggers>()
             .add_systems(Update, evaluate_alarms);
         // Pin the fog mode rather than inheriting `BH_FOG`: one alarm here is
@@ -1075,6 +1110,78 @@ mod tests {
         assert!(
             alarm.running_default.contains("squad 1 pushes"),
             "and what continues if the commander says nothing: {}",
+            alarm.running_default
+        );
+    }
+
+    /// **The running default speaks the commander's own word** (wc3clone-1qc).
+    ///
+    /// Stances landed after alarms did, so the continue-note was still
+    /// describing the posture a stance installs — "holds defend near our base"
+    /// — for a squad the commander had put on `turtle`. That is one fifth of
+    /// what turtle means (the ring, the leash, the 45% break-off and the
+    /// siege-first focus are the rest), and it is not the sentence anybody
+    /// typed. The snapshot's `stances` block already says `turtle`; two
+    /// vocabularies for one squad is the drift, not the wording.
+    #[test]
+    fn a_stanced_squad_continues_in_the_word_the_commander_used() {
+        let mut app = alarm_app();
+        let unit = spawn_unit(&mut app, Team::Human, UnitKind::Footman, Vec3::ZERO, Some(1));
+        let base = Team::Human.base_pos();
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 1), SquadPosture::Defend { pos: base, radius: 14.0 });
+        app.world_mut()
+            .resource_mut::<SquadStances>()
+            .0
+            .insert((Team::Human, 1), StanceKind::Turtle);
+        {
+            let mut e = app.world_mut().entity_mut(unit);
+            let mut hp = e.get_mut::<Health>().unwrap();
+            hp.current = hp.max * 0.1;
+        }
+
+        run_for(&mut app, alarm_tuning(AlarmKind::SquadBelowHalf).grace_s + 2.0);
+        let alarm = alarm_of(&app, Team::Human, AlarmKind::SquadBelowHalf).expect("below half");
+        assert!(
+            alarm.running_default.contains("squad 1 holds the turtle stance near our base"),
+            "the word AND the ground, in the commander's own vocabulary: {}",
+            alarm.running_default
+        );
+        assert!(
+            !alarm.running_default.contains("holds defend"),
+            "the posture underneath the word is not the word: {}",
+            alarm.running_default
+        );
+    }
+
+    /// ...and a squad hand-tasked back out of its stance says the raw posture
+    /// again, because a raw posture is what it now has. `SquadStances` carries
+    /// no entry for it — intent.rs's `posture` verb clears the word — so this
+    /// is the *same* rule read from the other side rather than a second one.
+    #[test]
+    fn a_squad_with_no_stance_word_still_describes_its_bare_posture() {
+        let mut app = alarm_app();
+        let unit = spawn_unit(&mut app, Team::Human, UnitKind::Footman, Vec3::ZERO, Some(1));
+        app.world_mut().resource_mut::<SquadOrders>().0.insert(
+            (Team::Human, 1),
+            SquadPosture::Defend {
+                pos: Team::Human.base_pos(),
+                radius: 22.0,
+            },
+        );
+        {
+            let mut e = app.world_mut().entity_mut(unit);
+            let mut hp = e.get_mut::<Health>().unwrap();
+            hp.current = hp.max * 0.1;
+        }
+
+        run_for(&mut app, alarm_tuning(AlarmKind::SquadBelowHalf).grace_s + 2.0);
+        let alarm = alarm_of(&app, Team::Human, AlarmKind::SquadBelowHalf).expect("below half");
+        assert!(
+            alarm.running_default.contains("squad 1 holds defend near our base"),
+            "{}",
             alarm.running_default
         );
     }
