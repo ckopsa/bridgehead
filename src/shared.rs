@@ -754,6 +754,11 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
     crate::data::unit_row(kind).stats
 }
 
+/// One alarm kind's threshold and reflex window. See `AlarmTuning`.
+pub fn alarm_tuning(kind: AlarmKind) -> AlarmTuning {
+    crate::data::alarm_row(kind).tuning
+}
+
 /// Weapon on a building (towers). Always fires a projectile.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9551,6 +9556,18 @@ pub const SIM_ORDER: [SimSet; 14] = [
     SimSet::Cosmetic,
 ];
 
+/// The alarm evaluator's slot inside `SimSet::Feed`.
+///
+/// A named handle for the same reason `FogSet` is one: two other systems in
+/// `Feed` need a hard edge against it and would otherwise be scheduled against
+/// it by the executor. `alarm.rs` files itself here; `bridge.rs` declares
+/// `.after(AlarmSet)` so a snapshot carries the alarms computed in ITS frame
+/// rather than the previous one, and `shared.rs`'s own event diff runs before
+/// it so the two writers of `GameEvents` cannot interleave differently between
+/// two runs of one seed.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AlarmSet;
+
 // ---------------------------------------------------------------------------
 // Seeded randomness
 // ---------------------------------------------------------------------------
@@ -9662,6 +9679,12 @@ impl Plugin for CorePlugin {
             .init_resource::<TechTiers>()
             .init_resource::<TeamResearch>()
             .init_resource::<GameEvents>()
+            // Here rather than in `AlarmPlugin` so the resource exists
+            // wherever `CorePlugin` does: `bridge.rs`'s snapshot reads it, and
+            // a hand-built test app that composes the two without alarm.rs
+            // should get an empty list rather than a panic inside Bevy's
+            // worker pool (which HANGS the suite rather than failing it).
+            .init_resource::<Alarms>()
             .init_resource::<FogGrids>()
             .add_event::<SpawnUnitEvent>()
             .add_event::<SpawnBuildingEvent>()
@@ -9682,6 +9705,13 @@ impl Plugin for CorePlugin {
             // modules already declare `.after()`. It now lives *inside*
             // `SimSet::Fog`, so both spellings mean the same edge.
             .configure_sets(Update, FogSet.in_set(SimSet::Fog))
+            // The alarm evaluator only describes the frame, so it lives in the
+            // frame's reporting phase — downstream of `Think` and `Intent`,
+            // which is the structural half of "an alarm fires only after the
+            // reflex has". Configured here rather than in `AlarmPlugin` so the
+            // edge exists even in an app that reads `Alarms` without owning
+            // the evaluator.
+            .configure_sets(Update, AlarmSet.in_set(SimSet::Feed))
             .add_systems(
                 Startup,
                 (initial_spawns, apply_env_speed, log_fog_mode, log_seed),
@@ -10564,7 +10594,12 @@ const ARMY_EVENT_MIN: usize = 4;
 /// REAL seconds: at `BH_SPEED=16` a whole diff interval is sixteen game
 /// seconds, and a window narrower than that would silently stop announcing
 /// armies at speed — the exact class of bug the two clocks invite.
-const ARMY_EVENT_FRESH_S: f32 = 20.0;
+///
+/// `pub` because alarm.rs asks the identical question of the identical ledger.
+/// Two definitions of "recently enough to be news" would be two languages, and
+/// the alarm layer's whole claim is that it renders the same facts the feed
+/// does with the running default attached.
+pub const ARMY_EVENT_FRESH_S: f32 = 20.0;
 /// Same ground, same news: an army near a place already reported stays quiet
 /// this long. Rate-limiting re-sightings is not politeness, it is the
 /// difference between a feed and a stream.
@@ -10601,6 +10636,20 @@ pub enum EventSeverity {
     Warning,
     /// Act now: hero down or nearly down, a building gone, hostiles at home.
     Critical,
+}
+
+impl EventSeverity {
+    /// The wire word. Added with alarms, which are the first thing the bridge
+    /// reports a severity for — `events` never carried one, because a reader
+    /// with the message text and all the time in the world can grade its own
+    /// news, and an `alarms` entry is a triage list where it cannot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventSeverity::Info => "info",
+            EventSeverity::Warning => "warning",
+            EventSeverity::Critical => "critical",
+        }
+    }
 }
 
 /// One notable happening, from one team's point of view.
@@ -10845,7 +10894,12 @@ fn announce_bounty_claims(
     }
 }
 
-fn produce_game_events(
+/// `pub` so alarm.rs can declare a hard ordering edge against it. Both
+/// systems live in `SimSet::Feed` and both write `GameEvents`, and Bevy would
+/// otherwise leave two `ResMut` writers in one set to the executor — which
+/// would make `seq` numbering a property of the thread pool rather than of the
+/// seed.
+pub fn produce_game_events(
     time: Res<Time>,
     real: Res<Time<Real>>,
     mut feed: ResMut<GameEvents>,
@@ -11291,6 +11345,282 @@ fn diff_team(
     memo.bounties = cur_bounties;
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Alarms — forced re-decisions that default to continue and never act
+// ---------------------------------------------------------------------------
+//
+// docs/AFFORDANCES.md § Alarms, plan item 4. The contract half lives here for
+// the reason `TriggerWhen`/`Triggers` do: alarm.rs computes, bridge.rs renders,
+// and a type two modules speak through is an integrator type. The evaluator —
+// every predicate, every sentence — is alarm.rs and nothing here evaluates.
+//
+// Three properties are the whole design, and each one is structural rather
+// than a matter of anybody remembering it:
+//
+//   * **An alarm never acts.** There is no `Intent` in this section, no
+//     `SubmitIntent`, no `Order`. `Alarms` is a `Vec<Alarm>` of strings and
+//     the evaluator's only other write is a line on the team's own feed. The
+//     one path from a player to the world is still `Intent` → `apply_intents`,
+//     and an alarm is not on it.
+//   * **An alarm fires only AFTER the reflex has.** Two mechanisms, both
+//     load-bearing. The evaluator sits in `SimSet::Feed`, downstream of
+//     `Think` (doctrine and the trigger evaluator) and `Intent` (where what
+//     they submitted is compiled) in the SAME frame — so by the time an alarm
+//     is computed, the fast tier has already answered. And each kind carries
+//     a `grace_s` from `assets/data/alarms.ron`: the condition must hold that
+//     long before the alarm is raised, which is the reflex's window expressed
+//     as a number a balance-tuner can move. The payoff of an alarm is
+//     attention, not speed (AFFORDANCES.md), and a mechanism that could beat
+//     the reflex would be claiming the wrong one.
+//   * **Every alarm names its running default.** `Alarm::running_default` is
+//     mandatory, not optional, because the line the design asks for is not
+//     "base under attack — respond!" but "base under attack — home-guard is
+//     recalling squad 1 (ETA 22s)". A silent commander gets that outcome; the
+//     alarm exists so the choice to stay silent is a choice.
+//
+// Levels and edges, the distinction docs/BUILDER_BRIEF.md §6.11 lost an arena
+// match to: the `Alarms` list is a **status**, present in every snapshot for
+// exactly as long as the condition holds and refreshed each sweep so its ETA
+// and its counts stay current. The feed line is an **edge** — one on the way
+// in, one on the way out, and nothing in between. Told once that something is
+// standing and never told it stopped, a reader has to poll, which is the
+// polling this whole layer deletes.
+
+/// The four conditions worth interrupting a commander for.
+///
+/// A closed set on purpose. AFFORDANCES.md's argument is that a small
+/// commander drowns in an open-ended question every cycle, so the alarm layer
+/// is valuable in proportion to how little it says: four events force a fresh
+/// choice and *everything else defaults to continue*. A fifth kind should have
+/// to argue that a round was lost for want of it, the way each of these four
+/// can (r21's unflagged income collapse, r23's stale-contact reads).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Deserialize)]
+pub enum AlarmKind {
+    /// A body of enemy troops at or above the threshold is in this team's
+    /// **sightings ledger**. Memory, not sight — see `FogGrid::army_groups`.
+    EnemyArmySighted,
+    /// One of this team's own squads has fallen below the threshold fraction
+    /// of its pooled health.
+    SquadBelowHalf,
+    /// The gold has stopped: every mine this team's halls work is dry, or
+    /// there are fewer workers on gold than the threshold.
+    IncomeCollapse,
+    /// Buildings are being hit in two or more distinct **places** at once —
+    /// the alarm r23's blue seat asked for, and the one that carries a recall
+    /// ETA because "full recall or sacrifice the expansion?" is the question.
+    PlacesUnderAttack,
+}
+
+/// Every alarm kind, in the order they are evaluated and reported. The
+/// `alarms.ron` loader refuses to start if any of them has no row.
+pub const ALL_ALARM_KINDS: [AlarmKind; 4] = [
+    AlarmKind::EnemyArmySighted,
+    AlarmKind::SquadBelowHalf,
+    AlarmKind::IncomeCollapse,
+    AlarmKind::PlacesUnderAttack,
+];
+
+impl AlarmKind {
+    /// The wire id. Stable forever: a commander that learns to key off
+    /// `"income_collapse"` must keep working.
+    pub fn id(self) -> &'static str {
+        match self {
+            AlarmKind::EnemyArmySighted => "enemy_army_sighted",
+            AlarmKind::SquadBelowHalf => "squad_below_half",
+            AlarmKind::IncomeCollapse => "income_collapse",
+            AlarmKind::PlacesUnderAttack => "places_under_attack",
+        }
+    }
+
+    /// The short English name, for the clearing edge on the feed. The firing
+    /// edge does not use it — it carries the whole fact instead, because
+    /// "enemy army sighted" is a category and "enemy army of 9 near the east
+    /// ford" is news.
+    pub fn label(self) -> &'static str {
+        match self {
+            AlarmKind::EnemyArmySighted => "enemy army sighted",
+            AlarmKind::SquadBelowHalf => "squad below half strength",
+            AlarmKind::IncomeCollapse => "income collapse",
+            AlarmKind::PlacesUnderAttack => "multiple places under attack",
+        }
+    }
+}
+
+/// One alarm kind's two numbers, from `assets/data/alarms.ron`.
+///
+/// In data rather than in code because these are the knobs the arena will
+/// actually turn: `threshold` is "how big is big" and `grace_s` is "how long
+/// does the fast tier get". A round that wants a jumpier or a calmer harness
+/// should be a `BH_DATA_DIR` away, not a rebuild — and the scaffold version a
+/// round was played under is meant to be recorded in its `ruleset`
+/// (AFFORDANCES.md constraint 3), which is easier when it is a file.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlarmTuning {
+    /// What "enough" means, per kind:
+    ///
+    /// | kind | `threshold` |
+    /// |---|---|
+    /// | `EnemyArmySighted` | smallest body of troops worth the interruption, in units |
+    /// | `SquadBelowHalf` | pooled-health fraction, `0..=1` |
+    /// | `IncomeCollapse` | fewest workers on gold that still counts as income |
+    /// | `PlacesUnderAttack` | how many distinct places at once |
+    pub threshold: f32,
+    /// **The reflex's window.** Game seconds the condition must hold before
+    /// the alarm is raised. Not a debounce: it is the statement that the
+    /// fastest tier that can hold this decision gets it first, expressed as
+    /// the only thing a schedule cannot express — a duration.
+    pub grace_s: f32,
+}
+
+/// One standing alarm, as both seats' renderers read it.
+///
+/// Everything here is derived from what its OWNING team may know. There is no
+/// field an omniscient reader could fill that a fog-honest one could not: the
+/// enemy half comes from the sightings ledger, and every other half is the
+/// team's own units, buildings and doctrine.
+#[derive(Clone, Debug)]
+pub struct Alarm {
+    pub kind: AlarmKind,
+    /// **The triggering fact**, in the words the feed and the HUD use for the
+    /// same thing. Refreshed every sweep while the alarm stands.
+    pub fact: String,
+    /// **What is already being done about it** — the reflex tier's answer,
+    /// named. Never empty: when nothing is standing, this says so in those
+    /// words, because "nothing is happening automatically" is the single most
+    /// useful thing a commander can be told and the thing an alarm that only
+    /// shouted would hide.
+    pub running_default: String,
+    /// Game time the alarm STARTED STANDING — when it fired, not when the
+    /// condition first held. (The condition held `grace_s` earlier; the two
+    /// are one subtraction apart and this is the one that matches the feed.)
+    pub since_t: f32,
+    pub severity: EventSeverity,
+    /// Seconds until the running default arrives, when the running default is
+    /// a movement. `None` when nothing is in transit — and `None` is a real
+    /// answer, not a missing one: it means the default is to stand still.
+    pub eta_s: Option<f32>,
+    /// Where it is happening, so the HUD can ping it and a camera can go
+    /// there. `None` for an alarm with no one place (income collapse).
+    pub pos: Option<Vec3>,
+}
+
+/// What one team's one alarm kind is doing between sweeps.
+#[derive(Default, Clone, Copy)]
+struct AlarmState {
+    /// When the condition began holding continuously, or `None` while it does
+    /// not hold. Reset the moment it lapses, so a condition that flickers
+    /// never accumulates its way past the grace window.
+    held_since: Option<f32>,
+    /// Is the alarm currently standing (i.e. in the team's list)?
+    firing: bool,
+}
+
+/// A transition, and the only thing that earns a line on the feed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AlarmEdge {
+    Fired,
+    Cleared,
+}
+
+/// Per-team standing alarms, plus the little state machine that decides when
+/// one starts and stops standing.
+///
+/// `alarm.rs` is the only writer, through `observe` alone. Readers get a slice
+/// and must name a team to get anything at all — the same shape `GameEvents`
+/// uses, and for the same reason: a renderer for one seat has no way to ask
+/// for the other's.
+#[derive(Resource, Default)]
+pub struct Alarms {
+    human: Vec<Alarm>,
+    claude: Vec<Alarm>,
+    /// `BTreeMap` and not a `HashMap`, on the rule that governs every
+    /// collection on a gameplay path here: std's hasher reseeds per process.
+    /// This one only decides *event ordering*, which is exactly the kind of
+    /// thing that makes two runs of one seed produce two different logs.
+    states: std::collections::BTreeMap<(Team, AlarmKind), AlarmState>,
+}
+
+impl Alarms {
+    /// That team's standing alarms, in `ALL_ALARM_KINDS` order.
+    pub fn get(&self, team: Team) -> &[Alarm] {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+
+    /// One kind's verdict for one team, this sweep.
+    ///
+    /// `raised` is `Some` when the condition holds — carrying the fact and the
+    /// running default the caller has already worded — and `None` when it does
+    /// not. The return value is the EDGE, if there was one, so the caller
+    /// writes exactly one feed line per transition and none for the long
+    /// middle where the alarm is merely still true.
+    ///
+    /// The grace window is applied HERE rather than in each predicate, so no
+    /// alarm can be added later that forgets to let the reflex go first.
+    pub fn observe(
+        &mut self,
+        team: Team,
+        kind: AlarmKind,
+        now: f32,
+        grace_s: f32,
+        raised: Option<Alarm>,
+    ) -> Option<AlarmEdge> {
+        let state = self.states.entry((team, kind)).or_default();
+        let (edge, standing) = match raised {
+            // The condition has lapsed. Clear, and owe the reader the exit
+            // edge if we ever told them about the entry one.
+            None => {
+                state.held_since = None;
+                let was = std::mem::replace(&mut state.firing, false);
+                (was.then_some(AlarmEdge::Cleared), None)
+            }
+            Some(mut alarm) => {
+                let held = *state.held_since.get_or_insert(now);
+                if state.firing {
+                    // Still true: refresh the wording, keep the clock.
+                    (None, Some((alarm, None)))
+                } else if now - held >= grace_s {
+                    state.firing = true;
+                    alarm.since_t = ev_r1(now);
+                    (Some(AlarmEdge::Fired), Some((alarm, Some(ev_r1(now)))))
+                } else {
+                    // Inside the reflex's window. The condition is true and
+                    // the commander is deliberately not being told yet.
+                    (None, None)
+                }
+            }
+        };
+        let list = match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        };
+        match standing {
+            None => list.retain(|a| a.kind != kind),
+            Some((mut alarm, fired_at)) => {
+                match list.iter_mut().find(|a| a.kind == kind) {
+                    Some(slot) => {
+                        // A standing alarm keeps the time it started standing;
+                        // everything else about it is this sweep's truth.
+                        alarm.since_t = fired_at.unwrap_or(slot.since_t);
+                        *slot = alarm;
+                    }
+                    None => {
+                        list.push(alarm);
+                        // Sorted by kind rather than by arrival, so the array
+                        // a commander diffs between two polls depends on WHICH
+                        // alarms stand and never on the order they arrived in.
+                        list.sort_by_key(|a| a.kind);
+                    }
+                }
+            }
+        }
+        edge
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,100 @@
+// ---------------------------------------------------------------------------
+// alarms.ron — the four forced re-decisions, and how loud each one is.
+//
+// One record per `AlarmKind` variant, every variant exactly once; the loader
+// (src/data.rs) refuses to start otherwise, naming the variant it could not
+// find. Field meanings are documented on `AlarmTuning` in src/shared.rs; the
+// design argument is docs/AFFORDANCES.md § "Alarms: forced re-decisions,
+// defaulting to continue", and the balance rationale lives here, next to the
+// number it explains.
+//
+// TWO NUMBERS PER ALARM, and they are different kinds of thing:
+//
+//   * `threshold` — how big is big. Per-kind units; see the table on
+//     `AlarmTuning`.
+//   * `grace_s`   — how long the condition must hold before the commander is
+//     told. This is NOT a debounce. It is the reflex tier's window written
+//     down: doctrine and triggers run at 4 Hz and have already answered by the
+//     time this elapses, so the alarm reports an answer instead of racing one.
+//     "An alarm is never the first responder" is the design's line, and this
+//     is the number that makes it true. Raising it makes the harness calmer;
+//     lowering it toward zero makes the alarm arrive while the reflex is still
+//     mid-answer, and its `running_default` will say so.
+//
+// Whatever these are set to when a round is played belongs in that round's
+// `ruleset` field (AFFORDANCES.md constraint 3): once the scaffold encodes a
+// judgment, the ledger is measuring model+scaffold, and that is only honest if
+// the scaffold's version travels with the result.
+// ---------------------------------------------------------------------------
+[
+    (
+        kind: EnemyArmySighted,
+        tuning: (
+            // 8 units. Above `ARMY_EVENT_MIN` (4), which is the smallest body
+            // the event feed bothers to mention: the feed's job is a running
+            // transcript, an alarm's is to stop you. A four-man patrol should
+            // appear in `events` and should NOT force a re-decision — r23's
+            // red seat did not lose to a patrol, it lost to seventeen troops
+            // it had stopped looking for.
+            threshold: 8.0,
+            // 4s. The trigger evaluator sweeps at 4 Hz and squad postures
+            // re-task at 1 Hz, so four seconds is several rounds of both: any
+            // `enemy_sighted` / `enemy_army_seen` rule the commander armed has
+            // fired and been compiled, and its effect is what the alarm's
+            // running default gets to name.
+            grace_s: 4.0,
+        ),
+    ),
+    (
+        kind: SquadBelowHalf,
+        tuning: (
+            // Half, literally — the bead's name and AFFORDANCES.md's wording.
+            // Pooled across the squad, so one wounded footman in a healthy
+            // line is not a squad in trouble (the same reading
+            // `TriggerWhen::SquadBelow` uses; two readings of one phrase would
+            // be two languages).
+            threshold: 0.5,
+            // 4s. `doctrine::trigger_retreat` runs at 4 Hz, so a retreat
+            // threshold has fired and the members it applies to are already
+            // walking. The alarm's question is "is falling back enough?",
+            // which is still the right question four seconds later.
+            grace_s: 4.0,
+        ),
+    ),
+    (
+        kind: IncomeCollapse,
+        tuning: (
+            // One worker on gold. Zero is a collapse; one is a trickle you
+            // chose. Deliberately not a rate: a rate needs a window and a
+            // window needs tuning, and "is anybody mining?" is the question
+            // r21 could not answer about itself for ninety seconds.
+            threshold: 1.0,
+            // 20s, by far the longest here, and the right length for the
+            // slowest-burn condition in the set. Gold intake is bursty — a
+            // worker walking back to the hall is not mining — and there is no
+            // reflex that fixes an economy in under a minute, so a shorter
+            // window would only produce false alarms during ordinary hauls
+            // and during the opening seconds before the first workers reach
+            // the mine.
+            grace_s: 20.0,
+        ),
+    ),
+    (
+        kind: PlacesUnderAttack,
+        tuning: (
+            // Two. The whole content of this alarm is "at once" — one place
+            // under attack is `base_under_attack`, which the feed, the HUD and
+            // the trigger vocabulary already cover between them. Two is the
+            // number that turns a raid into a choice about what to give up.
+            threshold: 2.0,
+            // 6s, a little longer than the other two fast ones because
+            // `BASE_ATTACK_WINDOW_S` is 8s: the condition has to survive long
+            // enough to be two simultaneous attacks rather than one attack and
+            // the tail of another. Also gives a `base_under_attack` home-guard
+            // trigger time to fire AND its recalled squad time to start
+            // walking, which is what makes the ETA in the running default a
+            // real number instead of a guess.
+            grace_s: 6.0,
+        ),
+    ),
+]
