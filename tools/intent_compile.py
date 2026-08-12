@@ -679,6 +679,40 @@ def pick_mine(tokens, snap):
 # ---------------------------------------------------------------------------
 
 
+# The counts a commander types in front of a noun. Digits and the small words
+# both, because "send 3 footmen" and "send three footmen" are the same order
+# and a tool that honours one and silently widens the other is worse than one
+# that ignores both.
+COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+               "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+               "twelve": 12}
+LEADING_COUNT = re.compile(r"^(?:the\s+|a\s+|an\s+)?(?P<n>\d+|"
+                           + "|".join(COUNT_WORDS) + r")\s+(?P<rest>\S.*)$")
+
+
+def leading_count(text, default="army"):
+    """Split ``"3 footmen"`` into ``(3, "footmen")``; no count -> ``(None, phrase)``.
+
+    Ignoring the number was the oldest quiet bug in this layer: "send 3
+    footmen to mid" moved *every* footman and the confirmation line agreed
+    with the commander while doing it, because the line was derived from the
+    same selection the order was. A number in front of a noun is a decision,
+    and this is where it stops being noise.
+
+    ``"squad 2"`` cannot reach here — the count must be the FIRST word, and a
+    squad phrase starts with the word "squad".
+    """
+    phrase = (text or default).strip().lower()
+    m = LEADING_COUNT.match(phrase)
+    if not m:
+        return None, phrase
+    head = m.group("n")
+    n = int(head) if head.isdigit() else COUNT_WORDS[head]
+    # "0 footmen" is not an order anyone means; treat it as no count rather
+    # than as an order to move nobody.
+    return (n if n > 0 else None), m.group("rest").strip()
+
+
 def resolve_units(text, snap, default="army"):
     """A phrase like "the cavalry" / "squad 2" / "everything" -> a list of ids.
 
@@ -686,18 +720,24 @@ def resolve_units(text, snap, default="army"):
     (intent.rs), but a selector that could name an enemy unit would produce
     errors instead of an empty selection, and an empty selection is the more
     honest report.
+
+    A LEADING COUNT ("3 footmen") caps the list, in snapshot order so two
+    compiles of one sentence pick the same three.
     """
-    phrase = (text or default).strip().lower()
+    count, phrase = leading_count(text, default)
     tokens = [w for w in _words(phrase) if w not in NOISE]
     mine = snap.own_units()
+
+    def take(ids):
+        return ids if count is None else ids[:count]
 
     m = re.search(r"squad\s*(\d+)", phrase)
     if m:
         sid = int(m.group(1))
-        return [u["id"] for u in mine if u.get("squad") == sid]
+        return take([u["id"] for u in mine if u.get("squad") == sid])
 
     if phrase in ARMY_WORDS or any(w in ARMY_WORDS for w in tokens) or not tokens:
-        return [u["id"] for u in mine if u.get("kind") != WORKER_KIND]
+        return take([u["id"] for u in mine if u.get("kind") != WORKER_KIND])
 
     kinds = []
     for token in tokens:
@@ -706,7 +746,7 @@ def resolve_units(text, snap, default="army"):
         # An unrecognised noun must not silently become "the whole army" —
         # that is how a directive moves things it never named.
         return None
-    return [u["id"] for u in mine if u.get("kind") in kinds]
+    return take([u["id"] for u in mine if u.get("kind") in kinds])
 
 
 # The English roles that ARE engine selectors (shared.rs::parse_selector),
@@ -725,6 +765,12 @@ SELECTOR_FOR_KINDS = {
     ("Worker",): "workers",
     ("Hero", "Priestess"): "my hero",
 }
+# The one selector a "which ONE unit" slot may take. Every other role phrase
+# would be resolved by the engine's lowest-id tie-break, which for "all army"
+# or "squad 2" is a coin toss the commander cannot see; for the hero it is the
+# champion — the first hero slot, and what a commander who says "my hero"
+# means. Anything else goes through `resolve_one_unit`, which refuses.
+HERO_SELECTOR = SELECTOR_FOR_KINDS[("Hero", "Priestess")]
 
 
 def selector_phrase(text, default="army"):
@@ -734,7 +780,13 @@ def selector_phrase(text, default="army"):
     functions answer the same question in two vocabularies, and the moment they
     disagree the tool is reporting one selection and sending another.
     """
-    phrase = (text or default).strip().lower()
+    count, phrase = leading_count(text, default)
+    if count is not None:
+        # No engine selector can say "three of them". A counted phrase is a
+        # photograph by construction, so it travels as ids — sending
+        # `select:"footmen"` here would be the selector quietly overruling the
+        # number, which is the bug `leading_count` exists to fix.
+        return None
     tokens = [w for w in _words(phrase) if w not in NOISE]
 
     m = re.search(r"squad\s*(\d+)", phrase)
@@ -815,13 +867,18 @@ def resolve_one_unit(text, snap, role, result, clause, default="hero"):
     Priestess and "the hero" stops naming one thing. The verbs that take a
     LIST (retreat, focus, leash, autocast, squad) are unaffected — both heroes
     is a fine answer to "autocast at 3". The verbs that take exactly ONE unit
-    are not, and this is where they land.
+    are not, and this is where they land: `buy` and `use_item`, whose payload
+    is an inventory only one hero has.
 
     Picking the first, or the nearest, would be this tool guessing at the one
-    place a guess is unrecoverable: an escort posture aimed at the wrong hero
-    sends the army to the wrong side of the map, and it does it silently. So
-    it refuses, and names the two words that resolve it. Refusing here is the
+    place a guess is unrecoverable: a potion bought for the wrong hero is
+    money spent on the wrong side of the map, and it is spent silently. So it
+    refuses, and names the two words that resolve it. Refusing here is the
     same rule as an unresolvable place — say what you meant.
+
+    `escort` used to land here too and no longer does: it sends `follow` with
+    a `target_select`, so the ENGINE picks the hero, late, by a documented
+    tie-break, instead of this tool freezing an id it had to guess.
     """
     ids = resolve_units(text, snap, default=default)
     if ids is None:
@@ -935,6 +992,14 @@ class Ctx:
         return sid
 
 
+# Third person for a confirmation line. Written out rather than derived by
+# adding an "s", for the same reason `STANCE_VERBS` is: the derivation prints
+# "squad 1 pushs their base", and a confirmation line the commander cannot read
+# without flinching is a confirmation line they stop reading.
+POSTURE_VERB_ENGLISH = {"defend": "defends", "push": "pushes",
+                        "forage": "forages", "escort": "escorts"}
+
+
 def posture_clause(ctx, clause, word, place_text, who_text, extra=None, radius=None):
     """The shared body of hold / push / forage: squad, then posture.
 
@@ -982,7 +1047,8 @@ def posture_clause(ctx, clause, word, place_text, who_text, extra=None, radius=N
     out.append({"type": "posture", "id": sid, "posture": posture})
     ctx.result.ok(
         clause,
-        f"squad {sid} {word}s {place_english(place)} with {who.english()}",
+        f"squad {sid} {POSTURE_VERB_ENGLISH.get(word, word + 's')} "
+        f"{place_english(place)} with {who.english()}",
     )
     return out
 
@@ -1048,7 +1114,8 @@ def _squad_posture(m, ctx, clause):
         # ...and a named region with no radius said is left WITHOUT one, so the
         # engine uses the circle's own. "squad 1 defends the-perimeter" is then
         # a sentence with no numbers in it at either end of the wire.
-    ctx.result.ok(clause, f"squad {sid} {word}s {place_english(place)}")
+    ctx.result.ok(clause, f"squad {sid} {POSTURE_VERB_ENGLISH.get(word, word + 's')} "
+                          f"{place_english(place)}")
     return [{"type": "posture", "id": sid, "posture": posture}]
 
 
@@ -1443,32 +1510,49 @@ def _send(m, ctx, clause):
 
 @rule("escort", r"^(?:escort|bodyguard|protect|babysit)\s+(?P<who_target>.+?)" + WITH + r"$")
 def _escort(m, ctx, clause):
+    """"escort my hero with the footmen" -> ONE `follow`, both halves late-bound.
+
+    It used to be a squad plus an `escort` posture carrying a frozen unit id,
+    and the id is what was wrong with it. A posture aimed at `escort:4294968150`
+    is aimed at a hero who can die; the hero comes back with a brand-new id and
+    the squad is still bodyguarding a corpse's number. Worse, freezing the id
+    meant the tool had to KNOW which hero, so "escort my hero" on a Keep team —
+    two hero slots, champion and priestess — refused outright rather than
+    escorting whichever one there is.
+
+    `follow`'s `target_select` answers both. The phrase travels on the wire and
+    the engine resolves it when the intent compiles (which for a trigger's
+    action is when it FIRES), taking the lowest-id match as COMMANDER_BRIEF
+    documents for every one-unit selector. A phrase that names KINDS rather
+    than a role — "the champion", "the priestess" — has no selector to be, so
+    it still resolves to exactly one id here, and still refuses rather than
+    guesses when it names several.
+
+    Nothing needs to exclude the leader from the followers: `intent.rs` skips
+    it (`a unit following itself would deadlock its own order`), so the sentence
+    stays one intent instead of a squad, an exclusion and a posture.
+    """
     snap = ctx.snap
-    target = resolve_one_unit(m.group("who_target"), snap, "escort",
-                              ctx.result, clause)
-    if target is None:
-        return []
     who = resolve_selection(m.group("who"), snap)
     if who is None:
         ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
         return []
-    # The one place a role phrase must be spent back into ids: an escort may
-    # not escort itself, "all army" contains the hero it is escorting, and no
-    # selector can say "except that one". Frozen ids are the honest answer to a
-    # sentence with an exception in it.
-    if who.phrase and target in who.ids:
-        who = who.frozen()
-    escorts = Selection([i for i in who.ids if i != target], who.phrase)
-    # An escort has no ground position, so "already doing this job" means
-    # "already escorting this exact unit" — the wire form is `escort:<id>`.
-    sid = ctx.squad_for(("escort", target),
-                        lambda s: s.get("posture") == f"escort:{target}")
-    out = []
-    if not escorts.empty():
-        out.append({"type": "squad", **escorts.fields(), "id": sid})
-    out.append({"type": "posture", "id": sid, "posture": {"type": "escort", "unit": target}})
-    ctx.result.ok(clause, f"squad {sid} escorts unit {target} with {escorts.english()}")
-    return out
+    if who.empty():
+        ctx.result.fail(clause, f"no unit matches {m.group('who')!r}")
+        return []
+    lead = selector_phrase(m.group("who_target"), default="hero")
+    if lead == HERO_SELECTOR:
+        target = {"target_select": lead}
+        english = lead
+    else:
+        one = resolve_one_unit(m.group("who_target"), snap, "escort",
+                               ctx.result, clause)
+        if one is None:
+            return []
+        target = {"target": one}
+        english = f"unit {one}"
+    ctx.result.ok(clause, f"{who.english()} follow {english}")
+    return [{"type": "follow", **who.fields(), **target}]
 
 
 @rule("squad-retask", r"^squad\s+(?P<id>\d+)\s+(?:should\s+)?"
@@ -1877,8 +1961,21 @@ def _scout(m, ctx, clause):
     if pos is None:
         ctx.result.fail(clause, f"cannot resolve place {m.group('place')!r}")
         return []
-    who = resolve_selection(m.group("who"), snap) if m.group("who") else None
-    if who is None or who.empty():
+    if m.group("who"):
+        # A commander who SAID who scouts gets that or a refusal. The fallback
+        # below used to swallow this branch: "scout mid with the gryphons" on a
+        # team with no gryphons quietly sent one worker instead, which is the
+        # silent substitution this tool's own rules forbid everywhere else —
+        # and the worst kind of it, because the confirmation line named the
+        # unit that went and the commander was reading for the place.
+        who = resolve_selection(m.group("who"), snap)
+        if who is None:
+            ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
+            return []
+        if who.empty():
+            ctx.result.fail(clause, f"no unit matches {m.group('who')!r}")
+            return []
+    else:
         # Cheapest eyes on the map first (COMMANDER_BRIEF: raiders see 24).
         # An id, not a role: "the cheapest thing I own that can see" is a
         # judgement this tool makes about one unit, and the engine has no
@@ -1889,9 +1986,9 @@ def _scout(m, ctx, clause):
             if ids:
                 break
         who = Selection(ids[:1])
-    if who.empty():
-        ctx.result.fail(clause, "no unit available to scout with")
-        return []
+        if who.empty():
+            ctx.result.fail(clause, "no unit available to scout with")
+            return []
     ctx.result.ok(clause, f"{who.english()} attack-move to "
                           f"({pos[0]:.1f}, {pos[1]:.1f}) to look")
     return [{"type": "attackmove", **who.fields(),
@@ -2022,6 +2119,31 @@ def parse_when(text, snap=None):
             # human's own [V] Fall back preset uses, so "my hero is in trouble"
             # means the same number in both interfaces.
             return {"type": "hero_below", "frac": 0.35}
+
+    # --- a hero is healed -------------------------------------------------
+    # The wait-condition half of the pair, and the word a chain needs: "turtle
+    # until the hero is healed, then commit". It is NOT the negation of
+    # `hero_below` and this vocabulary could not spell a negation anyway —
+    # `hero_above` is false with no hero alive, so a chain waiting on it never
+    # advances over the corpse (shared.rs::TriggerWhen::HeroAbove), and it asks
+    # about ALL living heroes rather than any.
+    #
+    # Below the `hero_below` branches on purpose: the two word lists are
+    # disjoint, and keeping the dying reading first means a sentence that
+    # somehow satisfies both is read as the emergency.
+    if not theirs:
+        m = re.search(r"\bhero(?:es)?\b.*?(?:above|over|back\s+to|at\s+least)"
+                      r"\s*(?P<pct>\d+)\s*%", t)
+        if m:
+            return {"type": "hero_above",
+                    "frac": round(int(m.group("pct")) / 100.0, 3)}
+        if re.search(r"\bhero(?:es)?\b.*\b(healed|heals|healthy|recovered|"
+                     r"recovers|topped\s+up|patched\s+up|back\s+up|full|"
+                     r"ready|fit|fine)\b", t):
+            # 80% is the number COMMANDER_BRIEF's own chain example waits on,
+            # so "until my hero is healed" means the same thing whether the
+            # commander wrote English or JSON.
+            return {"type": "hero_above", "frac": 0.8}
 
     # --- a squad is breaking ---------------------------------------------
     m = re.search(r"\bsquad\s*(?P<sid>\d+)\b.*?(?:below|under|at)\s*(?P<pct>\d+)\s*%", t)
@@ -2183,6 +2305,12 @@ def name_for(when):
         return "base-attacked"
     if kind == "hero_below":
         return f"hero-{int(round(when['frac'] * 100))}"
+    if kind == "hero_above":
+        # `hero-up-` rather than `hero-`: a rule about the hero dying and a
+        # rule about the hero being healed are opposite rules, and colliding
+        # names replace each other in the engine's eight slots. The same care
+        # `champion-down` takes against `hero-35`.
+        return f"hero-up-{int(round(when['frac'] * 100))}"
     if kind == "squad_below":
         return f"sq{when['id']}-{int(round(when['frac'] * 100))}"
     if kind == "enemy_sighted":
@@ -2558,7 +2686,9 @@ WHAT THE PATTERN LAYER UNDERSTANDS
     push <place> [with <units>]                -> squad + posture push
        (also: attack / strike / press / hit / assault / advance on / raze)
     forage <place> [with <units>]              -> squad + posture forage
-    escort <unit> [with <units>]               -> squad + posture escort
+    escort <unit> [with <units>]               -> follow (say "my hero" and the
+                                                  phrase travels: it keeps
+                                                  meaning the hero you have)
     send <units> to <place>                    -> move (a walk; push to fight)
     squad <n> <place>                          -> re-point squad n, keeping its job
     squad <n> holds|pushes|forages <place>     -> re-point and change its job
@@ -2584,14 +2714,20 @@ WHAT THE PATTERN LAYER UNDERSTANDS
     buy <item> [for the champion|priestess]    -> buy at your Shop
     use slot <0|1> [for the champion]          -> consume an inventory item
     scout <place> [with <units>]               -> attack-move your cheapest eyes
+                                                  (name units and it sends
+                                                  those or refuses — it will
+                                                  not substitute)
     surrender / autopilot [off]
 
   UNITS:  the army (default) | cavalry | siege | footmen | archers | spearmen
           knights | gryphons | sorcerers | workers | squad <n> | everything
           the hero  -- every hero-CLASS unit. Hero slots climb the hall ladder,
           so a Keep team has TWO; verbs taking a list get both, and the verbs
-          taking exactly one (escort, buy, use) refuse and ask for
-          "the champion" or "the priestess" rather than guess.
+          taking exactly one (buy, use) refuse and ask for "the champion" or
+          "the priestess" rather than guess.
+          A LEADING COUNT is honoured: "send 3 footmen to mid" sends three, not
+          every footman you own. A counted phrase travels as ids rather than as
+          a selector, because no selector can say "three of them".
 
   ROLES ARE SENT AS ROLES, NOT AS ID LISTS. Four of those words are engine
   SELECTORS, and when you use one the phrase itself travels in the command:
@@ -2717,9 +2853,17 @@ TRIGGERS — "when X, Y" (the engine watches it for you, at 4 Hz)
   whenever / every time / each time       -> REPEATS (45s cooldown by default)
   "... as <name>"   names it;   "... every 90s"   sets the cooldown.
 
-  THE THIRTEEN PREDICATES (this is the whole list — `shared::TriggerWhen`):
+  THE FOURTEEN PREDICATES (this is the whole list — `shared::TriggerWhen`):
     my base is attacked                 any of your buildings damaged (last 8s)
     my hero drops below 40%             any living hero of yours under that
+    my hero is healed                   EVERY living hero at or above that
+    my hero is back above 80%           fraction, and you have at least one.
+                                        The wait-condition of a chain, and NOT
+                                        the negation of the line above: with no
+                                        hero alive it is false, so "turtle
+                                        until the hero is healed, then commit"
+                                        never commits over the corpse. Bare
+                                        "healed" means 80%.
     squad 2 drops below 50%             that squad's POOLED health under that
     I see 3 or more siege               enemy units you can SEE right now
     5 or more enemies in north-pass     enemy units you can see INSIDE a named
@@ -2802,7 +2946,7 @@ def report(result, stream):
         # CONDITION is outside `TriggerWhen`. The old watch-the-feed advice is
         # exactly right for that case and nothing else, so it lives here.
         print(f"  deferred {clause!r:<44} -> no predicate matches {cond!r} "
-              f"(see --explain for the thirteen); watch `events` for it, then run:",
+              f"(see --explain for the fourteen); watch `events` for it, then run:",
               file=stream)
         print(f"           intent_compile.py --seat <SEAT> --send "
               f"{suggestion!r}" if suggestion else

@@ -12,8 +12,11 @@ would be expensive to discover in an arena round:
   and `digest()` does not mutate the dict it is handed.
 * **It degrades.** Every key it reads was added at some point, so a snapshot
   from before that point must still render. The repo's oldest fixture
-  (`state_crossings.json`, no `intel`, no `my_race`) is the real specimen and
-  the empty dict is the paranoid one.
+  (`legacy_crossings.json`, no `intel`, no `my_race`) is the real specimen and
+  the empty dict is the paranoid one. That fixture is named for the job: it is
+  a specimen of an OLD wire, never a sample of the current one, and the rename
+  from `state_crossings.json` was because the old name invited exactly that
+  misreading.
 * **It stays short.** Fifteen lines that grow to fifty in a late game is the
   problem it was written to fix, so the ceiling is asserted against a snapshot
   built to blow it.
@@ -47,8 +50,14 @@ FIX = HERE / "fixtures"
 LIVE = [FIX / "digest_open_mid.json", FIX / "digest_crossings_mid.json"]
 #: t=8s: five workers, no army, nothing scouted.
 EARLY = FIX / "digest_open_early.json"
+#: t=236s: squad 1 stanced `stage` with a `defend@(0,0)` anchor underneath it,
+#: two named regions, two armed triggers, a running plan.
+ARMED = FIX / "doc_open_armed.json"
+#: t=388s with an `income_collapse` alarm ringing — the shipped `AlarmOut`
+#: shape, whose `running_default` names every standing squad by number.
+ALARM = FIX / "doc_open_alarm.json"
 #: The pre-`intel`, pre-`my_race` snapshot this repo has always carried.
-LEGACY = FIX / "state_crossings.json"
+LEGACY = FIX / "legacy_crossings.json"
 
 
 def load(path):
@@ -164,7 +173,7 @@ def test_no_line_runs_away():
 
 
 def test_a_snapshot_that_predates_every_optional_key_still_renders():
-    """`state_crossings.json` has no `intel`, no `my_race`, no `alarms`."""
+    """`legacy_crossings.json` has no `intel`, no `my_race`, no `alarms`."""
     s = load(LEGACY)
     assert "intel" not in s and "my_race" not in s, "fixture is no longer the old shape"
     props = bridge_view.digest(s)
@@ -329,6 +338,44 @@ def test_an_alarms_running_default_leads_the_default_line():
     assert "home-guard recalls squad 1" in line
 
 
+def test_a_squad_the_alarm_already_named_is_not_named_twice():
+    """`income_collapse`'s running default is a full sentence about what every
+    squad is doing, so the DEFAULT line used to say "squad 0 (15 units) holds
+    defend near our base; …; squad 0 keeps defend near our base" — the same
+    squad twice, in two vocabularies, inside one line meant to be read at a
+    glance.
+
+    The ALARM's clause is the one that survives: it is the engine's account of
+    what the reflex left that squad doing, and it is the half a commander
+    cannot reconstruct.
+    """
+    props = bridge_view.digest(load(ALARM))
+    default = props["default"]
+    assert [sq["id"] for sq in props["squads"]] == [0, 1], "fixture has both squads"
+    assert "squad 0 (15 units) holds" in default, "the alarm's own clause stays"
+    assert "squad 0 keeps" not in default and "squad 1 keeps" not in default
+    # Not a blanket suppression: an alarm that names ONE squad leaves the
+    # others to be reported the ordinary way.
+    s = load(ALARM)
+    s["alarms"] = [{"text": "base under attack", "default": "home-guard recalls squad 1"}]
+    default = bridge_view.digest(s)["default"]
+    assert "squad 1 keeps" not in default
+    assert "squad 0 keeps" in default
+
+
+def test_a_squad_number_is_matched_whole_when_deduping():
+    """"squad 1" must not swallow "squad 10" — a ten-squad late game is exactly
+    when the DEFAULT line matters most."""
+    s = load(ALARM)
+    s["squads"][1]["id"] = 10
+    for u in s["units"]:
+        if u.get("squad") == 1:
+            u["squad"] = 10
+    s["alarms"] = [{"text": "base under attack", "default": "home-guard recalls squad 1"}]
+    default = bridge_view.digest(s)["default"]
+    assert "squad 10 keeps" in default
+
+
 # -- the running default -----------------------------------------------------
 
 
@@ -348,14 +395,50 @@ def test_a_squad_with_no_posture_says_so_rather_than_inventing_one():
     assert "no standing posture" in props["default"]
 
 
-def test_a_named_stance_passes_through_untouched():
-    """When 0uu.2 lands, `squads[].stance` is a bare word and outranks posture."""
+def test_a_named_stance_keeps_the_anchor_underneath_it():
+    """`squads[].stance` is a bare doctrine word and it OUTRANKS posture — but
+    it does not replace it. A stanced squad carries both: the stance names the
+    doctrine, the posture underneath carries the ground the stance was
+    installed at.
+
+    WAS `test_a_named_stance_passes_through_untouched`, which asserted the
+    phrase was the bare word. That threw the anchor away, so a squad staging at
+    mid and a squad staging on its own hall both read "stage" — in a document
+    whose entire job is to say where things are.
+
+    `stance` stays the bare word, because it is the FACT and the phrase is the
+    sentence: a caller matching on the doctrine must not have to strip a
+    parenthesis off it.
+    """
     s = load(LIVE[0])
     s["squads"][0]["stance"] = "turtle"
     props = bridge_view.digest(s)
     assert props["squads"][0]["stance"] == "turtle"
+    assert props["squads"][0]["stance_phrase"] == "turtle (near our base)"
+    assert "squad 0 keeps turtle (near our base)" in props["default"]
+
+
+def test_a_real_stanced_squad_says_where_it_is_staging():
+    """The shipped fixtures, not a hand-edited one: squad 1 is `stage` with a
+    `defend@(0,0)` underneath it, and read "stage" for as long as the anchor
+    was being dropped."""
+    props = bridge_view.digest(load(ARMED))
+    stanced = [sq for sq in props["squads"] if sq["id"] == 1][0]
+    assert stanced["stance"] == "stage"
+    assert stanced["stance_phrase"] == "stage (near mid)"
+    line = [ln for ln in bridge_view.render_digest(props)
+            if ln.startswith("SQUAD 1")][0]
+    assert "stage (near mid)" in line
+
+
+def test_a_stance_with_no_ground_under_it_is_still_a_bare_word():
+    """A squad whose only record is the stance has no anchor to name, and an
+    empty parenthesis would be the renderer inventing punctuation."""
+    s = load(LIVE[0])
+    s["squads"][0].pop("posture", None)
+    s["squads"][0]["stance"] = "turtle"
+    props = bridge_view.digest(s)
     assert props["squads"][0]["stance_phrase"] == "turtle"
-    assert "squad 0 keeps turtle" in props["default"]
 
 
 # -- places ------------------------------------------------------------------

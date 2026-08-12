@@ -7,11 +7,19 @@ Plain asserts, no pytest features, so the file runs either way — an agent with
 no venv should still be able to check the compiler before sending an army
 somewhere on its say-so.
 
-The fixture (`fixtures/state_crossings.json`) is a real-shaped `state.json` for
-the Claude seat on the `crossings` map at ~3:34, with three named fords, two
-barracks, a shop with one locked rung, five mines and one visible bounty. Every
-place-name test below is therefore a test of the SNAPSHOT vocabulary, not of a
-hardcoded table: change the map and these tests change with it.
+The fixture (`fixtures/legacy_crossings.json`) is the Claude seat on the
+`crossings` map at ~3:34, with three named fords, two barracks, a shop with one
+locked rung, five mines and one visible bounty. Every place-name test below is
+therefore a test of the SNAPSHOT vocabulary, not of a hardcoded table: change
+the map and these tests change with it.
+
+**It is a LEGACY fixture and not a sample of the current wire.** It predates
+`intel`, `my_race`, `alarms` and everything after them, so it is a specimen of
+what old snapshots looked like, kept because reading one is a thing this tool
+must still do. `tools/verify_intent_bridge.py` is what pins the CURRENT
+top-level key set, against a live seat; nothing here should be read as "this is
+what a snapshot looks like". Fixtures captured from recent matches live beside
+it as `digest_*.json` / `doc_*.json`.
 """
 
 import json
@@ -23,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import intent_compile as ic  # noqa: E402
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "fixtures", "state_crossings.json")
+                       "fixtures", "legacy_crossings.json")
 
 CHAMPION = 4294968150
 PRIESTESS = 4294968151
@@ -251,6 +259,33 @@ def test_the_send_verb_is_the_shortest_sentence_that_shows_a_selector():
     assert compile_one("send the wizards to mid").errors
 
 
+def test_a_leading_count_is_a_decision_and_not_noise():
+    """"send 3 footmen to mid" used to move all four, and the confirmation
+    line agreed with the commander while doing it, because the line was
+    derived from the same selection the order was."""
+    s = snap()
+    all_footmen = ic.resolve_units("the footmen", s)
+    assert len(all_footmen) == 3
+    assert ic.resolve_units("2 footmen", s) == all_footmen[:2]
+    assert ic.resolve_units("two footmen", s) == all_footmen[:2]
+    # Asking for more than you have gets what you have, not an invention.
+    assert ic.resolve_units("9 footmen", s) == all_footmen
+    # The bare noun is untouched, and so is a squad phrase (the count has to
+    # be the FIRST word, and "squad 2" starts with "squad").
+    assert ic.resolve_units("squad 1", s) == ic.resolve_units("squad 1", s)
+
+
+def test_a_counted_phrase_travels_as_ids_never_as_a_selector():
+    """No engine selector can say "three of them", so a counted phrase is a
+    photograph by construction. Sending `select` here would be the selector
+    quietly overruling the number."""
+    assert ic.selector_phrase("the army") == "all army"
+    assert ic.selector_phrase("3 of the army") is None
+    move = only(compile_one("send 2 footmen to mid"), "move")
+    assert "select" not in move
+    assert len(move["units"]) == 2
+
+
 def test_an_armed_rule_names_the_role_so_it_stays_live():
     """The reason any of this exists. A trigger's `then` is compiled now and
     submitted later; ids in it are ids that die, and red-r23 lost a hero to a
@@ -363,20 +398,55 @@ def test_the_headline_directive():
     assert not result.errors and not result.deferred
 
 
-def test_escort_targets_a_unit_and_never_itself():
+def test_escort_is_one_follow_and_names_the_leader_by_id_when_it_must():
+    """A CLASS word has no selector to be, so the leader is a frozen id — and
+    the followers stay a frozen id list too, because "the footmen" is not a
+    role the engine can name either.
+
+    One intent, not three: the leader excludes itself engine-side (`a unit
+    following itself would deadlock its own order`), so the compiler no longer
+    spends a squad and an exclusion on saying so.
+    """
     result = compile_one("escort the champion with the footmen")
-    squad, posture = result.intents
-    assert posture["posture"] == {"type": "escort", "unit": CHAMPION}
-    assert CHAMPION not in squad["units"]
+    follow = only(result, "follow")
+    assert follow["target"] == CHAMPION
+    assert len(result.intents) == 1
+    assert "target_select" not in follow
+
+
+def test_escort_my_hero_sends_the_phrase_not_the_id():
+    """The point of the verb. "escort my hero" used to REFUSE on a Keep team —
+    two hero slots, so the tool could not pick an id and would not guess. The
+    phrase is the answer: it travels on the wire, the engine resolves it when
+    the intent compiles, and the rule survives the hero dying and coming back
+    with a new id.
+    """
+    for phrase in ("escort my hero", "escort the hero with the footmen",
+                   "bodyguard the heroes with the cavalry"):
+        follow = only(compile_one(phrase), "follow")
+        assert follow["target_select"] == "my hero", phrase
+        assert "target" not in follow, phrase
+    # ...and the followers default to the army, as every other verb's do.
+    assert only(compile_one("escort my hero"), "follow")["select"] == "all army"
+
+
+def test_escorting_a_crowd_still_refuses_rather_than_picking_one():
+    """`follow` takes exactly one leader, and every selector BUT "my hero"
+    would leave the engine's lowest-id tie-break to choose from a crowd the
+    commander did not mean to narrow."""
+    result = compile_one("escort the cavalry with the footmen")
+    assert result.intents == []
+    assert "exactly one" in result.errors[0][1]
 
 
 def test_an_ambiguous_hero_is_refused_with_the_words_that_fix_it():
     """Hero slots climb the hall ladder, so "the hero" stops naming one unit.
-    An escort aimed at the wrong hero sends the army to the wrong side of the
-    map and does it silently — so the verbs that take exactly ONE unit refuse
-    and name the two words that resolve it, rather than picking first/nearest.
+    A potion bought for the wrong hero is money spent on the wrong side of the
+    map and it is spent silently — so the verbs that take exactly ONE unit
+    refuse and name the two words that resolve it, rather than picking
+    first/nearest.
     """
-    result = compile_one("escort the hero with the footmen")
+    result = compile_one("use slot 0")
     assert result.intents == []
     reason = result.errors[0][1]
     assert "ambiguous" in reason
@@ -840,6 +910,37 @@ def test_scout_sends_the_cheapest_eyes():
     assert (attack_move["x"], attack_move["z"]) == THEIR_BASE
 
 
+def test_scout_will_not_substitute_for_the_units_you_named():
+    """The cheapest-eyes pick is what you get when you name NOBODY. Naming a
+    unit you do not have used to fall through to it silently, which is the one
+    thing this tool refuses to do anywhere else — and the confirmation line
+    named the substitute while the commander was reading for the place."""
+    # The fixture seat owns no gryphons. It used to send a raider anyway.
+    result = compile_one("scout mid with the gryphons")
+    assert result.intents == []
+    assert "no unit matches" in result.errors[0][1]
+    # A noun the tool cannot map at all is refused in its own words.
+    assert "cannot resolve units" in \
+        compile_one("scout mid with the wizards").errors[0][1]
+    # ...and units it CAN find are the ones that go.
+    named = only(compile_one("scout mid with the archers"), "attackmove")
+    assert named["units"] == ic.resolve_units("the archers", snap())
+
+
+def test_a_posture_confirmation_is_spelled_by_a_human():
+    """It read "squad 1 pushs their base" for as long as the line was derived
+    by adding an "s". A confirmation the commander flinches at is one they
+    stop reading, and this tool is only useful while it is read."""
+    result = compile_one("push their base with the footmen")
+    summary = result.notes[0][1]
+    assert "pushes" in summary and "pushs" not in summary
+    result = compile_one("squad 1 pushes their base")
+    assert "pushes" in result.notes[0][1]
+    # The other two are regular and must not have regressed.
+    assert "defends" in compile_one("hold mid").notes[0][1]
+    assert "forages" in compile_one("forage mid").notes[0][1]
+
+
 def test_surrender_and_autopilot():
     assert compile_one("surrender").intents == [{"type": "surrender"}]
     assert compile_one("autopilot").intents == [{"type": "autopilot", "on": True}]
@@ -912,6 +1013,8 @@ def test_every_predicate_has_a_phrase_that_reaches_it():
             {"type": "base_under_attack"},
         "when my hero drops below 30%, squad 1 defends our base":
             {"type": "hero_below", "frac": 0.3},
+        "when my hero is back above 70%, squad 1 pushes their base":
+            {"type": "hero_above", "frac": 0.7},
         "when squad 2 drops below 40%, squad 2 defends our base":
             {"type": "squad_below", "id": 2, "frac": 0.4},
         "when I see 3 or more siege, squad 1 defends our base":
@@ -936,6 +1039,31 @@ def test_every_predicate_has_a_phrase_that_reaches_it():
     for directive, want in cases.items():
         got = only(compile_one(directive), "trigger_set")["when"]
         assert got == want, f"{directive!r} -> {got}, wanted {want}"
+
+
+def test_the_hero_is_healed_reaches_the_wait_condition_not_its_opposite():
+    """`hero_above` is the word a chain waits on ("turtle until the hero is
+    healed, then commit"), and it arrived with stance chains without any
+    English reaching it — so the compiler had thirteen of the engine's
+    fourteen predicates and nothing said so.
+
+    It is NOT the negation of `hero_below`, and the names must not collide:
+    a rule about the hero dying and a rule about the hero being healed are
+    opposite rules, and the engine's eight slots are keyed by name.
+    """
+    for phrase in ("when my hero is healed, squad 1 pushes their base",
+                   "once my heroes have recovered, squad 1 pushes their base",
+                   "when my hero is topped up, squad 1 pushes their base"):
+        assert ic.parse_when(phrase.split(",")[0].split(" ", 1)[1]) == \
+            {"type": "hero_above", "frac": 0.8}, phrase
+    healed = only(compile_one("when my hero is healed, squad 1 pushes their base"),
+                  "trigger_set")
+    hurt = only(compile_one("when my hero drops below 80%, squad 1 defends our base"),
+                "trigger_set")
+    assert healed["name"] != hurt["name"]
+    assert healed["name"] == "hero-up-80"
+    # An ENEMY hero's health is still unknowable, healed or hurt.
+    assert ic.parse_when("their hero is healed") is None
 
 
 def test_supply_capped_answers_to_the_words_a_commander_actually_uses():
@@ -1171,7 +1299,8 @@ def test_explain_lists_the_whole_vocabulary():
                    # predicate cannot arm it.
                    "when X, Y", "trigger_set", "trigger_clear", "as <name>",
                    "every 90s", "whenever", "my base is attacked",
-                   "my hero drops below", "squad 2 drops below",
+                   "my hero drops below", "my hero is healed",
+                   "squad 2 drops below",
                    "I see 3 or more siege", "a bounty appears",
                    "my mine runs dry", "supply is capped",
                    "we reach tier 2", "we have 8 footmen",

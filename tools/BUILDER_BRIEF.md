@@ -557,6 +557,19 @@ Rules of thumb:
   reading proves it. It is also the fastest way to discover that your "pure
   refactor" changed the frame order.
 
+`identity` builds two source trees through one cargo target directory, and both
+of them are the same cargo unit — cargo hashes a workspace-root package's path
+*relative to the workspace root*, which is empty for every checkout. That is a
+fight with cargo's freshness rules, and the script now wins it by force: it
+drops this crate's fingerprint before each build and again on the way out, and
+refuses to compare unless cargo actually printed `Compiling bridgehead` for
+each tree. Two costs to expect, both deliberate — the tier always pays two crate
+compiles, and your next `cargo build` in the worktree recompiles once. The
+alternative was a tier that reported IDENTICAL in sixty seconds having compiled
+nothing, and left the worktree saying `Finished` over a syntax error. The tier's
+own negative — a ref that must diverge and a ref that must not — is
+`tools/test_verify_identity.sh`, which is manual and takes about ten minutes.
+
 `tools/verify.sh` is being built by a sibling bead (`wc3clone-5g8`). **Do not
 build it yourself** — if it is not there yet, run the raw litany in Appendix A,
 which is what the tiers compose.
@@ -697,7 +710,7 @@ They do **not** all work the same way, and the difference matters:
 | --- | --- | --- |
 | `verify_intent_bridge.py` | **you do** | Expects a live `BH_BRIDGE=1` seat (`bridge/red`) already running, and drives it with `bridge_send.py`. Asserts `state.json`'s exact historical top-level key set (`EXPECTED_TOP_KEYS` + `OPTIONAL_TOP_KEYS`), that refusals keep the `cmd <i>:` prefix, and that every intent reaches `bridge/intent_log.jsonl` as a sentence. Fast, if the seat is up. |
 | `verify_research_bridge.py` | itself, via `cargo run` | Headless, `BH_SPEED=16`, cap 4000. Drives five workers to a completed research level over the wire. |
-| `verify_r9_legibility.py` | itself, via `cargo run` | Headless, `BH_SPEED=2` **on purpose** (so the final snapshot survives `headless_exit`'s post-verdict window), cap 4000, waits for a real `game_over`. The slowest of the four. |
+| `verify_r9_legibility.py` | itself, via `cargo run` | Headless, `BH_SPEED=16`, cap 4000, drives four rejections over the wire and then surrenders to read a real `game_over` and its `game_over_reason`. |
 | `verify_territory_bridge.py` | itself, from the **pre-built binary** | `python3 tools/verify_territory_bridge.py [--bin target/debug/bridgehead]`. Exits immediately if the binary is missing — it will not build one for you. Runs `crossings`, `BH_FOG=0`, `BH_SEED=7`. |
 
 So: `cargo build` first (§4) — the territory verifier demands it and the others

@@ -1811,8 +1811,8 @@ for a click they never made is a worse answer than none.
 
 | seat | authoring surface |
 |---|---|
-| bridge / copilot | full — nine predicates × any ordinary verb, as JSON |
-| `tools/intent_compile.py` | full-ish — "when X, Y" over the same nine, in English |
+| bridge / copilot | full — fourteen predicates × any ordinary verb, as JSON |
+| `tools/intent_compile.py` | full-ish — "when X, Y" over the same fourteen, in English |
 | human at the keyboard | **one preset**: `[I][H] Home guard`, plus a readout of every armed rule |
 
 **This is a real asymmetry and it is the first one this document has had to
@@ -1826,7 +1826,7 @@ whole surface.
 What the preset is *not* is a capability gap in the sense that matters: every
 intent it produces is one a commander could have typed, byte-identical, and the
 test that proves it is `the_home_guard_preset_is_a_trigger_a_commander_could_have_typed`.
-What the human lacks is the *authoring* — nine predicates and a free choice of
+What the human lacks is the *authoring* — fourteen predicates and a free choice of
 action — and a full custom authoring UI (predicate picker, action picker,
 click-to-place) is v3-later work, deliberately not attempted here.
 

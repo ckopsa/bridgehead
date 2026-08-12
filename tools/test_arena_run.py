@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -131,6 +132,274 @@ def test_an_explicit_override_beats_the_derived_value():
 def test_screenshots_are_filed_with_the_round():
     env = env_for("red=scripted", "blue=scripted", id="r42", out="arena")
     assert env["BH_SHOT_DIR"].endswith(os.path.join("arena", "r42", "shots"))
+
+
+# ---------------------------------------------------------------------------
+# The scaffold and the tuning it depends on (AFFORDANCES.md constraint 3)
+# ---------------------------------------------------------------------------
+
+
+def scaffolded(*specs, sides=("red",)):
+    seats = [arena_run.parse_seat(s) for s in specs]
+    arena_run.mark_scaffolds(seats, list(sides), arena_run.scaffold_version())
+    return seats
+
+
+def test_the_scaffold_version_is_the_documents_own():
+    """Not a copy: a second spelling of the version is a ledger that can
+    disagree with the tool it is recording."""
+    import affordances  # noqa: PLC0415
+
+    assert arena_run.scaffold_version() == affordances.DOC_VERSION
+
+
+def test_only_the_scaffolded_seat_carries_the_document():
+    """The A/B round is the reason this is per seat and not per round: the same
+    model in both chairs, the document in one of them."""
+    red, blue = scaffolded("red=commander:haiku", "blue=commander:haiku", sides=("red",))
+    assert red["scaffold"] == arena_run.scaffold_version()
+    assert "scaffold" not in blue, "the bare seat was stamped too"
+
+
+def test_both_scaffolds_every_commander_seat():
+    seats = scaffolded("red=commander:a", "blue=commander:b", sides=("both",))
+    assert all(s.get("scaffold") for s in seats)
+    # ...and a comma list is the same thing said the long way.
+    seats = scaffolded("red=commander:a", "blue=commander:b", sides=("red,blue",))
+    assert all(s.get("scaffold") for s in seats)
+
+
+def test_a_scripted_seat_cannot_be_scaffolded():
+    """The document is a rendering of a bridge seat's own snapshot. Stamping a
+    scripted seat would put a scaffold in the ruleset of a round that had
+    none — the exact dishonesty the field exists to prevent."""
+    for spec, sides in (("blue=scripted", ("blue",)), ("blue=scripted", ("both",))):
+        try:
+            scaffolded("red=commander:rusher", spec, sides=sides)
+        except ValueError as err:
+            assert "scripted" in str(err), err
+        else:
+            raise AssertionError(f"--scaffold {sides} stamped a scripted seat")
+
+
+def test_the_scaffold_flag_rejects_a_side_that_is_not_playing():
+    for sides in (("green",), ("blue",)):
+        try:
+            scaffolded("red=commander:rusher", sides=sides)
+        except ValueError:
+            continue
+        raise AssertionError(f"--scaffold {sides} was accepted")
+
+
+def test_an_unscaffolded_round_says_nothing_about_the_document():
+    """The stamp is conditional on purpose: an unconditional one would make
+    every round look scaffolded, and the comparison would be worthless."""
+    seats = [arena_run.parse_seat("red=scripted"), arena_run.parse_seat("blue=scripted")]
+    consts = arena_run.ruleset_constants(seats, {})
+    assert "affordance_doc" not in consts
+    # ...but the tuning the scaffold reads is still recorded, because it moved
+    # this round whether or not anybody read a document about it.
+    assert set(consts) == set(arena.TUNING_FILES)
+
+
+def test_a_scaffolded_round_names_the_document_version_in_the_ruleset():
+    seats = scaffolded("red=commander:haiku", "blue=commander:haiku")
+    consts = arena_run.ruleset_constants(seats, {})
+    assert consts["affordance_doc"] == arena_run.scaffold_version()
+
+
+# ---------------------------------------------------------------------------
+# The other half of model+scaffold
+# ---------------------------------------------------------------------------
+
+
+def modelled(*specs, models=("red=opus",)):
+    seats = [arena_run.parse_seat(s) for s in specs]
+    arena_run.mark_models(seats, list(models))
+    return seats
+
+
+def test_each_seat_carries_the_model_that_sat_in_it():
+    """AFFORDANCES.md constraint 3 says an arena result measures
+    model+scaffold. The ledger recorded the scaffold and left the model to a
+    commit message, so half of every result was unrecorded — and the ladder is
+    nothing but a comparison of that half."""
+    red, blue = modelled("red=commander:rusher", "blue=commander:boomer",
+                         models=("red=opus,blue=haiku",))
+    assert red["model"] == "opus"
+    assert blue["model"] == "haiku"
+
+
+def test_both_puts_one_model_in_every_commander_chair():
+    """The A/B round the scaffold field exists for: the same model in both
+    chairs, the document in one of them."""
+    seats = modelled("red=commander:a", "blue=commander:b", models=("both=haiku",))
+    assert [s["model"] for s in seats] == ["haiku", "haiku"]
+
+
+def test_a_seat_nobody_named_a_model_for_has_no_model_key():
+    """Absence, not a null — the same rule `scaffold` and `ready_wait_s`
+    follow. A round run before anybody typed `--model` is not a round with an
+    unknown model in the sense `unknown[]` means."""
+    red, blue = modelled("red=commander:a", "blue=commander:b", models=("red=opus",))
+    assert red["model"] == "opus"
+    assert "model" not in blue
+
+
+def test_a_scripted_seat_cannot_be_given_a_model():
+    """The scripted AI is ai.rs. Calling it opus would put a round with no
+    model in it into a model-vs-model comparison."""
+    for models in (("blue=opus",), ("both=opus",)):
+        try:
+            modelled("red=commander:rusher", "blue=scripted", models=models)
+        except ValueError as err:
+            assert "scripted" in str(err), err
+        else:
+            raise AssertionError(f"--model {models} named a model for ai.rs")
+
+
+def test_the_model_flag_refuses_a_shape_it_cannot_read():
+    for models in (("opus",), ("green=opus",), ("red=",), ("blue=opus",)):
+        try:
+            modelled("red=commander:rusher", models=models)
+        except ValueError:
+            continue
+        raise AssertionError(f"--model {models} was accepted")
+
+
+def test_a_recorded_round_carries_the_model_and_validates():
+    seats = modelled("red=commander:rusher", "blue=commander:boomer",
+                     models=("red=opus,blue=haiku",))
+    args = Args(notes="", commit="abc1234", hypothesis="which model?", id="r99")
+    rec = arena_run.build_record(args, seats, arena_run.derive_env(seats, args),
+                                 arena_run.read_log(DECISIVE_LOG))
+    assert arena.validate(rec) == [], arena.validate(rec)
+    assert [s["model"] for s in rec["seats"]] == ["opus", "haiku"]
+    assert not any("model" in u for u in rec["unknown"])
+
+
+def test_the_commit_defaults_to_the_head_this_round_was_played_at():
+    """`ruleset.commit` was null on every recorded round because it was a flag
+    nobody remembered — and it is the only record of which stat tables the
+    binary was compiled with, since the engine normally runs the `include_str!`
+    copy."""
+    head = arena_run.head_commit()
+    assert head and re.match(r"^[0-9a-f]{4,40}$", head), head
+    out = subprocess.run(
+        [sys.executable, str(Path(arena_run.__file__)),
+         "--hypothesis", "whose commit?", "--id", "r999",
+         "--seat", "red=scripted", "--seat", "blue=scripted", "--dry-run"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert f"commit: {head}" in out.stdout
+    # ...and an explicit --commit still wins, for a round replayed from a tree.
+    out = subprocess.run(
+        [sys.executable, str(Path(arena_run.__file__)),
+         "--hypothesis", "whose commit?", "--id", "r999",
+         "--seat", "red=scripted", "--seat", "blue=scripted",
+         "--commit", "deadbee", "--dry-run"],
+        capture_output=True, text=True,
+    )
+    assert "commit: deadbee" in out.stdout
+
+
+def test_a_dry_run_names_the_model_in_each_chair():
+    out = subprocess.run(
+        [sys.executable, str(Path(arena_run.__file__)),
+         "--hypothesis", "does the plan print?", "--id", "r999",
+         "--seat", "red=commander:haiku", "--seat", "blue=commander:boomer",
+         "--model", "red=haiku,blue=opus", "--dry-run"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "red=commander:haiku (haiku)" in out.stdout
+    assert "blue=commander:boomer (opus)" in out.stdout
+
+
+def test_the_tuning_digests_are_stable_and_content_addressed():
+    """Same bytes, same digest; one byte different, different digest. This is
+    the whole claim the ledger makes when it compares two rounds' constants."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data = Path(tmp)
+        (data / "alarms.ron").write_text("([(id: \"push\", secs: 30.0)])\n")
+        (data / "stances.ron").write_text("([(id: \"turtle\")])\n")
+        env = {"BH_DATA_DIR": str(data)}
+        first = arena_run.ruleset_constants([], env)
+        assert first == arena_run.ruleset_constants([], env), "the digest is not stable"
+        assert len(first["alarms_ron"]) == arena_run.DIGEST_CHARS
+        assert first["alarms_ron"] != first["stances_ron"]
+
+        (data / "alarms.ron").write_text("([(id: \"push\", secs: 45.0)])\n")
+        after = arena_run.ruleset_constants([], env)
+        assert after["alarms_ron"] != first["alarms_ron"], "a retune left no trace"
+        assert after["stances_ron"] == first["stances_ron"], "an untouched table moved"
+
+
+def test_a_missing_tuning_file_is_an_absent_key_not_a_null():
+    """A null would land in the round's `unknown` list and claim we failed to
+    learn something there was nothing to learn."""
+    with tempfile.TemporaryDirectory() as tmp:
+        consts = arena_run.ruleset_constants([], {"BH_DATA_DIR": tmp})
+    assert consts == {}
+    assert arena_run.file_digest(Path(tmp) / "alarms.ron") is None
+
+
+def test_the_digests_are_read_from_the_data_directory_the_engine_reads():
+    """`BH_DATA_DIR` is what decides which copy of the tables the engine loads
+    (src/data.rs). Hashing the repo's copy while the engine read another
+    directory would record a tuning that was not in force."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data = Path(tmp)
+        (data / "alarms.ron").write_text("(probe)\n")
+        probe = arena_run.ruleset_constants([], {"BH_DATA_DIR": str(data)})
+        shipped = arena_run.ruleset_constants([], {})
+    assert probe["alarms_ron"] != shipped["alarms_ron"]
+
+
+def test_the_repos_own_tables_hash_and_reach_the_record():
+    """The digests the next real round will carry, checked against the
+    validator's shape rule rather than against a frozen value — pinning the
+    hash here would mean a bead every time somebody tunes an alarm."""
+    seats = [arena_run.parse_seat("red=scripted"), arena_run.parse_seat("blue=scripted")]
+    args = Args(notes="", commit=None, hypothesis="what is in force?", id="r99")
+    rec = arena_run.build_record(args, seats, arena_run.derive_env(seats, args),
+                                 arena_run.read_log(DECISIVE_LOG))
+    assert arena.validate(rec) == [], arena.validate(rec)
+    for key in arena.TUNING_FILES:
+        assert arena.DIGEST_RE.match(rec["ruleset"]["constants"][key]), key
+
+
+def test_the_recorded_ab_round_says_which_seat_had_the_document():
+    """The two halves of constraint 3 in one record: the version in the
+    ruleset, the chair on the seat."""
+    seats = scaffolded("red=commander:haiku", "blue=commander:haiku", sides=("red",))
+    args = Args(notes="", commit=None, hypothesis="does the doc carry haiku?", id="r99")
+    rec = arena_run.build_record(args, seats, arena_run.derive_env(seats, args),
+                                 arena_run.read_log(DECISIVE_LOG))
+    assert arena.validate(rec) == [], arena.validate(rec)
+    assert rec["ruleset"]["constants"]["affordance_doc"] == arena_run.scaffold_version()
+    assert rec["seats"][0]["scaffold"] == arena_run.scaffold_version()
+    assert "scaffold" not in rec["seats"][1]
+    # Absence, not a null: the honesty rule has nothing to say about the seat
+    # that played bare.
+    assert not any("scaffold" in u for u in rec["unknown"])
+
+
+def test_a_dry_run_prints_the_constants_it_would_record():
+    """The dry run is the only look anybody gets at a ruleset before it is
+    written, and the digests are the part nobody typed."""
+    out = subprocess.run(
+        [sys.executable, str(Path(arena_run.__file__)),
+         "--hypothesis", "does the plan print?", "--id", "r999",
+         "--seat", "red=commander:haiku", "--seat", "blue=commander:boomer",
+         "--scaffold", "red", "--dry-run"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "alarms_ron=" in out.stdout and "stances_ron=" in out.stdout
+    assert f"affordance_doc={arena_run.scaffold_version()}" in out.stdout
+    assert "red read tools/bridge_view.py --doc" in out.stdout
 
 
 # ---------------------------------------------------------------------------

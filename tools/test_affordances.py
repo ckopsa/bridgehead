@@ -57,7 +57,7 @@ ALARM = FIX / "doc_open_alarm.json"
 EARLY = FIX / "digest_open_early.json"
 #: The pre-`intel`, pre-`my_race`, pre-everything snapshot this repo has always
 #: carried.
-LEGACY = FIX / "state_crossings.json"
+LEGACY = FIX / "legacy_crossings.json"
 #: `catalog.json` exactly as the engine writes it, `stances` and `selectors`
 #: included.
 CATALOG = FIX / "catalog_full.json"
