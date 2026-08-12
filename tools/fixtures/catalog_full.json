@@ -1,0 +1,2146 @@
+{
+  "units": [
+    {
+      "id": "Worker",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Worker",
+      "cost_gold": 75,
+      "cost_lumber": 0,
+      "supply": 1,
+      "hp": 60.0,
+      "damage": 5.0,
+      "range": 1.8,
+      "attack_cooldown": 1.5,
+      "speed": 8.0,
+      "train_time": 8.0,
+      "class": "Worker",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 12.0,
+      "trained_at": "TownHall",
+      "requires": [
+        "TownHall"
+      ],
+      "tier": 1,
+      "description": "Harvests gold/lumber, constructs buildings. Fights poorly."
+    },
+    {
+      "id": "Footman",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Line",
+      "cost_gold": 135,
+      "cost_lumber": 0,
+      "supply": 2,
+      "hp": 140.0,
+      "damage": 12.0,
+      "range": 2.0,
+      "attack_cooldown": 1.2,
+      "speed": 7.0,
+      "train_time": 12.0,
+      "class": "Footman",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 16.0,
+      "trained_at": "Barracks",
+      "requires": [
+        "Barracks"
+      ],
+      "tier": 1,
+      "description": "Cheap melee line unit. Tanks for archers."
+    },
+    {
+      "id": "Archer",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Ranged",
+      "cost_gold": 90,
+      "cost_lumber": 30,
+      "supply": 2,
+      "hp": 70.0,
+      "damage": 14.0,
+      "range": 14.0,
+      "attack_cooldown": 1.5,
+      "speed": 7.0,
+      "train_time": 12.0,
+      "class": "Archer",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": true,
+      "can_hit_ground": true,
+      "vision": 18.0,
+      "trained_at": "Barracks",
+      "requires": [
+        "Barracks"
+      ],
+      "tier": 1,
+      "description": "Long-range attacker. Fragile; keep behind footmen."
+    },
+    {
+      "id": "Hero",
+      "race": [
+        "kingdom"
+      ],
+      "role": "HeroMelee",
+      "cost_gold": 0,
+      "cost_lumber": 0,
+      "revive_gold": 400,
+      "revive_lumber": 100,
+      "supply": 5,
+      "hp": 320.0,
+      "damage": 24.0,
+      "range": 2.4,
+      "attack_cooldown": 1.1,
+      "speed": 7.5,
+      "train_time": 25.0,
+      "class": "Hero",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 20.0,
+      "trained_at": "TownHall",
+      "requires": [
+        "TownHall"
+      ],
+      "tier": 1,
+      "description": "The Champion: melee hero, levels from nearby enemy deaths, AoE Slam ability. Your team's FIRST hero is FREE (the 25s and the 5 supply are still real, and both are spent at the hall that makes your workers); every hero after it — a second class, or this one back from the dead — costs revive_gold/revive_lumber, which is why that pair doubles as the fielding price. Revival preserves the level. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class."
+    },
+    {
+      "id": "Catapult",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Siege",
+      "cost_gold": 180,
+      "cost_lumber": 120,
+      "supply": 3,
+      "hp": 110.0,
+      "damage": 15.0,
+      "range": 20.0,
+      "attack_cooldown": 3.0,
+      "speed": 4.5,
+      "train_time": 22.0,
+      "class": "Siege",
+      "vs_building_mult": 6.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 14.0,
+      "trained_at": "Workshop",
+      "requires": [
+        "Workshop",
+        "Barracks"
+      ],
+      "tier": 1,
+      "description": "Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it."
+    },
+    {
+      "id": "Raider",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Cavalry",
+      "cost_gold": 170,
+      "cost_lumber": 30,
+      "supply": 3,
+      "hp": 130.0,
+      "damage": 16.0,
+      "range": 2.2,
+      "attack_cooldown": 1.1,
+      "speed": 10.5,
+      "train_time": 16.0,
+      "class": "Cavalry",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 2.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 24.0,
+      "trained_at": "Barracks",
+      "requires": [
+        "Barracks",
+        "Workshop"
+      ],
+      "tier": 1,
+      "description": "Fast cavalry: 2x damage vs Catapults, excels at worker raids and map control. Melts under massed fire."
+    },
+    {
+      "id": "Priestess",
+      "race": [
+        "kingdom"
+      ],
+      "role": "HeroSupport",
+      "cost_gold": 0,
+      "cost_lumber": 0,
+      "revive_gold": 400,
+      "revive_lumber": 100,
+      "supply": 5,
+      "hp": 240.0,
+      "damage": 14.0,
+      "range": 10.0,
+      "attack_cooldown": 1.4,
+      "speed": 7.5,
+      "train_time": 25.0,
+      "class": "Hero",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": true,
+      "can_hit_ground": true,
+      "vision": 18.0,
+      "trained_at": "TownHall",
+      "requires": [
+        "TownHall"
+      ],
+      "tier": 1,
+      "description": "Support hero: ranged attack, Heal ability (AoE ally healing). Free only if she is your team's first hero ever; standing alongside a Champion costs revive_gold/revive_lumber, the same price her death does — a Keep grants the SLOT, not the hero. Revival preserves the level. Occupies one hero slot."
+    },
+    {
+      "id": "Spearman",
+      "race": [
+        "kingdom"
+      ],
+      "role": "AntiCavalry",
+      "cost_gold": 90,
+      "cost_lumber": 0,
+      "supply": 2,
+      "hp": 160.0,
+      "damage": 6.0,
+      "range": 2.6,
+      "attack_cooldown": 1.7,
+      "speed": 5.5,
+      "train_time": 10.0,
+      "class": "Footman",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 5.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 18.0,
+      "trained_at": "Barracks",
+      "requires": [
+        "Barracks"
+      ],
+      "tier": 1,
+      "description": "Cheap anti-cavalry line: 5x damage vs Raiders and Knights, and the cheapest hit points in the game. Slow, and feeble against anything that isn't mounted."
+    },
+    {
+      "id": "Sorcerer",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Caster",
+      "cost_gold": 110,
+      "cost_lumber": 45,
+      "supply": 2,
+      "hp": 55.0,
+      "damage": 8.0,
+      "range": 11.0,
+      "attack_cooldown": 2.0,
+      "speed": 6.0,
+      "train_time": 15.0,
+      "class": "Archer",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": true,
+      "can_hit_ground": true,
+      "vision": 18.0,
+      "trained_at": "Sanctum",
+      "requires": [
+        "Sanctum",
+        "Keep"
+      ],
+      "tier": 2,
+      "description": "Tier-2 caster (Arcane Sanctum, requires a Keep): auto-casts Slow, a -40% move and attack speed debuff on every enemy within 8 for 5s. Blunts cavalry charges and covers retreats. Barely fights; keep it behind the line."
+    },
+    {
+      "id": "Knight",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Shock",
+      "cost_gold": 270,
+      "cost_lumber": 60,
+      "supply": 4,
+      "hp": 350.0,
+      "damage": 34.0,
+      "range": 2.4,
+      "attack_cooldown": 1.15,
+      "speed": 9.5,
+      "train_time": 20.0,
+      "class": "Cavalry",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 20.0,
+      "trained_at": "Barracks",
+      "requires": [
+        "Barracks",
+        "Castle"
+      ],
+      "tier": 3,
+      "description": "Requires a Castle. Heavy shock cavalry: 350 hp at speed 9.5, no type bonus, just the best raw stats on the field. Breaks Footman and Archer lines at equal gold. Counter it with Spearmen — the Knight is cavalry, so it takes 5x from a spear, and 270g of Knight loses to 270g of Spearmen. Melee: cannot touch air."
+    },
+    {
+      "id": "GryphonRider",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Flyer",
+      "cost_gold": 280,
+      "cost_lumber": 120,
+      "supply": 5,
+      "hp": 200.0,
+      "damage": 20.0,
+      "range": 6.0,
+      "attack_cooldown": 1.3,
+      "speed": 9.0,
+      "train_time": 28.0,
+      "class": "Air",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": true,
+      "can_hit_air": true,
+      "can_hit_ground": true,
+      "vision": 26.0,
+      "trained_at": "Workshop",
+      "requires": [
+        "Workshop",
+        "Castle",
+        "Barracks"
+      ],
+      "tier": 3,
+      "description": "Requires a Castle; trained at the Workshop. Flying: ignores walls, forests and chokepoints entirely, and attacks both ground and air. Melee units and Catapults CANNOT hit it at all — only Archers, the Priestess and Towers can. Counter it with massed Archers: 270g of Archers beats one Gryphon. Sees 26, the widest eye in the game."
+    },
+    {
+      "id": "Peon",
+      "race": [
+        "horde"
+      ],
+      "role": "Worker",
+      "cost_gold": 75,
+      "cost_lumber": 0,
+      "supply": 1,
+      "hp": 55.0,
+      "damage": 5.0,
+      "range": 1.8,
+      "attack_cooldown": 1.5,
+      "speed": 8.5,
+      "train_time": 8.0,
+      "class": "Worker",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 12.0,
+      "trained_at": "Stronghold",
+      "requires": [
+        "Stronghold"
+      ],
+      "tier": 1,
+      "description": "Harvests gold/lumber, constructs buildings. Fights poorly."
+    },
+    {
+      "id": "Grunt",
+      "race": [
+        "horde"
+      ],
+      "role": "Line",
+      "cost_gold": 125,
+      "cost_lumber": 0,
+      "supply": 2,
+      "hp": 165.0,
+      "damage": 10.5,
+      "range": 2.0,
+      "attack_cooldown": 1.25,
+      "speed": 6.2,
+      "train_time": 11.0,
+      "class": "Footman",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 15.0,
+      "trained_at": "WarCamp",
+      "requires": [
+        "WarCamp"
+      ],
+      "tier": 1,
+      "description": "Melee line unit: tankier than a Footman, slower, and slightly worse damage. Wins the duel, loses the chase."
+    },
+    {
+      "id": "Headhunter",
+      "race": [
+        "horde"
+      ],
+      "role": "Ranged",
+      "cost_gold": 85,
+      "cost_lumber": 20,
+      "supply": 2,
+      "hp": 75.0,
+      "damage": 17.0,
+      "range": 10.5,
+      "attack_cooldown": 1.6,
+      "speed": 7.2,
+      "train_time": 11.0,
+      "class": "Archer",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": true,
+      "can_hit_ground": true,
+      "vision": 16.0,
+      "trained_at": "WarCamp",
+      "requires": [
+        "WarCamp"
+      ],
+      "tier": 1,
+      "description": "Ranged line unit: harder hitting than an Archer and much shorter ranged. Thrown axes, so it answers air."
+    },
+    {
+      "id": "Wolfrider",
+      "race": [
+        "horde"
+      ],
+      "role": "Cavalry",
+      "cost_gold": 150,
+      "cost_lumber": 25,
+      "supply": 3,
+      "hp": 120.0,
+      "damage": 15.0,
+      "range": 2.2,
+      "attack_cooldown": 1.1,
+      "speed": 11.0,
+      "train_time": 14.0,
+      "class": "Cavalry",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 2.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 24.0,
+      "trained_at": "WarCamp",
+      "requires": [
+        "WarCamp",
+        "Fortress"
+      ],
+      "tier": 2,
+      "description": "Requires a Fortress. Fast cavalry: 2x damage vs siege engines, excels at worker raids and map control. Cheaper and faster than a Raider, and dies quicker. Counter it with spears — it is cavalry, so a Spearman or an Impaler takes 5x off it."
+    },
+    {
+      "id": "Impaler",
+      "race": [
+        "horde"
+      ],
+      "role": "AntiCavalry",
+      "cost_gold": 85,
+      "cost_lumber": 0,
+      "supply": 2,
+      "hp": 150.0,
+      "damage": 7.0,
+      "range": 2.5,
+      "attack_cooldown": 1.75,
+      "speed": 5.8,
+      "train_time": 9.5,
+      "class": "Footman",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 5.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 17.0,
+      "trained_at": "WarCamp",
+      "requires": [
+        "WarCamp"
+      ],
+      "tier": 1,
+      "description": "Cheap anti-cavalry line: 5x damage vs any cavalry, of either race — Raiders, Knights and Wolfriders alike. Slow, and feeble against anything unmounted."
+    },
+    {
+      "id": "Demolisher",
+      "race": [
+        "horde"
+      ],
+      "role": "Siege",
+      "cost_gold": 170,
+      "cost_lumber": 110,
+      "supply": 3,
+      "hp": 120.0,
+      "damage": 14.0,
+      "range": 18.0,
+      "attack_cooldown": 2.8,
+      "speed": 5.0,
+      "train_time": 20.0,
+      "class": "Siege",
+      "vs_building_mult": 6.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 13.0,
+      "trained_at": "WarCamp",
+      "requires": [
+        "WarCamp",
+        "Fortress"
+      ],
+      "tier": 2,
+      "description": "Requires a Fortress. Siege engine: outranges towers, 6x damage vs buildings, but slow, fragile, and feeble against units. Escort it."
+    },
+    {
+      "id": "Shaman",
+      "race": [
+        "horde"
+      ],
+      "role": "Caster",
+      "cost_gold": 115,
+      "cost_lumber": 40,
+      "supply": 2,
+      "hp": 60.0,
+      "damage": 9.0,
+      "range": 10.0,
+      "attack_cooldown": 2.1,
+      "speed": 6.2,
+      "train_time": 15.0,
+      "class": "Archer",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": true,
+      "can_hit_ground": true,
+      "vision": 18.0,
+      "trained_at": "SpiritLodge",
+      "requires": [
+        "SpiritLodge",
+        "Fortress"
+      ],
+      "tier": 2,
+      "description": "Tier-2 caster (Spirit Lodge, requires a Fortress): auto-casts Bloodlust, thrown up to 8 away, giving every ally within 5 of it +20% damage and +25% move speed for 10s. Compounds a push; worthless in a retreat. Barely fights; keep it behind the line."
+    },
+    {
+      "id": "Warchief",
+      "race": [
+        "horde"
+      ],
+      "role": "HeroMelee",
+      "cost_gold": 0,
+      "cost_lumber": 0,
+      "revive_gold": 400,
+      "revive_lumber": 100,
+      "supply": 5,
+      "hp": 340.0,
+      "damage": 23.0,
+      "range": 2.4,
+      "attack_cooldown": 1.15,
+      "speed": 7.3,
+      "train_time": 25.0,
+      "class": "Hero",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": false,
+      "can_hit_ground": true,
+      "vision": 20.0,
+      "trained_at": "Stronghold",
+      "requires": [
+        "Stronghold"
+      ],
+      "tier": 1,
+      "description": "The Warchief: melee hero, levels from nearby enemy deaths, AoE Cleave ability. Your team's FIRST hero is FREE (the 25s and the 5 supply are still real, and both are spent at the hall that makes your workers); every hero after him — a second class, or this one back from the dead — costs revive_gold/revive_lumber, which is why that pair doubles as the fielding price. Revival preserves the level. Occupies one hero slot; slots scale with your hall tier (1/2/3) and no team may field two of the same class."
+    },
+    {
+      "id": "FarSeer",
+      "race": [
+        "horde"
+      ],
+      "role": "HeroSupport",
+      "cost_gold": 0,
+      "cost_lumber": 0,
+      "revive_gold": 400,
+      "revive_lumber": 100,
+      "supply": 5,
+      "hp": 250.0,
+      "damage": 13.0,
+      "range": 10.5,
+      "attack_cooldown": 1.45,
+      "speed": 7.5,
+      "train_time": 25.0,
+      "class": "Hero",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": false,
+      "can_hit_air": true,
+      "can_hit_ground": true,
+      "vision": 22.0,
+      "trained_at": "Stronghold",
+      "requires": [
+        "Stronghold"
+      ],
+      "tier": 1,
+      "description": "Support hero: ranged attack, Mend ability (AoE ally healing), and the widest eye of any ground unit in the game. Free only if he is your team's first hero ever; standing alongside a Warchief costs revive_gold/revive_lumber, the same price his death does — a Fortress grants the SLOT, not the hero. Revival preserves the level. Occupies one hero slot."
+    },
+    {
+      "id": "Wyvern",
+      "race": [
+        "horde"
+      ],
+      "role": "Flyer",
+      "cost_gold": 265,
+      "cost_lumber": 110,
+      "supply": 5,
+      "hp": 185.0,
+      "damage": 20.0,
+      "range": 6.5,
+      "attack_cooldown": 1.25,
+      "speed": 9.5,
+      "train_time": 26.0,
+      "class": "Air",
+      "vs_building_mult": 1.0,
+      "vs_siege_mult": 1.0,
+      "vs_cavalry_mult": 1.0,
+      "flying": true,
+      "can_hit_air": true,
+      "can_hit_ground": true,
+      "vision": 26.0,
+      "trained_at": "SpiritLodge",
+      "requires": [
+        "SpiritLodge",
+        "Hold",
+        "Fortress"
+      ],
+      "tier": 3,
+      "description": "Requires a Hold; trained at the Spirit Lodge. Flying: ignores walls, forests and chokepoints entirely, and attacks both ground and air. Melee units and Demolishers CANNOT hit it at all — only Headhunters, Shamans, the FarSeer and Watchtowers can. Counter it with massed Headhunters. Sees 26, the widest eye in the game."
+    }
+  ],
+  "buildings": [
+    {
+      "id": "TownHall",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Hall",
+      "cost_gold": 385,
+      "cost_lumber": 205,
+      "hp": 1200.0,
+      "build_time": 40.0,
+      "supply_provided": 10,
+      "size": 8.0,
+      "attack": null,
+      "vision": 26.0,
+      "built_by": "Worker",
+      "requires": [],
+      "trains": [
+        "Worker",
+        "Hero",
+        "Priestess"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Worker",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Hero",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Priestess",
+          "requires": [],
+          "tier": 1
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": {
+        "to": "Keep",
+        "cost_gold": 320,
+        "cost_lumber": 160,
+        "upgrade_time": 40.0
+      },
+      "upgraded_from": null,
+      "description": "Tier 1 hall. Resource drop-off. Trains Workers and heroes (1 hero slot). Upgrades to a Keep."
+    },
+    {
+      "id": "Barracks",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Production",
+      "cost_gold": 160,
+      "cost_lumber": 60,
+      "hp": 700.0,
+      "build_time": 25.0,
+      "supply_provided": 0,
+      "size": 6.0,
+      "attack": null,
+      "vision": 18.0,
+      "built_by": "Worker",
+      "requires": [],
+      "trains": [
+        "Footman",
+        "Archer",
+        "Raider",
+        "Spearman",
+        "Knight"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Footman",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Archer",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Raider",
+          "requires": [
+            "Workshop"
+          ],
+          "tier": 1
+        },
+        {
+          "unit": "Spearman",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Knight",
+          "requires": [
+            "Castle"
+          ],
+          "tier": 3
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Trains Footmen, Archers and Spearmen (Raiders once a Workshop stands, Knights once a Castle does)."
+    },
+    {
+      "id": "Farm",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Supply",
+      "cost_gold": 80,
+      "cost_lumber": 20,
+      "hp": 350.0,
+      "build_time": 12.0,
+      "supply_provided": 6,
+      "size": 4.0,
+      "attack": null,
+      "vision": 12.0,
+      "built_by": "Worker",
+      "requires": [],
+      "trains": [],
+      "trains_gated": [],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "+6 supply. Build ahead of the cap or production stalls."
+    },
+    {
+      "id": "Tower",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Defense",
+      "cost_gold": 110,
+      "cost_lumber": 80,
+      "hp": 550.0,
+      "build_time": 25.0,
+      "supply_provided": 0,
+      "size": 3.0,
+      "attack": {
+        "damage": 16.0,
+        "range": 16.0,
+        "cooldown": 1.3,
+        "can_hit_air": true
+      },
+      "vision": 20.0,
+      "built_by": "Worker",
+      "requires": [
+        "Barracks"
+      ],
+      "trains": [],
+      "trains_gated": [],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Static defense: shoots arrows at enemies in range."
+    },
+    {
+      "id": "Wall",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Barrier",
+      "cost_gold": 25,
+      "cost_lumber": 10,
+      "hp": 300.0,
+      "build_time": 8.0,
+      "supply_provided": 0,
+      "size": 2.0,
+      "attack": null,
+      "vision": 8.0,
+      "built_by": "Worker",
+      "requires": [],
+      "trains": [],
+      "trains_gated": [],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Cheap blocking segment. No function except HP in the way."
+    },
+    {
+      "id": "Workshop",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Siegeworks",
+      "cost_gold": 140,
+      "cost_lumber": 100,
+      "hp": 550.0,
+      "build_time": 22.0,
+      "supply_provided": 0,
+      "size": 5.0,
+      "attack": null,
+      "vision": 16.0,
+      "built_by": "Worker",
+      "requires": [
+        "Barracks"
+      ],
+      "trains": [
+        "Catapult",
+        "GryphonRider"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Catapult",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "GryphonRider",
+          "requires": [
+            "Castle"
+          ],
+          "tier": 3
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Siege works: trains Catapults, and Gryphon Riders once a Castle stands. Both answers to a tower turtle — one knocks the door down, the other flies over it."
+    },
+    {
+      "id": "Shop",
+      "race": [
+        "kingdom",
+        "horde"
+      ],
+      "role": "Vendor",
+      "cost_gold": 75,
+      "cost_lumber": 60,
+      "hp": 400.0,
+      "build_time": 15.0,
+      "supply_provided": 0,
+      "size": 4.0,
+      "attack": null,
+      "vision": 14.0,
+      "built_by": "Worker",
+      "requires": [],
+      "trains": [],
+      "trains_gated": [],
+      "researches": [],
+      "sells": [
+        "HealingPotion",
+        "TownPortal",
+        "BootsOfSpeed",
+        "BannerOfCommand",
+        "ScrollOfMassTeleport"
+      ],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Item vendor: heroes buy consumables here (see catalog items)."
+    },
+    {
+      "id": "Blacksmith",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Forge",
+      "cost_gold": 140,
+      "cost_lumber": 80,
+      "hp": 600.0,
+      "build_time": 24.0,
+      "supply_provided": 0,
+      "size": 5.0,
+      "attack": null,
+      "vision": 14.0,
+      "built_by": "Worker",
+      "requires": [
+        "Keep"
+      ],
+      "trains": [],
+      "trains_gated": [],
+      "researches": [
+        "attack",
+        "armor"
+      ],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Tier 2 forge (requires a Keep). Researches the two team-wide ladders in catalog.research: Attack (+1/+2/+3 flat damage on every UNIT attack) and Armor (+1/+2/+3 flat damage reduction on every UNIT hit taken, never below 1 damage per hit). Bonuses are permanent, retroactive to units already alive, and survive the Blacksmith's death. One research at a time per forge; build a second Blacksmith to run both ladders at once."
+    },
+    {
+      "id": "Keep",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Hall",
+      "cost_gold": 320,
+      "cost_lumber": 160,
+      "hp": 1700.0,
+      "build_time": 40.0,
+      "supply_provided": 10,
+      "size": 8.0,
+      "attack": null,
+      "vision": 30.0,
+      "built_by": "Upgrade",
+      "requires": [],
+      "trains": [
+        "Worker",
+        "Hero",
+        "Priestess"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Worker",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Hero",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Priestess",
+          "requires": [],
+          "tier": 1
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 2,
+      "placeable": false,
+      "upgrades_to": {
+        "to": "Castle",
+        "cost_gold": 480,
+        "cost_lumber": 240,
+        "upgrade_time": 50.0
+      },
+      "upgraded_from": "TownHall",
+      "description": "Tier 2 hall: everything the TownHall was, with a deeper HP pool. Opens a SECOND hero slot (distinct classes only) and unlocks tier-2 content such as the Arcane Sanctum. Satisfies tier-1 requirements. Upgrades to a Castle."
+    },
+    {
+      "id": "Castle",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Hall",
+      "cost_gold": 480,
+      "cost_lumber": 240,
+      "hp": 2200.0,
+      "build_time": 50.0,
+      "supply_provided": 10,
+      "size": 8.0,
+      "attack": null,
+      "vision": 34.0,
+      "built_by": "Upgrade",
+      "requires": [],
+      "trains": [
+        "Worker",
+        "Hero",
+        "Priestess"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Worker",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Hero",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Priestess",
+          "requires": [],
+          "tier": 1
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 3,
+      "placeable": false,
+      "upgrades_to": null,
+      "upgraded_from": "Keep",
+      "description": "Tier 3 hall: the top of the ladder. A third hero slot (unusable until a third hero class ships). Satisfies every hall requirement below it."
+    },
+    {
+      "id": "Sanctum",
+      "race": [
+        "kingdom"
+      ],
+      "role": "Tech",
+      "cost_gold": 150,
+      "cost_lumber": 130,
+      "hp": 480.0,
+      "build_time": 30.0,
+      "supply_provided": 0,
+      "size": 5.0,
+      "attack": null,
+      "vision": 18.0,
+      "built_by": "Worker",
+      "requires": [
+        "Keep"
+      ],
+      "trains": [
+        "Sorcerer"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Sorcerer",
+          "requires": [],
+          "tier": 2
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Arcane Sanctum: trains Sorcerers. Requires a Keep — the first thing a hall upgrade unlocks."
+    },
+    {
+      "id": "Stronghold",
+      "race": [
+        "horde"
+      ],
+      "role": "Hall",
+      "cost_gold": 380,
+      "cost_lumber": 200,
+      "hp": 1250.0,
+      "build_time": 40.0,
+      "supply_provided": 10,
+      "size": 8.0,
+      "attack": null,
+      "vision": 24.0,
+      "built_by": "Worker",
+      "requires": [],
+      "trains": [
+        "Peon",
+        "Warchief",
+        "FarSeer"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Peon",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Warchief",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "FarSeer",
+          "requires": [],
+          "tier": 1
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": {
+        "to": "Fortress",
+        "cost_gold": 320,
+        "cost_lumber": 160,
+        "upgrade_time": 40.0
+      },
+      "upgraded_from": null,
+      "description": "Tier 1 hall. Resource drop-off. Trains Peons and heroes (1 hero slot). Upgrades to a Fortress."
+    },
+    {
+      "id": "WarCamp",
+      "race": [
+        "horde"
+      ],
+      "role": "Production",
+      "cost_gold": 165,
+      "cost_lumber": 55,
+      "hp": 720.0,
+      "build_time": 24.0,
+      "supply_provided": 0,
+      "size": 6.0,
+      "attack": null,
+      "vision": 17.0,
+      "built_by": "Worker",
+      "requires": [],
+      "trains": [
+        "Grunt",
+        "Headhunter",
+        "Impaler",
+        "Wolfrider",
+        "Demolisher"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Grunt",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Headhunter",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Impaler",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Wolfrider",
+          "requires": [
+            "Fortress"
+          ],
+          "tier": 2
+        },
+        {
+          "unit": "Demolisher",
+          "requires": [
+            "Fortress"
+          ],
+          "tier": 2
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Trains Grunts, Headhunters and Impalers (Wolfriders and Demolishers once a Fortress stands). The Horde's entire ground army out of one building."
+    },
+    {
+      "id": "Burrow",
+      "race": [
+        "horde"
+      ],
+      "role": "Supply",
+      "cost_gold": 80,
+      "cost_lumber": 20,
+      "hp": 420.0,
+      "build_time": 14.0,
+      "supply_provided": 6,
+      "size": 4.0,
+      "attack": {
+        "damage": 9.0,
+        "range": 9.0,
+        "cooldown": 2.0,
+        "can_hit_air": false
+      },
+      "vision": 13.0,
+      "built_by": "Worker",
+      "requires": [],
+      "trains": [],
+      "trains_gated": [],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "+6 supply, and stabs at ground enemies that come within 9. Feeble on purpose — it punishes an unescorted worker raid, it does not hold a line, and it cannot touch air."
+    },
+    {
+      "id": "Watchtower",
+      "race": [
+        "horde"
+      ],
+      "role": "Defense",
+      "cost_gold": 115,
+      "cost_lumber": 70,
+      "hp": 520.0,
+      "build_time": 24.0,
+      "supply_provided": 0,
+      "size": 3.0,
+      "attack": {
+        "damage": 15.0,
+        "range": 16.0,
+        "cooldown": 1.25,
+        "can_hit_air": true
+      },
+      "vision": 20.0,
+      "built_by": "Worker",
+      "requires": [
+        "WarCamp"
+      ],
+      "trains": [],
+      "trains_gated": [],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Static defense: hurls spears at enemies in range, air included."
+    },
+    {
+      "id": "SpiritLodge",
+      "race": [
+        "horde"
+      ],
+      "role": "Tech",
+      "cost_gold": 145,
+      "cost_lumber": 120,
+      "hp": 500.0,
+      "build_time": 28.0,
+      "supply_provided": 0,
+      "size": 5.0,
+      "attack": null,
+      "vision": 18.0,
+      "built_by": "Worker",
+      "requires": [
+        "Fortress"
+      ],
+      "trains": [
+        "Shaman",
+        "Wyvern"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Shaman",
+          "requires": [],
+          "tier": 2
+        },
+        {
+          "unit": "Wyvern",
+          "requires": [
+            "Hold"
+          ],
+          "tier": 3
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Spirit Lodge: trains Shamans, and Wyverns once a Hold stands. Requires a Fortress — the first thing a hall upgrade unlocks."
+    },
+    {
+      "id": "WarMill",
+      "race": [
+        "horde"
+      ],
+      "role": "Forge",
+      "cost_gold": 135,
+      "cost_lumber": 75,
+      "hp": 580.0,
+      "build_time": 23.0,
+      "supply_provided": 0,
+      "size": 5.0,
+      "attack": null,
+      "vision": 14.0,
+      "built_by": "Worker",
+      "requires": [
+        "Fortress"
+      ],
+      "trains": [],
+      "trains_gated": [],
+      "researches": [
+        "attack",
+        "armor"
+      ],
+      "sells": [],
+      "tier": 1,
+      "placeable": true,
+      "upgrades_to": null,
+      "upgraded_from": null,
+      "description": "Tier 2 forge (requires a Fortress). Researches the same two team-wide ladders the Blacksmith does: Attack and Armor. Bonuses are permanent, retroactive to units already alive, and survive the WarMill's death. One research at a time per forge."
+    },
+    {
+      "id": "Fortress",
+      "race": [
+        "horde"
+      ],
+      "role": "Hall",
+      "cost_gold": 320,
+      "cost_lumber": 160,
+      "hp": 1750.0,
+      "build_time": 40.0,
+      "supply_provided": 10,
+      "size": 8.0,
+      "attack": null,
+      "vision": 28.0,
+      "built_by": "Upgrade",
+      "requires": [],
+      "trains": [
+        "Peon",
+        "Warchief",
+        "FarSeer"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Peon",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Warchief",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "FarSeer",
+          "requires": [],
+          "tier": 1
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 2,
+      "placeable": false,
+      "upgrades_to": {
+        "to": "Hold",
+        "cost_gold": 480,
+        "cost_lumber": 240,
+        "upgrade_time": 50.0
+      },
+      "upgraded_from": "Stronghold",
+      "description": "Tier 2 hall: everything the Stronghold was, with a deeper HP pool. Opens a SECOND hero slot (distinct classes only) and unlocks tier-2 content — the Spirit Lodge, the WarMill, Wolfriders and Demolishers. Satisfies tier-1 requirements. Upgrades to a Hold."
+    },
+    {
+      "id": "Hold",
+      "race": [
+        "horde"
+      ],
+      "role": "Hall",
+      "cost_gold": 480,
+      "cost_lumber": 240,
+      "hp": 2250.0,
+      "build_time": 50.0,
+      "supply_provided": 10,
+      "size": 8.0,
+      "attack": null,
+      "vision": 32.0,
+      "built_by": "Upgrade",
+      "requires": [],
+      "trains": [
+        "Peon",
+        "Warchief",
+        "FarSeer"
+      ],
+      "trains_gated": [
+        {
+          "unit": "Peon",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "Warchief",
+          "requires": [],
+          "tier": 1
+        },
+        {
+          "unit": "FarSeer",
+          "requires": [],
+          "tier": 1
+        }
+      ],
+      "researches": [],
+      "sells": [],
+      "tier": 3,
+      "placeable": false,
+      "upgrades_to": null,
+      "upgraded_from": "Fortress",
+      "description": "Tier 3 hall: the top of the Horde ladder, and the gate on the Wyvern. A third hero slot (unusable until a third Horde hero class ships). Satisfies every hall requirement below it."
+    }
+  ],
+  "abilities": [
+    {
+      "id": "Slam",
+      "caster": "Hero",
+      "index": 0,
+      "effect": "damage",
+      "effects": [
+        {
+          "atom": "damage",
+          "schedule": "instant",
+          "targets": "enemies",
+          "amount": 45.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 40.0,
+      "cooldown": 10.0,
+      "radius": 7.0,
+      "power": 45.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "AoE damage around the Champion (ground only), scales with level."
+    },
+    {
+      "id": "Warcry",
+      "caster": "Hero",
+      "index": 1,
+      "effect": "status",
+      "effects": [
+        {
+          "atom": "status",
+          "schedule": "instant",
+          "targets": "allies",
+          "status": "DamageBuff",
+          "magnitude": 0.3,
+          "duration": 8.0
+        }
+      ],
+      "status": "DamageBuff",
+      "target": "caster",
+      "mana_cost": 75.0,
+      "cooldown": 45.0,
+      "radius": 8.0,
+      "power": 0.3,
+      "duration": 8.0,
+      "hits_air": true,
+      "unlock": "hero level 5",
+      "unlock_hero_level": 5,
+      "unlock_tier": null,
+      "description": "Ultimate: allies around the Champion deal +30% damage for 8s. Hero level 5."
+    },
+    {
+      "id": "Heal",
+      "caster": "Priestess",
+      "index": 0,
+      "effect": "heal",
+      "effects": [
+        {
+          "atom": "heal",
+          "schedule": "instant",
+          "targets": "allies",
+          "amount": 60.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 45.0,
+      "cooldown": 12.0,
+      "radius": 8.0,
+      "power": 60.0,
+      "duration": 0.0,
+      "hits_air": true,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Restores HP to all allies around the Priestess, air included, scales with level."
+    },
+    {
+      "id": "Sanctuary",
+      "caster": "Priestess",
+      "index": 1,
+      "effect": "status",
+      "effects": [
+        {
+          "atom": "status",
+          "schedule": "instant",
+          "targets": "allies",
+          "status": "HealOverTime",
+          "magnitude": 15.0,
+          "duration": 6.0
+        },
+        {
+          "atom": "status",
+          "schedule": "instant",
+          "targets": "allies",
+          "status": "ArmorBuff",
+          "magnitude": 0.25,
+          "duration": 6.0
+        }
+      ],
+      "status": "HealOverTime",
+      "status2": [
+        "ArmorBuff",
+        0.25
+      ],
+      "target": "caster",
+      "mana_cost": 90.0,
+      "cooldown": 60.0,
+      "radius": 7.0,
+      "power": 15.0,
+      "duration": 6.0,
+      "hits_air": true,
+      "unlock": "hero level 5",
+      "unlock_hero_level": 5,
+      "unlock_tier": null,
+      "description": "Ultimate: allies around the Priestess regain 15 HP/s and take 25% less damage for 6s. Hero level 5."
+    },
+    {
+      "id": "Slow",
+      "caster": "Sorcerer",
+      "index": 0,
+      "effect": "status",
+      "effects": [
+        {
+          "atom": "status",
+          "schedule": "instant",
+          "targets": "enemies",
+          "status": "Slow",
+          "magnitude": 0.4,
+          "duration": 5.0
+        }
+      ],
+      "status": "Slow",
+      "target": "point",
+      "target_range": 9.0,
+      "mana_cost": 0.0,
+      "cooldown": 9.0,
+      "radius": 4.5,
+      "power": 0.4,
+      "duration": 5.0,
+      "hits_air": true,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Cast at a point up to 9 away: slows every enemy within 4.5 of it by 40% (move AND attack speed) for 5s. Refreshes rather than stacks; no mana, 9s cooldown. Omit the point and the Sorcerer aims at the biggest clump it can reach."
+    },
+    {
+      "id": "Bloodlust",
+      "caster": "Shaman",
+      "index": 0,
+      "effect": "status",
+      "effects": [
+        {
+          "atom": "status",
+          "schedule": "instant",
+          "targets": "allies",
+          "status": "DamageBuff",
+          "magnitude": 0.2,
+          "duration": 10.0
+        },
+        {
+          "atom": "status",
+          "schedule": "instant",
+          "targets": "allies",
+          "status": "Haste",
+          "magnitude": 0.25,
+          "duration": 10.0
+        }
+      ],
+      "status": "DamageBuff",
+      "status2": [
+        "Haste",
+        0.25
+      ],
+      "target": "point",
+      "target_range": 8.0,
+      "mana_cost": 0.0,
+      "cooldown": 12.0,
+      "radius": 5.0,
+      "power": 0.2,
+      "duration": 10.0,
+      "hits_air": true,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Cast at a point up to 8 away: every ally within 5 of it deals +20% damage and moves 25% faster for 10s. Stacks with a second Shaman up to the status cap; no mana, 12s cooldown. Omit the point and the Shaman aims at the biggest friendly clump it can reach."
+    },
+    {
+      "id": "Cleave",
+      "caster": "Warchief",
+      "index": 0,
+      "effect": "damage",
+      "effects": [
+        {
+          "atom": "damage",
+          "schedule": "instant",
+          "targets": "enemies",
+          "amount": 42.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 40.0,
+      "cooldown": 10.0,
+      "radius": 6.5,
+      "power": 42.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "AoE damage around the Warchief (ground only), scales with level."
+    },
+    {
+      "id": "Bloodfury",
+      "caster": "Warchief",
+      "index": 1,
+      "effect": "status",
+      "effects": [
+        {
+          "atom": "status",
+          "schedule": "instant",
+          "targets": "allies",
+          "status": "DamageBuff",
+          "magnitude": 0.2,
+          "duration": 8.0
+        },
+        {
+          "atom": "status",
+          "schedule": "instant",
+          "targets": "allies",
+          "status": "Haste",
+          "magnitude": 0.3,
+          "duration": 8.0
+        }
+      ],
+      "status": "DamageBuff",
+      "status2": [
+        "Haste",
+        0.3
+      ],
+      "target": "caster",
+      "mana_cost": 75.0,
+      "cooldown": 45.0,
+      "radius": 8.0,
+      "power": 0.2,
+      "duration": 8.0,
+      "hits_air": true,
+      "unlock": "hero level 5",
+      "unlock_hero_level": 5,
+      "unlock_tier": null,
+      "description": "Ultimate: allies around the Warchief deal +20% damage and move 30% faster for 8s. Hero level 5."
+    },
+    {
+      "id": "Mend",
+      "caster": "FarSeer",
+      "index": 0,
+      "effect": "heal",
+      "effects": [
+        {
+          "atom": "heal",
+          "schedule": "over_time",
+          "targets": "allies",
+          "amount": 12.0,
+          "interval": 1.0,
+          "ticks": 5
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 45.0,
+      "cooldown": 12.0,
+      "radius": 8.0,
+      "power": 12.0,
+      "duration": 0.0,
+      "hits_air": true,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Mends allies standing within 8 of the FarSeer for 12 HP a second over 5s, air included. A patch of ground that heals — walk the line into it."
+    },
+    {
+      "id": "AncestralCall",
+      "caster": "FarSeer",
+      "index": 1,
+      "effect": "summon",
+      "effects": [
+        {
+          "atom": "summon",
+          "schedule": "instant",
+          "unit_kind": "Grunt",
+          "count": 2,
+          "lifetime": 40.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 90.0,
+      "cooldown": 60.0,
+      "radius": 4.0,
+      "power": 2.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "hero level 5",
+      "unlock_hero_level": 5,
+      "unlock_tier": null,
+      "description": "Ultimate: two Grunts of the ancestors fight beside the FarSeer for 40s. Hero level 5."
+    },
+    {
+      "id": "CallToArms",
+      "caster": "TownHall",
+      "index": 0,
+      "effect": "militia",
+      "effects": [
+        {
+          "atom": "militia",
+          "schedule": "instant",
+          "targets": "own_workers",
+          "duration": 40.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 0.0,
+      "cooldown": 90.0,
+      "radius": 16.0,
+      "power": 40.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Own workers near the TownHall become fighters for 40s."
+    },
+    {
+      "id": "CallToArms",
+      "caster": "Keep",
+      "index": 0,
+      "effect": "militia",
+      "effects": [
+        {
+          "atom": "militia",
+          "schedule": "instant",
+          "targets": "own_workers",
+          "duration": 40.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 0.0,
+      "cooldown": 90.0,
+      "radius": 16.0,
+      "power": 40.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Own workers near the TownHall become fighters for 40s."
+    },
+    {
+      "id": "CallToArms",
+      "caster": "Castle",
+      "index": 0,
+      "effect": "militia",
+      "effects": [
+        {
+          "atom": "militia",
+          "schedule": "instant",
+          "targets": "own_workers",
+          "duration": 40.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 0.0,
+      "cooldown": 90.0,
+      "radius": 16.0,
+      "power": 40.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Own workers near the TownHall become fighters for 40s."
+    },
+    {
+      "id": "WarDrums",
+      "caster": "Stronghold",
+      "index": 0,
+      "effect": "militia",
+      "effects": [
+        {
+          "atom": "militia",
+          "schedule": "instant",
+          "targets": "own_workers",
+          "duration": 35.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 0.0,
+      "cooldown": 90.0,
+      "radius": 16.0,
+      "power": 35.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Own peons near the Stronghold become fighters for 35s."
+    },
+    {
+      "id": "WarDrums",
+      "caster": "Fortress",
+      "index": 0,
+      "effect": "militia",
+      "effects": [
+        {
+          "atom": "militia",
+          "schedule": "instant",
+          "targets": "own_workers",
+          "duration": 35.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 0.0,
+      "cooldown": 90.0,
+      "radius": 16.0,
+      "power": 35.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Own peons near the Stronghold become fighters for 35s."
+    },
+    {
+      "id": "WarDrums",
+      "caster": "Hold",
+      "index": 0,
+      "effect": "militia",
+      "effects": [
+        {
+          "atom": "militia",
+          "schedule": "instant",
+          "targets": "own_workers",
+          "duration": 35.0
+        }
+      ],
+      "status": null,
+      "target": "caster",
+      "mana_cost": 0.0,
+      "cooldown": 90.0,
+      "radius": 16.0,
+      "power": 35.0,
+      "duration": 0.0,
+      "hits_air": false,
+      "unlock": "always",
+      "unlock_hero_level": null,
+      "unlock_tier": null,
+      "description": "Own peons near the Stronghold become fighters for 35s."
+    }
+  ],
+  "research": [
+    {
+      "id": "attack",
+      "name": "Weapon Smithing",
+      "researched_at": "Blacksmith",
+      "forges": [
+        "Blacksmith",
+        "WarMill"
+      ],
+      "max_level": 3,
+      "applies_to": "units only (not buildings or towers)",
+      "levels": [
+        {
+          "level": 1,
+          "cost_gold": 100,
+          "cost_lumber": 50,
+          "research_time": 40.0,
+          "bonus": 1.0
+        },
+        {
+          "level": 2,
+          "cost_gold": 175,
+          "cost_lumber": 100,
+          "research_time": 55.0,
+          "bonus": 2.0
+        },
+        {
+          "level": 3,
+          "cost_gold": 250,
+          "cost_lumber": 150,
+          "research_time": 70.0,
+          "bonus": 3.0
+        }
+      ],
+      "description": "+1 damage per level on every attack made by one of your UNITS. Flat and applied last, so it is never multiplied by a Catapult's siege bonus or a hero's level. Does not arm Towers — research equips the army."
+    },
+    {
+      "id": "armor",
+      "name": "Armor Plating",
+      "researched_at": "Blacksmith",
+      "forges": [
+        "Blacksmith",
+        "WarMill"
+      ],
+      "max_level": 3,
+      "applies_to": "units only (not buildings or towers)",
+      "levels": [
+        {
+          "level": 1,
+          "cost_gold": 100,
+          "cost_lumber": 50,
+          "research_time": 40.0,
+          "bonus": 1.0
+        },
+        {
+          "level": 2,
+          "cost_gold": 175,
+          "cost_lumber": 100,
+          "research_time": 55.0,
+          "bonus": 2.0
+        },
+        {
+          "level": 3,
+          "cost_gold": 250,
+          "cost_lumber": 150,
+          "research_time": 70.0,
+          "bonus": 3.0
+        }
+      ],
+      "description": "-1 damage per level from every hit taken by one of your UNITS, floored at 1 damage per hit. Does not protect buildings — a Keep upgrade is what thickens masonry."
+    }
+  ],
+  "items": [
+    {
+      "id": "HealingPotion",
+      "cost_gold": 100,
+      "sold_at": "Shop",
+      "tier": 1,
+      "description": "Instantly restores 150 HP to the hero."
+    },
+    {
+      "id": "TownPortal",
+      "cost_gold": 150,
+      "sold_at": "Shop",
+      "tier": 1,
+      "destination": "choosable",
+      "description": "Teleports the hero and nearby own units to one of your own standing halls. Destination is CHOOSABLE: use_item takes an optional `destination` building id; omit it for the hall nearest the hero."
+    },
+    {
+      "id": "BootsOfSpeed",
+      "cost_gold": 50,
+      "sold_at": "Shop",
+      "tier": 1,
+      "description": "Hastes the hero: +40% move speed for 15s."
+    },
+    {
+      "id": "BannerOfCommand",
+      "cost_gold": 125,
+      "sold_at": "Shop",
+      "tier": 2,
+      "description": "Plants a banner: own units within 8 take 30% less damage for 10s."
+    },
+    {
+      "id": "ScrollOfMassTeleport",
+      "cost_gold": 250,
+      "sold_at": "Shop",
+      "tier": 3,
+      "destination": "choosable",
+      "description": "Recalls the hero and EVERY own non-worker unit on the map to one of your own standing halls. Destination is CHOOSABLE: use_item takes an optional `destination` building id; omit it for the hall nearest the hero. Aiming it at the hall that is NOT nearest is the whole point — an army at the expansion defends the main by porting away from itself."
+    }
+  ],
+  "statuses": [
+    {
+      "id": "Slow",
+      "stacking": "refresh",
+      "cap": 0.75,
+      "debuff": true,
+      "description": "Move and attack speed reduced."
+    },
+    {
+      "id": "Haste",
+      "stacking": "stack",
+      "cap": 1.0,
+      "debuff": false,
+      "description": "Move speed increased."
+    },
+    {
+      "id": "ArmorBuff",
+      "stacking": "stack",
+      "cap": 0.8,
+      "debuff": false,
+      "description": "Incoming damage reduced."
+    },
+    {
+      "id": "DamageBuff",
+      "stacking": "stack",
+      "cap": 2.0,
+      "debuff": false,
+      "description": "Outgoing damage increased."
+    },
+    {
+      "id": "HealOverTime",
+      "stacking": "stack",
+      "cap": 60.0,
+      "debuff": false,
+      "description": "Regenerates HP every second."
+    }
+  ],
+  "stances": [
+    {
+      "id": "turtle",
+      "label": "Turtle",
+      "description": "Hold home tight; break off early.",
+      "posture": "defend",
+      "radius": 14.0,
+      "leash": 20.0,
+      "retreat_below": 0.45,
+      "rally": "anchor",
+      "priority": [
+        "Siege",
+        "Cavalry"
+      ]
+    },
+    {
+      "id": "stage",
+      "label": "Stage",
+      "description": "Gather at a forward point and wait.",
+      "posture": "defend",
+      "radius": 10.0,
+      "leash": 16.0,
+      "retreat_below": 0.4,
+      "rally": "anchor",
+      "priority": []
+    },
+    {
+      "id": "push",
+      "label": "Push",
+      "description": "Commit to the objective.",
+      "posture": "push",
+      "radius": 0.0,
+      "leash": 0.0,
+      "retreat_below": 0.25,
+      "rally": "base",
+      "priority": [
+        "Siege",
+        "Archer",
+        "Hero"
+      ]
+    },
+    {
+      "id": "secure",
+      "label": "Secure",
+      "description": "Hold ground away from home.",
+      "posture": "defend",
+      "radius": 30.0,
+      "leash": 38.0,
+      "retreat_below": 0.35,
+      "rally": "anchor",
+      "priority": [
+        "Siege",
+        "Cavalry"
+      ]
+    },
+    {
+      "id": "harass",
+      "label": "Harass",
+      "description": "Hit the soft targets; leave before the trade.",
+      "posture": "push",
+      "radius": 0.0,
+      "leash": 44.0,
+      "retreat_below": 0.55,
+      "rally": "base",
+      "priority": [
+        "Worker",
+        "Siege"
+      ]
+    }
+  ],
+  "selectors": {
+    "units": [
+      "my hero",
+      "all army",
+      "all units",
+      "workers",
+      "squad <n>"
+    ],
+    "nodes": [
+      "nearest tree",
+      "nearest mine"
+    ],
+    "sites": [
+      "nearest legal site"
+    ]
+  }
+}

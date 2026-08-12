@@ -13,12 +13,16 @@ Two views over the same file, and nothing but views: this script never writes
     now. Drops the per-unit id rosters, the tree ids, the per-farm HP and the
     full plans echo, which is where a small commander's attention was going.
 
+  * ``--doc`` — the whole hypermedia affordance document, of which the digest
+    is one section. See ``tools/affordances.py``.
+
 The digest is deliberately split in two halves. ``digest()`` returns structured
 data and ``render_digest()`` turns that into lines. AFFORDANCES.md's "One
 document" section makes the digest the PROPERTIES section of a single
-hypermedia document whose other half is actions/forms; when that renderer
-arrives it embeds ``digest()``'s dict verbatim and adds its own ``actions`` key
-beside it, rather than re-deriving any of this from the snapshot a second time.
+hypermedia document whose other half is actions/forms; that renderer is
+``tools/affordances.py`` and it embeds ``digest()``'s dict verbatim beside its
+own ``actions`` key, rather than re-deriving any of this from the snapshot a
+second time.
 
 Everything here degrades on old snapshots. Every read is a ``.get`` with a
 default, because the keys this reads were added over a dozen releases and a
@@ -569,15 +573,53 @@ def main():
         help="the ~15-line commander digest instead of the full readout",
     )
     ap.add_argument(
+        "--doc",
+        action="store_true",
+        help="the whole hypermedia affordance document: this digest as its "
+        "properties section, plus the running default, the alarms and every "
+        "link and form (tools/affordances.py)",
+    )
+    ap.add_argument(
+        "--prefs",
+        help="with --doc: a JSON file of commander-declared doctrine, which "
+        "SORTS the actions and nothing else",
+    )
+    ap.add_argument(
+        "--doc-version",
+        action="store_true",
+        help="print the affordance document's media-type version and exit — "
+        "what an arena round records in its ruleset",
+    )
+    ap.add_argument(
         "--json",
         action="store_true",
         help="with --digest: the digest's structured data, which is what the "
-        "hypermedia document embeds as its properties section",
+        "hypermedia document embeds as its properties section. With --doc: the "
+        "whole document",
     )
     args = ap.parse_args()
+
+    # Imported here rather than at module scope: `affordances` imports THIS
+    # module for `digest()`, and a top-level import in both directions is a
+    # cycle. By the time main() runs, bridge_view is fully loaded.
+    import affordances  # noqa: PLC0415
+
+    if args.doc_version:
+        print(affordances.DOC_VERSION)
+        return
+
     path = args.path
     with open(path) as f:
         s = json.load(f)
+
+    if args.doc:
+        doc = affordances.document(s, load_catalog(path), affordances.load_prefs(args.prefs))
+        if args.json:
+            print(json.dumps(doc, indent=2))
+        else:
+            for line in affordances.render_document(doc):
+                print(line)
+        return
 
     if args.digest:
         props = digest(s, load_catalog(path))
