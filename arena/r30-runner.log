@@ -1,0 +1,25 @@
+round r30: ladder-2 r1/4: Fable mirror on affordance-doc/2.1 — folded page, acceptance notes, standard-kingdom playbook; baseline r25
+  seats:  red=commander:standard (claude-fable-5),  blue=commander:standard (claude-fable-5)
+  commit: 6e2d2d0
+  env:    BH_AI_BOTH=0 BH_BRIDGE=both BH_MAP=crossings BH_MAX_GAME_SECS=1800 BH_SHOT_DIR=arena/r30/shots BH_SPEED=1
+  consts: affordance_doc=affordance-doc/2.1 alarms_ron=a773dd4c4f9a playbooks_ron=e5ce7729d413 stances_ron=22ef85561d44
+  doc:    red blue read tools/bridge_view.py --doc --all once at t=0, --doc each cycle
+  binary: /home/ckopsa/dev/wc3clone/target/debug/bridgehead
+  out:    /home/ckopsa/dev/wc3clone/arena/r30
+  created seat /home/ckopsa/dev/wc3clone/bridge/red
+  created seat /home/ckopsa/dev/wc3clone/bridge/blue
+  skeleton: /home/ckopsa/dev/wc3clone/arena/r30/round.json
+
+commander seats are prepared and waiting — spawn them now against:
+  standard: seat /home/ckopsa/dev/wc3clone/bridge/red, brief tools/COMMANDER_BRIEF.md + tools/bridge_view.py --doc --all at t=0, --doc each cycle
+  standard: seat /home/ckopsa/dev/wc3clone/bridge/blue, brief tools/COMMANDER_BRIEF.md + tools/bridge_view.py --doc --all at t=0, --doc each cycle
+
+launching (wall timeout 2100s)...
+  match held at t=0 (the clock starts when every seat readies)
+  waiting for seats: red blue
+  waiting for seats: blue
+  match started at wall 121s
+
+Claude wins (surrender) at t=388.5s game, 511s wall
+appended r30 to /home/ckopsa/dev/wc3clone/arena/ledger.jsonl
+AARs attach later: tools/arena.py add-aar r30 --seat <seat> --path <file.md>
