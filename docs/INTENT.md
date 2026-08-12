@@ -2242,17 +2242,17 @@ answering has to see what they are agreeing to on the line they are answering.
 - **A step still cannot name a unit that does not exist.** Answered by the squad
   idiom above rather than solved. The residue is real: a plan cannot say "the
   *specific* Catapult I am about to build".
-- **And there is no squad idiom for BUILDINGS**, which is the sharper half of
-  the same gap and worth stating plainly: a step cannot name a building the
-  plan itself is about to put up. "Build a Barracks, then train Footmen at it"
-  is unspellable in one plan, because step 1 mints the id that step 3 would
-  need. Squads close this for units because membership is late-bound by number;
-  buildings have no such handle. The working idiom is two plans — an economic
-  opening now, an army plan set on the poll after the Barracks appears in your
-  snapshot — and that is what tools/COMMANDER_BRIEF.md ships as the canonical
-  pair. A `{"building":{"kind":"Barracks","nth":0}}` selector would close it and
-  was deliberately not invented here: it is a second way to name a building, and
-  the argument against inventing one is the argument this whole document makes.
+- ~~**And there is no squad idiom for BUILDINGS.**~~ **Closed** by the building
+  channel above (`wc3clone-3ji`). It was the sharper half of the same gap: a
+  step could not name a building the plan itself was about to put up, because
+  step 1 minted the id step 3 would need, so "build a Barracks, then train
+  Footmen at it" was unspellable in one plan and the working idiom was two
+  plans a poll apart. `{"intent":{"type":"train","select":"my Barracks",
+  "unit":"Footman"}}` is now one plan, and `tools/intent_compile.py` compiles
+  exactly that English into exactly that shape. The `{"kind":..,"nth":..}`
+  object this bullet declined to invent is still not invented — the handle is a
+  phrase in the channel that already existed, which is why the argument against
+  the object did not apply to it.
 - **A plan whose wait can never be satisfied is indistinguishable from one that
   is merely early.** `unit_count >= 8` behind a single `train` step (which
   queues one unit) is `running` forever, honestly and uselessly. Nothing
@@ -2496,6 +2496,57 @@ its space.
 **lowest-id match** — the same documented tie-break `buy` and `use_item` already
 use for an omitted `hero`, so there is one rule for "which one did you mean"
 rather than two.
+
+### The building channel
+
+*(`wc3clone-3ji`, from the 0uu.3 handoff)*
+
+The first three channels answered "which units", "which node" and "which
+ground". A fourth answers **which building**, for the four verbs that act on
+one — `train`, `template`, `rally`, `cancel`:
+
+```json
+{"type":"train","select":"idle barracks","unit":"Footman"}
+{"type":"train","select":"my hall","unit":"Worker"}
+{"type":"rally","select":"my barracks","region":"north-pass"}
+```
+
+It closes the gap the plan section below names in as many words: production —
+the one thing a small commander does every cycle — required an entity id read
+out of the snapshot, and a repeating `train` rule armed with that id trained
+nothing the moment the barracks was razed and rebuilt.
+
+Three phrases, and the shape of the family is the argument for each:
+
+* **`my <building>`** — this seat's own FINISHED buildings of one kind. The kind
+  is any `catalog.buildings[].id`, folded through `normalize_name` like every
+  other name on the wire, singular or plural. Unfinished is excluded because a
+  Barracks with scaffolding on it trains nothing, and resolving to one would
+  turn a good sentence into an `under construction` refusal nobody wrote.
+* **`idle <building>`** — the same, narrowed to an empty training queue. This is
+  the one that wins games: a repeating "train a Footman" rule wants a producer
+  that is actually free, and when they are all busy it says so — `all 2 of your
+  Barracks already have something queued; drop 'idle' to queue behind it` —
+  rather than stacking six deep on one building.
+* **`my hall`** — whichever rung of the ladder is standing. A hall UPGRADES in
+  place, so a rule that said `my town hall` would stop matching the moment it
+  became a Keep. That is the author-time-fact bug this whole feature deletes,
+  wearing a different hat, and the fix is a role rather than a kind.
+
+All four verbs act on exactly one building, so all four take the **lowest-id
+match** — the same tie-break as `build`'s worker, not a second rule. Their
+`building` key widened to `Option` to make room for the phrase, which is
+additive in both directions on the same argument as `build.worker` before it.
+
+The empty match teaches by naming what the seat *does* have — `'my workshop'
+matches none of your finished buildings — you have: Barracks ×2, Keep` — which
+is `Regions::unknown`'s rule applied to buildings. Own buildings only, so it
+leaks nothing the seat's own snapshot did not already print.
+
+**Why not `{"building":{"kind":"Barracks","nth":0}}`.** That object was
+considered in the plan section below and rejected for being a second way to name
+a building. It still is. A phrase in the `select` channel is not a second way —
+it is the way that already existed, reaching one more kind of thing.
 
 ### The four rules
 

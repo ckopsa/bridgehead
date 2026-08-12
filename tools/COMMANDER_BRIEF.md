@@ -330,8 +330,25 @@ Two more phrases answer "which one", not "which units":
 | `"nearest tree"` / `"nearest mine"` | `harvest`'s `"target_select"` | the nearest live node of that kind to the workers you are sending |
 | `"nearest legal site"` | `build`'s `"site"` | move the footprint to the nearest legal one within 15 of the point you named, instead of refusing |
 
+And a fourth channel names a **building**, for the four verbs that act on one —
+`train`, `template`, `rally`, `cancel`. Send `"select"` instead of `"building"`:
+
+| phrase | means |
+|---|---|
+| `"my barracks"` | your own FINISHED buildings of that kind. Any `catalog.buildings[].id`, singular or plural: `"barracks"`, `"my farms"`, `"war mill"` |
+| `"idle barracks"` | the same, narrowed to the ones with **nothing in the training queue** |
+| `"my hall"` | whichever rung of the hall ladder you have standing — TownHall, Keep or Castle. Use this rather than `"my town hall"`, which stops matching the moment you upgrade |
+
+All four verbs act on exactly one building, so they take the **lowest-id
+match**, the same tie-break as `build`'s worker. `"idle"` is the one to reach
+for in a repeating rule: it walks past a producer that is already working, and
+when they are all working it refuses in words rather than queueing six deep.
+
 Case, spaces, dashes and underscores are noise, exactly as in every other name
-on this wire. A phrase that is not one of these is refused with the list.
+on this wire. A phrase that is not one of these is refused with the list. A
+phrase from the *wrong* channel is refused with the right one —
+`{"type":"train","select":"my hero"}` earns `'my hero' names units, not a
+building`.
 
 Where each channel lives:
 
@@ -345,6 +362,11 @@ Where each channel lives:
 {"type":"follow","select":"all army","target_select":"my hero"}
 {"type":"build","select":"workers","kind":"Farm","region":"home","site":"nearest legal site"}
 {"type":"cast","select":"my hero","ability":"Slam"}
+{"type":"train","select":"idle barracks","unit":"Footman"}
+{"type":"train","select":"my hall","unit":"Worker"}
+{"type":"rally","select":"my barracks","region":"north-pass"}
+{"type":"template","select":"my barracks","squad":2}
+{"type":"cancel","select":"my barracks","index":0}
 ```
 
 `build`, `cast` and `follow`'s `target_select` need exactly one unit, so they
@@ -893,7 +915,7 @@ in front of you beats a sequence written before the match.
 ```bash
 python3 tools/bridge_view.py --doc <SEAT>/state.json          # to read
 python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse
-python3 tools/bridge_view.py --doc-version                    # affordance-doc/1
+python3 tools/bridge_view.py --doc-version                    # affordance-doc/1.1
 ```
 
 The digest tells you **what is going on**. The document tells you **what you can
@@ -1001,8 +1023,32 @@ creates, your snapshot echo reads, the same name updates in place for free,
   of those names to replace a rule in place").
 
 The recipes from *Triggers* above are served the same way — `recipe:home-guard`,
-`recipe:hero-save`, `recipe:expand`, `recipe:counter-punch` — with the ids taken
-out and one or two judgment fields left open.
+`recipe:hero-save`, `recipe:expand`, `recipe:counter-punch`,
+`recipe:steady-production` — with the ids taken out and one or two judgment
+fields left open.
+
+### Production is on the page (`affordance-doc/1.1`)
+
+One `train:<kind>` form for every producer kind you have standing, written in
+the building selector so there is no id to look up:
+
+```
+[READY    ] train:Barracks  train at your Barracks — no building id, the role
+                            resolves when it runs
+            why: 2 finished Barracks, 1 idle; you hold 964g/145l at 36/50 supply
+    template: {"type":"train","select":"idle Barracks","unit":null}
+      select <selector> default="idle Barracks"
+      unit   <kind>     (leave null — this one is yours)
+        domain: Footman — 135g/0l 2supply — available
+                Knight  — 245g/60l 3supply — NOT AVAILABLE at your tech
+                …
+```
+
+The `select` default is `idle <kind>` when one of yours is free and `my <kind>`
+when they are all busy — both facts about your own buildings, neither advice.
+The `unit` domain prices every row against your own bank, your own tech and
+(for heroes) your own slots, so a refusal that would have cost a poll cycle
+arrives with the menu instead.
 
 ### Declaring a doctrine (optional)
 

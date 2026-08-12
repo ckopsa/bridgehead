@@ -146,7 +146,7 @@ document version is recorded in the round's ruleset like every other scaffold
 layer (constraint 3).
 
 **Shipped** (`wc3clone-0uu.3`) as `tools/affordances.py`, rendered by
-`bridge_view.py --doc` / `--doc --json`, versioned `affordance-doc/1` and
+`bridge_view.py --doc` / `--doc --json`, versioned `affordance-doc/1.1` and
 readable from `bridge_view.py --doc-version`. The wire is untouched: the
 document is composed entirely from `state.json` and `catalog.json`, and the
 only engine change was two additive catalog keys (`stances`, `selectors`) so a
