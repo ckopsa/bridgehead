@@ -2588,17 +2588,65 @@ beside `x`/`z`:
 {"type":"build","select":"workers","kind":"Farm","region":"home","site":"nearest legal site"}
 ```
 
-The vocabulary is deliberately small: five roles a commander already thinks in
-(`my hero`, `all army`, `all units`, `workers`, `squad <n>`) and three
-"nearest X" phrases that answer the questions ids answered badly
-(`nearest tree`, `nearest mine`, `nearest legal site`). Phrases fold through
-`normalize_place`, so case, dashes and underscores are noise and `squad 2` keeps
-its space.
+The vocabulary is deliberately small: six roles a commander already thinks in
+(`my hero`, `all army`, `all units`, `workers`, `idle workers`, `squad <n>`) and
+four "nearest X" phrases that answer the questions ids answered badly
+(`nearest worker`, `nearest tree`, `nearest mine`, `nearest legal site`).
+Phrases fold through `normalize_place`, so case, dashes and underscores are
+noise and `squad 2` keeps its space.
 
-`build`, `cast` and `follow`'s leader need exactly one unit and take the
-**lowest-id match** — the same documented tie-break `buy` and `use_item` already
-use for an omitted `hero`, so there is one rule for "which one did you mean"
-rather than two.
+`cast` and `follow`'s leader need exactly one unit and take the **lowest-id
+match** — the same documented tie-break `buy` and `use_item` already use for an
+omitted `hero`, so there is one rule for "which one did you mean" rather than
+two.
+
+#### `build`'s worker is the one exception, and r26 is why
+
+*(`wc3clone-phc` / `wc3clone-ksu`)*
+
+`build` used the lowest-id rule too, and it was wrong in a way that took two
+arena rounds to see. A hero is singular; a worker is one of fifteen, and the
+lowest-id one is invariably already doing something. Worse, `build` issues
+`Order::Build` through `Commands`, which Bevy does not flush until the system
+ends — so **every** `build` in one batch resolved to the *same* body, and each
+new order abandoned the previous foundation before ground was broken. Nothing
+was spent (economy.rs pays at the site), nothing was said, and nothing appeared.
+r26-blue lost three expansions and a Blacksmith to it; r25-red sent three
+accepted `build`s and got no Barracks and no error.
+
+So the worker pick is its own rule, and it is the one place in the resolver that
+looks at what a unit is *doing*:
+
+1. an explicit `worker` id always wins — naming a body is the commander saying
+   "that one, I know it is busy";
+2. workers already walking to an unbroken site are **excluded**, from the world
+   (`Order::Build`) and from the rest of this batch (`claimed_builders`, which
+   is `batch_squads`' problem wearing another hat). If that empties the
+   candidate list the command is refused in words;
+3. idle beats working — `nearest worker` is how a commander says "distance,
+   never mind idleness";
+4. then nearest to the site, because the walk is the cost;
+5. then lowest id, so a seeded match still replays byte-for-byte.
+
+This is also the one selector that had to be resolved *after* the place channel
+rather than before it: the ranking measures from the site, so the site has to be
+a settled fact first.
+
+`nearest worker` is a unit phrase that needs a measuring point, and only `build`
+supplies one. A verb that names no ground refuses it by name and points at
+`workers` / `idle workers` — the same shape of channel refusal as `'my hero'
+names units, not a building`.
+
+**Both seats, checked.** The two new phrases are not rungs on `ui.rs`'s doctrine
+scope picker, and that is the `squad 7` asymmetry again rather than a new one:
+it is a *rendering* difference, not a capability one. The human picking which
+peasant lays a foundation does it by clicking the peasant, which is the same act
+the phrase automates, and the same `Intent::Build` with an explicit `worker`
+comes out — the path an explicit id takes through the pick unchanged, by rule 1
+above. `idle workers` as a *doctrine* scope ("retreat at 30%, whoever happens to
+be idle") is a rule about a set that changes between arming and firing, which is
+a different feature from the one this bead is; the picker keeps the five stable
+roles.
 
 ### The building channel
 

@@ -149,7 +149,8 @@ STANCE_FALLBACK = [
 ]
 
 SELECTOR_FALLBACK = {
-    "units": ["my hero", "all army", "all units", "workers", "squad <n>"],
+    "units": ["my hero", "all army", "all units", "workers", "idle workers",
+              "nearest worker", "squad <n>"],
     "nodes": ["nearest tree", "nearest mine"],
     "sites": ["nearest legal site"],
     "buildings": ["my <building>", "idle <building>", "my hall"],
