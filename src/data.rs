@@ -40,9 +40,11 @@ use crate::shared::{
     normalize_name, status_probe_enabled, upgrade_root, AbilityDef,
     AbilityTarget, AbilityTargets, Effect, EffectAtom, EffectSchedule,
     BuildingKind, BuildingRole,
-    BuildingStats, ItemDef, ItemId, Race, ResearchKind, ResearchStep, TechTier, UnitKind,
+    BuildingStats, ItemDef, ItemId, Race, ResearchKind, ResearchStep, StanceDef, StanceKind,
+    StancePosture, TechTier, UnitKind,
     UnitRole, UnitStats,
-    AbilityUnlock, ALL_BUILDING_KINDS, ALL_ITEMS, ALL_RACES, ALL_RESEARCH_KINDS, ALL_UNIT_KINDS,
+    AbilityUnlock, ALL_BUILDING_KINDS, ALL_ITEMS, ALL_RACES, ALL_RESEARCH_KINDS, ALL_STANCES,
+    ALL_UNIT_KINDS,
     RESEARCH_MAX_LEVEL,
 };
 
@@ -60,6 +62,7 @@ const BUILDINGS_RON: &str = include_str!("../assets/data/buildings.ron");
 const ABILITIES_RON: &str = include_str!("../assets/data/abilities.ron");
 const ITEMS_RON: &str = include_str!("../assets/data/items.ron");
 const RESEARCH_RON: &str = include_str!("../assets/data/research.ron");
+const STANCES_RON: &str = include_str!("../assets/data/stances.ron");
 
 /// Read one table's text: the override file if `BH_DATA_DIR` names a
 /// directory containing it, otherwise the compiled-in copy.
@@ -319,6 +322,8 @@ pub struct Tables {
     research_buildings: Vec<BuildingKind>,
     research_ladders: Vec<ResearchLadderRow>,
     research_steps: Vec<ResearchStep>,
+    /// Slot-indexed by `StanceKind as usize`, like every other table here.
+    stances: Vec<StanceDef>,
 }
 
 static TABLES: LazyLock<Tables> = LazyLock::new(load);
@@ -388,6 +393,7 @@ fn load() -> Tables {
     let defs: Vec<AbilityDef> = defs.into_iter().map(AbilityDef::from).collect();
     let item_rows: Vec<ItemRow> = parse("items.ron", ITEMS_RON);
     let research_file: ResearchFile = parse("research.ron", RESEARCH_RON);
+    let stance_rows: Vec<StanceDef> = parse("stances.ron", STANCES_RON);
 
     // Slotting first: every later check assumes a full table, and a missing
     // row is the failure this whole exercise exists to make loud.
@@ -430,6 +436,59 @@ fn load() -> Tables {
         |kind| format!("{kind:?}"),
         &mut problems,
     );
+    let stances: Vec<StanceDef> = slot_by_kind(
+        "stances.ron",
+        stance_rows,
+        &ALL_STANCES,
+        |row| row.kind,
+        |kind| kind as usize,
+        |kind| kind.word().to_string(),
+        &mut problems,
+    );
+
+    if !problems.is_empty() {
+        panic!("{}", report(&problems));
+    }
+
+    // Stance geometry. Each of these is a number a tuner could plausibly get
+    // wrong in a way the engine would then swallow silently — a `Defend` with
+    // no ring never re-tasks anybody, a `retreat_below` of 1.0 keeps every unit
+    // permanently in flight — so the loader refuses to start instead, naming
+    // the word and the field. Same standard the rest of this validator holds.
+    for row in &stances {
+        let word = row.kind.word();
+        if row.posture == StancePosture::Defend && !(row.radius > 0.0) {
+            problems.push(format!(
+                "stances.ron: {word} is a Defend stance, so its radius must be > 0 (got {})",
+                row.radius
+            ));
+        }
+        if row.leash < 0.0 {
+            problems.push(format!(
+                "stances.ron: {word} has a negative leash ({}); use 0 for 'no leash'",
+                row.leash
+            ));
+        }
+        // A leash inside the ring recalls a defender the moment it steps out to
+        // meet an attacker, which reads as units that will not fight.
+        if row.posture == StancePosture::Defend && row.leash > 0.0 && row.leash <= row.radius {
+            problems.push(format!(
+                "stances.ron: {word}'s leash ({}) is not wider than its ring ({}) — \
+                 members would be recalled the instant they answered a threat",
+                row.leash, row.radius
+            ));
+        }
+        if row.retreat_below < 0.0 || row.retreat_below >= 1.0 {
+            problems.push(format!(
+                "stances.ron: {word}'s retreat_below must be 0 (no policy) or a fraction \
+                 in (0,1); got {}",
+                row.retreat_below
+            ));
+        }
+        if row.label.is_empty() || row.description.is_empty() {
+            problems.push(format!("stances.ron: {word} needs a label and a description"));
+        }
+    }
 
     if !problems.is_empty() {
         panic!("{}", report(&problems));
@@ -510,6 +569,7 @@ fn load() -> Tables {
         research_buildings: research_file.buildings,
         research_ladders,
         research_steps: research_file.steps,
+        stances,
     };
 
     problems.extend(check_values(&tables, &defs));
@@ -1247,6 +1307,15 @@ pub fn research_ladder(kind: ResearchKind) -> (&'static str, &'static str, &'sta
         .get(kind as usize)
         .unwrap_or_else(|| panic!("{kind:?} has no ladder in research.ron"));
     (row.id.as_str(), row.label.as_str(), row.description.as_str())
+}
+
+/// The bundle behind one stance word. Reached through `StanceKind::def`.
+pub fn stance_row(kind: StanceKind) -> &'static StanceDef {
+    tables().stances.get(kind as usize).unwrap_or_else(|| {
+        panic!(
+            "{kind:?} has no row in stances.ron — add it to ALL_STANCES and the data file"
+        )
+    })
 }
 
 pub fn research_step(level: u32) -> Option<ResearchStep> {
@@ -2138,6 +2207,15 @@ mod tests {
         .into_iter()
         .map(|row| ItemDef::from(row.def))
         .collect();
+        let stances = slot_by_kind(
+            "stances.ron",
+            parse::<Vec<StanceDef>>("stances.ron", STANCES_RON),
+            &ALL_STANCES,
+            |row| row.kind,
+            |kind| kind as usize,
+            |kind| kind.word().to_string(),
+            &mut problems,
+        );
         assert!(problems.is_empty(), "{problems:?}");
         Tables {
             units,
@@ -2149,6 +2227,7 @@ mod tests {
             research_buildings: research_file.buildings,
             research_ladders,
             research_steps: research_file.steps,
+            stances,
         }
     }
 }

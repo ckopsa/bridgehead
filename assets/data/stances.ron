@@ -1,0 +1,127 @@
+// ---------------------------------------------------------------------------
+// stances.ron — the five fixed doctrine presets, one record per `StanceKind`.
+//
+// A stance is a NAME for a bundle the vocabulary already had: a squad posture,
+// a leash, a retreat threshold and a focus-fire list, installed together by one
+// sentence through the same appliers the four individual verbs use. See
+// docs/AFFORDANCES.md § Stances for why the vocabulary is fixed and
+// engine-defined rather than commander-assembled, and src/shared.rs's
+// `StanceDef` for what each field means.
+//
+// Every variant of `StanceKind` needs exactly one record here; data.rs refuses
+// to start otherwise, naming the missing or duplicated word. The five WORDS are
+// identity and live in the enum — this file is only their numbers, so tuning a
+// stance is an edit here (with `BH_DATA_DIR=assets/data`, not even a rebuild).
+//
+// The shape of the table, read down a column:
+//
+//   * `radius` grows with how far from home the stance operates — 14 for a
+//     turtle ring around your own hall, 30 for ground you are holding out on
+//     the map and cannot cover from the middle.
+//   * `leash` is always a little wider than `radius`, never equal to it. A
+//     leash equal to the ring recalls a defender the instant it steps out to
+//     meet somebody, which reads to a player as units that refuse to fight.
+//     `0` means no leash at all, and that is a setting rather than an omission:
+//     a push that could be recalled is not a push.
+//   * `retreat_below` runs OPPOSITE to commitment. Turtle and harass break off
+//     early because their units are worth more than the trade; push breaks off
+//     late because a squad that flinches at the enemy's ramp has spent the walk
+//     for nothing. This is the number the arena is most likely to argue with.
+//   * `rally` follows the same axis: defensive stances pull wounded back INTO
+//     the ring they are holding (`Anchor`), offensive ones send them out of the
+//     fight entirely (`Base`).
+//   * `priority` is at most three classes. A longer list is not a doctrine, it
+//     is a total order on the game, and combat.rs already has sensible taste
+//     below whatever this says.
+// ---------------------------------------------------------------------------
+[
+    (
+        kind: Turtle,
+        label: "Turtle",
+        description: "Hold home tight; break off early.",
+        posture: Defend,
+        // Tight enough to sit inside a base footprint rather than around it, so
+        // the ring's own members are standing among the buildings they are
+        // there to keep alive.
+        radius: 14.0,
+        leash: 20.0,
+        // The highest threshold of the five bar harass. A turtling army's units
+        // are the only ones it has; trading them evenly is losing.
+        retreat_below: 0.45,
+        rally: Anchor,
+        // Siege first because it is the only thing that beats a turtle on its
+        // own terms, then the fast flankers that get behind the line.
+        priority: [Siege, Cavalry],
+    ),
+    (
+        kind: Stage,
+        label: "Stage",
+        description: "Gather at a forward point and wait.",
+        posture: Defend,
+        // The tightest ring of the five, and deliberately so: staging IS
+        // cohesion. A loose muster point is how a squad arrives at the fight in
+        // packets, which is the death doctrine.rs's `COHESION_SPREAD` exists to
+        // prevent one rung further along.
+        radius: 10.0,
+        leash: 16.0,
+        retreat_below: 0.40,
+        rally: Anchor,
+        // Empty on purpose. A staging squad is not fighting; a focus list would
+        // only make it pick fights on the way to standing still.
+        priority: [],
+    ),
+    (
+        kind: Push,
+        label: "Push",
+        description: "Commit to the objective.",
+        posture: Push,
+        // No ring: `Push` has no radius, and doctrine.rs ignores this field for
+        // it. Zero rather than a plausible number so nobody tunes it expecting
+        // an effect.
+        radius: 0.0,
+        // No leash. A push that gets recalled at a radius is a push that stops
+        // one building short of the thing it walked across the map to kill.
+        leash: 0.0,
+        // The lowest of the five. Committed means committed; a squad that
+        // trickles home at 45% loses the fight and the units both.
+        retreat_below: 0.25,
+        rally: Base,
+        // The backline that decides the fight, in the order it decides it.
+        priority: [Siege, Archer, Hero],
+    ),
+    (
+        kind: Secure,
+        label: "Secure",
+        description: "Hold ground away from home.",
+        posture: Defend,
+        // The widest ring. Securing an expansion means covering a mine, its
+        // workers and the approach, none of which fit in a turtle's 14.
+        radius: 30.0,
+        leash: 38.0,
+        retreat_below: 0.35,
+        rally: Anchor,
+        // What actually takes held ground away from you: siege breaks the
+        // buildings, cavalry gets past the line to the workers.
+        priority: [Siege, Cavalry],
+    ),
+    (
+        kind: Harass,
+        label: "Harass",
+        description: "Hit the soft targets; leave before the trade.",
+        posture: Push,
+        radius: 0.0,
+        // The long leash is the whole stance. It keeps harassers inside the
+        // enemy's economy instead of chasing a baiter home, and combat.rs reads
+        // the same radius when acquiring, so they also stop *looking* at fights
+        // outside it.
+        leash: 44.0,
+        // The highest threshold of the five. A harasser that dies has converted
+        // a cheap unit into a free kill for the defender, which is the exact
+        // trade the stance exists to refuse.
+        retreat_below: 0.55,
+        rally: Base,
+        // Workers first — that is what harassment is for. Siege second: a
+        // catapult caught out of position is worth more than the workers.
+        priority: [Worker, Siege],
+    ),
+]
