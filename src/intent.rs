@@ -241,14 +241,29 @@ type IntentSquads<'w, 's> = Query<'w, 's, &'static SquadId>;
 /// in this file for one caller's benefit.
 type IntentResearching<'w, 's> = Query<'w, 's, &'static Researching>;
 
+/// The three queries late binding may read, as one system param.
+///
+/// Split out of [`IntentWorld`] rather than listed twice because the resolver
+/// has **two** readers now. The compiler is one. The other is copilot.rs's
+/// conflict preview, which has to expand a proposal's `"select"` phrases before
+/// it can tell the human whose orders approving it would overwrite — and the
+/// only honest way to do that is to run the same resolver over the same world.
+/// Two statements of "what a selector may see" would drift; one cannot.
+///
+/// It is read-only, so a second system holding it conflicts with nothing.
+#[derive(SystemParam)]
+pub struct LateBindWorld<'w, 's> {
+    units: IntentUnits<'w, 's>,
+    nodes: IntentNodes<'w, 's>,
+    squads: IntentSquads<'w, 's>,
+}
+
 #[derive(SystemParam)]
 pub struct IntentWorld<'w, 's> {
-    units: IntentUnits<'w, 's>,
+    bind: LateBindWorld<'w, 's>,
     buildings: IntentBuildings<'w, 's>,
     targets: IntentTargets<'w, 's>,
-    nodes: IntentNodes<'w, 's>,
     researching: IntentResearching<'w, 's>,
-    squads: IntentSquads<'w, 's>,
 }
 
 /// The read-only world knowledge a compile consults: money, hero records,
@@ -680,6 +695,32 @@ pub(crate) struct LateBind<'a, 'w, 's> {
     nav: &'a NavGrid,
 }
 
+impl<'a, 'w, 's> LateBind<'a, 'w, 's> {
+    /// The binding a reader outside this file assembles, from the one param
+    /// that says what late binding may see.
+    ///
+    /// The compiler builds its own inline (it already has the pieces
+    /// unbundled); this exists for copilot.rs's conflict preview, which needs
+    /// the identical view of the world so that "what would this proposal
+    /// reach?" is answered by the resolver rather than by a second, narrower
+    /// copy of the selector vocabulary.
+    pub(crate) fn new(
+        me: Team,
+        regions: &'a Regions,
+        nav: &'a NavGrid,
+        world: &'a LateBindWorld<'w, 's>,
+    ) -> Self {
+        LateBind {
+            me,
+            regions,
+            units: &world.units,
+            squads: &world.squads,
+            nodes: &world.nodes,
+            nav,
+        }
+    }
+}
+
 impl LateBind<'_, '_, '_> {
     /// Every living unit of this seat that a selector matches, as ids, **sorted
     /// by entity bits**.
@@ -805,7 +846,17 @@ fn unit_selector(verb: &str, raw: &str) -> Result<Selector, String> {
 /// that makes r21's "move 0 units" inexpressible: the only way to order nobody
 /// used to be to name nobody, and now naming a role that is currently empty
 /// teaches instead of firing.
-fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, String> {
+///
+/// **Two callers, one of which is not applying anything.** The compiler calls
+/// this to *execute* a sentence; copilot.rs's conflict preview calls it to
+/// *read* one, so that the human reviewing `"select":"all army"` is told what
+/// that reaches instead of being told it reaches nothing. The preview submits
+/// nothing and writes nothing back — this function keeps no resolved id
+/// anywhere, so a second call is only a second question asked of the same
+/// world. The two calls are separated in time (preview at arrival, apply on
+/// approval) and may legitimately disagree; saying so is the preview's job,
+/// not this function's.
+pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, String> {
     let me = bind.me;
     let regions = bind.regions;
     /// The unit channel. `select` outranks `units` on the same rule that makes
@@ -1302,13 +1353,16 @@ fn compile_intent(
     // Named locally so the arms below read exactly as they did when this was
     // one interface's private applier.
     let IntentWorld {
-        units,
+        bind,
         buildings,
         targets,
-        nodes,
         researching,
-        squads,
     } = world;
+    let LateBindWorld {
+        units,
+        nodes,
+        squads,
+    } = bind;
     // Names become coordinates and roles become rosters here and nowhere else.
     // Everything below this line sees the language it has always seen.
     let intent = match resolve_places(

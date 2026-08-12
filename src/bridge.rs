@@ -900,7 +900,10 @@ struct ProposalOut {
     /// the human is reading off the HUD and the log will write afterwards.
     sentences: Vec<String>,
     /// What the human was told this would disturb: their squads, their recent
-    /// orders. Empty when it steps on nothing.
+    /// orders, and — when the batch names a role rather than ids — how many
+    /// units that role reached when the proposal arrived. Empty when it steps
+    /// on nothing. Every line is dated `as of now`, because the scope was
+    /// measured at arrival and approval resolves it again.
     conflicts: Vec<String>,
     /// `"routine"` or `"urgent"` — as sent, echoed back so a seat can see that
     /// its urgency was accepted rather than assume it.

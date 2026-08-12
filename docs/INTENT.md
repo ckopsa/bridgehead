@@ -1342,6 +1342,43 @@ is arguing about.
 A partner who re-tasks your push is a partner. A partner who re-tasks your push
 *invisibly* is a bug you spend the next minute misdiagnosing.
 
+##### Roles are expanded for the readout, and the readout is dated
+
+*`wc3clone-brq`.* Selectors briefly reintroduced the invisibility they were
+meant to remove. A proposal written as `{"type":"move","select":"all army",…}`
+carries a *phrase*, and a phrase names no ids, so the scoping the tags are
+built from found nobody and the human was shown an empty conflict list under a
+batch that was about to take the whole army — the worst possible reading, since
+"no tags" is exactly how "this disturbs nothing" looks.
+
+The fix was **not** to teach copilot.rs the selector vocabulary. The preview
+runs the batch through `intent::resolve_places` — the same resolver, the same
+`LateBind` view of the world, the same empty-match refusal — and tags the
+*resolved* copy. A second reader was cheaper than a second vocabulary, and it
+cannot drift by construction: there is one statement of what a selector may
+see (`intent::LateBindWorld`) and both readers hold it.
+
+Two lines came out of doing it honestly:
+
+```
+ ! the roles named reach 7 unit(s) as of now
+ ! as of now this would refuse: move: 'all army' matches none of your units
+   right now — nothing was ordered
+```
+
+The first is the *size* of what is being agreed to, which the sentence alone
+never gave — `move all army to north-pass` reads identically at two units and
+at twenty. The second is the empty case, which must be said out loud for the
+same reason the compiler refuses it out loud rather than moving nobody.
+
+Both are dated, and so is the whole list by implication. **The preview resolves
+at arrival; approval resolves again, up to 20 seconds later, and what lands is
+the second answer.** A list of ids cannot change meaning in that window; a
+phrase can — the army takes casualties, a worker finishes a barracks, a unit
+joins squad 2 — so `as of now` is the difference between advice and a promise
+the engine never made. Nothing is written back at preview time, which is what
+keeps the two resolutions independent rather than one caching the other.
+
 #### Answering back: a veto has a reason
 
 *`wc3clone-3f7`.* The first cut of this loop was one-sided in a way that is
@@ -2295,6 +2332,12 @@ language it has always seen.
 siblings. Same function, same moment, same precedence rule; see "Selectors:
 roles, on the same footing as places" below for why they had to share one pass
 rather than get one each.)*
+
+*(One resolution point, **two readers**. copilot.rs's conflict preview calls the
+same function to ask what a proposal would reach, submitting nothing and keeping
+nothing — see "Roles are expanded for the readout" above. A second reader is not
+a second path: the rule still has exactly one implementation, and the preview's
+whole honesty argument rests on it being the implementation approval will use.)*
 
 The alternative — each verb resolving its own place — is how you get `defend`
 accepting a name `push` does not, and two spellings of the unknown-name error.

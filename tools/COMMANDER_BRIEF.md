@@ -1288,6 +1288,17 @@ urgent, and your partner will notice within a minute.
    `re-tasks squad 1 (defend)` or `overrides your move on 4 unit(s), 6s ago`.
    Those get vetoed the most. If you are about to write one, say why in the
    note — you are asking them to abandon something they chose.
+
+   **A `"select"` phrase is expanded for that readout**, so
+   `{"type":"move","select":"all army",…}` is weighed as the units it currently
+   names, and your partner also sees `the roles named reach 7 unit(s) as of
+   now` — the size of what they are agreeing to, which the sentence alone does
+   not give. If the phrase currently matches nobody they are told that instead
+   (`as of now this would refuse: …`), which is your cue that the proposal is
+   worth withdrawing rather than waiting on. Every tag is dated `as of now`
+   because the scope is measured when your proposal arrives and resolved again
+   when your partner approves it; those are up to 20 seconds apart, and what
+   lands is the second answer.
 7. **Doctrine is how you stay useful between proposals.** Set retreat, priority
    and a squad posture early and your army fights well while your partner is
    answering something else. This is the single biggest difference between a
