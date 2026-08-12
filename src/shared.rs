@@ -8723,6 +8723,39 @@ impl Intent {
                 _ => "(unspecified)".to_string(),
             }
         }
+        /// The same, for the **one** place-taking field in the vocabulary that
+        /// has a default: a stance's anchor. Omit it and `compile_intent`
+        /// anchors the stance on the issuing team's own base, which is what
+        /// `turtle` means with no argument — so `(unspecified)` was a sentence
+        /// describing a refusal for an intent that was not refused, and it
+        /// travelled to three readers (the intent log, `plans[].current` and
+        /// the seat journal) saying "defends (unspecified) within 14" about a
+        /// squad that was, in fact, defending home.
+        ///
+        /// **"our base" is the right words and not a paraphrase.** It is a
+        /// built-in region name — `builtin_places` mints it per seat, pointing
+        /// at that seat's own hall — so the defaulted sentence is byte-identical
+        /// to the sentence a commander who spelled `"target": "our base"` gets,
+        /// which is what makes the log comparable across the two spellings.
+        /// Rendering the coordinates instead would have frozen a hall position
+        /// into the record; tools/intent_compile.py's `stance_anchor` declines
+        /// to emit an anchor key for exactly that reason.
+        ///
+        /// The fix is here rather than in the compiler because the sentence is
+        /// rendered from the intent **as it was written** — apply_intents logs
+        /// `submission.intent` and hands `compile_intent` a *clone*, and a plan
+        /// step is stored as authored — so a default filled in downstream
+        /// reaches none of the three readers.
+        fn anchor(x: &Option<f32>, z: &Option<f32>, region: &Option<String>) -> String {
+            match (region, x, z) {
+                // Mirrors `intent::compile_intent`'s `resolved_point`, which
+                // takes the anchor only when BOTH coordinates arrived and
+                // falls back to `me.base_pos()` otherwise. A half-given anchor
+                // is a defaulted anchor there, so it is one here too.
+                (None, Some(_), Some(_)) | (Some(_), _, _) => place(x, z, region),
+                _ => "our base".to_string(),
+            }
+        }
         /// How a sentence names the units it is about. **A selector is spoken
         /// as its phrase**, for the same reason a region is spoken as its name:
         /// the replay line for a hero-save rule should read "my hero falls back
@@ -9018,13 +9051,16 @@ impl Intent {
                 match parse_stance(stance) {
                     Some(kind) => {
                         let def = kind.def();
+                        // `anchor`, not `place`: this is the field with a
+                        // default, and it is the only one in the vocabulary.
+                        let where_ = anchor(x, z, region);
                         let mut parts: Vec<String> = vec![match def.posture {
                             StancePosture::Defend => {
-                                format!("defends {} within {:.0}", place(x, z, region), def.radius)
+                                format!("defends {where_} within {:.0}", def.radius)
                             }
-                            StancePosture::Push => format!("pushes to {}", place(x, z, region)),
+                            StancePosture::Push => format!("pushes to {where_}"),
                             StancePosture::Forage => {
-                                format!("forages, mustering at {}", place(x, z, region))
+                                format!("forages, mustering at {where_}")
                             }
                         }];
                         if def.leash > 0.0 {
@@ -12704,6 +12740,86 @@ mod tests {
         .why();
         assert_eq!(logged, on_the_unit);
         assert_eq!(logged, "order:move by bridge t=22");
+    }
+
+    /// **A stance with no anchor is anchored on home, and says so**
+    /// (wc3clone-p91).
+    ///
+    /// `compile_intent` has always defaulted an omitted stance anchor to the
+    /// issuing team's own base — it is what `turtle` means with no argument —
+    /// but the sentence rendered `(unspecified)`, which is the wording reserved
+    /// for a sentence that names no ground *and is about to be refused*. Three
+    /// readers were told a legal order was incoherent: the intent log,
+    /// `plans[].current`, and the seat journal a co-commander reads.
+    ///
+    /// The three spellings below are the whole claim. Anchor omitted and anchor
+    /// spelled `"our base"` produce the **identical** sentence, because "our
+    /// base" is a built-in region name and not a paraphrase of one; an explicit
+    /// coordinate still reads as a coordinate.
+    #[test]
+    fn an_omitted_stance_anchor_reads_as_home_and_not_as_a_refusal() {
+        let defaulted = Intent::Stance {
+            squad: 1,
+            stance: "turtle".to_string(),
+            x: None,
+            z: None,
+            region: None,
+        };
+        let named = Intent::Stance {
+            squad: 1,
+            stance: "turtle".to_string(),
+            x: None,
+            z: None,
+            region: Some("our base".to_string()),
+        };
+        let radius = StanceKind::Turtle.def().radius;
+        assert_eq!(
+            defaulted.sentence(),
+            named.sentence(),
+            "the default IS the built-in region, so the two spellings are one sentence"
+        );
+        assert!(
+            defaulted
+                .sentence()
+                .contains(&format!("defends our base within {radius:.0}")),
+            "{}",
+            defaulted.sentence()
+        );
+        assert!(
+            !defaulted.sentence().contains("(unspecified)"),
+            "the order was not refused and the log must not read as though it was: {}",
+            defaulted.sentence()
+        );
+
+        // A given anchor is untouched — this is a default, not an override.
+        let placed = Intent::Stance {
+            squad: 2,
+            stance: "push".to_string(),
+            x: Some(12.0),
+            z: Some(-8.0),
+            region: None,
+        };
+        assert!(
+            placed.sentence().contains("pushes to (12.0, -8.0)"),
+            "{}",
+            placed.sentence()
+        );
+
+        // And a half-given one defaults, because `resolved_point` takes the
+        // anchor only when both coordinates arrived. The sentence tracks the
+        // compiler rather than guessing at the missing half.
+        let half = Intent::Stance {
+            squad: 3,
+            stance: "harass".to_string(),
+            x: Some(12.0),
+            z: None,
+            region: None,
+        };
+        assert!(
+            half.sentence().contains("pushes to our base"),
+            "{}",
+            half.sentence()
+        );
     }
 
     /// The template rung: a unit trained by a building that carries standing
