@@ -400,16 +400,30 @@ def running_default(props):
     the reflex it is reporting has already acted and that reflex is the part of
     silence a commander most needs to know about; the standing stances follow,
     because they go on being true underneath it.
+
+    ...but only the ones the alarm did not already name. `income_collapse`'s
+    running default is a full sentence about what every squad is doing, so the
+    line read "squad 0 (15 units) holds defend near our base; …; squad 0 keeps
+    defend near our base" — the same squad twice, in two vocabularies, inside
+    one line a commander is meant to read at a glance. Where the two disagree
+    the ALARM's clause wins, because it is the engine's own account of what the
+    reflex left that squad doing.
     """
     parts = [a["default"] for a in props.get("alarms") or [] if a.get("default")]
-    stances = [
-        "{} keeps {}".format(
-            "squad {}".format(sq["id"]) if sq["id"] is not None else "loose army",
-            sq["stance_phrase"],
-        )
-        for sq in props["squads"]
-    ]
-    parts += stances or ["no squad has a standing posture"]
+    spoken_for = " ".join(parts).lower()
+    stances = []
+    for sq in props["squads"]:
+        who = "squad {}".format(sq["id"]) if sq["id"] is not None else "loose army"
+        # `\b` on both ends so "squad 1" does not swallow "squad 10".
+        if parts and re.search(r"\b{}\b".format(re.escape(who)), spoken_for):
+            continue
+        stances.append("{} keeps {}".format(who, sq["stance_phrase"]))
+    if props["squads"]:
+        # Every squad deduped away is not "no squad has a posture" — the alarm
+        # just said what all of them are doing.
+        parts += stances
+    else:
+        parts.append("no squad has a standing posture")
     queued = props["production"]["queued"]
     idle = props["production"]["idle"]
     if queued:

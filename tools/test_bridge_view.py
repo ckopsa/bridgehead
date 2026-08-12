@@ -50,6 +50,9 @@ FIX = HERE / "fixtures"
 LIVE = [FIX / "digest_open_mid.json", FIX / "digest_crossings_mid.json"]
 #: t=8s: five workers, no army, nothing scouted.
 EARLY = FIX / "digest_open_early.json"
+#: t=388s with an `income_collapse` alarm ringing — the shipped `AlarmOut`
+#: shape, whose `running_default` names every standing squad by number.
+ALARM = FIX / "doc_open_alarm.json"
 #: The pre-`intel`, pre-`my_race` snapshot this repo has always carried.
 LEGACY = FIX / "legacy_crossings.json"
 
@@ -330,6 +333,44 @@ def test_an_alarms_running_default_leads_the_default_line():
     assert "squad 0 keeps defend" in props["default"]
     line = [ln for ln in bridge_view.render_digest(props) if ln.startswith("DEFAULT")][0]
     assert "home-guard recalls squad 1" in line
+
+
+def test_a_squad_the_alarm_already_named_is_not_named_twice():
+    """`income_collapse`'s running default is a full sentence about what every
+    squad is doing, so the DEFAULT line used to say "squad 0 (15 units) holds
+    defend near our base; …; squad 0 keeps defend near our base" — the same
+    squad twice, in two vocabularies, inside one line meant to be read at a
+    glance.
+
+    The ALARM's clause is the one that survives: it is the engine's account of
+    what the reflex left that squad doing, and it is the half a commander
+    cannot reconstruct.
+    """
+    props = bridge_view.digest(load(ALARM))
+    default = props["default"]
+    assert [sq["id"] for sq in props["squads"]] == [0, 1], "fixture has both squads"
+    assert "squad 0 (15 units) holds" in default, "the alarm's own clause stays"
+    assert "squad 0 keeps" not in default and "squad 1 keeps" not in default
+    # Not a blanket suppression: an alarm that names ONE squad leaves the
+    # others to be reported the ordinary way.
+    s = load(ALARM)
+    s["alarms"] = [{"text": "base under attack", "default": "home-guard recalls squad 1"}]
+    default = bridge_view.digest(s)["default"]
+    assert "squad 1 keeps" not in default
+    assert "squad 0 keeps" in default
+
+
+def test_a_squad_number_is_matched_whole_when_deduping():
+    """"squad 1" must not swallow "squad 10" — a ten-squad late game is exactly
+    when the DEFAULT line matters most."""
+    s = load(ALARM)
+    s["squads"][1]["id"] = 10
+    for u in s["units"]:
+        if u.get("squad") == 1:
+            u["squad"] = 10
+    s["alarms"] = [{"text": "base under attack", "default": "home-guard recalls squad 1"}]
+    default = bridge_view.digest(s)["default"]
+    assert "squad 10 keeps" in default
 
 
 # -- the running default -----------------------------------------------------
