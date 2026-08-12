@@ -825,7 +825,10 @@ fn ingest_wire(
         let id = copilot.next_id;
         copilot.next_id += 1;
         let sentences: Vec<String> = intents.iter().map(Intent::sentence).collect();
-        let conflicts = conflict_tags(
+        let Preview {
+            tags: conflicts,
+            pos,
+        } = conflict_tags(
             team,
             &intents,
             &squad_orders,
@@ -833,9 +836,6 @@ fn ingest_wire(
             now,
             &LateBind::new(team, &regions, &nav, &bind_world),
         );
-        let pos = intents
-            .iter()
-            .find_map(|i| intent_pos(i, team, &regions));
         let note = if wrapper.note.trim().is_empty() {
             "(no reason given)".to_string()
         } else {
@@ -894,6 +894,18 @@ enum Scope {
     Nothing,
 }
 
+/// Everything one pass over a proposal's resolved commands learns: what the
+/// human is told it would step on, and where on the map it is about.
+///
+/// One return value rather than two functions because there is one resolution.
+/// `intent_pos` used to be its own pass over the RAW intents with its own copy
+/// of the region-wins precedence, so a proposal could in principle be described
+/// by one reading of a place name and flown to by another.
+struct Preview {
+    tags: Vec<String>,
+    pos: Option<Vec3>,
+}
+
 fn scope_of(intent: &Intent) -> Scope {
     match intent {
         Intent::Move { units, .. }
@@ -917,53 +929,43 @@ fn scope_of(intent: &Intent) -> Scope {
 
 /// Somewhere on the map a proposal is about, so `[Space]` can go look at it.
 ///
-/// A proposal is held UNRESOLVED — it has not been through the compiler and may
-/// never be — so a partner that proposed "push to north-pass" carries a name
-/// here rather than coordinates. `regions` is the reviewing seat's own
-/// vocabulary, which is the right one to look the name up in: the two
-/// co-commanders share a team, and therefore share its regions.
-fn intent_pos(intent: &Intent, team: Team, regions: &Regions) -> Option<Vec3> {
-    /// Coordinates if given, else the named region's centre. Same precedence
-    /// the compiler's `resolve_places` uses — region wins — so the camera flies
-    /// to the ground the order would actually act on.
-    fn spot(
-        x: &Option<f32>,
-        z: &Option<f32>,
-        region: &Option<String>,
-        team: Team,
-        regions: &Regions,
-    ) -> Option<(f32, f32)> {
-        if let Some(name) = region {
-            let found = regions.find(team, name)?;
-            return Some((found.center.x, found.center.z));
-        }
-        match (x, z) {
-            (Some(x), Some(z)) => Some((*x, *z)),
-            _ => None,
-        }
-    }
-    let (x, z) = match intent {
-        Intent::Move { x, z, region, .. }
-        | Intent::AttackMove { x, z, region, .. }
-        | Intent::Build { x, z, region, .. }
-        | Intent::Leash { x, z, region, .. }
-        | Intent::Retreat { x, z, region, .. }
-        // A stance whose anchor was omitted means the team's base, which
-        // `spot` reports as "no place" — correct here: the camera has nothing
-        // to fly to that the reviewer is not already looking at.
-        | Intent::Stance { x, z, region, .. } => spot(x, z, region, team, regions)?,
+/// **It reads a RESOLVED intent**, and that is the whole of this function's
+/// design. It used to take the raw intent plus the seat's `Regions` and
+/// re-implement `resolve_places`' region-wins precedence in a private `spot()`
+/// — a second copy of the one rule that says what a place name means, living
+/// two hundred lines from the first copy of the same claim in `scope_of`'s doc
+/// about why it must not do that. `conflict_tags` already runs every command in
+/// the batch through the one resolver, and a resolved intent carries `x`/`z`
+/// filled in from whatever region it named, so the coordinates are simply there
+/// to be read. One resolver, one precedence, no chance of disagreeing about
+/// where a proposal is.
+///
+/// An intent whose place channel resolved to nothing — a `stance` with no
+/// anchor, which means the team's own base — reports no place, and correctly:
+/// the camera has nothing to fly to that the reviewer is not already looking at.
+fn intent_pos(resolved: &Intent) -> Option<Vec3> {
+    let (x, z) = match resolved {
+        Intent::Move { x, z, .. }
+        | Intent::AttackMove { x, z, .. }
+        | Intent::Build { x, z, .. }
+        | Intent::Leash { x, z, .. }
+        | Intent::Retreat { x, z, .. }
+        | Intent::Stance { x, z, .. } => (x, z),
         Intent::Posture {
             posture: Some(posture),
             ..
         } => match posture {
-            PostureIntent::Defend { x, z, region, .. }
-            | PostureIntent::Push { x, z, region }
-            | PostureIntent::Forage { x, z, region } => spot(x, z, region, team, regions)?,
+            PostureIntent::Defend { x, z, .. }
+            | PostureIntent::Push { x, z, .. }
+            | PostureIntent::Forage { x, z, .. } => (x, z),
             PostureIntent::Escort { .. } => return None,
         },
         _ => return None,
     };
-    Some(Vec3::new(x, 0.0, z))
+    match (x, z) {
+        (Some(x), Some(z)) => Some(Vec3::new(*x, 0.0, *z)),
+        _ => None,
+    }
 }
 
 /// What this batch would step on, phrased in the human's own terms.
@@ -1005,8 +1007,12 @@ fn conflict_tags(
     units: &CopilotUnits,
     now: f32,
     bind: &LateBind,
-) -> Vec<String> {
+) -> Preview {
     let mut tags: Vec<String> = Vec::new();
+    // The first place in the batch that resolves to real ground, for `[Space]`.
+    // Computed HERE rather than by a second pass over the raw intents, because
+    // this loop is already holding the resolved copy — see `intent_pos`.
+    let mut pos: Option<Vec3> = None;
     let mut squads_touched: Vec<u8> = Vec::new();
     // Human orders this batch would overwrite: verb -> how many units, and the
     // freshest one, because "4 seconds ago" is the part that stings.
@@ -1046,6 +1052,9 @@ fn conflict_tags(
         // Everything below weighs the RESOLVED batch, which is the one the
         // human would be approving.
         let intent = &resolved;
+        if pos.is_none() {
+            pos = intent_pos(intent);
+        }
         match scope {
             Scope::Squad(id) => {
                 if let Some(old) = squad_orders.0.get(&(me, id)) {
@@ -1138,7 +1147,7 @@ fn conflict_tags(
             format!("overrides your {verb} on {n} unit(s), {age:.0}s ago"),
         );
     }
-    tags
+    Preview { tags, pos }
 }
 
 fn push_unique(tags: &mut Vec<String>, tag: String) {
@@ -2217,28 +2226,63 @@ mod tests {
 
     /// `[Space]` should be able to send the camera to what a proposal is
     /// about — but only when the batch actually names a place.
+    ///
+    /// The input is a RESOLVED intent, which is why there is no `Regions` here
+    /// any more: a region name has already become coordinates by the time this
+    /// is asked, through the one resolver. A `push` still carrying a bare name
+    /// and no `x`/`z` is one that failed to resolve, and reports no place.
     #[test]
     fn a_proposal_about_ground_carries_that_ground() {
         let push = Intent::Posture {
             id: 1,
             posture: Some(PostureIntent::Push { x: Some(12.0), z: Some(-34.0), region: None }),
         };
+        assert_eq!(intent_pos(&push), Some(Vec3::new(12.0, 0.0, -34.0)));
         assert_eq!(
-            intent_pos(&push, Team::Human, &Regions::default()),
-            Some(Vec3::new(12.0, 0.0, -34.0))
-        );
-        assert_eq!(
-            intent_pos(
-                &Intent::Train {
-                    building: Some(1),
-                    unit: "Footman".to_string(),
-                    select: None,
-                },
-                Team::Human,
-                &Regions::default()
-            ),
+            intent_pos(&Intent::Train {
+                building: Some(1),
+                unit: "Footman".to_string(),
+                select: None,
+            }),
             None
         );
+        assert_eq!(
+            intent_pos(&Intent::Posture {
+                id: 1,
+                posture: Some(PostureIntent::Push {
+                    x: None,
+                    z: None,
+                    region: Some("north-pass".to_string()),
+                }),
+            }),
+            None,
+            "an unresolved name is not a place — the resolver fills x/z or refuses"
+        );
+    }
+
+    /// The other half of the same change: a proposal that names its ground by
+    /// REGION still flies the camera there, because the position comes off the
+    /// resolved copy `conflict_tags` already computes. Before this the private
+    /// `spot()` looked the name up itself, which is where a second reading of
+    /// "what does north-pass mean" could have grown.
+    #[test]
+    fn a_proposal_that_names_a_region_still_carries_its_ground() {
+        let mut app = co_app();
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .set(
+                Team::Human,
+                Region::new("north-pass", Vec3::new(-60.0, 0.0, 60.0), 20.0),
+            )
+            .expect("the test's own region is legal");
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"take the pass","commands":[
+                 {"type":"posture","id":1,
+                  "posture":{"type":"push","region":"north-pass"}}]}"#,
+        );
+        let pos = pending(&app)[0].pos.expect("a named place is a place");
+        assert_eq!(pos, Vec3::new(-60.0, 0.0, 60.0));
     }
 
     // -----------------------------------------------------------------------
