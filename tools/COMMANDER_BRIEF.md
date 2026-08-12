@@ -346,7 +346,7 @@ Two more phrases answer "which one", not "which units":
 | phrase | where | means |
 |---|---|---|
 | `"nearest tree"` / `"nearest mine"` | `harvest`'s `"target_select"` | the nearest live node of that kind to the workers you are sending |
-| `"nearest legal site"` | `build`'s `"site"` | move the footprint to the nearest legal one within 15 of the point you named, instead of refusing |
+| `"nearest legal site"` | `build`'s `"site"` | move the footprint to the nearest legal one within 15 of the point you named — preferring ground clear of the haul lanes between your halls and the mines they work, so your own base cannot wall in its miners — instead of refusing |
 
 And a fourth channel names a **building**, for the six verbs that act on one —
 `train`, `template`, `rally`, `cancel`, `upgrade`, `research`. Send `"select"`
