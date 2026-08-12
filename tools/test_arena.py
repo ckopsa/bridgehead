@@ -248,6 +248,203 @@ def test_a_null_ready_wait_must_still_be_declared():
     assert any("not listed in `unknown`" in m for m in arena.validate(rec))
 
 
+# ---------------------------------------------------------------------------
+# Autopilot: the spans, the schema, and the flag
+# ---------------------------------------------------------------------------
+
+
+def intent(t, team, on, ok=True):
+    """One `autopilot` line as `intent.rs` writes it."""
+    return {"t": t, "team": team, "source": "bridge", "verb": "autopilot",
+            "sentence": "hand the faction to the scripted AI", "ok": ok,
+            "intent": {"type": "autopilot", "on": on}}
+
+
+def test_a_closed_span_is_the_two_intents_that_bound_it():
+    """r33, exactly: engaged at t=189.3, took the faction back at t=450.7."""
+    spans = arena.autopilot_spans(
+        [intent(189.3, "Claude", True), intent(450.7, "Claude", False)], end_t=460.5
+    )
+    assert spans == {"Claude": [{"from": 189.3, "to": 450.7}]}
+    assert arena.autopilot_secs(spans["Claude"]) == 261.4
+
+
+def test_a_span_nobody_closed_runs_to_the_end_of_the_match():
+    """r35: engaged at t=316 and never released, winning at t=472.8. Marked
+    `to_end` so an inferred close cannot be misread as a commander taking the
+    faction back."""
+    spans = arena.autopilot_spans([intent(316.0, "Human", True)], end_t=472.8)
+    assert spans == {"Human": [{"from": 316.0, "to": 472.8, "to_end": True}]}
+    assert arena.autopilot_secs(spans["Human"]) == 156.8
+
+
+def test_a_refused_handover_is_not_a_span():
+    """`BH_NO_AUTOPILOT=1` logs the attempt with ok:false and changes nothing;
+    counting it would put ai.rs time on a seat that played the whole match."""
+    assert arena.autopilot_spans([intent(100.0, "Claude", True, ok=False)], end_t=300) == {}
+
+
+def test_engaging_twice_is_one_span_and_a_stray_release_is_nothing():
+    """`set_autopilot` is idempotent, so the log's edges are the truth and a
+    doubled verb must not open a second span or double the total."""
+    spans = arena.autopilot_spans(
+        [intent(10.0, "Claude", False),   # never engaged: nothing to release
+         intent(20.0, "Claude", True),
+         intent(30.0, "Claude", True),    # already on
+         intent(50.0, "Claude", False)],
+        end_t=100.0,
+    )
+    assert spans == {"Claude": [{"from": 20.0, "to": 50.0}]}
+
+
+def test_two_seats_are_counted_apart():
+    spans = arena.autopilot_spans(
+        [intent(10.0, "Claude", True), intent(20.0, "Human", True),
+         intent(30.0, "Claude", False)],
+        end_t=100.0,
+    )
+    assert spans["Claude"] == [{"from": 10.0, "to": 30.0}]
+    assert spans["Human"] == [{"from": 20.0, "to": 100.0, "to_end": True}]
+
+
+def test_without_a_duration_the_span_closes_at_the_last_clock_in_the_log():
+    """A floor on the delegation, never an invention past it — the same rule
+    `read_log`'s `last_status_t` follows."""
+    spans = arena.autopilot_spans(
+        [intent(10.0, "Claude", True), {"t": 42.0, "team": "Claude", "verb": "move", "ok": True}]
+    )
+    assert spans == {"Claude": [{"from": 10.0, "to": 42.0, "to_end": True}]}
+
+
+def test_a_seat_records_how_long_the_scripted_ai_played_for_it():
+    rec = good()
+    rec["seats"][0]["autopilot_secs"] = 261.4
+    rec["seats"][0]["autopilot_spans"] = [{"from": 189.3, "to": 450.7}]
+    rec["seats"][1]["autopilot_secs"] = 0.0
+    assert arena.validate(rec) == [], arena.validate(rec)
+    # A measured zero is a claim, not a gap: nothing lands in `unknown`.
+    assert arena.null_paths(rec) == rec["unknown"]
+
+
+def test_spans_that_do_not_add_up_to_the_total_are_caught():
+    """The stamp and the summary read the same record; if they can disagree,
+    the ledger has two answers for one round."""
+    rec = good()
+    rec["seats"][0]["autopilot_secs"] = 60.0
+    rec["seats"][0]["autopilot_spans"] = [{"from": 100.0, "to": 400.0}]
+    assert any("add up to" in m for m in arena.validate(rec))
+
+
+def test_a_malformed_span_is_refused():
+    rec = good()
+    rec["seats"][0]["autopilot_secs"] = 0.0
+    rec["seats"][0]["autopilot_spans"] = []
+    assert any("non-empty list" in m for m in arena.validate(rec))
+
+    rec = good()
+    rec["seats"][0]["autopilot_secs"] = 10.0
+    rec["seats"][0]["autopilot_spans"] = [{"from": 20.0, "to": 10.0}]
+    assert any("ends before it starts" in m for m in arena.validate(rec))
+
+    rec = good()
+    rec["seats"][0]["autopilot_secs"] = 10.0
+    rec["seats"][0]["autopilot_spans"] = [{"from": 0.0, "to": 10.0, "why": "raid"}]
+    assert any("unknown keys" in m for m in arena.validate(rec))
+
+    rec = good()
+    rec["seats"][0]["autopilot_spans"] = [{"from": 0.0, "to": 10.0}]
+    assert any("without autopilot_secs" in m for m in arena.validate(rec))
+
+
+def test_a_scripted_seat_cannot_carry_autopilot_time():
+    """ai.rs is already playing that faction — there is no handover to record,
+    and stamping one would put a scripted round in a delegation comparison."""
+    rec = good()
+    rec["seats"][0]["kind"] = "scripted"
+    rec["seats"][0]["persona"] = "scripted"
+    rec["seats"][0]["autopilot_secs"] = 0.0
+    assert any("cannot delegate" in m for m in arena.validate(rec))
+
+
+def test_an_unmeasured_round_is_not_a_round_measured_at_zero():
+    rec = good()
+    assert not arena.autopilot_measured(rec)
+    assert arena.autopilot_cell(rec) == ""
+    rec["seats"][0]["autopilot_secs"] = 0.0
+    rec["seats"][1]["autopilot_secs"] = 0.0
+    assert arena.autopilot_measured(rec)
+    assert arena.autopilot_cell(rec) == "none"
+
+
+def test_a_win_the_winner_spent_delegating_is_flagged_in_the_round_table():
+    """The bead's whole complaint: r33 and r35 read as unassisted victories."""
+    rec = good()                       # winner is Claude, on bridge/red
+    rec["seats"][0]["autopilot_secs"] = 261.4
+    rec["seats"][1]["autopilot_secs"] = 0.0
+    assert arena.winner_delegated(rec)
+    assert "red 261s" in arena.autopilot_cell(rec)
+    assert "*" in arena.one_line(rec)
+    # The loser delegating is recorded but does not qualify the win.
+    rec["seats"][0]["autopilot_secs"] = 0.0
+    rec["seats"][1]["autopilot_secs"] = 99.0
+    assert not arena.winner_delegated(rec)
+    assert "*" not in arena.one_line(rec)
+
+
+def test_the_series_line_separates_unmeasured_rounds_from_clean_ones():
+    clean, dirty = good(), good()
+    dirty["id"] = "r98"
+    for seat in clean["seats"]:
+        seat["autopilot_secs"] = 0.0
+    dirty["seats"][0]["autopilot_secs"] = 261.4
+    dirty["seats"][1]["autopilot_secs"] = 0.0
+    line = arena.autopilot_summary([good(), clean, dirty])
+    assert "1 of 2 measured rounds (3 on file)" in line
+    assert "r98" in line and "r99" not in line.split("\n")[0]
+    assert arena.autopilot_summary([good()]) == "autopilot: unmeasured on every round on file"
+    assert "none, across 1/1" in arena.autopilot_summary([clean])
+
+
+def test_the_ledgers_own_autopilot_rounds_are_the_ones_ladder2_names():
+    """arena/LADDER2.md's addendum says two of four Haiku seats delegated and
+    both ended on the winning side. That claim is now in the ledger as numbers,
+    and this is the test that keeps the two in step."""
+    rounds = arena.load(LEDGER)
+    used = [r["id"] for r in rounds if arena.delegating_seats(r)]
+    assert used == ["r33", "r35"], used
+    assert all(arena.winner_delegated(r) for r in rounds if r["id"] in used)
+    by_id = {r["id"]: r for r in rounds}
+    red = [s for s in by_id["r33"]["seats"] if s["seat"] == "bridge/red"][0]
+    blue = [s for s in by_id["r35"]["seats"] if s["seat"] == "bridge/blue"][0]
+    assert red["autopilot_secs"] == 261.4 and red["autopilot_spans"][0]["from"] == 189.3
+    assert blue["autopilot_secs"] == 156.8 and blue["autopilot_spans"][0]["to_end"] is True
+
+
+def test_reading_an_intent_log_from_an_offset_skips_the_earlier_match():
+    """The live log is append-only across matches, so a round that read it
+    whole would inherit the previous round's delegation."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "intent_log.jsonl"
+        first = json.dumps(intent(50.0, "Claude", True)) + "\n"
+        path.write_text(first + json.dumps(intent(60.0, "Human", True)) + "\n")
+        assert len(arena.read_intent_log(path)) == 2
+        later = arena.read_intent_log(path, len(first.encode()))
+        assert [r["team"] for r in later] == ["Human"]
+        assert arena.read_intent_log(Path(tmp) / "nope.jsonl") == []
+
+
+def test_a_session_header_and_a_torn_line_are_both_skipped():
+    """A log truncated by a crash is still evidence about what it did write."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "intent_log.jsonl"
+        path.write_text(
+            '{"wall_ms":1,"session":"wc3clone-intent-log-v1","note":"..."}\n'
+            + json.dumps(intent(10.0, "Claude", True)) + "\n"
+            + '{"t":20.0,"team":"Claude","verb":"mov'
+        )
+        assert [r["verb"] for r in arena.read_intent_log(path)] == ["autopilot"]
+
+
 def test_the_unknown_list_cannot_itself_be_unknown():
     """`unknown` is excluded from the scan, or a null inside it would demand
     that it list itself."""

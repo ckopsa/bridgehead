@@ -8,6 +8,7 @@
     tools/arena.py lessons --grep tower      # what the players actually learned
     tools/arena.py validate                  # schema + honesty check
     tools/arena.py add-aar r11 --seat bridge/red --path arena/r11/red-aar.md
+    tools/arena.py autopilot r33 --write     # stamp delegation from the intent log
 
 WHY A LEDGER AND NOT A CHANGELOG
 --------------------------------
@@ -117,6 +118,148 @@ TOP_LEVEL = (
     "lessons",
     "unknown",
 )
+
+#: The intent-log verb that hands a faction to the scripted AI, and the file it
+#: is read out of. `autopilot` is a documented verb ("emergency only",
+#: docs/INTENT.md) and therefore legal — but a round's verdict stops measuring
+#: the commander the moment it engages, and rounds r33 and r35 read as Haiku
+#: victories with nothing in the record saying so.
+AUTOPILOT_VERB = "autopilot"
+INTENT_LOG = "bridge/intent_log.jsonl"
+
+
+def read_intent_log(path: Path, start: int = 0) -> list[dict]:
+    """Every intent record in one log, in submission order.
+
+    `start` is a byte offset, because the log is append-only across matches
+    (`intent.rs`, `IntentLog`) and one file can hold several rounds. The runner
+    notes the size before it launches and reads from there; a reader of an
+    archived per-round copy passes nothing.
+
+    Session headers and unparseable lines are skipped rather than raised on: a
+    log truncated by a crash is still evidence about the part that was written,
+    and refusing to read it would lose a round's whole record over its last
+    line.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return []
+    if 0 < start <= len(raw):
+        raw = raw[start:]
+    out: list[dict] = []
+    for line in raw.decode("utf8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and "verb" in rec:
+            out.append(rec)
+    return out
+
+
+def autopilot_spans(records, end_t: float | None = None) -> dict[str, list[dict]]:
+    """Team -> the stretches of game time the scripted AI was playing its seat.
+
+    Read from the intent log rather than from the engine, because the log has
+    the exact edges: `{"verb":"autopilot","t":189.3,"intent":{"on":true}}` and
+    its matching `on:false`. Nothing else in a round's evidence records them —
+    which is why r33 and r35 sit in the ledger as unqualified wins.
+
+    Three rules, each of which is the engine's own behaviour rather than a
+    convention invented here:
+
+      * **Only `ok` records count.** A refusal (`BH_NO_AUTOPILOT=1`) is logged
+        with `ok:false` and changed nothing, so it is not a span.
+      * **Engaging while already engaged is one span**, because
+        `intent.rs`'s `set_autopilot` is idempotent; disengaging while not
+        engaged is nothing at all.
+      * **A span still open when the match ends closes at the ending**, marked
+        `to_end` so a reader can tell an inferred close from a commander who
+        actually took the faction back. r35 is exactly this: engaged at t=316,
+        never released, won at t=473.
+
+    `end_t` is the round's `duration_s`; without one the last clock in the log
+    is used, which is a floor on the span and never an invention past it.
+    """
+    open_at: dict[str, float] = {}
+    spans: dict[str, list[dict]] = {}
+    last_t = 0.0
+    for rec in records:
+        t = rec.get("t")
+        if not isinstance(t, (int, float)) or isinstance(t, bool):
+            continue
+        last_t = max(last_t, float(t))
+        if rec.get("verb") != AUTOPILOT_VERB or not rec.get("ok"):
+            continue
+        team = rec.get("team")
+        if not team:
+            continue
+        intent = rec.get("intent") or {}
+        if intent.get("on"):
+            open_at.setdefault(team, float(t))
+        elif team in open_at:
+            spans.setdefault(team, []).append(
+                {"from": round(open_at.pop(team), 1), "to": round(float(t), 1)}
+            )
+    close = last_t if end_t is None else float(end_t)
+    for team, start in sorted(open_at.items()):
+        spans.setdefault(team, []).append(
+            {"from": round(start, 1), "to": round(max(close, start), 1), "to_end": True}
+        )
+    for team_spans in spans.values():
+        team_spans.sort(key=lambda s: s["from"])
+    return spans
+
+
+def autopilot_secs(spans: list[dict]) -> float:
+    """How long one seat spent delegating, in game seconds.
+
+    Always a float, including the zero: `sum([])` is an `int` in Python, and a
+    ledger where some rounds say `0` and others say `0.0` is a diff that reads
+    as a change and a column that sorts by accident.
+    """
+    return round(float(sum(float(s["to"]) - float(s["from"]) for s in spans)), 1)
+
+
+def delegating_seats(rec: dict) -> list[dict]:
+    """The seats in one round that actually engaged autopilot."""
+    return [s for s in rec.get("seats", []) if (s.get("autopilot_secs") or 0) > 0]
+
+
+def autopilot_measured(rec: dict) -> bool:
+    """Whether this round's intent log was read at all.
+
+    An absent `autopilot_secs` is not a zero: rounds recorded before the key
+    existed, and rounds whose intent log was not kept, cannot say either way.
+    Distinguishing the two is the whole point of stamping a measured zero.
+    """
+    return any("autopilot_secs" in s for s in rec.get("seats", []))
+
+
+def winner_delegated(rec: dict) -> bool:
+    """Did the side that won hand its faction to the scripted AI at any point?
+
+    The question the ledger could not answer about r33 and r35.
+    """
+    winner = rec.get("result", {}).get("winner")
+    return bool(winner) and any(s.get("team") == winner for s in delegating_seats(rec))
+
+
+def autopilot_cell(rec: dict) -> str:
+    """The round table's autopilot column: who delegated, and for how long."""
+    if not autopilot_measured(rec):
+        return ""
+    used = delegating_seats(rec)
+    if not used:
+        return "none"
+    return ",".join(
+        f"{str(s.get('seat', '?')).rsplit('/', 1)[-1]} {int(s['autopilot_secs'])}s"
+        for s in used
+    )
 
 
 def skeleton(round_id: str, hypothesis: str) -> dict:
@@ -293,6 +436,66 @@ def validate(rec: dict) -> list[str]:
                 and seat["ready_wait_s"] >= 0),
             f"{where}.ready_wait_s must be a non-negative number when present",
         )
+        # `autopilot_secs` / `autopilot_spans` — how much of this round the
+        # scripted AI played on this seat's behalf. `autopilot` is documented
+        # and legal ("emergency only"), so this is not a foul flag; it is the
+        # fact that r33 and r35 sat in the ledger as Haiku victories in which
+        # 57% and 33% of the match, both including the winning stretch, were
+        # ai.rs. A verdict that measures the model has to be able to say so.
+        #
+        # ZERO IS A VALUE HERE, and this is the one place the ledger's
+        # absent-not-null rule cuts the other way: the key is stamped on every
+        # commander seat of a round whose intent log was read, `0.0` included,
+        # because "measured, and nobody delegated" is a different claim from
+        # "nobody looked". Absent still means unmeasured — every round before
+        # this key existed, and any round whose log was not kept.
+        secs = seat.get("autopilot_secs")
+        want(
+            "autopilot_secs" not in seat
+            or (isinstance(secs, (int, float))
+                and not isinstance(secs, bool)
+                and secs >= 0),
+            f"{where}.autopilot_secs must be a non-negative number of game "
+            f"seconds when present",
+        )
+        want(
+            not (seat.get("kind") == "scripted" and "autopilot_secs" in seat),
+            f"{where} is scripted and cannot delegate — ai.rs is already playing "
+            f"it, and `autopilot` is a bridge seat handing its faction over",
+        )
+        spans = seat.get("autopilot_spans")
+        if "autopilot_spans" in seat:
+            # Spans without a total would leave the summary line to re-derive a
+            # number the record could simply carry, and a total without spans
+            # is fine (a round may keep the sum and drop the detail).
+            want("autopilot_secs" in seat,
+                 f"{where}.autopilot_spans without autopilot_secs — the total is "
+                 f"what the ledger reads")
+            want(isinstance(spans, list) and spans != [],
+                 f"{where}.autopilot_spans must be a non-empty list when present "
+                 f"(no spans is autopilot_secs 0, not an empty list)")
+            total = 0.0
+            for j, span in enumerate(spans if isinstance(spans, list) else []):
+                at = f"{where}.autopilot_spans.{j}"
+                if not isinstance(span, dict):
+                    bad.append(f"{at} must be an object")
+                    continue
+                extra_keys = set(span) - {"from", "to", "to_end"}
+                want(not extra_keys, f"{at} has unknown keys: {', '.join(sorted(extra_keys))}")
+                ends = [span.get("from"), span.get("to")]
+                if not all(isinstance(e, (int, float)) and not isinstance(e, bool) for e in ends):
+                    bad.append(f"{at} needs numeric `from` and `to` game seconds")
+                    continue
+                want(ends[1] >= ends[0], f"{at} ends before it starts")
+                want(span.get("to_end", False) in (True, False),
+                     f"{at}.to_end must be true or false")
+                total += ends[1] - ends[0]
+            want(
+                not isinstance(secs, (int, float)) or isinstance(secs, bool)
+                or abs(total - secs) <= 0.5,
+                f"{where}.autopilot_secs is {secs} but its spans add up to "
+                f"{round(total, 1)}",
+            )
 
     res = rec["result"]
     want(isinstance(res, dict), "result must be an object")
@@ -474,16 +677,23 @@ def mmss(secs) -> str:
 def one_line(rec: dict) -> str:
     res = rec.get("result", {})
     won = winning_persona(rec) or ("draw" if res.get("winner") is None else "?")
+    # The asterisk is the point of the column beside it: a round the winner
+    # spent on autopilot is a win by ai.rs on that seat's behalf, and r33/r35
+    # read as unassisted model victories for a fortnight because nothing in
+    # this table said otherwise.
+    if winner_delegated(rec):
+        won += "*"
     return (
         f"{rec['id']:>4}  {rec.get('date') or '?':10}  {rec.get('ruleset', {}).get('map') or '?':9}  "
-        f"{'/'.join(personas(rec)) or '?':16}  {won:8}  {mmss(res.get('duration_s')):>6}  "
-        f"{res.get('game_over_reason') or '?':9}  {rec.get('hypothesis', '')[:64]}"
+        f"{'/'.join(personas(rec)) or '?':16}  {won:9}  {mmss(res.get('duration_s')):>6}  "
+        f"{res.get('game_over_reason') or '?':9}  {autopilot_cell(rec):11}  "
+        f"{rec.get('hypothesis', '')[:56]}"
     )
 
 
 HEADER = (
-    f"{'id':>4}  {'date':10}  {'map':9}  {'seats':16}  {'won':8}  "
-    f"{'length':>6}  {'ending':9}  hypothesis"
+    f"{'id':>4}  {'date':10}  {'map':9}  {'seats':16}  {'won':9}  "
+    f"{'length':>6}  {'ending':9}  {'autopilot':11}  hypothesis"
 )
 
 
@@ -516,7 +726,36 @@ def cmd_series(args) -> int:
         )
     backfilled = sum(1 for r in rounds if r.get("provenance") == "backfilled")
     print(f"provenance: {len(rounds) - backfilled} recorded, {backfilled} backfilled")
+    print(autopilot_summary(rounds))
     return 0
+
+
+def autopilot_summary(rounds: list[dict]) -> str:
+    """The series line for delegation — who handed the faction over, and won.
+
+    Kept beside `provenance` because it is the same kind of sentence: a
+    statement about how much of this series is what it appears to be. A round
+    with no measurement is counted separately from a round measured at zero,
+    for the reason `autopilot_measured` exists.
+    """
+    measured = [r for r in rounds if autopilot_measured(r)]
+    used = [r for r in measured if delegating_seats(r)]
+    if not measured:
+        return "autopilot: unmeasured on every round on file"
+    if not used:
+        return f"autopilot: none, across {len(measured)}/{len(rounds)} measured rounds"
+    detail = "; ".join(f"{r['id']} {autopilot_cell(r)}" for r in used)
+    won = [r["id"] for r in used if winner_delegated(r)]
+    line = (
+        f"autopilot: {len(used)} of {len(measured)} measured rounds "
+        f"({len(rounds)} on file) — {detail}"
+    )
+    if won:
+        line += (
+            f"\n  * marks a win the winner spent on autopilot: {', '.join(won)} "
+            f"— those verdicts measure when the seat delegated, not how it played"
+        )
+    return line
 
 
 def cmd_rounds(args) -> int:
@@ -632,6 +871,82 @@ def cmd_note(args) -> int:
     return 1
 
 
+def stamp_autopilot(rec: dict, records: list[dict], log_path: str | None = None) -> dict:
+    """Write one round's delegation into its own record. Returns what changed.
+
+    Split from the CLI so the runner and the retroactive backfill reach the
+    ledger through one function: `arena_run` stamps a round it just watched,
+    `arena.py autopilot` stamps one whose log survived in `arena/<id>/`, and
+    the two cannot disagree about what a span is.
+
+    Every non-scripted seat gets the key, `0.0` included — see the validator
+    for why a measured zero is not the same fact as an absent key. A scripted
+    seat never gets it: ai.rs is already playing that faction and there is no
+    handover to record.
+    """
+    spans = autopilot_spans(records, rec.get("result", {}).get("duration_s"))
+    stamped: dict[str, float] = {}
+    for seat in rec.get("seats", []):
+        if seat.get("kind") == "scripted":
+            continue
+        mine = spans.get(seat.get("team"), [])
+        seat["autopilot_secs"] = autopilot_secs(mine)
+        if mine:
+            seat["autopilot_spans"] = mine
+        else:
+            seat.pop("autopilot_spans", None)
+        stamped[seat.get("seat", "?")] = seat["autopilot_secs"]
+    if log_path and log_path not in rec["evidence"]["logs"]:
+        # The record cites the file the numbers came from, so a reader can
+        # recompute them rather than take the stamp on faith.
+        rec["evidence"]["logs"].append(log_path)
+    rec["unknown"] = null_paths(rec)
+    return stamped
+
+
+def cmd_autopilot(args) -> int:
+    """Stamp a round with what its intent log says about delegation.
+
+    The retroactive half of the machinery. r33 and r35 were recorded before
+    anything read the intent log for this, and both are cited in
+    arena/LADDER2.md as results that need a number attached; their logs are in
+    the repo, so the numbers are recoverable rather than guessable and the
+    honesty rule has nothing to complain about.
+    """
+    rounds = load(args.ledger)
+    for rec in rounds:
+        if rec.get("id") != args.id:
+            continue
+        log = Path(args.log) if args.log else REPO / "arena" / args.id / "bridge-logs" / "intent_log.jsonl"
+        if not log.exists():
+            print(
+                f"no intent log at {log} — a round whose log was not kept stays "
+                f"unmeasured, which is a fact the ledger already spells as an "
+                f"absent key",
+                file=sys.stderr,
+            )
+            return 1
+        records = read_intent_log(log)
+        cited = str(log.relative_to(REPO)) if log.is_relative_to(REPO) else str(log)
+        stamped = stamp_autopilot(rec, records, cited)
+        problems = validate(rec)
+        if problems:
+            print("refusing to write — " + "; ".join(problems), file=sys.stderr)
+            return 1
+        for seat, secs in sorted(stamped.items()):
+            print(f"{args.id}: {seat} autopilot {secs}s")
+        print(f"{args.id}: {autopilot_cell(rec)}"
+              + ("  (the winner delegated)" if winner_delegated(rec) else ""))
+        if not args.write:
+            print("(not written — pass --write to stamp the ledger)")
+            return 0
+        rewrite(rounds, args.ledger)
+        print(f"{args.id}: stamped into {args.ledger}")
+        return 0
+    print(f"no round {args.id}", file=sys.stderr)
+    return 1
+
+
 def cmd_append(args) -> int:
     rec = json.loads(Path(args.file).read_text())
     try:
@@ -683,6 +998,16 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"status is one of {', '.join(VERDICT_STATUS)}")
     n.add_argument("--lesson", action="append", metavar="TEXT")
     n.set_defaults(fn=cmd_note)
+
+    au = subs.add_parser(
+        "autopilot",
+        help="stamp seats[].autopilot_secs from a round's intent log",
+    )
+    au.add_argument("id")
+    au.add_argument("--log", help="the intent log to read "
+                                  "(default arena/<id>/bridge-logs/intent_log.jsonl)")
+    au.add_argument("--write", action="store_true", help="write the stamp into the ledger")
+    au.set_defaults(fn=cmd_autopilot)
 
     ap = subs.add_parser("append", help="append a record from a JSON file")
     ap.add_argument("file")
