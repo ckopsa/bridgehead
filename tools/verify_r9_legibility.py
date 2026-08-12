@@ -140,8 +140,18 @@ def run_checks():
     print("\n[3] a blocked placement names the rule and a legal alternative")
     worker = next(u for u in st["units"]
                   if u["team"] == st["my_team"] and u["kind"] == "Worker")
-    mine = min(st["mines"], key=lambda m: (m["pos"][0] - hall["pos"][0]) ** 2
-                                        + (m["pos"][1] - hall["pos"][1]) ** 2)
+    # LIVE mines only, and that is not a detail. A mine that has been worked
+    # out is unblocked in the NavGrid and still listed in `mines[]`, so on a
+    # long match the nearest mine to the hall can be a dry one — and building
+    # on a dry mine is legal, which turns this whole section into a check that
+    # a legal site is refused. Pinning the pick to `remaining > 0` is what
+    # makes the assertion below ("mines block 6x6") true by construction
+    # rather than true early in the match.
+    live_mines = [m for m in st["mines"] if m.get("remaining", 0) > 0]
+    if not live_mines:
+        raise SystemExit("FAIL: no live gold mine to place a blocked build on")
+    mine = min(live_mines, key=lambda m: (m["pos"][0] - hall["pos"][0]) ** 2
+                                       + (m["pos"][1] - hall["pos"][1]) ** 2)
     # Straight on top of a gold mine: its 6x6 block plus a TownHall's 8x8 makes
     # this the exact site a commander's eye picks and the compiler refuses.
     errs = errors_after([{"type": "build", "worker": worker["id"],
