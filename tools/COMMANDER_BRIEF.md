@@ -26,6 +26,20 @@ co-commander section near the end, which is the only part that differs.
 3. Decide. 4. Write commands (see below).
 Repeat until `game_over` is non-null, then stop and report the result.
 
+**How a match can end**, so you know what you are polling for. `game_over` is a
+team name — `"Human"` or `"Claude"` — or the literal `"draw"`, and `game_over_reason`
+beside it says which ending it was:
+
+| `game_over_reason` | What happened |
+| --- | --- |
+| `razed` | the loser has no production buildings left |
+| `surrender` | the loser conceded |
+| `score` | **the match hit its time cap** and the referee counted assets — bank plus the gold-and-lumber worth of everything still standing. Ahead on that total wins; exactly level is `game_over: "draw"`. |
+
+A capped match is not a stalemate you can wait out: it is scored, so being ahead
+on assets when the clock runs out is a real way to win and being behind is a
+real way to lose. Every ladder round runs under a cap.
+
 **Read the map before you say `ready` — that is what the time is for, and your
 opponent gets exactly the same amount of it.** You may look at everything and
 send your whole opening batch *before* readying; those orders compile at t=0 and

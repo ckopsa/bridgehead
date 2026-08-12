@@ -231,6 +231,10 @@ const POLL_INTERVAL: f32 = 0.25;
 /// How many trees to include in the snapshot (there are hundreds).
 const TREES_NEAR: usize = 12;
 
+/// What `game_over` says when the match was decided and nobody won. The only
+/// value of that key that is not a team name; see the field's doc comment.
+const DRAW_NAME: &str = "draw";
+
 
 // ---------------------------------------------------------------------------
 // Plugin & state
@@ -683,11 +687,27 @@ struct StateOut {
     /// and `t` begins to move.
     #[serde(skip_serializing_if = "Option::is_none")]
     match_started: Option<bool>,
+    /// **Who won, once anybody has** — a bare team name, `"draw"`, or null
+    /// while the match is live. The poll loop every commander is given
+    /// (tools/COMMANDER_BRIEF.md: "repeat until `game_over` is non-null")
+    /// terminates on this key and nothing else, which is why a drawn match has
+    /// to say *something* here: `wc3clone-j84` was a capped round that ended
+    /// with the process gone and this key still null, and four commander
+    /// agents sat polling a file nobody would ever write again.
+    ///
+    /// `"draw"` is the one value that is not a team, added rather than
+    /// modelled as an absent winner *on the wire* precisely because absence is
+    /// what "still playing" already means here. The ledger keeps ARENA.md's
+    /// spelling — a draw is a `winner: null` round with
+    /// `game_over_reason: "score"` — and `arena_run.py` translates at the
+    /// boundary.
     game_over: Option<&'static str>,
-    /// **Which win it was**: `"razed"` (the loser has no production buildings
-    /// left) or `"surrender"`. Round-9's winner could not tell the two apart —
-    /// a conceded match and a fought-out one call for completely different
-    /// AARs, and `game_over` alone never distinguished them.
+    /// **Which ending it was**: `"razed"` (the loser has no production
+    /// buildings left), `"surrender"`, or `"score"` (the time cap expired and
+    /// the referee counted assets — see `shared::GameOverReason::Score`).
+    /// Round-9's winner could not tell the first two apart — a conceded match
+    /// and a fought-out one call for completely different AARs, and
+    /// `game_over` alone never distinguished them.
     ///
     /// Deliberately a SIBLING key rather than turning `game_over` into
     /// `{winner, reason}`. `game_over` is read as a team name or null by
@@ -1847,7 +1867,7 @@ fn write_snapshot(
     let delta = real.delta();
     // The verdict is a reason to write, not merely something a write reports;
     // see `Seat::publishes_now`.
-    let decided = match_state.over.winner.is_some();
+    let decided = match_state.over.decided();
     for seat in &mut bridge.seats {
         if !seat.publishes_now(delta, decided) {
             continue;
@@ -2402,7 +2422,7 @@ fn write_seat_snapshot(
         // exactly as it has always been.
         waiting_for: ready.holding().then(|| ready.waiting_for()),
         match_started: ready.holding().then_some(false),
-        game_over: game_over.winner.map(team_name),
+        game_over: game_over_name(&game_over),
         game_over_reason: game_over.reason.map(GameOverReason::name),
         me: MeOut {
             gold: eco.gold,
@@ -2773,7 +2793,7 @@ fn poll_commands(
         // batch being acknowledged, never the one before it.
         intent_applied.get_mut(seat.team).clear();
 
-        if game_over.winner.is_some() {
+        if game_over.decided() {
             seat.errors
                 .push("batch: game over — commands ignored".to_string());
         } else {
@@ -2852,6 +2872,20 @@ fn team_name(team: Team) -> &'static str {
     match team {
         Team::Human => "Human",
         Team::Claude => "Claude",
+    }
+}
+
+/// The `game_over` key: the winner's team name, `DRAW_NAME` if the match was
+/// decided and nobody won, `None` while it is still being played.
+///
+/// One function rather than an expression at the call site because "what does
+/// the wire say the match ended as" is a fact `Seat::publishes_now` is holding
+/// the process open to deliver; a second spelling of it somewhere else is how
+/// a seat ends up published with a verdict the engine does not think it has.
+fn game_over_name(over: &GameOver) -> Option<&'static str> {
+    match over.winner {
+        Some(team) => Some(team_name(team)),
+        None => over.drawn.then_some(DRAW_NAME),
     }
 }
 
@@ -3044,6 +3078,38 @@ mod tests {
             "and with no seat open the bridge holds nothing up: an unbridged \
              run exits exactly when it always did"
         );
+    }
+
+    /// **What `game_over` says, in all four states** — `wc3clone-j84`. The key
+    /// a commander's poll loop terminates on: null while the match is live, a
+    /// bare team name when somebody won (`verify_r9_legibility.py` asserts
+    /// exactly that and must keep passing), and `"draw"` — the one value that
+    /// is not a team — when the cap ended it dead even.
+    #[test]
+    fn the_game_over_key_names_the_winner_a_draw_or_nothing() {
+        let live = GameOver::default();
+        assert_eq!(game_over_name(&live), None, "a live match says nothing");
+
+        let mut razed = GameOver::default();
+        razed.decide(Team::Claude, GameOverReason::Razed);
+        assert_eq!(game_over_name(&razed), Some("Claude"));
+
+        let mut on_score = GameOver::default();
+        on_score.decide(Team::Human, GameOverReason::Score);
+        assert_eq!(
+            game_over_name(&on_score),
+            Some("Human"),
+            "a score verdict still names its winner like any other ending"
+        );
+
+        let mut drawn = GameOver::default();
+        drawn.decide_draw(GameOverReason::Score);
+        assert_eq!(
+            game_over_name(&drawn),
+            Some(DRAW_NAME),
+            "a draw must say SOMETHING: null is the value the poll loop waits on"
+        );
+        assert_eq!(DRAW_NAME, "draw");
     }
 
     // -----------------------------------------------------------------------

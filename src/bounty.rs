@@ -138,7 +138,7 @@ fn spawn_bounty(
     game_over: Res<GameOver>,
 ) {
     let now = time.elapsed_secs();
-    if now < schedule.next_at || game_over.winner.is_some() {
+    if now < schedule.next_at || game_over.decided() {
         return;
     }
     // Whether or not a spot was found, the clock moves on.

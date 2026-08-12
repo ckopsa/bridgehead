@@ -583,6 +583,61 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The time cap decides the match it stops (wc3clone-j84)
+    // -----------------------------------------------------------------------
+
+    /// **The referee's rule, and the sentence it says.** Both halves are a
+    /// contract with `tools/arena_run.py`: it reads the winner out of this
+    /// phrase (`TIMECAP`), and it has read `"dead even"` as "no winner" since
+    /// round 10. The rule itself is `shared::asset_score`, unchanged — this
+    /// test pins that the engine's own verdict agrees with the ledger's.
+    #[test]
+    fn the_cap_verdict_follows_the_assets_and_says_so_in_the_arena_phrase() {
+        assert_eq!(cap_verdict(900, 400), (Some(shared::Team::Human), "Human wins on score"));
+        assert_eq!(cap_verdict(400, 900), (Some(shared::Team::Claude), "Claude wins on score"));
+        // A tie names nobody — docs/ARENA.md: "a draw is an absent winner, not
+        // a sentinel team".
+        assert_eq!(cap_verdict(700, 700), (None, "dead even"));
+    }
+
+    fn draw(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<shared::GameOver>()
+            .decide_draw(shared::GameOverReason::Score);
+    }
+
+    /// **A draw ends the match for the exit, too.** The whole point of
+    /// deciding a capped run is that the process stops *after* the seats have
+    /// been told; a verdict the exit path did not recognise as a verdict would
+    /// leave the run spinning until the harness's wall timeout instead.
+    #[test]
+    fn a_drawn_match_exits_like_any_other_ending() {
+        let mut app = exit_app(Some(bridge::Bridge::default()));
+        run_frames(&mut app, 20);
+        assert!(app.should_exit().is_none(), "no verdict, no exit");
+        draw(&mut app);
+        run_frames(&mut app, 300);
+        assert!(
+            app.should_exit().is_some(),
+            "a drawn match must terminate exactly like a won one"
+        );
+    }
+
+    /// ...and it owes the commanders the same telling first (wc3clone-0i9). A
+    /// draw is the ending most likely to reach a bridged seat — every ladder
+    /// round runs under a cap.
+    #[test]
+    fn a_seat_is_owed_the_draw_as_much_as_a_win() {
+        let mut app = exit_app(Some(bridge::one_unpublished_seat()));
+        draw(&mut app);
+        run_frames(&mut app, 300);
+        assert!(
+            app.should_exit().is_none(),
+            "a commander is owed the draw before the process may stop"
+        );
+    }
+
     /// **No bridge seat, no handshake.** The default that keeps every existing
     /// sim, every fingerprint run and the whole determinism harness byte-identical:
     /// an empty gate never holds, and the clock runs from the first frame.
@@ -602,12 +657,13 @@ mod tests {
     }
 }
 
-/// Headless runs terminate themselves: shortly after a decisive game over, or
-/// at a game-time cap (default 1800s) with a score-based verdict so even a
-/// stalemate produces a winner.
+/// Headless runs terminate themselves: shortly after a game over, or at a
+/// game-time cap (`BH_MAX_GAME_SECS`) whose score-based verdict is *recorded*
+/// like any other, so even a stalemate ends the match rather than merely
+/// stopping the process.
 fn headless_exit(
     time: Res<Time>,
-    game_over: Res<shared::GameOver>,
+    mut game_over: ResMut<shared::GameOver>,
     economies: Res<shared::Economies>,
     units: Query<(&shared::Unit, &shared::Team)>,
     buildings: Query<(&shared::Building, &shared::Team)>,
@@ -616,19 +672,21 @@ fn headless_exit(
     // open. See `check_decided`.
     bridge: Option<Res<bridge::Bridge>>,
     decided_at: Local<Option<f32>>,
-    mut exit: EventWriter<AppExit>,
+    exit: EventWriter<AppExit>,
 ) {
-    use shared::Team;
+    use shared::{GameOverReason, Team};
     // No time limit by default — matches end when a base falls. Setting
     // BH_MAX_GAME_SECS opts an automated run into a safety cap (with a
     // score-based verdict) so unattended sims can't spin forever.
-    let Some(cap) = std::env::var("BH_MAX_GAME_SECS")
+    let cap = std::env::var("BH_MAX_GAME_SECS")
         .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-    else {
-        return check_decided(time, game_over, bridge, decided_at, exit);
-    };
-    if time.elapsed_secs() > cap {
+        .and_then(|v| v.parse::<f32>().ok());
+    // `decided()`, not `winner`: past the cap this is true every frame, and the
+    // draw it can record names nobody. Without the guard the referee would
+    // re-count the assets sixty times a second and overwrite a verdict the
+    // seats may already have been told.
+    if cap.is_some_and(|cap| time.elapsed_secs() > cap) && !game_over.decided() {
+        let cap = cap.unwrap_or_default();
         let score = |team: Team| {
             shared::asset_score(
                 economies.get(team),
@@ -637,30 +695,60 @@ fn headless_exit(
             )
         };
         let (human, claude) = (score(Team::Human), score(Team::Claude));
-        let verdict = match human.cmp(&claude) {
-            std::cmp::Ordering::Greater => "Human wins on score",
-            std::cmp::Ordering::Less => "Claude wins on score",
-            std::cmp::Ordering::Equal => "dead even",
-        };
+        // **The verdict goes through `GameOver::decide`, not just into the
+        // log.** The log line is how `arena_run.py` has read a capped round
+        // since round 10 and it is unchanged; what is new is that the match is
+        // now *decided*, which is what puts `game_over` into both seats'
+        // final snapshots (`Seat::publishes_now`) and lets a commander's
+        // documented poll loop terminate. Before this, a capped round left
+        // every bridged seat reading `game_over: null` forever — wc3clone-j84.
+        let (winner, verdict) = cap_verdict(human, claude);
+        match winner {
+            Some(winner) => game_over.decide(winner, GameOverReason::Score),
+            // A dead-even cap is a draw, not a silence. It still has to be
+            // *said*, or the tie is the one ending that hangs a poller.
+            None => game_over.decide_draw(GameOverReason::Score),
+        }
         info!(
             "headless: time cap {cap}s — timeout verdict: {verdict} (Human {human} vs Claude {claude})"
         );
-        exit.write(AppExit::Success);
-        return;
     }
-    check_decided(time, game_over, bridge, decided_at, exit);
+    // One exit path for all three endings: whatever decided the match, the
+    // bridged seats are told before the process is allowed to stop.
+    check_decided(time, &game_over, bridge, decided_at, exit);
 }
 
-/// Exit shortly after a real, decisive game over — the only ending the game
-/// itself recognizes.
+/// **The cap's referee, and the sentence it says.** More assets wins; exactly
+/// equal is a draw.
+///
+/// The rule is not new and is deliberately not re-invented here: it is
+/// `shared::asset_score` (bank + the gold-and-lumber worth of every unit and
+/// building still standing), which is what the timeout has compared since the
+/// cap existed. The *phrase* is not new either — `arena_run.py`'s `TIMECAP`
+/// regex has parsed `timeout verdict: <this>` into the arena ledger since
+/// round 10, and `"dead even"` is the wording it already reads as "no winner".
+/// Keeping both means the ledger a capped round produces is unchanged; what
+/// changed in `wc3clone-j84` is only that the engine now *records* the verdict
+/// instead of merely printing it.
+fn cap_verdict(human: u32, claude: u32) -> (Option<shared::Team>, &'static str) {
+    use shared::Team;
+    match human.cmp(&claude) {
+        std::cmp::Ordering::Greater => (Some(Team::Human), "Human wins on score"),
+        std::cmp::Ordering::Less => (Some(Team::Claude), "Claude wins on score"),
+        std::cmp::Ordering::Equal => (None, "dead even"),
+    }
+}
+
+/// Exit shortly after the match is decided — by a raze, a concession, or the
+/// cap's referee.
 fn check_decided(
     time: Res<Time>,
-    game_over: Res<shared::GameOver>,
+    game_over: &shared::GameOver,
     bridge: Option<Res<bridge::Bridge>>,
     mut decided_at: Local<Option<f32>>,
     mut exit: EventWriter<AppExit>,
 ) {
-    if let Some(winner) = game_over.winner {
+    if game_over.decided() {
         let decided = *decided_at.get_or_insert(time.elapsed_secs());
         // **The commanders learn the result before the process is allowed to
         // stop.** A bridged seat's only channel is its `state.json`, and the
@@ -683,7 +771,20 @@ fn check_decided(
             // The game clock, not the wall clock: an automated run's only
             // record of how long the match was is this line, and every
             // after-action report in the series is written in game seconds.
-            info!("headless: game over — {winner:?} wins ({reason}) at t={decided:.1}s — exiting");
+            //
+            // A draw does NOT say "X wins" — `arena_run.py`'s DECISIVE regex
+            // is `(\w+) wins`, and a line claiming a winner the record has to
+            // spell as `null` (docs/ARENA.md: "a draw is an absent winner") is
+            // exactly the kind of disagreement between two readers of one fact
+            // this codebase keeps losing days to.
+            match game_over.winner {
+                Some(winner) => info!(
+                    "headless: game over — {winner:?} wins ({reason}) at t={decided:.1}s — exiting"
+                ),
+                None => info!(
+                    "headless: game over — dead even ({reason}) at t={decided:.1}s — exiting"
+                ),
+            }
             exit.write(AppExit::Success);
         }
     }
