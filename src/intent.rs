@@ -423,6 +423,10 @@ fn apply_intents(
     let now = time.elapsed_secs();
     // One allowance for the whole frame, shared by every gesture in it.
     let mut notice_budget = UI_NOTICE_BURST;
+    // Squad membership written by an earlier sentence in this frame's batch,
+    // which no query can see yet. See `compile_intent`'s `batch_squads`.
+    let mut batch_squads: std::collections::BTreeMap<Entity, Option<u8>> =
+        std::collections::BTreeMap::new();
     for submission in batch {
         let mut errors: Vec<String> = Vec::new();
         // See `compile_intent`'s `reached` parameter. Per submission, because
@@ -492,6 +496,7 @@ fn apply_intents(
             &mut world,
             &mut issuer,
             &mut reached,
+            &mut batch_squads,
         );
         // **The plan's verdict, straight back to the plan.** In the same frame
         // it submitted, before its evaluator's next sweep — so a step that
@@ -915,6 +920,25 @@ fn compile_intent(
     // game. Errors with `reached` are a partial success; errors without it are
     // a refusal.
     reached: &mut bool,
+    // **Squad membership written EARLIER IN THIS BATCH**, entity → new squad
+    // (`None` = removed from any squad).
+    //
+    // This exists because of the flush rule §6.3 of tools/BUILDER_BRIEF.md
+    // states: `squad` writes `SquadId` through `Commands`, and Bevy does not
+    // apply a command queue until the system ends — so within one
+    // `apply_intents` the insert is invisible to every query. Nothing cared
+    // until `stance`, which is the only verb here that finds its units *by
+    // membership* rather than from an id list. Without this map, the perfectly
+    // ordinary batch
+    //
+    //     [{"type":"squad","units":[1,2,3],"id":1},
+    //      {"type":"stance","squad":1,"stance":"push","target":"mid"}]
+    //
+    // would set squad 1's posture (per-squad, so it lands) and silently skip
+    // its leash, threshold and focus list (per-unit, so they find nobody) —
+    // half a doctrine installed, with nothing said about the other half. Last
+    // writer wins inside the batch, exactly as it does outside it.
+    batch_squads: &mut std::collections::BTreeMap<Entity, Option<u8>>,
 ) {
     // Named locally so the arms below read exactly as they did when this was
     // one interface's private applier.
@@ -2054,6 +2078,10 @@ fn compile_intent(
                         ec.try_remove::<SquadId>();
                     }
                 }
+                // ...and the same fact where a later sentence in this batch can
+                // see it, since the insert above will not be visible to any
+                // query until the system ends. See `batch_squads`.
+                batch_squads.insert(entity, id);
             }
         }
         Intent::Posture { id, posture } => {
@@ -2198,7 +2226,13 @@ fn compile_intent(
             //    bundle atomically" half of the design.
             let mut members = 0usize;
             for (entity, _, team, _, _, squad_id) in units.iter() {
-                if *team != me || squad_id.map(|s| s.0) != Some(squad) {
+                // Membership as of THIS SENTENCE: a `squad` earlier in the same
+                // batch outranks the component, which has not been flushed yet.
+                let member_of = match batch_squads.get(&entity) {
+                    Some(assigned) => *assigned,
+                    None => squad_id.map(|s| s.0),
+                };
+                if *team != me || member_of != Some(squad) {
                     continue;
                 }
                 members += 1;
@@ -2235,14 +2269,16 @@ fn compile_intent(
 
             // An empty squad is not a refusal — see above — but it is worth
             // saying out loud, because "I set a stance and nothing moved" is
-            // otherwise a silent five seconds a commander has to diagnose.
-            // A notice on the error channel, which is where this codebase puts
-            // things that are true and worth knowing about a command that was
-            // nonetheless accepted.
+            // otherwise a silent five seconds a commander has to diagnose. And
+            // the message has to be honest about the asymmetry rather than
+            // promising a hand-off that does not exist: the posture will
+            // re-task whoever joins, the other three pieces will not.
             if members == 0 {
                 errors.push(format!(
-                    "{tag}: squad {squad} has no members yet - the {} stance is set and will \
-                     apply as units join it",
+                    "{tag}: squad {squad} has no members - the {} stance is set and its posture \
+                     will re-task whoever joins, but its leash, retreat and focus reach only the \
+                     members present when you send it (re-send after reinforcing, or use \
+                     'template' to stamp new units)",
                     kind.word()
                 ));
             }
@@ -6723,6 +6759,60 @@ mod tests {
             .send_event(SubmitIntent::ui(Team::Human, Intent::Posture { id: 1, posture: None }));
         app.update();
         assert!(app.world().resource::<SquadStances>().0.get(&(Team::Human, 1)).is_none());
+    }
+
+    /// **`squad` then `stance`, in ONE batch.** The obvious opening a commander
+    /// writes, and the one shape that could silently half-work: `squad` inserts
+    /// `SquadId` through `Commands`, Bevy does not flush a command queue until
+    /// the system ends, so the stance's per-unit half would find an empty squad
+    /// and install nothing while its posture — which is per-squad — landed
+    /// fine. Half a doctrine, no error, and a leash the commander believes is
+    /// on. `batch_squads` is what makes the two sentences agree.
+    #[test]
+    fn a_squad_and_a_stance_in_one_batch_reach_the_same_units() {
+        let mut app = compiler_app();
+        // Deliberately NOT pre-enrolled: this is a bare unit, exactly as it is
+        // the moment it walks out of a barracks.
+        let unit = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Health::new(100.0),
+                Order::Idle,
+            ))
+            .id();
+
+        // Both sentences in the same frame, in the order a commander writes
+        // them. `apply_intents` drains them together.
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: Intent::Squad { units: vec![unit.to_bits()], id: Some(1) },
+            trigger: None,
+            plan: None,
+        });
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 1".to_string(),
+            intent: stance(1, "turtle", None),
+            trigger: None,
+            plan: None,
+        });
+        app.update();
+
+        assert!(
+            app.world().entity(unit).get::<LeashPolicy>().is_some(),
+            "the stance must reach a unit the sentence before it enrolled"
+        );
+        assert!(app.world().entity(unit).get::<RetreatPolicy>().is_some());
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "and must not claim the squad was empty"
+        );
     }
 
     /// A stance reaches only ITS OWN squad, and only its own team. The same

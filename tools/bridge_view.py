@@ -178,8 +178,15 @@ def main():
     )
 
     # --- squads ---
+    # The stance word, when one put the posture there, printed FIRST and in
+    # brackets: it is the thing a commander decides and the posture is the thing
+    # the engine derived from it. Absent for a hand-tasked squad, and absent
+    # entirely from a snapshot written before stances existed, so `.get` rather
+    # than `[...]` — this readout must survive an older state.json.
     for sq in s.get("squads", []):
-        print(f"SQUAD {sq['id']}: {sq['posture']} members={sq['members']}")
+        stance = sq.get("stance")
+        tag = f"[{stance}] " if stance else ""
+        print(f"SQUAD {sq['id']}: {tag}{sq['posture']} members={sq['members']}")
 
     # --- triggers ---
     # Absent until this seat has armed one, so a v1 snapshot prints nothing

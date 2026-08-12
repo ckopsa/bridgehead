@@ -208,7 +208,9 @@ Three things worth knowing:
    and covers anyone who joins later; the leash, threshold and focus list land on
    whoever is in the squad *now*, exactly as `leash`/`retreat`/`priority` do.
    Re-send the stance after reinforcing, or use `template` to stamp new units at
-   the barracks.
+   the barracks. Sending `squad` and `stance` **in the same batch works** — the
+   stance sees the enrolment the line above it made — so the natural opening
+   `[{"type":"squad",...},{"type":"stance",...}]` does what it looks like.
 
 **Silence continues a stance.** Nothing in the engine ever clears one — not a
 poll you skipped, not a fight, not a wipe. Your next snapshot echoes it back as
