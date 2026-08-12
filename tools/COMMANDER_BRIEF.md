@@ -236,13 +236,20 @@ Three things worth knowing:
    `secure`'s 30 whatever size you drew the circle. That is what makes a preset a
    preset. Use `posture` when you want to pick the number yourself — the full
    vocabulary stays open and nothing here can be expressed only as a stance.
-3. **It applies to the squad's members as they stand.** The posture is per-squad
-   and covers anyone who joins later; the leash, threshold and focus list land on
-   whoever is in the squad *now*, exactly as `leash`/`retreat`/`priority` do.
-   Re-send the stance after reinforcing, or use `template` to stamp new units at
-   the barracks. Sending `squad` and `stance` **in the same batch works** — the
-   stance sees the enrolment the line above it made — so the natural opening
-   `[{"type":"squad",...},{"type":"stance",...}]` does what it looks like.
+3. **Reinforcements inherit it.** A stance belongs to the *squad*, not to the
+   bodies that were standing in it when you sent the word: enrol a unit into a
+   stanced squad and it arrives wearing the posture, the leash, the threshold and
+   the focus list. That holds however it got there — a `squad` command, a
+   `template` at the barracks, or the engine's own enrolment into squad 0 — and
+   moving a unit between two stanced squads swaps the whole bundle, exactly as
+   switching a squad's word does. So you can stance an empty squad and train into
+   it, and sending `squad` and `stance` **in the same batch works** too — the
+   stance sees the enrolment the line above it made.
+
+   The limit: a squad you tasked with `posture` rather than a stance has no word
+   to hand down, and `leash`/`retreat`/`priority` name units rather than squads,
+   so joiners there are left as they are. If you want doctrine to follow the
+   squad, use a stance.
 
 **Silence continues a stance.** Nothing in the engine ever clears one — not a
 poll you skipped, not a fight, not a wipe. Your next snapshot echoes it back as

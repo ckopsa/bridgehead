@@ -168,7 +168,19 @@ impl Plugin for IntentPlugin {
             // `.after(FogSet)`: an intent is judged against the visibility its
             // issuer has right now, the same grid the snapshot and the HUD are
             // about to show them.
-            .add_systems(Update, apply_intents.in_set(IntentApply).after(FogSet));
+            .add_systems(Update, apply_intents.in_set(IntentApply).after(FogSet))
+            // Inside the same set, and `.after(apply_intents)` so a `squad`
+            // and a `stance` in one batch are both flushed before the joiner
+            // looks: Bevy inserts the sync point for the ordering, and without
+            // it the enrolment would be a frame ahead of the doctrine it
+            // implies. See `stamp_stance_on_joiners` for why the component and
+            // not any of its three writers is the choke point.
+            .add_systems(
+                Update,
+                stamp_stance_on_joiners
+                    .in_set(IntentApply)
+                    .after(apply_intents),
+            );
     }
 }
 
@@ -2916,10 +2928,10 @@ fn compile_intent(
             // 2. The per-unit half, onto this squad's CURRENT members — which
             //    is precisely the set `leash`/`retreat`/`priority` would have
             //    reached had the commander listed them by id. Members who join
-            //    later inherit the posture (it is per-squad) but not these
-            //    three; that is the existing behaviour of those three verbs
-            //    rather than something the stance introduces, and the
-            //    production `template` is the tool for stamping new units.
+            //    LATER get it too, from `stamp_stance_on_joiners` below, which
+            //    replays this same applier over the same recorded word: a
+            //    commander that reinforces a stanced squad no longer gets
+            //    bodies carrying half the doctrine (wc3clone-bol).
             //
             //    Absent pieces REMOVE rather than leave alone. A stance is
             //    absolute: switching from `turtle` to `push` must not leave the
@@ -2938,28 +2950,7 @@ fn compile_intent(
                     continue;
                 }
                 members += 1;
-                let mut ec = commands.entity(entity);
-                if def.retreat_below > 0.0 {
-                    ec.try_insert(RetreatPolicy {
-                        below_frac: def.retreat_below,
-                        rally,
-                    });
-                } else {
-                    ec.try_remove::<RetreatPolicy>();
-                }
-                if def.leash > 0.0 {
-                    ec.try_insert(LeashPolicy {
-                        anchor,
-                        radius: def.leash,
-                    });
-                } else {
-                    ec.try_remove::<LeashPolicy>();
-                }
-                if def.priority.is_empty() {
-                    ec.try_remove::<TargetPriority>();
-                } else {
-                    ec.try_insert(TargetPriority(def.priority.clone()));
-                }
+                stamp_stance(&mut commands.entity(entity), def, anchor, rally);
             }
 
             // 3. The word, so the snapshot can echo it and silence can continue
@@ -2971,16 +2962,17 @@ fn compile_intent(
 
             // An empty squad is not a refusal — see above — but it is worth
             // saying out loud, because "I set a stance and nothing moved" is
-            // otherwise a silent five seconds a commander has to diagnose. And
-            // the message has to be honest about the asymmetry rather than
-            // promising a hand-off that does not exist: the posture will
-            // re-task whoever joins, the other three pieces will not.
+            // otherwise a silent five seconds a commander has to diagnose.
+            //
+            // The caveat this message used to carry is gone with wc3clone-bol:
+            // it warned that the leash, retreat and focus "reach only the
+            // members present when you send it", which was true and is no
+            // longer. It now says what remains true — nothing is standing
+            // there yet — and what the commander should expect instead.
             if members == 0 {
                 errors.push(format!(
-                    "{tag}: squad {squad} has no members - the {} stance is set and its posture \
-                     will re-task whoever joins, but its leash, retreat and focus reach only the \
-                     members present when you send it (re-send after reinforcing, or use \
-                     'template' to stamp new units)",
+                    "{tag}: squad {squad} has no members - the {} stance is set and waiting; \
+                     its posture, leash, retreat and focus all land on whoever joins next",
                     kind.word()
                 ));
             }
@@ -3501,6 +3493,134 @@ fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result
         | TriggerWhen::BountySpawned
         | TriggerWhen::MineDry
         | TriggerWhen::SupplyCapped => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stances: one applier, and the joiner that replays it
+// ---------------------------------------------------------------------------
+
+/// The per-unit half of a stance, on one member.
+///
+/// Three components, and **absent pieces REMOVE rather than leave alone** — a
+/// stance is absolute, so a body that walks into a `push` squad carrying a
+/// `turtle`'s leash has that leash taken off it, exactly as a member present at
+/// the moment the stance was set would.
+///
+/// Extracted from the `stance` arm for wc3clone-bol so that the arm and
+/// [`stamp_stance_on_joiners`] are one applier and not two. Two copies of this
+/// would be a divergence with a schedule: the next field added to `StanceDef`
+/// would land in one of them, and the difference between a founding member and
+/// a reinforcement would be invisible until an arena round paid for it.
+fn stamp_stance(ec: &mut EntityCommands, def: &StanceDef, anchor: Vec3, rally: Vec3) {
+    if def.retreat_below > 0.0 {
+        ec.try_insert(RetreatPolicy {
+            below_frac: def.retreat_below,
+            rally,
+        });
+    } else {
+        ec.try_remove::<RetreatPolicy>();
+    }
+    if def.leash > 0.0 {
+        ec.try_insert(LeashPolicy {
+            anchor,
+            radius: def.leash,
+        });
+    } else {
+        ec.try_remove::<LeashPolicy>();
+    }
+    if def.priority.is_empty() {
+        ec.try_remove::<TargetPriority>();
+    } else {
+        ec.try_insert(TargetPriority(def.priority.clone()));
+    }
+}
+
+/// Where a stance's bundle is pinned, **recovered from the posture it
+/// installed** rather than remembered separately.
+///
+/// A stance writes its anchor into `SquadOrders` as the posture's own point,
+/// and `SquadStances` records the word; between them the whole bundle is
+/// reconstructible, so nothing new has to be stored and nothing new can drift.
+/// That matters more than the saved bytes: a second copy of the anchor would be
+/// a second answer to "where is this squad's doctrine pinned", and the first
+/// time a commander re-aimed a stance the two would disagree.
+///
+/// `None` when the squad's posture is not one a stance can install — which in
+/// practice means `Escort`, and cannot co-exist with a recorded word (the
+/// `posture` verb clears the word on its way past). Defensive, not expected.
+fn stance_bundle(
+    team: Team,
+    kind: StanceKind,
+    posture: &SquadPosture,
+) -> Option<(&'static StanceDef, Vec3, Vec3)> {
+    let anchor = match posture {
+        SquadPosture::Defend { pos, .. } => *pos,
+        SquadPosture::Push { pos } => *pos,
+        SquadPosture::Forage { muster } => *muster,
+        SquadPosture::Escort { .. } => return None,
+    };
+    let def = kind.def();
+    let rally = match def.rally {
+        StanceRally::Anchor => anchor,
+        StanceRally::Base => clamp_to_map(team.base_pos()),
+    };
+    Some((def, anchor, rally))
+}
+
+/// **A unit that enters a stanced squad inherits the whole stance, not just the
+/// posture** (wc3clone-bol).
+///
+/// The 0uu.2 stance arm stamped the leash, retreat threshold and focus list on
+/// the members standing in the squad at the moment the word was sent. The
+/// posture is per-squad and covered everyone; those three did not. A commander
+/// that stanced squad 1 and then reinforced it — which is the ordinary shape of
+/// a match — ended up fielding one squad wearing two different doctrines, and
+/// the only way to see it was to notice that half the army did not break off.
+///
+/// **The choke point is the component, not any of its writers.** Three places
+/// enrol a unit today — the `squad` verb above, `DoctrineTemplate` at spawn in
+/// units.rs, and doctrine.rs's auto-enrolment into `DEFAULT_SQUAD` — and there
+/// is no fourth path into a squad that does not go through writing `SquadId`.
+/// So this watches `Changed<SquadId>`, which is every one of them and anything
+/// added later, instead of asking each writer to remember to call an applier.
+/// It also means doctrine.rs keeps its module contract: it enrols by writing
+/// `SquadId`, exactly as it always did, and the doctrine components stay
+/// written by this file alone.
+///
+/// `Changed` rather than `Added` deliberately: moving from squad 2 to squad 3
+/// is joining squad 3, and the new squad's bundle replaces the old one's
+/// wholesale — the same "switching replaces the bundle atomically" rule the
+/// `stance` verb follows.
+///
+/// **Only stanced squads.** A squad holding a hand-set `posture` and no word
+/// stamps nothing, because there is nothing per-squad to stamp: `leash`,
+/// `retreat` and `priority` take a unit selector, not a squad, and a selection
+/// may span squads or contain unsquadded units. Making those uniform would mean
+/// inventing a per-squad record their own vocabulary does not have. The stance
+/// is the one doctrine this engine holds per squad, so the stance is the one
+/// doctrine a joiner can inherit. See docs/INTENT.md and the `stance` arm.
+fn stamp_stance_on_joiners(
+    mut commands: Commands,
+    stances: Res<SquadStances>,
+    orders: Res<SquadOrders>,
+    joiners: Query<(Entity, &Team, &SquadId), (With<Unit>, Changed<SquadId>)>,
+) {
+    if stances.0.is_empty() {
+        return;
+    }
+    for (entity, team, squad) in &joiners {
+        let key = (*team, squad.0);
+        let Some(kind) = stances.0.get(&key).copied() else {
+            continue;
+        };
+        let Some(posture) = orders.0.get(&key) else {
+            continue;
+        };
+        let Some((def, anchor, rally)) = stance_bundle(*team, kind, posture) else {
+            continue;
+        };
+        stamp_stance(&mut commands.entity(entity), def, anchor, rally);
     }
 }
 
@@ -7746,6 +7866,191 @@ mod tests {
             app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
             "and must not claim the squad was empty"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Late joiners (wc3clone-bol). A unit that walks into a stanced squad
+    // wears the whole stance, not just the posture.
+    // -----------------------------------------------------------------
+
+    /// **The bead.** A commander stances squad 1, then reinforces it — the
+    /// ordinary shape of a match. Before this, the newcomer inherited the
+    /// posture (per-squad) and none of the leash, threshold or focus list, so
+    /// the squad fielded two different doctrines and the only symptom was that
+    /// half of it did not break off.
+    #[test]
+    fn a_unit_that_joins_a_stanced_squad_inherits_the_whole_stance() {
+        let mut app = compiler_app();
+        let founder = squad_member(&mut app, Team::Human, 1);
+        let anchor = Vec3::new(20.0, 0.0, -30.0);
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "secure", Some(anchor))));
+        app.update();
+
+        // A body trained after the word was sent, enrolled by a later `squad`.
+        let recruit = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Health::new(100.0),
+                Order::Idle,
+            ))
+            .id();
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Squad {
+                units: vec![recruit.to_bits()],
+                id: Some(1),
+                select: None,
+            },
+        ));
+        app.update();
+
+        let def = StanceKind::Secure.def();
+        let world = app.world();
+        for (who, entity) in [("the founder", founder), ("the recruit", recruit)] {
+            let leash = world
+                .entity(entity)
+                .get::<LeashPolicy>()
+                .unwrap_or_else(|| panic!("{who} must carry secure's leash"));
+            assert_eq!(leash.anchor, anchor, "{who}'s leash is pinned elsewhere");
+            assert_eq!(leash.radius, def.leash);
+            let retreat = world
+                .entity(entity)
+                .get::<RetreatPolicy>()
+                .unwrap_or_else(|| panic!("{who} must carry secure's threshold"));
+            assert_eq!(retreat.below_frac, def.retreat_below);
+            assert_eq!(retreat.rally, anchor);
+            let prio = world
+                .entity(entity)
+                .get::<TargetPriority>()
+                .unwrap_or_else(|| panic!("{who} must carry secure's focus list"));
+            assert_eq!(prio.0, def.priority);
+        }
+    }
+
+    /// **The choke point is the component, not the `squad` verb.** units.rs
+    /// stamps a `DoctrineTemplate`'s squad at spawn and doctrine.rs enrols
+    /// strays into `DEFAULT_SQUAD`; neither goes anywhere near this compiler.
+    /// Writing `SquadId` from outside is how this test says so — if the
+    /// inheritance were wired into the verb instead, this would fail.
+    #[test]
+    fn a_unit_enrolled_by_another_module_inherits_the_stance_too() {
+        let mut app = compiler_app();
+        squad_member(&mut app, Team::Human, DEFAULT_SQUAD);
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(DEFAULT_SQUAD, "turtle", None)));
+        app.update();
+
+        // No intent, no batch, no compiler: just the component, exactly as
+        // `default_squad_autonomy` and the production template write it.
+        let stray = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Health::new(100.0),
+                Order::Idle,
+                SquadId(DEFAULT_SQUAD),
+            ))
+            .id();
+        app.update();
+
+        assert!(
+            app.world().entity(stray).get::<LeashPolicy>().is_some(),
+            "a unit enrolled outside the compiler still joined a turtling squad"
+        );
+        assert_eq!(
+            app.world().entity(stray).get::<RetreatPolicy>().unwrap().below_frac,
+            StanceKind::Turtle.def().retreat_below
+        );
+    }
+
+    /// Changing squads is joining one, and the new squad's bundle replaces the
+    /// old one's whole — the same rule `switching_stance_replaces_the_whole_bundle`
+    /// pins for a squad that switches word. A body walked out of a `turtle` and
+    /// into a `push` must not keep the turtle's leash, or the push it just
+    /// joined gets hauled back by a policy nobody set.
+    #[test]
+    fn a_unit_that_changes_squad_swaps_bundles_whole() {
+        let mut app = compiler_app();
+        let unit = squad_member(&mut app, Team::Human, 1);
+        squad_member(&mut app, Team::Human, 2);
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "turtle", None)));
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            stance(2, "push", Some(Vec3::new(70.0, 0.0, 70.0))),
+        ));
+        app.update();
+        assert!(
+            app.world().entity(unit).get::<LeashPolicy>().is_some(),
+            "control: turtle leashed it"
+        );
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Squad {
+                units: vec![unit.to_bits()],
+                id: Some(2),
+                select: None,
+            },
+        ));
+        app.update();
+
+        let world = app.world();
+        assert!(
+            world.entity(unit).get::<LeashPolicy>().is_none(),
+            "push has no leash, so joining a pushing squad must REMOVE turtle's"
+        );
+        assert_eq!(
+            world.entity(unit).get::<RetreatPolicy>().unwrap().rally,
+            clamp_to_map(Team::Human.base_pos()),
+            "push rallies to base; the turtle's anchor rally must be gone"
+        );
+    }
+
+    /// **Only stanced squads.** A squad holding a hand-set `posture` has no
+    /// per-squad doctrine to hand down — `leash`, `retreat` and `priority` take
+    /// a unit selector, not a squad — so a joiner is left exactly as it was.
+    /// This is the documented limit of the feature, and the reason the word
+    /// rather than the posture is what a joiner inherits.
+    #[test]
+    fn a_joiner_of_an_unstanced_squad_is_left_alone() {
+        let mut app = compiler_app();
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Posture {
+                id: 1,
+                posture: Some(PostureIntent::Push {
+                    x: Some(10.0),
+                    z: Some(10.0),
+                    region: None,
+                }),
+            },
+        ));
+        app.update();
+
+        let recruit = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Health::new(100.0),
+                Order::Idle,
+                SquadId(1),
+            ))
+            .id();
+        app.update();
+
+        let world = app.world();
+        assert!(world.entity(recruit).get::<LeashPolicy>().is_none());
+        assert!(world.entity(recruit).get::<RetreatPolicy>().is_none());
+        assert!(world.entity(recruit).get::<TargetPriority>().is_none());
     }
 
     /// A stance reaches only ITS OWN squad, and only its own team. The same
