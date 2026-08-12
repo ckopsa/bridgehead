@@ -100,7 +100,7 @@ struct Part {
     mat: usize,
 }
 
-#[derive(Resource)]
+#[derive(Resource, Default)]
 struct EconomyAssets {
     parts: HashMap<BuildingKind, Vec<Part>>,
     team_mats: HashMap<Team, [Handle<StandardMaterial>; 3]>,
@@ -2815,6 +2815,152 @@ mod tests {
             (gold(&app, team), lumber(&app, team)),
             (600, 900),
             "the team has had a hero; the next one is bought"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: what is left behind when a node runs out
+    // -----------------------------------------------------------------------
+
+    /// A world where a worker can actually empty a node: the real
+    /// `harvest_loop` over a nav grid and a treasury, and nothing else.
+    fn app_with_harvest() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<NavGrid>()
+            .init_resource::<Economies>()
+            .init_resource::<EconomyAssets>()
+            .add_systems(Update, harvest_loop);
+        app
+    }
+
+    fn spawn_node(app: &mut App, kind: ResourceKind, remaining: u32, pos: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                ResourceNode { kind, remaining },
+                Transform::from_translation(pos),
+            ))
+            .id()
+    }
+
+    /// A worker mid-swing at `node`, one gather short of emptying it.
+    fn swinging_at(app: &mut App, team: Team, node: Entity, kind: ResourceKind, pos: Vec3) {
+        app.world_mut().spawn((
+            team,
+            Transform::from_translation(pos),
+            HarvestJob {
+                node: Some(node),
+                node_pos: pos,
+                kind,
+                phase: HarvestPhase::Gathering,
+                timer: 0.0,
+                attempts: 0,
+            },
+        ));
+    }
+
+    /// **A mined-out gold mine stays on the board; a felled tree does not.**
+    ///
+    /// The two are different kinds of thing. A tree is scenery that is consumed;
+    /// a gold mine is *geography* — a named place, a fixed position every
+    /// snapshot ships, and the thing a hall was placed to work. "That mine is
+    /// dry" is a fact about the map that every reader of the world needs to be
+    /// able to observe: `TriggerWhen::MineDry` asks for a node with
+    /// `remaining == 0`, `alarm::income_alarm` counts live mines against mines
+    /// near home, `intent::nearest_node` skips the empty ones, and the bridge
+    /// snapshot ships `mines[].remaining`. All four are written against a dry
+    /// mine that is still there to be looked at. Despawning it does not make it
+    /// dry, it makes it *absent*, and absence is a different sentence.
+    #[test]
+    fn an_emptied_mine_stays_on_the_board_and_an_emptied_tree_does_not() {
+        let mut app = app_with_harvest();
+        let at_mine = Vec3::new(-60.0, 0.0, -60.0);
+        let at_tree = Vec3::new(10.0, 0.0, 10.0);
+        let mine = spawn_node(&mut app, ResourceKind::Gold, CARRY_AMOUNT, at_mine);
+        let tree = spawn_node(&mut app, ResourceKind::Lumber, CARRY_AMOUNT, at_tree);
+        swinging_at(&mut app, Team::Human, mine, ResourceKind::Gold, at_mine);
+        swinging_at(&mut app, Team::Human, tree, ResourceKind::Lumber, at_tree);
+
+        tick(&mut app, GATHER_TIME + 0.1);
+
+        let dry = app.world().get::<ResourceNode>(mine);
+        assert!(
+            dry.is_some(),
+            "the mine ran dry — it did not stop being a place"
+        );
+        assert_eq!(dry.unwrap().remaining, 0, "and it reads as dry");
+        assert!(
+            app.world().get::<ResourceNode>(tree).is_none(),
+            "a felled tree is gone; there are thousands of them and nothing asks after one"
+        );
+    }
+
+    /// **r23, the whole bug in one test.** Blue armed
+    /// `when a mine at our base runs dry: build a TownHall`, watched both home
+    /// mines empty, and the rule sat `armed` to the end of the match. The
+    /// predicate was right and the world never showed it a dry mine: the node
+    /// was despawned in the same statement that took its last gold, so the only
+    /// state that could have satisfied `remaining == 0` existed for zero frames
+    /// of the evaluator's sweep.
+    ///
+    /// The two systems are the two ends of that seam — `harvest_loop` empties
+    /// the mine in `SimSet::Economy`, `evaluate_triggers` sweeps in the next
+    /// frame's `SimSet::Think` — so the test runs both and ticks twice, which
+    /// is exactly the distance the real schedule puts between them.
+    #[test]
+    fn the_mine_running_dry_at_our_hall_fires_the_expand_trigger() {
+        let mut app = app_with_harvest();
+        app.init_resource::<Races>()
+            .init_resource::<Triggers>()
+            .init_resource::<Regions>()
+            .init_resource::<TechTiers>()
+            .init_resource::<GameEvents>()
+            .add_event::<SubmitIntent>()
+            .add_systems(Update, crate::trigger::evaluate_triggers);
+        app.insert_resource(FogGrids::test_dark());
+
+        // Blue's opening geometry: a finished hall, and the mine it was placed
+        // to work, well inside `MINE_HOME_RADIUS`.
+        let hall = Vec3::new(-66.0, 0.0, -66.0);
+        let at_mine = Vec3::new(-60.0, 0.0, -60.0);
+        app.world_mut().spawn((
+            Building { kind: BuildingKind::TownHall },
+            Team::Human,
+            Transform::from_translation(hall),
+            Health::new(1500.0),
+        ));
+        let mine = spawn_node(&mut app, ResourceKind::Gold, CARRY_AMOUNT, at_mine);
+        swinging_at(&mut app, Team::Human, mine, ResourceKind::Gold, at_mine);
+
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(TriggerRule {
+                name: TriggerName::new("expand").expect("legal name"),
+                when: TriggerWhen::MineDry,
+                then: Intent::Stop { units: vec![], select: None },
+                repeat: None,
+                source: IntentSource::Bridge,
+                armed: true,
+                last_fired: None,
+            });
+
+        tick(&mut app, GATHER_TIME + 0.1); // the mine empties
+        tick(&mut app, 0.1); // the sweep reads the world it left
+
+        let fired: Vec<SubmitIntent> = app
+            .world_mut()
+            .resource_mut::<Events<SubmitIntent>>()
+            .drain()
+            .collect();
+        assert_eq!(
+            fired.len(),
+            1,
+            "the mine at our hall ran dry and the rule was armed for exactly that"
+        );
+        assert!(
+            !app.world().resource::<Triggers>().get(Team::Human)[0].armed,
+            "a once-trigger spends itself when it fires"
         );
     }
 }
