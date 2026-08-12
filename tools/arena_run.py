@@ -275,7 +275,13 @@ def read_log(log: str) -> dict:
         # Bevy prints the Team enum, whose variants are the team names.
         out["winner"] = m.group("winner")
         out["reason"] = m.group("reason") if m.group("reason") != "unknown" else None
-        out["decisive"] = True
+        # A capped match now decides itself (wc3clone-j84), so the engine
+        # prints BOTH the timeout verdict and the game-over line — and this
+        # branch reads the second one first. `decisive` follows the reason
+        # rather than the line it was found on: `score` is a referee's opinion
+        # however the engine chose to announce it, and the ledger has recorded
+        # capped rounds as undecisive since round 10.
+        out["decisive"] = out["reason"] != "score"
         if m.group("t"):
             out["duration_s"] = round(float(m.group("t")), 1)
     elif m := TIMECAP.search(log):
@@ -319,11 +325,22 @@ def wait_for_seat_game_over(seat_dirs: list[Path], deadline: float, poll: float 
             except (OSError, json.JSONDecodeError):
                 continue
             if snap.get("game_over"):
+                reason = snap.get("game_over_reason")
+                # The wire and the ledger spell a draw differently, and this is
+                # the boundary where they are translated. `game_over: "draw"`
+                # exists because a commander's poll loop terminates on that key
+                # being non-null and a tie has to end the match too
+                # (wc3clone-j84); the record keeps ARENA.md's spelling, where a
+                # draw is an absent winner and never a sentinel team.
+                winner = None if snap["game_over"] == "draw" else snap["game_over"]
                 return {
-                    "winner": snap["game_over"],
-                    "reason": snap.get("game_over_reason"),
+                    "winner": winner,
+                    "reason": reason,
                     "duration_s": round(float(snap.get("t", 0)), 1) or None,
-                    "decisive": True,
+                    # `score` is the cap's referee, not a win: same rule as
+                    # `read_log`, so the windowed and headless paths cannot
+                    # disagree about a round they both watched.
+                    "decisive": winner is not None and reason != "score",
                     "metrics": {},
                 }
         time.sleep(poll)
