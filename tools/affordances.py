@@ -1372,13 +1372,19 @@ def recipe_forms(state, catalog):
                 "type": "trigger_set",
                 "name": "steady-production",
                 "repeat": 20,
-                "when": {"type": "unit_count", "kind": None, "below": None},
+                "when": {"type": "game_time", "at": 0},
                 "then": {"type": "train", "select": steady_select, "unit": None},
             },
             [
-                field("when.kind", "kind", "which unit to keep topped up.",
-                      domain=[k for _, _, _, trains in producers for k in trains] or None),
-                field("when.below", "integer", "the headcount that re-arms it.", rng=(1, 200)),
+                field(
+                    "repeat",
+                    "seconds",
+                    "the production pulse. Every this-many seconds the rule tries to queue "
+                    "one unit at an idle producer; all-busy is a quiet refusal and the rule "
+                    "stays armed.",
+                    rng=(10, 120),
+                    default=20,
+                ),
                 field(
                     "then.select",
                     "selector",
@@ -1390,9 +1396,11 @@ def recipe_forms(state, catalog):
                 field("then.unit", "kind", "what it queues.",
                       domain=[k for _, _, _, trains in producers for k in trains] or None),
             ],
-            reason="repeating on a 20s cooldown, because production is a level and not an "
-                   "event. The gold is charged when it fires, never at arm time — and if the "
-                   "bank is short the fire is refused in words and the rule stays armed.",
+            reason="a repeating pulse (`game_time` at 0 + `repeat`), because the trigger "
+                   "vocabulary has no 'fewer than N of kind' predicate — 'maintain N' is a "
+                   "policy the wire cannot yet say (it is a filed want). The gold is charged "
+                   "when it fires, never at arm time — and if the bank is short the fire is "
+                   "refused in words and the rule stays armed.",
             note="`then.unit` and `when.kind` are usually the same word; they do not have to be."
                  if producers else
                  "you hold no finished producer yet, so `then.select` has no fact-shaped "

@@ -433,6 +433,33 @@ def test_the_unit_domain_prices_every_row_against_this_seats_own_bank():
     assert unit["default"] is None, "what to build is the commander's call"
 
 
+def test_every_served_when_matches_the_predicate_schema_the_document_serves():
+    """r25's lesson: the steady-production recipe shipped a `when` with a
+    `below` field no predicate has, and the first commander to trust the
+    printed template got 'missing field count' back at fire time. A printed
+    recipe must compile, and the document itself serves the schema to check
+    against — so every template's `when` is validated here against
+    `catalog.predicates`, required fields covered, no invented fields."""
+    cat = catalog()
+    schema = {p["id"]: p["fields"] for p in cat["predicates"]}
+    for fixture in (ARMED, ALARM):
+        d = affordances.document(load(fixture), cat)
+        for a in d["actions"]:
+            when = (a.get("template") or {}).get("when")
+            if not isinstance(when, dict):
+                continue
+            pid = when.get("type")
+            assert pid in schema, "{}: unknown predicate {!r}".format(a["rel"], pid)
+            legal = {f["name"] for f in schema[pid]}
+            sent = set(when) - {"type"}
+            assert sent <= legal, "{}: `when` invents fields {} — predicate {} takes {}".format(
+                a["rel"], sorted(sent - legal), pid, sorted(legal))
+            required = {f["name"] for f in schema[pid] if f.get("required")}
+            # A None is a judgment hole the commander fills; the KEY must exist.
+            assert required <= sent, "{}: `when` omits required {}".format(
+                a["rel"], sorted(required - sent))
+
+
 def test_the_steady_production_recipe_names_a_role_and_not_a_barracks():
     """The r23-class win: a repeating train rule that finds a live, idle
     producer every time it fires instead of a barracks that may be rubble."""
