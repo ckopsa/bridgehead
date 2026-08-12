@@ -432,7 +432,7 @@ def field(path, ftype, note, domain=None, rng=None, default=None):
     return f
 
 
-def form(rel, title, template, fields, ready=True, reason="", slots=None, note=None):
+def form(rel, title, template, fields, ready=True, reason="", slots=None, note=None, cost=None):
     """One FORM: a template with the judgment-shaped holes left `null`."""
     a = {
         "kind": "form",
@@ -443,6 +443,8 @@ def form(rel, title, template, fields, ready=True, reason="", slots=None, note=N
         "template": template,
         "fields": fields,
     }
+    if cost is not None:
+        a["cost"] = cost
     if slots is not None:
         a["slots"] = slots
     if note is not None:
@@ -575,7 +577,7 @@ def stance_form(state, catalog):
     )
 
 
-def squad_form(state):
+def squad_form(state, catalog=None):
     """Enrolment — the prerequisite a stance has no way to state for itself."""
     return form(
         "squad",
@@ -587,6 +589,7 @@ def squad_form(state):
                 "selector",
                 "resolved when the command runs. `all army` is pre-filled because it is "
                 "a fact about what the phrase means, never a claim about where they belong.",
+                domain=selector_vocabulary(catalog)["units"],
                 default="all army",
             ),
             field("id", "integer", "which squad number to enrol them into.", rng=(0, 255)),
@@ -628,9 +631,10 @@ def trigger_forms(state, catalog):
                 field("when", "predicate", "one of the thirteen predicates; see "
                                            "tools/COMMANDER_BRIEF.md for each one's fields.",
                       domain=predicates),
-                field("then", "intent", "any intent. Prefer a `stance`/`posture` on a SQUAD or a "
-                                        "`select` phrase over a list of unit ids — a frozen id "
-                                        "becomes a corpse."),
+                field("then", "intent", "any intent. Prefer a `stance`/`posture` on a SQUAD, or a "
+                                        "`\"select\"` phrase over a list of unit ids — a frozen "
+                                        "id becomes a corpse. Legal phrases: "
+                        + ", ".join(selector_vocabulary(catalog)["units"]) + "."),
                 field("repeat", "number", "cooldown in game seconds. Omit and the rule fires once."),
             ],
             ready=room,
@@ -835,16 +839,15 @@ def build_form(state, catalog):
         if race and b.get("race") and race not in b["race"]:
             continue
         g, l = b.get("cost_gold"), b.get("cost_lumber")
-        price = "{}g/{}l".format(g, l) if g is not None else "price not in this catalog"
+        if g is None:
+            rows.append("{} — price not in this catalog".format(kid))
+            continue
+        ok, price = affordable(state, g, l)
         if unlocked.get(kid) is False:
             req = ", ".join(b.get("requires") or []) or "higher tech"
             rows.append("{} — {} — NOT AVAILABLE: requires {}".format(kid, price, req))
-        elif g is not None and (me.get("gold", 0) < g or me.get("lumber", 0) < l):
-            rows.append(
-                "{} — {} — cannot afford (you hold {}g/{}l)".format(
-                    kid, price, me.get("gold", 0), me.get("lumber", 0)
-                )
-            )
+        elif not ok:
+            rows.append("{} — {} — cannot afford".format(kid, price))
         else:
             rows.append("{} — {} — available".format(kid, price))
     return form(
@@ -859,12 +862,13 @@ def build_form(state, catalog):
         },
         [
             field("select", "selector", "the lowest-id match builds it. A role, not an id.",
-                  default="workers"),
+                  domain=selector_vocabulary(catalog)["units"], default="workers"),
             field("kind", "kind", "what to put down. Availability is your OWN tech, read off "
                                   "`unlocked`.", domain=rows or None),
             field("region", "place", "roughly where.", domain=place_domain(state)),
             field("site", "selector", "`nearest legal site` moves the footprint to the nearest "
                                       "legal one within 15 instead of refusing.",
+                  domain=selector_vocabulary(catalog)["sites"],
                   default="nearest legal site"),
         ],
         reason="you hold {}g/{}l at tier {}".format(
@@ -965,6 +969,7 @@ def recipe_forms(state, catalog):
                      hall_price,
                      "" if unlocked.get("TownHall", True) else " and is NOT currently available",
                  ),
+            cost=hall_price,
         ),
         form(
             "recipe:counter-punch",
@@ -1156,7 +1161,7 @@ def document(state, catalog=None, prefs=None):
     actions = []
     actions += stance_actions(state, props, catalog)
     actions.append(stance_form(state, catalog))
-    actions.append(squad_form(state))
+    actions.append(squad_form(state, catalog))
     actions += trigger_forms(state, catalog)
     actions += region_forms(state)
     actions += plan_forms(state)

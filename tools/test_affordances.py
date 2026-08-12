@@ -414,6 +414,27 @@ def test_the_field_domains_come_from_the_engines_own_vocabulary():
     assert affordances.selector_vocabulary(None) == affordances.SELECTOR_FALLBACK
 
 
+def test_a_unit_field_serves_the_selector_vocabulary_not_a_roster_of_ids():
+    """The point of 0uu.1: a commander names a ROLE and stops plumbing ids, so
+    the domain of a unit-shaped field is the phrase list, never `units[]`."""
+    d = doc(ARMED)
+    phrases = affordances.selector_vocabulary(catalog())
+    select = next(f for f in by_rel(d, "squad")["fields"] if f["path"] == "select")
+    assert select["domain"] == phrases["units"]
+    assert "my hero" in select["domain"] and "squad <n>" in select["domain"]
+    site = next(f for f in by_rel(d, "build")["fields"] if f["path"] == "site")
+    assert site["domain"] == phrases["sites"] == ["nearest legal site"]
+    then = next(f for f in by_rel(d, "trigger_set")["fields"] if f["path"] == "then")
+    assert "all army" in then["note"], "the phrase list rides with the free-form field too"
+
+
+def test_a_form_that_spends_says_what_it_costs():
+    expand = by_rel(doc(ARMED), "recipe:expand")
+    assert expand["cost"], "arming is free; the TownHall it will place is not"
+    assert "g/" in expand["cost"]
+    assert "charged when it fires" in expand["note"]
+
+
 def test_the_predicate_domain_matches_the_brief_a_commander_reads():
     """The thirteen `when` predicates are not in the catalog, so this module
     keeps a copy — and a copy that can rot quietly is worse than no copy. The
