@@ -67,6 +67,17 @@ def main():
     for e in s.get("errors", []):
         print(f"ERR: {e}")
 
+    # --- alarms ---
+    # Above everything else in the readout, and printed with its running
+    # default on the same line, because that is the whole design: the alarm is
+    # a prompt to re-decide, and the sentence after the dash is what happens if
+    # you do not. Absent until something is standing, so a quiet match prints
+    # nothing extra (docs/AFFORDANCES.md, "Alarms").
+    for a in s.get("alarms", []):
+        eta = f" [ETA {a['eta_s']:.0f}s]" if a.get("eta_s") is not None else ""
+        print(f"ALARM/{a['severity']} {a['fact']}{eta}")
+        print(f"  default (happens if you say nothing): {a['running_default']}")
+
     mine_units = [u for u in s["units"] if u["team"] == my_team]
     enemy_units = [u for u in s["units"] if u["team"] == enemy_team]
     mine_b = [b for b in s["buildings"] if b["team"] == my_team]

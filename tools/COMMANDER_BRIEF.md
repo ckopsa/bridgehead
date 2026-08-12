@@ -50,6 +50,11 @@ Farm, a cheaper step) or `plan_clear` and write a plan you can afford. Sleeping
 until the grace window expires is neither, and it ends with the plan `halted`
 on the step you needed most.
 
+**Check `alarms` on every view.** It is the short list of things the engine
+thinks are worth a fresh decision — and each entry already tells you what is
+being done about it if you do nothing. Everything not in that list defaults to
+continue. See **Alarms** below.
+
 Your units are never fully idle even between your cycles: every army unit auto-joins
 squad 0 (default posture: defend your base). Repoint squad 0 — or set it to
 `forage` — and your army acts continuously without further orders.
@@ -214,6 +219,66 @@ be 4..60. You may not take a name `map.places` already owns.
 A name you have not defined is refused with the list of names you do have, so a
 typo costs you one error line rather than a silent order to the map's centre.
 
+## Alarms: the four things worth re-deciding
+
+Everything else defaults to **continue**. Silence is a legal, and usually
+correct, move — your squads keep their postures, your triggers keep watching,
+your plans keep stepping. The engine forces a fresh choice on exactly four
+conditions, and it puts them in your snapshot's `alarms` array:
+
+| `id` | fires when |
+| --- | --- |
+| `enemy_army_sighted` | a body of enemy troops at or above the threshold is in **your `intel` ledger**, seen recently |
+| `squad_below_half` | one of your own squads is under half its pooled health |
+| `income_collapse` | your gold has stopped — every mine your halls work is dry, or nobody is on gold |
+| `places_under_attack` | your buildings are being hit in **two or more places at once** |
+
+```json
+"alarms": [
+  {
+    "id": "places_under_attack",
+    "fact": "2 places under attack at once: near our base (Barracks, TownHall); at (60, 60) (Farm)",
+    "running_default": "your trigger home-guard fired at t=203 — squad 1 is closing on near our base (ETA 22s)",
+    "since_t": 209.0,
+    "severity": "critical",
+    "eta_s": 22.0
+  }
+]
+```
+
+**Read `running_default` first, every time.** An alarm never acts and the sim
+never waits for your answer. It fires only *after* the fast tier — your
+doctrine, your armed triggers — has already responded, and `running_default` is
+that response, named. If you say nothing, that is what happens. A commander
+that only ever confirms its defaults is playing acceptably; the alarm exists so
+that confirming is a decision instead of an accident.
+
+When nothing is standing, `running_default` says so in those words — *"nothing
+recovers this automatically"*, *"nothing pulls them out (no retreat threshold
+set)"*, *"nothing is moving to either place"*. That sentence is the most useful
+one in the array: it is the difference between a raid being handled and a raid
+being watched.
+
+`eta_s` is present only when the running default is something walking. It is
+**absent**, not zero, when nothing is in transit — "nothing is moving" and "it
+arrives now" are opposite answers.
+
+**Levels and edges.** The array is a *status*: an entry is there for exactly as
+long as its condition holds, refreshed every sweep, so a slow poller reads what
+is true now rather than what was true when it fired. The transitions are in
+`events` — one `alarm: <fact> — default: <what is happening>` line on the way
+in, one `alarm clear: <name>` on the way out, and **nothing in between**. An
+alarm that is still true is not new news. `bridge_wait.py` wakes you on the
+edges; the array answers "and is it still going on?".
+
+**What an alarm is not.** It is not a first responder. You answer at tens of
+seconds; anything with a shorter deadline has to live in doctrine or a trigger,
+which is what the section below is for. The right reading of an alarm is
+policy-shaped and stays valid over a thirty-second window — *"full recall, or
+sacrifice the expansion?"* is still the right question a minute later; *"dodge
+the ambush"* never was. Arm the fast answers ahead of time and spend your polls
+on the slow ones.
+
 ## Triggers: make the engine react for you
 
 **This is the single biggest thing you can do about your own latency.** You poll
@@ -225,7 +290,9 @@ link** (see the chain-of-command section) because you reached the unit when you
 armed the rule, not when it fired.
 
 Arm your standing plans at the top of the match and stop spending polls on
-alarms you already know how to answer.
+situations you already know how to answer. (An *alarm* in this brief means the
+`alarms` array above — a prompt to re-decide. A trigger is how you answer one
+before it is raised.)
 
 Rules: max **8** armed at once. Re-using a `name` replaces that rule in place
 (free — the cap counts names, so tune all you like). A trigger cannot arm or
