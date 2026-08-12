@@ -801,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
     ))
     scaffolded = [s["side"] for s in seats if s.get("scaffold")]
     if scaffolded:
-        print(f"  doc:    {' '.join(scaffolded)} read tools/bridge_view.py --doc")
+        print(f"  doc:    {' '.join(scaffolded)} read tools/bridge_view.py --doc --all once at t=0, --doc each cycle")
     print(f"  binary: {args.bin}")
     print(f"  out:    {out_dir}")
     if args.dry_run:
@@ -839,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
             # the document, so the line that spawns it says so — the ledger
             # entry is a claim about what this seat was given, and the briefing
             # is where that claim is made true.
-            view = " + tools/bridge_view.py --doc" if seat.get("scaffold") else ""
+            view = " + tools/bridge_view.py --doc --all at t=0, --doc each cycle" if seat.get("scaffold") else ""
             print(f"  {seat['persona'] or 'unnamed'}: seat {seat['dir']}, brief {brief}{view}")
 
     launch = dict(os.environ)

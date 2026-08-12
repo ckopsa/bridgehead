@@ -399,7 +399,7 @@ def test_a_dry_run_prints_the_constants_it_would_record():
     assert out.returncode == 0, out.stderr
     assert "alarms_ron=" in out.stdout and "stances_ron=" in out.stdout
     assert f"affordance_doc={arena_run.scaffold_version()}" in out.stdout
-    assert "red read tools/bridge_view.py --doc" in out.stdout
+    assert "red read tools/bridge_view.py --doc --all once at t=0" in out.stdout
 
 
 # ---------------------------------------------------------------------------

@@ -1,9 +1,9 @@
 # Stances, Affordances, and the Small-Commander Problem
 
 *Design distilled from arena rounds r21–r23 (see `arena/ledger.jsonl` and each
-round's AARs) and the orchestration discussion of 2026-08-11. Status: design,
-not yet implemented. The work breakdown is the Implementation plan section at
-the end of this document, filed as epic `wc3clone-0uu`. 2026-08-12: the
+round's AARs) and the orchestration discussion of 2026-08-11. Status: SHIPPED —
+epic `wc3clone-0uu` closed 2026-08-12; validated by the r25–r29 model ladder
+(`arena/LADDER.md`). 2026-08-12: the
 affordance menu and the commander digest were merged into a single hypermedia
 document — see "One document" below.*
 
