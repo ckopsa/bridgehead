@@ -962,7 +962,7 @@ in front of you beats a sequence written before the match.
 ```bash
 python3 tools/bridge_view.py --doc <SEAT>/state.json          # to read
 python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse
-python3 tools/bridge_view.py --doc-version                    # affordance-doc/1.2
+python3 tools/bridge_view.py --doc-version                    # affordance-doc/1.3
 ```
 
 The digest tells you **what is going on**. The document tells you **what you can
@@ -1097,7 +1097,7 @@ The `unit` domain prices every row against your own bank, your own tech and
 (for heroes) your own slots, so a refusal that would have cost a poll cycle
 arrives with the menu instead.
 
-`affordance-doc/1.2` adds `rally:<kind>`, `template:<kind>` and `cancel:<kind>`
+`affordance-doc/1.3` fixes the steady-production recipe (a served template now always compiles); `1.2` added `rally:<kind>`, `template:<kind>` and `cancel:<kind>`
 beside them, the other three verbs a building selector made sayable without an
 id. `rally:` states the current rally point in its reason line (off
 `buildings[].rally`), and `cancel:` is listed NOT-READY with your queues spelled

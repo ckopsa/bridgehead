@@ -80,6 +80,10 @@ from bridge_view import dist, load_catalog  # noqa: E402
 #: the `recipe:steady-production` rule) once the building selector family made
 #: `train` sayable without an entity id. The document's SHAPE did not move, so
 #: the major half did not either.
+#: `1.3` — r25: `recipe:steady-production`'s `when` becomes a compilable
+#: repeating `game_time` pulse (the served `unit_count`+`below` shape never
+#: compiled). A fixed recipe changes what a trusting commander arms, so the
+#: rounds either side of it must not claim one scaffold.
 #: `1.2` — the `when` field serves the real predicate schema out of
 #: `catalog.predicates` (`enemy_in(region, [class], [count=1])`) instead of
 #: fourteen bare type names, and the rally/template/cancel forms arrived beside
@@ -87,7 +91,7 @@ from bridge_view import dist, load_catalog  # noqa: E402
 #: that no longer has to leave the document to find out what an arm takes writes
 #: different commands — so the ledger has to be able to tell the two scaffolds
 #: apart.
-DOC_VERSION = "affordance-doc/1.2"
+DOC_VERSION = "affordance-doc/1.3"
 
 # ---------------------------------------------------------------------------
 # Engine constants this view mirrors

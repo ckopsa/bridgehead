@@ -122,10 +122,10 @@ def test_the_document_has_the_five_top_level_sections():
 def test_the_document_carries_its_own_version():
     """AFFORDANCES.md constraint 3: the scaffold's version travels with the
     result, or the ledger cannot tell model from model+scaffold."""
-    # `1.2`: the `when` field serves real predicate schemas out of the catalog,
-    # and rally/template/cancel joined the production forms. The major half is
-    # the document's SHAPE and has not moved.
-    assert affordances.DOC_VERSION == "affordance-doc/1.2"
+    # `1.3`: r25's steady-production recipe fix — a served template that never
+    # compiled now does, which changes what a trusting commander arms. The
+    # major half is the document's SHAPE and has not moved.
+    assert affordances.DOC_VERSION == "affordance-doc/1.3"
     assert doc()["doc_version"] == affordances.DOC_VERSION
     assert run("--doc-version").strip() == affordances.DOC_VERSION
     assert subprocess.run(
