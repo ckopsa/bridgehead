@@ -1,11 +1,73 @@
 #!/usr/bin/env python3
-"""Compact tactical summary of bridge/state.json for the Red commander."""
+"""Compact tactical summary of bridge/state.json for the Red commander.
+
+Two views over the same file, and nothing but views: this script never writes
+`state.json`, never sends a command, and never needs the wire to grow a key.
+
+  * the default full readout — every unit id, every building, mines and trees.
+    What a commander wants when it is editing a rule or hunting an id.
+  * ``--digest`` — the ~15-line commander digest of docs/AFFORDANCES.md
+    ("Snapshot diet"): resources, army by squad, production queues, the enemy
+    production buildings this seat has SEEN (the win-condition line), the last
+    five events, any active alarms, and the running default — what silence does
+    now. Drops the per-unit id rosters, the tree ids, the per-farm HP and the
+    full plans echo, which is where a small commander's attention was going.
+
+The digest is deliberately split in two halves. ``digest()`` returns structured
+data and ``render_digest()`` turns that into lines. AFFORDANCES.md's "One
+document" section makes the digest the PROPERTIES section of a single
+hypermedia document whose other half is actions/forms; when that renderer
+arrives it embeds ``digest()``'s dict verbatim and adds its own ``actions`` key
+beside it, rather than re-deriving any of this from the snapshot a second time.
+
+Everything here degrades on old snapshots. Every read is a ``.get`` with a
+default, because the keys this reads were added over a dozen releases and a
+digest that raises ``KeyError`` on a seat that never armed a trigger is worse
+than no digest at all.
+"""
+import argparse
 import json
 import math
+import os
+import re
 import sys
 from collections import Counter, defaultdict
 
 BASES = {"Claude": (70.0, 70.0), "Human": (-70.0, -70.0)}
+
+# --- digest constants -------------------------------------------------------
+
+# How many lines the digest may occupy. "~15 lines" is the design number; this
+# is the hard ceiling that keeps a fifteen-squad late game from quietly turning
+# the digest back into the thing it replaced. Sections trim themselves against
+# it in `render_digest`, cheapest information first.
+MAX_LINES = 18
+#: Events shown, newest last. Five is AFFORDANCES.md's number.
+EVENT_LINES = 5
+#: Squad lines before the rest collapse into a "+N more" tail.
+SQUAD_LINES = 4
+
+# A building is PRODUCTION — the thing the win condition counts — when it
+# trains something (`shared::check_game_over` asks `!trainable(kind).is_empty()`).
+# The seat's own `catalog.json` carries `trains` per building and is consulted
+# first; this is the fallback for a digest rendered from a bare `state.json`
+# with no catalog beside it. Both hall ladders and both races are here because
+# a kind missing from this set would silently under-count the win condition.
+PRODUCTION_KINDS = frozenset(
+    {
+        # Kingdom
+        "TownHall", "Keep", "Castle", "Barracks", "Workshop", "Sanctum",
+        # Horde
+        "Stronghold", "Fortress", "Hold", "WarCamp", "SpiritLodge",
+    }
+)
+
+#: How near a named choke a spot must be to be called by its name — the same
+#: 30.0 `shared::place_name` uses, so the digest names ground the way the event
+#: feed does.
+PLACE_CHOKE_RADIUS = 30.0
+
+_COORDS = re.compile(r"\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)")
 
 
 def dist(a, b):
@@ -21,10 +83,493 @@ def centroid(points):
     )
 
 
+# ---------------------------------------------------------------------------
+# The digest — docs/AFFORDANCES.md, "Snapshot diet"
+#
+# `digest()` is a pure function of the snapshot dict (plus, optionally, the
+# seat's catalog). It reads nothing off disk, writes nothing, and has no
+# opinions: every number in it is either copied out of the snapshot or summed
+# from it. Where it reports the enemy, it reports only what the snapshot has
+# already decided this seat may know — `buildings` is fog-gated by the engine
+# (live sightings plus remembered ghosts carrying `last_seen`), so the
+# win-condition line inherits fog-honesty instead of re-deriving it.
+# ---------------------------------------------------------------------------
+
+
+def production_kinds(catalog):
+    """Which building kinds count toward the win condition.
+
+    The catalog is authoritative — a building is production when it trains
+    something — and `PRODUCTION_KINDS` stands in when no catalog is at hand.
+    """
+    if not catalog:
+        return PRODUCTION_KINDS
+    kinds = {
+        b.get("id")
+        for b in catalog.get("buildings") or []
+        if b.get("trains") and b.get("id")
+    }
+    return kinds or PRODUCTION_KINDS
+
+
+def load_catalog(state_path):
+    """The `catalog.json` sitting beside a seat's `state.json`, if there is one."""
+    path = os.path.join(os.path.dirname(os.path.abspath(state_path)), "catalog.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def place_of(pos, smap):
+    """Name a spot the way `shared::place_name` does, from public geography.
+
+    Nearest named choke inside 30 wins, then the named place whose radius
+    covers the spot, then the bare coordinate. `map.places` is already written
+    from THIS seat's point of view ("our base" / "their base"), so no team
+    argument is needed here.
+    """
+    if not pos or len(pos) < 2:
+        return "position unknown"
+    best = None
+    for c in smap.get("chokes") or []:
+        cp = c.get("pos")
+        if not cp or not c.get("name"):
+            continue
+        d = dist(pos, cp)
+        if d <= PLACE_CHOKE_RADIUS and (best is None or d < best[0]):
+            best = (d, "the " + c["name"])
+    if best is None:
+        for p in smap.get("places") or []:
+            pp = p.get("pos")
+            if not pp or not p.get("name"):
+                continue
+            d = dist(pos, pp)
+            if d <= p.get("radius", 0.0) and (best is None or d < best[0]):
+                best = (d, p["name"])
+    if best is not None:
+        return "near " + best[1]
+    return "at ({:.0f}, {:.0f})".format(pos[0], pos[1])
+
+
+def stance_phrase(stance, smap):
+    """Turn a squad's posture string into something a sentence can hold.
+
+    Postures arrive as `"defend@(70.0,70.0)r=18"`, `"push@(x,z)"`,
+    `"forage@(x,z)"` or `"escort:<unitid>"`. A named stance (turtle / stage /
+    push / secure / harass, AFFORDANCES.md's five) is a bare word and passes
+    through untouched, so this keeps working when `squads[].stance` lands.
+    """
+    if not stance:
+        return "no standing posture"
+    if "@" in stance:
+        verb, _, rest = stance.partition("@")
+        m = _COORDS.search(rest)
+        if m:
+            return "{} {}".format(verb, place_of([float(m.group(1)), float(m.group(2))], smap))
+        return verb
+    if ":" in stance:
+        verb, _, arg = stance.partition(":")
+        return "{} {}".format(verb, arg)
+    return stance
+
+
+def _squad_props(sid, sq, members, smap):
+    """One squad as the digest sees it: who, how strong, and where."""
+    hp = sum(u.get("hp", 0.0) for u in members)
+    max_hp = sum(u.get("max_hp", 0.0) for u in members)
+    pos = centroid([u["pos"] for u in members if u.get("pos")])
+    # `stance` is AFFORDANCES.md item 2 and is not on the wire yet; `posture`
+    # is what every shipped snapshot carries. Prefer the newer key when it
+    # appears and never require it.
+    stance = sq.get("stance") or sq.get("posture")
+    return {
+        "id": sid,
+        "stance": stance,
+        "stance_phrase": stance_phrase(stance, smap),
+        # A snapshot always carries the count on the squad record; the unit
+        # rosters are what we sum strength from. They agree, except on a
+        # snapshot old enough to predate `units[].squad`, where the count is
+        # still right and the roster is empty.
+        "units": len(members) or sq.get("members", 0),
+        "strength": round(hp),
+        "hp_frac": round(hp / max_hp, 2) if max_hp else None,
+        "pos": pos,
+        "place": place_of(pos, smap) if pos else "position unknown",
+        "hurt": sum(1 for u in members if u.get("hp", 0) < 0.55 * u.get("max_hp", 1)),
+    }
+
+
+def _alarm_props(raw):
+    """Normalize one alarm.
+
+    `alarms[]` is being added by a parallel bead (AFFORDANCES.md item 4) and
+    this renderer predates its exact shape on purpose: a string, or a dict
+    under any of the obvious spellings, all render. An alarm names its running
+    default (AFFORDANCES.md: "every alarm names its running default"), so that
+    field is pulled out where it exists and the DEFAULT line defers to it.
+    """
+    if isinstance(raw, str):
+        return {"text": raw, "default": None}
+    if not isinstance(raw, dict):
+        return {"text": str(raw), "default": None}
+    text = (
+        raw.get("text")
+        or raw.get("message")
+        or raw.get("title")
+        or raw.get("why")
+        or raw.get("reason")
+        or raw.get("kind")
+        or raw.get("name")
+        or "alarm"
+    )
+    kind = raw.get("kind") or raw.get("name")
+    if kind and kind != text:
+        text = "{}: {}".format(kind, text)
+    return {
+        "text": text,
+        "default": raw.get("default") or raw.get("running_default") or raw.get("doing"),
+        "since": raw.get("since", raw.get("t")),
+    }
+
+
+def digest(state, catalog=None):
+    """The ~15-line view as structured data — the document's PROPERTIES half.
+
+    Pure: no disk, no marker files, no mutation of `state`.
+    """
+    me = state.get("me") or {}
+    my_team = state.get("my_team") or "Claude"
+    enemy_team = "Human" if my_team == "Claude" else "Claude"
+    smap = state.get("map") or {}
+    units = state.get("units") or []
+    buildings = state.get("buildings") or []
+    prod_kinds = production_kinds(catalog)
+    now = state.get("t", 0.0)
+
+    mine_u = [u for u in units if u.get("team") == my_team]
+    workers = [u for u in mine_u if u.get("kind") == "Worker"]
+    army = [u for u in mine_u if u.get("kind") != "Worker"]
+
+    # --- army by squad ---
+    by_squad = defaultdict(list)
+    for u in army:
+        by_squad[u.get("squad")].append(u)
+    squads = []
+    for sq in state.get("squads") or []:
+        sid = sq.get("id")
+        squads.append(_squad_props(sid, sq, by_squad.get(sid, []), smap))
+    loose = by_squad.get(None, [])
+    if loose:
+        squads.append(_squad_props(None, {}, loose, smap))
+
+    # --- my production ---
+    queues, idle, building, jobs = [], [], [], []
+    for b in buildings:
+        if b.get("team") != my_team:
+            continue
+        kind = b.get("kind", "?")
+        if not b.get("done", True):
+            building.append("{}({:.0f}%)".format(kind, 100.0 * b.get("progress", 0.0)))
+            continue
+        if kind in prod_kinds:
+            q = b.get("queue") or []
+            if q:
+                queues.append({"kind": kind, "id": b.get("id"), "queue": list(q)})
+            elif not b.get("upgrading"):
+                idle.append(kind)
+        job = b.get("researching")
+        if job:
+            jobs.append(
+                "{} L{} {:.0f}s".format(
+                    job.get("upgrade", "?"), job.get("level", 0), job.get("remaining", 0.0)
+                )
+            )
+        up = b.get("upgrading")
+        if up:
+            jobs.append("{}→{} {:.0f}s".format(kind, up.get("into", "next"), up.get("remaining", 0.0)))
+
+    # --- the win-condition line ---
+    #
+    # Fog-honest by inheritance: `buildings` holds enemy structures this seat
+    # can see plus the ghosts it remembers, and a ghost carries `last_seen`.
+    # Nothing here counts a building nobody looked at, and nothing here guesses
+    # at one — "2 seen" is a floor on what they have, never a total, which is
+    # why the line says `seen` and reports how stale the memory is.
+    enemy_prod = [
+        b for b in buildings if b.get("team") == enemy_team and b.get("kind") in prod_kinds
+    ]
+    ages = [now - b["last_seen"] for b in enemy_prod if b.get("last_seen") is not None]
+    win = {
+        "seen": len(enemy_prod),
+        "by_kind": dict(sorted(Counter(b.get("kind", "?") for b in enemy_prod).items())),
+        "remembered": len(ages),
+        "oldest_age": round(max(ages), 0) if ages else None,
+        "explored": (state.get("fog") or {}).get("explored"),
+    }
+
+    # --- alarms: absent key and empty list are different claims ---
+    alarms = None
+    if state.get("alarms") is not None:
+        alarms = [_alarm_props(a) for a in state.get("alarms") or []]
+
+    props = {
+        "t": now,
+        "seq_applied": state.get("seq_applied", 0),
+        "team": my_team,
+        "race": state.get("my_race"),
+        "map": smap.get("name", "?"),
+        "resources": {
+            "gold": me.get("gold", 0),
+            "lumber": me.get("lumber", 0),
+            "supply_used": me.get("supply_used", 0),
+            "supply_cap": me.get("supply_cap", 0),
+            "upkeep_rate": me.get("upkeep_rate", 1.0),
+            "tier": me.get("tier", 1),
+            "workers": len(workers),
+            "idle_workers": sum(1 for w in workers if w.get("order") == "Idle"),
+        },
+        "army": {
+            "units": len(army),
+            "strength": round(sum(u.get("hp", 0.0) for u in army)),
+            "by_kind": dict(sorted(Counter(u.get("kind", "?") for u in army).items())),
+            "heroes": [
+                {
+                    "kind": u.get("kind"),
+                    "level": (u.get("hero") or {}).get("level"),
+                    "hp_frac": round(u.get("hp", 0.0) / u["max_hp"], 2) if u.get("max_hp") else None,
+                }
+                for u in mine_u
+                if u.get("hero")
+            ],
+        },
+        "squads": squads,
+        "production": {
+            "queues": queues,
+            "queued": sum(len(q["queue"]) for q in queues),
+            "idle": sorted(idle),
+            "building": building,
+            "jobs": jobs,
+        },
+        "win_condition": win,
+        "events": [list(e) for e in (state.get("events") or [])[-EVENT_LINES:]],
+        "alarms": alarms,
+        "status": {
+            "game_over": state.get("game_over"),
+            "game_over_reason": state.get("game_over_reason"),
+            "waiting_for": state.get("waiting_for"),
+            "errors": list(state.get("errors") or []),
+        },
+    }
+    props["default"] = running_default(props)
+    return props
+
+
+def running_default(props):
+    """What silence does now.
+
+    AFFORDANCES.md makes persistence the default — "no command means continue
+    current stance" — so the digest has to be able to say what continuing IS.
+    An alarm's own named default comes FIRST, because an alarm fires only after
+    the reflex it is reporting has already acted and that reflex is the part of
+    silence a commander most needs to know about; the standing stances follow,
+    because they go on being true underneath it.
+    """
+    parts = [a["default"] for a in props.get("alarms") or [] if a.get("default")]
+    stances = [
+        "{} keeps {}".format(
+            "squad {}".format(sq["id"]) if sq["id"] is not None else "loose army",
+            sq["stance_phrase"],
+        )
+        for sq in props["squads"]
+    ]
+    parts += stances or ["no squad has a standing posture"]
+    queued = props["production"]["queued"]
+    idle = props["production"]["idle"]
+    if queued:
+        parts.append(
+            "{} queued item{} finish{}".format(queued, "" if queued == 1 else "s", "es" if queued == 1 else "")
+        )
+    if idle:
+        # The names are already on the PRODUCTION line; here the count is the
+        # news, and r21's lesson is that an idle production building is news.
+        parts.append(
+            "{} production building{} stay{} idle".format(
+                len(idle), "" if len(idle) == 1 else "s", "s" if len(idle) == 1 else ""
+            )
+        )
+    return "; ".join(parts)
+
+
+def _trunc(line, width=110):
+    return line if len(line) <= width else line[: width - 1] + "…"
+
+
+def render_digest(props):
+    """The properties section as ~15 lines of text."""
+    r = props["resources"]
+    head = [
+        _trunc(
+            "DIGEST t={:.0f}s seq={} map={} seat={}{}".format(
+                props["t"],
+                props["seq_applied"],
+                props["map"],
+                props["team"],
+                "/" + props["race"] if props.get("race") else "",
+            )
+        ),
+        _trunc(
+            "RESOURCES gold {} lumber {} supply {}/{} upkeep {:.0f}% tier {} workers {}{}".format(
+                r["gold"], r["lumber"], r["supply_used"], r["supply_cap"],
+                100.0 * r["upkeep_rate"], r["tier"], r["workers"],
+                " (idle {})".format(r["idle_workers"]) if r["idle_workers"] else "",
+            )
+        ),
+    ]
+
+    st = props["status"]
+    if st["waiting_for"] is not None:
+        head.append(
+            _trunc("HELD at t=0, waiting for: {} — send ready".format(
+                " ".join(str(x) for x in st["waiting_for"]) or "(nobody)"))
+        )
+    if st["game_over"]:
+        head.append("GAME OVER: {} wins{}".format(
+            st["game_over"], " (" + st["game_over_reason"] + ")" if st["game_over_reason"] else ""))
+    if st["errors"]:
+        head.append(_trunc("ERRORS {}: {}".format(len(st["errors"]), st["errors"][-1])))
+
+    a = props["army"]
+    # Most numerous first, and only the head of the list: a composition is read
+    # for its shape, and the tail of ones is what the full readout is for.
+    kinds = sorted(a["by_kind"].items(), key=lambda kv: (-kv[1], kv[0]))
+    comp = " ".join("{}:{}".format(k, v) for k, v in kinds[:4])
+    if len(kinds) > 4:
+        comp += " +{}".format(sum(v for _, v in kinds[4:]))
+    heroes = " ".join(
+        "{} L{} {:.0f}%".format(
+            h["kind"], h["level"] if h["level"] is not None else "?", 100.0 * (h["hp_frac"] or 0)
+        )
+        for h in a["heroes"]
+    )
+    body = [
+        _trunc(
+            "ARMY {} str {} · {}{}".format(
+                a["units"], a["strength"], comp or "-", " · heroes " + heroes if heroes else ""
+            )
+        )
+    ]
+    squads = props["squads"]
+    for sq in squads[:SQUAD_LINES]:
+        name = "SQUAD {}".format(sq["id"]) if sq["id"] is not None else "LOOSE"
+        # An empty squad is a live fact — r21 armed a rule on one and it fired
+        # as "move 0 units" — so it keeps its line and says so plainly rather
+        # than reporting a strength of zero at an unknown position.
+        if not sq["units"]:
+            body.append(_trunc("{} {} · EMPTY".format(name, sq["stance_phrase"])))
+            continue
+        body.append(
+            _trunc(
+                "{} {} · {} units · str {}{} · {}".format(
+                    name,
+                    sq["stance_phrase"],
+                    sq["units"],
+                    sq["strength"],
+                    " hp {:.0f}%".format(100.0 * sq["hp_frac"]) if sq["hp_frac"] is not None else "",
+                    sq["place"],
+                )
+            )
+        )
+    if len(squads) > SQUAD_LINES:
+        body.append("SQUADS +{} more".format(len(squads) - SQUAD_LINES))
+
+    p = props["production"]
+    q = " ".join("{}[{}]".format(x["kind"], ",".join(x["queue"])) for x in p["queues"])
+    tail = []
+    if p["idle"]:
+        tail.append(
+            "idle: "
+            + " ".join(
+                "{}x{}".format(v, k) if v > 1 else k
+                for k, v in sorted(Counter(p["idle"]).items())
+            )
+        )
+    if p["building"]:
+        tail.append("building: " + " ".join(p["building"]))
+    if p["jobs"]:
+        tail.append("jobs: " + " ".join(p["jobs"]))
+    body.append(_trunc("PRODUCTION " + " · ".join(x for x in [q or "nothing queued"] + tail if x)))
+
+    w = props["win_condition"]
+    if w["seen"]:
+        seen = " ".join("{}x{}".format(v, k) for k, v in w["by_kind"].items())
+        stale = ""
+        if w["remembered"]:
+            stale = " · {} remembered, oldest {:.0f}s ago".format(w["remembered"], w["oldest_age"])
+        body.append(_trunc("WIN raze their production: {} seen ({}){}".format(w["seen"], seen, stale)))
+    else:
+        explored = ""
+        if w["explored"] is not None:
+            explored = " (explored {:.0f}% of the map)".format(100.0 * w["explored"])
+        body.append(_trunc("WIN raze their production: none seen yet{} — scout".format(explored)))
+
+    alarms = []
+    if props["alarms"]:
+        for al in props["alarms"][:3]:
+            alarms.append(
+                _trunc("ALARM {}{}".format(
+                    al["text"], " — default: " + al["default"] if al.get("default") else ""))
+            )
+        if len(props["alarms"]) > 3:
+            alarms.append("ALARMS +{} more".format(len(props["alarms"]) - 3))
+
+    events = [_trunc("EVT [{:.0f}s] {}".format(e[0], e[1])) for e in props["events"] if len(e) >= 2]
+    # The one line allowed to run long: it is the whole point of the
+    # persistence default that a commander can read what silence will do, and
+    # a clause lost off the end is a squad it did not know was still marching.
+    default = [_trunc("DEFAULT if you say nothing: " + props["default"], 240)]
+
+    lines = head + body + alarms + events + default
+    # Trim to the ceiling, cheapest information first: events are the only
+    # section a commander can recover from the full snapshot at no cost.
+    while len(lines) > MAX_LINES and events:
+        events.pop(0)
+        lines = head + body + alarms + events + default
+    return lines
+
+
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "bridge/red/state.json"
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("path", nargs="?", default="bridge/red/state.json")
+    ap.add_argument(
+        "--digest",
+        action="store_true",
+        help="the ~15-line commander digest instead of the full readout",
+    )
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="with --digest: the digest's structured data, which is what the "
+        "hypermedia document embeds as its properties section",
+    )
+    args = ap.parse_args()
+    path = args.path
     with open(path) as f:
         s = json.load(f)
+
+    if args.digest:
+        props = digest(s, load_catalog(path))
+        if args.json:
+            print(json.dumps(props, indent=2))
+        else:
+            for line in render_digest(props):
+                print(line)
+        return
+    full_view(s, path)
+
+
+def full_view(s, path):
 
     # Events newer than my previous read; one marker per seat so parallel
     # commanders don't clobber each other's read position.
