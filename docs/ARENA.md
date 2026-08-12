@@ -109,7 +109,9 @@ diff shows what changed about a round rather than that a dict reordered itself.
     {"seat": "bridge/red",  "team": "Claude", "kind": "commander",
      "persona": "rusher",
      "model": "opus",                    // optional; absent on a scripted seat
-     "scaffold": "affordance-doc/1"}     // optional; absent on a seat that played bare
+     "scaffold": "affordance-doc/1",     // optional; absent on a seat that played bare
+     "autopilot_secs": 261.4,            // game seconds this seat spent handed to ai.rs
+     "autopilot_spans": [{"from": 189.3, "to": 450.7}]}  // optional; when it was
   ],
   "hypothesis": "Does the rusher line still win with 40% more gold in the ground?",
   "result": {
@@ -163,6 +165,19 @@ diff shows what changed about a round rather than that a dict reordered itself.
 - **`constants` is for balance values that were in force but are not in `env`.**
   `MINE_GOLD` is a compile-time constant, so the only way a round can say which
   value it was played under is to write it down.
+- **`autopilot_secs` is the one key where zero is a value and absence is the
+  gap.** Everywhere else in this schema an absent key is a fact ("this seat
+  played bare") and a `null` is a gap. Delegation inverts it: `0.0` means *we
+  read the intent log and nobody handed the faction over*, and an absent key
+  means *nobody looked* — every round before r28, and any round whose intent
+  log was not kept. The two are different claims and the flag is worthless
+  unless they are told apart, so the runner stamps every commander seat of a
+  measured round, zero included. A scripted seat never carries it: `ai.rs` is
+  already playing that faction and there is no handover to record.
+  `autopilot_spans` carries the edges (`from`/`to` in game seconds, plus
+  `to_end: true` when the match ended with the seat still delegating), and the
+  validator checks the spans add up to the total, because a summary line and a
+  stamp that can disagree give the ledger two answers for one round.
 - **A `score` round is never `decisive`, and the validator now says so.** Both
   readers of a verdict derive it that way already (`read_log` from the engine's
   log, `wait_for_seat_game_over` from the snapshot); the check exists because a
@@ -227,6 +242,7 @@ tools/arena.py rounds --persona boomer --winner Human
 tools/arena.py lessons --grep tower        # what the players actually learned
 tools/arena.py validate                    # schema + honesty check
 tools/arena.py add-aar r11 --seat bridge/red --path arena/r11/red-aar.md
+tools/arena.py autopilot r33 --write       # stamp delegation from the intent log
 ```
 
 `series` is the query the AARs used to end on by hand:
@@ -235,7 +251,16 @@ tools/arena.py add-aar r11 --seat bridge/red --path arena/r11/red-aar.md
 10 rounds — rusher 6, boomer 3, 1 draw(s)
 length: median 13:00, shortest 5:24, longest 64:43 (9/10 rounds timed)
 provenance: 0 recorded, 10 backfilled
+autopilot: 2 of 8 measured rounds (35 on file) — r33 red 261s; r35 blue 156s
+  * marks a win the winner spent on autopilot: r33, r35 — those verdicts
+  measure when the seat delegated, not how it played
 ```
+
+`autopilot` reads a round's intent log (`arena/<id>/bridge-logs/intent_log.jsonl`
+by default, `--log` for anywhere else) and stamps the spans onto the record. The
+runner does this for every round it runs; the subcommand is how a round recorded
+before the stamp existed gets its numbers, and it refuses a round whose log is
+not on disk rather than filling in a zero.
 
 ## Running a round
 
@@ -281,6 +306,14 @@ spawns that seat from — the ledger entry is a claim about what the seat was
 given, and the briefing is where the claim is made true. It refuses a scripted
 seat, which reads no snapshot and therefore no document.
 
+`--no-autopilot` sets `BH_NO_AUTOPILOT=1`, which makes `intent.rs` refuse a
+mid-match handover to the scripted AI for the whole match. **It is off by
+default**, because banning a documented verb is a round rule and the owner has
+not made it one — see "Autopilot in a ladder round" below. It is round-level
+rather than per-seat because the engine reads one process-wide variable. The
+round records what it was played under either way: the flag lands in
+`ruleset.env`, and `seats[].autopilot_secs` records what actually happened.
+
 It derives `BH_BRIDGE` and `BH_AI_BOTH` from the seats rather than trusting a
 hand-typed value — they are two spellings of one fact (who is playing which
 side), and a launch line where they disagree produces a match that isn't the
@@ -308,6 +341,94 @@ somebody was playing. Two rules follow, enforced rather than documented:
   an existing one is reused only with `--reuse-seat`, and a pre-existing
   snapshot is *renamed aside*, never removed — a stale `game_over` from the last
   match would otherwise read as this match ending instantly.
+
+## Autopilot in a ladder round
+
+> **Status: owner decision pending.** Nothing below is a policy. The machinery
+> for all three options exists and the recording happens regardless; which
+> option the ladder adopts is the owner's call, and this section is the brief
+> it should be made from.
+
+### What happened
+
+`autopilot` hands a faction to `ai.rs` for as long as the commander leaves it
+there. It is a documented verb — `tools/COMMANDER_BRIEF.md` calls it *emergency
+only* — so engaging it is **legal**, and both seats that did so disclosed it in
+their AARs. The problem is not conduct. It is that **a round's verdict stops
+measuring the model the moment it engages**, and until this bead nothing in the
+round's record said it had.
+
+Two of the four Haiku seats across the second ladder delegated, and both ended
+on the winning side:
+
+| round | seat | span | share of the match | ending |
+|---|---|---|---|---|
+| r33 | `bridge/red` (Claude) | t=189.3 → t=450.7, released 9.8s before the end | 261.4s of 460.5s — **57%** | red wins, surrender |
+| r35 | `bridge/blue` (Human) | t=316.0 → the end, **never released** | 156.8s of 472.8s — **33%** | blue wins, surrender |
+
+In r33 the delegated stretch spans the whole recovery from blue's worker raid
+and the winning army buildup. In r35 the entire winning late game — tier 2, the
+Spearman counter, the expansion, the pressure from t=316 onward — was scripted
+play, and the seat that *lost* had played the floor tier's best own-hands game
+on record (arena/LADDER2.md, Addendum 1). The six other rounds with a kept
+intent log (r28, r29, r30, r31, r34, r36) measure zero.
+
+That is the finding the options are about: **at the floor tier, delegation
+beat playing, twice.** Either it is a legitimate skill the ladder is measuring
+on purpose, or the ladder is not measuring what it says it is.
+
+### What the machinery does now, whichever way it goes
+
+Recording is unconditional, because the bead that added it said so and because
+r33 and r35 are the proof: the spans were in `bridge/intent_log.jsonl` all
+along, and nobody could ask the ledger a question nobody had thought to ask
+before the round.
+
+- **The runner stamps every round.** `arena_run.py` notes the intent log's size
+  before launch, keeps this round's slice at
+  `arena/<id>/bridge-logs/intent_log.jsonl`, and writes `seats[].autopilot_secs`
+  (and `autopilot_spans`) onto every commander seat — `0.0` included, so a
+  measured zero is distinguishable from an unmeasured round.
+- **The ledger shows it.** `arena.py series` has an `autopilot` column, marks
+  the `won` cell with `*` when the winner delegated, and ends with a series
+  line naming the rounds.
+- **Old rounds can be stamped.** `arena.py autopilot <id> --write` reads a kept
+  log and backfills. r28–r36 have been stamped from the logs in `arena/`.
+- **The ban is one flag.** `arena_run.py --no-autopilot` sets
+  `BH_NO_AUTOPILOT=1`; `intent.rs` then refuses the verb with a message that
+  says whose rule it is and points at the doctrine tier instead. r36 was run
+  that way (through `--env`, before the flag existed).
+
+### The three options
+
+**(a) Ban mid-match autopilot in ladder rounds.** Round rules say so, the
+briefing says so, and `--no-autopilot` makes it true — a prompt cannot bind a
+model, which r33 and r35 demonstrated, so the enforcement has to be at the
+compiler. *Cost:* the seat loses a real escape hatch, and a round where a
+commander would have delegated instead plays on with whatever it has, which is
+its own kind of unrepresentative. *Already available:* one flag, plus a line in
+the round rules.
+
+**(b) Allow it and record it.** Rounds stay as they are; the ledger carries the
+seconds and the summary flags the qualified wins, so a ladder table can weight
+or filter them. *Cost:* the ladder's headline numbers keep mixing two skills
+unless whoever reads them applies the filter, and "r33 was a Haiku win" stays
+technically true and misleading. *Already available:* everything — this is what
+the machinery does with no further decision.
+
+**(c) Make delegation the measured skill at small tiers, and say so in the
+hypothesis.** The claim becomes *knowing when to hand off is the competence a
+floor-tier commander has*, and a round's hypothesis states it, so the result
+means what it says. *Cost:* it is a different experiment from the one the
+ladder has been running, and it cannot be compared against r25–r32 without
+saying so. *Already available:* the hypothesis field, plus the seconds to
+report against.
+
+A fourth shape is available cheaply if the owner wants it and is **not**
+recommended here: a per-seat ban. `intent.rs` reads one process-wide
+`BH_NO_AUTOPILOT`, so a round where red may delegate and blue may not would
+need the refusal to consult the seat rather than the environment. That is an
+engine change and a bead of its own.
 
 ## Screenshots
 
