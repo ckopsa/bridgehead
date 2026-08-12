@@ -66,9 +66,17 @@ EXPECTED_TOP_KEYS = {
 #     held snapshot when we first look, not because the check tolerates them
 #     mid-match. `the_handshake_keys_are_gone_once_the_match_starts` (step 2b)
 #     is the assertion that actually pins their disappearance.
+#   * notes (wc3clone-b9m) is the advisory half of the acknowledgement: one
+#     line per ACCEPTED command that contradicts a readiness fact the scaffold
+#     serves — push gates unmet, an intel ledger too stale to be committing
+#     against. Same `skip_serializing_if` empty rule as `applied` beside it, and
+#     the same reason it is listed here rather than in the exact set: this
+#     script's run never stances a squad into a push, so it must not require the
+#     key — but a seat that did would grow one, and the assertion has to tolerate
+#     that without being loosened to a subset check.
 OPTIONAL_TOP_KEYS = {
     "applied", "game_over_reason", "triggers", "plans", "alarms",
-    "waiting_for", "match_started",
+    "waiting_for", "match_started", "notes",
 }
 
 # The same contract, one level down, for the array this run always populates.
