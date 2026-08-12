@@ -1077,6 +1077,170 @@ def production_forms(state, catalog):
                      "survives the building it names being razed and rebuilt.",
             )
         )
+    out.extend(rally_forms(state, catalog))
+    out.extend(template_forms(state, catalog))
+    out.extend(cancel_forms(state, catalog))
+    return out
+
+
+def rally_readback(held):
+    """What these buildings' rally points currently are, as one phrase.
+
+    Reads `buildings[].rally`, the key the snapshot gained so this question had
+    an answer at all. Before it, the only way to be sure where a building sent
+    its output was to send `rally` again — a poll, and the thing the document
+    exists to delete. `unset` is stated rather than omitted: "no rally point"
+    and "I could not tell you" are different facts.
+    """
+    seen = []
+    for b in held:
+        r = b.get("rally")
+        if not r:
+            seen.append("unset")
+        elif r.get("pos"):
+            seen.append("({:.0f}, {:.0f})".format(r["pos"][0], r["pos"][1]))
+        else:
+            seen.append("onto {}".format(r.get("target")))
+    return ", ".join(seen) or "none standing"
+
+
+def rally_forms(state, catalog):
+    """`rally`, written as a role — where a producer sends what it trains."""
+    out = []
+    for kind, held, _idle, _trains in producer_kinds(state, catalog):
+        mine = [b for b in own_buildings(state)
+                if b.get("done") and b.get("kind") == kind]
+        out.append(
+            form(
+                "rally:{}".format(kind),
+                "send what your {} trains somewhere — no building id".format(kind),
+                {"type": "rally", "select": "my {}".format(kind), "region": None},
+                [
+                    field(
+                        "select",
+                        "selector",
+                        "which producer. `my {k}` is the lowest-id one; name the kind you "
+                        "mean if you hold several sorts.".format(k=kind),
+                        domain=selector_vocabulary(catalog)["buildings"],
+                        default="my {}".format(kind),
+                    ),
+                    field(
+                        "region",
+                        "place",
+                        "where they walk. A named place or a built-in; `x`/`z` take numbers "
+                        "instead, and `target` takes a resource node (new workers harvest it) "
+                        "or one of your own units (new units follow it).",
+                        domain=place_domain(state),
+                    ),
+                ],
+                reason="{} finished {}; rally now: {}".format(
+                    held, kind, rally_readback(mine)
+                ),
+                note="the snapshot reads it back as `buildings[].rally`, so you never have to "
+                     "re-send one to find out what it is.",
+            )
+        )
+    return out
+
+
+def template_forms(state, catalog):
+    """`template`, written as a role — standing doctrine for everything a
+    producer trains from here on.
+
+    The one verb in the family that is *policy* rather than an order, so its
+    reason line says whether one is already installed (`buildings[].template`
+    has been a flag since the verb landed) — replacing a template replaces the
+    WHOLE of it, and a commander that did not know one was there would silently
+    drop the half it did not restate.
+    """
+    out = []
+    squads = [str(sq.get("id")) for sq in state.get("squads") or [] if sq.get("id") is not None]
+    for kind, held, _idle, _trains in producer_kinds(state, catalog):
+        mine = [b for b in own_buildings(state)
+                if b.get("done") and b.get("kind") == kind]
+        set_on = sum(1 for b in mine if b.get("template"))
+        out.append(
+            form(
+                "template:{}".format(kind),
+                "stamp standing doctrine on everything your {} trains".format(kind),
+                {"type": "template", "select": "my {}".format(kind), "squad": None},
+                [
+                    field(
+                        "select",
+                        "selector",
+                        "which producer's output the doctrine applies to.",
+                        domain=selector_vocabulary(catalog)["buildings"],
+                        default="my {}".format(kind),
+                    ),
+                    field(
+                        "squad",
+                        "integer",
+                        "enrol every new unit into this squad, so it inherits the squad's "
+                        "stance the moment it walks out.",
+                        domain=squads or None,
+                        rng=(0, 255),
+                    ),
+                ],
+                reason="{} finished {}, {} already carrying a template".format(
+                    held, kind, set_on
+                ),
+                note="`retreat`, `priority` and `autocast` are the other pieces. WHATEVER YOU "
+                     "SEND REPLACES THE WHOLE TEMPLATE — a piece you omit is unset, not kept — "
+                     "and a `template` with no pieces at all removes it.",
+            )
+        )
+    return out
+
+
+def cancel_forms(state, catalog):
+    """`cancel`, written as a role — and offered only where there is a queue.
+
+    The one form in the family whose readiness is not about the building: a
+    cancel with nothing queued is `queue index 0 out of range`, so the form is
+    listed with `ready: false` and the reason states every queue this seat holds
+    of that kind. Listing it anyway is AFFORDANCES.md constraint 1 — a menu that
+    hides the option is worse than one that explains why it would refuse.
+    """
+    out = []
+    for kind, held, _idle, _trains in producer_kinds(state, catalog):
+        mine = [b for b in own_buildings(state)
+                if b.get("done") and b.get("kind") == kind]
+        queues = [list(b.get("queue") or []) for b in mine]
+        longest = max((len(q) for q in queues), default=0)
+        out.append(
+            form(
+                "cancel:{}".format(kind),
+                "drop one entry from a {} training queue".format(kind),
+                {"type": "cancel", "select": "my {}".format(kind), "index": None},
+                [
+                    field(
+                        "select",
+                        "selector",
+                        # Never `idle` here, and that is a fact rather than a
+                        # preference: an idle producer is exactly the one with
+                        # nothing to cancel.
+                        "which producer's queue. `idle {k}` is never right here — an idle "
+                        "one has nothing queued.".format(k=kind),
+                        domain=selector_vocabulary(catalog)["buildings"],
+                        default="my {}".format(kind),
+                    ),
+                    field(
+                        "index",
+                        "integer",
+                        "which slot, 0-based. 0 is the one being built right now and "
+                        "cancelling it restarts the timer for whatever is behind it.",
+                        rng=(0, max(longest - 1, 0)),
+                    ),
+                ],
+                ready=longest > 0,
+                reason="{} finished {}; queues: {}".format(
+                    held, kind, " | ".join(str(q) for q in queues) or "none"
+                ),
+                note="`select` resolves to the LOWEST-id match, which may not be the one whose "
+                     "queue you are reading. Send `building: <id>` off `buildings[]` when you "
+                     "mean a particular one.",
+            )
+        )
     return out
 
 

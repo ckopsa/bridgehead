@@ -1348,6 +1348,23 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
             index,
             select,
         },
+        // The two verbs that spend on a BUILDING rather than through one. They
+        // joined the channel late and the asymmetry was visible from the brief:
+        // `train` and `rally` were sayable without an entity id while "upgrade
+        // my hall" — the most obvious sentence in the family — was not.
+        Intent::Upgrade { building, select } => Intent::Upgrade {
+            building: producer("upgrade", building, &select, bind)?,
+            select,
+        },
+        Intent::Research {
+            building,
+            upgrade,
+            select,
+        } => Intent::Research {
+            building: producer("research", building, &select, bind)?,
+            upgrade,
+            select,
+        },
         Intent::Template {
             building,
             squad,
@@ -1895,7 +1912,14 @@ fn compile_intent(
                 mark.order("build"),
             );
         }
-        Intent::Upgrade { building } => {
+        Intent::Upgrade { building, .. } => {
+            // Defensive re-check, exactly as `train` and `rally` keep one:
+            // `producer` refuses both-channels-empty in `resolve_places`, and
+            // the arm does not get to assume it ran.
+            let Some(building) = building else {
+                errors.push(format!("{tag}: {}", needs_building("upgrade")));
+                return;
+            };
             let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
@@ -2099,9 +2123,15 @@ fn compile_intent(
                 queue.progress = 0.0;
             }
         }
-        Intent::Research { building, upgrade } => {
+        Intent::Research {
+            building, upgrade, ..
+        } => {
             let Some(kind) = parse_research_kind(&upgrade) else {
                 errors.push(format!("{tag}: unknown research '{upgrade}'"));
+                return;
+            };
+            let Some(building) = building else {
+                errors.push(format!("{tag}: {}", needs_building("research")));
                 return;
             };
             let Some(entity) = intent_entity(building) else {
@@ -6411,7 +6441,10 @@ mod tests {
     #[test]
     fn upgrade_is_one_verb_for_both_seats() {
         let typed: Intent = serde_json::from_str(r#"{"type":"upgrade","building":77}"#).unwrap();
-        let gesture = Intent::Upgrade { building: 77 };
+        let gesture = Intent::Upgrade {
+            building: Some(77),
+            select: None,
+        };
         assert_eq!(
             serde_json::to_value(&gesture).unwrap(),
             serde_json::to_value(&typed).unwrap()
@@ -6420,6 +6453,11 @@ mod tests {
             gesture.sentence(),
             "building 77 upgrades to its next tier"
         );
+        // And the phrase form, which the human seat never speaks (it already
+        // has a referent) but the wire now can.
+        let by_role: Intent =
+            serde_json::from_str(r#"{"type":"upgrade","select":"my hall"}"#).unwrap();
+        assert_eq!(by_role.sentence(), "my hall upgrades to its next tier");
     }
 
     /// A round trip through JSON must not change what an intent means — this
@@ -6554,8 +6592,9 @@ mod tests {
         // [Q] on a selected Blacksmith. ui.rs spells the ladder with the
         // catalog id, which is exactly what a commander types.
         let gesture = Intent::Research {
-            building: 77,
+            building: Some(77),
             upgrade: ResearchKind::Attack.id().to_string(),
+            select: None,
         };
         let typed: Intent =
             serde_json::from_str(r#"{"type":"research","building":77,"upgrade":"attack"}"#)
@@ -8909,6 +8948,9 @@ mod tests {
             r#"{"type":"rally","select":"my barracks","x":1.0,"z":2.0}"#,
             r#"{"type":"template","select":"my barracks","squad":2}"#,
             r#"{"type":"cancel","select":"my barracks","index":0}"#,
+            // The two that joined the channel in round 2 (`wc3clone-3w9`).
+            r#"{"type":"upgrade","select":"my hall"}"#,
+            r#"{"type":"research","select":"idle blacksmith","upgrade":"attack"}"#,
         ];
         for form in forms {
             let parsed: Intent =
@@ -9332,6 +9374,80 @@ mod tests {
         assert!(
             queue_of(&app, barracks).is_empty(),
             "the train queued a Footman and the cancel took it back out"
+        );
+    }
+
+    /// **Round two: the two verbs that spend ON a building rather than through
+    /// one.** `upgrade my hall` is the most obvious sentence in the family and
+    /// it was the one the channel did not serve, which made the asymmetry
+    /// visible from tools/COMMANDER_BRIEF.md: four verbs took a phrase and two
+    /// demanded an entity id.
+    ///
+    /// The id it demanded is also the one least worth freezing. A hall's id
+    /// changes when it is razed and rebuilt, and a plan written before the match
+    /// has no id to write down at all — so `upgrade` was the one production verb
+    /// a chain could not contain.
+    #[test]
+    fn upgrade_and_research_take_the_same_phrase() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let hall = spawn_hall_at(
+            &mut app,
+            BuildingKind::TownHall,
+            Team::Human,
+            Vec3::ZERO,
+            false,
+        );
+        let forge = spawn_hall_at(
+            &mut app,
+            BuildingKind::Blacksmith,
+            Team::Human,
+            Vec3::new(20.0, 0.0, 20.0),
+            false,
+        );
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"upgrade","select":"my hall"}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert_eq!(
+            app.world().resource::<Events<UpgradeBuilding>>().len(),
+            1,
+            "the phrase reached the payer, which is what makes the rule true"
+        );
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"research","select":"my blacksmith","upgrade":"attack"}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        let jobs = app.world().resource::<Events<StartResearch>>();
+        let mut reader = jobs.get_cursor();
+        assert_eq!(
+            reader.read(jobs).map(|j| j.building).collect::<Vec<_>>(),
+            vec![forge],
+            "the forge the phrase named, not the hall beside it"
+        );
+        // The ids are still in play for both, unchanged.
+        assert!(hall.to_bits() < forge.to_bits());
+
+        // And the empty match teaches from the same roster every other building
+        // verb teaches from.
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"upgrade","select":"my workshop"}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("upgrade: 'my workshop' matches none of your finished buildings")
+                && errors[0].contains("you have:"),
+            "{}",
+            errors[0]
         );
     }
 

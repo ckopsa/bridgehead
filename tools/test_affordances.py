@@ -368,6 +368,54 @@ def test_the_producer_default_is_a_phrase_that_would_not_refuse():
     assert by_rel(freed, "train:Barracks")["template"]["select"] == "idle Barracks"
 
 
+def test_the_other_three_building_verbs_are_served_too():
+    """3w9 item 3. The building selector made `rally`, `template` and `cancel`
+    sayable without an entity id in round 1, and the document went on serving
+    only `train` — so the three verbs a commander could now speak by role were
+    the three it had no way to discover."""
+    d = doc(ARMED)
+    for rel, verb in (("rally:Barracks", "rally"),
+                      ("template:Barracks", "template"),
+                      ("cancel:Barracks", "cancel")):
+        a = by_rel(d, rel)
+        assert a["template"]["type"] == verb
+        assert a["template"]["select"] == "my Barracks"
+        assert "building" not in a["template"], "no id, ever"
+    # A producer kind this seat does not hold is not offered, exactly as with
+    # `train`.
+    assert not any(a["rel"].startswith("rally:Sanctum") for a in d["actions"])
+
+
+def test_a_cancel_with_nothing_queued_is_listed_and_says_why():
+    """AFFORDANCES.md constraint 1: the menu never hides the option. An empty
+    queue makes `cancel` refuse with `queue index 0 out of range`, so the form
+    is listed NOT-READY with every queue of that kind in the reason."""
+    d = doc(ARMED)
+    busy, idle = by_rel(d, "cancel:Barracks"), by_rel(d, "cancel:TownHall")
+    assert busy["ready"] and "Footman" in busy["reason"]
+    assert not idle["ready"], "a hall with an empty queue has nothing to cancel"
+    index = next(f for f in busy["fields"] if f["path"] == "index")
+    assert index["range"][0] == 0 and index["range"][1] >= 1
+
+
+def test_a_rally_form_reads_back_the_rally_point_it_would_replace():
+    """The `buildings[].rally` key exists so this question has an answer without
+    re-sending the verb. `unset` is stated rather than omitted: 'no rally point'
+    and 'I could not tell you' are different facts, and the older fixtures say
+    the first because they predate the key."""
+    d = doc(ARMED)
+    assert "rally now: unset, unset" in by_rel(d, "rally:Barracks")["reason"], \
+        "two barracks, neither rallied — and it says so twice rather than staying quiet"
+
+    s = load(ARMED)
+    for b in s["buildings"]:
+        if b["team"] == s["my_team"] and b.get("kind") == "Barracks":
+            b["rally"] = {"pos": [55.0, -12.0]}
+            break
+    told = affordances.document(s, catalog())
+    assert "(55, -12)" in by_rel(told, "rally:Barracks")["reason"]
+
+
 def test_the_unit_domain_prices_every_row_against_this_seats_own_bank():
     """Same three annotations `build`'s `kind` domain carries, from the same two
     sources — and the hero row prices off `me.hero_costs`, which is a match fact

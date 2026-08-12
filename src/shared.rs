@@ -8514,8 +8514,18 @@ pub enum Intent {
     /// (`catalog.buildings[].upgrades_to`). Paid in full the moment it is
     /// accepted; the building keeps its position, footprint, rally and
     /// training queue, but trains nothing until the conversion finishes.
+    ///
+    /// `select` names the building by role instead of by id — see
+    /// [`Intent::Train`]. `"upgrade my hall"` is the obvious want, and it is
+    /// what makes a tier-up armable in a trigger or a plan step: the hall's
+    /// entity id is knowable at arm time, but an id frozen into a rule outlives
+    /// nothing (a razed and rebuilt hall is a new id), and a plan written before
+    /// the match has no id to freeze.
     Upgrade {
-        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        building: Option<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Drop one entry from a building's training queue. `select` names the
     /// building by role instead of by id — see [`Intent::Train`].
@@ -8538,9 +8548,15 @@ pub enum Intent {
     /// wrong. Refused if the forge is already researching something — one job
     /// per Blacksmith, and requests are rejected rather than queued (see
     /// `Researching`).
+    /// `select` names the forge by role instead of by id — see
+    /// [`Intent::Train`]. `"idle blacksmith"` is the useful phrase here, because
+    /// one job per forge is exactly the rule this verb bounces off.
     Research {
-        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        building: Option<IntentId>,
         upgrade: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Where units this building trains should go. `x`/`z` for ground, or
     /// `target` for a resource node (new workers harvest it) or an own unit
@@ -9215,8 +9231,11 @@ impl Intent {
             } => {
                 format!("{} trains {unit}", one_building(building, select))
             }
-            Intent::Upgrade { building } => {
-                format!("building {building} upgrades to its next tier")
+            Intent::Upgrade { building, select } => {
+                format!(
+                    "{} upgrades to its next tier",
+                    one_building(building, select)
+                )
             }
             Intent::Cancel {
                 building,
@@ -9228,8 +9247,12 @@ impl Intent {
                     one_building(building, select)
                 )
             }
-            Intent::Research { building, upgrade } => {
-                format!("building {building} researches {upgrade}")
+            Intent::Research {
+                building,
+                upgrade,
+                select,
+            } => {
+                format!("{} researches {upgrade}", one_building(building, select))
             }
             Intent::Rally {
                 building,

@@ -112,7 +112,10 @@ Production:
 - `{"type":"cancel","building":id,"index":n}` — **refunds in full** whatever had already been
   charged for that item, and nothing when nothing was charged (cancelling your free first
   hero returns 0; cancelling a 400g/100l revival returns 400g/100l).
-- `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}`
+- `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}` —
+  read back as `buildings[].rally` on your own buildings (`{"pos":[x,z]}` or
+  `{"target":id}`), so you never have to re-send one to find out what it is.
+  Absent means no rally point is set. Never present on an enemy building.
 - `{"type":"cast","hero":id}` — cast the caster's first available ability (heroes: their class
   ability; a TownHall id works too: CallToArms turns nearby workers into fighters for 40s,
   90s cooldown). Add `"ability":<index>` or `"ability":"Slam"` to pick a specific one — casters
@@ -330,8 +333,9 @@ Two more phrases answer "which one", not "which units":
 | `"nearest tree"` / `"nearest mine"` | `harvest`'s `"target_select"` | the nearest live node of that kind to the workers you are sending |
 | `"nearest legal site"` | `build`'s `"site"` | move the footprint to the nearest legal one within 15 of the point you named, instead of refusing |
 
-And a fourth channel names a **building**, for the four verbs that act on one —
-`train`, `template`, `rally`, `cancel`. Send `"select"` instead of `"building"`:
+And a fourth channel names a **building**, for the six verbs that act on one —
+`train`, `template`, `rally`, `cancel`, `upgrade`, `research`. Send `"select"`
+instead of `"building"`:
 
 | phrase | means |
 |---|---|
@@ -339,7 +343,7 @@ And a fourth channel names a **building**, for the four verbs that act on one �
 | `"idle barracks"` | the same, narrowed to the ones with **nothing in the training queue** |
 | `"my hall"` | whichever rung of the hall ladder you have standing — TownHall, Keep or Castle. Use this rather than `"my town hall"`, which stops matching the moment you upgrade |
 
-All four verbs act on exactly one building, so they take the **lowest-id
+All six act on exactly one building, so they take the **lowest-id
 match**, the same tie-break as `build`'s worker. `"idle"` is the one to reach
 for in a repeating rule: it walks past a producer that is already working, and
 when they are all working it refuses in words rather than queueing six deep.
@@ -367,7 +371,14 @@ Where each channel lives:
 {"type":"rally","select":"my barracks","region":"north-pass"}
 {"type":"template","select":"my barracks","squad":2}
 {"type":"cancel","select":"my barracks","index":0}
+{"type":"upgrade","select":"my hall"}
+{"type":"research","select":"idle blacksmith","upgrade":"attack"}
 ```
+
+`"upgrade":"my hall"` is the one worth learning by heart. A hall's entity id
+changes when it is razed and rebuilt, and a plan written before the match has no
+id to write down at all — so the phrase is what makes a tier-up something a
+chain can contain.
 
 `build`, `cast` and `follow`'s `target_select` need exactly one unit, so they
 take the **lowest-id match** — the same documented tie-break `buy` and

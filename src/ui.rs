@@ -4803,8 +4803,12 @@ fn command_input(
                         say(
                             &mut submissions,
                             Intent::Research {
-                                building: intent_id(entity),
+                                building: Some(intent_id(entity)),
                                 upgrade: kind.id().to_string(),
+                                // The human seat already HAS a referent — the
+                                // building it selected — so it never speaks the
+                                // phrase. Same as `train` above it.
+                                select: None,
                             },
                         );
                     }
@@ -4818,7 +4822,8 @@ fn command_input(
                         say(
                             &mut submissions,
                             Intent::Upgrade {
-                                building: intent_id(entity),
+                                building: Some(intent_id(entity)),
+                                select: None,
                             },
                         );
                     }

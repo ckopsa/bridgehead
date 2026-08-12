@@ -1513,6 +1513,23 @@ struct BuildingOut {
     /// landed by losing a fight, not by looking at their base.
     #[serde(skip_serializing_if = "Option::is_none")]
     researching: Option<ResearchJobOut>,
+    /// **Where this building sends what it trains**, on YOUR OWN production
+    /// buildings only and only once a `rally` has set one.
+    ///
+    /// The readback the verb never had. `rally` has been in the protocol since
+    /// the beginning and its effect was invisible: a commander could set a rally
+    /// point and had no way to ask what it currently was, so the only safe move
+    /// was to re-send it — which is a poll, which is the thing the snapshot
+    /// exists to delete. `template` had the same gap and closed it with a
+    /// `template: true` flag; this is the same fix with the value attached,
+    /// because unlike a template's contents a rally point is one short fact and
+    /// hiding it would be ceremony.
+    ///
+    /// Never for the opponent, for the reason `queue` is not: where a rival's
+    /// reinforcements walk is command structure, and you learn it by watching
+    /// them arrive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rally: Option<RallyOut>,
     /// Present ONLY on remembered enemy structures: the game time at which
     /// this seat last actually saw it. Everything else in the record is the
     /// state observed at that moment and may since have changed — including
@@ -1520,6 +1537,37 @@ struct BuildingOut {
     /// Absent means "observed right now".
     #[serde(skip_serializing_if = "Option::is_none")]
     last_seen: Option<f32>,
+}
+
+/// A building's rally point, in the shape a `rally` command would re-state it.
+///
+/// Exactly one of `pos` / `target` is present, mirroring the two forms of the
+/// verb: ground, or a node/unit to follow. Reading one out, changing it, and
+/// sending it back is the round trip `plans[].steps` and `triggers[].when`
+/// already offer.
+#[derive(Serialize)]
+struct RallyOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pos: Option<[f32; 2]>,
+    /// A resource node (new workers harvest it) or one of your own units (new
+    /// units follow it) — the same id a `rally` command's `target` takes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<u64>,
+}
+
+impl RallyOut {
+    fn of(rally: &RallyPoint) -> Self {
+        match rally.target {
+            RallyTarget::Ground(p) => RallyOut {
+                pos: Some([r1(p.x), r1(p.z)]),
+                target: None,
+            },
+            RallyTarget::Node(e) | RallyTarget::Unit(e) => RallyOut {
+                pos: None,
+                target: Some(e.to_bits()),
+            },
+        }
+    }
 }
 
 /// A research job on one of your own forges.
@@ -1747,6 +1795,7 @@ type SnapshotBuildings<'w, 's> = Query<
         Option<&'static AbilityCooldowns>,
         Option<&'static Upgrading>,
         Option<&'static Researching>,
+        Option<&'static RallyPoint>,
     ),
 >;
 
@@ -2070,7 +2119,7 @@ fn write_seat_snapshot(
         .iter()
         .filter(|(_, _, team, tf, ..)| **team == me || fog.sees(tf.translation))
         .map(
-            |(e, building, team, tf, health, under, queue, template, cooldown, upgrading, researching)| BuildingOut {
+            |(e, building, team, tf, health, under, queue, template, cooldown, upgrading, researching, rally)| BuildingOut {
             id: e.to_bits(),
             team: team_name(*team),
             kind: building_name(building.kind),
@@ -2115,6 +2164,8 @@ fn write_seat_snapshot(
                 level: r.to_level,
                 remaining: r1(r.remaining),
             }),
+            // Ours only — see the field's doc.
+            rally: rally.filter(|_| *team == me).map(RallyOut::of),
             // Observed this instant.
             last_seen: None,
             },
@@ -2148,9 +2199,11 @@ fn write_seat_snapshot(
             // is stale in exactly the way the scouting report was.
             tier: building_tier(ghost.kind),
             // Never on a ghost: see each field's doc. A remembered forge is a
-            // building, not a work order.
+            // building, not a work order, and a remembered rally point would be
+            // an enemy's command structure reconstructed from a scouting report.
             upgrading: None,
             researching: None,
+            rally: None,
             last_seen: Some(ghost.last_seen),
         });
     }
@@ -2211,7 +2264,7 @@ fn write_seat_snapshot(
     // Tech state, for this seat only: what its completed buildings unlock.
     let completed: Vec<BuildingKind> = buildings
         .iter()
-        .filter(|(_, _, team, _, _, under, _, _, _, _, _)| **team == me && under.is_none())
+        .filter(|(_, _, team, _, _, under, _, _, _, _, _, _)| **team == me && under.is_none())
         .map(|(_, building, ..)| building.kind)
         .collect();
     let unlocked = unlocked_map(&completed);
@@ -2492,7 +2545,7 @@ fn write_seat_snapshot(
                         in_progress: buildings
                             .iter()
                             .filter(|(_, _, team, ..)| **team == me)
-                            .find_map(|(e, _, _, _, _, _, _, _, _, _, job)| {
+                            .find_map(|(e, _, _, _, _, _, _, _, _, _, job, _)| {
                                 job.filter(|j| j.kind == k).map(|j| ResearchProgressOut {
                                     level: j.to_level,
                                     remaining: r1(j.remaining),
@@ -3273,6 +3326,59 @@ mod tests {
         let json = serde_json::to_string(&plans_out(std::slice::from_ref(&running))).unwrap();
         let back: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(back[0]["status"], "blocked: not enough gold (need 160, have 120)");
+
+        // The third stopped word (`wc3clone-8hu`): a step whose advance
+        // predicate names ground the seat has not named holds here rather than
+        // reading `running` forever.
+        running.state = PlanState::Held("no region named 'staging'".to_string());
+        let json = serde_json::to_string(&plans_out(std::slice::from_ref(&running))).unwrap();
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0]["status"], "held: no region named 'staging'");
+    }
+
+    /// **The readback `rally` never had.** The verb has been in the protocol
+    /// since the beginning and its effect was invisible, so the only way to be
+    /// sure of a building's rally point was to send it again — which is a poll,
+    /// which is the thing a snapshot exists to delete.
+    ///
+    /// Additive and optional in the strict sense: a building with no rally point
+    /// carries **no key**, so a match in which nobody says the word produces a
+    /// `buildings[]` byte-identical to the pre-feature one and
+    /// `verify_intent_bridge.py`'s shape assertions still hold.
+    #[test]
+    fn a_rally_point_rides_the_snapshot_in_the_shape_the_verb_takes() {
+        let ground = RallyOut::of(&RallyPoint {
+            target: RallyTarget::Ground(Vec3::new(55.04, 0.0, -12.06)),
+        });
+        let json: serde_json::Value = serde_json::to_value(&ground).unwrap();
+        // Rounded to one decimal by `r1`, exactly like every other coordinate
+        // in the snapshot — the wire is not where a float's tail belongs.
+        let pos = json["pos"].as_array().expect("two numbers");
+        assert_eq!(pos[0].as_f64().unwrap() as f32, 55.0);
+        assert_eq!(pos[1].as_f64().unwrap() as f32, -12.1);
+        assert!(
+            json.get("target").is_none(),
+            "exactly one of the two forms, as the verb takes exactly one: {json}"
+        );
+
+        let entity = Entity::from_raw(7);
+        for target in [RallyTarget::Node(entity), RallyTarget::Unit(entity)] {
+            let json: serde_json::Value =
+                serde_json::to_value(RallyOut::of(&RallyPoint { target })).unwrap();
+            assert_eq!(json["target"], serde_json::json!(entity.to_bits()));
+            assert!(json.get("pos").is_none(), "{json}");
+        }
+
+        // Read it out, send it back: the round trip `plans[].steps` and
+        // `triggers[].when` already offer, now for the rally point too.
+        let resent: Intent = serde_json::from_value(serde_json::json!({
+            "type": "rally",
+            "building": 9,
+            "x": json["pos"][0],
+            "z": json["pos"][1],
+        }))
+        .expect("a rally read out of a snapshot is a legal rally");
+        assert_eq!(resent.verb(), "rally");
     }
 
     /// **The snapshot echoes the stance, and only when there is one.**
