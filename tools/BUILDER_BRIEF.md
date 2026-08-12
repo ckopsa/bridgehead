@@ -570,9 +570,9 @@ nothing, and left the worktree saying `Finished` over a syntax error. The tier's
 own negative — a ref that must diverge and a ref that must not — is
 `tools/test_verify_identity.sh`, which is manual and takes about ten minutes.
 
-`tools/verify.sh` is being built by a sibling bead (`wc3clone-5g8`). **Do not
-build it yourself** — if it is not there yet, run the raw litany in Appendix A,
-which is what the tiers compose.
+`tools/verify.sh` exists and is the interface — the raw litany in Appendix A
+is what its tiers compose, and is there for when you need one piece of it in
+isolation.
 
 ### Screenshots
 
