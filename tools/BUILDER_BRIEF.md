@@ -142,6 +142,14 @@ only if that is absent. Leave a release binary lying around and every later
 determinism check silently verifies *it* — including after you have rebuilt
 debug twenty times. A stale artifact you forgot about is the worst kind.
 
+**Never run `cargo fmt`.** The repo is not rustfmt-clean and has no intention
+of becoming so mid-bead: a bare `cargo fmt` rewrites thousands of lines in
+files you never touched, drowning your actual diff and setting up merge
+conflicts for every sibling branch. One agent's fmt run produced 5,946
+insertions of pure churn across 10 untouched files and cost a three-way
+un-merge to undo. Match the surrounding style by hand, as the code-style
+section says.
+
 **`cargo build` before any live check.** This one has a body count.
 
 > `cargo test` and `cargo test --no-run` build the **test harness**. They do not
@@ -235,7 +243,7 @@ these was, at some point, two places:
 | --- | --- |
 | a player mutates the world | `Intent` → `SubmitIntent` → `intent::apply_intents`. `ui.rs` and `bridge.rs` build intents and mutate **nothing**. |
 | what a unit's stats actually are | `effective_stats` / `effective_stats_with` — base row + statuses + research, one function. |
-| what a place name means | `intent::resolve_places`, run once at the top of `compile_intent`, before any verb arm sees the intent. |
+| what a place name means — and a role selector | `intent::resolve_places`, run once at the top of `compile_intent`, before any verb arm sees the intent. Since 0uu.1 it also resolves `select` / `target_select` / `site` phrases (`my hero`, `all army`, `nearest tree`, …) at fire time. |
 | what an ability effect *does* | `combat::apply_atom` — used by the instant path and by the `ScheduledEffect` entities that pay out `OverTime` clauses. |
 | spending money | `Economies::get_mut(team).pay(..)` |
 | moving a unit's `Transform` | `units.rs`. Everyone else inserts `MoveTo`. |
@@ -699,11 +707,28 @@ the bridge is a live singleton and these write into seat directories.
 ### A.5 Python tooling tests
 
 ```bash
-python3 -m pytest tools/            # or: for f in tools/test_*.py; do python3 "$f"; done
+for f in tools/test_*.py; do python3 "$f"; done   # what verify.sh's python stage runs
 ```
 
-`tools/test_arena.py`, `tools/test_arena_run.py`, `tools/test_bridge_wait.py`,
-`tools/test_intent_compile.py`. Touch a `tools/*.py` and you own these.
+Every `tools/test_*.py` file MUST run standalone under bare `python3` — a
+`_run()` main, not a hard pytest dependency. pytest is not installed on every
+machine this repo builds on (`python3 -m pytest` fails here), and `verify.sh`
+invokes the files directly, so a suite that imports pytest at module scope or
+in `__main__` fails the python stage everywhere it matters. The files stay
+pytest-*compatible* (plain `test_*` functions, zero-arg after decorators) for
+anyone who has it. Touch a `tools/*.py` and you own these.
+
+### A.5b Capturing bridge fixtures
+
+A bridged seat LOSES its scripted AI (`bridge.rs` flips that faction's
+`AiControlled` off), so `BH_AI_BOTH=1 BH_BRIDGE=red` is *not* an AI-vs-AI
+match with an observer — the bridged side sits still and gets razed. To
+capture realistic seat snapshots, bridge the seat and hand it straight back:
+
+```bash
+BH_HEADLESS=1 BH_AI_BOTH=1 BH_BRIDGE=red BH_SPEED=16 BH_SEED=42 ./target/debug/bridgehead &
+python3 tools/bridge_send.py --seat bridge/red '[{"type":"autopilot","on":true},{"type":"ready"}]'
+```
 
 ### A.6 Other useful envs
 

@@ -223,7 +223,17 @@ type IntentTargets<'w, 's> = Query<
     ),
 >;
 
-type IntentNodes<'w, 's> = Query<'w, 's, &'static ResourceNode>;
+/// Resource nodes, with the two extra columns late binding needs. `Entity` and
+/// `Transform` are here rather than in a second query because "is this id a
+/// node?" and "which node is nearest?" are one question asked from two ends,
+/// and two queries over the same archetype is how they drift apart.
+type IntentNodes<'w, 's> = Query<'w, 's, (Entity, &'static ResourceNode, &'static Transform)>;
+
+/// Squad membership, for the `"select":"squad 2"` selector. A separate query
+/// rather than a sixth column on [`IntentUnits`] for the same reason
+/// [`IntentResearching`] is separate: widening the shared tuple would rewrite
+/// every `units.get` destructure in this file for one caller's benefit.
+type IntentSquads<'w, 's> = Query<'w, 's, &'static SquadId>;
 
 /// Forges currently working. A separate query rather than a sixth column on
 /// `IntentBuildings` on purpose: `research` is the only verb that asks, and
@@ -238,6 +248,7 @@ pub struct IntentWorld<'w, 's> {
     targets: IntentTargets<'w, 's>,
     nodes: IntentNodes<'w, 's>,
     researching: IntentResearching<'w, 's>,
+    squads: IntentSquads<'w, 's>,
 }
 
 /// The read-only world knowledge a compile consults: money, hero records,
@@ -648,34 +659,201 @@ fn apply_intents(
 /// `"ui"` for a gesture — which is what keeps the bridge's historical error
 /// strings byte-identical.
 // ---------------------------------------------------------------------------
-// Territory: the one place a name becomes a coordinate
+// Late binding: the one place a name becomes a coordinate, and a role a roster
 // ---------------------------------------------------------------------------
 
-/// Turn every `"region":"<name>"` in a submitted intent into the coordinates it
-/// stands for, or refuse with the list of names this seat may speak.
+/// Everything late binding is allowed to look at.
+///
+/// A bundle rather than seven parameters because the resolver's inner helpers
+/// all want most of it, and because the *shape* of this struct is the honest
+/// statement of what a selector may know: this seat's own living units, their
+/// squads, the neutral resource nodes, the nav grid (map geography, public per
+/// docs/FOG.md) and the named places. **No enemy query, deliberately** — a
+/// `"nearest enemy"` selector would be an intel question wearing a convenience
+/// hat, and fog decides intel, not the resolver.
+pub(crate) struct LateBind<'a, 'w, 's> {
+    me: Team,
+    regions: &'a Regions,
+    units: &'a IntentUnits<'w, 's>,
+    squads: &'a IntentSquads<'w, 's>,
+    nodes: &'a IntentNodes<'w, 's>,
+    nav: &'a NavGrid,
+}
+
+impl LateBind<'_, '_, '_> {
+    /// Every living unit of this seat that a selector matches, as ids, **sorted
+    /// by entity bits**.
+    ///
+    /// The sort is not cosmetic. `ground_order` hands out formation offsets by
+    /// index, so an unsorted resolution would spread the same squad across the
+    /// same ground in a different arrangement depending on Bevy's archetype
+    /// order — a determinism hole of exactly the kind `SimSet` exists to close.
+    fn units_matching(&self, sel: Selector) -> Vec<IntentId> {
+        let mut out: Vec<Entity> = self
+            .units
+            .iter()
+            .filter(|(entity, unit, team, ..)| {
+                **team == self.me
+                    && match sel {
+                        Selector::Heroes => is_hero_kind(unit.kind),
+                        Selector::Army => !is_worker_kind(unit.kind),
+                        Selector::AllUnits => true,
+                        Selector::Workers => is_worker_kind(unit.kind),
+                        // The membership the squad has RIGHT NOW, which is the
+                        // whole reason this selector exists.
+                        Selector::Squad(n) => {
+                            matches!(self.squads.get(*entity), Ok(SquadId(id)) if *id == n)
+                        }
+                        _ => false,
+                    }
+            })
+            .map(|(entity, ..)| entity)
+            .collect();
+        out.sort_by_key(|e| e.to_bits());
+        out.into_iter().map(intent_id).collect()
+    }
+
+    /// The nearest live node of `kind` to `from`, or `None` if the map has none
+    /// left. Ties break on `(distance, x, z, id)` so the answer does not depend
+    /// on query iteration order — the same rule
+    /// `the_fingerprint_describes_the_world_not_the_visit_order` holds the
+    /// fingerprint to.
+    fn nearest_node(&self, kind: ResourceKind, from: Vec3) -> Option<IntentId> {
+        // Written as `nearest_free_site` writes it — a running best compared as
+        // a tuple — rather than with `min_by`, so the two "nearest" answers in
+        // this file break ties by the same rule read the same way.
+        let mut best: Option<(f32, f32, f32, u64)> = None;
+        for (entity, node, tf) in self.nodes.iter() {
+            if node.kind != kind || node.remaining == 0 {
+                continue;
+            }
+            let p = tf.translation;
+            let key = (from.distance(p), p.x, p.z, entity.to_bits());
+            if best.is_none_or(|b| key < b) {
+                best = Some(key);
+            }
+        }
+        best.map(|(_, _, _, bits)| bits)
+    }
+
+    /// Where a resolved unit list is standing, for the "nearest X" selectors.
+    /// The FIRST living own unit in the list (they are sorted, so this is
+    /// stable), or `None` if the list reaches nobody.
+    fn anchor(&self, ids: &[IntentId]) -> Option<Vec3> {
+        ids.iter()
+            .find_map(|&id| own_unit(id, self.units, self.me).map(|(_, pos)| pos))
+    }
+}
+
+/// Parse one selector phrase for a channel that takes units, refusing with a
+/// sentence that names the fix.
+fn unit_selector(verb: &str, raw: &str) -> Result<Selector, String> {
+    let sel = parse_selector(raw).ok_or_else(|| unknown_selector(raw))?;
+    if !sel.is_unit_selector() {
+        return Err(format!(
+            "{verb}: '{raw}' names {}, not units — unit selectors are: \
+             {SELECTOR_UNIT_NAMES}",
+            if sel.is_node_selector() {
+                "a resource node"
+            } else {
+                "a build site"
+            }
+        ));
+    }
+    Ok(sel)
+}
+
+/// Turn every `"region":"<name>"` and every `"select":"<phrase>"` in a
+/// submitted intent into the coordinates and the ids they stand for, or refuse
+/// with the list of names this seat may speak.
 ///
 /// **This is the single resolution point, and that is the whole design.** The
 /// alternative — every verb resolving its own place — is how you end up with
 /// `defend` accepting a name that `push` does not, and with two spellings of
 /// the unknown-name error. Here there is one function, one refusal, and every
-/// arm below it sees plain floats exactly as it did before regions existed.
+/// arm below it sees plain floats and plain ids exactly as it did before
+/// regions and selectors existed.
+///
+/// The role channel joined the place channel here rather than getting its own
+/// pass for that reason and one more: **the two interact.** `harvest` with
+/// `"select":"workers","target_select":"nearest tree"` has to resolve the
+/// workers before it can say which tree is nearest, and a second resolver would
+/// have had to either duplicate the first or run in a fixed order agreed by
+/// comment. Inside one function the order is a line of code.
 ///
 /// Three things it deliberately does NOT do:
 ///
 ///  * **It does not recurse into a trigger's `then`.** compile_intent's
 ///    `trigger_set` arm says why in full: the action is validated when it
-///    FIRES, against the world that fired it. A region is on the same footing.
-///    That means an armed rule keeps naming *the perimeter* rather than the
-///    coordinates the perimeter had at arm time — so moving a region re-aims
-///    every rule that names it, and clearing one makes those rules refuse, out
-///    loud, into the arming seat's own error channel. Both are the behaviour a
-///    commander wants from a name.
+///    FIRES, against the world that fired it. A region is on the same footing,
+///    and so, now, is a selector — which is the entire point of the feature.
+///    An armed rule keeps naming *the perimeter* and *my hero* rather than the
+///    coordinates the perimeter had and the entity the hero was at arm time, so
+///    moving a region re-aims every rule that names it, and reviving a hero
+///    re-aims every rule that names the role.
 ///  * **It does not clamp or validate the geometry** — `clamp_to_map` and the
 ///    per-verb checks below still own that. A region's centre is already on the
 ///    map by construction, so there is nothing to add.
-///  * **It does not keep a resolved coordinate anywhere.** Resolution happens
-///    per submission, so a region moved between two sentences moves both.
-fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent, String> {
+///  * **It does not keep a resolved coordinate or a resolved id anywhere.**
+///    Resolution happens per submission, so a region moved between two
+///    sentences moves both, and a unit killed between two firings of the same
+///    trigger is gone from the second.
+///
+/// **An empty resolution is a refusal, not a quiet nothing.** A selector that
+/// matches no units returns `Err`, which means the intent never reaches its
+/// arm, `reached` stays false, and the seat is told in words. That is the rule
+/// that makes r21's "move 0 units" inexpressible: the only way to order nobody
+/// used to be to name nobody, and now naming a role that is currently empty
+/// teaches instead of firing.
+fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, String> {
+    let me = bind.me;
+    let regions = bind.regions;
+    /// The unit channel. `select` outranks `units` on the same rule that makes
+    /// a region outrank the coordinates beside it: naming a role is a stronger
+    /// statement than listing ids, and silently unioning the two would make
+    /// "all army plus this corpse" a sentence.
+    fn crew(
+        verb: &str,
+        ids: Vec<IntentId>,
+        select: &Option<String>,
+        bind: &LateBind,
+    ) -> Result<Vec<IntentId>, String> {
+        let Some(raw) = select else {
+            return Ok(ids);
+        };
+        let sel = unit_selector(verb, raw)?;
+        let found = bind.units_matching(sel);
+        if found.is_empty() {
+            return Err(format!(
+                "{verb}: '{raw}' matches none of your units right now — \
+                 nothing was ordered"
+            ));
+        }
+        Ok(found)
+    }
+    /// The single-referent form of `crew`: a build's worker, a cast's caster, a
+    /// follow's leader. Narrowed to the lowest entity id among the matches,
+    /// which is the same documented tie-break `own_hero` already uses for an
+    /// omitted `hero` field — one rule for "which one did you mean", not two.
+    fn soloist(
+        verb: &str,
+        id: Option<IntentId>,
+        select: &Option<String>,
+        bind: &LateBind,
+    ) -> Result<Option<IntentId>, String> {
+        let Some(raw) = select else {
+            return Ok(id);
+        };
+        let sel = unit_selector(verb, raw)?;
+        // Sorted by entity bits already, so `first` IS the lowest id.
+        match bind.units_matching(sel).first() {
+            Some(found) => Ok(Some(*found)),
+            None => Err(format!(
+                "{verb}: '{raw}' matches none of your units right now — \
+                 nothing was ordered"
+            )),
+        }
+    }
     /// `(x, z, radius_from_region)`. A region always supplies a radius; only
     /// the two verbs that have a radius to give away actually use it.
     fn shape(
@@ -710,7 +888,14 @@ fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent,
     }
 
     Ok(match intent {
-        Intent::Move { units, x, z, region } => {
+        Intent::Move {
+            units,
+            x,
+            z,
+            region,
+            select,
+        } => {
+            let units = crew("move", units, &select, bind)?;
             let (x, z, _) = shape(regions, me, x, z, &region)?;
             let (px, pz) = both("move", x, z)?;
             Intent::Move {
@@ -718,9 +903,17 @@ fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent,
                 x: Some(px),
                 z: Some(pz),
                 region,
+                select,
             }
         }
-        Intent::AttackMove { units, x, z, region } => {
+        Intent::AttackMove {
+            units,
+            x,
+            z,
+            region,
+            select,
+        } => {
+            let units = crew("attackmove", units, &select, bind)?;
             let (x, z, _) = shape(regions, me, x, z, &region)?;
             let (px, pz) = both("attackmove", x, z)?;
             Intent::AttackMove {
@@ -728,25 +921,185 @@ fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent,
                 x: Some(px),
                 z: Some(pz),
                 region,
+                select,
             }
         }
+        Intent::Attack {
+            units,
+            target,
+            select,
+        } => Intent::Attack {
+            units: crew("attack", units, &select, bind)?,
+            target,
+            select,
+        },
+        Intent::Harvest {
+            units,
+            target,
+            select,
+            target_select,
+        } => {
+            let units = crew("harvest", units, &select, bind)?;
+            // The node is chosen from where the WORKERS are, which is why this
+            // runs after the crew and not beside it.
+            let target = match &target_select {
+                None => target,
+                Some(raw) => {
+                    let sel = parse_selector(raw).ok_or_else(|| unknown_selector(raw))?;
+                    let kind = match sel {
+                        Selector::NearestTree => ResourceKind::Lumber,
+                        Selector::NearestMine => ResourceKind::Gold,
+                        _ => {
+                            return Err(format!(
+                                "harvest: '{raw}' does not name a resource node — \
+                                 node selectors are: {SELECTOR_NODE_NAMES}"
+                            ))
+                        }
+                    };
+                    let Some(from) = bind.anchor(&units) else {
+                        return Err("harvest: '(nearest)' needs at least one living worker to \
+                             measure from — name units or a unit selector that matches"
+                            .to_string());
+                    };
+                    let Some(found) = bind.nearest_node(kind, from) else {
+                        return Err(format!(
+                            "harvest: no {} left on the map — nothing was ordered",
+                            sel.phrase().trim_start_matches("nearest ")
+                        ));
+                    };
+                    Some(found)
+                }
+            };
+            Intent::Harvest {
+                units,
+                target,
+                select,
+                target_select,
+            }
+        }
+        Intent::Return { units, select } => Intent::Return {
+            units: crew("return", units, &select, bind)?,
+            select,
+        },
+        Intent::Follow {
+            units,
+            target,
+            select,
+            target_select,
+        } => Intent::Follow {
+            units: crew("follow", units, &select, bind)?,
+            target: soloist("follow", target, &target_select, bind)?,
+            select,
+            target_select,
+        },
+        Intent::Stop { units, select } => Intent::Stop {
+            units: crew("stop", units, &select, bind)?,
+            select,
+        },
         Intent::Build {
             worker,
             kind,
             x,
             z,
             region,
+            select,
+            site,
         } => {
+            let worker = soloist("build", worker, &select, bind)?;
             let (x, z, _) = shape(regions, me, x, z, &region)?;
             let (px, pz) = both("build", x, z)?;
+            // **The site selector, and the loop it exists to break.** The
+            // rejection this verb already produces computes a legal alternative
+            // and prints it (`blocked_site_error`'s `nearest legal: (x, z)`);
+            // before this there was no way to say "yes, that one". Blue-r23
+            // armed a farm trigger on fixed coordinates, watched it report
+            // `site blocked` on every retry for the whole match, and never got
+            // the farm. `"site":"nearest legal site"` accepts the hint in
+            // advance, through the same `nearest_free_site` the hint comes
+            // from — so what the selector picks is legal by construction rather
+            // than by two functions agreeing.
+            let (px, pz) = match &site {
+                None => (px, pz),
+                Some(raw) => {
+                    let sel = parse_selector(raw).ok_or_else(|| unknown_selector(raw))?;
+                    if sel != Selector::NearestLegalSite {
+                        return Err(format!(
+                            "build: '{raw}' does not name a site — the site selector is \
+                             'nearest legal site'"
+                        ));
+                    }
+                    // An unknown kind is the build arm's error to report, in its
+                    // own words. Leave the point alone and let it.
+                    match parse_building_kind(&kind) {
+                        None => (px, pz),
+                        Some(k) => {
+                            let size = building_stats(k).size;
+                            let want = snap_footprint(clamp_to_map(Vec3::new(px, 0.0, pz)), size);
+                            match nearest_free_site(bind.nav, want, size, PLACEMENT_HINT_RADIUS) {
+                                Some(p) => (p.x, p.z),
+                                None => {
+                                    return Err(format!(
+                                        "build: no legal site for {} within \
+                                         {PLACEMENT_HINT_RADIUS:.0} of ({px:.1}, {pz:.1}) — \
+                                         name somewhere else",
+                                        building_name(k)
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+            };
             Intent::Build {
                 worker,
                 kind,
                 x: Some(px),
                 z: Some(pz),
                 region,
+                select,
+                site,
             }
         }
+        Intent::Cast {
+            hero,
+            ability,
+            x,
+            z,
+            target,
+            select,
+        } => Intent::Cast {
+            hero: soloist("cast", hero, &select, bind)?,
+            ability,
+            x,
+            z,
+            target,
+            select,
+        },
+        Intent::Priority {
+            units,
+            classes,
+            select,
+        } => Intent::Priority {
+            units: crew("priority", units, &select, bind)?,
+            classes,
+            select,
+        },
+        Intent::Autocast {
+            units,
+            min_enemies,
+            ability,
+            select,
+        } => Intent::Autocast {
+            units: crew("autocast", units, &select, bind)?,
+            min_enemies,
+            ability,
+            select,
+        },
+        Intent::Squad { units, id, select } => Intent::Squad {
+            units: crew("squad", units, &select, bind)?,
+            id,
+            select,
+        },
         // Rally, retreat and leash each have a legal placeless form (a rally
         // onto a unit; the two doctrine verbs' CLEAR spelling), so an absent
         // place is not an error here — only an unresolvable name is.
@@ -772,7 +1125,9 @@ fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent,
             x,
             z,
             region,
+            select,
         } => {
+            let units = crew("retreat", units, &select, bind)?;
             let (x, z, _) = shape(regions, me, x, z, &region)?;
             Intent::Retreat {
                 units,
@@ -780,6 +1135,7 @@ fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent,
                 x,
                 z,
                 region,
+                select,
             }
         }
         Intent::Leash {
@@ -788,7 +1144,9 @@ fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent,
             z,
             region,
             radius,
+            select,
         } => {
+            let units = crew("leash", units, &select, bind)?;
             let (x, z, from_region) = shape(regions, me, x, z, &region)?;
             Intent::Leash {
                 units,
@@ -798,6 +1156,7 @@ fn resolve_places(intent: Intent, me: Team, regions: &Regions) -> Result<Intent,
                 // An explicit radius still wins: naming a circle is a
                 // convenience, never a ceiling on what you may say.
                 radius: radius.or(from_region),
+                select,
             }
         }
         Intent::Posture { id, posture } => {
@@ -948,10 +1307,21 @@ fn compile_intent(
         targets,
         nodes,
         researching,
+        squads,
     } = world;
-    // Names become coordinates here and nowhere else. Everything below this
-    // line sees the language it has always seen.
-    let intent = match resolve_places(intent, me, regions) {
+    // Names become coordinates and roles become rosters here and nowhere else.
+    // Everything below this line sees the language it has always seen.
+    let intent = match resolve_places(
+        intent,
+        &LateBind {
+            me,
+            regions,
+            units,
+            squads,
+            nodes,
+            nav,
+        },
+    ) {
         Ok(intent) => intent,
         Err(err) => {
             errors.push(format!("{tag}: {err}"));
@@ -1007,7 +1377,9 @@ fn compile_intent(
                 reached,
             );
         }
-        Intent::Attack { units: ids, target } => {
+        Intent::Attack {
+            units: ids, target, ..
+        } => {
             let Some(target_entity) = intent_entity(target) else {
                 errors.push(format!("{tag}: target {target} not found"));
                 return;
@@ -1053,7 +1425,18 @@ fn compile_intent(
                 );
             }
         }
-        Intent::Harvest { units: ids, target } => {
+        Intent::Harvest {
+            units: ids, target, ..
+        } => {
+            // `resolve_places` has already turned a `target_select` into an id,
+            // so `None` here means the sentence named no node at all.
+            let Some(target) = target else {
+                errors.push(format!(
+                    "{tag}: harvest needs target (a node id) or target_select \
+                     (\"nearest tree\", \"nearest mine\")"
+                ));
+                return;
+            };
             // Resource nodes are neutral: either seat may harvest any of
             // them.
             let node = match intent_entity(target).filter(|e| nodes.get(*e).is_ok()) {
@@ -1088,7 +1471,7 @@ fn compile_intent(
             }
             *reached |= sent > 0;
         }
-        Intent::Return { units: ids } => {
+        Intent::Return { units: ids, .. } => {
             for (entity, pos) in own_units(&ids, units, me, tag, errors, reached) {
                 issuer.issue(
                     commands,
@@ -1100,7 +1483,16 @@ fn compile_intent(
                 );
             }
         }
-        Intent::Follow { units: ids, target } => {
+        Intent::Follow {
+            units: ids, target, ..
+        } => {
+            let Some(target) = target else {
+                errors.push(format!(
+                    "{tag}: follow needs target (a unit id) or target_select \
+                     (e.g. \"my hero\")"
+                ));
+                return;
+            };
             let leader = match intent_entity(target) {
                 Some(e) => match units.get(e) {
                     Ok((_, _, team, ..)) if *team == me => e,
@@ -1128,7 +1520,7 @@ fn compile_intent(
                 );
             }
         }
-        Intent::Stop { units: ids } => {
+        Intent::Stop { units: ids, .. } => {
             // The established Stop: re-issue a Move to the unit's own spot,
             // which halts it and clears any attack target. It is a direct
             // order like any other — "halt" travels down the same wire as
@@ -1151,6 +1543,13 @@ fn compile_intent(
             };
             let Some(building_kind) = parse_building_kind(&kind) else {
                 errors.push(format!("{tag}: unknown building kind '{kind}'"));
+                return;
+            };
+            // `resolve_places` has already turned a `select` into an id.
+            let Some(worker) = worker else {
+                errors.push(format!(
+                    "{tag}: build needs worker (a unit id) or select (e.g. \"workers\")"
+                ));
                 return;
             };
             let Some((entity, _)) = own_unit(worker, units, me) else {
@@ -1546,7 +1945,24 @@ fn compile_intent(
                 )),
             }
         }
-        Intent::Cast { hero, ability, x, z, target } => {
+        Intent::Cast {
+            hero,
+            ability,
+            x,
+            z,
+            target,
+            ..
+        } => {
+            // `resolve_places` has already turned a `select` into an id, so a
+            // missing one means the sentence named no caster at all. Named
+            // rather than defaulted: a cast that quietly picked *some* hero is
+            // the bug `own_hero`'s doc comment describes at length.
+            let Some(hero) = hero else {
+                errors.push(format!(
+                    "{tag}: cast needs hero/caster (an id) or select (e.g. \"my hero\")"
+                ));
+                return;
+            };
             let Some(entity) = intent_entity(hero) else {
                 errors.push(format!("{tag}: caster {hero} not found/not yours"));
                 return;
@@ -1926,6 +2342,7 @@ fn compile_intent(
         Intent::Priority {
             units: ids,
             classes,
+            ..
         } => {
             // One bad class name invalidates the whole list rather than
             // silently installing a priority order the commander didn't ask
@@ -2014,6 +2431,7 @@ fn compile_intent(
             units: ids,
             min_enemies,
             ability,
+            ..
         } => {
             let min_enemies = min_enemies.unwrap_or(0);
             // Recomputed for the same reason `harvest` recomputes it: a
@@ -2067,7 +2485,7 @@ fn compile_intent(
             }
             *reached |= set > 0;
         }
-        Intent::Squad { units: ids, id } => {
+        Intent::Squad { units: ids, id, .. } => {
             for (entity, _) in own_units(&ids, units, me, tag, errors, reached) {
                 let mut ec = commands.entity(entity);
                 match id {
@@ -3410,6 +3828,7 @@ mod tests {
             Intent::Attack {
                 units: vec![soldier.to_bits()],
                 target: barracks.to_bits(),
+                select: None,
             },
         ));
         app.update();
@@ -3471,14 +3890,26 @@ mod tests {
             team: Team::Human,
             source: IntentSource::Bridge,
             tag: "cmd 3".to_string(),
-            intent: Intent::Move { units: vec![commanded.to_bits()], x: Some(0.0), z: Some(0.0), region: None },
+            intent: Intent::Move {
+                units: vec![commanded.to_bits()],
+                x: Some(0.0),
+                z: Some(0.0),
+                region: None,
+                select: None,
+            },
             trigger: None,
             plan: None,
         });
         // The same sentence, from the seat with a screen.
         app.world_mut().send_event(SubmitIntent::ui(
             Team::Human,
-            Intent::Move { units: vec![clicked.to_bits()], x: Some(0.0), z: Some(0.0), region: None },
+            Intent::Move {
+                units: vec![clicked.to_bits()],
+                x: Some(0.0),
+                z: Some(0.0),
+                region: None,
+                select: None,
+            },
         ));
         app.update();
 
@@ -3519,7 +3950,13 @@ mod tests {
             team: Team::Human,
             source: IntentSource::Bridge,
             tag: "cmd 0".to_string(),
-            intent: Intent::Move { units: vec![inside.to_bits()], x: Some(61.0), z: Some(61.0), region: None },
+            intent: Intent::Move {
+                units: vec![inside.to_bits()],
+                x: Some(61.0),
+                z: Some(61.0),
+                region: None,
+                select: None,
+            },
             trigger: None,
             plan: None,
         });
@@ -3568,6 +4005,7 @@ mod tests {
                 x: Some(12.0),
                 z: Some(-4.0),
                 region: None,
+                select: None,
             },
         ));
         app.world_mut().send_event(SubmitIntent {
@@ -3577,6 +4015,7 @@ mod tests {
             intent: Intent::Squad {
                 units: vec![soldier.to_bits()],
                 id: Some(1),
+                select: None,
             },
             trigger: None,
             plan: None,
@@ -3614,6 +4053,7 @@ mod tests {
                     x: Some(0.0),
                     z: Some(0.0),
                     region: None,
+                    select: None,
                 },
             ));
         }
@@ -3704,6 +4144,7 @@ mod tests {
         let gesture = Intent::Attack {
             units: vec![soldier.to_bits()],
             target: barracks.to_bits(),
+            select: None,
         };
         let typed: Intent = serde_json::from_str(&format!(
             r#"{{"type":"attack","units":[{}],"target":{}}}"#,
@@ -3775,6 +4216,7 @@ mod tests {
             Intent::Attack {
                 units: vec![soldier.to_bits()],
                 target: stale,
+                select: None,
             },
         ));
         app.update();
@@ -3820,6 +4262,7 @@ mod tests {
                 Intent::Attack {
                     units: vec![soldier.to_bits()],
                     target: 999_999,
+                    select: None,
                 },
             ));
             app.update();
@@ -3839,11 +4282,13 @@ mod tests {
         app.world_mut().send_event(SubmitIntent::ui(
             Team::Human,
             Intent::Build {
-                worker: soldier.to_bits(),
+                worker: Some(soldier.to_bits()),
                 kind: "Nonsense".to_string(),
                 x: Some(0.0),
                 z: Some(0.0),
                 region: None,
+                select: None,
+                site: None,
             },
         ));
         app.update();
@@ -3880,6 +4325,7 @@ mod tests {
             intent: Intent::Attack {
                 units: vec![soldier.to_bits()],
                 target: 999_999,
+                select: None,
             },
             trigger: None,
             plan: None,
@@ -4550,6 +4996,7 @@ mod tests {
                 x: Some(-70.0),
                 z: Some(-70.0),
                 region: None,
+                select: None,
             },
         ));
         app.update();
@@ -4576,6 +5023,7 @@ mod tests {
                 x: Some(-70.0),
                 z: Some(-70.0),
                 region: None,
+                select: None,
             },
         ));
         app.update();
@@ -4666,6 +5114,7 @@ mod tests {
             x: Some(40.0),
             z: Some(40.0),
             region: None,
+            select: None,
         };
 
         // Spoken now: it travels.
@@ -4720,6 +5169,7 @@ mod tests {
                 x: Some(1.0),
                 z: Some(2.0),
                 region: None,
+                select: None,
             },
         ));
         app.update();
@@ -4816,6 +5266,7 @@ mod tests {
                 x: Some(1.0),
                 z: Some(2.0),
                 region: None,
+                select: None,
             },
         ));
         app.update();
@@ -4867,8 +5318,9 @@ mod tests {
                     x: None,
                     z: None,
                     target: None,
-                    hero: caster.to_bits(),
+                    hero: Some(caster.to_bits()),
                     ability: Some(AbilitySelector::Id("CallToArms".to_string())),
+                    select: None,
                 },
                 trigger: None,
                 plan: None,
@@ -4897,7 +5349,11 @@ mod tests {
                 intent: Intent::Cast {
                     x: None,
                     z: None,
-                    target: None, hero: caster, ability: None },
+                    target: None,
+                    hero: Some(caster),
+                    ability: None,
+                    select: None,
+                },
                 trigger: None,
                 plan: None,
             });
@@ -5004,11 +5460,13 @@ mod tests {
             source: IntentSource::Bridge,
             tag: "cmd 0".to_string(),
             intent: Intent::Build {
-                worker: worker.to_bits(),
+                worker: Some(worker.to_bits()),
                 kind: "TownHall".to_string(),
                 x: Some(mine.x),
                 z: Some(mine.z),
                 region: None,
+                select: None,
+                site: None,
             },
             trigger: None,
             plan: None,
@@ -5047,11 +5505,13 @@ mod tests {
             source: IntentSource::Bridge,
             tag: "cmd 0".to_string(),
             intent: Intent::Build {
-                worker: worker.to_bits(),
+                worker: Some(worker.to_bits()),
                 kind: "TownHall".to_string(),
                 x: Some(hx),
                 z: Some(hz),
                 region: None,
+                select: None,
+                site: None,
             },
             trigger: None,
             plan: None,
@@ -5365,6 +5825,7 @@ mod tests {
             x: Some(12.5),
             z: Some(-30.5),
             region: None,
+            select: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: Intent = serde_json::from_str(&json).unwrap();
@@ -5589,6 +6050,7 @@ mod tests {
             z: Some(-8.0),
             region: None,
             radius: Some(18.0),
+            select: None,
         };
         let typed: Intent = serde_json::from_str(
             r#"{"type":"leash","units":[41,42],"x":12.0,"z":-8.0,"radius":18.0}"#,
@@ -5608,8 +6070,9 @@ mod tests {
             x: None,
             z: None,
             target: None,
-            hero: 5,
+            hero: Some(5),
             ability: Some(AbilitySelector::Index(1)),
+            select: None,
         };
         let typed: Intent =
             serde_json::from_str(r#"{"type":"cast","hero":5,"ability":1}"#).unwrap();
@@ -5623,6 +6086,7 @@ mod tests {
         let gesture = Intent::Attack {
             units: vec![1, 2, 3],
             target: 77,
+            select: None,
         };
         let typed: Intent =
             serde_json::from_str(r#"{"type":"attack","units":[1,2,3],"target":77}"#).unwrap();
@@ -6338,6 +6802,7 @@ mod tests {
                 x: None,
                 z: None,
                 region: Some("the-perimeter".to_string()),
+                select: None,
             },
         ));
         app.update();
@@ -6374,6 +6839,7 @@ mod tests {
                 x: Some(90.0),
                 z: Some(90.0),
                 region: Some("here".to_string()),
+                select: None,
             },
         ));
         app.update();
@@ -6409,6 +6875,7 @@ mod tests {
                 x: None,
                 z: None,
                 region: Some("the-perimiter".to_string()),
+                select: None,
             },
         ));
         app.update();
@@ -6444,6 +6911,7 @@ mod tests {
                     x: None,
                     z: None,
                     region: None,
+                    select: None,
                 },
                 "move needs x/z or a region name",
             ),
@@ -6453,6 +6921,7 @@ mod tests {
                     x: None,
                     z: None,
                     region: None,
+                    select: None,
                 },
                 "attackmove needs x/z or a region name",
             ),
@@ -6790,7 +7259,11 @@ mod tests {
             team: Team::Human,
             source: IntentSource::Bridge,
             tag: "cmd 0".to_string(),
-            intent: Intent::Squad { units: vec![unit.to_bits()], id: Some(1) },
+            intent: Intent::Squad {
+                units: vec![unit.to_bits()],
+                id: Some(1),
+                select: None,
+            },
             trigger: None,
             plan: None,
         });
@@ -6958,6 +7431,7 @@ mod tests {
                 z: None,
                 region: Some("the-ring".to_string()),
                 radius: None,
+                select: None,
             },
         ));
         app.update();
@@ -6996,6 +7470,7 @@ mod tests {
                 x: None,
                 z: None,
                 region: Some("the-perimeter".to_string()),
+                select: None,
             }
             .sentence(),
             "move unit 7 to the-perimeter"
@@ -7007,6 +7482,7 @@ mod tests {
                 x: Some(1.0),
                 z: Some(2.0),
                 region: None,
+                select: None,
             }
             .sentence(),
             "move unit 7 to (1.0, 2.0)"
@@ -7039,7 +7515,10 @@ mod tests {
                     class: None,
                     count: 5,
                 },
-                then: Box::new(Intent::Stop { units: vec![] }),
+                then: Box::new(Intent::Stop {
+                    units: vec![],
+                    select: None,
+                }),
                 repeat: None,
             },
         ));
@@ -7062,7 +7541,10 @@ mod tests {
                     class: None,
                     count: 5,
                 },
-                then: Box::new(Intent::Stop { units: vec![] }),
+                then: Box::new(Intent::Stop {
+                    units: vec![],
+                    select: None,
+                }),
                 repeat: None,
             },
         ));
@@ -7137,5 +7619,644 @@ mod tests {
             assert!(errs[0].contains("doctrine, not a scripting language"), "{}", errs[0]);
         }
         assert!(app.world().resource::<Triggers>().get(Team::Human).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Late-bound selectors (docs/AFFORDANCES.md § Chains; arena r21–r23)
+    // -----------------------------------------------------------------------
+
+    /// Fire a stored trigger's action exactly the way `trigger.rs` does: pull
+    /// the `then` out of `Triggers` and submit it. Nothing here re-derives the
+    /// intent, so a test that fires twice is genuinely firing the SAME stored
+    /// sentence twice.
+    fn fire(app: &mut App, team: Team, name: &str) {
+        let then = app
+            .world()
+            .resource::<Triggers>()
+            .get(team)
+            .iter()
+            .find(|t| t.name.as_str() == name)
+            .unwrap_or_else(|| panic!("no trigger named {name}"))
+            .then
+            .clone();
+        let stamp = TriggerName::new(name).unwrap();
+        app.world_mut()
+            .send_event(SubmitIntent::fired(team, IntentSource::Bridge, stamp, then));
+        app.update();
+    }
+
+    fn order_of(app: &App, entity: Entity) -> Order {
+        app.world()
+            .entity(entity)
+            .get::<Order>()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn spawn_worker(app: &mut App, team: Team, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit {
+                    kind: UnitKind::Worker,
+                },
+                team,
+                Transform::from_translation(at),
+                Order::Idle,
+            ))
+            .id()
+    }
+
+    fn spawn_footman(app: &mut App, team: Team, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit {
+                    kind: UnitKind::Footman,
+                },
+                team,
+                Transform::from_translation(at),
+                Order::Idle,
+            ))
+            .id()
+    }
+
+    fn spawn_node(app: &mut App, kind: ResourceKind, at: Vec3, remaining: u32) -> Entity {
+        app.world_mut()
+            .spawn((
+                ResourceNode { kind, remaining },
+                Transform::from_translation(at),
+            ))
+            .id()
+    }
+
+    /// **The bead, in one test.** Arm a hero-save rule against the ROLE, kill
+    /// the hero the role pointed at when the rule was armed, train another, and
+    /// fire the same stored sentence again. The new hero moves.
+    ///
+    /// This is r21's `"units":[]` corpse and red-r23's dead hero ids in a single
+    /// scenario, and the thing that fixes both is that the stored `then` still
+    /// says `"select":"my hero"` on the second firing — the resolution happened
+    /// in `resolve_places`, at the top of the compiler, and was thrown away
+    /// afterwards exactly like a region's coordinates.
+    #[test]
+    fn a_selector_binds_to_the_hero_that_exists_when_the_rule_fires() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"hero-save","repeat":5,
+                "when":{"type":"base_under_attack"},
+                "then":{"type":"move","select":"my hero","x":-70.0,"z":-70.0}}"#,
+        );
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "arming against a role the team does not have yet must not refuse"
+        );
+
+        let first = spawn_hero(&mut app, Team::Human, Vec3::new(10.0, 0.0, 10.0));
+        fire(&mut app, Team::Human, "hero-save");
+        assert!(
+            matches!(order_of(&app, first), Order::Move(p) if p.x == -70.0 && p.z == -70.0),
+            "the hero alive at fire time is the one that moves"
+        );
+
+        // The hero dies and the team trains another. A frozen id would now name
+        // a corpse; the role names whoever holds it.
+        app.world_mut().despawn(first);
+        let second = spawn_hero(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.update();
+        drain_errors(&mut app, Team::Human);
+
+        fire(&mut app, Team::Human, "hero-save");
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "the re-fire must not report a dead id"
+        );
+        assert!(
+            matches!(order_of(&app, second), Order::Move(p) if p.x == -70.0 && p.z == -70.0),
+            "the hero trained AFTER the rule was armed is the one that moves"
+        );
+
+        // And the stored sentence is still the role, not a resolved roster.
+        let then = app
+            .world()
+            .resource::<Triggers>()
+            .get(Team::Human)
+            .iter()
+            .find(|t| t.name.as_str() == "hero-save")
+            .unwrap()
+            .then
+            .clone();
+        match then {
+            Intent::Move { units, select, .. } => {
+                assert!(units.is_empty(), "resolution must not be written back");
+                assert_eq!(select.as_deref(), Some("my hero"));
+            }
+            other => panic!("stored then changed shape: {other:?}"),
+        }
+    }
+
+    /// **"Move 0 units" is inexpressible.** r21's hero-save fired with
+    /// `"units":[]`, was rejected as "no units given", and the hero died three
+    /// seconds later. A selector that currently matches nobody is the same
+    /// situation said in the new vocabulary, and it must teach rather than
+    /// fire: nothing is ordered, and the seat is told which phrase found
+    /// nobody.
+    #[test]
+    fn an_empty_selector_teaches_instead_of_ordering_nobody() {
+        let mut app = compiler_app();
+        // A worker exists, so the team is not empty — only the ARMY is.
+        let worker = spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"move","select":"all army","x":5.0,"z":5.0}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'all army' matches none of your units right now")
+                && errors[0].contains("nothing was ordered"),
+            "{}",
+            errors[0]
+        );
+        assert!(
+            matches!(order_of(&app, worker), Order::Idle),
+            "an empty resolution must not spill onto somebody else"
+        );
+    }
+
+    /// A plan step whose selector matches nobody is a REFUSAL, not a partial
+    /// success — so the plan blocks and says why instead of walking past a step
+    /// that did nothing. (`reached` is what tells the two apart; an empty
+    /// resolution never reaches the verb's arm at all.)
+    #[test]
+    fn an_empty_selector_blocks_the_plan_step_that_used_it() {
+        let mut app = compiler_app();
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"plan_set","name":"opening","steps":[
+                {"intent":{"type":"attackmove","select":"all army","x":0.0,"z":0.0}}]}"#,
+        ));
+        app.update();
+        drain_errors(&mut app, Team::Human);
+
+        let stamp = PlanStamp {
+            name: PlanName::new("opening").unwrap(),
+            step: 1,
+            of: 1,
+        };
+        let step = app.world().resource::<Plans>().get(Team::Human)[0].steps[0]
+            .intent
+            .clone();
+        // What plan.rs's evaluator sets on the way out; without it `report`
+        // treats the verdict as addressed to a plan that has sent nothing.
+        app.world_mut().resource_mut::<Plans>().get_mut(Team::Human)[0].submitted = true;
+        app.world_mut().send_event(SubmitIntent::plan_step(
+            Team::Human,
+            IntentSource::Bridge,
+            stamp,
+            step,
+        ));
+        app.update();
+        let state = app.world().resource::<Plans>().get(Team::Human)[0]
+            .state
+            .clone();
+        assert!(
+            matches!(state, PlanState::Blocked(ref why) if why.contains("all army")),
+            "{state:?}"
+        );
+    }
+
+    /// **A selector outranks the ids beside it**, exactly as a region outranks
+    /// the coordinates beside it. Red-r23's stale rosters were lists that had
+    /// been right when they were written; a sentence carrying both a stale list
+    /// and a role must mean the role, and must not report the stale list's
+    /// corpses as errors it is about to ignore anyway.
+    #[test]
+    fn a_selector_outranks_the_ids_beside_it() {
+        let mut app = compiler_app();
+        let corpse = spawn_footman(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().despawn(corpse);
+        let alive = spawn_footman(&mut app, Team::Human, Vec3::new(3.0, 0.0, 0.0));
+        app.update();
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"move","units":[{}],"select":"all army","x":8.0,"z":8.0}}"#,
+                corpse.to_bits()
+            ),
+        ));
+        app.update();
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "the overruled list must not be reported"
+        );
+        assert!(matches!(order_of(&app, alive), Order::Move(p) if p.x == 8.0 && p.z == 8.0));
+    }
+
+    /// `squad N` means the members it has NOW. A unit enrolled after the rule
+    /// was armed is in it; a unit that never joined is not.
+    #[test]
+    fn a_squad_selector_names_the_members_the_squad_has_now() {
+        let mut app = compiler_app();
+        let veteran = spawn_footman(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().entity_mut(veteran).insert(SquadId(2));
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"push","repeat":5,
+                "when":{"type":"game_time","at":0.0},
+                "then":{"type":"attackmove","select":"squad 2","x":40.0,"z":40.0}}"#,
+        );
+        drain_errors(&mut app, Team::Human);
+
+        // A recruit joins the squad AFTER the rule was written.
+        let recruit = spawn_footman(&mut app, Team::Human, Vec3::new(1.0, 0.0, 0.0));
+        app.world_mut().entity_mut(recruit).insert(SquadId(2));
+        // And an outsider that must not be swept up.
+        let outsider = spawn_footman(&mut app, Team::Human, Vec3::new(2.0, 0.0, 0.0));
+        app.update();
+
+        fire(&mut app, Team::Human, "push");
+        assert!(matches!(order_of(&app, veteran), Order::AttackMove(_)));
+        assert!(matches!(order_of(&app, recruit), Order::AttackMove(_)));
+        assert!(matches!(order_of(&app, outsider), Order::Idle));
+    }
+
+    /// **The tree is chosen when the order compiles.** Red-r23 memorized a tree
+    /// id and had it chopped out from under a repeating harvest order. The same
+    /// rule written against `"nearest tree"` re-answers the question every time
+    /// it fires.
+    #[test]
+    fn the_nearest_tree_is_chosen_at_fire_time_not_arm_time() {
+        let mut app = compiler_app();
+        let worker = spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        let near = spawn_node(
+            &mut app,
+            ResourceKind::Lumber,
+            Vec3::new(5.0, 0.0, 0.0),
+            100,
+        );
+        let far = spawn_node(
+            &mut app,
+            ResourceKind::Lumber,
+            Vec3::new(40.0, 0.0, 0.0),
+            100,
+        );
+        // A mine sitting nearer than either tree, to prove the kind is honoured.
+        spawn_node(&mut app, ResourceKind::Gold, Vec3::new(1.0, 0.0, 0.0), 100);
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"chop","repeat":5,
+                "when":{"type":"game_time","at":0.0},
+                "then":{"type":"harvest","select":"workers","target_select":"nearest tree"}}"#,
+        );
+        drain_errors(&mut app, Team::Human);
+
+        fire(&mut app, Team::Human, "chop");
+        assert!(matches!(order_of(&app, worker), Order::Harvest(e) if e == near));
+
+        // The near tree is felled. The stored rule still says "nearest tree".
+        app.world_mut().despawn(near);
+        app.update();
+        fire(&mut app, Team::Human, "chop");
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "a felled tree must not become an error"
+        );
+        assert!(matches!(order_of(&app, worker), Order::Harvest(e) if e == far));
+    }
+
+    /// An exhausted map teaches instead of firing, on the same rule as an empty
+    /// unit selector.
+    #[test]
+    fn a_nearest_node_selector_with_nothing_left_teaches() {
+        let mut app = compiler_app();
+        spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"harvest","select":"workers","target_select":"nearest mine"}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("no mine left on the map"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    /// **Blue-r23's loop, closed.** A fixed-coordinate farm trigger reported
+    /// `site blocked` on every retry all match; the rejection was already
+    /// computing a legal alternative and printing it, and there was no way to
+    /// say "yes, that one". `"site":"nearest legal site"` says it.
+    #[test]
+    fn a_site_selector_accepts_the_nearest_legal_footprint() {
+        let mut app = compiler_app();
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let e = economies.get_mut(Team::Human);
+            e.gold = 2000;
+            e.lumber = 2000;
+        }
+        let wanted = Vec3::new(20.0, 0.0, 20.0);
+        app.world_mut()
+            .resource_mut::<NavGrid>()
+            .set_blocked_rect(wanted, 6.0, true);
+        spawn_worker(&mut app, Team::Human, Vec3::new(10.0, 0.0, 10.0));
+
+        // Without the selector: the historical refusal, unchanged.
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"build","select":"workers","kind":"Farm","x":20.0,"z":20.0}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("is blocked for"), "{}", errors[0]);
+
+        // With it: the engine takes its own advice.
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"build","select":"workers","kind":"Farm","x":20.0,"z":20.0,
+                "site":"nearest legal site"}"#,
+        ));
+        app.update();
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "the nearest legal site must itself be legal"
+        );
+        let placed = app
+            .world_mut()
+            .query::<&Order>()
+            .iter(app.world())
+            .find_map(|o| match o {
+                Order::Build { kind, pos } => Some((*kind, *pos)),
+                _ => None,
+            })
+            .expect("a build order was issued");
+        let (kind, pos) = placed;
+        assert_eq!(kind, BuildingKind::Farm);
+        let size = building_stats(BuildingKind::Farm).size;
+        assert!(
+            app.world().resource::<NavGrid>().rect_is_free(pos, size),
+            "the chosen site must be free"
+        );
+        assert!(
+            (pos.x - wanted.x).hypot(pos.z - wanted.z) <= PLACEMENT_HINT_RADIUS,
+            "and near where the commander asked: {pos:?}"
+        );
+    }
+
+    /// A misspelled phrase earns the list of phrases that exist — the
+    /// `Regions::unknown` rule applied to roles.
+    #[test]
+    fn an_unknown_selector_names_the_ones_that_exist() {
+        let mut app = compiler_app();
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"move","select":"my hreo","x":1.0,"z":1.0}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("unknown selector 'my hreo'"),
+            "{}",
+            errors[0]
+        );
+        assert!(errors[0].contains("all army"), "{}", errors[0]);
+        assert!(errors[0].contains("squad <n>"), "{}", errors[0]);
+    }
+
+    /// The channels are typed, and saying so is the teaching. A tree is not an
+    /// army; the refusal names the phrases that ARE.
+    #[test]
+    fn a_node_phrase_in_the_unit_channel_says_which_phrases_belong_there() {
+        let mut app = compiler_app();
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"move","select":"nearest tree","x":1.0,"z":1.0}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("names a resource node, not units"),
+            "{}",
+            errors[0]
+        );
+        assert!(errors[0].contains(SELECTOR_UNIT_NAMES), "{}", errors[0]);
+    }
+
+    /// A selector never reaches across the line. `all units` is *my* units, and
+    /// the enemy's stay where they are.
+    #[test]
+    fn a_selector_is_bounded_by_the_seat_that_speaks_it() {
+        let mut app = compiler_app();
+        let mine = spawn_footman(&mut app, Team::Human, Vec3::ZERO);
+        let theirs = spawn_footman(&mut app, Team::Claude, Vec3::new(1.0, 0.0, 0.0));
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"move","select":"all units","x":9.0,"z":9.0}"#,
+        ));
+        app.update();
+        assert!(matches!(order_of(&app, mine), Order::Move(_)));
+        assert!(matches!(order_of(&app, theirs), Order::Idle));
+    }
+
+    /// The resolved list is sorted by entity id, not by whatever order the
+    /// archetypes happen to be walked in — `ground_order` hands out formation
+    /// offsets by index, so an unsorted resolution would arrange the same squad
+    /// differently in two runs of the same binary.
+    #[test]
+    fn a_selector_resolves_in_a_deterministic_order() {
+        let mut app = compiler_app();
+        let a = spawn_footman(&mut app, Team::Human, Vec3::ZERO);
+        let b = spawn_footman(&mut app, Team::Human, Vec3::new(1.0, 0.0, 0.0));
+        let c = spawn_footman(&mut app, Team::Human, Vec3::new(2.0, 0.0, 0.0));
+        app.update();
+        let mut expected = [a, b, c];
+        expected.sort_by_key(|e| e.to_bits());
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"move","select":"all army","x":0.0,"z":0.0}"#,
+        ));
+        app.update();
+        let places: Vec<Vec3> = expected
+            .iter()
+            .map(|e| match order_of(&app, *e) {
+                Order::Move(p) => p,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(places.len(), 3);
+        assert!(places[0] != places[1] && places[1] != places[2]);
+        assert_eq!(
+            places[0],
+            clamp_to_map(Vec3::ZERO + formation_offset(0, 3)),
+            "the lowest entity id holds slot 0"
+        );
+    }
+
+    /// **The wire did not move.** Every historical spelling still parses
+    /// (`legacy_wire_commands_parse` pins that), and — the half a parse test
+    /// cannot show — a sentence that uses none of the new keys still
+    /// SERIALIZES to exactly the keys it always did. `bridge.rs` echoes armed
+    /// triggers and set plans back into `state.json` by re-serializing the
+    /// stored `Intent`, so a stray `"select":null` would appear in every
+    /// snapshot of every match that never used the feature.
+    #[test]
+    fn the_selector_keys_are_absent_from_a_sentence_that_does_not_use_them() {
+        let cases: Vec<(Intent, serde_json::Value)> = vec![
+            (
+                Intent::Move {
+                    units: vec![7],
+                    x: Some(1.0),
+                    z: Some(2.0),
+                    region: None,
+                    select: None,
+                },
+                serde_json::json!({"type":"move","units":[7],"x":1.0,"z":2.0}),
+            ),
+            (
+                Intent::Harvest {
+                    units: vec![7],
+                    target: Some(9),
+                    select: None,
+                    target_select: None,
+                },
+                serde_json::json!({"type":"harvest","units":[7],"target":9}),
+            ),
+            (
+                Intent::Follow {
+                    units: vec![7],
+                    target: Some(9),
+                    select: None,
+                    target_select: None,
+                },
+                serde_json::json!({"type":"follow","units":[7],"target":9}),
+            ),
+            (
+                Intent::Build {
+                    worker: Some(7),
+                    kind: "Farm".to_string(),
+                    x: Some(1.0),
+                    z: Some(2.0),
+                    region: None,
+                    select: None,
+                    site: None,
+                },
+                serde_json::json!({"type":"build","worker":7,"kind":"Farm","x":1.0,"z":2.0}),
+            ),
+            (
+                Intent::Cast {
+                    hero: Some(7),
+                    ability: None,
+                    x: None,
+                    z: None,
+                    target: None,
+                    select: None,
+                },
+                serde_json::json!({"type":"cast","hero":7}),
+            ),
+            (
+                Intent::Squad {
+                    units: vec![7],
+                    id: Some(2),
+                    select: None,
+                },
+                serde_json::json!({"type":"squad","units":[7],"id":2}),
+            ),
+            (
+                Intent::Priority {
+                    units: vec![7],
+                    classes: vec!["ranged".to_string()],
+                    select: None,
+                },
+                serde_json::json!({"type":"priority","units":[7],"classes":["ranged"]}),
+            ),
+        ];
+        for (intent, expected) in cases {
+            let got = serde_json::to_value(&intent).unwrap();
+            assert_eq!(got, expected, "serialized shape moved for {intent:?}");
+            // And it round-trips: what the snapshot prints, the wire re-reads.
+            let back: Intent = serde_json::from_value(got).unwrap();
+            assert_eq!(
+                serde_json::to_value(&back).unwrap(),
+                serde_json::to_value(&intent).unwrap()
+            );
+        }
+    }
+
+    /// Every new spelling, parsed from the wire in the shape
+    /// `tools/COMMANDER_BRIEF.md` prints it. The companion to
+    /// `legacy_wire_commands_parse`, which pins the old ones.
+    #[test]
+    fn the_selector_forms_parse_from_the_wire() {
+        let forms = [
+            r#"{"type":"move","select":"my hero","x":1.0,"z":2.0}"#,
+            r#"{"type":"attackmove","select":"all army","region":"north"}"#,
+            r#"{"type":"attack","select":"squad 1","target":9}"#,
+            r#"{"type":"harvest","select":"workers","target_select":"nearest tree"}"#,
+            r#"{"type":"return","select":"workers"}"#,
+            r#"{"type":"follow","select":"all army","target_select":"my hero"}"#,
+            r#"{"type":"stop","select":"all units"}"#,
+            r#"{"type":"build","select":"workers","kind":"Farm","x":1.0,"z":2.0,
+                "site":"nearest legal site"}"#,
+            r#"{"type":"cast","select":"my hero","ability":"Slam"}"#,
+            r#"{"type":"priority","select":"all army","classes":["ranged"]}"#,
+            r#"{"type":"retreat","select":"squad 2","below":0.35,"region":"home"}"#,
+            r#"{"type":"leash","select":"squad 2","region":"home"}"#,
+            r#"{"type":"autocast","select":"my hero","min_enemies":3}"#,
+            r#"{"type":"squad","select":"all army","id":1}"#,
+        ];
+        for form in forms {
+            let parsed: Intent =
+                serde_json::from_str(form).unwrap_or_else(|e| panic!("{form}: {e}"));
+            // A selector-bearing sentence reads as its phrase, not as a count
+            // of the ids it did not carry.
+            let sentence = parsed.sentence();
+            assert!(
+                !sentence.contains("0 units"),
+                "{form} -> {sentence}: a selector must never read as a count"
+            );
+        }
+    }
+
+    /// Every phrase the vocabulary advertises actually parses, in every
+    /// spelling the wire tolerates. A phrase printed in a refusal that the
+    /// parser then rejects is a refusal that lies.
+    #[test]
+    fn every_advertised_selector_phrase_parses() {
+        for phrase in [
+            "my hero",
+            "My Hero",
+            "my_hero",
+            "hero",
+            "all army",
+            "army",
+            "all units",
+            "workers",
+            "squad 0",
+            "squad 7",
+            "squad-3",
+            "nearest tree",
+            "nearest mine",
+            "nearest legal site",
+        ] {
+            assert!(
+                parse_selector(phrase).is_some(),
+                "advertised phrase does not parse: {phrase}"
+            );
+        }
+        assert_eq!(parse_selector("squad 3"), Some(Selector::Squad(3)));
+        assert_eq!(parse_selector("squad 300"), None, "a squad id is a u8");
+        assert_eq!(parse_selector(""), None);
+        assert_eq!(parse_selector("north-pass"), None, "a place is not a role");
     }
 }

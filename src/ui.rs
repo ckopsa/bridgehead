@@ -1064,11 +1064,12 @@ fn cast_here(caster: Entity, slot: usize, aim: Option<CastTarget>) -> Intent {
         None => (None, None, None),
     };
     Intent::Cast {
-        hero: intent_id(caster),
+        hero: Some(intent_id(caster)),
         ability: Some(AbilitySelector::Index(slot)),
         x,
         z,
         target,
+        select: None,
     }
 }
 
@@ -3174,6 +3175,7 @@ fn ground_intent(
                 // pointed, and re-deriving a name for it would be the UI
                 // guessing at what the player meant.
                 region: None,
+                select: None,
             }
         } else {
             Intent::Move {
@@ -3181,6 +3183,7 @@ fn ground_intent(
                 x: Some(x),
                 z: Some(z),
                 region: None,
+                select: None,
             }
         },
     );
@@ -4633,6 +4636,7 @@ fn command_input(
                     Intent::Squad {
                         units: own_ids(),
                         id: Some(squad),
+                        select: None,
                     },
                 );
             }
@@ -4654,6 +4658,7 @@ fn command_input(
             Intent::Squad {
                 units: own_ids(),
                 id: Some(squad),
+                select: None,
             },
         );
         Some(squad)
@@ -4670,7 +4675,13 @@ fn command_input(
             }
             CmdAction::Stop => {
                 if !own_units.is_empty() {
-                    say(&mut submissions, Intent::Stop { units: own_ids() });
+                    say(
+                        &mut submissions,
+                        Intent::Stop {
+                            units: own_ids(),
+                            select: None,
+                        },
+                    );
                 }
                 ui.attack_move_armed = false;
             }
@@ -4883,6 +4894,7 @@ fn command_input(
                             z: Some(anchor.z),
                             region: None,
                             radius: Some(GUARD_RADIUS),
+                            select: None,
                         },
                     );
                 } else {
@@ -4896,6 +4908,7 @@ fn command_input(
                             z: None,
                             region: None,
                             radius: Some(0.0),
+                            select: None,
                         },
                     );
                 }
@@ -4915,6 +4928,7 @@ fn command_input(
                             x: Some(rally.x),
                             z: Some(rally.z),
                             region: None,
+                            select: None,
                         },
                     );
                 } else {
@@ -4927,6 +4941,7 @@ fn command_input(
                             x: None,
                             z: None,
                             region: None,
+                            select: None,
                         },
                     );
                 }
@@ -4946,6 +4961,7 @@ fn command_input(
                     Intent::Priority {
                         units: own_ids(),
                         classes,
+                        select: None,
                     },
                 );
             }
@@ -4971,6 +4987,7 @@ fn command_input(
                             0 // "clear"
                         }),
                         ability: None,
+                        select: None,
                     },
                 );
             }
@@ -4994,6 +5011,7 @@ fn command_input(
                         // intent.rs edits that rule and leaves the others
                         // standing, so two spells can carry two policies.
                         ability: Some(AbilitySelector::Index(slot)),
+                        select: None,
                     },
                 );
             }
@@ -5179,6 +5197,7 @@ fn command_input(
                                 x: Some(rally.x),
                                 z: Some(rally.z),
                                 region: None,
+                                select: None,
                             },
                         );
                     }
@@ -5190,6 +5209,7 @@ fn command_input(
                             x: None,
                             z: None,
                             region: None,
+                            select: None,
                         },
                     ),
                 }
@@ -5221,6 +5241,7 @@ fn command_input(
                                 x: Some(rally.x),
                                 z: Some(rally.z),
                                 region: None,
+                                select: None,
                             },
                         );
                     }
@@ -5232,6 +5253,7 @@ fn command_input(
                             x: None,
                             z: None,
                             region: None,
+                            select: None,
                         },
                     ),
                 }
@@ -5258,6 +5280,7 @@ fn command_input(
                                 z: Some(anchor.z),
                                 region: None,
                                 radius: Some(radius),
+                                select: None,
                             },
                         );
                     }
@@ -5269,6 +5292,7 @@ fn command_input(
                             z: None,
                             region: None,
                             radius: Some(0.0),
+                            select: None,
                         },
                     ),
                 }
@@ -5288,6 +5312,7 @@ fn command_input(
                                 z: Some(anchor.z),
                                 region: None,
                                 radius: Some(radius),
+                                select: None,
                             },
                         );
                     }
@@ -5299,6 +5324,7 @@ fn command_input(
                             z: None,
                             region: None,
                             radius: Some(0.0),
+                            select: None,
                         },
                     ),
                 }
@@ -5543,6 +5569,7 @@ fn control_groups(
                         Intent::Squad {
                             units: ids(&joining),
                             id: Some(slot),
+                            select: None,
                         },
                     );
                 }
@@ -5568,6 +5595,7 @@ fn control_groups(
                         Intent::Squad {
                             units: ids(&leavers),
                             id: None,
+                            select: None,
                         },
                     );
                 }
@@ -5577,6 +5605,7 @@ fn control_groups(
                         Intent::Squad {
                             units: ids(&joining),
                             id: Some(slot),
+                            select: None,
                         },
                     );
                 }
@@ -5805,11 +5834,13 @@ fn left_mouse(
                             say(
                                 &mut submissions,
                                 Intent::Build {
-                                    worker: intent_id(worker),
+                                    worker: Some(intent_id(worker)),
                                     kind: building_name(kind).to_string(),
                                     x: Some(pos.x),
                                     z: Some(pos.z),
                                     region: None,
+                                    select: None,
+                                    site: None,
                                 },
                             );
                             if chaining {
@@ -6362,6 +6393,7 @@ fn right_mouse(
             Intent::Attack {
                 units: ids(&entities_of(&selected_units)),
                 target: intent_id(target),
+                select: None,
             },
         );
         return;
@@ -6381,7 +6413,9 @@ fn right_mouse(
                 &mut submissions,
                 Intent::Harvest {
                     units: ids(&entities_of(&workers)),
-                    target: intent_id(target),
+                    target: Some(intent_id(target)),
+                    select: None,
+                    target_select: None,
                 },
             );
         }
@@ -6398,6 +6432,7 @@ fn right_mouse(
             &mut submissions,
             Intent::Return {
                 units: ids(&entities_of(&loaded)),
+                select: None,
             },
         );
         ground_intent(&mut submissions, &entities_of(&others), ground, false);
@@ -6416,7 +6451,9 @@ fn right_mouse(
                 &mut submissions,
                 Intent::Follow {
                     units: ids(&followers),
-                    target: intent_id(leader),
+                    target: Some(intent_id(leader)),
+                    select: None,
+                    target_select: None,
                 },
             );
             return;
@@ -10005,7 +10042,10 @@ mod tests {
         crate::copilot::Proposal {
             id,
             note: note.to_string(),
-            intents: vec![Intent::Stop { units: vec![1] }],
+            intents: vec![Intent::Stop {
+                units: vec![1],
+                select: None,
+            }],
             sentences: sentences.iter().map(|s| s.to_string()).collect(),
             conflicts: conflicts.iter().map(|s| s.to_string()).collect(),
             severity: ProposalSeverity::Routine,
@@ -10826,7 +10866,10 @@ mod tests {
                 TriggerRule {
                     name: TriggerName::new(HOME_GUARD).unwrap(),
                     when: TriggerWhen::BaseUnderAttack,
-                    then: Intent::Stop { units: vec![] },
+                    then: Intent::Stop {
+                        units: vec![],
+                        select: None,
+                    },
                     repeat: Some(HOME_GUARD_COOLDOWN),
                     source: IntentSource::Ui,
                     armed: true,
@@ -10850,7 +10893,10 @@ mod tests {
         let rule = |name: &str, repeat, armed, last| TriggerRule {
             name: TriggerName::new(name).unwrap(),
             when: TriggerWhen::BaseUnderAttack,
-            then: Intent::Stop { units: vec![] },
+            then: Intent::Stop {
+                units: vec![],
+                select: None,
+            },
             repeat,
             source: IntentSource::Bridge,
             armed,
@@ -10885,7 +10931,10 @@ mod tests {
             name: PlanName::new(name).unwrap(),
             steps: (0..steps)
                 .map(|_| PlanStep {
-                    intent: Intent::Stop { units: vec![] },
+                    intent: Intent::Stop {
+                        units: vec![],
+                        select: None,
+                    },
                     advance: PlanAdvance::OnApplied,
                 })
                 .collect(),

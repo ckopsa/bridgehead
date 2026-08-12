@@ -754,6 +754,11 @@ pub fn unit_stats(kind: UnitKind) -> UnitStats {
     crate::data::unit_row(kind).stats
 }
 
+/// One alarm kind's threshold and reflex window. See `AlarmTuning`.
+pub fn alarm_tuning(kind: AlarmKind) -> AlarmTuning {
+    crate::data::alarm_row(kind).tuning
+}
+
 /// Weapon on a building (towers). Always fires a projectile.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -7774,12 +7779,190 @@ impl std::fmt::Display for PlanStamp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Late-bound references: saying WHO and WHERE without freezing an entity id
+// ---------------------------------------------------------------------------
+//
+// An entity id is a fact about one instant. `{"units":[4294967297]}` names the
+// hero that was alive when the sentence was written, and a sentence the engine
+// stores and runs later — a trigger's `then`, a plan step — is exactly the
+// place where that instant has already passed. Arena rounds r21–r23 traced five
+// distinct failure classes to it: a hero-save trigger armed with `"units":[]`
+// because the hero had not been trained yet; dead hero ids in triggers; stale
+// unit lists in `priority`; a memorized tree chopped out from under a harvest
+// order; and the wrong worker frozen into a repeating trigger. Every one of
+// them is the same bug — an author-time id used at fire time.
+//
+// A [`Selector`] is the fix and it is deliberately the same shape as a region
+// name. `"region":"north-pass"` has always been a late-bound *place*: the name
+// travels in the stored intent and becomes coordinates when the intent is
+// compiled, so moving the region re-aims every rule that names it. A selector
+// is a late-bound *role*, on the identical footing, resolved at the identical
+// moment: [`intent::resolve_places`], at the top of the one compiler, which a
+// trigger reaches only when it FIRES.
+//
+// The vocabulary is small on purpose. Roles a commander already thinks in
+// (my hero, all army, workers, squad N), and the two "nearest X" phrases that
+// answer the questions ids answered badly (which tree, which build site).
+
+/// A role, a squad, or a nearest-thing — written as a phrase, resolved against
+/// the world at the moment the intent is compiled.
+///
+/// Parsed by [`parse_selector`]; the channels each verb accepts it on are
+/// listed on [`Intent`]. Which selectors are legal in which channel is decided
+/// by the resolver, so `{"units": …, "select":"nearest tree"}` earns a sentence
+/// explaining that a tree is not an army rather than a silent miss.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Selector {
+    /// Every living hero of the seat. Plural because hero slots scale with the
+    /// hall ladder — "my hero" said by a Keep team with two of them means both,
+    /// and the channels that can only take one (a cast's caster) say so.
+    Heroes,
+    /// Every living non-worker of the seat, heroes included. What a commander
+    /// means by "all army": the things that fight.
+    Army,
+    /// Every living unit of the seat, workers included.
+    AllUnits,
+    /// Every living worker of the seat.
+    Workers,
+    /// The CURRENT members of squad `n` — the whole point of the selector, and
+    /// the answer to red-r23's stale rosters. A unit trained into the squad
+    /// after the trigger was armed is in it; a unit that died is not.
+    ///
+    /// One caveat, and it is the standing one about `Commands`: the `squad`
+    /// verb enrols members through deferred commands, so a `squad` and a
+    /// `select: "squad 1"` in the SAME batch do not see each other. The second
+    /// sentence earns the ordinary "matches none of your units right now"
+    /// refusal rather than acting on a stale roster, which is the safe half of
+    /// the trade; the fix is to send the two in successive batches, or to
+    /// address the squad by number with `posture`, which never needed the
+    /// roster at all.
+    Squad(u8),
+    /// The nearest living tree to the units being ordered.
+    NearestTree,
+    /// The nearest un-exhausted gold mine to the units being ordered.
+    NearestMine,
+    /// The nearest legal footprint to the point the sentence names. Not a unit
+    /// and not a node — the one selector that answers "where", and the answer
+    /// to blue-r23's farm trigger that reported `site blocked` all match
+    /// without ever moving the site.
+    NearestLegalSite,
+}
+
+impl Selector {
+    /// The canonical phrase, as the replay log and every error print it.
+    pub fn phrase(&self) -> String {
+        match self {
+            Selector::Heroes => "my hero".to_string(),
+            Selector::Army => "all army".to_string(),
+            Selector::AllUnits => "all units".to_string(),
+            Selector::Workers => "workers".to_string(),
+            Selector::Squad(n) => format!("squad {n}"),
+            Selector::NearestTree => "nearest tree".to_string(),
+            Selector::NearestMine => "nearest mine".to_string(),
+            Selector::NearestLegalSite => "nearest legal site".to_string(),
+        }
+    }
+
+    /// Does this selector name a set of the seat's own units?
+    pub fn is_unit_selector(&self) -> bool {
+        matches!(
+            self,
+            Selector::Heroes
+                | Selector::Army
+                | Selector::AllUnits
+                | Selector::Workers
+                | Selector::Squad(_)
+        )
+    }
+
+    /// Does this selector name a resource node?
+    pub fn is_node_selector(&self) -> bool {
+        matches!(self, Selector::NearestTree | Selector::NearestMine)
+    }
+}
+
+impl std::fmt::Display for Selector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.phrase())
+    }
+}
+
+/// The unit-naming half of the vocabulary, for error messages that teach.
+pub const SELECTOR_UNIT_NAMES: &str = "my hero, all army, all units, workers, squad <n>";
+/// The node-naming half.
+pub const SELECTOR_NODE_NAMES: &str = "nearest tree, nearest mine";
+/// Everything a selector phrase may be. Printed by the unknown-phrase refusal,
+/// on the same rule as `Regions::unknown`: a refusal that names no alternative
+/// is a refusal to help.
+pub const SELECTOR_NAMES: &str =
+    "my hero, all army, all units, workers, squad <n>, nearest tree, nearest mine, \
+     nearest legal site";
+
+/// Parse a selector phrase, or `None` if it is not one.
+///
+/// Folded through [`normalize_place`] rather than [`normalize_name`]: a
+/// selector is a phrase with word boundaries that matter (`squad 1`), and
+/// stripping the space would leave `squad1` needing its own parser. Case,
+/// dashes and underscores are noise exactly as they are everywhere else on this
+/// wire, so `"My Hero"`, `"my_hero"` and `"my hero"` are one phrase.
+pub fn parse_selector(raw: &str) -> Option<Selector> {
+    let folded = normalize_place(raw);
+    // `squad 3`, and the two spellings a commander reaches for when it forgets
+    // the space. Bounded by u8 like every other squad id on this wire.
+    if let Some(rest) = folded
+        .strip_prefix("squad ")
+        .or_else(|| folded.strip_prefix("squad:"))
+        .or_else(|| folded.strip_prefix("squad"))
+    {
+        if let Ok(n) = rest.trim().parse::<u8>() {
+            return Some(Selector::Squad(n));
+        }
+    }
+    Some(match folded.as_str() {
+        "my hero" | "hero" | "heroes" | "my heroes" | "our hero" | "our heroes" => Selector::Heroes,
+        "all army" | "army" | "my army" | "our army" | "all my army" | "the army" => Selector::Army,
+        "all units" | "all" | "everything" | "my units" | "our units" | "everyone" => {
+            Selector::AllUnits
+        }
+        "workers" | "worker" | "all workers" | "my workers" | "our workers" => Selector::Workers,
+        "nearest tree" | "nearest trees" | "nearest lumber" | "nearest wood" | "tree" => {
+            Selector::NearestTree
+        }
+        "nearest mine" | "nearest gold" | "nearest gold mine" | "mine" => Selector::NearestMine,
+        "nearest legal site" | "nearest legal" | "nearest free site" | "nearest free"
+        | "nearest site" | "auto" => Selector::NearestLegalSite,
+        _ => return None,
+    })
+}
+
+/// The refusal an unrecognised selector phrase earns. One wording, so every
+/// channel teaches the same lesson — the [`Regions::unknown`] rule applied to
+/// roles instead of places.
+pub fn unknown_selector(raw: &str) -> String {
+    format!("unknown selector '{raw}' — known selectors: {SELECTOR_NAMES}")
+}
+
 /// Everything a player can mean.
 ///
 /// Grouped by what it is for: unit orders, production, the doctrine layer that
 /// runs at machine speed for whoever set it, abilities and items, and the three
 /// match-level statements. Adding a verb here is adding it to *both* seats at
 /// once, which is the point.
+///
+/// **Two late-binding channels run through this vocabulary**, and both are
+/// optional keys that outrank the frozen form beside them:
+///
+///   * `"region": "<name>"` wherever `x`/`z` appear — the place channel, which
+///     has always been here.
+///   * `"select": "<phrase>"` wherever `units`, `worker` or a cast's `hero`
+///     appear — the role channel. See [`Selector`]. Plus `"target_select"` for
+///     the node a `harvest` gathers and the unit a `follow` follows, and
+///     `"site"` for `build`'s footprint.
+///
+/// Both resolve in `intent::resolve_places`, which runs at the top of the one
+/// compiler — so a trigger's `then` and a plan's step resolve when they FIRE,
+/// against the world that fired them.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Intent {
@@ -7791,6 +7974,10 @@ pub enum Intent {
     /// all" is now a thing a sentence can say, and it earns a refusal that
     /// names both spellings rather than serde's "missing field x".
     Move {
+        /// Frozen ids. `#[serde(default)]` so a sentence may name its units by
+        /// `select` alone and omit this key entirely — the array still
+        /// serializes exactly as it always did, so nothing on the wire moved.
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
@@ -7798,8 +7985,15 @@ pub enum Intent {
         z: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
+        /// The role channel. See [`Selector`]. Given, it OUTRANKS `units`, on
+        /// the same rule that makes a region outrank the coordinates beside it.
+        /// Last in the struct because new wire keys are appended, never
+        /// interleaved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     AttackMove {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
@@ -7807,31 +8001,74 @@ pub enum Intent {
         z: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     Attack {
+        #[serde(default)]
         units: Vec<IntentId>,
         target: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Gold mines and trees alike; workers only.
+    ///
+    /// `target_select` — `"nearest tree"` or `"nearest mine"` — is the answer to
+    /// the memorized-tree bug: the node is chosen when the order is COMPILED,
+    /// measured from the workers being sent, so a repeating trigger that says
+    /// "idle workers, nearest tree" keeps working after the tree it would have
+    /// frozen is felled.
     Harvest {
+        #[serde(default)]
         units: Vec<IntentId>,
-        target: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_select: Option<String>,
     },
     Return {
+        #[serde(default)]
         units: Vec<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     Follow {
+        #[serde(default)]
         units: Vec<IntentId>,
-        target: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
+        /// A unit selector naming the leader. Resolves to ONE unit — the lowest
+        /// entity id among the matches — so `"my hero"` escorts the hero this
+        /// team has *now*, not the one it had when the trigger was armed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_select: Option<String>,
     },
     /// Halt in place and drop any attack target.
     Stop {
+        #[serde(default)]
         units: Vec<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
 
     // --- production ---
+    /// `select` names the worker by role instead of by id and resolves to ONE —
+    /// the lowest entity id among the matches — which is what kills the "wrong
+    /// worker frozen into a repeating trigger" class.
+    ///
+    /// `site: "nearest legal site"` lets the engine move the footprint to the
+    /// nearest legal one within [`crate::intent::PLACEMENT_HINT_RADIUS`] of the
+    /// point named, instead of refusing. Blue-r23 armed a farm trigger on fixed
+    /// coordinates, watched it report `site blocked` every retry for the whole
+    /// match, and never got the farm; the hint the refusal already computed was
+    /// right there and nothing could accept it.
     Build {
-        worker: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<IntentId>,
         kind: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
@@ -7839,6 +8076,10 @@ pub enum Intent {
         z: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
     },
     Train {
         building: IntentId,
@@ -7917,8 +8158,8 @@ pub enum Intent {
     /// into: a caster that closed the gap by itself would undo the reason
     /// targeted casting exists.
     Cast {
-        #[serde(alias = "caster")]
-        hero: IntentId,
+        #[serde(alias = "caster", default, skip_serializing_if = "Option::is_none")]
+        hero: Option<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ability: Option<AbilitySelector>,
         /// Ground point for a `"point"` ability. Both `x` and `z` or neither.
@@ -7929,6 +8170,13 @@ pub enum Intent {
         /// Victim/beneficiary for a `"unit"` ability.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<IntentId>,
+        /// A unit selector naming the CASTER, resolved when the cast compiles
+        /// and narrowed to one — the lowest entity id among the matches. This
+        /// is the one that kills red-r23's dead-hero-id trigger: a hero-save
+        /// rule armed as `"select":"my hero"` still finds the hero after it has
+        /// died and been revived into a new entity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Buy a consumable at one of our own finished Shops.
     ///
@@ -7967,13 +8215,17 @@ pub enum Intent {
     // --- doctrine: standing policy, executed by the engine at machine speed ---
     /// Focus-fire order. An empty/omitted `classes` clears the policy.
     Priority {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default)]
         classes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Break off below `below` (a fraction in the open range 0..1) and fall
     /// back to x/z. `below` omitted, null, or 0 clears the policy.
     Retreat {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         below: Option<f32>,
@@ -7983,6 +8235,8 @@ pub enum Intent {
         z: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Anchor to x/z within `radius`. `radius <= 0` clears the policy.
     ///
@@ -7991,6 +8245,7 @@ pub enum Intent {
     /// not also require remembering how big you said the perimeter was. An
     /// explicit `radius` still wins.
     Leash {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
@@ -8000,23 +8255,31 @@ pub enum Intent {
         region: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         radius: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Heroes only. `min_enemies` omitted, null, or 0 clears the rule.
     /// `ability` names the slot the rule governs; omitted, it means the first
     /// slot, which is what it always meant. Rules are per-slot: a hero told to
     /// auto-heal does not thereby stop auto-slamming.
     Autocast {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         min_enemies: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ability: Option<AbilitySelector>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Squad membership. `id` omitted or null removes the units from any squad.
     Squad {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// What a squad is for. `posture` omitted or null clears the entry, which
     /// leaves the members where they are without disbanding the squad.
@@ -8341,10 +8604,35 @@ impl Intent {
                 _ => "(unspecified)".to_string(),
             }
         }
-        fn group(units: &[IntentId]) -> String {
+        /// How a sentence names the units it is about. **A selector is spoken
+        /// as its phrase**, for the same reason a region is spoken as its name:
+        /// the replay line for a hero-save rule should read "my hero falls back
+        /// to home", not "unit 4294967297 falls back to (0.0, 0.0)" — and after
+        /// the hero has died and been revived, the id in that second line would
+        /// be a lie besides. An unparseable phrase is quoted verbatim so the log
+        /// shows the typo the commander actually wrote.
+        fn group(units: &[IntentId], select: &Option<String>) -> String {
+            if let Some(raw) = select {
+                return match parse_selector(raw) {
+                    Some(sel) => sel.phrase(),
+                    None => format!("'{raw}'"),
+                };
+            }
             match units.len() {
                 1 => format!("unit {}", units[0]),
                 n => format!("{n} units"),
+            }
+        }
+        /// The same rule for the single-referent channels — a `build`'s worker,
+        /// a `cast`'s caster, a `follow`'s leader.
+        fn one(id: &Option<IntentId>, select: &Option<String>) -> String {
+            match (select, id) {
+                (Some(raw), _) => match parse_selector(raw) {
+                    Some(sel) => sel.phrase(),
+                    None => format!("'{raw}'"),
+                },
+                (None, Some(id)) => format!("{id}"),
+                (None, None) => "(unspecified)".to_string(),
             }
         }
         /// How a sentence names an ability slot. The id reads as itself; a
@@ -8357,30 +8645,84 @@ impl Intent {
             }
         }
         match self {
-            Intent::Move { units, x, z, region } => {
-                format!("move {} to {}", group(units), place(x, z, region))
+            Intent::Move {
+                units,
+                x,
+                z,
+                region,
+                select,
+            } => {
+                format!("move {} to {}", group(units, select), place(x, z, region))
             }
-            Intent::AttackMove { units, x, z, region } => {
-                format!("attack-move {} to {}", group(units), place(x, z, region))
+            Intent::AttackMove {
+                units,
+                x,
+                z,
+                region,
+                select,
+            } => {
+                format!(
+                    "attack-move {} to {}",
+                    group(units, select),
+                    place(x, z, region)
+                )
             }
-            Intent::Attack { units, target } => {
-                format!("{} attack {target}", group(units))
+            Intent::Attack {
+                units,
+                target,
+                select,
+            } => {
+                format!("{} attack {target}", group(units, select))
             }
-            Intent::Harvest { units, target } => {
-                format!("{} harvest node {target}", group(units))
+            Intent::Harvest {
+                units,
+                target,
+                select,
+                target_select,
+            } => {
+                format!(
+                    "{} harvest node {}",
+                    group(units, select),
+                    one(target, target_select)
+                )
             }
-            Intent::Return { units } => format!("{} return cargo", group(units)),
-            Intent::Follow { units, target } => {
-                format!("{} follow {target}", group(units))
+            Intent::Return { units, select } => {
+                format!("{} return cargo", group(units, select))
             }
-            Intent::Stop { units } => format!("{} hold position", group(units)),
+            Intent::Follow {
+                units,
+                target,
+                select,
+                target_select,
+            } => {
+                format!(
+                    "{} follow {}",
+                    group(units, select),
+                    one(target, target_select)
+                )
+            }
+            Intent::Stop { units, select } => {
+                format!("{} hold position", group(units, select))
+            }
             Intent::Build {
                 worker,
                 kind,
                 x,
                 z,
                 region,
-            } => format!("worker {worker} builds {kind} at {}", place(x, z, region)),
+                select,
+                site,
+            } => {
+                // The site selector is part of the sentence because "build the
+                // farm at (10, 20)" and "build the farm near (10, 20), wherever
+                // it fits" are different instructions, and a log that spelled
+                // them identically would hide which one was given.
+                let where_ = match site {
+                    Some(_) => format!("the nearest legal site to {}", place(x, z, region)),
+                    None => place(x, z, region),
+                };
+                format!("worker {} builds {kind} at {where_}", one(worker, select))
+            }
             Intent::Train { building, unit } => {
                 format!("building {building} trains {unit}")
             }
@@ -8414,13 +8756,20 @@ impl Intent {
             // pointed somewhere else. A log line that read `7 casts Slow` for
             // both a clump-shattering hit and a shot at empty ground would
             // hide the only decision the caster made.
-            Intent::Cast { hero, ability, x, z, target } => {
+            Intent::Cast {
+                hero,
+                ability,
+                x,
+                z,
+                target,
+                select,
+            } => {
                 let aim = match (x, z, target) {
                     (Some(x), Some(z), _) => format!(" at {}", at(*x, *z)),
                     (_, _, Some(t)) => format!(" on {t}"),
                     _ => String::new(),
                 };
-                format!("{hero} casts {}{aim}", ability_name(ability))
+                format!("{} casts {}{aim}", one(hero, select), ability_name(ability))
             }
             Intent::Buy { shop, item, hero } => match hero {
                 Some(hero) => format!("hero {hero} buys {item} at shop {shop}"),
@@ -8445,26 +8794,44 @@ impl Intent {
                     None => format!("hero uses item in slot {slot}{to}"),
                 }
             }
-            Intent::Priority { units, classes } => {
+            Intent::Priority {
+                units,
+                classes,
+                select,
+            } => {
                 if classes.is_empty() {
-                    format!("{} clear focus-fire priority", group(units))
+                    format!("{} clear focus-fire priority", group(units, select))
                 } else {
-                    format!("{} focus {}", group(units), classes.join(" > "))
+                    format!("{} focus {}", group(units, select), classes.join(" > "))
                 }
             }
-            Intent::Retreat { units, below, x, z, region } => {
+            Intent::Retreat {
+                units,
+                below,
+                x,
+                z,
+                region,
+                select,
+            } => {
                 let has_place = region.is_some() || (x.is_some() && z.is_some());
                 match below {
                     Some(b) if *b > 0.0 && has_place => format!(
                         "{} fall back to {} below {:.0}% health",
-                        group(units),
+                        group(units, select),
                         place(x, z, region),
                         b * 100.0
                     ),
-                    _ => format!("{} clear retreat policy", group(units)),
+                    _ => format!("{} clear retreat policy", group(units, select)),
                 }
             }
-            Intent::Leash { units, x, z, region, radius } => {
+            Intent::Leash {
+                units,
+                x,
+                z,
+                region,
+                radius,
+                select,
+            } => {
                 let has_place = region.is_some() || (x.is_some() && z.is_some());
                 // A leash whose radius came from the region has no number to
                 // print, so it names the shape instead — and "hold the
@@ -8472,35 +8839,36 @@ impl Intent {
                 match (radius, has_place) {
                     (Some(r), true) if *r > 0.0 => format!(
                         "{} hold within {r:.0} of {}",
-                        group(units),
+                        group(units, select),
                         place(x, z, region)
                     ),
                     (None, true) => match region {
-                        Some(name) => format!("{} hold {name}", group(units)),
-                        None => format!("{} clear leash", group(units)),
+                        Some(name) => format!("{} hold {name}", group(units, select)),
+                        None => format!("{} clear leash", group(units, select)),
                     },
-                    _ => format!("{} clear leash", group(units)),
+                    _ => format!("{} clear leash", group(units, select)),
                 }
             }
             Intent::Autocast {
                 units,
                 min_enemies,
                 ability,
+                select,
             } => match min_enemies {
                 Some(n) if *n > 0 => format!(
                     "{} auto-cast {} at {n}+ enemies",
-                    group(units),
+                    group(units, select),
                     ability_name(ability)
                 ),
                 _ => format!(
                     "{} clear auto-cast for {}",
-                    group(units),
+                    group(units, select),
                     ability_name(ability)
                 ),
             },
-            Intent::Squad { units, id } => match id {
-                Some(id) => format!("{} join squad {id}", group(units)),
-                None => format!("{} leave their squad", group(units)),
+            Intent::Squad { units, id, select } => match id {
+                Some(id) => format!("{} join squad {id}", group(units, select)),
+                None => format!("{} leave their squad", group(units, select)),
             },
             Intent::Posture { id, posture } => match posture {
                 None => format!("squad {id} stands down (posture cleared)"),
@@ -9819,6 +10187,18 @@ pub const SIM_ORDER: [SimSet; 14] = [
     SimSet::Cosmetic,
 ];
 
+/// The alarm evaluator's slot inside `SimSet::Feed`.
+///
+/// A named handle for the same reason `FogSet` is one: two other systems in
+/// `Feed` need a hard edge against it and would otherwise be scheduled against
+/// it by the executor. `alarm.rs` files itself here; `bridge.rs` declares
+/// `.after(AlarmSet)` so a snapshot carries the alarms computed in ITS frame
+/// rather than the previous one, and `shared.rs`'s own event diff runs before
+/// it so the two writers of `GameEvents` cannot interleave differently between
+/// two runs of one seed.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AlarmSet;
+
 // ---------------------------------------------------------------------------
 // Seeded randomness
 // ---------------------------------------------------------------------------
@@ -9931,6 +10311,12 @@ impl Plugin for CorePlugin {
             .init_resource::<TechTiers>()
             .init_resource::<TeamResearch>()
             .init_resource::<GameEvents>()
+            // Here rather than in `AlarmPlugin` so the resource exists
+            // wherever `CorePlugin` does: `bridge.rs`'s snapshot reads it, and
+            // a hand-built test app that composes the two without alarm.rs
+            // should get an empty list rather than a panic inside Bevy's
+            // worker pool (which HANGS the suite rather than failing it).
+            .init_resource::<Alarms>()
             .init_resource::<FogGrids>()
             .add_event::<SpawnUnitEvent>()
             .add_event::<SpawnBuildingEvent>()
@@ -9951,6 +10337,13 @@ impl Plugin for CorePlugin {
             // modules already declare `.after()`. It now lives *inside*
             // `SimSet::Fog`, so both spellings mean the same edge.
             .configure_sets(Update, FogSet.in_set(SimSet::Fog))
+            // The alarm evaluator only describes the frame, so it lives in the
+            // frame's reporting phase — downstream of `Think` and `Intent`,
+            // which is the structural half of "an alarm fires only after the
+            // reflex has". Configured here rather than in `AlarmPlugin` so the
+            // edge exists even in an app that reads `Alarms` without owning
+            // the evaluator.
+            .configure_sets(Update, AlarmSet.in_set(SimSet::Feed))
             .add_systems(
                 Startup,
                 (initial_spawns, apply_env_speed, log_fog_mode, log_seed),
@@ -10833,7 +11226,12 @@ const ARMY_EVENT_MIN: usize = 4;
 /// REAL seconds: at `BH_SPEED=16` a whole diff interval is sixteen game
 /// seconds, and a window narrower than that would silently stop announcing
 /// armies at speed — the exact class of bug the two clocks invite.
-const ARMY_EVENT_FRESH_S: f32 = 20.0;
+///
+/// `pub` because alarm.rs asks the identical question of the identical ledger.
+/// Two definitions of "recently enough to be news" would be two languages, and
+/// the alarm layer's whole claim is that it renders the same facts the feed
+/// does with the running default attached.
+pub const ARMY_EVENT_FRESH_S: f32 = 20.0;
 /// Same ground, same news: an army near a place already reported stays quiet
 /// this long. Rate-limiting re-sightings is not politeness, it is the
 /// difference between a feed and a stream.
@@ -10870,6 +11268,20 @@ pub enum EventSeverity {
     Warning,
     /// Act now: hero down or nearly down, a building gone, hostiles at home.
     Critical,
+}
+
+impl EventSeverity {
+    /// The wire word. Added with alarms, which are the first thing the bridge
+    /// reports a severity for — `events` never carried one, because a reader
+    /// with the message text and all the time in the world can grade its own
+    /// news, and an `alarms` entry is a triage list where it cannot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventSeverity::Info => "info",
+            EventSeverity::Warning => "warning",
+            EventSeverity::Critical => "critical",
+        }
+    }
 }
 
 /// One notable happening, from one team's point of view.
@@ -11114,7 +11526,12 @@ fn announce_bounty_claims(
     }
 }
 
-fn produce_game_events(
+/// `pub` so alarm.rs can declare a hard ordering edge against it. Both
+/// systems live in `SimSet::Feed` and both write `GameEvents`, and Bevy would
+/// otherwise leave two `ResMut` writers in one set to the executor — which
+/// would make `seq` numbering a property of the thread pool rather than of the
+/// seed.
+pub fn produce_game_events(
     time: Res<Time>,
     real: Res<Time<Real>>,
     mut feed: ResMut<GameEvents>,
@@ -11560,6 +11977,282 @@ fn diff_team(
     memo.bounties = cur_bounties;
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Alarms — forced re-decisions that default to continue and never act
+// ---------------------------------------------------------------------------
+//
+// docs/AFFORDANCES.md § Alarms, plan item 4. The contract half lives here for
+// the reason `TriggerWhen`/`Triggers` do: alarm.rs computes, bridge.rs renders,
+// and a type two modules speak through is an integrator type. The evaluator —
+// every predicate, every sentence — is alarm.rs and nothing here evaluates.
+//
+// Three properties are the whole design, and each one is structural rather
+// than a matter of anybody remembering it:
+//
+//   * **An alarm never acts.** There is no `Intent` in this section, no
+//     `SubmitIntent`, no `Order`. `Alarms` is a `Vec<Alarm>` of strings and
+//     the evaluator's only other write is a line on the team's own feed. The
+//     one path from a player to the world is still `Intent` → `apply_intents`,
+//     and an alarm is not on it.
+//   * **An alarm fires only AFTER the reflex has.** Two mechanisms, both
+//     load-bearing. The evaluator sits in `SimSet::Feed`, downstream of
+//     `Think` (doctrine and the trigger evaluator) and `Intent` (where what
+//     they submitted is compiled) in the SAME frame — so by the time an alarm
+//     is computed, the fast tier has already answered. And each kind carries
+//     a `grace_s` from `assets/data/alarms.ron`: the condition must hold that
+//     long before the alarm is raised, which is the reflex's window expressed
+//     as a number a balance-tuner can move. The payoff of an alarm is
+//     attention, not speed (AFFORDANCES.md), and a mechanism that could beat
+//     the reflex would be claiming the wrong one.
+//   * **Every alarm names its running default.** `Alarm::running_default` is
+//     mandatory, not optional, because the line the design asks for is not
+//     "base under attack — respond!" but "base under attack — home-guard is
+//     recalling squad 1 (ETA 22s)". A silent commander gets that outcome; the
+//     alarm exists so the choice to stay silent is a choice.
+//
+// Levels and edges, the distinction docs/BUILDER_BRIEF.md §6.11 lost an arena
+// match to: the `Alarms` list is a **status**, present in every snapshot for
+// exactly as long as the condition holds and refreshed each sweep so its ETA
+// and its counts stay current. The feed line is an **edge** — one on the way
+// in, one on the way out, and nothing in between. Told once that something is
+// standing and never told it stopped, a reader has to poll, which is the
+// polling this whole layer deletes.
+
+/// The four conditions worth interrupting a commander for.
+///
+/// A closed set on purpose. AFFORDANCES.md's argument is that a small
+/// commander drowns in an open-ended question every cycle, so the alarm layer
+/// is valuable in proportion to how little it says: four events force a fresh
+/// choice and *everything else defaults to continue*. A fifth kind should have
+/// to argue that a round was lost for want of it, the way each of these four
+/// can (r21's unflagged income collapse, r23's stale-contact reads).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Deserialize)]
+pub enum AlarmKind {
+    /// A body of enemy troops at or above the threshold is in this team's
+    /// **sightings ledger**. Memory, not sight — see `FogGrid::army_groups`.
+    EnemyArmySighted,
+    /// One of this team's own squads has fallen below the threshold fraction
+    /// of its pooled health.
+    SquadBelowHalf,
+    /// The gold has stopped: every mine this team's halls work is dry, or
+    /// there are fewer workers on gold than the threshold.
+    IncomeCollapse,
+    /// Buildings are being hit in two or more distinct **places** at once —
+    /// the alarm r23's blue seat asked for, and the one that carries a recall
+    /// ETA because "full recall or sacrifice the expansion?" is the question.
+    PlacesUnderAttack,
+}
+
+/// Every alarm kind, in the order they are evaluated and reported. The
+/// `alarms.ron` loader refuses to start if any of them has no row.
+pub const ALL_ALARM_KINDS: [AlarmKind; 4] = [
+    AlarmKind::EnemyArmySighted,
+    AlarmKind::SquadBelowHalf,
+    AlarmKind::IncomeCollapse,
+    AlarmKind::PlacesUnderAttack,
+];
+
+impl AlarmKind {
+    /// The wire id. Stable forever: a commander that learns to key off
+    /// `"income_collapse"` must keep working.
+    pub fn id(self) -> &'static str {
+        match self {
+            AlarmKind::EnemyArmySighted => "enemy_army_sighted",
+            AlarmKind::SquadBelowHalf => "squad_below_half",
+            AlarmKind::IncomeCollapse => "income_collapse",
+            AlarmKind::PlacesUnderAttack => "places_under_attack",
+        }
+    }
+
+    /// The short English name, for the clearing edge on the feed. The firing
+    /// edge does not use it — it carries the whole fact instead, because
+    /// "enemy army sighted" is a category and "enemy army of 9 near the east
+    /// ford" is news.
+    pub fn label(self) -> &'static str {
+        match self {
+            AlarmKind::EnemyArmySighted => "enemy army sighted",
+            AlarmKind::SquadBelowHalf => "squad below half strength",
+            AlarmKind::IncomeCollapse => "income collapse",
+            AlarmKind::PlacesUnderAttack => "multiple places under attack",
+        }
+    }
+}
+
+/// One alarm kind's two numbers, from `assets/data/alarms.ron`.
+///
+/// In data rather than in code because these are the knobs the arena will
+/// actually turn: `threshold` is "how big is big" and `grace_s` is "how long
+/// does the fast tier get". A round that wants a jumpier or a calmer harness
+/// should be a `BH_DATA_DIR` away, not a rebuild — and the scaffold version a
+/// round was played under is meant to be recorded in its `ruleset`
+/// (AFFORDANCES.md constraint 3), which is easier when it is a file.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlarmTuning {
+    /// What "enough" means, per kind:
+    ///
+    /// | kind | `threshold` |
+    /// |---|---|
+    /// | `EnemyArmySighted` | smallest body of troops worth the interruption, in units |
+    /// | `SquadBelowHalf` | pooled-health fraction, `0..=1` |
+    /// | `IncomeCollapse` | fewest workers on gold that still counts as income |
+    /// | `PlacesUnderAttack` | how many distinct places at once |
+    pub threshold: f32,
+    /// **The reflex's window.** Game seconds the condition must hold before
+    /// the alarm is raised. Not a debounce: it is the statement that the
+    /// fastest tier that can hold this decision gets it first, expressed as
+    /// the only thing a schedule cannot express — a duration.
+    pub grace_s: f32,
+}
+
+/// One standing alarm, as both seats' renderers read it.
+///
+/// Everything here is derived from what its OWNING team may know. There is no
+/// field an omniscient reader could fill that a fog-honest one could not: the
+/// enemy half comes from the sightings ledger, and every other half is the
+/// team's own units, buildings and doctrine.
+#[derive(Clone, Debug)]
+pub struct Alarm {
+    pub kind: AlarmKind,
+    /// **The triggering fact**, in the words the feed and the HUD use for the
+    /// same thing. Refreshed every sweep while the alarm stands.
+    pub fact: String,
+    /// **What is already being done about it** — the reflex tier's answer,
+    /// named. Never empty: when nothing is standing, this says so in those
+    /// words, because "nothing is happening automatically" is the single most
+    /// useful thing a commander can be told and the thing an alarm that only
+    /// shouted would hide.
+    pub running_default: String,
+    /// Game time the alarm STARTED STANDING — when it fired, not when the
+    /// condition first held. (The condition held `grace_s` earlier; the two
+    /// are one subtraction apart and this is the one that matches the feed.)
+    pub since_t: f32,
+    pub severity: EventSeverity,
+    /// Seconds until the running default arrives, when the running default is
+    /// a movement. `None` when nothing is in transit — and `None` is a real
+    /// answer, not a missing one: it means the default is to stand still.
+    pub eta_s: Option<f32>,
+    /// Where it is happening, so the HUD can ping it and a camera can go
+    /// there. `None` for an alarm with no one place (income collapse).
+    pub pos: Option<Vec3>,
+}
+
+/// What one team's one alarm kind is doing between sweeps.
+#[derive(Default, Clone, Copy)]
+struct AlarmState {
+    /// When the condition began holding continuously, or `None` while it does
+    /// not hold. Reset the moment it lapses, so a condition that flickers
+    /// never accumulates its way past the grace window.
+    held_since: Option<f32>,
+    /// Is the alarm currently standing (i.e. in the team's list)?
+    firing: bool,
+}
+
+/// A transition, and the only thing that earns a line on the feed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AlarmEdge {
+    Fired,
+    Cleared,
+}
+
+/// Per-team standing alarms, plus the little state machine that decides when
+/// one starts and stops standing.
+///
+/// `alarm.rs` is the only writer, through `observe` alone. Readers get a slice
+/// and must name a team to get anything at all — the same shape `GameEvents`
+/// uses, and for the same reason: a renderer for one seat has no way to ask
+/// for the other's.
+#[derive(Resource, Default)]
+pub struct Alarms {
+    human: Vec<Alarm>,
+    claude: Vec<Alarm>,
+    /// `BTreeMap` and not a `HashMap`, on the rule that governs every
+    /// collection on a gameplay path here: std's hasher reseeds per process.
+    /// This one only decides *event ordering*, which is exactly the kind of
+    /// thing that makes two runs of one seed produce two different logs.
+    states: std::collections::BTreeMap<(Team, AlarmKind), AlarmState>,
+}
+
+impl Alarms {
+    /// That team's standing alarms, in `ALL_ALARM_KINDS` order.
+    pub fn get(&self, team: Team) -> &[Alarm] {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+
+    /// One kind's verdict for one team, this sweep.
+    ///
+    /// `raised` is `Some` when the condition holds — carrying the fact and the
+    /// running default the caller has already worded — and `None` when it does
+    /// not. The return value is the EDGE, if there was one, so the caller
+    /// writes exactly one feed line per transition and none for the long
+    /// middle where the alarm is merely still true.
+    ///
+    /// The grace window is applied HERE rather than in each predicate, so no
+    /// alarm can be added later that forgets to let the reflex go first.
+    pub fn observe(
+        &mut self,
+        team: Team,
+        kind: AlarmKind,
+        now: f32,
+        grace_s: f32,
+        raised: Option<Alarm>,
+    ) -> Option<AlarmEdge> {
+        let state = self.states.entry((team, kind)).or_default();
+        let (edge, standing) = match raised {
+            // The condition has lapsed. Clear, and owe the reader the exit
+            // edge if we ever told them about the entry one.
+            None => {
+                state.held_since = None;
+                let was = std::mem::replace(&mut state.firing, false);
+                (was.then_some(AlarmEdge::Cleared), None)
+            }
+            Some(mut alarm) => {
+                let held = *state.held_since.get_or_insert(now);
+                if state.firing {
+                    // Still true: refresh the wording, keep the clock.
+                    (None, Some((alarm, None)))
+                } else if now - held >= grace_s {
+                    state.firing = true;
+                    alarm.since_t = ev_r1(now);
+                    (Some(AlarmEdge::Fired), Some((alarm, Some(ev_r1(now)))))
+                } else {
+                    // Inside the reflex's window. The condition is true and
+                    // the commander is deliberately not being told yet.
+                    (None, None)
+                }
+            }
+        };
+        let list = match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        };
+        match standing {
+            None => list.retain(|a| a.kind != kind),
+            Some((mut alarm, fired_at)) => {
+                match list.iter_mut().find(|a| a.kind == kind) {
+                    Some(slot) => {
+                        // A standing alarm keeps the time it started standing;
+                        // everything else about it is this sweep's truth.
+                        alarm.since_t = fired_at.unwrap_or(slot.since_t);
+                        *slot = alarm;
+                    }
+                    None => {
+                        list.push(alarm);
+                        // Sorted by kind rather than by arrival, so the array
+                        // a commander diffs between two polls depends on WHICH
+                        // alarms stand and never on the order they arrived in.
+                        list.sort_by_key(|a| a.kind);
+                    }
+                }
+            }
+        }
+        edge
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -257,6 +257,42 @@ def test_alarms_render_as_strings_or_as_records():
     assert "base_under_attack" in alarms[1] and "default:" in alarms[1]
 
 
+def test_the_shipped_alarm_shape_renders_every_field_that_matters():
+    """The real `AlarmOut` (src/bridge.rs): id / fact / running_default /
+    since_t / severity / eta_s. `fact` is the noun, `running_default` is what
+    happens if you say nothing, and the ETA is the number that makes
+    "recall or sacrifice?" answerable at LLM latency."""
+    s = load(LIVE[0])
+    s["alarms"] = [
+        {
+            "id": "places_under_attack",
+            "fact": "2 places under attack at once: near our base (TownHall); at (60, 60) (Farm)",
+            "running_default": "your trigger home-guard fired at t=203 — squad 1 is closing on near our base (ETA 22s)",
+            "since_t": 209.0,
+            "severity": "critical",
+            "eta_s": 22.0,
+        },
+        {
+            "id": "income_collapse",
+            "fact": "income collapse: the one gold mine your hall works is dry",
+            "running_default": "nothing recovers this automatically",
+            "since_t": 180.0,
+            "severity": "warning",
+        },
+    ]
+    props = bridge_view.digest(s)
+    assert props["alarms"][0]["since"] == 209.0
+    lines = [ln for ln in bridge_view.render_digest(props) if ln.startswith("ALARM")]
+    assert len(lines) == 2, lines
+    assert "places_under_attack" in lines[0] and "2 places under attack" in lines[0]
+    assert "ETA 22s" in lines[0], "the recall ETA has to survive the truncation"
+    assert props["alarms"][0]["default"].startswith("your trigger home-guard"), \
+        "an alarm names its running default, whether or not the ALARM line fits it"
+    assert "income collapse" in lines[1]
+    # And the DEFAULT line leads with the reflex, as it does for every alarm.
+    assert props["default"].startswith("your trigger home-guard fired")
+
+
 def test_an_alarms_running_default_leads_the_default_line():
     """AFFORDANCES.md: every alarm names its running default, and silence takes it.
 

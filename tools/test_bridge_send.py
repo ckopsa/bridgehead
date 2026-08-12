@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,6 +31,25 @@ import bridge_send  # noqa: E402
 TOOL = Path(__file__).resolve().parent / "bridge_send.py"
 
 
+def seat_test(fn):
+    """Give the test its own throwaway seat directory.
+
+    Not the pytest `tmp_path` fixture, so every file in tools/ stays runnable
+    as `python3 tools/test_bridge_send.py` with nothing installed — the same
+    contract tools/verify.sh holds the rest of the suite to.
+    """
+
+    def wrapper():
+        with tempfile.TemporaryDirectory() as tmp:
+            fn(Path(tmp))
+
+    # No functools.wraps: preserving the original signature would make pytest
+    # hunt for a `tmp_path` fixture instead of calling the zero-arg wrapper.
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 def write_state(seat: Path, seq_applied: int) -> None:
     (seat / "state.json").write_text(json.dumps({"seq_applied": seq_applied}))
 
@@ -38,7 +58,8 @@ def read_batch(seat: Path) -> dict:
     return json.loads((seat / "commands.json").read_text())
 
 
-def test_fresh_send(tmp_path):
+@seat_test
+def test_fresh_send(tmp_path: Path):
     """First send to a quiet seat: seq 1, commands as given."""
     batch = bridge_send.send(str(tmp_path), [{"type": "ready"}], wait_secs=0)
     assert batch["seq"] == 1
@@ -46,7 +67,8 @@ def test_fresh_send(tmp_path):
     assert on_disk == {"seq": 1, "commands": [{"type": "ready"}]}
 
 
-def test_consumed_batch_is_not_carried(tmp_path):
+@seat_test
+def test_consumed_batch_is_not_carried(tmp_path: Path):
     """A batch the engine already applied is history, not cargo."""
     write_state(tmp_path, 3)
     (tmp_path / "commands.json").write_text(
@@ -57,7 +79,8 @@ def test_consumed_batch_is_not_carried(tmp_path):
     assert batch["commands"] == [{"type": "ready"}]
 
 
-def test_unconsumed_batch_is_carried_forward(tmp_path):
+@seat_test
+def test_unconsumed_batch_is_carried_forward(tmp_path: Path):
     """The r22 case: opening batch, then ready, no engine in between."""
     write_state(tmp_path, 0)
     opening = [{"type": "train", "building": 5, "unit": "Footman"}]
@@ -69,7 +92,8 @@ def test_unconsumed_batch_is_carried_forward(tmp_path):
     assert on_disk["seq"] == 2
 
 
-def test_wait_yields_to_a_live_engine(tmp_path):
+@seat_test
+def test_wait_yields_to_a_live_engine(tmp_path: Path):
     """If the engine consumes mid-wait, nothing is carried and nothing doubles."""
     write_state(tmp_path, 0)
     bridge_send.send(str(tmp_path), [{"type": "stop", "units": [1]}], wait_secs=0)
@@ -87,7 +111,8 @@ def test_wait_yields_to_a_live_engine(tmp_path):
     assert read_batch(tmp_path)["commands"] == [{"type": "ready"}]
 
 
-def test_malformed_pending_is_replaced(tmp_path):
+@seat_test
+def test_malformed_pending_is_replaced(tmp_path: Path):
     """Garbage on disk is the engine's error to report, not ours to preserve."""
     write_state(tmp_path, 0)
     (tmp_path / "commands.json").write_text("{not json")
@@ -96,7 +121,8 @@ def test_malformed_pending_is_replaced(tmp_path):
     assert read_batch(tmp_path)["commands"] == [{"type": "ready"}]
 
 
-def test_cli_reports_carry(tmp_path):
+@seat_test
+def test_cli_reports_carry(tmp_path: Path):
     """The CLI says out loud when it carried commands forward."""
     write_state(tmp_path, 0)
     env = {"BH_SEND_WAIT_SECS": "0", "PATH": "/usr/bin:/bin"}
@@ -111,7 +137,22 @@ def test_cli_reports_carry(tmp_path):
     assert "sent seq=2 (1 commands) (+1 unconsumed carried forward)" in out
 
 
-if __name__ == "__main__":
-    import pytest
+def _run():
+    tests = [(n, f) for n, f in sorted(globals().items())
+             if n.startswith("test_") and callable(f)]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+        except AssertionError as err:
+            failed += 1
+            print(f"FAIL {name}: {err}")
+        except Exception as err:  # noqa: BLE001
+            failed += 1
+            print(f"ERROR {name}: {type(err).__name__}: {err}")
+    print(f"{len(tests) - failed}/{len(tests)} passed")
+    return 1 if failed else 0
 
-    raise SystemExit(pytest.main([__file__, "-v"]))
+
+if __name__ == "__main__":
+    sys.exit(_run())

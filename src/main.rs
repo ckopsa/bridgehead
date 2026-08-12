@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
 mod ai;
+mod alarm;
 mod bounty;
 mod bridge;
 mod combat;
@@ -149,6 +150,7 @@ fn main() {
         // plan.rs, where the reasoning for the edge lives.
         plan::PlanPlugin,
         bounty::BountyPlugin,
+        alarm::AlarmPlugin,
     ))
     .run();
 }
@@ -192,6 +194,7 @@ mod tests {
             trigger::TriggerPlugin,
             plan::PlanPlugin,
             bounty::BountyPlugin,
+            alarm::AlarmPlugin,
         ))
         .add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));
 
@@ -244,6 +247,7 @@ mod tests {
             trigger::TriggerPlugin,
             plan::PlanPlugin,
             bounty::BountyPlugin,
+            alarm::AlarmPlugin,
         ));
         // After the plugins, so it overwrites `CorePlugin`'s `init_resource`
         // default rather than being overwritten by it.

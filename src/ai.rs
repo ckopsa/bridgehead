@@ -547,6 +547,7 @@ fn seed_machine_autocast(
                     units: vec![intent_id(entity)],
                     min_enemies: Some(*min),
                     ability: Some(AbilitySelector::Index(*index)),
+                    select: None,
                 },
             ));
         }
@@ -1410,6 +1411,7 @@ fn think(
                 x: Some(safe.x),
                 z: Some(safe.z),
                 region: None,
+                select: None,
             });
         }
     }
@@ -1644,11 +1646,13 @@ fn think(
                         // the same arm of the same compiler, rather than this
                         // file remembering to call `issue_instant`.
                         voice.say(Intent::Build {
-                            worker: intent_id(builder),
+                            worker: Some(intent_id(builder)),
                             kind: building_name(kind).to_string(),
                             x: Some(site.x),
                             z: Some(site.z),
                             region: None,
+                            select: None,
+                            site: None,
                         });
                         // Optimistic, and safe to be: if the compiler refuses
                         // the placement the worker never picks up an
@@ -1953,11 +1957,16 @@ fn think(
             }
         }
     }
-    voice.say_group(haulers, |units| Intent::Return { units });
+    voice.say_group(haulers, |units| Intent::Return {
+        units,
+        select: None,
+    });
     for (node, crew) in crews {
         voice.say(Intent::Harvest {
             units: crew,
-            target: intent_id(node),
+            target: Some(intent_id(node)),
+            select: None,
+            target_select: None,
         });
     }
 
@@ -2415,11 +2424,12 @@ fn think(
             // A hero IS a command node, so the link the compiler charges here
             // computes zero and the cast fires in the frame it always did.
             voice.say(Intent::Cast {
-                hero: intent_id(hero.entity),
+                hero: Some(intent_id(hero.entity)),
                 ability: None,
                 x: None,
                 z: None,
                 target: None,
+                select: None,
             });
         }
     }
@@ -2453,6 +2463,7 @@ fn think(
             x: Some(threat_pos.x),
             z: Some(threat_pos.z),
             region: None,
+            select: None,
         });
         return;
     }
@@ -2471,6 +2482,7 @@ fn think(
                 x: Some(target.x),
                 z: Some(target.z),
                 region: None,
+                select: None,
             });
         } else {
             // Stragglers rejoin the push. Only the free ones, so a wave in
@@ -2482,6 +2494,7 @@ fn think(
                 x: Some(target.x),
                 z: Some(target.z),
                 region: None,
+                select: None,
             });
         }
     } else if army.len() >= brain.next_wave_size {
@@ -2495,6 +2508,7 @@ fn think(
             x: Some(target.x),
             z: Some(target.z),
             region: None,
+            select: None,
         });
     } else {
         // Gather at the rally point while the army builds up. Whoever is free
@@ -2510,6 +2524,7 @@ fn think(
             x: Some(rally.x),
             z: Some(rally.z),
             region: None,
+            select: None,
         });
     }
 }
@@ -3001,7 +3016,9 @@ fn rebalance_mines(
         .collect();
     voice.say_group(shift, |units| Intent::Harvest {
         units,
-        target: intent_id(target.entity),
+        target: Some(intent_id(target.entity)),
+        select: None,
+        target_select: None,
     });
 }
 
@@ -4293,7 +4310,13 @@ mod tests {
     /// on a unit that happened to be standing on a command node.
     #[test]
     fn the_script_never_claims_the_trigger_link_exemption() {
-        let spoken = SubmitIntent::script(Team::Claude, Intent::Return { units: vec![] });
+        let spoken = SubmitIntent::script(
+            Team::Claude,
+            Intent::Return {
+                units: vec![],
+                select: None,
+            },
+        );
         assert!(
             spoken.trigger.is_none(),
             "a scripted decision is a commander deciding now, not a rule firing — \

@@ -2215,6 +2215,11 @@ verb arm sees the intent. It turns every `region` into coordinates or refuses
 with the list of names this seat may speak. Everything downstream sees the
 language it has always seen.
 
+*(It resolves the **role** channel too, now — `"select":"my hero"` and its
+siblings. Same function, same moment, same precedence rule; see "Selectors:
+roles, on the same footing as places" below for why they had to share one pass
+rather than get one each.)*
+
 The alternative — each verb resolving its own place — is how you get `defend`
 accepting a name `push` does not, and two spellings of the unknown-name error.
 Here there is one function and one refusal:
@@ -2321,6 +2326,118 @@ the whole match. Authoring is the deterministic form only:
 `call this the perimeter`, is a trap: `the perimeter` is both a name and a
 phrase that file resolves as a place, so the parse is ambiguous in exactly the
 sentences a commander would write.
+
+## Selectors: roles, on the same footing as places
+
+*(arena r21–r23; docs/AFFORDANCES.md § "Chains: stance plans with late-bound
+references", plan item 1)*
+
+An entity id is a fact about one instant. `{"units":[4294967297]}` names the
+hero that was alive when the sentence was written — and a sentence the engine
+*stores and runs later* is precisely where that instant has already passed.
+Three arena rounds produced five distinct failure classes from this one cause:
+
+| what happened | round |
+|---|---|
+| a hero-save trigger armed with `"units":[]` because the hero was not trained yet; it fired as "move 0 units", was rejected, and the hero died three seconds later | r21 |
+| dead hero ids in triggers | r23 red |
+| stale unit lists in `priority`, refreshed by hand every poll | r23 red |
+| a memorized tree chopped out from under a repeating harvest order | r23 red |
+| the wrong worker frozen into a repeating trigger | r23 red |
+| a farm trigger on fixed coordinates that reported `site blocked` on every retry for the whole match | r23 blue |
+
+Both r23 commanders, asked independently how they would prioritize the decision
+space for a smaller model, put late-bound references first.
+
+### The shape was already in the language
+
+Regions are late-bound **places**. `"region":"north-pass"` travels in the stored
+intent and becomes coordinates when the intent is compiled, so moving the region
+re-aims every rule that names it. A selector is a late-bound **role**, on the
+identical footing, resolved at the identical moment — `intent::resolve_places`,
+at the top of the one compiler, which a trigger reaches only when it *fires*.
+
+So the wire grew one optional key beside `units`, exactly as it once grew one
+beside `x`/`z`:
+
+```json
+{"type":"move","select":"my hero","region":"home"}
+{"type":"harvest","select":"workers","target_select":"nearest tree"}
+{"type":"build","select":"workers","kind":"Farm","region":"home","site":"nearest legal site"}
+```
+
+The vocabulary is deliberately small: five roles a commander already thinks in
+(`my hero`, `all army`, `all units`, `workers`, `squad <n>`) and three
+"nearest X" phrases that answer the questions ids answered badly
+(`nearest tree`, `nearest mine`, `nearest legal site`). Phrases fold through
+`normalize_place`, so case, dashes and underscores are noise and `squad 2` keeps
+its space.
+
+`build`, `cast` and `follow`'s leader need exactly one unit and take the
+**lowest-id match** — the same documented tie-break `buy` and `use_item` already
+use for an omitted `hero`, so there is one rule for "which one did you mean"
+rather than two.
+
+### The four rules
+
+1. **Precedence.** A `select` given alongside `units` **wins**, and the
+   overruled list is not even reported. Same sentence as territory's: the name
+   is the decision; ids next to it are not.
+2. **An empty resolution is a refusal, not a quiet nothing.** A phrase that
+   currently matches nobody returns `Err` from the resolver, so the intent never
+   reaches its verb's arm, `reached` stays false, and the seat is told
+   `'all army' matches none of your units right now — nothing was ordered`.
+   **"Move 0 units" is now inexpressible**: the only way to order nobody used to
+   be to name nobody, and naming a currently-empty role teaches instead of
+   firing. In a plan this blocks the step rather than skipping it, because a
+   step that reached nothing is a refusal by the rule already written down.
+3. **Nothing is written back.** Resolution is per submission and discarded; the
+   armed rule still says `"my hero"` on its hundredth firing. A hero can die and
+   be revived with a brand-new entity id and the rule keeps working.
+4. **A selector is bounded by the seat that speaks it and by fog.** The
+   resolver's context struct holds this seat's own units, their squads, the
+   neutral resource nodes and the nav grid — and no enemy query at all. There is
+   deliberately no `"nearest enemy"`: that is an intel question wearing a
+   convenience hat, and fog decides intel (docs/FOG.md), not the resolver.
+
+### Determinism
+
+A resolved unit list is sorted by entity bits before it leaves the resolver.
+This is not cosmetic: `ground_order` hands out formation offsets by index, so an
+unsorted resolution would arrange the same squad on the same ground differently
+depending on Bevy's archetype order. `nearest_node` breaks ties on
+`(distance, x, z, id)` for the same reason `nearest_free_site` does — two seats
+reading the same board must be given the same answer.
+
+### Both seats
+
+The human's answer to "which units" is the mouse, and it is already late-bound:
+a gesture resolves its selection at press time, which for a *direct* order is
+fire time. The asymmetry to watch is in the *deferred* half, and the one preset
+the HUD can arm — `[H]` home guard — was already written against a squad rather
+than a roster (`Intent::Posture { id }`, whose membership doctrine.rs resolves
+every second). So the human's deferred authoring surface is late-bound today by
+a different mechanism, and neither seat can currently arm a rule the other
+cannot express.
+
+What the human seat does **not** have is a way to *type* a role into a rule,
+because there is no text entry in this HUD. That is the same limitation that
+makes the human's regions `mark 1`..`mark 8` rather than `north-pass`, and it is
+a rendering difference rather than a capability one. A selector-picker on the
+doctrine page would close it; nothing about the wire needs to change for that.
+
+### Wire compatibility
+
+Every new key is optional and `skip_serializing_if`, and every one is declared
+last in its variant so the serialized key *order* did not move either. Four
+required scalars widened to `Option` — `build.worker`, `cast.hero`,
+`harvest.target`, `follow.target` — which is additive in both directions: a
+historical command always carries them, so it parses as `Some` and serializes
+identically. `bridge.rs` echoes armed triggers and set plans into `state.json`
+by re-serializing the stored `Intent`, so a stray `"select":null` would have
+appeared in every snapshot of every match that never used the feature;
+`the_selector_keys_are_absent_from_a_sentence_that_does_not_use_them` pins that
+it does not.
 
 ## What this unlocks
 

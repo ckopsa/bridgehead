@@ -37,6 +37,7 @@ use serde::Deserialize;
 use std::sync::LazyLock;
 
 use crate::shared::{
+    AlarmKind, AlarmTuning, ALL_ALARM_KINDS,
     normalize_name, status_probe_enabled, upgrade_root, AbilityDef,
     AbilityTarget, AbilityTargets, Effect, EffectAtom, EffectSchedule,
     BuildingKind, BuildingRole,
@@ -63,6 +64,7 @@ const ABILITIES_RON: &str = include_str!("../assets/data/abilities.ron");
 const ITEMS_RON: &str = include_str!("../assets/data/items.ron");
 const RESEARCH_RON: &str = include_str!("../assets/data/research.ron");
 const STANCES_RON: &str = include_str!("../assets/data/stances.ron");
+const ALARMS_RON: &str = include_str!("../assets/data/alarms.ron");
 
 /// Read one table's text: the override file if `BH_DATA_DIR` names a
 /// directory containing it, otherwise the compiled-in copy.
@@ -285,6 +287,22 @@ struct ItemRow {
     def: ItemDefRow,
 }
 
+/// One row of `alarms.ron` — one alarm kind's two tuning numbers.
+///
+/// A table rather than a handful of `const`s in alarm.rs, and the reason is
+/// the one §"Content data files" gives for every other table here: these are
+/// per-kind rows that two agents will append to, and rows in a file either
+/// conflict loudly or not at all. The second reason is the arena — the
+/// scaffold's aggressiveness is exactly what a round wants to vary and record
+/// in its `ruleset` (docs/AFFORDANCES.md constraint 3), and `BH_DATA_DIR` is
+/// how you vary it without a rebuild.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AlarmRow {
+    kind: AlarmKind,
+    pub tuning: AlarmTuning,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct ResearchFile {
@@ -324,6 +342,8 @@ pub struct Tables {
     research_steps: Vec<ResearchStep>,
     /// Slot-indexed by `StanceKind as usize`, like every other table here.
     stances: Vec<StanceDef>,
+    /// Slot-indexed by `AlarmKind as usize`, like every other table here.
+    alarms: Vec<AlarmRow>,
 }
 
 static TABLES: LazyLock<Tables> = LazyLock::new(load);
@@ -394,6 +414,7 @@ fn load() -> Tables {
     let item_rows: Vec<ItemRow> = parse("items.ron", ITEMS_RON);
     let research_file: ResearchFile = parse("research.ron", RESEARCH_RON);
     let stance_rows: Vec<StanceDef> = parse("stances.ron", STANCES_RON);
+    let alarm_rows: Vec<AlarmRow> = parse("alarms.ron", ALARMS_RON);
 
     // Slotting first: every later check assumes a full table, and a missing
     // row is the failure this whole exercise exists to make loud.
@@ -490,6 +511,35 @@ fn load() -> Tables {
         }
     }
 
+    let alarms = slot_by_kind(
+        "alarms.ron",
+        alarm_rows,
+        &ALL_ALARM_KINDS,
+        |row| row.kind,
+        |kind| kind as usize,
+        |kind| format!("{kind:?}"),
+        &mut problems,
+    );
+    // The one check the schema cannot make: a negative grace window would mean
+    // the alarm may fire before the reflex it is supposed to follow, which is
+    // the single property docs/AFFORDANCES.md asks of this whole layer. A
+    // negative threshold is meaningless for all four kinds.
+    for row in &alarms {
+        if row.tuning.grace_s < 0.0 {
+            problems.push(format!(
+                "alarms.ron: {:?} has grace_s {} — an alarm must never be able to \
+                 outrun the reflex it reports",
+                row.kind, row.tuning.grace_s
+            ));
+        }
+        if row.tuning.threshold < 0.0 {
+            problems.push(format!(
+                "alarms.ron: {:?} has a negative threshold ({})",
+                row.kind, row.tuning.threshold
+            ));
+        }
+    }
+
     if !problems.is_empty() {
         panic!("{}", report(&problems));
     }
@@ -570,6 +620,7 @@ fn load() -> Tables {
         research_ladders,
         research_steps: research_file.steps,
         stances,
+        alarms,
     };
 
     problems.extend(check_values(&tables, &defs));
@@ -1257,6 +1308,12 @@ fn duplicates(table: &str, field: &str, values: &[String], p: &mut Vec<String>) 
 pub fn unit_row(kind: UnitKind) -> &'static UnitRow {
     tables().units.get(kind as usize).unwrap_or_else(|| {
         panic!("{kind:?} has no row in units.ron — add it to ALL_UNIT_KINDS and the data file")
+    })
+}
+
+pub fn alarm_row(kind: AlarmKind) -> &'static AlarmRow {
+    tables().alarms.get(kind as usize).unwrap_or_else(|| {
+        panic!("{kind:?} has no row in alarms.ron — add it to ALL_ALARM_KINDS and the data file")
     })
 }
 
@@ -2228,6 +2285,15 @@ mod tests {
             research_ladders,
             research_steps: research_file.steps,
             stances,
+            alarms: slot_by_kind(
+                "alarms.ron",
+                parse::<Vec<AlarmRow>>("alarms.ron", ALARMS_RON),
+                &ALL_ALARM_KINDS,
+                |row| row.kind,
+                |kind| kind as usize,
+                |kind| format!("{kind:?}"),
+                &mut Vec::new(),
+            ),
         }
     }
 }
