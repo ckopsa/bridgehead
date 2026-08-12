@@ -145,6 +145,19 @@ facts; "best move" is an opinion, and the engine does not have opinions. The
 document version is recorded in the round's ruleset like every other scaffold
 layer (constraint 3).
 
+**Shipped** (`wc3clone-0uu.3`) as `tools/affordances.py`, rendered by
+`bridge_view.py --doc` / `--doc --json`, versioned `affordance-doc/1` and
+readable from `bridge_view.py --doc-version`. The wire is untouched: the
+document is composed entirely from `state.json` and `catalog.json`, and the
+only engine change was two additive catalog keys (`stances`, `selectors`) so a
+form's field domain and the refusal a bad value earns are the same words. Its
+user documentation is tools/COMMANDER_BRIEF.md § "The affordance document".
+Two things the design left open and the implementation settled: the preference
+channel is a `--prefs` file rather than a wire verb (a doctrine statement the
+engine is forbidden to act on does not belong in the protocol), and the push
+gates were fixed at one consolidated squad, six units and heroes at 80% — the
+scaffold's own numbers, which is exactly what `doc_version` is for.
+
 ### Chains: stance plans with late-bound references
 
 "Turtle until the hero is healed, then secure an expansion" is a plan whose

@@ -21,8 +21,11 @@ co-commander section near the end, which is the only part that differs.
    resources, your army by squad, your production queues, the enemy production
    buildings you have SEEN (the win-condition line), the last five events, any
    active alarms, and one line naming what happens if you send nothing this
-   cycle. Both read the same `state.json` and neither writes anything; the full
-   readout is there whenever you want the ids the digest drops.
+   cycle. Add `--doc` instead for the whole affordance document: that digest,
+   plus every command you could send right now with its precondition truth
+   already computed — see **The affordance document** below. All three read the
+   same `state.json` and none of them writes anything; the full readout is there
+   whenever you want the ids the digest drops.
 3. Decide. 4. Write commands (see below).
 Repeat until `game_over` is non-null, then stop and report the result.
 
@@ -775,6 +778,142 @@ A plan step can arm a trigger, which is how you say "once the barracks is up,
 start guarding the base". If a plan step and a trigger both re-task the same
 squad on the same tick, **the trigger wins** — a rule written for the situation
 in front of you beats a sequence written before the match.
+
+## The affordance document: everything above, as one page you can read
+
+```bash
+python3 tools/bridge_view.py --doc <SEAT>/state.json          # to read
+python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse
+python3 tools/bridge_view.py --doc-version                    # affordance-doc/1
+```
+
+The digest tells you **what is going on**. The document tells you **what you can
+say about it**, on one page, with the command already written. It is rendered
+from your `state.json` and your `catalog.json` and nothing else — it sends
+nothing, writes nothing, and knows nothing you do not.
+
+### How to read it
+
+Five sections, in this order.
+
+| section | what it is |
+|---|---|
+| `properties` | the `--digest` view, embedded verbatim |
+| `default` | **what happens if you send nothing this cycle**, with `command: null` |
+| `alarms` | each ringing alarm, leading with the reflex that already fired |
+| `actions` | every link and every form (below) |
+| `preference` | your own declared doctrine, if you declared one |
+
+Plus `doc_version` — the version of this scaffold, which an arena round records
+in its `ruleset` so a result can be read as model+scaffold rather than as model.
+
+### The ladder: default, link, form, raw
+
+Four rungs, in increasing order of how much you have to decide. Take the lowest
+one that says what you mean.
+
+1. **`default`** — zero decisions. Say nothing and this is what happens. Your
+   stances persist, your triggers keep watching, your plans keep stepping. A
+   cycle in which you send nothing is a cycle in which your doctrine runs. It is
+   printed every time, so silence is never a guess.
+
+2. **link** — zero fields. `command` is complete; send it back verbatim.
+
+   ```
+   [READY    ] stance:squad-1:secure  squad 1 → secure · Hold ground away from home.
+               why: squad 1 holds 6 units, pooled strength 729
+               send: {"type": "stance", "squad": 1, "stance": "secure", "target": "mid"}
+   ```
+
+   Every link is written in **selectors and place names, never entity ids**, so
+   a link is still a valid sentence a minute after it was rendered.
+
+3. **form** — the engine filled every fact-shaped field and left the
+   judgment-shaped ones `null`. Fill those and send the template.
+
+   ```
+   [READY    ] recipe:hero-save  HERO SAVE — the hero walks out before it dies
+       template: {"type":"trigger_set","name":"hero-save","repeat":45,
+                  "when":{"type":"hero_below","frac":null},
+                  "then":{"type":"move","select":"my hero","region":null}}
+         when.frac   <number> range 0.05..0.95  (leave null — this one is yours)
+         then.region <place>                    (leave null — this one is yours)
+           domain: our base · their base · mid · north-pass (YOUR region) · …
+   ```
+
+   A field's `domain` is the real list the engine will accept — place names from
+   `map.places` plus your own `regions`, the selector phrases, the building kinds
+   with their prices and whether your tech allows them. The refusal that would
+   have taught you this arrives with the form instead of costing you a cycle.
+
+4. **raw** — the URI bar. **Everything in this brief is legal whether or not it
+   appears in the document.** The document is a floor, never a ceiling: it lists
+   what is easy to say, and it constrains nothing. If the winning move is a verb
+   the page did not offer, send the verb.
+
+### Readiness is a fact. There is no recommendation.
+
+Every link carries `ready` and a `reason`, and the reason prints **both sides of
+every comparison**, whether it passed or failed:
+
+```
+[NOT READY] stance:squad-1:push  squad 1 → push · Commit to the objective.
+            why: push gates: not consolidated: 3 of your 9 army units are outside
+                 squad 1 (met: size 6/6; Hero at 92%, gate is 80%)
+            intel: last seen: 7 troops (3 Archer, 2 Footman, 1 Catapult, 1 Hero)
+                 at (-12, -11), 0s ago — not since
+```
+
+Three things about that block:
+
+- **NOT READY never blocks anything.** The command underneath is complete and
+  the engine will accept it. `ready` is the engine telling you what it can
+  measure, not what it thinks.
+- **The push gates are this scaffold's numbers** — one consolidated squad, six
+  or more units, heroes at 80% — and they are printed with both halves so you
+  can disagree with the threshold rather than with the engine.
+- **`intel` is your ledger, not your eyes.** "Last seen … — not since" is the
+  sentence a commander lost a match for not having. An empty ledger says so in
+  those words: what you cannot see is not what is not there.
+
+Costs, tech gates and staleness are facts too. *Best move* is an opinion and you
+will not find one on the page.
+
+### Standing state is a set of resources
+
+`trigger_set` / `region_set` / `plan_set` were always CRUD by name — a fresh name
+creates, your snapshot echo reads, the same name updates in place for free,
+`*_clear` deletes. The document says so out loud:
+
+- each collection reports its **slot pressure** (`2 of 8 region names in use`);
+- each thing you already have gets an **edit form pre-filled with its current
+  values** and a **delete link** beside it;
+- a full collection is `NOT READY` with the way out in the reason ("re-use one
+  of those names to replace a rule in place").
+
+The recipes from *Triggers* above are served the same way — `recipe:home-guard`,
+`recipe:hero-save`, `recipe:expand`, `recipe:counter-punch` — with the ids taken
+out and one or two judgment fields left open.
+
+### Declaring a doctrine (optional)
+
+The engine will **sort** the menu under your own values. It will never generate
+them. Write a file and point the view at it:
+
+```json
+{"doctrine": "aggression: high, risk: low",
+ "prefer": ["harass", "push"],
+ "avoid":  ["turtle"]}
+```
+
+```bash
+python3 tools/bridge_view.py --doc --prefs doctrine.json <SEAT>/state.json
+```
+
+`prefer` and `avoid` are matched against each action's name and title.
+Preference reorders the page and does nothing else: not one `ready`, `reason` or
+`command` changes. With no file, the order is facts only — anything an alarm
+points at, then links before forms, then ready before not-ready.
 
 ## Speakable strategy: `tools/intent_compile.py`
 
