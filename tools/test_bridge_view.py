@@ -133,6 +133,27 @@ def test_a_late_game_snapshot_cannot_blow_the_ceiling():
     assert "DEFAULT" in prefixes(lines) and "WIN" in prefixes(lines)
 
 
+def test_the_ending_is_named_the_way_it_happened():
+    """`game_over` is a team name — or `"draw"`, the one value that is not one
+    (wc3clone-j84: a capped match can end dead even and still has to end).
+    "draw wins" is the sentence this pins shut."""
+    def head_for(game_over, reason):
+        s = load(LIVE[1])
+        s["game_over"] = game_over
+        s["game_over_reason"] = reason
+        return " ".join(bridge_view.render_digest(bridge_view.digest(s)))
+
+    won = head_for("Human", "razed")
+    assert "GAME OVER: Human wins (razed)" in won, won
+
+    scored = head_for("Claude", "score")
+    assert "GAME OVER: Claude wins (score)" in scored, scored
+
+    drawn = head_for("draw", "score")
+    assert "GAME OVER: a draw (score)" in drawn, drawn
+    assert "draw wins" not in drawn, drawn
+
+
 def test_no_line_runs_away():
     for path in LIVE + [EARLY, LEGACY]:
         for line in bridge_view.render_digest(bridge_view.digest(load(path))):
