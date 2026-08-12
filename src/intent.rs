@@ -3104,6 +3104,7 @@ fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result
     }
     match when {
         TriggerWhen::HeroBelow { frac: f } => frac("hero_below", *f),
+        TriggerWhen::HeroAbove { frac: f } => frac("hero_above", *f),
         TriggerWhen::SquadBelow { frac: f, .. } => frac("squad_below", *f),
         TriggerWhen::EnemySighted { class, count } => {
             if *count == 0 {

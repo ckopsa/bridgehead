@@ -229,6 +229,26 @@ pub fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bo
             *team == me && hero.is_some() && hp.max > 0.0 && hp.current / hp.max < *frac
         }),
 
+        // The wait-condition half of the pair, and NOT the negation of the arm
+        // above it — see the doc on `TriggerWhen::HeroAbove`. Written as a fold
+        // that has to see a hero before it can be true, so "we have no hero" and
+        // "our hero is healed" can never be confused: an empty roster leaves
+        // `found` false and the whole predicate false, which is what keeps a
+        // chain from advancing over a corpse.
+        TriggerWhen::HeroAbove { frac } => {
+            let mut found = false;
+            for (_, team, _, hp, hero, _) in world.units.iter() {
+                if *team != me || hero.is_none() || hp.max <= 0.0 {
+                    continue;
+                }
+                found = true;
+                if hp.current / hp.max < *frac {
+                    return false;
+                }
+            }
+            found
+        }
+
         // POOLED health, not per-member: a squad is a formation, and one
         // wounded footman in a healthy line is not a squad in trouble. False
         // for an empty squad — see the doc on `TriggerWhen::SquadBelow`.
@@ -1171,6 +1191,161 @@ mod tests {
         advance(&mut app, 5.0);
         app.update();
         assert_eq!(fired(&mut app).len(), 1);
+    }
+
+    /// **`hero_above` is a wait-condition, not a negation.** The predicate
+    /// "turtle until the hero is healed" needs, and the three cases that make it
+    /// different from `not hero_below` — each of which is a way a chain could
+    /// advance at the worst possible moment.
+    #[test]
+    fn hero_above_is_healed_and_a_dead_hero_is_not_healed() {
+        let mut app = trigger_app();
+        app.world_mut()
+            .resource_mut::<Triggers>()
+            .get_mut(Team::Human)
+            .push(armed(
+                TriggerWhen::HeroAbove { frac: 0.8 },
+                stop_intent(),
+                Some(1.0),
+            ));
+
+        // 1. NO hero. `not hero_below` would be true here and would release a
+        //    chain over a corpse; this must not.
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "a hero you do not have is not a hero that is healed"
+        );
+
+        let hero = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Transform::default(),
+                Health { current: 30.0, max: 100.0 },
+                Hero { level: 1, xp: 0.0, mana: 80.0 },
+            ))
+            .id();
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(fired(&mut app).is_empty(), "30% is not healed");
+
+        app.world_mut().entity_mut(hero).insert(Health {
+            current: 85.0,
+            max: 100.0,
+        });
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(fired(&mut app).len(), 1, "85% is at or above 80%");
+
+        // 2. ALL, not any. A fresh second hero must not release the wait while
+        //    the first one is still crawling home.
+        let second = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Priestess },
+                Team::Human,
+                Transform::default(),
+                Health { current: 20.0, max: 100.0 },
+                Hero { level: 1, xp: 0.0, mana: 80.0 },
+            ))
+            .id();
+        advance(&mut app, 5.0);
+        app.update();
+        assert!(
+            fired(&mut app).is_empty(),
+            "one hero at 20% means the roster is not ready"
+        );
+
+        // 3. Ours, not theirs — the same rule every other predicate obeys.
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Hero },
+            Team::Claude,
+            Transform::default(),
+            Health { current: 5.0, max: 100.0 },
+            Hero { level: 1, xp: 0.0, mana: 80.0 },
+        ));
+        app.world_mut().entity_mut(second).insert(Health {
+            current: 90.0,
+            max: 100.0,
+        });
+        advance(&mut app, 5.0);
+        app.update();
+        assert_eq!(
+            fired(&mut app).len(),
+            1,
+            "both of OUR heroes are up; theirs is not our question"
+        );
+    }
+
+    /// With at least one hero alive the pair really are complements, and with
+    /// none alive both are false. Stated as a test because it is the property
+    /// the doc on `TriggerWhen::HeroAbove` promises, and the one a future
+    /// "simplification" into `!hero_below` would break.
+    #[test]
+    fn hero_above_and_hero_below_partition_a_living_roster() {
+        let mut app = trigger_app();
+        let hero = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Transform::default(),
+                Health { current: 100.0, max: 100.0 },
+                Hero { level: 1, xp: 0.0, mana: 80.0 },
+            ))
+            .id();
+        app.update();
+
+        for current in [5.0f32, 49.0, 50.0, 99.0, 100.0] {
+            app.world_mut().entity_mut(hero).insert(Health {
+                current,
+                max: 100.0,
+            });
+            advance(&mut app, 1.0);
+            app.update();
+            let (below, above) = probe(&mut app, 0.5);
+            assert_ne!(
+                below, above,
+                "at {current}% exactly one of below/above 50% holds"
+            );
+        }
+
+        app.world_mut().despawn(hero);
+        advance(&mut app, 1.0);
+        app.update();
+        let (below, above) = probe(&mut app, 0.5);
+        assert!(
+            !below && !above,
+            "with no hero at all, neither question has a yes"
+        );
+    }
+
+    /// Ask both hero predicates about the live world, through the real
+    /// evaluator: two rules, one sweep, and which of them fired is the answer.
+    fn probe(app: &mut App, frac: f32) -> (bool, bool) {
+        {
+            let mut triggers = app.world_mut().resource_mut::<Triggers>();
+            let list = triggers.get_mut(Team::Human);
+            list.clear();
+            let mut below = armed(TriggerWhen::HeroBelow { frac }, stop_intent(), Some(0.1));
+            below.name = name("below");
+            list.push(below);
+            let mut above = armed(TriggerWhen::HeroAbove { frac }, stop_intent(), Some(0.1));
+            above.name = name("above");
+            list.push(above);
+        }
+        advance(app, 1.0);
+        app.update();
+        let names: Vec<String> = fired(app)
+            .iter()
+            .map(|s| s.trigger.unwrap().as_str().to_string())
+            .collect();
+        (
+            names.iter().any(|n| n == "below"),
+            names.iter().any(|n| n == "above"),
+        )
     }
 
     #[test]

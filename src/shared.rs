@@ -6934,6 +6934,28 @@ pub enum TriggerWhen {
     BaseUnderAttack,
     /// Any of our own living heroes is below `frac` of max health.
     HeroBelow { frac: f32 },
+    /// **Every** living hero we own is at or above `frac` of max health, and we
+    /// own at least one. "My hero is healed", as a wait-condition.
+    ///
+    /// This is NOT `not hero_below`, and the difference is the whole reason it
+    /// is a named predicate rather than a negation operator (docs/INTENT.md
+    /// refuses `and`/`or`/`not` — a boolean algebra is where doctrine stops
+    /// being doctrine). Two departures, both deliberate:
+    ///
+    ///   * **A dead hero is not a healed hero.** With no living hero this is
+    ///     false, exactly as `hero_below` is. A chain that said "turtle until
+    ///     the hero is healed, then commit" must not commit the moment the hero
+    ///     dies — which is precisely what a negation would do, at the worst
+    ///     available instant.
+    ///   * **All, not any.** `hero_below` asks about "whichever one is dying"
+    ///     because that is the useful reading of *save my hero*; the useful
+    ///     reading of *wait until my heroes are ready* is the whole roster, or
+    ///     a fresh second hero would release a chain over the corpse-adjacent
+    ///     first one.
+    ///
+    /// So with at least one hero alive the two really are complements, and with
+    /// none alive both are false — which is the honest answer to both questions.
+    HeroAbove { frac: f32 },
     /// The living members of our squad `id` hold, in total, less than `frac` of
     /// their combined max health. False for a squad with no living members —
     /// a squad that is gone cannot be "hurt", and firing a rescue at a corpse
@@ -7107,6 +7129,9 @@ impl TriggerWhen {
             TriggerWhen::BaseUnderAttack => "the base is attacked".to_string(),
             TriggerWhen::HeroBelow { frac } => {
                 format!("a hero drops below {} health", pct(*frac))
+            }
+            TriggerWhen::HeroAbove { frac } => {
+                format!("every living hero is back above {} health", pct(*frac))
             }
             TriggerWhen::SquadBelow { id, frac } => {
                 format!("squad {id} drops below {} health", pct(*frac))
