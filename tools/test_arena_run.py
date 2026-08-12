@@ -11,6 +11,7 @@ engine's log. Those are the parts a hand-typed launch line got wrong.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -173,6 +174,68 @@ def test_a_time_cap_is_recorded_as_a_score_verdict_not_a_win():
     assert v["reason"] == "score"
     assert v["decisive"] is False
     assert v["duration_s"] == 1800.0
+
+
+DECIDED_CAP_LOG = """
+INFO [1800.0s] Human: gold 4900 lumber 4200 supply 100/100 | 44 units, 25 buildings | 20 Archer
+INFO [1800.0s] Claude: gold 300 lumber 100 supply 90/100 | 40 units, 11 buildings | 18 Footman
+INFO headless: time cap 1800s — timeout verdict: Human wins on score (Human 812 vs Claude 640)
+INFO headless: game over — Human wins (score) at t=1800.1s — exiting
+"""
+
+DRAWN_CAP_LOG = """
+INFO [1800.0s] Human: gold 900 lumber 400 supply 30/100 | 20 units, 8 buildings | 10 Archer
+INFO [1800.0s] Claude: gold 900 lumber 400 supply 30/100 | 20 units, 8 buildings | 10 Footman
+INFO headless: time cap 1800s — timeout verdict: dead even (Human 812 vs Claude 812)
+INFO headless: game over — dead even (score) at t=1800.1s — exiting
+"""
+
+
+def test_a_capped_round_the_engine_decided_is_still_not_a_decisive_win():
+    """wc3clone-j84 made the cap decide the match, so the engine now prints the
+    game-over line as well as the timeout verdict. The ledger must read the
+    same round the same way it did before: `score`, and not decisive."""
+    v = arena_run.read_log(DECIDED_CAP_LOG)
+    assert v["winner"] == "Human"
+    assert v["reason"] == "score"
+    assert v["decisive"] is False
+
+
+def test_a_dead_even_cap_is_a_draw_with_no_winner():
+    """docs/ARENA.md: a draw is an absent winner, never a sentinel team. The
+    engine says `dead even` rather than `X wins` for exactly this reason."""
+    v = arena_run.read_log(DRAWN_CAP_LOG)
+    assert v["winner"] is None
+    assert v["reason"] == "score"
+    assert v["decisive"] is False
+    assert v["duration_s"] == 1800.0
+
+
+def test_the_windowed_watcher_reads_a_draw_out_of_the_snapshot():
+    """The other reader of a verdict: a windowed round watches `state.json`
+    instead of the log, and the wire spells a draw `game_over: "draw"`. Both
+    paths have to land on the same ledger row."""
+    with tempfile.TemporaryDirectory() as tmp:
+        seat = Path(tmp) / "red"
+        seat.mkdir()
+        (seat / "state.json").write_text(json.dumps(
+            {"t": 1800.0, "game_over": "draw", "game_over_reason": "score"}))
+        v = arena_run.wait_for_seat_game_over([seat], time.monotonic() + 5)
+    assert v["winner"] is None, "a draw names nobody in the record"
+    assert v["reason"] == "score"
+    assert v["decisive"] is False
+
+
+def test_the_windowed_watcher_still_reads_a_real_win():
+    with tempfile.TemporaryDirectory() as tmp:
+        seat = Path(tmp) / "red"
+        seat.mkdir()
+        (seat / "state.json").write_text(json.dumps(
+            {"t": 324.0, "game_over": "Claude", "game_over_reason": "surrender"}))
+        v = arena_run.wait_for_seat_game_over([seat], time.monotonic() + 5)
+    assert v["winner"] == "Claude"
+    assert v["reason"] == "surrender"
+    assert v["decisive"] is True
 
 
 def test_an_old_log_without_the_reason_or_clock_still_parses():

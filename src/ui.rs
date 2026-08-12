@@ -4244,7 +4244,7 @@ fn command_input(
         Option<&TrainingQueue>,
     )>,
 ) {
-    if game_over.winner.is_some() {
+    if game_over.decided() {
         return;
     }
 
@@ -5446,7 +5446,7 @@ fn panel_clicks(
     alive: Query<Entity, Or<(With<Unit>, With<Building>)>>,
     queues: Query<(Entity, &TrainingQueue), With<Selected>>,
 ) {
-    if game_over.winner.is_some() {
+    if game_over.decided() {
         return;
     }
     for (interaction, el) in &pressed_buttons {
@@ -5563,7 +5563,7 @@ fn control_groups(
                     }
                 }
                 ui.groups.insert(slot, merged);
-                if !joining.is_empty() && game_over.winner.is_none() {
+                if !joining.is_empty() && !game_over.decided() {
                     say(
                         &mut submissions,
                         Intent::Squad {
@@ -5588,7 +5588,7 @@ fn control_groups(
                 .map(|(e, _, _)| e)
                 .collect();
             ui.groups.insert(slot, members);
-            if game_over.winner.is_none() {
+            if !game_over.decided() {
                 if !leavers.is_empty() {
                     say(
                         &mut submissions,
@@ -5648,7 +5648,7 @@ fn minimap_input(
     let Ok(window) = windows.single() else {
         return;
     };
-    if game_over.winner.is_some() {
+    if game_over.decided() {
         ui.minimap_drag = false;
         return;
     }
@@ -5777,7 +5777,7 @@ fn left_mouse(
         return;
     };
 
-    if game_over.winner.is_some() {
+    if game_over.decided() {
         if let Ok(mut node) = drag_node.single_mut() {
             node.display = Display::None;
         }
@@ -6187,7 +6187,7 @@ fn right_mouse(
     nodes: Query<(Entity, &Transform, &ResourceNode)>,
     fog: Res<FogGrids>,
 ) {
-    if !buttons.just_pressed(MouseButton::Right) || game_over.winner.is_some() {
+    if !buttons.just_pressed(MouseButton::Right) || game_over.decided() {
         return;
     }
 
@@ -8554,10 +8554,14 @@ fn update_hud(
     // --- banner ------------------------------------------------------------
     // Whether we were spectating is latched at the moment the match ends, so
     // toggling F9 on the result screen can't rewrite history.
-    match game_over.winner {
-        Some(_) if spectated.is_none() => *spectated = Some(ai_controlled.human),
-        None => *spectated = None,
-        _ => {}
+    // `decided()`, not `winner`: a drawn match is over, and latching on the
+    // winner alone would leave the result screen looking like a live game.
+    if game_over.decided() {
+        if spectated.is_none() {
+            *spectated = Some(ai_controlled.human);
+        }
+    } else {
+        *spectated = None;
     }
     let (banner, banner_sub, banner_color) = match (game_over.winner, spectated.unwrap_or(false)) {
         // AI vs AI: team-neutral result, no "you".
@@ -8565,14 +8569,18 @@ fn update_hud(
         (Some(Team::Claude), true) => ("RED WINS", "AI vs AI", Color::srgb(1.0, 0.45, 0.35)),
         (Some(Team::Human), false) => ("VICTORY!", "You win", Color::srgb(0.45, 1.0, 0.5)),
         (Some(Team::Claude), false) => ("DEFEAT", "Claude wins", Color::srgb(1.0, 0.35, 0.3)),
+        // Decided and nobody won: the cap's dead-even verdict. The seat on the
+        // bridge reads `game_over: "draw"` in the same frame.
+        (None, _) if game_over.drawn => ("DRAW", "dead even", Color::srgb(0.85, 0.85, 0.85)),
         (None, _) => ("", "", Color::WHITE),
     };
-    // Which win it was, in the sub-line — the human's copy of the snapshot's
+    // Which ending it was, in the sub-line — the human's copy of the snapshot's
     // `game_over_reason`. Both seats get told the same fact in the same words;
     // only the frame around it differs, which is the usual rule.
     let banner_sub = match game_over.reason {
         Some(GameOverReason::Razed) => format!("{banner_sub} — production razed"),
         Some(GameOverReason::Surrender) => format!("{banner_sub} — by surrender"),
+        Some(GameOverReason::Score) => format!("{banner_sub} — on assets at the time cap"),
         None => banner_sub.to_string(),
     };
 
@@ -8865,7 +8873,7 @@ fn hover_feedback(
     let mut icon = SystemCursorIcon::Default;
     let workers_selected = selected.iter().any(|u| is_worker_kind(u.kind));
 
-    let pickable = game_over.winner.is_none() && state.placement.is_none() && !state.dragging;
+    let pickable = !game_over.decided() && state.placement.is_none() && !state.dragging;
     if pickable {
         if let (Some(cursor), Ok((cam, cam_tf))) = (window.cursor_position(), camera.single()) {
             if !cursor_over_hud(cursor, window, &state, &hud) {
@@ -8960,7 +8968,7 @@ fn hover_feedback(
     }
 
     // Armed attack-move always reads as "next click is an attack".
-    if state.attack_move_armed && game_over.winner.is_none() {
+    if state.attack_move_armed && !game_over.decided() {
         icon = SystemCursorIcon::Crosshair;
     }
 
@@ -8999,7 +9007,7 @@ fn surrender_hotkey(
     mut armed_at: Local<Option<f32>>,
     mut submissions: EventWriter<SubmitIntent>,
 ) {
-    if game_over.winner.is_some() || !keys.just_pressed(hotkeys::SURRENDER) {
+    if game_over.decided() || !keys.just_pressed(hotkeys::SURRENDER) {
         return;
     }
     let now = time.elapsed_secs();
@@ -9513,7 +9521,7 @@ fn notification_input(
     mut focus: EventWriter<CameraFocus>,
     pressed_rows: Query<(&Interaction, &NotifRow), Changed<Interaction>>,
 ) {
-    if game_over.winner.is_some() {
+    if game_over.decided() {
         return;
     }
 
@@ -9733,7 +9741,7 @@ fn proposal_input(
     mut verdicts: EventWriter<ProposalVerdict>,
     pressed: Query<(&Interaction, &PropBtn), Changed<Interaction>>,
 ) {
-    if game_over.winner.is_some() || copilot.seat.is_none() {
+    if game_over.decided() || copilot.seat.is_none() {
         return;
     }
     // A click names its proposal exactly — and reads the same modifiers, so

@@ -325,19 +325,24 @@ sim() {
         printf '  %-10s seed %-4s engine exited %d — %s\n' "$map" "$seed" "$rc" "$log"
         return 1
     fi
-    local over
+    # The CAP is checked first, and that order is load-bearing. A capped run
+    # now decides the match it stops (wc3clone-j84) and therefore prints a
+    # `headless: game over — ... (score)` line of its own, so looking for the
+    # game-over line first would report every stalemate as a pass — the exact
+    # "green because it hit the time cap" this script was written against. A
+    # score verdict is the referee's opinion; this tier wants a fought-out one.
+    local capped over
+    capped="$(grep -m1 'headless: time cap' "$log" | sed -E 's/.*headless: //')"
+    if [ -n "$capped" ]; then
+        printf '  %-10s seed %-4s NOT DECISIVE: %s\n' "$map" "$seed" "$capped"
+        return 1
+    fi
     over="$(grep -m1 'headless: game over' "$log" | sed -E 's/.*headless: //')"
     if [ -n "$over" ]; then
         printf '  %-10s seed %-4s %s\n' "$map" "$seed" "$over"
         return 0
     fi
-    local capped
-    capped="$(grep -m1 'headless: time cap' "$log" | sed -E 's/.*headless: //')"
-    if [ -n "$capped" ]; then
-        printf '  %-10s seed %-4s NOT DECISIVE: %s\n' "$map" "$seed" "$capped"
-    else
-        printf '  %-10s seed %-4s no verdict line at all — see %s\n' "$map" "$seed" "$log"
-    fi
+    printf '  %-10s seed %-4s no verdict line at all — see %s\n' "$map" "$seed" "$log"
     return 1
 }
 

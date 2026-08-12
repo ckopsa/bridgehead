@@ -427,6 +427,13 @@ def _trunc(line, width=110):
     return line if len(line) <= width else line[: width - 1] + "…"
 
 
+def _game_over_phrase(game_over):
+    """`game_over` is a team name, or `"draw"` — the one value that is not a
+    team (wc3clone-j84: a capped match ends dead even and still has to end).
+    "draw wins" is the sentence this exists to not print."""
+    return "a draw" if game_over == "draw" else f"{game_over} wins"
+
+
 def render_digest(props):
     """The properties section as ~15 lines of text."""
     r = props["resources"]
@@ -456,8 +463,9 @@ def render_digest(props):
                 " ".join(str(x) for x in st["waiting_for"]) or "(nobody)"))
         )
     if st["game_over"]:
-        head.append("GAME OVER: {} wins{}".format(
-            st["game_over"], " (" + st["game_over_reason"] + ")" if st["game_over_reason"] else ""))
+        head.append("GAME OVER: {}{}".format(
+            _game_over_phrase(st["game_over"]),
+            " (" + st["game_over_reason"] + ")" if st["game_over_reason"] else ""))
     if st["errors"]:
         head.append(_trunc("ERRORS {}: {}".format(len(st["errors"]), st["errors"][-1])))
 
@@ -629,7 +637,7 @@ def full_view(s, path):
         )
         print("  send '[{\"type\":\"ready\"}]' once you have read the map and set your opening")
     if s.get("game_over"):
-        print(f"GAME OVER: {s['game_over']} wins")
+        print(f"GAME OVER: {_game_over_phrase(s['game_over'])}")
     for e in s.get("errors", []):
         print(f"ERR: {e}")
 
