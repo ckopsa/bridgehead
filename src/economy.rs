@@ -1978,7 +1978,40 @@ fn harvest_loop(
 
                 if depleted {
                     nav.set_blocked_rect(node_pos, node_block_size(kind), false);
-                    commands.entity(node_e).try_despawn();
+                    match kind {
+                        // A felled tree is gone. There are thousands of them,
+                        // nothing asks after one by name, and a stump is not a
+                        // fact anybody reasons about.
+                        ResourceKind::Lumber => {
+                            commands.entity(node_e).try_despawn();
+                        }
+                        // A mined-out gold mine STAYS, as a dry mine. Mines are
+                        // geography: a fixed handful of named places, shipped in
+                        // every snapshot with their remaining gold, and the
+                        // thing a hall is placed to work. Half this codebase is
+                        // already written against a dry mine you can look at —
+                        // `TriggerWhen::MineDry` asks for a node with
+                        // `remaining == 0`, `alarm::income_alarm` counts live
+                        // mines against the mines near your halls to say "the
+                        // one gold mine your hall works is dry",
+                        // `intent::nearest_node` skips the empty ones, and the
+                        // snapshot's `mines[].remaining` is documented in
+                        // COMMANDER_BRIEF as the thing `mine_dry` saves you
+                        // watching. Despawning it satisfied none of them:
+                        // arena r23's blue armed the expand trigger, emptied
+                        // both home mines, and the rule never fired because
+                        // `remaining == 0` was never a state of the world — the
+                        // entity died in the same statement that reached zero.
+                        //
+                        // Only the visuals collapse. The node keeps its
+                        // Transform and its `ResourceNode`, so it is still a
+                        // place with a reading; the ground it stood on was just
+                        // unblocked above, so an expansion can be built over it
+                        // exactly as before.
+                        ResourceKind::Gold => {
+                            commands.entity(node_e).despawn_related::<Children>();
+                        }
+                    }
                     job.node = None;
                 }
 

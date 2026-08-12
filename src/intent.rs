@@ -1374,6 +1374,21 @@ fn compile_intent(
                     return;
                 }
             };
+            // A mined-out gold mine stays on the board as geography (economy.rs:
+            // `mine_dry`, the income alarm and `mines[].remaining` all need a dry
+            // mine they can look at), so its id still resolves. Say so here
+            // rather than let it through: `harvest_loop` would silently
+            // re-target the crew to the nearest live node, and a worker doing
+            // something you did not ask for is worse than a refusal that names
+            // the way to ask for it.
+            if nodes.get(node).is_ok_and(|(_, n, _)| n.remaining == 0) {
+                errors.push(format!(
+                    "{tag}: resource node {target} is empty — use target_select \
+                     \"nearest mine\" (or \"nearest tree\") for the closest one \
+                     with anything left in it"
+                ));
+                return;
+            }
             // `reached` is recomputed rather than inherited from `own_units`:
             // every survivor can still be skipped here for not being a worker,
             // and a `harvest` that ordered nobody is a refusal, not a partial.

@@ -83,7 +83,8 @@ Unit orders (ids from state):
   outrank the frozen form beside them.
 
 - `{"type":"attack","units":[ids],"target":enemy_id}`
-- `{"type":"harvest","units":[worker_ids],"target":node_id}` (mines AND trees — tree ids in `trees_near`)
+- `{"type":"harvest","units":[worker_ids],"target":node_id}` (mines AND trees — tree ids in `trees_near`;
+  a mine with `"remaining": 0` is refused — say `"target_select":"nearest mine"` instead)
 - `{"type":"return","units":[worker_ids]}`  `{"type":"stop","units":[ids]}`  `{"type":"follow","units":[ids],"target":own_id}`
 Production:
 - `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free; you pay on placement)
@@ -1049,7 +1050,9 @@ first), `unlocked` for ACTING.
     absent == you are looking at it right now.
   - `bounties` lists only caches you can SEE. Treasure you have no eyes on is invisible.
   - Still public and unfiltered: `map`, `mines` (position AND remaining gold), `trees_near`.
-    Map geography is not a secret; what the enemy is DOING with it is.
+    Map geography is not a secret; what the enemy is DOING with it is. A mined-out
+    mine **stays** in `mines` reading `"remaining": 0` — a dry mine is still a place,
+    and it is the thing `mine_dry` watches for. (Felled trees leave `trees_near`.)
   - You cannot `attack` an id you cannot see or remember — it is rejected as
     `target N is not visible`. Use `attackmove` to advance into the unknown.
   - **Scout deliberately.** Vision radius is per-kind in `catalog.json` (`vision`).

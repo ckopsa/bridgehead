@@ -6231,8 +6231,12 @@ fn right_mouse(
     }
 
     // --- resource node under the cursor? ---------------------------------
+    // A dry gold mine is still an entity (economy.rs keeps it as geography, so
+    // `mine_dry` and the income alarm have something to read) but it is not a
+    // job. Right-clicking the hole must not order a harvest that the loop would
+    // immediately re-target — what is clickable is what can still be worked.
     let mut node: Option<(Entity, f32)> = None;
-    for (e, tf, res) in &nodes {
+    for (e, tf, res) in nodes.iter().filter(|(_, _, res)| res.remaining > 0) {
         let radius = match res.kind {
             ResourceKind::Gold => MINE_PICK_RADIUS,
             ResourceKind::Lumber => TREE_PICK_RADIUS,
@@ -8793,7 +8797,10 @@ fn hover_feedback(
                             hit = Some((pos, r * 1.24, mat));
                             icon = ic;
                         } else if workers_selected {
-                            for (tf, node) in &nodes {
+                            // Same rule as the right-click picker: a dry mine is
+                            // a place, not a job, so the grab cursor does not
+                            // offer it.
+                            for (tf, node) in nodes.iter().filter(|(_, n)| n.remaining > 0) {
                                 let r = match node.kind {
                                     ResourceKind::Gold => MINE_PICK_RADIUS,
                                     ResourceKind::Lumber => TREE_PICK_RADIUS,
