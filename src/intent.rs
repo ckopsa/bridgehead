@@ -140,6 +140,10 @@ impl Plugin for IntentPlugin {
             // `IntentErrors` is: bridge.rs reads all three, but this file is
             // the only thing that ever writes them.
             .init_resource::<IntentApplied>()
+            // The third half of the same acknowledgement — what was refused,
+            // what it cost, and what it contradicted. Registered here for the
+            // identical reason.
+            .init_resource::<IntentNotes>()
             .init_resource::<IntentJournal>()
             // A fourth on the same reasoning, one layer up: `Triggers` is
             // read by trigger.rs, bridge.rs and ui.rs, and written by exactly
@@ -315,11 +319,41 @@ pub struct LateBindWorld<'w, 's> {
     orders: IntentOrders<'w, 's>,
 }
 
+/// How hurt everything is. A separate read-only query on the same reasoning as
+/// [`IntentSquads`] and [`IntentOrders`]: exactly one reader wants it —
+/// [`readiness_note`]'s hero clause — and widening [`IntentUnits`]' tuple would
+/// rewrite every `units.get` destructure in this file so that one caller could
+/// see one column.
+type IntentHealth<'w, 's> = Query<'w, 's, &'static Health>;
+
 #[derive(SystemParam)]
 pub struct IntentWorld<'w, 's> {
     bind: LateBindWorld<'w, 's>,
     targets: IntentTargets<'w, 's>,
     researching: IntentResearching<'w, 's>,
+    /// Read only by the acceptance-note pass, which needs a hero's health
+    /// fraction to state both halves of the 80% gate.
+    health: IntentHealth<'w, 's>,
+}
+
+/// **The three channels the compiler answers a batch on**: what it refused,
+/// what the rest cost to deliver, and what it accepted-but-noticed.
+///
+/// Bundled because `apply_intents` sat *exactly* on Bevy's 16-parameter ceiling
+/// (tools/BUILDER_BRIEF.md §6.6) and the advisory channel would have been the
+/// seventeenth. The pairing is the right one anyway, and bridge.rs's
+/// `SeatVerdicts` had already made it: all three are keyed by team, all three
+/// are written only here, all three are read only by the snapshot writer, and
+/// all three are cleared together the instant a new batch is accepted. One
+/// acknowledgement in three halves.
+#[derive(SystemParam)]
+pub struct IntentFeedback<'w> {
+    errors: ResMut<'w, IntentErrors>,
+    /// The positive half: what each command cost to deliver.
+    applied: ResMut<'w, IntentApplied>,
+    /// The advisory half: what an accepted command contradicts. See
+    /// [`shared::IntentNotes`].
+    notes: ResMut<'w, IntentNotes>,
 }
 
 /// The read-only world knowledge a compile consults: money, hero records,
@@ -482,9 +516,9 @@ fn apply_intents(
     mut squads: SquadPolicy,
     mut deferred: DeferredPolicy,
     mut ai_controlled: ResMut<AiControlled>,
-    mut error_log: ResMut<IntentErrors>,
-    // The positive half of the same channel: what each command cost to deliver.
-    mut applied_log: ResMut<IntentApplied>,
+    // What the compiler has to say back about this batch, in three channels:
+    // refusals, delivery cost, and advisory notes. See `IntentFeedback`.
+    mut feedback: IntentFeedback,
     mut log: ResMut<IntentLog>,
     mut journal: ResMut<IntentJournal>,
     mut feed: ResMut<GameEvents>,
@@ -683,16 +717,79 @@ fn apply_intents(
         //
         // The verdict itself already went everywhere it goes: the intent log
         // has the sentence, its `ok: false` and the error strings verbatim.
+        // Whether this sentence came through clean, asked BEFORE `errors` is
+        // drained into the sink below. The advisory channel speaks only about
+        // commands the compiler accepted without complaint: a command that
+        // already earned a refusal has been taught, and a note beside it would
+        // say the same thing twice in two vocabularies.
+        let accepted = errors.is_empty();
         if submission.source == IntentSource::Script {
             for error in &errors {
                 debug!("[script {:?}] refused: {error}", submission.team);
             }
         } else {
-            let sink = error_log.get_mut(submission.team);
+            let sink = feedback.errors.get_mut(submission.team);
             sink.extend(errors);
             if sink.len() > MAX_ERRORS {
                 let overflow = sink.len() - MAX_ERRORS;
                 sink.drain(..overflow);
+            }
+        }
+
+        // **The advisory** (arena/LADDER.md, Finding 5). What this accepted
+        // command contradicts about the readiness the scaffold has been serving
+        // all match — said here, in the echo, because the annotation was already
+        // correct in the document and nobody read it at the moment they
+        // committed.
+        //
+        // Bridge-sourced only, on the same reasoning as the acknowledgement
+        // above. Accepted-only, per `accepted`. And **after** `compile_intent`
+        // rather than before, so a `squad` earlier in this same batch counts:
+        // `batch_squads` holds the enrolments Bevy has not flushed yet, which is
+        // exactly the r26-blue trap wearing its other hat.
+        //
+        // **Direct commands only** — the same `trigger.is_none() &&
+        // plan.is_none()` the link exemption above is written against, and for
+        // the same reason plus a sharper one.
+        //
+        // The same reason: a trigger-fired intent is not a command the
+        // commander just sent. It is standing policy the engine is executing,
+        // and its author was told what it contradicted — if it did — at the
+        // moment they armed it.
+        //
+        // The sharper one is §6.11 of tools/BUILDER_BRIEF.md, which cost r17 a
+        // match. "Squad 1 is under strength" is a LEVEL: it stays true for as
+        // long as it is true. A repeating trigger whose `then` is `stance push`
+        // fires every `repeat` seconds, and a note per firing would put the
+        // identical string into the seat's channel a dozen times, wake
+        // `bridge_wait` on every one, and turn the commander's loop into the
+        // fire hose that made r17's commander chain waits and lose. Nothing is
+        // hidden by the silence: the affordance document renders the same three
+        // gates on the `push` link in every cycle, which is the level-triggered
+        // rendering and the right one for a condition that persists.
+        //
+        // NEVER a refusal. Everything above this line has already happened.
+        if submission.source == IntentSource::Bridge
+            && submission.trigger.is_none()
+            && submission.plan.is_none()
+            && accepted
+        {
+            if let Some(note) = readiness_note(
+                &submission.intent,
+                submission.team,
+                now,
+                &world.bind.units,
+                &world.health,
+                tables.fog.get(submission.team),
+                &batch_squads,
+            ) {
+                let sink = feedback.notes.get_mut(submission.team);
+                sink.push(format!("{}: accepted; note: {note}", submission.tag));
+                // Bounded exactly like the two sinks beside it.
+                if sink.len() > MAX_ERRORS {
+                    let overflow = sink.len() - MAX_ERRORS;
+                    sink.drain(..overflow);
+                }
             }
         }
 
@@ -710,7 +807,7 @@ fn apply_intents(
         // spoken has nothing to acknowledge, and this keeps the whole channel
         // empty — and its wire key absent — whenever the feature is off.
         if submission.source == IntentSource::Bridge && issuer.max_delay > 0.0 {
-            let sink = applied_log.get_mut(submission.team);
+            let sink = feedback.applied.get_mut(submission.team);
             sink.push(AppliedCommand {
                 cmd: submission.tag.clone(),
                 delay: issuer.max_delay,
@@ -723,6 +820,150 @@ fn apply_intents(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The advisory pass: what an accepted command contradicts
+// ---------------------------------------------------------------------------
+
+/// **The commitments worth measuring against readiness, and nothing else.**
+///
+/// Kept to what the r25-r29 ladder actually produced losses from, because a
+/// channel that speaks on every third command is a channel a commander learns
+/// to skip — which is the failure this whole feature exists to undo.
+///
+///   * `stance push` and `posture push` — the squad walks at the objective and
+///     does not come back, so both push gates and the intel age apply.
+///   * `attack_move` — a walk into ground you have not looked at. No squad is
+///     named, so only the intel age applies.
+///
+/// Deliberately NOT on the list: `attack <id>`, because the target is an entity
+/// this seat can currently see and a fight it has eyes on is not an intel-blind
+/// commitment; and `stance harass`, whose whole doctrine is to leave before the
+/// trade, so under-strength is the *point* rather than a contradiction.
+enum Commitment {
+    /// A push, by the squad it commits.
+    Push(u8),
+    /// A ground commitment that names no squad.
+    Advance,
+}
+
+fn commitment_of(intent: &Intent) -> Option<Commitment> {
+    match intent {
+        Intent::Stance { squad, stance, .. } => match parse_stance(stance) {
+            Some(StanceKind::Push) => Some(Commitment::Push(*squad)),
+            _ => None,
+        },
+        Intent::Posture {
+            id,
+            posture: Some(PostureIntent::Push { .. }),
+        } => Some(Commitment::Push(*id)),
+        Intent::AttackMove { .. } => Some(Commitment::Advance),
+        _ => None,
+    }
+}
+
+/// **One advisory line for a command the compiler just accepted**, or `None`
+/// when it contradicts nothing.
+///
+/// See [`shared::IntentNotes`] for what this channel is and the three rules it
+/// keeps. The one worth restating here is the third: **every fact below comes
+/// from the seat's own knowable state.** The parameter list is the structural
+/// version of that claim, the way `LateBind`'s is — `units` is filtered to
+/// `*team == me` before anything is counted, `health` is only ever read for an
+/// entity that filter already admitted, and the enemy half comes from
+/// `FogGrid::freshest_enemy_age`, which reads the two memory ledgers and touches
+/// `world.units` not at all. There is no enemy query here to leak from
+/// (tools/BUILDER_BRIEF.md §6.10, "the one insert guard").
+///
+/// Every clause carries **both** numbers of its comparison, so the commander can
+/// disagree with the threshold rather than with the engine, and none of them is
+/// phrased as advice. `PUSH_MIN_UNITS`, `PUSH_HERO_FRAC` and
+/// `COMMIT_INTEL_STALE_S` are the same three the affordance document annotates
+/// its `push` links with; they reach it through `catalog.gates` so the two
+/// renderings cannot drift.
+fn readiness_note(
+    intent: &Intent,
+    me: Team,
+    now: f32,
+    units: &IntentUnits,
+    health: &IntentHealth,
+    fog: &FogGrid,
+    batch_squads: &std::collections::BTreeMap<Entity, Option<u8>>,
+) -> Option<String> {
+    let commitment = commitment_of(intent)?;
+    let mut clauses: Vec<String> = Vec::new();
+
+    if let Commitment::Push(squad) = commitment {
+        // This seat's own army: non-worker units, ours, alive. Membership as of
+        // THIS sentence — a `squad` earlier in the same batch outranks the
+        // component, which Bevy has not flushed yet.
+        let mut army = 0usize;
+        let mut members: Vec<(Entity, UnitKind)> = Vec::new();
+        for (entity, unit, team, _, _, squad_id) in units.iter() {
+            if *team != me || is_worker_kind(unit.kind) {
+                continue;
+            }
+            army += 1;
+            let member_of = match batch_squads.get(&entity) {
+                Some(assigned) => *assigned,
+                None => squad_id.map(|s| s.0),
+            };
+            if member_of == Some(squad) {
+                members.push((entity, unit.kind));
+            }
+        }
+
+        let mut gates: Vec<String> = Vec::new();
+        if members.len() < PUSH_MIN_UNITS {
+            gates.push(format!("squad {}/{}", members.len(), PUSH_MIN_UNITS));
+        }
+        let outside = army - members.len();
+        if outside > 0 {
+            gates.push(format!(
+                "not consolidated: {outside} of your {army} army units are outside squad {squad}"
+            ));
+        }
+        for (entity, kind) in &members {
+            if !is_hero_kind(*kind) {
+                continue;
+            }
+            let Ok(hp) = health.get(*entity) else { continue };
+            if hp.max <= 0.0 {
+                continue;
+            }
+            let frac = hp.current / hp.max;
+            if frac < PUSH_HERO_FRAC {
+                gates.push(format!(
+                    "{} {:.0}%, gate is {:.0}%",
+                    kind_name(*kind),
+                    100.0 * frac,
+                    100.0 * PUSH_HERO_FRAC
+                ));
+            }
+        }
+        if !gates.is_empty() {
+            clauses.push(format!("push gates not met ({})", gates.join(", ")));
+        }
+    }
+
+    // The staleness half. An EMPTY ledger is the loudest of the three readings
+    // and gets the loudest sentence, exactly as the document's `intel_note`
+    // says it: red read current sight as ground truth at r26 and walked into an
+    // army it had never seen.
+    match fog.freshest_enemy_age(now) {
+        None => clauses.push(format!(
+            "your intel ledger is empty — nothing of theirs seen in the last {:.0}s, \
+             which is not the same as their having nothing",
+            SIGHTING_TTL_S
+        )),
+        Some(age) if age > COMMIT_INTEL_STALE_S => clauses.push(format!(
+            "last enemy sighting {age:.0}s stale, threshold is {COMMIT_INTEL_STALE_S:.0}s"
+        )),
+        Some(_) => {}
+    }
+
+    (!clauses.is_empty()).then(|| clauses.join("; "))
 }
 
 /// Apply one intent. `me` is the issuing team: every ownership check, economy
@@ -1827,6 +2068,9 @@ fn compile_intent(
         bind,
         targets,
         researching,
+        // Read by the advisory pass in `apply_intents`, not by any arm here:
+        // no verb's *verdict* depends on how hurt anything is.
+        health: _,
     } = world;
     let LateBindWorld {
         units,
@@ -4962,6 +5206,460 @@ mod tests {
             app.world().resource::<IntentApplied>().get(Team::Human).is_empty(),
             "silence means instant — an order that paid nothing must not be \
              acknowledged, or the wire gains a key with the feature off"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Acceptance notes (wc3clone-b9m). arena/LADDER.md Finding 5: the document
+    // already computed these facts and printed them on the `push` link, and
+    // across five rounds and four tiers nobody read them at the moment they
+    // committed. So they are said again in the echo of the command itself.
+    // -----------------------------------------------------------------------
+
+    /// Enrol `n` soldiers of this team in `squad`, all standing at the origin.
+    #[cfg(test)]
+    fn enrol(app: &mut App, team: Team, squad: Option<u8>, n: usize) -> Vec<Entity> {
+        (0..n)
+            .map(|_| {
+                let mut e = app.world_mut().spawn((
+                    Unit { kind: UnitKind::Footman },
+                    team,
+                    Transform::from_translation(Vec3::ZERO),
+                    Health::new(100.0),
+                    Order::Idle,
+                ));
+                if let Some(id) = squad {
+                    e.insert(SquadId(id));
+                }
+                e.id()
+            })
+            .collect()
+    }
+
+    /// Send one command as a bridge seat would, tagged the way a batch tags it.
+    #[cfg(test)]
+    fn send_cmd(app: &mut App, team: Team, tag: &str, intent: Intent) {
+        app.world_mut().send_event(SubmitIntent {
+            team,
+            source: IntentSource::Bridge,
+            tag: tag.to_string(),
+            intent,
+            trigger: None,
+            plan: None,
+        });
+    }
+
+    #[cfg(test)]
+    fn notes_of(app: &App, team: Team) -> Vec<String> {
+        app.world().resource::<IntentNotes>().get(team).clone()
+    }
+
+    /// **The whole feature in one command.** A `stance push` sent by a seat
+    /// whose squad fails all three gates and whose ledger is empty is
+    /// ACCEPTED — the posture lands, the stance word is recorded, nothing is
+    /// refused — and the echo carries one advisory line naming both sides of
+    /// every comparison.
+    ///
+    /// The shape matters as much as the content: `cmd N:` so it joins the
+    /// error and applied channels, the literal word `accepted;` so it can never
+    /// be misread as a refusal, and numbers rather than a recommendation.
+    #[test]
+    fn a_push_that_contradicts_the_served_readiness_says_so_in_its_echo() {
+        let mut app = compiler_app();
+        // Four soldiers plus a hero in the squad, three loose — five bodies
+        // against a gate of six, three of eight army units outside the squad,
+        // and the hero at 61% against a gate of 80%. All three fail at once.
+        enrol(&mut app, Team::Human, Some(1), 4);
+        enrol(&mut app, Team::Human, None, 3);
+        let hero = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Health { current: 61.0, max: 100.0 },
+                SquadId(1),
+                Order::Idle,
+            ))
+            .id();
+
+        send_cmd(
+            &mut app,
+            Team::Human,
+            "cmd 1",
+            Intent::Stance {
+                squad: 1,
+                stance: "push".into(),
+                x: None,
+                z: None,
+                region: None,
+            },
+        );
+        app.update();
+
+        // 1. Accepted. Nothing refused, and the doctrine actually landed.
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "a note must never come with a refusal: {:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+        assert_eq!(
+            app.world().resource::<SquadStances>().0.get(&(Team::Human, 1)),
+            Some(&StanceKind::Push),
+            "the stance must be installed exactly as it would be without the note"
+        );
+        assert!(matches!(
+            app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1)),
+            Some(SquadPosture::Push { .. })
+        ));
+        // ...and the hero is carrying the push bundle, note or no note.
+        assert!(app.world().entity(hero).get::<RetreatPolicy>().is_some());
+
+        // 2. One note, on the command that earned it.
+        let notes = notes_of(&app, Team::Human);
+        assert_eq!(notes.len(), 1, "expected exactly one note, got {notes:?}");
+        let note = &notes[0];
+        assert!(
+            note.starts_with("cmd 1: accepted; note: "),
+            "a note must name its command and say plainly that it was accepted: {note}"
+        );
+
+        // 3. Every clause, with BOTH numbers on it.
+        assert!(note.contains("squad 5/6"), "size gate, both numbers: {note}");
+        assert!(
+            note.contains("3 of your 8 army units are outside squad 1"),
+            "consolidation gate, both numbers: {note}"
+        );
+        assert!(
+            note.contains("Hero 61%, gate is 80%"),
+            "hero gate, both numbers: {note}"
+        );
+        assert!(
+            note.contains("intel ledger is empty"),
+            "an empty ledger is the loudest reading and must be said: {note}"
+        );
+        // 4. Facts, never advice. The engine has no opinion about the plan.
+        for opinion in ["should", "recommend", "wait ", "instead", "do not", "don't"] {
+            assert!(
+                !note.to_lowercase().contains(opinion),
+                "a note states facts and never advises ({opinion:?}): {note}"
+            );
+        }
+    }
+
+    /// **A command that contradicts nothing is echoed in silence**, and the
+    /// wire key stays absent.
+    ///
+    /// Six consolidated bodies, a healthy hero, and an enemy seen thirty
+    /// seconds ago: every gate the document serves holds, so there is nothing
+    /// to say. A channel that spoke on every push would be a channel a
+    /// commander learns to skip, which is the failure this feature is undoing.
+    #[test]
+    fn a_push_that_meets_every_gate_earns_no_note() {
+        let mut app = compiler_app();
+        enrol(&mut app, Team::Human, Some(2), 6);
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Hero },
+            Team::Human,
+            Transform::from_translation(Vec3::ZERO),
+            Health { current: 95.0, max: 100.0 },
+            SquadId(2),
+            Order::Idle,
+        ));
+        app.update();
+        let now = app.world().resource::<Time>().elapsed_secs();
+        app.world_mut().resource_mut::<FogGrids>().test_sight(
+            Team::Human,
+            Sighting {
+                id: 9_001,
+                team: Team::Claude,
+                kind: UnitKind::Footman,
+                pos: Vec3::new(40.0, 0.0, 40.0),
+                hp_frac: 1.0,
+                heading: None,
+                t_seen: now - 30.0,
+            },
+        );
+
+        send_cmd(
+            &mut app,
+            Team::Human,
+            "cmd 0",
+            Intent::Stance {
+                squad: 2,
+                stance: "push".into(),
+                x: None,
+                z: None,
+                region: None,
+            },
+        );
+        app.update();
+
+        assert!(
+            notes_of(&app, Team::Human).is_empty(),
+            "a push that meets every gate must be echoed in silence: {:?}",
+            notes_of(&app, Team::Human)
+        );
+    }
+
+    /// **The note changes nothing.** The same command, into two worlds that
+    /// differ only in whether the gates hold, produces the same doctrine — and
+    /// the same command from the seat with a screen produces no note at all.
+    ///
+    /// Constraint 1 of docs/AFFORDANCES.md, asserted rather than promised: the
+    /// winning move nobody anticipated stays exactly as expressible as it was.
+    #[test]
+    fn a_note_never_blocks_and_never_reaches_the_seat_with_a_screen() {
+        let push = |squad: u8| Intent::Stance {
+            squad,
+            stance: "push".into(),
+            x: Some(70.0),
+            z: Some(70.0),
+            region: None,
+        };
+
+        // Under-strength, over the wire: noted, and fully applied.
+        let mut noted = compiler_app();
+        let thin = enrol(&mut noted, Team::Human, Some(1), 2);
+        send_cmd(&mut noted, Team::Human, "cmd 0", push(1));
+        noted.update();
+        assert_eq!(notes_of(&noted, Team::Human).len(), 1);
+
+        // At full strength: silent, and applied the same way.
+        let mut quiet = compiler_app();
+        let full = enrol(&mut quiet, Team::Human, Some(1), 6);
+        quiet.world_mut().resource_mut::<FogGrids>().test_sight(
+            Team::Human,
+            Sighting {
+                id: 9_002,
+                team: Team::Claude,
+                kind: UnitKind::Footman,
+                pos: Vec3::new(40.0, 0.0, 40.0),
+                hp_frac: 1.0,
+                heading: None,
+                t_seen: 0.0,
+            },
+        );
+        send_cmd(&mut quiet, Team::Human, "cmd 0", push(1));
+        quiet.update();
+        assert!(notes_of(&quiet, Team::Human).is_empty());
+
+        // The applied doctrine is identical on both sides.
+        let posture = |app: &App| {
+            format!(
+                "{:?}",
+                app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1))
+            )
+        };
+        assert_eq!(
+            posture(&noted),
+            posture(&quiet),
+            "the note must not change where the push goes"
+        );
+        let retreat = |app: &App, e: Entity| app.world().entity(e).get::<RetreatPolicy>().copied();
+        assert_eq!(
+            retreat(&noted, thin[0]).map(|r| r.below_frac),
+            retreat(&quiet, full[0]).map(|r| r.below_frac),
+            "the note must not change the bundle the stance installs"
+        );
+
+        // ...and the human's own gesture is not echoed at all: their
+        // acknowledgement is the selection panel.
+        let mut clicked = compiler_app();
+        enrol(&mut clicked, Team::Human, Some(1), 2);
+        clicked
+            .world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, push(1)));
+        clicked.update();
+        assert!(
+            notes_of(&clicked, Team::Human).is_empty(),
+            "the UI seat reads squad size off its own panel; a note there is noise"
+        );
+    }
+
+    /// **A note may not know anything the seat does not.**
+    ///
+    /// The adversarial case: seventeen enemies standing in the dark twenty
+    /// metres away, and a `stance push` sent straight at them. The note must
+    /// report an EMPTY ledger, because the ledger is what this seat knows —
+    /// and it must not contain their count, their composition, or their
+    /// position, none of which this seat has earned.
+    ///
+    /// Structural, not checked: `readiness_note` is handed the seat's own units
+    /// and the seat's own `FogGrid`, and `FogGrid::freshest_enemy_age` reads the
+    /// two memory ledgers and never `world.units`. This test is the tripwire on
+    /// that structure (tools/BUILDER_BRIEF.md §6.10).
+    #[test]
+    fn a_note_cannot_see_what_the_seat_cannot_see() {
+        let mut app = compiler_app();
+        enrol(&mut app, Team::Human, Some(1), 2);
+        // An army the seat has never laid eyes on, standing right there.
+        for i in 0..17 {
+            app.world_mut().spawn((
+                Unit { kind: UnitKind::Archer },
+                Team::Claude,
+                Transform::from_translation(Vec3::new(20.0 + i as f32, 0.0, 20.0)),
+                Health::new(100.0),
+                Order::Idle,
+            ));
+        }
+
+        send_cmd(
+            &mut app,
+            Team::Human,
+            "cmd 0",
+            Intent::Stance {
+                squad: 1,
+                stance: "push".into(),
+                x: Some(20.0),
+                z: Some(20.0),
+                region: None,
+            },
+        );
+        app.update();
+
+        let notes = notes_of(&app, Team::Human);
+        assert_eq!(notes.len(), 1, "expected the note, got {notes:?}");
+        let note = &notes[0];
+        assert!(
+            note.contains("intel ledger is empty"),
+            "an unseen army is an empty ledger, not a warning about an army: {note}"
+        );
+        for leak in ["17", "Archer", "seventeen"] {
+            assert!(
+                !note.contains(leak),
+                "the note leaked {leak:?} from a force this seat has never seen: {note}"
+            );
+        }
+    }
+
+    /// **The staleness half stands alone**, on a commitment that names no
+    /// squad. An `attack_move` into ground whose last sighting is four minutes
+    /// old gets the intel clause and nothing else — there is no squad to
+    /// measure, so there are no push gates to report.
+    ///
+    /// The age is deliberately past `SIGHTING_TTL_S`: the unit ledger drops a
+    /// sighting at ninety seconds, so an age of two hundred can only have come
+    /// from the hero ledger, which keeps its `t_seen` forever. That is the half
+    /// `FogGrid::freshest_enemy_age` exists to read.
+    #[test]
+    fn a_commitment_on_a_stale_picture_is_told_how_stale() {
+        let mut app = compiler_app();
+        let soldiers = enrol(&mut app, Team::Human, None, 3);
+        app.update();
+        let now = app.world().resource::<Time>().elapsed_secs();
+        app.world_mut().resource_mut::<FogGrids>().test_hero_intel_at(
+            Team::Human,
+            UnitKind::Hero,
+            HeroStatus::Alive,
+            Vec3::new(70.0, 0.0, 70.0),
+            now - 200.0,
+        );
+
+        send_cmd(
+            &mut app,
+            Team::Human,
+            "cmd 2",
+            Intent::AttackMove {
+                units: soldiers.iter().map(|e| e.to_bits()).collect(),
+                x: Some(70.0),
+                z: Some(70.0),
+                region: None,
+                select: None,
+            },
+        );
+        app.update();
+
+        let notes = notes_of(&app, Team::Human);
+        assert_eq!(notes.len(), 1, "expected the staleness note, got {notes:?}");
+        let note = &notes[0];
+        assert!(
+            note.contains("200s stale") && note.contains("threshold is 45s"),
+            "the staleness clause must carry both numbers: {note}"
+        );
+        assert!(
+            !note.contains("push gates"),
+            "an attack_move names no squad, so it has no push gates to fail: {note}"
+        );
+    }
+
+    /// **A repeating trigger must not become a fire hose.**
+    ///
+    /// tools/BUILDER_BRIEF.md §6.11, which cost r17 a match: "squad 1 is under
+    /// strength" is a LEVEL, not an event. A trigger whose `then` is `stance
+    /// push` fires on its own clock, and a note per firing would push the same
+    /// string into the seat's channel a dozen times and wake `bridge_wait` on
+    /// every one. The note belongs to the command a commander SENT; a trigger
+    /// is standing policy the engine is executing, and the same three gates are
+    /// on the affordance document's `push` link in every cycle anyway, which is
+    /// the level-triggered rendering of the identical fact.
+    ///
+    /// A plan step is exempt on the same argument, exactly as it is for the
+    /// command link.
+    #[test]
+    fn a_trigger_or_a_plan_step_firing_a_push_is_not_a_new_advisory() {
+        for (trigger, plan) in [
+            (Some(TriggerName::new("watch").unwrap()), None),
+            (
+                None,
+                Some(PlanStamp {
+                    name: PlanName::new("opening").unwrap(),
+                    step: 3,
+                    of: 5,
+                }),
+            ),
+        ] {
+            let mut app = compiler_app();
+            enrol(&mut app, Team::Human, Some(1), 2);
+            app.world_mut().send_event(SubmitIntent {
+                team: Team::Human,
+                source: IntentSource::Bridge,
+                tag: "trigger watch".to_string(),
+                intent: Intent::Stance {
+                    squad: 1,
+                    stance: "push".into(),
+                    x: None,
+                    z: None,
+                    region: None,
+                },
+                trigger,
+                plan,
+            });
+            app.update();
+            // The push landed — this is not a refusal of any kind.
+            assert_eq!(
+                app.world().resource::<SquadStances>().0.get(&(Team::Human, 1)),
+                Some(&StanceKind::Push)
+            );
+            assert!(
+                notes_of(&app, Team::Human).is_empty(),
+                "engine-executed standing policy must not re-announce a level on \
+                 every firing: {:?}",
+                notes_of(&app, Team::Human)
+            );
+        }
+    }
+
+    /// **The document and the engine measure against ONE set of numbers.**
+    ///
+    /// `catalog.gates` is how the three thresholds reach `tools/affordances.py`,
+    /// which used to keep its own copies. Two renderings of one rule that
+    /// disagree is the failure docs/FOG.md is written against, and it never
+    /// errors — the two channels simply say different things about the same
+    /// squad. This pins the export to the constants the compiler reads.
+    #[test]
+    fn the_catalog_publishes_the_gates_the_compiler_measures_against() {
+        let gates = game_catalog().gates;
+        assert_eq!(gates.push_min_units as usize, PUSH_MIN_UNITS);
+        assert_eq!(gates.push_hero_frac, PUSH_HERO_FRAC);
+        assert_eq!(gates.intel_stale_s, COMMIT_INTEL_STALE_S);
+        assert_eq!(gates.sighting_ttl_s, SIGHTING_TTL_S);
+        // The staleness threshold has to sit INSIDE the horizon, or the unit
+        // ledger can never trip it and the clause becomes a hero-only fact.
+        assert!(
+            gates.intel_stale_s < gates.sighting_ttl_s,
+            "a threshold at or past the TTL is a threshold the sightings ledger \
+             can never reach"
         );
     }
 
