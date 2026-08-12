@@ -330,7 +330,19 @@ def digest(state, catalog=None):
             continue
         kind = b.get("kind", "?")
         if not b.get("done", True):
-            building.append("{}({:.0f}%)".format(kind, 100.0 * b.get("progress", 0.0)))
+            # `build_progress` and NOT `progress`. The latter is the training
+            # queue's progress, which a building still going up has never had —
+            # so this line printed `(0%)` for every site at every stage, and
+            # r26-blue read a hall three seconds from done as a phantom that
+            # "was never in buildings[]". A snapshot written before the field
+            # existed simply says `(building)` rather than a number it does not
+            # have; guessing `0%` is what got us here.
+            pct = b.get("build_progress")
+            building.append(
+                "{}({:.0f}%)".format(kind, 100.0 * pct)
+                if pct is not None
+                else "{}(building)".format(kind)
+            )
             continue
         if kind in prod_kinds:
             q = b.get("queue") or []
@@ -348,6 +360,25 @@ def digest(state, catalog=None):
         up = b.get("upgrading")
         if up:
             jobs.append("{}→{} {:.0f}s".format(kind, up.get("into", "next"), up.get("remaining", 0.0)))
+
+    # --- accepted builds that have not broken ground ---
+    #
+    # The other half of the construction ledger, and the half that was missing
+    # entirely. `buildings[]` begins at ground-break, so between "accepted" and
+    # "foundation" a build existed in no array the digest read — which is how
+    # three of r26-blue's expansions and three of r25-red's Barracks went from
+    # ordered to never-mentioned-again in silence. `units[].build_site` carries
+    # the kind and the snapped footprint on the worker walking to it, so the
+    # line names the thing that is about to exist and the body responsible.
+    walking = sorted(
+        "{}@({:.0f},{:.0f})".format(
+            u["build_site"].get("kind", "?"),
+            (u["build_site"].get("pos") or [0, 0])[0],
+            (u["build_site"].get("pos") or [0, 0])[1],
+        )
+        for u in mine_u
+        if u.get("build_site")
+    )
 
     # --- the win-condition line ---
     #
@@ -409,6 +440,7 @@ def digest(state, catalog=None):
             "queued": sum(len(q["queue"]) for q in queues),
             "idle": sorted(idle),
             "building": building,
+            "walking": walking,
             "jobs": jobs,
         },
         "win_condition": win,
@@ -584,6 +616,8 @@ def render_digest(props):
         )
     if p["building"]:
         tail.append("building: " + " ".join(p["building"]))
+    if p.get("walking"):
+        tail.append("walking: " + " ".join(p["walking"]))
     if p["jobs"]:
         tail.append("jobs: " + " ".join(p["jobs"]))
     body.append(_trunc("PRODUCTION " + " · ".join(x for x in [q or "nothing queued"] + tail if x)))

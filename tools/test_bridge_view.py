@@ -527,6 +527,86 @@ def test_loose_army_units_get_their_own_line():
     assert "LOOSE" in prefixes(bridge_view.render_digest(props))
 
 
+# -- the construction ledger (wc3clone-phc, from arena r26) ------------------
+
+
+def _with_construction(state, **kw):
+    """`state` plus one of MY buildings under construction."""
+    s = copy.deepcopy(state)
+    b = {
+        "id": 999,
+        "team": s.get("my_team", "Claude"),
+        "kind": "TownHall",
+        "pos": [30.0, 30.0],
+        "hp": 100.0,
+        "max_hp": 1500.0,
+        "done": False,
+        "queue": [],
+        "progress": 0.0,
+    }
+    b.update(kw)
+    s.setdefault("buildings", []).append(b)
+    return s
+
+
+def test_a_site_going_up_reports_its_real_progress_and_not_the_queues():
+    """r26-blue's "phantom": `building: TownHall(0%)` on a hall that was most of
+    the way up.
+
+    The digest was reading `progress`, which is the TRAINING QUEUE's progress
+    and is `0.0` on anything still under scaffolding — so every site in every
+    match read `0%` at every stage, and a commander reasonably concluded the
+    line was describing a building that did not exist. `build_progress` is the
+    fraction that actually means construction.
+    """
+    s = _with_construction(load(LIVE[0]), build_progress=0.73)
+    props = bridge_view.digest(s)
+    assert "TownHall(73%)" in props["production"]["building"], props["production"]
+    line = [ln for ln in bridge_view.render_digest(props) if ln.startswith("PRODUCTION")]
+    assert line and "TownHall(73%)" in line[0], line
+
+
+def test_a_snapshot_without_the_new_field_says_building_rather_than_zero():
+    """Degrade honestly. An older engine cannot tell us how far along the site
+    is, and `0%` is the guess that caused the trouble in the first place."""
+    props = bridge_view.digest(_with_construction(load(LIVE[0])))
+    assert "TownHall(building)" in props["production"]["building"], props["production"]
+    assert not any("(0%)" in x for x in props["production"]["building"]), props["production"]
+
+
+def test_an_accepted_build_is_visible_before_it_breaks_ground():
+    """The window `buildings[]` cannot cover. Between "accepted" and "ground
+    broken" the build lived in no array the digest read, which is how three of
+    r26-blue's expansions went from ordered to never-mentioned in silence."""
+    s = copy.deepcopy(load(LIVE[0]))
+    mine = s.get("my_team", "Claude")
+    s["units"].append(
+        {
+            "id": 4242,
+            "team": mine,
+            "kind": "Worker",
+            "pos": [10.0, -4.0],
+            "hp": 50.0,
+            "max_hp": 50.0,
+            "order": "Build",
+            "moving": True,
+            "carrying": False,
+            "build_site": {"kind": "Barracks", "pos": [12.0, -4.0]},
+        }
+    )
+    props = bridge_view.digest(s)
+    assert props["production"]["walking"] == ["Barracks@(12,-4)"], props["production"]
+    line = [ln for ln in bridge_view.render_digest(props) if ln.startswith("PRODUCTION")]
+    assert line and "walking: Barracks@(12,-4)" in line[0], line
+
+
+def test_nothing_walking_adds_no_line():
+    props = bridge_view.digest(load(LIVE[0]))
+    assert props["production"]["walking"] == []
+    line = [ln for ln in bridge_view.render_digest(props) if ln.startswith("PRODUCTION")]
+    assert line and "walking:" not in line[0], line
+
+
 # -- the catalog decides what production means -------------------------------
 
 

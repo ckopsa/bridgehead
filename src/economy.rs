@@ -956,6 +956,48 @@ struct BuildSite {
     attempts: u32,
 }
 
+/// **The one sentence an abandoned foundation gets.**
+///
+/// Construction has two failure windows and only the first one ever spoke. The
+/// compiler refuses an illegal `build` in words at command time; what happened
+/// *after* an accepted one — the worker re-tasked, killed, or turned away at
+/// the site — was pure silence, and the commander's only evidence was a
+/// building that never appeared. r25-red sent three accepted `build`s and got
+/// no Barracks and no error; r26-blue lost three expansions and a Blacksmith
+/// the same way, and diagnosed it by diffing `buildings[]` by hand. This is
+/// that window learning to talk.
+///
+/// **The economics, stated because they are the surprising part.** Nothing is
+/// spent. `build_sites` below is the only place a building's price is ever
+/// paid, and it pays at the moment the worker breaks ground — so an order that
+/// dies before then costs its team no gold and no lumber, and there is nothing
+/// to refund. What it costs is *time*, and a commander who thinks it cost gold
+/// will bank against a bill that never arrives. So the line says so out loud.
+///
+/// Edge-triggered, and terminal: an abandonment happens once, at the moment the
+/// site stops being anybody's job (tools/BUILDER_BRIEF.md §6.11).
+fn report_abandoned_build(
+    feed: &mut GameEvents,
+    team: Team,
+    now: f32,
+    site: &BuildSite,
+    why: &str,
+) {
+    feed.push(
+        team,
+        now,
+        format!(
+            "build abandoned: {} at ({:.0}, {:.0}) — {why}; nothing was spent \
+             (a build is paid for when the worker breaks ground)",
+            building_name(site.kind),
+            site.pos.x,
+            site.pos.z,
+        ),
+        EventSeverity::Warning,
+        Some(site.pos),
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HarvestPhase {
     ToNode,
@@ -1633,20 +1675,56 @@ fn research_progress(
 
 fn order_changed(
     mut commands: Commands,
+    time: Res<Time>,
+    mut feed: ResMut<GameEvents>,
     mut units: Query<
         (
             Entity,
             &Order,
             &Transform,
+            &Team,
             Option<&mut HarvestJob>,
             Option<&RememberedNode>,
             Option<&Carrying>,
+            // The site this worker was walking to before the new order
+            // arrived, if there was one. Read only to say goodbye to it.
+            Option<&BuildSite>,
         ),
         (Changed<Order>, With<Unit>),
     >,
     nodes: Query<(&ResourceNode, &Transform)>,
 ) {
-    for (entity, order, tf, job, remembered, carrying) in &mut units {
+    let now = time.elapsed_secs();
+    for (entity, order, tf, team, job, remembered, carrying, site) in &mut units {
+        // **The re-task window, spoken.** Every arm below that is not
+        // `Order::Build` removes `BuildSite`, and until now it did so without
+        // a word: the foundation simply stopped existing. A worker handed a new
+        // `Order::Build` is not an abandonment of the *worker's* job in the
+        // sense that matters — it is one build superseding another on the same
+        // body, which is still one lost foundation, so it is reported too.
+        if let Some(site) = site {
+            // Re-issuing the SAME build on the same body is a no-op, not an
+            // abandonment. `try_insert` marks `Order` changed whether or not
+            // the value moved, and the scripted commander re-thinks every
+            // second — without this guard the feed would carry a line a second
+            // for a build that is going perfectly well. Nothing else about the
+            // re-issue changes: the arm below still re-seats `BuildSite` and
+            // the approach `MoveTo` exactly as it always did.
+            let same_build = matches!(
+                order,
+                Order::Build { kind, pos } if *kind == site.kind && flat(*pos) == site.pos
+            );
+            if !same_build {
+                let why = match order {
+                    Order::Build { .. } => "the worker was given a different build",
+                    Order::Harvest(_) | Order::ReturnResources => {
+                        "the worker was sent back to gathering before breaking ground"
+                    }
+                    _ => "the worker was re-tasked before breaking ground",
+                };
+                report_abandoned_build(&mut feed, *team, now, site, why);
+            }
+        }
         match order {
             Order::Build { kind, pos } => {
                 let site = Vec3::new(pos.x, 0.0, pos.z);
@@ -1747,16 +1825,42 @@ fn order_changed(
 fn build_sites(
     mut commands: Commands,
     nav: Res<NavGrid>,
+    time: Res<Time>,
+    mut feed: ResMut<GameEvents>,
     mut economies: ResMut<Economies>,
     mut spawn_events: EventWriter<SpawnBuildingEvent>,
-    mut workers: Query<(Entity, &Transform, &Team, &mut BuildSite, Option<&MoveTo>)>,
+    mut workers: Query<(
+        Entity,
+        &Transform,
+        &Team,
+        &mut BuildSite,
+        Option<&MoveTo>,
+        // Dead-but-not-yet-despawned. Combat subtracts health in
+        // `SimSet::Combat`, which is upstream of `SimSet::Economy`, and
+        // `apply_death` despawns at the top of the NEXT frame — so this system
+        // sees a killed builder exactly once, with its site still readable.
+        // That one pass is the only chance anybody gets to say the foundation
+        // died with the worker.
+        &Health,
+    )>,
     // Tech tree: only FINISHED buildings count toward requirements.
     completed: Query<(&Building, &Team), Without<UnderConstruction>>,
     races: Res<Races>,
 ) {
     let owned = completed_kinds(&completed);
+    let now = time.elapsed_secs();
 
-    for (entity, tf, team, mut site, moving) in &mut workers {
+    for (entity, tf, team, mut site, moving, health) in &mut workers {
+        if health.current <= 0.0 {
+            report_abandoned_build(
+                &mut feed,
+                *team,
+                now,
+                &site,
+                "the worker was killed before breaking ground",
+            );
+            continue;
+        }
         if moving.is_some() {
             continue; // still walking
         }
@@ -1792,6 +1896,26 @@ fn build_sites(
                 // Step out of the footprint we are about to block.
                 let out = approach_point(tf.translation, site.pos, stats.size * 0.5 + 2.5);
                 commands.entity(entity).try_insert(MoveTo { target: out });
+            } else {
+                // **Arrived, and turned away.** This is r25-red's failure
+                // exactly: the command was accepted, the worker walked the
+                // whole way, and the site was refused at the pay-point with
+                // nothing said. The compiler checked all four of these when the
+                // sentence was written; the walk is where they go stale, and
+                // this is the one place that knows which one did.
+                let why = if !free {
+                    "the ground was no longer clear when the worker arrived".to_string()
+                } else if !race_ok {
+                    "it is not in your roster".to_string()
+                } else if !tech_ok {
+                    "its requirements were no longer met when the worker arrived".to_string()
+                } else {
+                    format!(
+                        "you could not afford it when the worker arrived ({}g {}l)",
+                        stats.cost_gold, stats.cost_lumber
+                    )
+                };
+                report_abandoned_build(&mut feed, *team, now, &site, &why);
             }
             commands
                 .entity(entity)
@@ -1803,7 +1927,16 @@ fn build_sites(
                 target: approach_point(tf.translation, site.pos, stats.size * 0.5 + 1.5),
             });
         } else {
-            // Unreachable site — give up.
+            // Unreachable site — give up. The third silent window, and the one
+            // a commander has least chance of guessing: the order was legal,
+            // the worker set off, and the pathing never got there.
+            report_abandoned_build(
+                &mut feed,
+                *team,
+                now,
+                &site,
+                "the worker could not reach the site after several tries",
+            );
             commands
                 .entity(entity)
                 .remove::<BuildSite>()
@@ -2933,6 +3066,186 @@ mod tests {
             (600, 900),
             "the team has had a hero; the next one is bought"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests: the build lifecycle between "accepted" and "ground broken"
+    // (wc3clone-phc, from arena r25/r26)
+    // -----------------------------------------------------------------------
+
+    /// A world where a build can be ordered, walked and lost: the two systems
+    /// that own the window, and nothing else.
+    fn app_with_builds(gold: u32, lumber: u32) -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<NavGrid>()
+            .init_resource::<Economies>()
+            .init_resource::<Races>()
+            .init_resource::<GameEvents>()
+            .add_event::<SpawnBuildingEvent>()
+            .add_systems(Update, (order_changed, build_sites).chain());
+        {
+            let mut economies = app.world_mut().resource_mut::<Economies>();
+            let e = economies.get_mut(Team::Human);
+            e.gold = gold;
+            e.lumber = lumber;
+        }
+        app
+    }
+
+    fn builder_at(app: &mut App, at: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Worker },
+                Team::Human,
+                Transform::from_translation(at),
+                Order::Idle,
+                Health::new(50.0),
+            ))
+            .id()
+    }
+
+    /// Order a Farm and let `order_changed` install the site. Returns once the
+    /// worker is walking.
+    fn order_a_farm(app: &mut App, worker: Entity, site: Vec3) {
+        app.world_mut().entity_mut(worker).insert(Order::Build {
+            kind: BuildingKind::Farm,
+            pos: site,
+        });
+        app.update();
+        assert!(
+            app.world().get::<BuildSite>(worker).is_some(),
+            "the order must have become a site"
+        );
+    }
+
+    fn abandonments(app: &App) -> Vec<String> {
+        feed_lines(app, Team::Human)
+            .into_iter()
+            .filter(|l| l.starts_with("build abandoned"))
+            .collect()
+    }
+
+    /// **The r26-blue failure, spoken.** A worker re-tasked before it breaks
+    /// ground used to lose the foundation in complete silence — the whole
+    /// diagnostic difficulty of the bead. Now it says so, and it says the true
+    /// economics: nothing was spent, because economy.rs pays at the site.
+    #[test]
+    fn a_retasked_builder_says_the_foundation_is_gone_and_that_nothing_was_spent() {
+        let mut app = app_with_builds(1000, 1000);
+        let worker = builder_at(&mut app, Vec3::ZERO);
+        order_a_farm(&mut app, worker, Vec3::new(0.0, 0.0, 30.0));
+        assert_eq!(gold(&app, Team::Human), 1000, "a build charges on arrival");
+        assert!(abandonments(&app).is_empty(), "ordering one is not losing one");
+
+        // The re-task: any other order at all.
+        app.world_mut().entity_mut(worker).insert(Order::Idle);
+        app.update();
+
+        let said = abandonments(&app);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("build abandoned: Farm at (0, 30)"), "{}", said[0]);
+        assert!(said[0].contains("re-tasked before breaking ground"), "{}", said[0]);
+        assert!(said[0].contains("nothing was spent"), "{}", said[0]);
+        assert_eq!(
+            gold(&app, Team::Human),
+            1000,
+            "and the sentence is true — there is nothing to refund"
+        );
+        assert!(app.world().get::<BuildSite>(worker).is_none());
+    }
+
+    /// **The r25-red failure, spoken.** Accepted, walked the whole way, refused
+    /// at the pay-point — three times, with no error. The line names which of
+    /// the four re-checks went stale, because "it did not work" is the part the
+    /// commander could already see.
+    #[test]
+    fn a_build_refused_on_arrival_names_the_reason_it_went_stale() {
+        let mut app = app_with_builds(0, 0);
+        let site = Vec3::new(0.0, 0.0, 4.0);
+        let worker = builder_at(&mut app, site);
+        order_a_farm(&mut app, worker, site);
+        // Standing on the site: drop the approach walk and let it arrive.
+        app.world_mut().entity_mut(worker).remove::<MoveTo>();
+        app.update();
+
+        let said = abandonments(&app);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("could not afford it"), "{}", said[0]);
+        let stats = building_stats(BuildingKind::Farm);
+        assert!(
+            said[0].contains(&format!("{}g {}l", stats.cost_gold, stats.cost_lumber)),
+            "{}",
+            said[0]
+        );
+        assert!(app.world().get::<BuildSite>(worker).is_none());
+    }
+
+    /// A build that WORKS says nothing. The channel is edge-triggered and the
+    /// edge is the loss; a foundation going up is what `buildings[]` is for.
+    #[test]
+    fn a_build_that_breaks_ground_is_not_an_abandonment() {
+        let mut app = app_with_builds(1000, 1000);
+        let site = Vec3::new(0.0, 0.0, 4.0);
+        let worker = builder_at(&mut app, site);
+        order_a_farm(&mut app, worker, site);
+        app.world_mut().entity_mut(worker).remove::<MoveTo>();
+        app.update();
+
+        assert!(abandonments(&app).is_empty(), "{:?}", abandonments(&app));
+        let stats = building_stats(BuildingKind::Farm);
+        assert_eq!(
+            gold(&app, Team::Human),
+            1000 - stats.cost_gold,
+            "ground-break is where the money goes"
+        );
+    }
+
+    /// A builder killed on the way loses the foundation too, and that is the
+    /// one case nobody can infer: the worker is simply not in `units[]` next
+    /// poll, and the build was never in `buildings[]` at all.
+    #[test]
+    fn a_builder_killed_on_the_walk_still_reports_its_lost_site() {
+        let mut app = app_with_builds(1000, 1000);
+        let worker = builder_at(&mut app, Vec3::ZERO);
+        order_a_farm(&mut app, worker, Vec3::new(0.0, 0.0, 30.0));
+        app.world_mut().get_mut::<Health>(worker).unwrap().current = 0.0;
+        app.update();
+
+        let said = abandonments(&app);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("killed before breaking ground"), "{}", said[0]);
+    }
+
+    /// **Not every `Changed<Order>` is an abandonment.** The scripted commander
+    /// re-issues the same build every think, and `try_insert` marks the
+    /// component changed whether or not the value moved. A line a second for a
+    /// build that is going fine is the fire-hose r17 lost a match to
+    /// (tools/BUILDER_BRIEF.md §6.11).
+    #[test]
+    fn re_issuing_the_same_build_is_not_an_abandonment() {
+        let mut app = app_with_builds(1000, 1000);
+        let worker = builder_at(&mut app, Vec3::ZERO);
+        let site = Vec3::new(0.0, 0.0, 30.0);
+        order_a_farm(&mut app, worker, site);
+        for _ in 0..3 {
+            app.world_mut().entity_mut(worker).insert(Order::Build {
+                kind: BuildingKind::Farm,
+                pos: site,
+            });
+            app.update();
+        }
+        assert!(abandonments(&app).is_empty(), "{:?}", abandonments(&app));
+
+        // A DIFFERENT build on the same body is one lost foundation, and says so.
+        app.world_mut().entity_mut(worker).insert(Order::Build {
+            kind: BuildingKind::Farm,
+            pos: Vec3::new(30.0, 0.0, 0.0),
+        });
+        app.update();
+        let said = abandonments(&app);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("given a different build"), "{}", said[0]);
     }
 
     // -----------------------------------------------------------------------

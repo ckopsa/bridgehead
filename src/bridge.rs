@@ -1186,6 +1186,22 @@ struct UnitOut {
     /// case is "no doctrine", and an empty object per unit is pure noise.
     #[serde(skip_serializing_if = "Option::is_none")]
     policies: Option<PoliciesOut>,
+    /// **What this worker is walking to build, and where** — own units only,
+    /// present only while `order` is `"Build"`.
+    ///
+    /// The missing half of the construction ledger. `buildings[]` starts at the
+    /// moment ground is broken, so between "the order was accepted" and "the
+    /// foundation exists" a build was in no array at all: r25-red's three
+    /// accepted Barracks and r26-blue's three expansions were invisible for the
+    /// whole walk, and then invisible forever. `order: "Build"` said *that* a
+    /// worker was building; it never said WHAT, so the digest could not name
+    /// the thing that later failed to appear.
+    ///
+    /// Own units only, for the reason `queue` is: what an opponent's peasant is
+    /// walking off to put up is exactly the intelligence scouting is meant to
+    /// have to earn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_site: Option<BuildSiteOut>,
     /// Own casters only: every ability this unit HAS, with its slot index, its
     /// own cooldown and whether it is unlocked yet. This is what a `cast`
     /// command's optional `ability` field selects from. Absent for units with
@@ -1484,6 +1500,17 @@ struct HeroOut {
     cd: f32,
 }
 
+/// An accepted build that has not broken ground yet, as it rides on the worker
+/// carrying it. See [`UnitOut::build_site`].
+#[derive(Serialize)]
+struct BuildSiteOut {
+    /// `catalog.buildings[].id`, the same spelling `build`'s `"kind"` takes.
+    kind: &'static str,
+    /// Where the footprint will go — already snapped, so it is the point the
+    /// building will actually stand on and not the point that was asked for.
+    pos: [f32; 2],
+}
+
 #[derive(Serialize)]
 struct BuildingOut {
     id: u64,
@@ -1495,6 +1522,23 @@ struct BuildingOut {
     done: bool,
     queue: Vec<&'static str>,
     progress: f32,
+    /// **Construction progress, 0.0–1.0 — present only while `done` is false**,
+    /// and only on a building this seat can actually watch being built.
+    ///
+    /// Additive because the field it is not was being read as if it were.
+    /// `progress` above is the TRAINING QUEUE's progress and has always been
+    /// `0.0` on a building that is still going up (it has no queue yet), so
+    /// tools/bridge_view.py's `building: TownHall(0%)` line printed `0%` for
+    /// every site in the game, at every stage, forever — a hall three seconds
+    /// from finishing read exactly like one whose foundation was laid this
+    /// tick. r26-blue read that line as a phantom and wrote it up as the
+    /// digest's one outright lie. The number was never wrong; it was the answer
+    /// to a different question.
+    ///
+    /// Never on a remembered ghost, on the same rule as `upgrading`: how far
+    /// along a scaffold you last saw two minutes ago is not something you know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_progress: Option<f32>,
     /// Own buildings with an active ability only: seconds until the FIRST one
     /// may be cast again (0 = ready). Absent for buildings that have no
     /// ability. `abilities` below is the per-slot version.
@@ -2114,6 +2158,13 @@ fn write_seat_snapshot(
                 why: mine.then(|| {
                     why.map_or_else(|| NO_PROVENANCE.to_string(), Provenance::why)
                 }),
+                build_site: match (mine, order) {
+                    (true, Some(Order::Build { kind, pos })) => Some(BuildSiteOut {
+                        kind: building_name(*kind),
+                        pos: [r1(pos.x), r1(pos.z)],
+                    }),
+                    _ => None,
+                },
                 policies: (mine && has_policy).then(|| PoliciesOut {
                     prio: prio.map(|p| p.0.iter().map(|c| target_class_name(*c)).collect()),
                     retreat: retreat
@@ -2161,6 +2212,13 @@ fn write_seat_snapshot(
                 .map(|q| q.queue.iter().map(|k| kind_name(*k)).collect())
                 .unwrap_or_default(),
             progress: r1(queue.map(|q| q.progress).unwrap_or(0.0)),
+            // The same fraction `construction_progress` scales the mesh by:
+            // one over the row's build time, clamped, so the wire and the
+            // scaffolding on screen are the same number.
+            build_progress: under.map(|u| {
+                let build_time = building_stats(building.kind).build_time.max(0.01);
+                r2((1.0 - u.remaining / build_time).clamp(0.0, 1.0))
+            }),
             // Our own casters only: an ability we can actually order.
             ability_cd: (*team == me && !abilities_of_building(building.kind).is_empty())
                 .then(|| r1(cooldown.map_or(0.0, |c| c.remaining(0)))),
@@ -2219,6 +2277,9 @@ fn write_seat_snapshot(
             done: ghost.done,
             queue: Vec::new(),
             progress: 0.0,
+            // See the field: how far along a scaffold you last saw is not
+            // something a scouting report brings home.
+            build_progress: None,
             ability_cd: None,
             abilities: Vec::new(),
             // A remembered enemy Shop sells us nothing.
@@ -2955,6 +3016,13 @@ fn r1(v: f32) -> f32 {
     (v * 10.0).round() / 10.0
 }
 
+/// Two decimal places, for the 0.0–1.0 fractions. `r1` would round a build
+/// that is 4% done to 0.0 and hand the digest back the phantom `0%` that
+/// `build_progress` exists to delete.
+fn r2(v: f32) -> f32 {
+    (v * 100.0).round() / 100.0
+}
+
 fn team_name(team: Team) -> &'static str {
     match team {
         Team::Human => "Human",
@@ -3505,6 +3573,63 @@ mod tests {
             ["id", "members", "posture"].into_iter().collect(),
             "a squad with no walking to describe must serialize exactly as it always did"
         );
+    }
+
+    /// **The construction ledger rides the same shape** (wc3clone-phc).
+    ///
+    /// Two additive keys, one on each array, and the same compatibility rule as
+    /// the two tests above: a finished building and a worker that is not
+    /// building carry **no key at all**, so a snapshot from a match that never
+    /// puts anything up is byte-identical to the one that shipped before the
+    /// fields existed.
+    ///
+    /// The `build_progress` half also pins the distinction that caused the bug:
+    /// `progress` is the training queue's and stays `0.0` on a site, and the
+    /// new key is the one that answers "how far along is it".
+    #[test]
+    fn the_construction_keys_ride_the_snapshot_without_disturbing_the_old_shape() {
+        let hall = |done: bool, build_progress: Option<f32>| BuildingOut {
+            id: 1,
+            team: "Claude",
+            kind: "TownHall",
+            pos: [30.0, 30.0],
+            hp: 500.0,
+            max_hp: 1500.0,
+            done,
+            queue: Vec::new(),
+            progress: 0.0,
+            build_progress,
+            ability_cd: None,
+            abilities: Vec::new(),
+            sells: Vec::new(),
+            template: false,
+            tier: 1,
+            upgrading: None,
+            researching: None,
+            rally: None,
+            last_seen: None,
+        };
+        let json = serde_json::to_string(&vec![hall(false, Some(0.73)), hall(true, None)])
+            .expect("buildings serialize");
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back[0]["build_progress"], 0.73);
+        assert_eq!(back[0]["progress"], 0.0, "the queue's progress, untouched");
+        assert!(
+            back[1].as_object().unwrap().get("build_progress").is_none(),
+            "a finished building must serialize exactly as it always did"
+        );
+
+        // ...and the worker half, which covers the window before there is a
+        // building to report at all.
+        let site = BuildSiteOut {
+            kind: "Barracks",
+            pos: [12.0, -4.0],
+        };
+        let json = serde_json::to_string(&site).expect("a build site serializes");
+        let back: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back["kind"], "Barracks");
+        assert_eq!(back["pos"][0], 12.0);
+        assert_eq!(back["pos"][1], -4.0);
     }
 
     /// **The veto reason, end to end on the wire.** The human's answer is

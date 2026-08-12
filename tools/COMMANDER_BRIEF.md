@@ -104,7 +104,23 @@ Unit orders (ids from state):
   a mine with `"remaining": 0` is refused — say `"target_select":"nearest mine"` instead)
 - `{"type":"return","units":[worker_ids]}`  `{"type":"stop","units":[ids]}`  `{"type":"follow","units":[ids],"target":own_id}`
 Production:
-- `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free; you pay on placement)
+- `{"type":"build","worker":id,"kind":"Farm"|"Barracks"|"TownHall","x":..,"z":..}` (site must be free)
+
+  **You pay when the worker breaks ground, not when the command is accepted.**
+  That is one sentence with three consequences worth knowing before you plan
+  around it. (a) Bank the price for the whole walk — an expansion hall is a long
+  trip and a Barracks queued in the meantime can spend the money out from under
+  it. (b) An accepted build that dies before the foundation is laid — the worker
+  re-tasked, killed, turned away at the site, or the site no longer clear —
+  costs you **nothing**; there is no refund because there was no charge. (c) It
+  is no longer silent: every one of those cases now writes a
+  `build abandoned: <Kind> at (x, z) — <why>; nothing was spent` line into
+  `events`, which is the edge you should be waking on. While the worker is still
+  walking, the build is visible as `units[].build_site` (`{"kind","pos"}`) on
+  the worker carrying it, and the digest prints it as `walking: Barracks@(12,-4)`.
+  Once ground is broken it joins `buildings[]` with `"done": false` and
+  `"build_progress"` (0.0–1.0, present only while it is going up — `progress`
+  beside it is the *training queue's* and is `0.0` on any site).
 - `{"type":"train","building":id,"unit":"Worker"|"Footman"|"Archer"|"Hero"|...}` (queue cap 7;
   full roster in `catalog.json`). A `train` of a hero is rejected with a reason when your slots
   are full, when you already hold that class, or when you cannot afford it — and the refusal
@@ -339,12 +355,14 @@ Anywhere a verb takes `units`, send `"select":"<phrase>"` instead:
 | `"all army"` | every living non-worker of yours, heroes included (`"army"`) |
 | `"all units"` | every living unit of yours, workers included |
 | `"workers"` | every living worker of yours |
+| `"idle workers"` | the same, narrowed to the ones whose `order` is `"Idle"` — the number the digest prints as `workers 12 (idle 3)` |
 | `"squad 2"` | the members squad 2 has **right now** |
 
-Two more phrases answer "which one", not "which units":
+Three more phrases answer "which one", not "which units":
 
 | phrase | where | means |
 |---|---|---|
+| `"nearest worker"` | `build`'s `"select"` | the worker with the shortest walk to the site. Only `build` names ground for it to measure from; any other verb refuses it and tells you to say `"workers"` or `"idle workers"` |
 | `"nearest tree"` / `"nearest mine"` | `harvest`'s `"target_select"` | the nearest live node of that kind to the workers you are sending |
 | `"nearest legal site"` | `build`'s `"site"` | move the footprint to the nearest legal one within 15 of the point you named — preferring ground clear of the haul lanes between your halls and the mines they work, so your own base cannot wall in its miners — instead of refusing |
 
@@ -359,7 +377,7 @@ instead of `"building"`:
 | `"my hall"` | whichever rung of the hall ladder you have standing — TownHall, Keep or Castle. Use this rather than `"my town hall"`, which stops matching the moment you upgrade |
 
 All six act on exactly one building, so they take the **lowest-id
-match**, the same tie-break as `build`'s worker. `"idle"` is the one to reach
+match**. `"idle"` is the one to reach
 for in a repeating rule: it walks past a producer that is already working, and
 when they are all working it refuses in words rather than queueing six deep.
 
@@ -395,9 +413,30 @@ changes when it is razed and rebuilt, and a plan written before the match has no
 id to write down at all — so the phrase is what makes a tier-up something a
 chain can contain.
 
-`build`, `cast` and `follow`'s `target_select` need exactly one unit, so they
-take the **lowest-id match** — the same documented tie-break `buy` and
-`use_item` already use for an omitted `hero`.
+`cast` and `follow`'s `target_select` need exactly one unit, so they take the
+**lowest-id match** — the same documented tie-break `buy` and `use_item`
+already use for an omitted `hero`.
+
+**`build` is the exception, and you want it to be.** Its `"select"` picks a body
+that has to *walk*, so lowest-id was the wrong answer and it cost two arena
+rounds: with fifteen workers, `{"select":"workers"}` handed every build in a
+batch the same peasant, and each new order abandoned the previous foundation
+before ground was broken — three expansions and a Blacksmith gone, no error
+line, no building. The rule now, in order:
+
+1. an explicit `"worker": <id>` always wins — naming a body means "that one,
+   even though it is busy";
+2. workers **already walking to a build site** are excluded, including one
+   claimed by an earlier `build` in the same batch. If the phrase reaches
+   nobody else, the command is **refused in words** rather than stealing a
+   builder;
+3. an **idle** worker beats a working one (`"nearest worker"` is how you say
+   "distance, never mind idleness");
+4. then the shortest walk to the site;
+5. then the lowest id, so a seeded match replays identically.
+
+So a batch of three `build`s now uses three different workers, and a repeating
+build trigger no longer cannibalises its own previous order.
 
 **Three rules worth knowing before you rely on it:**
 
