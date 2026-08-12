@@ -113,7 +113,8 @@ def walk(node):
 
 def test_the_document_has_the_five_top_level_sections():
     d = doc()
-    for key in ("doc_version", "seq", "properties", "default", "alarms", "actions"):
+    for key in ("doc_version", "seq", "properties", "default", "alarms",
+                "playbook", "actions"):
         assert key in d, "no {} section".format(key)
     assert d["seq"] == load(ARMED)["seq_applied"]
     assert d["properties"] == bridge_view.digest(load(ARMED), catalog()), \
@@ -128,7 +129,12 @@ def test_the_document_carries_its_own_version():
     # them (wc3clone-b9m). Neither half ever played a round alone, so the
     # ledger sees one scaffold. A ledger row that could not tell the ~600-line
     # page from the ~76-line one would be comparing two different experiments.
-    assert affordances.DOC_VERSION == "affordance-doc/2.0"
+    # `2.1`: a PLAYBOOK section between the alarms and the actions, served from
+    # `catalog.playbooks`. Additive — a seat that declares no playbook gets one
+    # advertisement line — but a seat that declares one reads a sequenced plan
+    # with a "you are here" pointer at the decision moment, which is a different
+    # scaffold and has to compare as one.
+    assert affordances.DOC_VERSION == "affordance-doc/2.1"
     assert doc()["doc_version"] == affordances.DOC_VERSION
     assert run("--doc-version").strip() == affordances.DOC_VERSION
     assert subprocess.run(
@@ -1026,7 +1032,14 @@ def test_the_text_render_is_readable_and_terminates():
 #: `catalog_full.json`, on these two fixtures. Kept as the thing the collapse is
 #: measured against — and as the pin on `--all`, whose whole promise is that it
 #: is still that render.
-FULL_LINES = {"doc_open_armed.json": 643, "doc_open_alarm.json": 803}
+#: 2.1 moved both numbers, additively and for two separate reasons that are
+#: worth keeping apart: `catalog_full.json` was refreshed from the engine and
+#: had been missing two selector phrases the engine has served for a while
+#: (`idle workers`, `nearest worker`), which is +5 domain rows across the forms;
+#: and the PLAYBOOK section is 5 lines with nothing declared. `--all` is still
+#: the pre-2.0 ACTIONS render exactly — the fold is what `--all` undoes, and a
+#: top-level section is not folded in either mode.
+FULL_LINES = {"doc_open_armed.json": 653, "doc_open_alarm.json": 813}
 
 #: What the collapsed render must fit in. The real numbers when this landed were
 #: **76** (armed, 43 actions) and **94** (alarm, 51 actions and a ringing
@@ -1034,7 +1047,14 @@ FULL_LINES = {"doc_open_armed.json": 643, "doc_open_alarm.json": 803}
 #: constraint 1 forbids dropping any, so this budget is really a cap on how many
 #: actions the document may grow before somebody has to think about grouping
 #: them. It is not a pin: a couple of new actions should not fail a suite.
-COLLAPSED_BUDGET = 100
+#:
+#: 2.1 raised it from 100. The numbers now are **81 / 99** with no playbook
+#: declared and **88 / 107** with one, and the whole of that growth is the two
+#: refreshed selector phrases plus the PLAYBOOK section. The section is worth
+#: its lines precisely because of arena/LADDER.md Finding 5 — the annotations
+#: that mattered were served on a page nobody re-opened — and it is capped
+#: separately by `test_a_declared_playbook_costs_a_dozen_lines_at_most`.
+COLLAPSED_BUDGET = 115
 
 
 def render(path=ARMED, prefs=None, full=False):
@@ -1343,6 +1363,366 @@ def test_a_focus_and_a_doctrine_are_independent_channels():
     assert by_rel(d, "build")["collapsed"] is False, "`focus` still expands"
     assert by_rel(d, "stance:squad-0:harass")["collapsed"] is True, \
         "a preferred action is sorted, not expanded — they are different channels"
+
+
+# -- 2.1: playbooks ----------------------------------------------------------
+#
+# THE ANCHORING CONSTRAINT is what most of these tests are about. Telling a
+# small model "this is what you should try to do" removes its ability to do
+# anything else: arena/LADDER.md r28, prompted to trust the document, did
+# exactly and only what the document said. So the properties that matter are
+# structural — every step renders as a fork, every step has exits, an
+# invalidated step puts them on top, and nothing about a playbook can move the
+# "you are here" pointer using a fact this seat did not earn.
+
+
+BOOK = "standard-kingdom"
+
+
+def the_book():
+    return next(b for b in catalog()["playbooks"] if b["id"] == BOOK)
+
+
+def pb(path=ARMED, name=BOOK, state=None):
+    """The PLAYBOOK section of a document with `name` declared."""
+    st = state if state is not None else load(path)
+    return affordances.document(st, catalog(), prefs_file(playbook=name))["playbook"]
+
+
+def test_a_seat_that_declares_nothing_is_told_the_library_exists():
+    """One line, and it names a real id and the exact prefs key. A library
+    nobody is told about is a library nobody uses."""
+    d = doc(ARMED)
+    section = d["playbook"]
+    assert section["selected"] is None and section["fork"] is None
+    assert [b["id"] for b in section["library"]] == [BOOK]
+    text = unwrapped(affordances.render_document(d))
+    assert "PLAYBOOK none declared" in text
+    assert '{"playbook":"standard-kingdom"}' in text
+    assert "off-book is legal and unflagged" in text
+
+
+def test_the_engine_never_infers_a_playbook():
+    """Same channel and same reason as `focus`: an inferred plan is an opinion,
+    and the engine does not have opinions."""
+    for path in LIVE + [EARLY, LEGACY]:
+        assert doc(path)["playbook"] is None or doc(path)["playbook"]["selected"] is None
+    assert doc(ARMED)["preference"]["playbook"] is None
+
+
+def test_every_step_of_every_shipped_playbook_is_a_fork():
+    """The anchoring constraint, as a property of the content rather than of the
+    render: authored exits on EVERY step, and the loader refuses one without
+    them (`data::check_playbooks`). This is the test that fails if somebody
+    writes a step as an instruction."""
+    for book in catalog()["playbooks"]:
+        assert book["steps"], book["id"]
+        for step in book["steps"]:
+            where = "{}/{}".format(book["id"], step["id"])
+            assert 1 <= len(step["exits"]) <= 3, where
+            assert step["why"].strip(), where
+            for key in ("entry", "gate", "fail_when"):
+                assert isinstance(step[key], dict) and step[key].get("type"), where
+            for x in step["exits"]:
+                assert x["title"].strip() and x["why"].strip(), where
+                assert isinstance(x["command"], dict) and x["command"].get("type"), where
+
+
+def test_the_rendered_fork_always_offers_more_than_one_thing_to_do():
+    """Rendered, not merely authored. Whatever step the pointer lands on, and
+    whatever else is true of the snapshot, the section prints at least two live
+    options with complete commands."""
+    for path in LIVE + [EARLY]:
+        fork = pb(path)["fork"]
+        assert fork, path.name
+        kinds = [o["kind"] for o in fork["options"]]
+        assert len(fork["options"]) >= 3, path.name
+        assert sum(1 for o in fork["options"] if o["command"] is not None) >= 2
+        assert kinds.count("continue") == 1 and kinds.count("exit") >= 1, kinds
+        # Which one leads is the news: the step's own move, unless its
+        # assumption has broken. `digest_open_early.json` is the second case
+        # and it is real — a queued free Hero eats the last five supply, so
+        # `open-economy`'s `supply_capped` fires and its "Farm first" exit is
+        # exactly the answer.
+        assert kinds[0] == ("exit" if fork["invalidated"] else "continue"), kinds
+
+
+def test_you_are_here_is_the_first_gate_that_does_not_hold():
+    """The pointer is a FACT about the snapshot, not a bookmark. Every step
+    before it has its gate satisfied; the one it points at does not."""
+    section = pb(ARMED)
+    rows, i = section["position"]["steps"], section["position"]["index"]
+    assert i is not None
+    assert all(r["gate_met"] for r in rows[:i]), rows
+    assert not rows[i]["gate_met"]
+    assert section["fork"]["n"] == i + 1
+
+
+def test_the_pointer_walks_backwards_when_the_facts_do():
+    """Statelessness, stated as the property it buys. Delete the army and the
+    plan says the army step is where you are — because it is. A remembered
+    pointer would keep pointing at the push."""
+    state = copy.deepcopy(load(ARMED))
+    ahead = pb(state=state)["fork"]["n"]
+    state["units"] = [u for u in state["units"] if u.get("kind") != "Footman"]
+    behind = pb(state=state)["fork"]["n"]
+    assert behind < ahead, (behind, ahead)
+
+
+def test_an_invalidated_step_names_the_broken_assumption_and_leads_with_exits():
+    """Anchoring is broken by interrupts, never by disclaimers. `fail_when`
+    holding re-renders the step INVALIDATED, puts the exits on top and labels
+    the step's own move as being taken on an assumption that has gone."""
+    state = copy.deepcopy(load(ARMED))
+    # Step 3's `fail_when` is `squad_below(1, 0.35)`. Hurt squad 1 badly enough
+    # and the step the pointer is on is a step whose own premise is gone.
+    for u in state["units"]:
+        if u.get("squad") == 1:
+            u["hp"] = 0.1 * u["max_hp"]
+    fork = pb(state=state)["fork"]
+    assert fork["invalidated"] is True
+    assert "squad 1 is pooled at" in fork["broken_assumption"]
+    assert fork["options"][0]["kind"] == "exit"
+    assert fork["options"][-1]["kind"] == "continue"
+    text = unwrapped(affordances.render_document(
+        affordances.document(state, catalog(), prefs_file(playbook=BOOK))))
+    assert "INVALIDATED" in text
+    assert "broken assumption: squad 1 is pooled at" in text
+    assert "the exits are first because the step's own assumption failed" in text
+
+
+def test_a_step_you_arrive_at_early_says_so_rather_than_ordering_you_forward():
+    """`entry` and `gate` are different questions. A step whose entry has not
+    come round yet is rendered NOT OPEN YET with the clock on the line, and its
+    exits are what you do with the wait."""
+    state = copy.deepcopy(load(ARMED))
+    state["t"] = 30.0
+    # Everything through the first four gates, at thirty seconds — a seat that
+    # is far ahead of the clock the expansion step waits on.
+    state["units"] += [dict(state["units"][0], id=900000 + i, kind="Footman",
+                            squad=1, hp=100.0, max_hp=100.0) for i in range(6)]
+    fork = pb(state=state)["fork"]
+    assert fork["step"] == "expand-before-dry"
+    assert fork["entry_met"] is False
+    assert "clock 30s, this asks for 300s" in fork["entry_fact"]
+    assert "NOT OPEN YET" in unwrapped(affordances.render_document(
+        affordances.document(state, catalog(), prefs_file(playbook=BOOK))))
+
+
+def test_a_ringing_alarm_is_one_of_the_options_and_outranks_the_plan():
+    """A plan that could sit above the fact that just broke it would be soft
+    enforcement. Alarms stay on top of the page, and the fork carries one more
+    option pointing at them."""
+    d = affordances.document(load(ALARM), catalog(), prefs_file(playbook=BOOK))
+    options = d["playbook"]["fork"]["options"]
+    assert "alarm" in [o["kind"] for o in options]
+    alarm_option = next(o for o in options if o["kind"] == "alarm")
+    assert alarm_option["command"] is None, "confirming the reflex is the move here"
+    assert "an alarm outranks any plan" in alarm_option["why"]
+    lines = affordances.render_document(d)
+    at_alarms = [i for i, l in enumerate(lines) if l.startswith("ALARMS")][0]
+    at_playbook = [i for i, l in enumerate(lines) if l.startswith("PLAYBOOK")][0]
+    assert at_alarms < at_playbook, "ALARMS must stay above PLAYBOOK"
+
+
+def test_the_playbook_section_sits_between_the_alarms_and_the_actions():
+    lines = affordances.render_document(doc(ALARM, prefs_file(playbook=BOOK)))
+    order = [i for i, l in enumerate(lines)
+             if l.startswith(("DEFAULT", "ALARMS", "PLAYBOOK", "ACTIONS"))]
+    assert order == sorted(order) and len(order) == 4
+    heads = [lines[i].split()[0] for i in order]
+    assert heads == ["DEFAULT", "ALARMS", "PLAYBOOK", "ACTIONS"]
+
+
+def test_no_playbook_command_contains_an_entity_id():
+    """Same sweep the actions half gets, and for the same reason one rung up: a
+    playbook is authored once and read at t=600, so an id in it is a corpse with
+    a schedule. `data::check_playbook_template` refuses one at load; this proves
+    the shipped file is clean and that nothing is injected on the way out."""
+    for path in LIVE:
+        fork = pb(path)["fork"]
+        for opt in fork["options"]:
+            for value in walk(opt.get("command")):
+                assert not (isinstance(value, int) and not isinstance(value, bool)
+                            and value > 4096), (opt["title"], value)
+            for key in ("units", "worker", "building", "hero", "caster"):
+                assert key not in list(walk(opt.get("command"))), (opt["title"], key)
+
+
+def test_every_catalog_predicate_is_either_answered_or_declared_unanswerable():
+    """The cross-check, built from the schema the engine publishes. A fifteenth
+    predicate arriving in `TriggerWhen` lands in neither table and fails HERE,
+    rather than being silently read as "unknown" by a pointer that then moves on
+    a guess."""
+    ids = [p["id"] for p in catalog()["predicates"]]
+    assert ids, "the catalog serves no predicate schema"
+    for pid in ids:
+        assert (pid in affordances.PREDICATE_EVALUATORS
+                or pid in affordances.UNANSWERABLE_PREDICATES), pid
+    stray = (set(affordances.PREDICATE_EVALUATORS) | set(affordances.UNANSWERABLE_PREDICATES)) \
+        - set(ids)
+    assert not stray, "this view reads predicates the engine does not have: {}".format(stray)
+
+
+def test_every_evaluator_takes_the_fields_the_schema_names():
+    """Built from `catalog.predicates` rather than from a hand list: a `when`
+    made of exactly the schema's own field names must be readable, and the
+    answer must be a real boolean rather than an exception swallowed into
+    `None`."""
+    sample = {"fraction": 0.5, "integer": 2, "squad": 1, "seconds": 30.0,
+              "place": "mid", "class": "Footman", "hero_class": "Hero",
+              "unit_kind": "Footman"}
+    for row in catalog()["predicates"]:
+        if row["id"] not in affordances.PREDICATE_EVALUATORS:
+            continue
+        when = {"type": row["id"]}
+        for f in row["fields"]:
+            when[f["name"]] = sample[f["type"]]
+        truth, fact = affordances.predicate_truth(when, load(ARMED), catalog())
+        assert truth in (True, False), (row["id"], fact)
+        assert fact, row["id"]
+
+
+def test_the_shipped_playbook_only_uses_predicates_this_view_can_answer():
+    """The Rust half of this is `data::PLAYBOOK_PREDICATES` and the loader
+    refuses a step that reaches outside it. This is the same rule read from the
+    other end, so the two cannot drift apart without one of them failing."""
+    for book in catalog()["playbooks"]:
+        for step in book["steps"]:
+            for key in ("entry", "gate", "fail_when"):
+                pid = step[key]["type"]
+                assert pid in affordances.PREDICATE_EVALUATORS, (book["id"], step["id"], pid)
+                assert pid not in affordances.UNANSWERABLE_PREDICATES
+
+
+def test_the_evaluator_reads_the_four_arms_the_engine_documents_as_traps():
+    """The predicates whose obvious reading is the wrong one. Each of these is
+    written down in `shared::TriggerWhen` and enforced in `trigger.rs`, and this
+    view answering differently would be two languages for one word."""
+    st = load(ARMED)
+    cat = catalog()
+
+    # `hero_above` is NOT `not hero_below`: with no living hero BOTH are false,
+    # which is what keeps a plan from advancing over a corpse.
+    none = copy.deepcopy(st)
+    none["units"] = [u for u in none["units"] if not u.get("hero")]
+    assert affordances.predicate_truth({"type": "hero_above", "frac": 0.5}, none, cat)[0] is False
+    assert affordances.predicate_truth({"type": "hero_below", "frac": 0.5}, none, cat)[0] is False
+
+    # `squad_below` is false for a squad with no living members — firing a
+    # rescue at a corpse pile is worse than firing nothing.
+    assert affordances.predicate_truth(
+        {"type": "squad_below", "id": 77, "frac": 0.9}, st, cat)[0] is False
+
+    # A supply cap of zero is "no base yet", not "blocked".
+    zero = copy.deepcopy(st)
+    zero["me"]["supply_cap"], zero["me"]["supply_used"] = 0, 0
+    assert affordances.predicate_truth({"type": "supply_capped"}, zero, cat)[0] is False
+    # ...and the real thing counts the QUEUE, which is the half the ledger has
+    # not been told about. `digest_open_early.json` is that case for real: five
+    # supply used, ten cap, a free Hero (5 supply) in the hall's queue.
+    assert affordances.predicate_truth({"type": "supply_capped"}, load(EARLY), cat)[0] is True
+
+    # `enemy_in` over a name that is not a place goes QUIET rather than falling
+    # back to the whole map — an unresolvable name is no question, not a bigger
+    # one.
+    truth, fact = affordances.predicate_truth(
+        {"type": "enemy_in", "region": "the-perimiter", "count": 1}, st, cat)
+    assert truth is False and "asks about nowhere" in fact
+
+
+def test_the_pointer_never_moves_on_a_fact_this_seat_did_not_earn():
+    """The fog adversarial. Give the seat an omniscient view of an enemy it
+    cannot see — a full enemy roster bolted onto `units[]` is exactly what fog
+    withholds — and the pointer must be unchanged, because every predicate it
+    reads is answered from the seat's own knowability. Then remove the ledger
+    entirely and check it still renders."""
+    base = load(ARMED)
+    before = pb(state=base)
+    blind = copy.deepcopy(base)
+    blind["units"] = [u for u in blind["units"] if u.get("team") == blind["my_team"]]
+    blind["intel"] = {"sightings": [], "groups": [], "heroes": {}, "ttl_s": 90.0}
+    after = pb(state=blind)
+    assert before["position"]["index"] == after["position"]["index"], \
+        "the pointer moved on enemy state — steps 1-3 are about this seat only"
+    assert after["fork"]["options"], "a blind seat still gets a fork"
+
+
+def test_an_unknown_playbook_name_is_reported_rather_than_dropped():
+    """A commander that thinks it is following a plan and is not has been lied
+    to by a view — the same rule `focus` follows."""
+    section = pb(name="standard-horde-that-does-not-exist")
+    assert section["fork"] is None
+    assert "no playbook called" in section["note"]
+    assert BOOK in section["note"]
+
+
+def test_a_playbook_for_the_other_roster_is_served_with_a_warning_not_hidden():
+    """Constraint 1: invisible is inexpressible. The document says the roster
+    does not match and serves the plan anyway."""
+    state = copy.deepcopy(load(ARMED))
+    state["my_race"] = "horde"
+    section = pb(state=state)
+    assert section["selected"] == BOOK
+    assert "written for the kingdom roster" in section["note"]
+    assert section["fork"], "still served — a floor, never a ceiling"
+
+
+def test_a_completed_playbook_says_the_plan_ran_out_rather_than_inventing_a_step():
+    state = copy.deepcopy(load(ARMED))
+    book = copy.deepcopy(the_book())
+    book["steps"] = [book["steps"][0]]
+    book["steps"][0]["gate"] = {"type": "game_time", "at": 0.0}
+    cat = copy.deepcopy(catalog())
+    cat["playbooks"] = [book]
+    section = affordances.document(state, cat, prefs_file(playbook=BOOK))["playbook"]
+    assert section["position"]["index"] is None
+    assert section["fork"] is None
+    assert "the plan has run out" in section["note"]
+
+
+def test_a_declared_playbook_costs_a_dozen_lines_at_most():
+    """The section is the fork and the fork only. Ten steps of authored prose
+    live in the data file and in `--json`; the page prints the one you are on."""
+    for path in LIVE:
+        with_pb = affordances.render_document(doc(path, prefs_file(playbook=BOOK)))
+        without = affordances.render_document(doc(path))
+        assert len(with_pb) - len(without) <= 12, (path.name, len(with_pb), len(without))
+        assert len(with_pb) <= COLLAPSED_BUDGET, (path.name, len(with_pb))
+
+
+def test_the_fork_lines_carry_their_complete_commands():
+    """The fold's promise, one rung up: an option you have to re-open a page to
+    send is an option a small commander does not take."""
+    d = doc(ARMED, prefs_file(playbook=BOOK))
+    text = "\n".join(affordances.render_document(d))
+    for opt in d["playbook"]["fork"]["options"]:
+        if opt["command"] is None:
+            continue
+        assert json.dumps(opt["command"], separators=(",", ":")) in text, opt["title"]
+
+
+def test_a_playbook_changes_no_action_no_readiness_and_no_default():
+    """It is a section, not a filter. Declaring one must not move a single fact
+    in the rest of the document — the actions half never learns about it."""
+    plain, booked = doc(ARMED), doc(ARMED, prefs_file(playbook=BOOK))
+    assert plain["actions"] == booked["actions"]
+    assert plain["default"] == booked["default"]
+    assert plain["alarms"] == booked["alarms"]
+    assert plain["properties"] == booked["properties"]
+
+
+def test_the_playbook_section_degrades():
+    """Every read is a `.get`. A catalog with no playbooks has no section; the
+    pre-everything fixture and the empty dict render rather than raising."""
+    assert affordances.document(load(ARMED), None, None)["playbook"] is None
+    bare = copy.deepcopy(catalog())
+    bare.pop("playbooks")
+    assert affordances.document(load(ARMED), bare, None)["playbook"] is None
+    for state in ({}, load(LEGACY)):
+        d = affordances.document(state, catalog(), prefs_file(playbook=BOOK))
+        assert affordances.render_document(d)
+        assert d["playbook"]["selected"] == BOOK
 
 
 def _run():

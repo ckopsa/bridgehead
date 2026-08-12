@@ -153,10 +153,12 @@ def ruleset_constants(seats: list[dict], env: dict[str, str]) -> dict[str, str]:
 
     Two kinds of thing, and they are recorded on different conditions:
 
-      * **The tuning digests, always.** `alarms.ron` and `stances.ron` are
-        numbers the round was played under no matter which seat read what;
-        recording them only for scaffolded rounds would leave a retune
-        invisible in exactly the comparison it invalidates.
+      * **The tuning digests, always.** `alarms.ron`, `stances.ron` and
+        `playbooks.ron` are content the round was played under no matter which
+        seat read what; recording them only for scaffolded rounds would leave a
+        retune invisible in exactly the comparison it invalidates. `playbooks
+        _ron` is the sharpest of the three — it is authored strategy, which
+        constraint 3 permits only on condition that it is versioned here.
       * **`affordance_doc`, only when a seat actually used the document.**
         docs/AFFORDANCES.md constraint 3: "once the scaffold encodes any
         judgment, an arena result measures model+scaffold... the scaffold

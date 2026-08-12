@@ -90,9 +90,17 @@ VERDICT_STATUS = ("confirmed", "refuted", "unresolved")
 #: `stances.ron` decides what each stance word does; both move every round
 #: after a retune, which is precisely what a ledger comparison must be able to
 #: see (docs/AFFORDANCES.md constraint 3).
+#:
+#: `playbooks.ron` is the loudest of the three by that standard, because it is
+#: the one that carries authored STRATEGY rather than tuning: constraint 3 is
+#: what permits judgment in the scaffold at all, and only on condition that the
+#: judgment is versioned in the ruleset. A round played with a retuned playbook
+#: and a round played with the old one are two experiments, and the digest is
+#: the only thing that can say so.
 TUNING_FILES = {
     "alarms_ron": "alarms.ron",
     "stances_ron": "stances.ron",
+    "playbooks_ron": "playbooks.ron",
 }
 
 TOP_LEVEL = (

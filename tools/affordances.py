@@ -35,8 +35,17 @@ TWO ANNOTATION CHANNELS, STRICTLY SEPARATED (AFFORDANCES.md):
   * **preference** — commander-declared doctrine, engine-SORTED and never
     engine-generated. See `load_prefs` for the mechanism and the argument for
     why it is a file rather than a wire key. Since 2.0 it also carries an
-    optional `focus`, which chooses what the TEXT render expands — declared by
-    the commander, never inferred by the engine.
+    optional `focus`, which chooses what the TEXT render expands, and since 2.1
+    an optional `playbook` — both declared by the commander, never inferred by
+    the engine.
+
+PLAYBOOKS (2.1). A third thing on the page, between the alarms and the actions:
+a declared game-plan from `catalog.playbooks`, served as the ONE step this
+snapshot says you are on, rendered as a FORK of 2-4 live options rather than as
+an instruction. See the "Playbooks" section below for the anchoring constraint
+that shapes every line of it, and docs/AFFORDANCES.md § Playbooks for why
+authored strategy is allowed in the scaffold at all (it is versioned in the
+round's ruleset, and the engine executes none of it).
 
 FACT-COLLAPSED RENDERING (2.0). The arena's model ladder (arena/LADDER.md,
 Findings 2 and 5) measured the cost of the full render: ~600 lines mid-game,
@@ -122,8 +131,17 @@ from bridge_view import dist, load_catalog  # noqa: E402
 #: `catalog.gates` (wc3clone-b9m): the readiness annotations now speak the
 #: engine's own thresholds, and the engine echoes an advisory note on any
 #: accepted command that contradicts them. Neither 1.4 nor a bare 2.0 ever
-#: played a round, so the ledger sees one scaffold: this one.
-DOC_VERSION = "affordance-doc/2.0"
+#: played a round, so the ledger sees one scaffold.
+#: `2.1` — a PLAYBOOK section, between the alarms and the actions. Additive: the
+#: rows are `catalog.playbooks` (`assets/data/playbooks.ron`), nothing was
+#: removed or reworded, and a seat that declares no playbook gets one
+#: advertisement line. It is a version bump rather than a free change because
+#: the section changes what a commander reads at the decision moment — a
+#: sequenced plan with a "you are here" pointer — and arena/LADDER.md Finding 4
+#: says the tiers differ in judgment, which is exactly what a playbook supplies.
+#: The section is a FORK and never an instruction (docs/AFFORDANCES.md
+#: § Playbooks), so it cannot be compared against 2.0 as "the same page".
+DOC_VERSION = "affordance-doc/2.1"
 
 # ---------------------------------------------------------------------------
 # Sections: what a declared focus can expand, and how the collapsed render
@@ -165,6 +183,7 @@ MAX_PLANS = 2  # shared::MAX_PLANS_PER_TEAM
 MAX_PLAN_STEPS = 8  # shared::MAX_PLAN_STEPS
 REGION_RADIUS_MIN = 4.0  # shared::REGION_RADIUS_MIN
 REGION_RADIUS_MAX = 60.0  # shared::REGION_RADIUS_MAX
+MINE_HOME_RADIUS = 40.0  # shared::MINE_HOME_RADIUS — what "our mine" means
 
 # ---------------------------------------------------------------------------
 # The push gates — the one place this document encodes a judgment
@@ -1671,6 +1690,475 @@ def alarm_entries(state, actions):
 
 
 # ---------------------------------------------------------------------------
+# Playbooks — the fork, and the pointer that says which fork you face
+#
+# `catalog.playbooks` (assets/data/playbooks.ron) is a library of declarative
+# game-plans: ordered steps, each with a fog-legal `entry`, a command to send, a
+# `gate` that says you may move on, ONE authored `why`, a `fail_when` that says
+# the step is dead, and two or three authored `exits`. The engine publishes them
+# and executes none of them — a commander enacts a step by sending its command
+# through the ordinary intent path.
+#
+# THE ANCHORING CONSTRAINT (docs/AFFORDANCES.md § Playbooks) is what this code
+# is shaped by: a step is rendered as a FORK, never as an instruction. Told to
+# trust the document, arena/LADDER.md's r28 Haiku did exactly and only what the
+# document said, and a plan a model cannot abandon is r21's one-long-wrong-
+# continue one level up. So the render always carries the step's own action
+# BESIDE its authored alternatives and any ringing alarm, each with its complete
+# command and the numbers under it, and the instruction the commander is
+# anchored to becomes "choose".
+#
+# "YOU ARE HERE" is computed here, from this seat's own snapshot, by evaluating
+# the same `TriggerWhen` predicates `src/trigger.rs` evaluates. It is a FACT
+# about the snapshot and not a bookmark: the pointer is the first step whose
+# gate does not hold, so losing an army walks the pointer back to the step that
+# builds one. Nothing is remembered between renders, which is also why no wire
+# key was needed.
+# ---------------------------------------------------------------------------
+
+
+def playbook_table(catalog):
+    """The library, straight from the catalog.
+
+    No fallback list, on `predicate_schemas`' reasoning: a hand copy of authored
+    strategy is a second source of truth for the one thing the data file exists
+    to keep single. Rendered beside a catalog written before playbooks landed,
+    the section simply has nothing to advertise.
+    """
+    return list((catalog or {}).get("playbooks") or [])
+
+
+def _fold(name):
+    return " ".join(str(name or "").split()).casefold()
+
+
+def _my_units(state):
+    me = state.get("my_team")
+    return [u for u in state.get("units") or [] if not me or u.get("team") == me]
+
+
+def _enemy_units(state):
+    """The enemy bodies THIS SEAT CAN SEE, which is the only list there is.
+
+    Fog-honesty by inheritance, not by a check here: `state.json`'s `units[]` is
+    already filtered to what this seat's own `FogGrid` admits, so counting it is
+    counting exactly what `trigger.rs` counts through `fog.sees`. The actions
+    half of this module never reads the enemy at all; the playbook half must,
+    because `enemy_sighted` is a predicate a commander armed — and it reads the
+    same array the digest's own win-condition line does.
+    """
+    me = state.get("my_team")
+    return [u for u in state.get("units") or [] if me and u.get("team") != me]
+
+
+def _class_of(kind, catalog):
+    """A unit kind's `TargetClass`, from the catalog the engine published."""
+    for u in (catalog or {}).get("units") or []:
+        if u.get("id") == kind:
+            return u.get("class")
+    return None
+
+
+def _supply_of(kind, catalog):
+    for u in (catalog or {}).get("units") or []:
+        if u.get("id") == kind:
+            return u.get("supply") or 0
+    return 0
+
+
+def _circle(name, state):
+    """`(pos, radius)` for a place name, or None.
+
+    `map.places` is the engine's `builtin_places` and `regions` is this seat's
+    own vocabulary — together they are exactly what `Regions::find` resolves, so
+    a name this cannot place is a name the engine could not place either.
+    """
+    for r in list((state.get("map") or {}).get("places") or []) + own_regions(state):
+        if _fold(r.get("name")) == _fold(name) and r.get("pos"):
+            return r["pos"], r.get("radius", 0.0)
+    return None
+
+
+def _hall_kinds(catalog):
+    """Which building kinds are halls, read off the catalog's own upgrade ladder.
+
+    `shared::is_hall` is derived code, not data, so there is no `is_hall` key to
+    read. What there IS is the fact that a hall is the thing that trains Workers
+    — true for TownHall/Keep/Castle and for the horde ladder, and false for
+    everything else on the board.
+    """
+    return {
+        b.get("id")
+        for b in (catalog or {}).get("buildings") or []
+        if "Worker" in (b.get("trains") or [])
+    }
+
+
+def _pred_game_time(w, state, catalog):
+    now, at = state.get("t", 0.0), float(w.get("at", 0.0))
+    return now >= at, "clock {:.0f}s, this asks for {:.0f}s".format(now, at)
+
+
+def _pred_unit_count(w, state, catalog):
+    kind, want = w.get("kind"), int(w.get("count", 1))
+    have = sum(1 for u in _my_units(state) if u.get("kind") == kind)
+    return have >= want, "{} {}/{}".format(kind, have, want)
+
+
+def _pred_tier_reached(w, state, catalog):
+    tier = (state.get("me") or {}).get("tier", 1)
+    want = int(w.get("tier", 1))
+    return tier >= want, "tier {}/{}".format(tier, want)
+
+
+def _heroes(state):
+    return [u for u in _my_units(state) if u.get("hero") and u.get("max_hp")]
+
+
+def _pred_hero_below(w, state, catalog):
+    frac = float(w.get("frac", 0.0))
+    heroes = _heroes(state)
+    if not heroes:
+        return False, "you field no living hero, and a dead hero is not a hurt one"
+    worst = min(h["hp"] / h["max_hp"] for h in heroes)
+    return worst < frac, "your worst hero is at {:.0f}%, this asks below {:.0f}%".format(
+        100.0 * worst, 100.0 * frac
+    )
+
+
+def _pred_hero_above(w, state, catalog):
+    """NOT the negation of `hero_below`, and the difference decides matches.
+
+    `shared::TriggerWhen::HeroAbove`: with no living hero this is FALSE, exactly
+    as `hero_below` is, so a plan that waits for a healed hero does not advance
+    over the corpse. And it is ALL heroes, not any.
+    """
+    frac = float(w.get("frac", 0.0))
+    heroes = _heroes(state)
+    if not heroes:
+        return False, "you field no living hero, and a dead hero is not a healed one"
+    worst = min(h["hp"] / h["max_hp"] for h in heroes)
+    return worst >= frac, "your worst hero is at {:.0f}%, this asks {:.0f}% or better".format(
+        100.0 * worst, 100.0 * frac
+    )
+
+
+def _pred_squad_below(w, state, catalog):
+    """Pooled health, and EVERY enrolled body — including a worker.
+
+    Deliberately not `squad_members`, which drops workers because a squad's
+    *army* is what the readiness channel is about. `trigger.rs` filters on team
+    and squad id only, so a Call-to-Arms worker enrolled into the line counts
+    toward the pool the engine measures, and a second reading of one predicate
+    would be a second language.
+    """
+    sid, frac = w.get("id"), float(w.get("frac", 0.0))
+    members = [u for u in _my_units(state) if u.get("squad") == sid]
+    cur = sum(u.get("hp", 0.0) for u in members)
+    mx = sum(u.get("max_hp", 0.0) for u in members)
+    if mx <= 0.0:
+        return False, "squad {} has no living members — a squad that is gone cannot be hurt".format(sid)
+    return cur / mx < frac, "squad {} is pooled at {:.0f}%, this asks below {:.0f}%".format(
+        sid, 100.0 * cur / mx, 100.0 * frac
+    )
+
+
+def _sighted(state, catalog, cls, inside=None):
+    seen = []
+    for u in _enemy_units(state):
+        if cls and _fold(_class_of(u.get("kind"), catalog)) != _fold(cls):
+            continue
+        if inside:
+            pos, radius = inside
+            if not u.get("pos") or dist(u["pos"], pos) > radius:
+                continue
+        seen.append(u)
+    return seen
+
+
+def _pred_enemy_sighted(w, state, catalog):
+    want = max(int(w.get("count", 1)), 1)
+    cls = w.get("class")
+    seen = _sighted(state, catalog, cls)
+    return len(seen) >= want, "{} enemy {} in sight, this asks for {}".format(
+        len(seen), cls or "units", want
+    )
+
+
+def _pred_enemy_in(w, state, catalog):
+    want = max(int(w.get("count", 1)), 1)
+    cls, region = w.get("class"), w.get("region")
+    circle = _circle(region, state)
+    if circle is None:
+        # The engine goes QUIET on a name it cannot resolve rather than falling
+        # back to the whole map, and so does this: an unresolvable name is not a
+        # bigger question, it is no question.
+        return False, "no place called {!r} on this map, so this asks about nowhere".format(region)
+    seen = _sighted(state, catalog, cls, inside=circle)
+    return len(seen) >= want, "{} enemy {} inside {}, this asks for {}".format(
+        len(seen), cls or "units", region, want
+    )
+
+
+def _pred_enemy_army_seen(w, state, catalog):
+    want = max(int(w.get("size", 1)), 1)
+    within = w.get("within_s")
+    groups = ((state.get("intel") or {}).get("groups")) or []
+    live = [g for g in groups if within is None or g.get("age", 0.0) <= float(within)]
+    biggest = max((g.get("size", 0) for g in live), default=0)
+    return biggest >= want, "your ledger's largest force is {} troops{}, this asks for {}".format(
+        biggest, "" if within is None else " seen inside {:.0f}s".format(float(within)), want
+    )
+
+
+def _pred_enemy_hero_down(w, state, catalog):
+    cls = w.get("class")
+    heroes = ((state.get("intel") or {}).get("heroes")) or {}
+    rows = heroes.items() if not cls else [(cls, heroes.get(cls) or {})]
+    down = [k for k, v in rows if (v or {}).get("status") == "seen-dying"]
+    return bool(down), "believed down: {} (belief, not truth — you have to have watched it)".format(
+        ", ".join(down) or "nobody"
+    )
+
+
+def _pred_bounty_spawned(w, state, catalog):
+    n = len(state.get("bounties") or [])
+    return n > 0, "{} bounty cache{} visible to you".format(n, "" if n == 1 else "s")
+
+
+def _pred_mine_dry(w, state, catalog):
+    halls = [
+        b for b in own_buildings(state)
+        if b.get("done") and b.get("kind") in _hall_kinds(catalog) and b.get("pos")
+    ]
+    if not halls:
+        return False, "you hold no completed hall, so no mine is yours to lose"
+    # `== 0`, not falsiness: a snapshot with no `remaining` key at all is a
+    # snapshot that has not told us, and "we were not told" is not "it is dry".
+    dry = [
+        m for m in state.get("mines") or []
+        if m.get("remaining") == 0
+        and m.get("pos")
+        and any(dist(m["pos"], h["pos"]) <= MINE_HOME_RADIUS for h in halls)
+    ]
+    return bool(dry), "{} of your halls' mines {} dry".format(
+        len(dry), "is" if len(dry) == 1 else "are"
+    )
+
+
+def _pred_supply_capped(w, state, catalog):
+    me = state.get("me") or {}
+    cap, used = me.get("supply_cap", 0), me.get("supply_used", 0)
+    queued = sum(
+        _supply_of(k, catalog)
+        for b in own_buildings(state)
+        for k in (b.get("queue") or [])
+    )
+    if not cap:
+        # A cap of zero is "no completed supply building yet", which is where
+        # every team stands on frame one — not "supply blocked". The engine
+        # draws the line in the same place and two readings would be two
+        # languages.
+        return False, "your supply cap is 0, which is 'no base yet' and not 'blocked'"
+    return cap - (used + queued) <= 0, "{}/{} supply used with {} more queued".format(
+        used, cap, queued
+    )
+
+
+#: Every `when` arm this view can answer from the seat's OWN snapshot, and
+#: therefore every arm a playbook may use. The set is pinned in Rust too
+#: (`data::PLAYBOOK_PREDICATES`), and the loader refuses a playbook step that
+#: reaches outside it — so the two halves cannot drift without the engine
+#: refusing to start.
+PREDICATE_EVALUATORS = {
+    "game_time": _pred_game_time,
+    "unit_count": _pred_unit_count,
+    "tier_reached": _pred_tier_reached,
+    "hero_below": _pred_hero_below,
+    "hero_above": _pred_hero_above,
+    "squad_below": _pred_squad_below,
+    "enemy_sighted": _pred_enemy_sighted,
+    "enemy_in": _pred_enemy_in,
+    "enemy_army_seen": _pred_enemy_army_seen,
+    "enemy_hero_down": _pred_enemy_hero_down,
+    "bounty_spawned": _pred_bounty_spawned,
+    "mine_dry": _pred_mine_dry,
+    "supply_capped": _pred_supply_capped,
+}
+
+#: The arms this view deliberately cannot answer, each with the reason, so a
+#: predicate that arrives in the engine and lands in neither table fails the
+#: cross-check test rather than being silently treated as "unknown". A pointer
+#: that moves on a guess is worse than a pointer that refuses to exist.
+UNANSWERABLE_PREDICATES = {
+    "base_under_attack": (
+        "no snapshot key carries when your buildings were last hit, so this view "
+        "would have to guess; say it with `enemy_in` on `our base`, which the "
+        "snapshot can answer and which names the place as well"
+    ),
+}
+
+
+def predicate_truth(when, state, catalog):
+    """`(truth, fact)` for one predicate against this seat's own snapshot.
+
+    `truth` is `True`, `False`, or `None` for an arm this view cannot answer —
+    and `None` is treated everywhere downstream as "does not hold", said out
+    loud. Every read is a `.get` with a default, so a snapshot missing a key
+    answers "no" rather than raising.
+    """
+    if not isinstance(when, dict):
+        return None, "no predicate"
+    pid = when.get("type")
+    fn = PREDICATE_EVALUATORS.get(pid)
+    if fn is None:
+        return None, UNANSWERABLE_PREDICATES.get(
+            pid, "this document has no reading for `{}`".format(pid)
+        )
+    try:
+        return fn(when, state, catalog)
+    except Exception as err:  # a document that raises is worse than none at all
+        return None, "could not read `{}` from this snapshot ({})".format(pid, err)
+
+
+def playbook_position(book, state, catalog):
+    """Where this seat stands in a plan, as a fact about the snapshot.
+
+    The pointer is **the first step whose gate does not hold**. Every step
+    before it has its gate satisfied, so the plan has got that far; if every
+    gate holds, the plan is COMPLETE and says so rather than inventing an
+    eleventh step. Nothing is remembered between renders, which is what lets the
+    pointer walk BACKWARDS — lose the army and the plan says the army step is
+    where you are, because it is.
+    """
+    steps = book.get("steps") or []
+    rows = []
+    for s in steps:
+        ok, fact = predicate_truth(s.get("gate"), state, catalog)
+        rows.append({"id": s.get("id"), "title": s.get("title"),
+                     "gate_met": bool(ok), "gate_fact": fact})
+    index = next((i for i, r in enumerate(rows) if not r["gate_met"]), None)
+    return {"steps": rows, "index": index, "of": len(steps)}
+
+
+def playbook_fork(book, pos, state, catalog, alarms):
+    """The current step as 3-4 live options, each carrying its whole command.
+
+    Order is the news: normally the step's own action leads and its authored
+    exits follow; when `fail_when` holds the exits come FIRST and the continue
+    option is labelled as being taken on a broken assumption. Any ringing alarm
+    adds a final option with a `null` command — confirming the reflex is a move,
+    and the alarm's own overrides are in the ALARMS section above, which is
+    where they belong and where nothing may hide them.
+    """
+    step = (book.get("steps") or [])[pos["index"]]
+    entry_ok, entry_fact = predicate_truth(step.get("entry"), state, catalog)
+    fail_ok, fail_fact = predicate_truth(step.get("fail_when"), state, catalog)
+    gate_row = pos["steps"][pos["index"]]
+
+    cont = {
+        "kind": "continue",
+        "title": step.get("title"),
+        "command": step.get("action"),
+        "why": step.get("why"),
+        "note": (
+            "the step's own move, on an assumption that has broken"
+            if fail_ok
+            else "advance when: " + gate_row["gate_fact"]
+            if entry_ok
+            else "this step is not open yet — " + entry_fact
+        ),
+    }
+    exits = [
+        {
+            "kind": "exit",
+            "title": x.get("title"),
+            "command": x.get("command"),
+            "why": x.get("why"),
+            "note": None,
+        }
+        for x in step.get("exits") or []
+    ]
+    options = (exits + [cont]) if fail_ok else ([cont] + exits)
+    for a in alarms or []:
+        options.append({
+            "kind": "alarm",
+            "title": "ALARM {}: {}".format(a.get("id") or "?", a.get("fact")),
+            "command": None,
+            "why": "running default: {} — its overrides are in ALARMS above, and an alarm "
+                   "outranks any plan".format(
+                       a.get("running_default") or "nothing is standing to answer this"),
+            "note": "an alarm fires only after the reflex has; confirming it is a move",
+        })
+    return {
+        "step": step.get("id"),
+        "title": step.get("title"),
+        "n": pos["index"] + 1,
+        "of": pos["of"],
+        "entry_met": bool(entry_ok),
+        "entry_fact": entry_fact,
+        "gate_met": gate_row["gate_met"],
+        "gate_fact": gate_row["gate_fact"],
+        "invalidated": bool(fail_ok),
+        "broken_assumption": fail_fact if fail_ok else None,
+        "why": step.get("why"),
+        "options": options,
+    }
+
+
+def playbook_entry(state, catalog, prefs, alarms):
+    """The PLAYBOOK section: the library, and — if one is declared — the fork.
+
+    Selection rides the `--prefs` file beside `focus` and for the same reason
+    (`load_prefs`): a plan a commander chose to follow is a declaration, the
+    engine is forbidden to act on it, and inventing a wire verb for a value the
+    engine may not read would be a protocol change inside a view. Declared,
+    never inferred — the engine has no opinion about which plan you are on, and
+    an inferred one would be exactly the opinion this document may not have.
+    """
+    library = [
+        {"id": b.get("id"), "label": b.get("label"), "race": b.get("race"),
+         "pitch": b.get("pitch"), "steps": len(b.get("steps") or [])}
+        for b in playbook_table(catalog)
+    ]
+    if not library:
+        return None
+    want = (prefs or {}).get("playbook")
+    entry = {"library": library, "selected": None, "note": None, "fork": None}
+    if not want:
+        entry["note"] = (
+            "no playbook declared — declare {{\"playbook\":\"{}\"}} in your prefs file to "
+            "follow one. Every step renders as a fork with its own exits; going off-book is "
+            "legal and unflagged.".format(library[0]["id"])
+        )
+        return entry
+    book = next((b for b in playbook_table(catalog) if b.get("id") == want), None)
+    if book is None:
+        entry["note"] = "no playbook called {!r} — the library holds: {}".format(
+            want, ", ".join(b["id"] for b in library)
+        )
+        return entry
+    entry["selected"] = book.get("id")
+    race = state.get("my_race")
+    if race and book.get("race") and _fold(race) != _fold(book["race"]):
+        entry["note"] = (
+            "'{}' is written for the {} roster and you are playing {} — its steps name "
+            "buildings you cannot put down. Served anyway: this document is a floor, never "
+            "a ceiling.".format(book.get("id"), book.get("race"), race)
+        )
+    pos = playbook_position(book, state, catalog)
+    entry["position"] = pos
+    if pos["index"] is None:
+        entry["note"] = (
+            "every gate in '{}' holds — the plan has run out, and from here the whole "
+            "vocabulary below is the plan.".format(book.get("id"))
+        )
+        return entry
+    entry["fork"] = playbook_fork(book, pos, state, catalog, alarms)
+    return entry
+
+
+# ---------------------------------------------------------------------------
 # The preference channel
 # ---------------------------------------------------------------------------
 
@@ -1691,7 +2179,8 @@ def load_prefs(path):
         {"doctrine": "aggression: high, risk: low",
          "prefer": ["push", "harass", "trigger"],
          "avoid":  ["turtle"],
-         "focus":  "army"}
+         "focus":  "army",
+         "playbook": "standard-kingdom"}
 
     `prefer` and `avoid` are plain substrings matched, case-folded, against
     each action's `rel` and `title`. Nothing here changes a `ready`, a `reason`
@@ -1711,6 +2200,13 @@ def load_prefs(path):
     fact — the commander's own judgment rendered back at it, and measurable
     against what it then did.
 
+    `playbook` (2.1) rides the same channel for the same reason, one rung up:
+    it names one of `catalog.playbooks` and the PLAYBOOK section then serves
+    that plan's current step as a fork. Declared, never inferred — the engine
+    has no opinion about which plan you are on, an inferred one would be exactly
+    the opinion this document may not have, and a name that matches nothing in
+    the library is reported in the section rather than dropped.
+
     An unrecognised focus word is IGNORED and said so in `source`, never
     silently dropped: a commander that thinks it is reading a filtered page and
     is not has been lied to by a view.
@@ -1725,11 +2221,16 @@ def load_prefs(path):
             path, focus, "/".join(FOCUS_WORDS)
         )
         focus = None
+    playbook = raw.get("playbook")
     return {
         "doctrine": raw.get("doctrine"),
         "prefer": [str(x).lower() for x in raw.get("prefer") or []],
         "avoid": [str(x).lower() for x in raw.get("avoid") or []],
         "focus": str(focus).lower() if focus else None,
+        # NOT case-folded: a playbook id is a key into a data file, and the
+        # section says so out loud when it matches nothing rather than guessing
+        # which row was meant.
+        "playbook": str(playbook) if playbook else None,
         "source": source,
     }
 
@@ -1862,12 +2363,19 @@ def document(state, catalog=None, prefs=None):
             "note": "silence continues all of this. Nothing below is required.",
         },
         "alarms": alarms,
+        # Between the alarms and the actions, and that order is the fork the
+        # seat faces: what silence does, then what changed under it, then which
+        # plan step you are on, then the whole vocabulary. Alarms stay on top
+        # unconditionally — a plan that could sit above the fact that just broke
+        # it would be the soft enforcement this section exists to refuse.
+        "playbook": playbook_entry(state, catalog, prefs, alarms),
         "actions": actions,
         "preference": {
             "doctrine": (prefs or {}).get("doctrine"),
             "prefer": (prefs or {}).get("prefer") or [],
             "avoid": (prefs or {}).get("avoid") or [],
             "focus": focus,
+            "playbook": (prefs or {}).get("playbook"),
             "source": (prefs or {}).get("source")
             or "none — fact order, fact-collapsed, no declared focus",
         },
@@ -2089,9 +2597,83 @@ def render_document(doc, full=False):
     elif doc["alarms"] is not None:
         lines += ["", "ALARMS none ringing"]
 
+    lines += _render_playbook(doc.get("playbook"))
     lines += _render_actions(doc, full)
     lines += ["", "RAW (rung 4)"]
     lines += ["  " + x for x in _wrap(doc["raw"], 100, "  ")]
+    return lines
+
+
+def _playbook_option_line(i, opt):
+    """One option of the fork, folded like every other line on this page: the
+    tier word, the title, the COMPLETE command, and the reason.
+
+    The command is never clipped — a clipped command is not a command — and the
+    reason is, at a length that still carries a whole sentence. `--all` does not
+    expand this: a fork is already the short form of itself, and the point of
+    the section is that it is readable at loop cadence.
+    """
+    tier = {"continue": "CONTINUE", "exit": "EXIT", "alarm": "ALARM"}.get(opt["kind"], "?")
+    bits = ["{} {}".format(i, tier)]
+    # The continue option's title and reason ARE the step's, printed three lines
+    # above; repeating them here is the one thing a folded page cannot afford.
+    # `--json` keeps both, because a parser pays no line cost.
+    if opt["kind"] != "continue":
+        bits.append(_clip(opt.get("title"), 90))
+    bits.append("send nothing" if opt.get("command") is None else _compact(opt["command"]))
+    if opt.get("note"):
+        bits.append(_clip(opt["note"], 110))
+    if opt.get("why") and opt["kind"] != "continue":
+        bits.append("why: " + _clip(opt["why"], 300))
+    return "    " + " · ".join(b for b in bits if b)
+
+
+def _render_playbook(pb):
+    """The PLAYBOOK section — one line of library, or one fork.
+
+    THE RULE, and the only one that matters: what gets printed is always a set
+    of live options, never a single next action. A step whose `fail_when` holds
+    is re-rendered INVALIDATED with the broken assumption named and the exits
+    moved to the top, alarm-style — anchoring is broken by interrupts, never by
+    disclaimers (docs/AFFORDANCES.md § Playbooks).
+    """
+    if not pb:
+        return []
+    lines = [""]
+    fork = pb.get("fork")
+    if not fork:
+        lines.append("PLAYBOOK {}".format(
+            "'{}' selected".format(pb["selected"]) if pb.get("selected") else "none declared"))
+        for b in pb["library"]:
+            lines.append("  playbooks: {} ({}, {} steps) — {}".format(
+                b["id"], b["race"], b["steps"], b["pitch"]))
+        if pb.get("note"):
+            lines += ["  " + x for x in _wrap(pb["note"], 100, "  ")]
+        return lines
+
+    lines.append("PLAYBOOK {} · step {}/{}{} — {}".format(
+        pb["selected"], fork["n"], fork["of"],
+        " INVALIDATED" if fork["invalidated"] else "", fork["title"]))
+    if fork["invalidated"]:
+        lines += ["  " + x for x in _wrap(
+            "broken assumption: " + (fork["broken_assumption"] or "?"), 100, "  ")]
+    else:
+        lines.append("  you are here: {}".format(
+            "this step is OPEN — " + fork["entry_fact"] if fork["entry_met"]
+            else "NOT OPEN YET — " + fork["entry_fact"]))
+        lines.append("  advance when: {} — {}".format(
+            "MET" if fork["gate_met"] else "NOT YET", fork["gate_fact"]))
+    if pb.get("note"):
+        lines += ["  " + x for x in _wrap(pb["note"], 100, "  ")]
+    lines += ["  " + x for x in _wrap("why: " + (fork["why"] or ""), 100, "  ")]
+    lines.append(
+        "  the fork ({} options — choose one; the exits are first because the step's own "
+        "assumption failed)".format(len(fork["options"]))
+        if fork["invalidated"] else
+        "  the fork ({} options — choose one. Off-book is legal and unflagged, and silence "
+        "runs the DEFAULT above)".format(len(fork["options"])))
+    for i, opt in enumerate(fork["options"], 1):
+        lines.append(_playbook_option_line(i, opt))
     return lines
 
 

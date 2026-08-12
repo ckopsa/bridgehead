@@ -1,0 +1,288 @@
+// ---------------------------------------------------------------------------
+// playbooks.ron — declarative game-plans, as content.
+//
+// A playbook is the wiki build order, in the game, symmetric: strategy shipped
+// through the catalog so both seats discover it identically, authored rather
+// than inferred, advisory rather than enforcing. The engine does not execute
+// any of this. A commander enacts a step by SENDING the step's own command,
+// through the one compiler, exactly as it would send anything else; the only
+// engine code behind this file is a loader and a catalog key. See
+// docs/AFFORDANCES.md § Playbooks and src/shared.rs's `CatalogPlaybook`.
+//
+// THE ANCHORING CONSTRAINT — the rule every step in this file obeys.
+//
+//   Telling a small model "this is what you should try to do" removes its
+//   ability to do anything else. arena/LADDER.md r28: prompted to trust the
+//   document, Haiku did exactly and only that. A playbook ridden past its own
+//   validity is r21's one-long-wrong-continue rebuilt one level up, and it
+//   would be OUR fault rather than the model's.
+//
+//   So a step is never an instruction. It is a FORK: the step's own action,
+//   plus two or three authored alternatives, each with its complete command and
+//   the numbers under it. The anchored-to instruction becomes "choose", which
+//   is a thing a weak model can do well. `exits` and `fail_when` are therefore
+//   first-class fields and the loader refuses a step without them — deviations
+//   authored at leisure, before the anchoring exists.
+//
+// THE FOUR PREDICATE FIELDS, and what each one is asking:
+//
+//   * `entry`     — is this step OPEN yet? (a step you arrive at early)
+//   * `gate`      — may you move ON? The view's "you are here" pointer is the
+//                   first step whose gate does not hold, which makes the
+//                   pointer a fact about the snapshot and not a bookmark: lose
+//                   your army and the pointer walks back to the step that
+//                   builds one.
+//   * `fail_when` — is this step DEAD? When it holds, the document re-renders
+//                   the step INVALIDATED with the broken assumption named and
+//                   the exits on top. Anchoring is broken by interrupts, never
+//                   by disclaimers.
+//
+// All three are ordinary `TriggerWhen` predicates — the same fourteen arms a
+// `trigger_set` takes, minus `base_under_attack`, which a seat's snapshot
+// cannot answer (say it with `enemy_in` on `our base`). One vocabulary, one
+// rule of knowability, no second predicate language.
+//
+// AUTHORING RULES the loader enforces, each because a violation is silent:
+//
+//   * Every command is written in SELECTORS and PLACE NAMES. A playbook is
+//     read hundreds of seconds after it was written, so an entity id in it is
+//     a corpse with a schedule. `units`, `worker`, `building`, `hero` and
+//     `caster` are refused outright, and so is any number the size of an id.
+//   * Every `enemy_in` names ground EVERY map has: `our base`, `their base`,
+//     `mid`, and the four `<compass> mine`s. The fords exist only on
+//     `crossings` — a step that named one would go quiet on `open` and nobody
+//     would notice. (`mid` is the centre on both maps, and on `crossings` the
+//     centre ford sits inside it.)
+//   * Every `why` carries the REASON, in a sentence, the way this project's
+//     refusal messages do. A rule with a reason survives contact with a model
+//     good enough to disagree; a bare rule gets ridden off a cliff or ignored,
+//     and both are worse.
+//
+// The numbers below come from arena/LADDER.md's own findings — r27's
+// tech-without-follow-through, r27/r29's absent early contact, r28's late
+// income answers, r26's push into an empty intel ledger — plus the shipped
+// prices in units.ron / buildings.ron. Retuning them is an edit here (with
+// `BH_DATA_DIR=assets/data`, not even a rebuild); the digest of this file rides
+// in every arena round's `ruleset.constants.playbooks_ron`, so a retune can
+// never be invisible in the comparison it invalidates.
+// ---------------------------------------------------------------------------
+[
+    (
+        id: "standard-kingdom",
+        label: "Standard Kingdom",
+        pitch: "Ten workers, a Barracks before three minutes, eyes on mid before four, a second mine before the first runs dry, and a tier bought only when there is something to spend it on.",
+        race: "kingdom",
+        steps: [
+            (
+                id: "open-economy",
+                title: "Ten workers before anything clever",
+                entry: {"type": "game_time", "at": 0.0},
+                action: {"type": "trigger_set", "name": "worker-pulse", "repeat": 18.0, "when": {"type": "game_time", "at": 0.0}, "then": {"type": "train", "select": "idle TownHall", "unit": "Worker"}},
+                gate: {"type": "unit_count", "kind": "Worker", "count": 10},
+                why: "A worker costs 75 gold and has paid for itself in about ninety seconds, so an idle hall in the first three minutes is compound interest you never get back — and armed as a pulse this costs you nothing per cycle, where hand-queueing each Worker costs a whole poll you could have spent deciding something.",
+                fail_when: {"type": "supply_capped"},
+                exits: [
+                    (
+                        title: "Farm first — buy the supply the pulse is about to eat",
+                        command: {"type": "build", "select": "workers", "kind": "Farm", "region": "our base", "site": "nearest legal site"},
+                        why: "80g/20l is the cheapest thing on the board, and a capped hall trains nothing at any price; if supply_used is within two of supply_cap this is the step and the pulse is not.",
+                    ),
+                    (
+                        title: "Take the free hero now",
+                        command: {"type": "train", "select": "my TownHall", "unit": "Hero"},
+                        why: "Your first hero is free and every one after it is 400g/100l, so the only bad time to take it is later — and it scouts, which is the one thing ten workers cannot do for you.",
+                    ),
+                ],
+            ),
+            (
+                id: "barracks-by-three-minutes",
+                title: "A Barracks in the ground before the third minute",
+                entry: {"type": "unit_count", "kind": "Worker", "count": 6},
+                action: {"type": "build", "select": "workers", "kind": "Barracks", "region": "our base", "site": "nearest legal site"},
+                gate: {"type": "unit_count", "kind": "Footman", "count": 3},
+                why: "r27's winner did not field a combat unit until t=165 and survived only because its mirror was exactly as slow; 160g/60l here is what buys you the ability to answer anything at all, and a plan with no answer in it is a plan that depends on your opponent's manners.",
+                fail_when: {"type": "enemy_in", "region": "our base", "count": 2},
+                exits: [
+                    (
+                        title: "Spearmen instead of Footmen — three bodies for the price of two",
+                        command: {"type": "train", "select": "idle Barracks", "unit": "Spearman"},
+                        why: "90g against 135g: when you are behind on bodies rather than on gold, count is the stat that stops a raid, and you can upgrade the composition later.",
+                    ),
+                    (
+                        title: "Turtle first, build behind the line",
+                        command: {"type": "stance", "squad": 0, "stance": "turtle"},
+                        why: "A Barracks going up in front of somebody already inside your base is 160 gold donated; hold the ring, then put it down thirty seconds later with the same worker.",
+                    ),
+                ],
+            ),
+            (
+                id: "one-squad",
+                title: "Stamp the doctrine once, and every new body inherits it",
+                entry: {"type": "unit_count", "kind": "Footman", "count": 1},
+                action: {"type": "template", "select": "my Barracks", "squad": 1},
+                gate: {"type": "unit_count", "kind": "Footman", "count": 5},
+                why: "A squad outlives its own members and an entity id does not, so stamping the Barracks once means every Footman it ever trains walks out already enrolled and already carrying squad 1's stance — the difference between one command now and one command per unit for the rest of the match.",
+                fail_when: {"type": "squad_below", "id": 1, "frac": 0.35},
+                exits: [
+                    (
+                        title: "Enrol what is already standing",
+                        command: {"type": "squad", "select": "all army", "id": 1},
+                        why: "The template only catches what the Barracks trains from here on; anything already alive is still loose and answers to nobody, which is how an army of six fights as six armies of one.",
+                    ),
+                    (
+                        title: "Rally them somewhere useful while you mass",
+                        command: {"type": "rally", "select": "my Barracks", "region": "our base"},
+                        why: "New units walk to the rally point by themselves, so a gathered squad and a trickle differ by exactly one command that you send exactly once.",
+                    ),
+                ],
+            ),
+            (
+                id: "map-presence",
+                title: "Be standing at mid by the fourth minute",
+                entry: {"type": "game_time", "at": 240.0},
+                action: {"type": "stance", "squad": 1, "stance": "stage", "target": "mid"},
+                gate: {"type": "enemy_sighted", "count": 1},
+                why: "Both r27 seats played a whole 791-second game without meaningful contact and each read the other's passivity as safety; a staged squad at mid is not an attack, it is the cheapest scout you own and the only way a number ever gets into your intel ledger before you need one.",
+                fail_when: {"type": "enemy_army_seen", "size": 8},
+                exits: [
+                    (
+                        title: "Harass instead of stage — their workers, not their army",
+                        command: {"type": "stance", "squad": 1, "stance": "harass", "target": "their base"},
+                        why: "Harass breaks off at 55% and hunts workers first, so it spends your cheap units against their income rather than against their line, which is the trade you want while you are still the smaller army.",
+                    ),
+                    (
+                        title: "Hold home and scout with the hero alone",
+                        command: {"type": "move", "select": "my hero", "region": "mid"},
+                        why: "One hero at mid buys the same sighting for none of the squad, and if your army is the only thing between them and your hall then the sighting is all you can afford to pay for.",
+                    ),
+                ],
+            ),
+            (
+                id: "expand-before-dry",
+                title: "Take the second mine while the first still has gold in it",
+                entry: {"type": "game_time", "at": 300.0},
+                action: {"type": "build", "select": "workers", "kind": "TownHall", "region": "southeast mine", "site": "nearest legal site"},
+                gate: {"type": "unit_count", "kind": "Worker", "count": 16},
+                why: "An expansion begun when the mine runs dry arrives about forty seconds after your income stopped, and both r28 seats' fatal errors were resource judgment of exactly that shape — 385g/205l is a price you pay comfortably now and cannot pay at all later, which is the whole argument.",
+                fail_when: {"type": "enemy_in", "region": "southeast mine", "count": 2},
+                exits: [
+                    (
+                        title: "The other flank instead",
+                        command: {"type": "build", "select": "workers", "kind": "TownHall", "region": "northwest mine", "site": "nearest legal site"},
+                        why: "The two flank mines sit the same distance from both bases, so the only thing that separates them is which one they are standing on — take the other.",
+                    ),
+                    (
+                        title: "Skip the expansion and buy the tier instead",
+                        command: {"type": "upgrade", "select": "my hall"},
+                        why: "320g/160l against 385g/205l: if your first mine is still fat, the Keep turns the same gold into units they cannot answer instead of into more gold you already have.",
+                    ),
+                ],
+            ),
+            (
+                id: "keep",
+                title: "Upgrade the hall — but only because of what comes after it",
+                entry: {"type": "unit_count", "kind": "Worker", "count": 14},
+                action: {"type": "upgrade", "select": "my hall"},
+                gate: {"type": "tier_reached", "tier": 2},
+                why: "r27's Sonnet put a naked Keep down at t=27 with zero army and never bought one tier-2 thing with it, which made 320 gold into a taller building; this upgrade is worth its price only as the first half of the step after it, so do not start it unless you mean to finish it.",
+                fail_when: {"type": "enemy_army_seen", "size": 10},
+                exits: [
+                    (
+                        title: "Workshop first — Raiders and Catapults are tier one",
+                        command: {"type": "build", "select": "workers", "kind": "Workshop", "region": "our base", "site": "nearest legal site"},
+                        why: "140g/100l unlocks Raiders at the Barracks you already own and Catapults for the buildings nothing else of yours can kill, and it never touches the hall.",
+                    ),
+                    (
+                        title: "A second Barracks — one building cannot out-produce two",
+                        command: {"type": "build", "select": "workers", "kind": "Barracks", "region": "our base", "site": "nearest legal site"},
+                        why: "If what you are losing is the unit count, then doubling the rate you make units is 160g/60l and beats any tier you could buy with the same gold.",
+                    ),
+                ],
+            ),
+            (
+                id: "spend-the-tier",
+                title: "Buy something with tier 2 in the same minute you reach it",
+                entry: {"type": "tier_reached", "tier": 2},
+                action: {"type": "build", "select": "workers", "kind": "Sanctum", "region": "our base", "site": "nearest legal site"},
+                gate: {"type": "unit_count", "kind": "Sorcerer", "count": 2},
+                why: "A tier is a shopping list and not a score: 150g/130l of Sanctum turns into Sorcerers that arrive with Slow already on autocast and change how every fight after them resolves, whereas a Keep with nothing behind it is the 4,000-gold float the ladder watched Sonnet sit on for 35 cycles.",
+                fail_when: {"type": "enemy_in", "region": "our base", "count": 3},
+                exits: [
+                    (
+                        title: "Blacksmith, and buy the research",
+                        command: {"type": "build", "select": "workers", "kind": "Blacksmith", "region": "our base", "site": "nearest legal site"},
+                        why: "Weapon Smithing is 100g/50l and applies to every unit you own and every unit you will ever own, which makes it the only purchase in the game that gets better the longer the match runs.",
+                    ),
+                    (
+                        title: "Spend it on bodies, not buildings",
+                        command: {"type": "train", "select": "idle Barracks", "unit": "Footman"},
+                        why: "A tech building that finishes after the fight it was meant for is a building you paid to lose with; if they are already at your ford the answer is Footmen and it is Footmen right now.",
+                    ),
+                ],
+            ),
+            (
+                id: "mass-before-you-push",
+                title: "One squad, ten bodies, a healthy hero — then walk",
+                entry: {"type": "unit_count", "kind": "Footman", "count": 6},
+                action: {"type": "squad", "select": "all army", "id": 1},
+                gate: {"type": "unit_count", "kind": "Footman", "count": 10},
+                why: "r26's red committed thirteen units into twelve defenders on an empty intel ledger, and r23's blue lost its push at four bodies and won the same push at eight; consolidation is the cheapest of the three push gates the document measures and the only one you can fix with a single command.",
+                fail_when: {"type": "hero_below", "frac": 0.5},
+                exits: [
+                    (
+                        title: "Secure the expansion instead of massing for a push",
+                        command: {"type": "stance", "squad": 1, "stance": "secure", "target": "southeast mine"},
+                        why: "Secure holds a 30-radius ring around a mine, its workers and the approach, which is the thing a second base is actually worth defending with rather than a turtle ring around a hall nobody is attacking.",
+                    ),
+                    (
+                        title: "Send what you have at their workers",
+                        command: {"type": "stance", "squad": 1, "stance": "harass", "target": "their base"},
+                        why: "If you cannot win the fight then do not have it — harassment turns a squad too small to push into income they have to stop mining in order to answer.",
+                    ),
+                ],
+            ),
+            (
+                id: "push",
+                title: "Commit, and commit all of it",
+                entry: {"type": "unit_count", "kind": "Footman", "count": 10},
+                action: {"type": "stance", "squad": 1, "stance": "push", "target": "their base"},
+                gate: {"type": "enemy_hero_down"},
+                why: "Push carries no leash and breaks off only at 25% because a squad that flinches at the enemy's ramp has spent the entire walk for nothing; the decision is made here, at arm time, and the one thing that must not happen after it is reinforcements arriving in ones.",
+                fail_when: {"type": "squad_below", "id": 1, "frac": 0.5},
+                exits: [
+                    (
+                        title: "Break off to mid and re-form",
+                        command: {"type": "stance", "squad": 1, "stance": "stage", "target": "mid"},
+                        why: "Stage pulls the survivors into a 10-radius ring and holds them there, which is how a push that went badly becomes an army again instead of a casualty list.",
+                    ),
+                    (
+                        title: "Full recall — your base is worth more than the trade",
+                        command: {"type": "stance", "squad": 1, "stance": "turtle"},
+                        why: "Turtle anchors on your own hall and breaks off at 45%; if their counter-attack is already inside your base then the push is no longer the most expensive thing on the board.",
+                    ),
+                ],
+            ),
+            (
+                id: "castle-and-knights",
+                title: "If it goes long, tier 3 is what breaks the stalemate",
+                entry: {"type": "game_time", "at": 900.0},
+                action: {"type": "upgrade", "select": "my hall"},
+                gate: {"type": "unit_count", "kind": "Knight", "count": 4},
+                why: "Every round of the ladder ended before anybody reached tier 3, so a fifteen-minute game is one nobody in this arena has yet played well: Knights are 270g/60l of cavalry that no tier-1 composition answers, and 480g/240l for the Castle is affordable exactly once a second mine has been running for five minutes.",
+                fail_when: {"type": "enemy_in", "region": "our base", "count": 4},
+                exits: [
+                    (
+                        title: "Gryphons instead — nothing they own shoots up",
+                        command: {"type": "train", "select": "my Workshop", "unit": "GryphonRider"},
+                        why: "280g/120l of Air, and an opponent with no answer to it has to rebuild their whole composition from scratch while you keep flying over the one they had.",
+                    ),
+                    (
+                        title: "A third base rather than a third tier",
+                        command: {"type": "build", "select": "workers", "kind": "TownHall", "region": "northwest mine", "site": "nearest legal site"},
+                        why: "A Castle you can only afford once is worse than two mines you can afford twice; if the thing that is behind is your income, then fix your income.",
+                    ),
+                ],
+            ),
+        ],
+    ),
+]

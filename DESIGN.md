@@ -206,6 +206,7 @@ conflicts loudly (both edited the same record) or not at all.
 | `research.ron` | ladder ids/labels/descriptions, the shared price list, the forge | `ResearchKind::{id,label,description}`, `research_step`, `research_building` |
 | `stances.ron` | `StanceDef` — the posture, ring, leash, retreat threshold, rally and focus list behind each of the five stance words | `StanceKind::def` |
 | `alarms.ron` | `AlarmTuning` — one threshold and one reflex window per `AlarmKind` | `alarm_tuning` |
+| `playbooks.ron` | `CatalogPlaybook` — declarative game-plans: ordered steps with a fog-legal entry, a selector-written command, a gate, one authored reason, a `fail_when` and 1-3 authored exits. The one table that is CONTENT rather than tuning; the engine publishes it through the catalog and executes none of it (docs/AFFORDANCES.md § Playbooks) | `data::playbooks`, `Catalog::playbooks` |
 
 **What is data and what is code.** *Every number and every flag* is data.
 *Identity and rules* stay in Rust:

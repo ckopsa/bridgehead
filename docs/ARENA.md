@@ -99,6 +99,7 @@ diff shows what changed about a round rather than that a dict reordered itself.
       "mine_gold": 5000,                 // a balance value not visible in env
       "alarms_ron": "a773dd4c4f9a",      // content digest of assets/data/alarms.ron
       "stances_ron": "22ef85561d44",     // content digest of assets/data/stances.ron
+      "playbooks_ron": "6f0b1c9d2a44",   // content digest of assets/data/playbooks.ron
       "affordance_doc": "affordance-doc/1"  // only when a seat read the document
     },
     "commit": "c8be188",
@@ -181,7 +182,7 @@ comparisons stay honest.* Five keys carry that, and they are written by
 | `seats[].model` | seat | only on commander seats somebody named a model for | the model id that sat in that chair — `--model red=opus,blue=haiku`. |
 | `ruleset.constants.affordance_doc` | round | only when a seat read the document | `tools/affordances.py`'s `DOC_VERSION` — the media type of the affordance document (`bridge_view.py --doc`). |
 | `seats[].scaffold` | seat | only on the seats that read it | the same version, on the chair it sat in. |
-| `ruleset.constants.alarms_ron`, `.stances_ron` | round | **always** | the first 12 hex of the sha256 of `assets/data/alarms.ron` and `stances.ron`. |
+| `ruleset.constants.alarms_ron`, `.stances_ron`, `.playbooks_ron` | round | **always** | the first 12 hex of the sha256 of `assets/data/alarms.ron`, `stances.ron` and `playbooks.ron`. `playbooks_ron` is the sharpest of the three: it is the digest of authored STRATEGY, which constraint 3 permits in the scaffold only on condition that it is versioned here — and rewriting a build order changes no line of `tools/affordances.py`, so `affordance_doc` cannot see it. |
 | `ruleset.commit` | round | **always**, in a git checkout | `git rev-parse --short HEAD` at launch. Defaulted rather than typed: it was null on every round the runner ever recorded, and it is the only record of which stat tables the binary was compiled with. |
 
 **`model` is free-form and per seat.** Free-form because model ids are somebody
