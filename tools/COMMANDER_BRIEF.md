@@ -1005,7 +1005,7 @@ in front of you beats a sequence written before the match.
 python3 tools/bridge_view.py --doc <SEAT>/state.json          # ~75 lines: read every cycle
 python3 tools/bridge_view.py --doc --all <SEAT>/state.json    # ~650 lines: read once
 python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse; never folded
-python3 tools/bridge_view.py --doc-version                    # affordance-doc/2.0
+python3 tools/bridge_view.py --doc-version                    # affordance-doc/2.1
 ```
 
 The digest tells you **what is going on**. The document tells you **what you can
@@ -1022,8 +1022,9 @@ Five sections, in this order.
 | `properties` | the `--digest` view, embedded verbatim |
 | `default` | **what happens if you send nothing this cycle**, with `command: null` |
 | `alarms` | each ringing alarm, leading with the reflex that already fired |
+| `playbook` | the plan library, and — if you declared one — the fork you are on |
 | `actions` | every link and every form (below) |
-| `preference` | your own declared doctrine and focus, if you declared them |
+| `preference` | your own declared doctrine, focus and playbook, if you declared them |
 
 Plus `doc_version` — the version of this scaffold, which an arena round records
 in its `ruleset` so a result can be read as model+scaffold rather than as model.
@@ -1178,6 +1179,9 @@ The `unit` domain prices every row against your own bank, your own tech and
 (for heroes) your own slots, so a refusal that would have cost a poll cycle
 arrives with the menu instead.
 
+`affordance-doc/2.1` adds the PLAYBOOK section (below) — a declared game-plan
+served as the fork you are on. Additive: no action moved, and a seat that
+declares nothing gets one line advertising the library.
 `affordance-doc/2.0` folds the text render (above) and adds the declared focus
 (below); the action set, the JSON and every command are unchanged, which is why
 the minor half went back to zero and the major half moved.
@@ -1231,6 +1235,71 @@ name, and an arena round can measure it against what you actually did.
 
 An unrecognised word is ignored and the page says so, rather than quietly
 serving you the default while you think you are reading a focused page.
+
+### Playbooks: a build order, in the game (`affordance-doc/2.1`)
+
+A **playbook** is a declarative game-plan that ships with the engine as content
+(`assets/data/playbooks.ron`, published in your `catalog.json` as
+`playbooks[]`). It is the wiki build order, in-game and symmetric: the human
+seat reads the same rows you do, the engine authored none of it, and the engine
+executes none of it either. You enact a step by **sending its command**, through
+the same wire as everything else.
+
+Declare one in the same prefs file the doctrine and focus travel in:
+
+```json
+{"playbook": "standard-kingdom", "focus": "army"}
+```
+
+The page then carries a PLAYBOOK section, between the alarms and the actions:
+
+```
+PLAYBOOK standard-kingdom · step 3/10 — Stamp the doctrine once, and every new body inherits it
+  you are here: this step is OPEN — Footman 3/1
+  advance when: NOT YET — Footman 3/5
+  why: A squad outlives its own members and an entity id does not, so stamping the Barracks once
+    means every Footman it ever trains walks out already enrolled ...
+  the fork (3 options — choose one. Off-book is legal and unflagged, and silence runs the DEFAULT above)
+    1 CONTINUE · {"type":"template","select":"my Barracks","squad":1} · advance when: Footman 3/5
+    2 EXIT · Enrol what is already standing · {"type":"squad","id":1,"select":"all army"} · why: ...
+    3 EXIT · Rally them somewhere useful while you mass · {"type":"rally",...} · why: ...
+```
+
+**THE RULE, and it is the only one that matters: a step is a FORK, never an
+instruction.** Every step ships with two or three authored alternatives beside
+its own command, each with its complete JSON and its reason, and the engine
+refuses at startup to load a step that has none. You are being asked to
+*choose*, not to comply. Going off-book is legal, unflagged, and not reported
+anywhere: the document is a floor, never a ceiling, and that applies to a plan
+as much as to a menu.
+
+Four things to know before you follow one:
+
+- **"You are here" is a fact, not a bookmark.** The pointer is the first step
+  whose `gate` does not hold, recomputed from your snapshot every render. It can
+  move BACKWARDS — lose your army and the plan says the army step is where you
+  are, because it is. Nothing is remembered between cycles and no wire key
+  carries it.
+- **`entry` and `gate` are different questions.** `entry` says whether the step
+  is open (a `game_time` step you have arrived at early reads `NOT OPEN YET`
+  with the clock on the line); `gate` says whether you may move on. Both are
+  ordinary predicates from the fourteen, minus `base_under_attack` — a playbook
+  may only use the ones your own snapshot can answer.
+- **A step can be INVALIDATED, and that is an interrupt.** Every step carries a
+  `fail_when`. When it holds, the section re-renders with `INVALIDATED` in the
+  heading, the broken assumption named in numbers, and the exits moved to the
+  top with the step's own move demoted to last and labelled as being taken on an
+  assumption that has gone. Abandon it. A plan ridden past its own validity is
+  the most expensive thing on this page.
+- **An alarm outranks any plan.** ALARMS stays above PLAYBOOK, always, and a
+  ringing alarm adds one more option to the fork pointing back at it.
+
+`catalog.playbooks[]` is the machine-readable version, with every step's `entry`
+/ `action` / `gate` / `why` / `fail_when` / `exits[]` in full — read it once at
+t=0 if you want the whole plan; the page serves the step you are on.
+`ruleset.constants.playbooks_ron` records which version of the library a round
+was played under, because authored strategy in the scaffold has to be versioned
+for a result to mean anything.
 
 ## Speakable strategy: `tools/intent_compile.py`
 

@@ -147,7 +147,7 @@ layer (constraint 3).
 
 **Shipped** (`wc3clone-0uu.3`) as `tools/affordances.py`, rendered by
 `bridge_view.py --doc` / `--doc --all` / `--doc --json`, versioned
-`affordance-doc/2.0` and
+`affordance-doc/2.1` and
 readable from `bridge_view.py --doc-version`. The wire is untouched: the
 document is composed entirely from `state.json` and `catalog.json`, and the
 only engine change was three additive catalog keys (`stances`, `selectors`,
@@ -190,6 +190,60 @@ hide the fork one just named would be soft enforcement. Because the focus is
 written rather than derived, a persona can declare its transitions as strategy
 — which makes the phase itself something a round can measure against what the
 commander then did.
+
+### Playbooks: strategy as content, served as a fork
+
+**`2.1` — the sequencing layer** (`wc3clone-avn`, after the model ladder).
+Finding 4 decomposed the tiers: the vocabulary held the floor, and what
+separated a Fable from a Haiku was *judgment* — Sonnet reached tier 2 at t=27
+and never bought anything with it, two mirrors played 791 seconds without
+contact, both r28 seats died of resource judgment rather than protocol. None of
+that is a rendering failure, so no rendering change fixes it. What can be
+shipped is **sequencing**: `assets/data/playbooks.ron` holds declarative
+game-plans, published through `catalog.playbooks` so both seats discover them
+identically, and the document serves the CURRENT step above the ordinary menu.
+
+This is legitimate under constraint 3 and only under constraint 3: it is
+authored judgment in the scaffold, so it is versioned in the round's ruleset
+(`ruleset.constants.playbooks_ron` joins `alarms_ron` and `stances_ron`). It is
+content, not code — the engine publishes a playbook and executes none of it; a
+commander enacts a step by sending its command through the one compiler, like
+any other intent, so there is no second mutation path and no new engine state.
+
+**The anchoring constraint is the whole design, and it is a hard requirement.**
+Telling a small model "this is what you should try to do" removes its ability to
+do anything else — r28, prompted to trust the document, did exactly and only
+what the document said. A playbook ridden past its own validity is r21's one
+long wrong continue rebuilt one level up, and this time it would be the
+scaffold's fault. So three rules, each structural rather than advisory:
+
+1. **Never serve an instruction — serve a fork.** Every step renders as 2–4 live
+   options: the step's own action, its authored alternatives, and any ringing
+   alarm, each with its complete command and the numbers under it. The
+   anchored-to instruction becomes *choose*, which weak models do well.
+2. **Exits are first-class, authored fields.** Each step carries `fail_when` (a
+   fog-legal predicate) and `exits[]` beside its `gate` — the counter-punch move
+   generalized: deviations written at leisure, before the anchoring exists. The
+   loader refuses a step without them.
+3. **Invalidation is a structural interrupt.** When `fail_when` holds the step
+   re-renders INVALIDATED with the broken assumption named in numbers and the
+   exits on top, alarm-style. Anchoring is broken by interrupts, never by
+   disclaimers — the evidence being that r27's blue cleared its own conflicting
+   trigger within one cycle of an alarm naming it, and r28 answered both income
+   collapses.
+
+Two smaller properties follow from the same reasoning. **"You are here" is a
+fact, not a bookmark** — the pointer is the first step whose gate does not hold,
+recomputed from the seat's own snapshot every render, so it can walk backwards
+when the facts do and nothing is remembered between cycles. And **selection is
+declared, never inferred**, riding the `--prefs` file beside `focus` for exactly
+the reason that channel exists: an inferred plan would be an opinion.
+
+The predicate vocabulary is the trigger vocabulary minus `base_under_attack`,
+which no snapshot key can answer — the view would have to guess, and a pointer
+that moves on a guess is worse than no pointer. The Rust loader and the Python
+evaluator pin the same list from both ends, so they cannot drift without one of
+them failing.
 
 ### Chains: stance plans with late-bound references
 
