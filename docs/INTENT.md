@@ -1004,6 +1004,24 @@ In the engine the pair is one resource with one setter (`GameOver::decide(winner
 reason)`), so a winner with no reason is unrepresentable rather than merely unlikely.
 The human's banner sub-line and the headless exit log print the same two words.
 
+**A third reason, and the one value of `game_over` that is not a team.** The time cap
+(`BH_MAX_GAME_SECS`) used to stop the process without ending the match, so a capped
+round left every bridged seat reading `game_over: null` forever and the documented poll
+loop never terminated (`wc3clone-j84`; `wc3clone-0i9` had just fixed the same hang for
+the other two endings). The cap now decides through the same setter, with
+`GameOverReason::Score` — bank plus the worth of everything still standing, which is the
+comparison the timeout has always made and the one `arena_run.py` records. That leaves
+the tie, which is the one ending a poller cannot survive as a silence: on the wire only,
+a dead-even cap is `game_over: "draw"`. The ledger keeps docs/ARENA.md's spelling (a draw
+is an absent winner) and `arena_run.py` translates at the boundary — the wire's job is to
+end the loop, the record's job is to name nobody.
+
+Splitting "the match is over" from "somebody won" is the rest of that change:
+`GameOver::decided()` is what every gate in the game asks now, and `winner` is asked only
+by the things that print a name. They were the same question for as long as a draw was
+impossible, and a draw that ended the match in the snapshot while the UI still took
+orders is precisely the two-readers-of-one-fact bug docs/FOG.md is written against.
+
 ### One sentence standing for four failures
 
 *`wc3clone-d4y`, round 10.* `{"type":"cast","hero":<expansion TownHall id>,

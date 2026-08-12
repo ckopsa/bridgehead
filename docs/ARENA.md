@@ -131,11 +131,22 @@ diff shows what changed about a round rather than that a dict reordered itself.
 
 ### Notes on the vocabulary
 
-- **`razed` and `surrender` are the engine's own two endings** (`shared.rs`,
-  `GameOverReason`). **`score`** is the headless time-cap verdict — a referee's
+- **`razed` and `surrender` are the engine's own two wins** (`shared.rs`,
+  `GameOverReason`). **`score`** is the time-cap verdict — a referee's
   opinion, not a win the game recognises, named differently so it can never be
   quoted as one. **`none`** is a round that stopped without ending.
 - **A draw is an absent winner**, not a sentinel team. Round 2 is the reason.
+- **The engine now *records* the score verdict rather than only printing it**
+  (`wc3clone-j84`). A capped round ends the match the same way a raze does —
+  `GameOver::decide`, both seats' final `state.json`, `game_over_reason:
+  "score"` — because a commander's poll loop terminates on `game_over` and a
+  round that merely stopped left every bridged seat waiting on a file nobody
+  would write again. Two things did **not** change: `decisive` is still
+  `false` for a `score` round, and the winner is still whoever `asset_score`
+  had ahead when the cap expired. The engine and the ledger reach that verdict
+  from the same numbers, so `arena_run.py` records the round it always did.
+  On the wire only, a dead-even cap is spelled `game_over: "draw"` — the poll
+  loop needs a value there; the ledger keeps the absent winner.
 - **`duration_s` is game seconds.** Wall time is a property of the hardware and
   `BH_SPEED`; every AAR in the series is written in game seconds.
 - **`persona` on a scripted seat is the literal string `scripted`.** "This seat
