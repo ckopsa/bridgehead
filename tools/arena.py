@@ -247,6 +247,16 @@ def validate(rec: dict) -> list[str]:
             or (isinstance(seat["scaffold"], str) and seat["scaffold"].strip() != ""),
             f"{where}.scaffold must be a non-empty version string when present",
         )
+        # `playbook` — the strategy library the seat's starter prefs declared
+        # (opt-out since the second ladder; LADDER2.md Finding 2). A round
+        # played with the book open is a different experiment from one
+        # played off-book, and both are different from one where the seat
+        # opted out mid-match — the ledger records what was DECLARED.
+        want(
+            "playbook" not in seat
+            or (isinstance(seat["playbook"], str) and seat["playbook"].strip() != ""),
+            f"{where}.playbook must be a non-empty id when present",
+        )
         # `model` — WHICH MODEL sat in this chair. The other half of the pair
         # docs/AFFORDANCES.md constraint 3 names: "an arena result measures
         # model+scaffold", and until this key existed the ledger recorded the

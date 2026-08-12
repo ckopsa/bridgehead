@@ -449,6 +449,16 @@ def prepare_seats(seats: list[dict], root: Path, reuse: bool) -> list[Path]:
             path.mkdir(parents=True)
             created.append(path)
         seat["dir"] = str(path)
+        # The starter prefs file: opt-OUT strategy content. A scaffolded seat
+        # begins with the playbook declared and may edit or delete the file —
+        # both ladders showed the seats that most needed the content never
+        # wrote the declaration themselves (LADDER2.md, Finding 2), and
+        # AFFORDANCES.md's preference channel says the commander OR ITS
+        # PERSONA declares; the runner writes on the persona's behalf.
+        if seat.get("playbook") and seat["playbook"] != "none":
+            prefs = path / "prefs.json"
+            if not prefs.exists():
+                prefs.write_text(json.dumps({"playbook": seat["playbook"]}))
     return created
 
 
@@ -668,8 +678,8 @@ def build_record(args, seats: list[dict], env: dict, verdict: dict) -> dict:
             k: v
             for k, v in s.items()
             if k in ("seat", "team", "kind", "persona", "prompt", "model",
-                     "scaffold", "ready_wait_s")
-            and not (k in ("prompt", "model", "scaffold") and v is None)
+                     "scaffold", "playbook", "ready_wait_s")
+            and not (k in ("prompt", "model", "scaffold", "playbook") and v is None)
         }
         for s in seats
     ]
@@ -707,6 +717,12 @@ def main(argv: list[str] | None = None) -> int:
                         "seats[].model — an arena result measures model+scaffold "
                         "and this is the half the ledger used to leave to a "
                         "commit message")
+    p.add_argument("--playbook", default="standard-kingdom", metavar="ID",
+                   help="playbook declared in every SCAFFOLDED seat's starter prefs "
+                        "file at creation — opt-OUT, because two ladders showed "
+                        "opt-in never reaches the tiers the content was written "
+                        "for (arena/LADDER2.md, Finding 2). 'none' writes no "
+                        "prefs file. Lands in seats[].playbook")
     p.add_argument("--map", default="open", choices=list(arena.MAPS))
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--cap", type=float, default=1800.0, help="BH_MAX_GAME_SECS; 0 for none")
@@ -745,6 +761,11 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as err:
             print(f"error: {err}", file=sys.stderr)
             return 2
+
+    if args.playbook and args.playbook != "none":
+        for seat in seats:
+            if seat.get("scaffold"):
+                seat["playbook"] = args.playbook
 
     if args.model:
         try:
@@ -804,6 +825,9 @@ def main(argv: list[str] | None = None) -> int:
     scaffolded = [s["side"] for s in seats if s.get("scaffold")]
     if scaffolded:
         print(f"  doc:    {' '.join(scaffolded)} read tools/bridge_view.py --doc --all once at t=0, --doc each cycle")
+        books = sorted({s.get("playbook") for s in seats if s.get("playbook")})
+        if books:
+            print(f"  book:   starter prefs declare {', '.join(books)} (opt-out — the seat may edit prefs.json)")
     print(f"  binary: {args.bin}")
     print(f"  out:    {out_dir}")
     if args.dry_run:

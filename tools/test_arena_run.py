@@ -689,6 +689,53 @@ def test_a_seat_that_never_readied_carries_no_ready_wait_into_the_ledger():
     assert not any("ready_wait_s" in u for u in rec["unknown"])
 
 
+def test_a_scaffolded_seat_gets_the_starter_prefs_file(tmp_path=None):
+    """Opt-out strategy content: the seat begins with the playbook declared
+    (LADDER2.md Finding 2 — opt-in never reached the tiers it was written
+    for), and may edit or delete prefs.json itself."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        seats = [
+            {"side": "red", "seat": "bridge/red", "kind": "commander",
+             "persona": "standard", "scaffold": "affordance-doc/2.1",
+             "playbook": "standard-kingdom"},
+            {"side": "blue", "seat": "bridge/blue", "kind": "commander",
+             "persona": "standard"},
+        ]
+        arena_run.prepare_seats(seats, root, reuse=False)
+        declared = json.loads((root / "red" / "prefs.json").read_text())
+        assert declared == {"playbook": "standard-kingdom"}
+        assert not (root / "blue" / "prefs.json").exists(), \
+            "an unscaffolded seat is not handed the book"
+
+
+def test_playbook_none_writes_no_prefs():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        seats = [{"side": "red", "seat": "bridge/red", "kind": "commander",
+                  "persona": "standard", "scaffold": "affordance-doc/2.1",
+                  "playbook": "none"}]
+        arena_run.prepare_seats(seats, root, reuse=False)
+        assert not (root / "red" / "prefs.json").exists()
+
+
+def test_an_existing_prefs_file_is_never_clobbered():
+    """--reuse-seat keeps a commander's own edits; the starter is a default,
+    not an enforcement."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "red").mkdir(parents=True)
+        (root / "red" / "prefs.json").write_text('{"playbook": "my-own"}')
+        seats = [{"side": "red", "seat": "bridge/red", "kind": "commander",
+                  "persona": "standard", "scaffold": "affordance-doc/2.1",
+                  "playbook": "standard-kingdom"}]
+        arena_run.prepare_seats(seats, root, reuse=True)
+        assert json.loads((root / "red" / "prefs.json").read_text()) == {"playbook": "my-own"}
+
+
 def _run():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
