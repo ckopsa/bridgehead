@@ -1189,6 +1189,43 @@ mod tests {
         );
     }
 
+    /// The `near_home == 0` branch, which had no test (wc3clone-6qt).
+    ///
+    /// A hall with no mine in reach of it is a *different sentence* from a hall
+    /// whose mines have run out, and the difference is the whole advice: the
+    /// second team should expand, the first one built in the wrong place (or
+    /// has just lost the hall that was near the gold). `live_mines == 0` is
+    /// true in both, so without this the branch could have said "the one gold
+    /// mine your hall works is dry" about a mine that does not exist.
+    #[test]
+    fn a_hall_with_no_mine_in_reach_says_so_rather_than_calling_nothing_dry() {
+        let mut app = alarm_app();
+        spawn_building(&mut app, Team::Human, BuildingKind::TownHall, Vec3::ZERO);
+        // A gold node on the map, but far outside `MINE_HOME_RADIUS` — so the
+        // alarm counts zero mines near home rather than zero mines at all.
+        app.world_mut().spawn((
+            ResourceNode {
+                kind: ResourceKind::Gold,
+                remaining: 5000,
+            },
+            Transform::from_translation(Vec3::new(MINE_HOME_RADIUS * 3.0, 0.0, 0.0)),
+        ));
+
+        run_for(&mut app, alarm_tuning(AlarmKind::IncomeCollapse).grace_s + 2.0);
+        let alarm = alarm_of(&app, Team::Human, AlarmKind::IncomeCollapse)
+            .expect("a hall with no mine in reach has no income");
+        assert!(
+            alarm.fact.contains("no gold mine is in reach of any of your halls"),
+            "{}",
+            alarm.fact
+        );
+        assert!(
+            !alarm.fact.contains("dry"),
+            "nothing ran dry — there was never a mine here: {}",
+            alarm.fact
+        );
+    }
+
     #[test]
     fn a_team_with_no_hall_gets_no_income_alarm() {
         let mut app = alarm_app();

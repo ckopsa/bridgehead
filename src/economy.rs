@@ -1816,11 +1816,94 @@ fn build_sites(
 // 4. Harvest loop
 // ---------------------------------------------------------------------------
 
+/// Every standing (completed) building, which is how the harvest loop finds a
+/// drop-off point and how it decides whose mine just ran out. Named because two
+/// things now take it.
+type HallQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Transform,
+        &'static Team,
+        &'static Building,
+    ),
+    Without<UnderConstruction>,
+>;
+
+/// **A mine your hall works has hit zero.** One line, once, on the owning
+/// team's own feed.
+///
+/// r23's ask, finished. The level has been right since a dry mine stopped
+/// being despawned — `mines[].remaining` reads `0` in every snapshot from here
+/// on, `TriggerWhen::MineDry` sees it, `income_alarm` counts it. What none of
+/// those is, is an *interruption*: a commander parked in `bridge_wait` learns
+/// its income ended whenever it next looks, which for an LLM seat is the length
+/// of one whole decision. Levels are status, transitions are events
+/// (BUILDER_BRIEF §6.11), and this transition happens exactly once in a match
+/// per mine, in the one statement that takes the last gold out of it.
+///
+/// **There is no clearing edge and none is owed.** The rule in §6.11 is that an
+/// entry edge obliges an exit edge because the reader would otherwise have to
+/// poll to learn it recovered. A mine does not recover: `remaining` is
+/// monotonically decreasing and zero is terminal, so there is nothing to wait
+/// for and nothing to poll. What *can* recover is the income, and that is the
+/// `IncomeCollapse` alarm's business — it already raises and clears on its own
+/// grace window.
+///
+/// **"Yours" is geometry**, the same definition `TriggerWhen::MineDry` and
+/// `alarm::income_alarm` use: a completed hall of yours inside
+/// `MINE_HOME_RADIUS`. Mines are neutral; the hall you placed to work one is
+/// the only honest reading of the mine you are losing. Both teams can qualify
+/// for one mine (two expansions on one hole), and both are told, each on its
+/// own feed — pushed to a team about that team's own hall, never to
+/// `team.enemy()`.
+///
+/// Fog-legal by construction, and doubly so. The fact is about your own
+/// building's neighbourhood, and the underlying number is public geography
+/// anyway: bridge.rs ships `mines` (position and remaining) unfiltered to both
+/// seats, as its header says. This event hands out no fact a snapshot did not
+/// already carry; it changes only *when* the reader finds out.
+fn announce_mine_dry(feed: &mut GameEvents, halls: &HallQuery, pos: Vec3, now: f32) {
+    // A fixed team order, not the query's: two lines minted in one statement
+    // must take their `seq` in the same order on every run of one seed.
+    for team in [Team::Human, Team::Claude] {
+        let works_it = halls.iter().any(|(hall_tf, hall_team, building)| {
+            *hall_team == team
+                && is_hall(building.kind)
+                && xz_dist(hall_tf.translation, pos) <= MINE_HOME_RADIUS
+        });
+        if !works_it {
+            continue;
+        }
+        feed.push(
+            team,
+            now,
+            format!("the {} your hall works has run dry", mine_place_name(pos)),
+            // Warning and not Critical: your income just took a real cut, which
+            // is the severity's own definition ("something of yours is being
+            // spent"), but nothing is burning and the answer — expand, or move
+            // the crew — is a decision rather than a reflex.
+            EventSeverity::Warning,
+            Some(pos),
+        );
+    }
+}
+
 fn harvest_loop(
     time: Res<Time>,
     mut commands: Commands,
     mut nav: ResMut<NavGrid>,
     mut economies: ResMut<Economies>,
+    // The exhaustion EDGE (shared.rs § "Levels are status; transitions are
+    // events"). `mines[].remaining` is the level and it was always there; this
+    // is the once-ever transition, so a seat asleep in `bridge_wait` wakes on
+    // the frame its income ended instead of on its next poll.
+    //
+    // A third writer of `GameEvents` after `announce_bounty_claims` and
+    // `produce_game_events`, and `seq` stays deterministic without a new edge
+    // because this one is in `SimSet::Economy`, which `SIM_ORDER` already
+    // chains ahead of `SimSet::Feed` where both of those live.
+    mut feed: ResMut<GameEvents>,
     assets: Res<EconomyAssets>,
     mut workers: Query<(
         Entity,
@@ -1832,7 +1915,7 @@ fn harvest_loop(
         Option<&CarryVisual>,
     )>,
     mut nodes: Query<(Entity, &mut ResourceNode, &Transform)>,
-    halls: Query<(&Transform, &Team, &Building), Without<UnderConstruction>>,
+    halls: HallQuery,
     hostiles: Query<(&Transform, &Team, &Unit)>,
 ) {
     let dt = time.delta_secs();
@@ -2010,6 +2093,7 @@ fn harvest_loop(
                         // exactly as before.
                         ResourceKind::Gold => {
                             commands.entity(node_e).despawn_related::<Children>();
+                            announce_mine_dry(&mut feed, &halls, node_pos, time.elapsed_secs());
                         }
                     }
                     job.node = None;
@@ -2863,8 +2947,28 @@ mod tests {
             .init_resource::<NavGrid>()
             .init_resource::<Economies>()
             .init_resource::<EconomyAssets>()
+            .init_resource::<GameEvents>()
             .add_systems(Update, harvest_loop);
         app
+    }
+
+    /// Every line on one team's feed, oldest first.
+    fn feed_lines(app: &App, team: Team) -> Vec<String> {
+        app.world()
+            .resource::<GameEvents>()
+            .feed(team)
+            .iter()
+            .map(|e| e.message.clone())
+            .collect()
+    }
+
+    fn spawn_hall(app: &mut App, team: Team, at: Vec3) {
+        app.world_mut().spawn((
+            Building { kind: BuildingKind::TownHall },
+            team,
+            Transform::from_translation(at),
+            Health::new(1500.0),
+        ));
     }
 
     fn spawn_node(app: &mut App, kind: ResourceKind, remaining: u32, pos: Vec3) -> Entity {
@@ -2956,12 +3060,7 @@ mod tests {
         // to work, well inside `MINE_HOME_RADIUS`.
         let hall = Vec3::new(-66.0, 0.0, -66.0);
         let at_mine = Vec3::new(-60.0, 0.0, -60.0);
-        app.world_mut().spawn((
-            Building { kind: BuildingKind::TownHall },
-            Team::Human,
-            Transform::from_translation(hall),
-            Health::new(1500.0),
-        ));
+        spawn_hall(&mut app, Team::Human, hall);
         let mine = spawn_node(&mut app, ResourceKind::Gold, CARRY_AMOUNT, at_mine);
         swinging_at(&mut app, Team::Human, mine, ResourceKind::Gold, at_mine);
 
@@ -2994,6 +3093,97 @@ mod tests {
         assert!(
             !app.world().resource::<Triggers>().get(Team::Human)[0].armed,
             "a once-trigger spends itself when it fires"
+        );
+    }
+
+    /// **The edge, not just the level** (wc3clone-q90, r23's AAR).
+    ///
+    /// The mine reading `0` is a status a reader has to go and look at. The
+    /// moment it hits zero is an interruption, and it is the interruption that
+    /// wakes `bridge_wait` — which is the whole point, because the commander
+    /// this was written for was asleep in exactly that call while its income
+    /// ended.
+    #[test]
+    fn a_mine_your_hall_works_announces_the_moment_it_runs_dry() {
+        let mut app = app_with_harvest();
+        let at_mine = Vec3::new(-60.0, 0.0, -60.0);
+        spawn_hall(&mut app, Team::Human, Vec3::new(-66.0, 0.0, -66.0));
+        let mine = spawn_node(&mut app, ResourceKind::Gold, CARRY_AMOUNT * 2, at_mine);
+        swinging_at(&mut app, Team::Human, mine, ResourceKind::Gold, at_mine);
+
+        // Two loads, so the level falls before it hits the floor — and while
+        // it is merely falling, nothing is said. A mine with gold in it is not
+        // news. (The whole gather/deliver/return cycle runs, which is why this
+        // counts frames rather than assuming a fixed number of them.)
+        let mut emptied = false;
+        for step in 0..12 {
+            let left = app.world().get::<ResourceNode>(mine).map_or(0, |n| n.remaining);
+            if left == 0 {
+                emptied = true;
+                break;
+            }
+            assert!(
+                feed_lines(&app, Team::Human).is_empty(),
+                "step {step}: {left}g still in the ground is not an event: {:?}",
+                feed_lines(&app, Team::Human)
+            );
+            tick(&mut app, GATHER_TIME + 0.1);
+        }
+        assert!(emptied, "the worker never emptied the mine");
+
+        assert_eq!(
+            feed_lines(&app, Team::Human),
+            vec!["the southwest mine your hall works has run dry".to_string()],
+            "the transition to zero is announced once, naming the place"
+        );
+
+        // And it stays once. The mine is still on the board reading `0`, so a
+        // level-triggered producer would re-say this every frame forever.
+        tick(&mut app, GATHER_TIME * 3.0);
+        assert_eq!(
+            feed_lines(&app, Team::Human).len(),
+            1,
+            "an edge fires on the transition, not for as long as it is true"
+        );
+    }
+
+    /// Whose mine it was is geometry, and the enemy is not told. A hall of
+    /// theirs forty units away would earn them their own line; a hall across
+    /// the map earns them nothing, because the mine they are losing is the one
+    /// their hall was placed to work.
+    #[test]
+    fn the_exhaustion_line_goes_to_the_hall_that_works_the_mine_and_no_further() {
+        let mut app = app_with_harvest();
+        let at_mine = Vec3::new(-60.0, 0.0, -60.0);
+        spawn_hall(&mut app, Team::Human, Vec3::new(-66.0, 0.0, -66.0));
+        spawn_hall(&mut app, Team::Claude, Vec3::new(66.0, 0.0, 66.0));
+        let mine = spawn_node(&mut app, ResourceKind::Gold, CARRY_AMOUNT, at_mine);
+        swinging_at(&mut app, Team::Human, mine, ResourceKind::Gold, at_mine);
+
+        tick(&mut app, GATHER_TIME + 0.1);
+
+        assert_eq!(feed_lines(&app, Team::Human).len(), 1, "our mine, our news");
+        assert!(
+            feed_lines(&app, Team::Claude).is_empty(),
+            "the enemy's halls are nowhere near it: {:?}",
+            feed_lines(&app, Team::Claude)
+        );
+    }
+
+    /// A tree is not geography and nobody is told about one.
+    #[test]
+    fn a_felled_tree_is_not_an_event() {
+        let mut app = app_with_harvest();
+        let at_tree = Vec3::new(-62.0, 0.0, -62.0);
+        spawn_hall(&mut app, Team::Human, Vec3::new(-66.0, 0.0, -66.0));
+        let tree = spawn_node(&mut app, ResourceKind::Lumber, CARRY_AMOUNT, at_tree);
+        swinging_at(&mut app, Team::Human, tree, ResourceKind::Lumber, at_tree);
+
+        tick(&mut app, GATHER_TIME + 0.1);
+
+        assert!(
+            feed_lines(&app, Team::Human).is_empty(),
+            "there are thousands of trees; a stump is not a fact anybody reasons about"
         );
     }
 }

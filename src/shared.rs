@@ -6739,11 +6739,7 @@ pub fn builtin_places(team: Team) -> Vec<Region> {
         Region::new("mid", Vec3::ZERO, BUILTIN_MID_RADIUS),
     ];
     for pos in GOLD_MINE_POSITIONS {
-        out.push(Region::new(
-            format!("{} mine", compass_word(pos)),
-            pos,
-            BUILTIN_MINE_RADIUS,
-        ));
+        out.push(Region::new(mine_place_name(pos), pos, BUILTIN_MINE_RADIUS));
     }
     for choke in crate::terrain::active_map().chokepoints() {
         // The ford's own opening is the honest radius: `width` is how wide the
@@ -6765,6 +6761,22 @@ pub fn builtin_places(team: Team) -> Vec<Region> {
 /// names `northwest mine` is the mine that tool hands back for the words
 /// "northwest mine". The map's own convention (bases on the SW→NE diagonal,
 /// west is -x, north is +z) is read off terrain.rs's ford names.
+/// What a gold mine is CALLED — `"north mine"`.
+///
+/// The one producer of the four mine names. [`builtin_places`] offers them as
+/// regions a commander may type, `intent_compile.py`'s `pick_mine` resolves
+/// the same words, and economy.rs's exhaustion event names the hole in the
+/// ground it is about with them. A second spelling of "the mine at (-60, -60)"
+/// would be a second vocabulary for one place, which is the drift docs/FOG.md
+/// and docs/INTENT.md both spend their length preventing.
+///
+/// Positional, not a lookup: it takes the nearest compass anchor, so a node
+/// that is not one of [`GOLD_MINE_POSITIONS`] still gets a name rather than a
+/// panic or a coordinate.
+pub fn mine_place_name(p: Vec3) -> String {
+    format!("{} mine", compass_word(p))
+}
+
 fn compass_word(p: Vec3) -> &'static str {
     const ANCHORS: [(&str, f32, f32); 8] = [
         ("west", -65.0, 0.0),
