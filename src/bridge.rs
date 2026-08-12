@@ -1282,6 +1282,21 @@ struct SquadOut {
     /// `defend` whenever it is missing.
     posture: Option<String>,
     members: usize,
+    /// **The stance word this squad is holding**, when one put it there —
+    /// `"turtle"`, `"stage"`, `"push"`, `"secure"`, `"harass"`. Absent for a
+    /// squad whose posture was set by hand, which is the honest answer rather
+    /// than a missing one: those four verbs are still available and a squad
+    /// under them is genuinely in no stance.
+    ///
+    /// This is the key the whole feature is steered by. A commander that says
+    /// nothing reads its own stance back in the next snapshot and knows what its
+    /// army is still doing — silence continues the stance rather than dissolving
+    /// it, so the answer to "what am I doing?" survives a poll with no command.
+    ///
+    /// Additive and skipped when absent, so a match that never sends a `stance`
+    /// produces a byte-identical snapshot to the one that shipped before it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stance: Option<&'static str>,
 }
 
 /// One armed trigger, as its owner reads it back.
@@ -1775,6 +1790,9 @@ struct MatchState<'w> {
 #[derive(SystemParam)]
 struct StandingOrders<'w> {
     squads: Res<'w, SquadOrders>,
+    /// The stance word behind each squad's posture, travelling with the posture
+    /// it produced so `SquadOut` cannot report one without the other.
+    stances: Res<'w, SquadStances>,
     triggers: Res<'w, Triggers>,
     /// The third store on the same rule: written only by the intent compiler's
     /// two `region_*` verbs, read here and in the HUD, and it answers the same
@@ -1863,6 +1881,7 @@ fn write_snapshot(
             &match_state.over,
             &match_state.ready,
             &standing.squads,
+            &standing.stances,
             standing.triggers.get(seat.team),
             standing.regions.get(seat.team),
             standing.plans.get(seat.team),
@@ -1897,6 +1916,10 @@ fn write_seat_snapshot(
     // the two optional keys at the top of `StateOut`; see `shared::ReadyGate`.
     ready: &ReadyGate,
     squad_orders: &SquadOrders,
+    // The stance word behind those postures, when one put it there. Whole
+    // resource rather than pre-sliced because it is keyed by `(team, squad)`
+    // exactly like `squad_orders` beside it, and the two are read together.
+    squad_stances: &SquadStances,
     // This seat's own armed triggers. Passed pre-sliced by team rather than as
     // the whole resource, so this function cannot read the opponent's plans
     // even by accident.
@@ -2219,6 +2242,7 @@ fn write_seat_snapshot(
             id,
             posture: squad_orders.0.get(&(me, id)).map(posture_name),
             members: members.get(&id).copied().unwrap_or(0),
+            stance: squad_stances.0.get(&(me, id)).map(|s| s.word()),
         })
         .collect();
 
@@ -3180,6 +3204,49 @@ mod tests {
         let json = serde_json::to_string(&plans_out(std::slice::from_ref(&running))).unwrap();
         let back: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(back[0]["status"], "blocked: not enough gold (need 160, have 120)");
+    }
+
+    /// **The snapshot echoes the stance, and only when there is one.**
+    ///
+    /// Two claims in one test, and the second is the compatibility one. A squad
+    /// in a stance carries the word, so a commander that says nothing next poll
+    /// reads back what its army is still doing — that echo is what makes
+    /// persistence usable rather than merely true. A squad that is not in one
+    /// carries **no key at all**, so a match that never sends a `stance`
+    /// produces a `squads[]` byte-identical to the one that shipped before the
+    /// feature existed. `skip_serializing_if` is doing that, and a `null` here
+    /// would quietly break every reader that pins the shape.
+    #[test]
+    fn a_squads_stance_rides_the_snapshot_without_disturbing_the_old_shape() {
+        let stanced = SquadOut {
+            id: 1,
+            posture: Some("push@(60,60)".to_string()),
+            members: 6,
+            stance: Some(StanceKind::Push.word()),
+        };
+        let hand_tasked = SquadOut {
+            id: 2,
+            posture: Some("defend@(-70,-70)r=22".to_string()),
+            members: 3,
+            stance: None,
+        };
+        let json =
+            serde_json::to_string(&vec![stanced, hand_tasked]).expect("squads serialize");
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parses");
+
+        assert_eq!(back[0]["stance"], "push");
+        // The historical keys are untouched beside it.
+        assert_eq!(back[0]["id"], 1);
+        assert_eq!(back[0]["members"], 6);
+        assert_eq!(back[0]["posture"], "push@(60,60)");
+
+        let plain: std::collections::BTreeSet<&str> =
+            back[1].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            plain,
+            ["id", "members", "posture"].into_iter().collect(),
+            "a squad in no stance must serialize exactly as it always did"
+        );
     }
 
     /// **The veto reason, end to end on the wire.** The human's answer is

@@ -264,7 +264,53 @@ slot's `unlocked`, `ready`, `cd` and, while locked, `requires: "hero level 5"`.
 | `autocast` | `{units:[id], min_enemies:3, ability?}` — any own caster | `min_enemies` 0/absent |
 | `squad` | `{units:[id], id:1}` | `id` absent |
 | `posture` | `{id:1, posture:{type:"defend"\|"push"\|"escort"\|"forage", …}}` | `posture` absent |
+| `stance` | `{squad:1, stance:"turtle"\|"stage"\|"push"\|"secure"\|"harass", target?\|x,z?}` | never — see § Stances |
 | `template` | `{building:id, squad, retreat, priority, autocast}` | all pieces absent |
+
+#### Stances — five words for the seven verbs above
+
+A stance is a **fixed, engine-defined bundle** of `posture` + anchor + `leash` +
+`retreat` + `priority`, set in one sentence. It adds no capability: the arm
+writes the same `SquadOrders` entry and the same three components those verbs
+write, so `doctrine.rs` cannot tell a stanced squad from a hand-tuned one, and a
+stance can never acquire a behaviour the individual verbs lack. Its numbers are
+rows in `assets/data/stances.ron`; its five *words* are a `StanceKind` enum,
+because a fixed vocabulary both seats and the arena ledger speak is identity.
+
+Four properties are the design, and each answers a failure the arena produced
+(docs/AFFORDANCES.md § Stances; arena rounds r21–r23):
+
+1. **The default is persistence.** Nothing in the engine ever clears a stance.
+   A commander that says nothing for ninety seconds still has the stance it set
+   and the engine is still executing it — silence is a policy, not a gap. r21
+   lost a match to the opposite: 98 seconds in which nothing continued the last
+   decision because nothing was written down as continuing.
+2. **`squads[].stance` echoes it**, which is what makes persistence *usable*
+   rather than merely true: "what is my army doing?" is answerable from the
+   snapshot instead of from memory. Additive key, `skip_serializing_if`, so a
+   match that never sends a `stance` writes a byte-identical `squads[]`.
+3. **Switching replaces the bundle atomically.** Absent pieces REMOVE rather
+   than survive: `turtle` then `push` leaves no leash behind. A leash nobody set
+   and nobody can see, recalling a push twenty metres from home, is the exact
+   invisible failure a merge-shaped bundle would produce.
+4. **A hand-set `posture` clears the word.** The bundle it installed stays —
+   those are honest components a commander could have typed — but the squad is
+   no longer *in* a stance, and a readout that still said `"push"` about a squad
+   its own commander had just told to defend would be the one lie this feature
+   cannot afford.
+
+Two deliberate limits. A named region supplies the stance's **centre and not its
+radius** (unlike `posture defend`): a preset whose numbers moved with its target
+would not be a preset, and `posture` remains for anyone who wants to pick the
+number. And the per-unit half lands on the squad's members *as they stand*,
+exactly as `leash`/`retreat`/`priority` do — the posture covers later joiners
+because it is per-squad; the rest is what `template` is for.
+
+The vocabulary is fixed rather than commander-assembled, which is the whole
+economy of the thing: commander-defined bundles would make the decision surface
+as large as the vocabulary they were meant to shrink, and would make two arena
+rounds incomparable. The full vocabulary stays open beside it — a stance is a
+floor for a small commander, never a ceiling for a capable one.
 
 ### Triggers — contingent standing policy (v3)
 | Verb | Shape | Clears when |
@@ -1214,7 +1260,7 @@ set of rules to drift.
 
 | | verbs | why |
 |---|---|---|
-| **direct** | `squad` `posture` `template` `priority` `retreat` `leash` `autocast` | doctrine is *advice-shaped already* |
+| **direct** | `squad` `posture` `stance` `template` `priority` `retreat` `leash` `autocast` | doctrine is *advice-shaped already* |
 | **propose** | every unit order, all production, all spending, `autopilot`, `surrender` | irreversible, or spends what is not the proposer's |
 | **neither** | `ready` | a statement about the clock, not the army — intercepted before the negotiation exists. See § The ready handshake |
 
@@ -2201,6 +2247,7 @@ be discovered:
 | `posture` `forage` | the centre is the muster point held while no cache is up |
 | `posture` `escort` | **no region form.** It names a unit, and a region that followed a hero would be a second, moving vocabulary for one word |
 | `leash` | anchor at the centre; the region's own radius is the leash unless `radius` is given |
+| `stance` | the centre is the anchor. The region's radius is **dropped** — a stance's ring is its own, because a preset whose numbers moved with its target would not be a preset. Omit the place entirely and the anchor is the issuing team's base |
 
 `x`/`z` became `Option` on the verbs that required them, and that is a
 deliberate improvement rather than a cost: "this sentence names no ground at

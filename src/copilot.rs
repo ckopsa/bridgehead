@@ -641,15 +641,21 @@ pub fn is_doctrine_verb(intent: &Intent) -> bool {
             | Intent::Autocast { .. }
             | Intent::Squad { .. }
             | Intent::Posture { .. }
+            // A stance is the other seven in one word, so it is doctrine by
+            // construction: it installs a disposition, spends nothing and moves
+            // nobody. Excluding it would have been the odd choice — a partner
+            // trusted to set a posture and a leash separately but not to set
+            // both at once.
+            | Intent::Stance { .. }
             | Intent::Template { .. }
     )
 }
 
-/// The seven doctrine verbs by name, for the snapshot to tell the seat what it
+/// The eight doctrine verbs by name, for the snapshot to tell the seat what it
 /// may say without asking. Kept honest against `is_doctrine_verb` by
 /// `the_advertised_direct_verbs_are_the_ones_that_pass`.
-pub const DOCTRINE_VERBS: [&str; 7] = [
-    "priority", "retreat", "leash", "autocast", "squad", "posture", "template",
+pub const DOCTRINE_VERBS: [&str; 8] = [
+    "priority", "retreat", "leash", "autocast", "squad", "posture", "stance", "template",
 ];
 
 /// What this seat may send directly, as the snapshot reports it. A
@@ -890,6 +896,7 @@ fn scope_of(intent: &Intent) -> Scope {
         | Intent::Squad { units, .. } => Scope::Units(units.clone()),
         Intent::Build { worker, .. } => Scope::Units(worker.iter().copied().collect()),
         Intent::Posture { id, .. } => Scope::Squad(*id),
+        Intent::Stance { squad, .. } => Scope::Squad(*squad),
         _ => Scope::Nothing,
     }
 }
@@ -926,7 +933,11 @@ fn intent_pos(intent: &Intent, team: Team, regions: &Regions) -> Option<Vec3> {
         | Intent::AttackMove { x, z, region, .. }
         | Intent::Build { x, z, region, .. }
         | Intent::Leash { x, z, region, .. }
-        | Intent::Retreat { x, z, region, .. } => spot(x, z, region, team, regions)?,
+        | Intent::Retreat { x, z, region, .. }
+        // A stance whose anchor was omitted means the team's base, which
+        // `spot` reports as "no place" — correct here: the camera has nothing
+        // to fly to that the reviewer is not already looking at.
+        | Intent::Stance { x, z, region, .. } => spot(x, z, region, team, regions)?,
         Intent::Posture {
             posture: Some(posture),
             ..
@@ -1881,6 +1892,13 @@ mod tests {
             Intent::Posture {
                 id: 1,
                 posture: None,
+            },
+            Intent::Stance {
+                squad: 1,
+                stance: "turtle".to_string(),
+                x: None,
+                z: None,
+                region: None,
             },
             Intent::Template {
                 building: 1,

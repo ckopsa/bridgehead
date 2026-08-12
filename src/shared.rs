@@ -4028,7 +4028,12 @@ pub struct MainCamera;
 
 /// Broad target classes for focus-fire rules. Every unit kind maps to exactly
 /// one class — an unclassifiable kind would be silently un-focusable.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// `Deserialize` because `stances.ron` names the focus list of each stance
+/// preset in these words. The wire still speaks strings and resolves them
+/// through `parse_target_class`, which folds spellings; RON is a data file
+/// written by hand once and validated at load, so it may name the variant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
 pub enum TargetClass {
     Hero,
     Archer,
@@ -4248,6 +4253,177 @@ pub const DEFAULT_SQUAD: u8 = 0;
 /// same binary. Sorted keys make the walk reproducible.
 #[derive(Resource, Default)]
 pub struct SquadOrders(pub std::collections::BTreeMap<(Team, u8), SquadPosture>);
+
+// ---------------------------------------------------------------------------
+// Stances: five fixed doctrine presets, one word each
+// ---------------------------------------------------------------------------
+//
+// A stance is not a new capability. It is a NAME for a bundle of the doctrine
+// this file already declares — a squad posture, a leash, a retreat threshold
+// and a focus-fire list — installed together, through the same appliers, by one
+// sentence. docs/AFFORDANCES.md is the argument for it: the bridge exposes ~25
+// verbs and a small commander drowns choosing among them, while the sub-second
+// half of the match is already played well by doctrine.rs between polls. Five
+// words that each set five things is a decision surface a weak model can hold
+// in its head, and the full vocabulary stays open beside it for one that cannot
+// be served by a preset.
+//
+// **The vocabulary is fixed and engine-defined**, deliberately. Commander-
+// defined bundles would make the affordance graph as large as the vocabulary
+// they were meant to shrink, and would make two arena rounds incomparable.
+//
+// **The default is persistence.** Nothing in the engine clears a stance; a
+// commander that says nothing for ninety seconds keeps the stance it set, and
+// doctrine.rs keeps executing it. Silence is a policy, not a gap. (arena/r21:
+// a Barracks idle for 98 seconds because nothing forced a re-evaluation and
+// nothing continued the last decision either.)
+
+/// The five stance words. Fixed vocabulary — see the section comment above.
+/// `Default` is `Turtle` — the first word of `ALL_STANCES`, and the one the
+/// human's cycle tile starts on for a squad that has never been stanced. It is
+/// a starting point for a cycle, never an implicit stance: nothing is in a
+/// stance until a `stance` intent puts it in one.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Deserialize)]
+pub enum StanceKind {
+    /// Hold home, tight. Small ring, short leash, break off early.
+    #[default]
+    Turtle,
+    /// Gather at a forward point and wait. A staging post, not a fight.
+    Stage,
+    /// Commit to an objective. No leash, low retreat threshold.
+    Push,
+    /// Hold ground away from home — an expansion, a ford. Wide ring.
+    Secure,
+    /// Hunt the soft targets and leave before the trade. Long leash, high
+    /// retreat threshold.
+    Harass,
+}
+
+pub const ALL_STANCES: [StanceKind; 5] = [
+    StanceKind::Turtle,
+    StanceKind::Stage,
+    StanceKind::Push,
+    StanceKind::Secure,
+    StanceKind::Harass,
+];
+
+impl StanceKind {
+    /// The word, as it travels on the wire and appears in the snapshot.
+    pub fn word(self) -> &'static str {
+        match self {
+            StanceKind::Turtle => "turtle",
+            StanceKind::Stage => "stage",
+            StanceKind::Push => "push",
+            StanceKind::Secure => "secure",
+            StanceKind::Harass => "harass",
+        }
+    }
+
+    /// The next stance in `ALL_STANCES`, wrapping. The human's doctrine tile is
+    /// a cycle for the same reason `[P]` Priority is one.
+    pub fn next(self) -> StanceKind {
+        let i = ALL_STANCES.iter().position(|s| *s == self).unwrap_or(0);
+        ALL_STANCES[(i + 1) % ALL_STANCES.len()]
+    }
+
+    /// This stance's row of `stances.ron`.
+    pub fn def(self) -> &'static StanceDef {
+        crate::data::stance_row(self)
+    }
+}
+
+/// Parse a stance word off the wire. Folded through `normalize_name`, exactly
+/// like every other name a commander may type, so `"Push"` and `"push"` are one
+/// word. `None` is a refusal the caller turns into a message naming all five.
+pub fn parse_stance(name: &str) -> Option<StanceKind> {
+    let wanted = normalize_name(name);
+    ALL_STANCES
+        .iter()
+        .copied()
+        .find(|s| normalize_name(s.word()) == wanted)
+}
+
+/// Every stance word, comma-joined, for the refusal that teaches.
+pub fn stance_words() -> String {
+    ALL_STANCES
+        .iter()
+        .map(|s| s.word())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Which ground-anchored posture a stance installs.
+///
+/// Three of the four postures, and the missing one is principled rather than an
+/// omission: `Escort` names a *unit*, and a stance names ground. A preset that
+/// followed a hero would need a second kind of target and would stop being one
+/// word about one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
+pub enum StancePosture {
+    Defend,
+    Push,
+    Forage,
+}
+
+/// Where a stance's retreat threshold falls back TO.
+///
+/// A flag rather than a coordinate because the two answers are the only ones
+/// that survive the anchor moving: `Anchor` keeps a defensive stance's wounded
+/// inside the ring it is holding, `Base` sends an offensive stance's wounded
+/// out of the fight entirely. Anything else would be a number the preset had no
+/// way to know.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
+pub enum StanceRally {
+    /// The stance's own anchor point.
+    Anchor,
+    /// The team's base. `Team::base_pos`, the same point doctrine.rs seeds the
+    /// default squad's home `Defend` on.
+    Base,
+}
+
+/// One row of `stances.ron`: the numbers behind one stance word.
+///
+/// Every field here is a number or a flag, which is why the table is data and
+/// not a `match` (DESIGN.md § "Content data files", and the merge argument in
+/// data.rs's header). The five WORDS are identity and stay in the enum above.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StanceDef {
+    pub kind: StanceKind,
+    /// Tile caption on the human's doctrine card.
+    pub label: String,
+    /// One line, for the card's cost slot and the catalog.
+    pub description: String,
+    pub posture: StancePosture,
+    /// Ring radius for a `Defend` posture. Must be > 0 for `Defend`; ignored
+    /// (and conventionally 0) for the other two, which have no ring.
+    pub radius: f32,
+    /// Leash radius around the anchor. `0` installs no leash — which is a real
+    /// setting, not a missing one: a push that could be recalled is not a push.
+    pub leash: f32,
+    /// Retreat threshold as a fraction of max HP. `0` installs no retreat
+    /// policy; anything else must be in the open range (0,1).
+    pub retreat_below: f32,
+    pub rally: StanceRally,
+    /// Focus-fire list, in order. Empty installs no `TargetPriority`, which
+    /// leaves combat.rs's ordinary acquisition alone.
+    pub priority: Vec<TargetClass>,
+}
+
+/// The stance word each squad is holding, per `(team, squad)` — the readout
+/// half of the feature, and the thing "the default is persistence" is about.
+///
+/// It is a RECORD, never a second source of truth: the components and the
+/// `SquadOrders` entry the stance installed are what doctrine.rs executes, and
+/// this map only remembers which word produced them. That is why the `posture`
+/// verb clears the entry — a squad hand-tasked out of its stance is no longer in
+/// it, and a snapshot that still said `"push"` would be lying to the commander
+/// about its own army.
+///
+/// A `BTreeMap` for the reason `SquadOrders` beside it is one: iteration order
+/// is randomness, and `HashMap` reseeds per process.
+#[derive(Resource, Default)]
+pub struct SquadStances(pub std::collections::BTreeMap<(Team, u8), StanceKind>);
 
 // ---------------------------------------------------------------------------
 // Orders (high-level intents) & movement (low-level)
@@ -8112,6 +8288,43 @@ pub enum Intent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         posture: Option<PostureIntent>,
     },
+    /// **One word for a whole doctrine.** Put a squad into one of the five
+    /// engine-defined stances — `turtle`, `stage`, `push`, `secure`, `harass` —
+    /// each a fixed bundle of posture + anchor + leash + retreat threshold +
+    /// focus priority, taken from `assets/data/stances.ron`.
+    ///
+    /// It installs exactly what the four verbs above install, through the same
+    /// appliers: there is no stance machinery in the executor, and doctrine.rs
+    /// cannot tell a stanced squad from a hand-tuned one. What the stance adds
+    /// is a *name* — one that persists in the snapshot, so silence continues it
+    /// rather than dissolving it, and one sentence that replaces the bundle
+    /// atomically rather than four that can half-land.
+    ///
+    /// `stance` is a `String` rather than a typed tag so an unknown word earns
+    /// a refusal naming all five, instead of serde's "unknown variant" killing
+    /// the whole command. Same reason `priority` takes class names as strings.
+    ///
+    /// The anchor is `x`/`z`, or a place name in `region` — spelled `target` on
+    /// the wire as well, because "which stance, where" reads better with a
+    /// target than with a region and both spellings resolve identically. Omit
+    /// the anchor entirely and it is the team's own base, which is what
+    /// `turtle` means anyway.
+    ///
+    /// **A region names WHERE, never HOW BIG.** Unlike `posture defend`, a named
+    /// region's own radius does not become the ring: the ring is the stance's,
+    /// because a preset whose numbers moved with its target would not be a
+    /// preset. A commander who wants a custom ring still has `posture`.
+    Stance {
+        #[serde(alias = "id")]
+        squad: u8,
+        stance: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f32>,
+        #[serde(default, alias = "target", skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+    },
     /// Standing doctrine for everything a production building trains from now
     /// on. Each piece is independent and absolute: whatever is given replaces
     /// the whole template, and every piece omitted or null is left unset. An
@@ -8331,6 +8544,7 @@ impl Intent {
             Intent::Autocast { .. } => "autocast",
             Intent::Squad { .. } => "squad",
             Intent::Posture { .. } => "posture",
+            Intent::Stance { .. } => "stance",
             Intent::Template { .. } => "template",
             Intent::TriggerSet { .. } => "trigger_set",
             Intent::TriggerClear { .. } => "trigger_clear",
@@ -8676,6 +8890,60 @@ impl Intent {
                     format!("squad {id} forages, mustering at {}", place(x, z, region))
                 }
             },
+            // One word in, one sentence out — and the sentence spells out the
+            // WHOLE bundle rather than echoing the word back. A replay log that
+            // said only "squad 1 takes the push stance" would make the log
+            // depend on a data file to be readable a year later, and the point
+            // of the journal is that it is the record of what happened.
+            Intent::Stance { squad, stance, x, z, region } => {
+                match parse_stance(stance) {
+                    Some(kind) => {
+                        let def = kind.def();
+                        let mut parts: Vec<String> = vec![match def.posture {
+                            StancePosture::Defend => {
+                                format!("defends {} within {:.0}", place(x, z, region), def.radius)
+                            }
+                            StancePosture::Push => format!("pushes to {}", place(x, z, region)),
+                            StancePosture::Forage => {
+                                format!("forages, mustering at {}", place(x, z, region))
+                            }
+                        }];
+                        if def.leash > 0.0 {
+                            parts.push(format!("leashed to {:.0}", def.leash));
+                        }
+                        if def.retreat_below > 0.0 {
+                            parts.push(format!(
+                                "retreat below {:.0}% to its {}",
+                                def.retreat_below * 100.0,
+                                match def.rally {
+                                    StanceRally::Anchor => "anchor",
+                                    StanceRally::Base => "base",
+                                }
+                            ));
+                        }
+                        if !def.priority.is_empty() {
+                            parts.push(format!(
+                                "focus {}",
+                                def.priority
+                                    .iter()
+                                    .map(|c| c.name())
+                                    .collect::<Vec<_>>()
+                                    .join(" > ")
+                            ));
+                        }
+                        format!(
+                            "squad {squad} takes the {} stance: {}",
+                            kind.word(),
+                            parts.join(", ")
+                        )
+                    }
+                    // Unparseable words never reach the appliers — the compiler
+                    // refuses them with the list of five. This arm exists only
+                    // because the journal renders intents that were merely
+                    // *submitted*, and it says what was asked for.
+                    None => format!("squad {squad} is asked for an unknown stance '{stance}'"),
+                }
+            }
             Intent::Template {
                 building,
                 squad,
@@ -10039,6 +10307,7 @@ impl Plugin for CorePlugin {
             .init_resource::<AiControlled>()
             .init_resource::<ExternallyCommanded>()
             .init_resource::<SquadOrders>()
+            .init_resource::<SquadStances>()
             .init_resource::<TechTiers>()
             .init_resource::<TeamResearch>()
             .init_resource::<GameEvents>()

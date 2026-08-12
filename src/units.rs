@@ -518,7 +518,7 @@ fn spawn_units(
     assets: Option<Res<UnitAssets>>,
     nav: Res<NavGrid>,
     records: Res<HeroRecords>,
-    nodes: Query<&Transform, With<ResourceNode>>,
+    nodes: Query<(&Transform, &ResourceNode)>,
     live_units: Query<Entity, With<Unit>>,
     // The producing building, for both halves of what it stamps: the doctrine
     // template, and the name a trained unit gives when asked who sent it.
@@ -629,9 +629,15 @@ fn spawn_units(
             None => Order::default(),
             Some(RallyTarget::Ground(p)) => Order::Move(Vec3::new(p.x, 0.0, p.z)),
             Some(RallyTarget::Node(node)) => match nodes.get(node) {
+                // A mined-out gold mine is still an entity — economy.rs keeps
+                // it as geography so `mine_dry` and the income alarm have
+                // something to read — but it is not work. A rally onto one is
+                // as stale as a rally onto a node that no longer exists, and
+                // "depleted node degrades to Idle" has to keep meaning that.
+                Ok((_, res)) if res.remaining == 0 => Order::default(),
                 Ok(_) if is_worker_kind(ev.kind) => Order::Harvest(node),
                 // Non-workers can't gather — just gather *near* the node.
-                Ok(node_tf) => Order::Move(Vec3::new(
+                Ok((node_tf, _)) => Order::Move(Vec3::new(
                     node_tf.translation.x,
                     0.0,
                     node_tf.translation.z,

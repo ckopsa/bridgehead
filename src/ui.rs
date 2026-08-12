@@ -1040,6 +1040,17 @@ impl PostureKind {
 struct PostureArm {
     squad: u8,
     kind: PostureKind,
+    /// Set when the armed gesture is a STANCE rather than a bare posture: the
+    /// click compiles to `Intent::Stance` and `kind`/the marker radius are only
+    /// the posture the stance's bundle happens to install, so the disc the
+    /// player sees under the cursor is the ring they are about to get.
+    ///
+    /// A field on the existing arm rather than a second one beside it, and
+    /// deliberately: eleven places in this file disarm `posture_place` (Esc, a
+    /// new selection, another card gesture, a right-click…), and a parallel
+    /// field would be eleven chances to forget one and leave a gesture armed
+    /// under a player who thought they had cancelled it.
+    stance: Option<StanceKind>,
 }
 
 /// One `cast` sentence, whatever supplied the aim. Written once because the
@@ -1143,6 +1154,12 @@ enum CmdAction {
     SetPosture(PostureKind),
     /// Clear the selection's squad posture (membership survives).
     ClearPosture,
+    /// Step the squad's stance one word along the fixed five and arm the ground
+    /// click that anchors it. The five presets are engine-defined, so this is a
+    /// cycle over a closed vocabulary rather than an authoring surface — the
+    /// same shape as [P] Priority, and the same reason: one tile for a small
+    /// fixed set beats five tiles the doctrine page has no letters for.
+    CycleStance,
     /// Step the retreat threshold: off -> 25% -> 35% -> 50% -> off. The
     /// parameterised form of [V], and the reason it exists: the bridge sends a
     /// number, so the human must be able to choose one too.
@@ -1978,6 +1995,11 @@ fn ability_label(def: &AbilityDef, cooldown: f32) -> String {
 struct CastLookup<'w, 's> {
     tiers: Res<'w, TechTiers>,
     squads: Res<'w, SquadOrders>,
+    /// The stance word behind each squad's posture. Beside `squads` because it
+    /// is the other half of the same fact and is read in the same breath — the
+    /// doctrine card lights its stance tile from this and its posture tiles
+    /// from that, and they must agree about the same squad.
+    stances: Res<'w, SquadStances>,
     /// The team's armed triggers. Here rather than as its own parameter
     /// because `command_input` and `update_hud` both sit on Bevy's
     /// 16-parameter ceiling and both already share this bundle — and because
@@ -2460,6 +2482,14 @@ struct DoctrineCard {
     /// Live posture of `doc.squad`, when that squad has an entry in
     /// `SquadOrders` — i.e. when doctrine.rs is actually executing something.
     posture: Option<PostureKind>,
+    /// The stance the tile will arm on the next press: the armed one stepped
+    /// along if a stance click is already waiting, else the squad's CURRENT
+    /// stance stepped along, else the first word. So pressing repeatedly walks
+    /// all five instead of flapping between two, and the very first press on an
+    /// unstanced squad offers `turtle` rather than skipping past it.
+    stance_next: StanceKind,
+    /// The stance the squad is actually in, if any. Lights the tile.
+    stance: Option<StanceKind>,
     tmpl: TemplateView,
     /// Is the `home-guard` trigger armed right now? The tile is a toggle, so
     /// this is what decides whether pressing it arms or clears.
@@ -2519,6 +2549,28 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
             CmdEntry::plain(CmdAction::ClearPosture, bind(Hk::StandDown), "Stand Down");
         stand_down.enabled = card.posture.is_some();
         out.push(stand_down);
+
+        // **The stance tile.** One press steps the word, arms the click, and
+        // shows the whole bundle's one-line description in the cost slot; the
+        // click puts the squad in it. The caption names the word the NEXT press
+        // will arm, which is what the player is choosing between — the word the
+        // squad is already in is shown by the tile being lit, exactly as
+        // `SetPosture` shows the live posture.
+        //
+        // Five stances behind one tile is the human's minimum viable route to
+        // the verb, not its final shape: the fairness invariant needs the
+        // gesture to exist and to submit the identical `Intent::Stance` a
+        // commander sends, and it does. See docs/INTENT.md § "The residual
+        // asymmetry" for the standard this is being held to.
+        let next = card.stance_next;
+        let mut stance = CmdEntry::plain(
+            CmdAction::CycleStance,
+            bind(Hk::CycleStance),
+            &format!("Stance: {}", next.def().label),
+        )
+        .active(card.stance.is_some());
+        stance.cost = next.def().description.clone();
+        out.push(stance);
 
         // The parameterised pair. Captions name the CURRENT value, like [P]
         // does, so the card always reads as state rather than as a verb — and
@@ -3146,6 +3198,20 @@ fn ground_intent(
 /// `posture_unit_intent`, its twin for the other kind of click.
 fn posture_intent(arm: PostureArm, ground: Vec3) -> Option<Intent> {
     let p = clamp_to_map(ground);
+    // A stance is one word about one place, so the click composes the whole
+    // bundle in a single sentence — the same `{"type":"stance","squad":N,
+    // "stance":"push","x":..,"z":..}` a commander sends. Nothing here reads the
+    // stance's numbers: they live in stances.ron and the compiler applies them,
+    // so the button and the wire cannot drift apart.
+    if let Some(stance) = arm.stance {
+        return Some(Intent::Stance {
+            squad: arm.squad,
+            stance: stance.word().to_string(),
+            x: Some(p.x),
+            z: Some(p.z),
+            region: None,
+        });
+    }
     let posture = match arm.kind {
         PostureKind::Defend => PostureIntent::Defend {
             x: Some(p.x),
@@ -4405,12 +4471,26 @@ fn command_input(
         .collect();
 
     // Which squad the doctrine page is about, and what it is already doing.
+    let live_stance = doc
+        .squad
+        .and_then(|s| cast.stances.0.get(&(Team::Human, s)))
+        .copied();
     let card = DoctrineCard {
         doc,
         posture: doc
             .squad
             .and_then(|s| cast.squads.0.get(&(Team::Human, s)))
             .map(posture_kind),
+        // Step from whatever is already armed, so holding the key walks all
+        // five; otherwise from the squad's live stance, so the first press
+        // offers the next word rather than the one you are already in. With
+        // neither, `StanceKind::default()` (turtle) is where the cycle starts.
+        stance_next: ui
+            .posture_place
+            .and_then(|arm| arm.stance)
+            .or(live_stance)
+            .map_or_else(StanceKind::default, StanceKind::next),
+        stance: live_stance,
         tmpl: single_template,
         home_guard: has_trigger(&cast.triggers, HOME_GUARD),
         region_mark: mark_number(&cast.regions),
@@ -5054,7 +5134,34 @@ fn command_input(
                 // building placement already teaches. Three of them want a
                 // point and Escort wants a unit; `left_mouse` reads
                 // `PostureKind::needs_unit` to know which click it is holding.
-                ui.posture_place = Some(PostureArm { squad, kind });
+                ui.posture_place = Some(PostureArm { squad, kind, stance: None });
+                ui.attack_move_armed = false;
+                ui.placement = None;
+                ui.wall_chain.clear();
+                ui.cast_place = None;
+                ui.teleport_place = None;
+                ui.region_place = false;
+            }
+            CmdAction::CycleStance => {
+                let Some(squad) = resolve_squad(&mut submissions) else {
+                    continue;
+                };
+                // Press-then-click, like every posture. The word advances on the
+                // press and the click commits it, so a player can walk the five
+                // and only spend one of them.
+                let stance = card.stance_next;
+                ui.posture_place = Some(PostureArm {
+                    squad,
+                    // What the stance's bundle will install, so the marker disc
+                    // under the cursor is the ring the click actually produces.
+                    // The compiler reads the same row; this is only the preview.
+                    kind: match stance.def().posture {
+                        StancePosture::Defend => PostureKind::Defend,
+                        StancePosture::Push => PostureKind::Push,
+                        StancePosture::Forage => PostureKind::Forage,
+                    },
+                    stance: Some(stance),
+                });
                 ui.attack_move_armed = false;
                 ui.placement = None;
                 ui.wall_chain.clear();
@@ -6231,8 +6338,12 @@ fn right_mouse(
     }
 
     // --- resource node under the cursor? ---------------------------------
+    // A dry gold mine is still an entity (economy.rs keeps it as geography, so
+    // `mine_dry` and the income alarm have something to read) but it is not a
+    // job. Right-clicking the hole must not order a harvest that the loop would
+    // immediately re-target — what is clickable is what can still be worked.
     let mut node: Option<(Entity, f32)> = None;
-    for (e, tf, res) in &nodes {
+    for (e, tf, res) in nodes.iter().filter(|(_, _, res)| res.remaining > 0) {
         let radius = match res.kind {
             ResourceKind::Gold => MINE_PICK_RADIUS,
             ResourceKind::Lumber => TREE_PICK_RADIUS,
@@ -6427,8 +6538,19 @@ fn update_ghost(
 /// and Forage name a single point, so they get a small puck instead — big
 /// enough to see under the cursor, not big enough to imply an area they do not
 /// have. Escort names a unit and never reaches this function.
-fn posture_marker_radius(kind: PostureKind) -> Option<f32> {
-    match kind {
+fn posture_marker_radius(arm: PostureArm) -> Option<f32> {
+    // A stance draws ITS ring, out of stances.ron, because that is the ring the
+    // click will produce — the card's promise and the compiler's behaviour read
+    // the same row. `turtle`'s 14 and `secure`'s 30 are visibly different discs,
+    // which is most of what a player needs to learn the difference.
+    if let Some(stance) = arm.stance {
+        let def = stance.def();
+        return Some(match def.posture {
+            StancePosture::Defend => def.radius,
+            StancePosture::Push | StancePosture::Forage => 3.0,
+        });
+    }
+    match arm.kind {
         PostureKind::Defend => Some(DEFEND_RADIUS),
         PostureKind::Push | PostureKind::Forage => Some(3.0),
         PostureKind::Escort => None,
@@ -6450,9 +6572,7 @@ fn update_posture_marker(
         return;
     };
 
-    let radius = ui
-        .posture_place
-        .and_then(|arm| posture_marker_radius(arm.kind));
+    let radius = ui.posture_place.and_then(posture_marker_radius);
     let (Some(radius), Ok(window), Ok((camera, cam_tf))) =
         (radius, windows.single(), camera_q.single())
     else {
@@ -8085,6 +8205,12 @@ fn update_hud(
     let live_posture = doc
         .squad
         .and_then(|s| cast.squads.0.get(&(Team::Human, s)));
+    // ...and the word that put it there, if a stance did. Same lookup, same
+    // squad, so the tile's caption and its lit state cannot disagree.
+    let live_stance = doc
+        .squad
+        .and_then(|s| cast.stances.0.get(&(Team::Human, s)))
+        .copied();
     // The one selected own building: kind, finished, ability cooldown.
     let single = if building_count == 1 && unit_count == 0 {
         sel_buildings
@@ -8265,6 +8391,12 @@ fn update_hud(
         DoctrineCard {
             doc,
             posture: live_posture.map(posture_kind),
+            stance_next: ui
+                .posture_place
+                .and_then(|arm| arm.stance)
+                .or(live_stance)
+                .map_or_else(StanceKind::default, StanceKind::next),
+            stance: live_stance,
             tmpl: single_template,
             region_mark: mark_number(&cast.regions),
             region_count: cast.regions.get(Team::Human).len(),
@@ -8377,9 +8509,15 @@ fn update_hud(
         )
     } else if let Some(arm) = ui.posture_place {
         format!(
-            "Squad {} - {} posture armed: left-click {} (Right-click / Esc cancels)",
+            "Squad {} - {} armed: left-click {} (Right-click / Esc cancels)",
             arm.squad,
-            arm.kind.label(),
+            // A stance names itself rather than the posture underneath it: the
+            // player pressed "Harass", and being told "Push posture armed" would
+            // teach them the implementation instead of the word.
+            match arm.stance {
+                Some(s) => format!("{} stance", s.def().label),
+                None => format!("{} posture", arm.kind.label()),
+            },
             if arm.kind.needs_unit() {
                 // Says "keeps trying" because it does: a missed unit click
                 // leaves the gesture armed, and a hint that implied otherwise
@@ -8617,8 +8755,15 @@ fn update_hud(
                         CmdAction::Place(k) => ui.placement == Some(k),
                         // A posture waiting for its ground click is armed in
                         // exactly the sense the other two are.
-                        CmdAction::SetPosture(k) => {
-                            ui.posture_place.is_some_and(|arm| arm.kind == k)
+                        // A STANCE-armed gesture must not light the posture tile
+                        // its bundle happens to use: the player armed "Harass",
+                        // not "Push", and a lit Push would be the card claiming
+                        // a gesture nobody made.
+                        CmdAction::SetPosture(k) => ui
+                            .posture_place
+                            .is_some_and(|arm| arm.stance.is_none() && arm.kind == k),
+                        CmdAction::CycleStance => {
+                            ui.posture_place.is_some_and(|arm| arm.stance.is_some())
                         }
                         _ => false,
                     };
@@ -8793,7 +8938,10 @@ fn hover_feedback(
                             hit = Some((pos, r * 1.24, mat));
                             icon = ic;
                         } else if workers_selected {
-                            for (tf, node) in &nodes {
+                            // Same rule as the right-click picker: a dry mine is
+                            // a place, not a job, so the grab cursor does not
+                            // offer it.
+                            for (tf, node) in nodes.iter().filter(|(_, n)| n.remaining > 0) {
                                 let r = match node.kind {
                                     ResourceKind::Gold => MINE_PICK_RADIUS,
                                     ResourceKind::Lumber => TREE_PICK_RADIUS,
@@ -9788,6 +9936,7 @@ mod tests {
             .init_resource::<GameOver>()
             .init_resource::<TechTiers>()
             .init_resource::<SquadOrders>()
+            .init_resource::<SquadStances>()
             // `CastLookup` reads them, so the card cannot be built without
             // them: research for the forge buttons, triggers and the clock for
             // the home-guard toggle's lit state, regions for the mark tile's.
@@ -10119,6 +10268,7 @@ mod tests {
             .init_resource::<NavGrid>()
             .init_resource::<TeamResearch>()
             .init_resource::<SquadOrders>()
+            .init_resource::<SquadStances>()
             .init_resource::<AiControlled>()
             .init_resource::<GameEvents>()
             .init_resource::<GameOver>()
@@ -10405,6 +10555,83 @@ mod tests {
         )
         .unwrap();
         assert_eq!(json(&click), json(&typed));
+    }
+
+    /// **The human can reach a stance, and reaches the identical sentence.**
+    ///
+    /// The fairness invariant applied to the newest verb (THESIS.md;
+    /// docs/INTENT.md § "The fairness invariant"): the human's surface is
+    /// narrower — one cycling tile against five words a commander types
+    /// directly — but what it *produces* is byte-identical to the JSON in
+    /// tools/COMMANDER_BRIEF.md, and the intent log cannot tell which seat
+    /// spoke. [S] steps the word and arms the click; the click anchors it.
+    #[test]
+    fn the_stance_tile_is_a_sentence_a_commander_could_have_typed() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        spawn_selected_footman(&mut app, Vec3::new(-8.0, 0.0, -10.0));
+
+        press(&mut app, &[KeyCode::KeyI]);
+        // A squad in no stance is offered the FIRST word, not the second: the
+        // cycle starts at the default rather than stepping past it, so the
+        // cheapest possible gesture ([I][S], click) reaches a real stance.
+        press(&mut app, &[KeyCode::KeyS]);
+        let arm = app
+            .world()
+            .resource::<UiState>()
+            .posture_place
+            .expect("the stance tile arms a ground click");
+        assert_eq!(arm.stance, Some(StanceKind::Turtle));
+        // The armed disc previews the ring the click will actually install.
+        assert_eq!(
+            posture_marker_radius(arm),
+            Some(StanceKind::Turtle.def().radius)
+        );
+
+        let click = posture_intent(arm, Vec3::new(40.0, 0.0, 40.0)).unwrap();
+        let mut sentences: Vec<String> = said(&app).iter().map(|i| i.sentence()).collect();
+        sentences.push(click.sentence());
+        assert_eq!(sentences[0], "2 units join squad 1");
+        assert!(
+            sentences[1].starts_with("squad 1 takes the turtle stance:"),
+            "the log names the word AND spells the bundle out: {}",
+            sentences[1]
+        );
+
+        let typed: Intent = serde_json::from_str(
+            r#"{"type":"stance","squad":1,"stance":"turtle","x":40.0,"z":40.0}"#,
+        )
+        .unwrap();
+        assert_eq!(json(&click), json(&typed));
+    }
+
+    /// The tile walks the five words rather than flapping between two: each
+    /// press steps from what is already armed, so a player can reach `harass`
+    /// without committing the four stances in front of it.
+    #[test]
+    fn pressing_the_stance_tile_again_steps_to_the_next_word() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        press(&mut app, &[KeyCode::KeyI]);
+
+        let mut walked = Vec::new();
+        for _ in 0..ALL_STANCES.len() {
+            press(&mut app, &[KeyCode::KeyS]);
+            walked.push(
+                app.world()
+                    .resource::<UiState>()
+                    .posture_place
+                    .and_then(|arm| arm.stance)
+                    .expect("still armed"),
+            );
+        }
+        // Five distinct words, and nothing was submitted — arming is not saying.
+        let unique: std::collections::BTreeSet<StanceKind> = walked.iter().copied().collect();
+        assert_eq!(unique.len(), ALL_STANCES.len(), "walked: {walked:?}");
+        assert!(
+            said(&app).iter().all(|i| i.verb() == "squad"),
+            "stepping the tile arms; only the ground click speaks a stance"
+        );
     }
 
     /// **The human's trigger gesture is a sentence a commander could type.**

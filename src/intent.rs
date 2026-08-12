@@ -150,6 +150,14 @@ impl Plugin for IntentPlugin {
             // bridge.rs and ui.rs. Each is written by exactly two verbs here.
             .init_resource::<Plans>()
             .init_resource::<Regions>()
+            // A seventh, on identical reasoning. `SquadStances` is read by
+            // bridge.rs's snapshot and ui.rs's doctrine card, and written by
+            // exactly two verbs here (`stance` sets it, `posture` clears it).
+            // Note that its partner `SquadOrders` is registered by `CorePlugin`
+            // instead, and that asymmetry is historical rather than principled:
+            // doctrine.rs cannot run without a posture map, so it predates this
+            // rule. `init_resource` is idempotent, so both are safe.
+            .init_resource::<SquadStances>()
             .init_resource::<UiNotices>()
             .insert_resource(IntentLog::from_env())
             // `IntentApply` lives INSIDE `SimSet::Intent`, declared once here
@@ -181,6 +189,10 @@ type IntentUnits<'w, 's> = Query<
         // Read-only: `autocast` edits ONE rule of a policy that may already
         // hold others, so the applier has to see the current one.
         Option<&'static AutoCastPolicy>,
+        // Membership, for the one verb that names a SQUAD and then has to write
+        // per-unit components: `stance`. Every other doctrine verb is handed an
+        // explicit id list and never asks who is in what.
+        Option<&'static SquadId>,
     ),
 >;
 
@@ -255,6 +267,21 @@ pub struct IntentTables<'w> {
     nav: Res<'w, NavGrid>,
     fog: Res<'w, FogGrids>,
     team_research: Res<'w, TeamResearch>,
+}
+
+/// The two halves of "what each squad is currently for": the posture doctrine.rs
+/// executes, and the stance word that produced it.
+///
+/// Bundled because `apply_intents` sits exactly on Bevy's 16-parameter ceiling
+/// (§6.6 of tools/BUILDER_BRIEF.md) and because the pairing is not arbitrary:
+/// both are keyed by `(team, squad)`, both are written by this compiler and by
+/// nothing else, and both are read by the snapshot and the HUD. Keeping them in
+/// one param also keeps them honest — every write that sets a posture is next to
+/// the write that names it, so the readout cannot drift from the doctrine.
+#[derive(SystemParam)]
+pub struct SquadPolicy<'w> {
+    orders: ResMut<'w, SquadOrders>,
+    stances: ResMut<'w, SquadStances>,
 }
 
 /// The two stores of **deferred** standing policy this compiler writes: armed
@@ -381,7 +408,7 @@ fn apply_intents(
     mut commands: Commands,
     time: Res<Time>,
     tables: IntentTables,
-    mut squad_orders: ResMut<SquadOrders>,
+    mut squads: SquadPolicy,
     mut deferred: DeferredPolicy,
     mut ai_controlled: ResMut<AiControlled>,
     mut error_log: ResMut<IntentErrors>,
@@ -407,6 +434,10 @@ fn apply_intents(
     let now = time.elapsed_secs();
     // One allowance for the whole frame, shared by every gesture in it.
     let mut notice_budget = UI_NOTICE_BURST;
+    // Squad membership written by an earlier sentence in this frame's batch,
+    // which no query can see yet. See `compile_intent`'s `batch_squads`.
+    let mut batch_squads: std::collections::BTreeMap<Entity, Option<u8>> =
+        std::collections::BTreeMap::new();
     for submission in batch {
         let mut errors: Vec<String> = Vec::new();
         // See `compile_intent`'s `reached` parameter. Per submission, because
@@ -466,7 +497,8 @@ fn apply_intents(
             // The issuer's own fog: what *they* can see decides what they may
             // order, and neither seat gets to borrow the other's eyes.
             tables.fog.get(submission.team),
-            &mut squad_orders,
+            &mut squads.orders,
+            &mut squads.stances,
             &mut deferred.triggers,
             &mut deferred.plans,
             &mut deferred.regions,
@@ -475,6 +507,7 @@ fn apply_intents(
             &mut world,
             &mut issuer,
             &mut reached,
+            &mut batch_squads,
         );
         // **The plan's verdict, straight back to the plan.** In the same frame
         // it submitted, before its evaluator's next sweep — so a step that
@@ -659,7 +692,7 @@ impl LateBind<'_, '_, '_> {
         let mut out: Vec<Entity> = self
             .units
             .iter()
-            .filter(|(entity, unit, team, _, _)| {
+            .filter(|(entity, unit, team, ..)| {
                 **team == self.me
                     && match sel {
                         Selector::Heroes => is_hero_kind(unit.kind),
@@ -1170,6 +1203,21 @@ fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, String> {
             };
             Intent::Posture { id, posture }
         }
+        // A stance's anchor resolves exactly like every other place, and the
+        // region's own RADIUS is dropped on the floor — the third caller to do
+        // so, alongside `push` and `forage`, and here for a sharper reason. A
+        // stance is a fixed preset; if naming a wide region silently widened
+        // the ring, two commanders saying `secure` would have two different
+        // doctrines and the arena could not compare them. `posture defend` is
+        // still there for anyone who wants the region to be the ring.
+        //
+        // A missing anchor is NOT an error here: the compiler defaults it to the
+        // issuing team's own base, which is what `turtle` means with no
+        // argument. See the `Stance` arm.
+        Intent::Stance { squad, stance, x, z, region } => {
+            let (x, z, _) = shape(regions, me, x, z, &region)?;
+            Intent::Stance { squad, stance, x, z, region }
+        }
         other => other,
     })
 }
@@ -1190,6 +1238,11 @@ fn compile_intent(
     team_research: &TeamResearch,
     fog: &FogGrid,
     squad_orders: &mut SquadOrders,
+    // The stance word behind each squad's posture, on the same one-writer rule
+    // as `squad_orders` above it: two verbs here write it (`stance` sets it,
+    // `posture` clears it, because a hand-tasked squad is no longer in one) and
+    // the snapshot and the HUD read it.
+    squad_stances: &mut SquadStances,
     // The armed triggers of every team. Written by two verbs here and read by
     // trigger.rs's evaluator, bridge.rs's snapshot and ui.rs's HUD — same
     // shape, and the same one-writer rule, as `SquadOrders` above it.
@@ -1226,6 +1279,25 @@ fn compile_intent(
     // game. Errors with `reached` are a partial success; errors without it are
     // a refusal.
     reached: &mut bool,
+    // **Squad membership written EARLIER IN THIS BATCH**, entity → new squad
+    // (`None` = removed from any squad).
+    //
+    // This exists because of the flush rule §6.3 of tools/BUILDER_BRIEF.md
+    // states: `squad` writes `SquadId` through `Commands`, and Bevy does not
+    // apply a command queue until the system ends — so within one
+    // `apply_intents` the insert is invisible to every query. Nothing cared
+    // until `stance`, which is the only verb here that finds its units *by
+    // membership* rather than from an id list. Without this map, the perfectly
+    // ordinary batch
+    //
+    //     [{"type":"squad","units":[1,2,3],"id":1},
+    //      {"type":"stance","squad":1,"stance":"push","target":"mid"}]
+    //
+    // would set squad 1's posture (per-squad, so it lands) and silently skip
+    // its leash, threshold and focus list (per-unit, so they find nobody) —
+    // half a doctrine installed, with nothing said about the other half. Last
+    // writer wins inside the batch, exactly as it does outside it.
+    batch_squads: &mut std::collections::BTreeMap<Entity, Option<u8>>,
 ) {
     // Named locally so the arms below read exactly as they did when this was
     // one interface's private applier.
@@ -1374,6 +1446,21 @@ fn compile_intent(
                     return;
                 }
             };
+            // A mined-out gold mine stays on the board as geography (economy.rs:
+            // `mine_dry`, the income alarm and `mines[].remaining` all need a dry
+            // mine they can look at), so its id still resolves. Say so here
+            // rather than let it through: `harvest_loop` would silently
+            // re-target the crew to the nearest live node, and a worker doing
+            // something you did not ask for is worse than a refusal that names
+            // the way to ask for it.
+            if nodes.get(node).is_ok_and(|(_, n, _)| n.remaining == 0) {
+                errors.push(format!(
+                    "{tag}: resource node {target} is empty — use target_select \
+                     \"nearest mine\" (or \"nearest tree\") for the closest one \
+                     with anything left in it"
+                ));
+                return;
+            }
             // `reached` is recomputed rather than inherited from `own_units`:
             // every survivor can still be skipped here for not being a worker,
             // and a `harvest` that ordered nobody is a refusal, not a partial.
@@ -1423,7 +1510,7 @@ fn compile_intent(
             };
             let leader = match intent_entity(target) {
                 Some(e) => match units.get(e) {
-                    Ok((_, _, team, _, _)) if *team == me => e,
+                    Ok((_, _, team, ..)) if *team == me => e,
                     _ => {
                         errors.push(format!("{tag}: unit {target} not found/not yours"));
                         return;
@@ -1626,8 +1713,8 @@ fn compile_intent(
                 held.extend(
                     units
                         .iter()
-                        .filter(|(_, u, t, _, _)| **t == me && is_hero_kind(u.kind))
-                        .map(|(_, u, _, _, _)| u.kind),
+                        .filter(|(_, u, t, ..)| **t == me && is_hero_kind(u.kind))
+                        .map(|(_, u, ..)| u.kind),
                 );
                 for (_, b_team, _, b_queue, _) in buildings.iter() {
                     if *b_team != me {
@@ -1857,7 +1944,7 @@ fn compile_intent(
                     // own units makes new units follow it.
                     Some(e) if nodes.get(e).is_ok() => Some(RallyTarget::Node(e)),
                     Some(e) => match units.get(e) {
-                        Ok((_, _, team, _, _)) if *team == me => Some(RallyTarget::Unit(e)),
+                        Ok((_, _, team, ..)) if *team == me => Some(RallyTarget::Unit(e)),
                         _ => None,
                     },
                     None => None,
@@ -1921,7 +2008,7 @@ fn compile_intent(
             let unit_hit = units
                 .get(entity)
                 .ok()
-                .map(|(_, u, team, tf, _)| (u.kind, *team, tf.translation));
+                .map(|(_, u, team, tf, ..)| (u.kind, *team, tf.translation));
             let building_hit = buildings
                 .get(entity)
                 .ok()
@@ -2371,7 +2458,7 @@ fn compile_intent(
                 // that existed when this verb was written. The gate is "does
                 // this kind have an ability list", which is the same question
                 // `Intent::Cast` already asks.
-                let Ok((_, unit, _, _, policy)) = units.get(entity) else {
+                let Ok((_, unit, _, _, policy, _)) = units.get(entity) else {
                     continue;
                 };
                 let list = abilities_of_unit(unit.kind);
@@ -2424,9 +2511,23 @@ fn compile_intent(
                         ec.try_remove::<SquadId>();
                     }
                 }
+                // ...and the same fact where a later sentence in this batch can
+                // see it, since the insert above will not be visible to any
+                // query until the system ends. See `batch_squads`.
+                batch_squads.insert(entity, id);
             }
         }
         Intent::Posture { id, posture } => {
+            // **A hand-set posture takes the squad out of its stance.** Not
+            // because the stance stops working — the leash and the retreat
+            // threshold it installed are still on the members, exactly as they
+            // would be if a commander had typed the four verbs — but because
+            // the WORD is no longer true, and `squads[].stance` is a readout a
+            // commander steers by. A snapshot that still said "push" about a
+            // squad the same commander had just told to defend would be the one
+            // failure this feature cannot afford. Cleared before the early
+            // return below, so the clear-posture form clears it too.
+            squad_stances.0.remove(&(me, id));
             // Squad ids are per-team, so red's squad 1 and blue's squad 1
             // are different squads.
             let posture = match posture {
@@ -2485,6 +2586,139 @@ fn compile_intent(
                 }
             };
             squad_orders.0.insert((me, id), posture);
+        }
+        // -------------------------------------------------------------------
+        // Stances. Five words, each a fixed bundle of the four doctrine verbs
+        // above. See shared.rs's `StanceKind` for the design and
+        // assets/data/stances.ron for the numbers.
+        //
+        // **There is no stance machinery downstream of here.** This arm writes
+        // exactly what `posture`, `leash`, `retreat` and `priority` write — the
+        // same `SquadOrders` entry and the same three components, through the
+        // same `try_insert`/`try_remove` — so doctrine.rs and combat.rs cannot
+        // tell a stanced squad from a hand-tuned one, and a stance can never
+        // acquire a behaviour the individual verbs do not have. What the word
+        // buys is that all five land in one submission (no half-applied
+        // doctrine if a batch is cut short) and that the engine remembers which
+        // word it was.
+        // -------------------------------------------------------------------
+        Intent::Stance {
+            squad,
+            stance,
+            x,
+            z,
+            ..
+        } => {
+            let Some(kind) = parse_stance(&stance) else {
+                errors.push(format!(
+                    "{tag}: no stance called '{stance}' - the five are: {}",
+                    stance_words()
+                ));
+                return;
+            };
+            let def = kind.def();
+
+            // The anchor. Omitted means the team's own base, which is what
+            // `turtle` means with no argument and a sane floor for the rest —
+            // `resolve_places` has already turned any region name into these
+            // two numbers, or refused with the list of names this seat knows.
+            let anchor = clamp_to_map(match resolved_point(x, z) {
+                Some(p) => p,
+                None => me.base_pos(),
+            });
+            let rally = match def.rally {
+                StanceRally::Anchor => anchor,
+                StanceRally::Base => clamp_to_map(me.base_pos()),
+            };
+
+            // 1. The posture, into the same map the `posture` verb writes.
+            squad_orders.0.insert(
+                (me, squad),
+                match def.posture {
+                    StancePosture::Defend => SquadPosture::Defend {
+                        pos: anchor,
+                        radius: def.radius,
+                    },
+                    StancePosture::Push => SquadPosture::Push { pos: anchor },
+                    StancePosture::Forage => SquadPosture::Forage { muster: anchor },
+                },
+            );
+
+            // 2. The per-unit half, onto this squad's CURRENT members — which
+            //    is precisely the set `leash`/`retreat`/`priority` would have
+            //    reached had the commander listed them by id. Members who join
+            //    later inherit the posture (it is per-squad) but not these
+            //    three; that is the existing behaviour of those three verbs
+            //    rather than something the stance introduces, and the
+            //    production `template` is the tool for stamping new units.
+            //
+            //    Absent pieces REMOVE rather than leave alone. A stance is
+            //    absolute: switching from `turtle` to `push` must not leave the
+            //    turtle's leash on, or the push walks twenty metres and gets
+            //    recalled by a policy nobody can see. This is the "replaces the
+            //    bundle atomically" half of the design.
+            let mut members = 0usize;
+            for (entity, _, team, _, _, squad_id) in units.iter() {
+                // Membership as of THIS SENTENCE: a `squad` earlier in the same
+                // batch outranks the component, which has not been flushed yet.
+                let member_of = match batch_squads.get(&entity) {
+                    Some(assigned) => *assigned,
+                    None => squad_id.map(|s| s.0),
+                };
+                if *team != me || member_of != Some(squad) {
+                    continue;
+                }
+                members += 1;
+                let mut ec = commands.entity(entity);
+                if def.retreat_below > 0.0 {
+                    ec.try_insert(RetreatPolicy {
+                        below_frac: def.retreat_below,
+                        rally,
+                    });
+                } else {
+                    ec.try_remove::<RetreatPolicy>();
+                }
+                if def.leash > 0.0 {
+                    ec.try_insert(LeashPolicy {
+                        anchor,
+                        radius: def.leash,
+                    });
+                } else {
+                    ec.try_remove::<LeashPolicy>();
+                }
+                if def.priority.is_empty() {
+                    ec.try_remove::<TargetPriority>();
+                } else {
+                    ec.try_insert(TargetPriority(def.priority.clone()));
+                }
+            }
+
+            // 3. The word, so the snapshot can echo it and silence can continue
+            //    it. Recorded even for an EMPTY squad, and deliberately: a
+            //    commander who stances squad 2 before training into it has said
+            //    something true about squad 2, and the posture is already
+            //    waiting in `SquadOrders` for the first member to arrive.
+            squad_stances.0.insert((me, squad), kind);
+
+            // An empty squad is not a refusal — see above — but it is worth
+            // saying out loud, because "I set a stance and nothing moved" is
+            // otherwise a silent five seconds a commander has to diagnose. And
+            // the message has to be honest about the asymmetry rather than
+            // promising a hand-off that does not exist: the posture will
+            // re-task whoever joins, the other three pieces will not.
+            if members == 0 {
+                errors.push(format!(
+                    "{tag}: squad {squad} has no members - the {} stance is set and its posture \
+                     will re-task whoever joins, but its leash, retreat and focus reach only the \
+                     members present when you send it (re-send after reinforcing, or use \
+                     'template' to stamp new units)",
+                    kind.word()
+                ));
+            }
+            // Reached: the squad's standing order changed whether or not a body
+            // was standing in it. A stance on an empty squad is a real,
+            // executed policy, so a plan step that sets one must not block.
+            *reached = true;
         }
         Intent::Template {
             building,
@@ -3187,7 +3421,7 @@ fn ability_slot_of(sel: &Option<AbilitySelector>, list: &[AbilityDef]) -> Option
 fn own_unit(id: IntentId, units: &IntentUnits, me: Team) -> Option<(Entity, Vec3)> {
     let entity = intent_entity(id)?;
     match units.get(entity) {
-        Ok((_, _, team, tf, _)) if *team == me => Some((entity, tf.translation)),
+        Ok((_, _, team, tf, ..)) if *team == me => Some((entity, tf.translation)),
         _ => None,
     }
 }
@@ -3214,7 +3448,7 @@ fn own_hero(
 ) -> Option<Entity> {
     let heroes: Vec<Entity> = units
         .iter()
-        .filter(|(_, u, team, _, _)| **team == me && is_hero_kind(u.kind))
+        .filter(|(_, u, team, ..)| **team == me && is_hero_kind(u.kind))
         .map(|(entity, ..)| entity)
         .collect();
     match named {
@@ -3286,7 +3520,7 @@ fn completed_kinds(buildings: &IntentBuildings, me: Team) -> Vec<BuildingKind> {
 }
 
 fn is_worker(units: &IntentUnits, entity: Entity) -> bool {
-    matches!(units.get(entity), Ok((_, u, _, _, _)) if is_worker_kind(u.kind))
+    matches!(units.get(entity), Ok((_, u, ..)) if is_worker_kind(u.kind))
 }
 
 /// Move / AttackMove for a group, spread over the UI's formation grid.
@@ -4179,6 +4413,18 @@ mod tests {
             r#"{"type":"posture","id":1}"#,
             r#"{"type":"template","building":1,"squad":1,"retreat":{"below":0.35,"x":1.0,"z":2.0},"priority":["Hero"],"autocast":3}"#,
             r#"{"type":"template","building":1}"#,
+            // v4 stances. Every spelling of the anchor, because all four are
+            // documented in tools/COMMANDER_BRIEF.md and a commander that
+            // learned one must never find another rejected: coordinates, the
+            // `target` name the brief leads with, the `region` alias every
+            // other place-taking verb uses, and the bare form that means "at
+            // my base". Plus `id` for `squad`, so a commander who reached for
+            // `posture`'s key gets the sentence it obviously meant.
+            r#"{"type":"stance","squad":1,"stance":"turtle"}"#,
+            r#"{"type":"stance","squad":1,"stance":"push","x":1.0,"z":2.0}"#,
+            r#"{"type":"stance","squad":2,"stance":"secure","target":"north-pass"}"#,
+            r#"{"type":"stance","squad":2,"stance":"harass","region":"north-pass"}"#,
+            r#"{"type":"stance","id":3,"stance":"stage","x":0.0,"z":0.0}"#,
             // v3 triggers. Every predicate, both cadences, both clear-forms.
             r#"{"type":"trigger_set","name":"home-guard","when":{"type":"base_under_attack"},"then":{"type":"posture","id":1,"posture":{"type":"defend","x":-70.0,"z":-70.0,"radius":22.0}}}"#,
             r#"{"type":"trigger_set","name":"hero-save","when":{"type":"hero_below","frac":0.35},"then":{"type":"move","units":[1],"x":-70.0,"z":-70.0},"repeat":60.0}"#,
@@ -6804,6 +7050,349 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------
+    // Stances (wc3clone-0uu.2). Five words, each a fixed bundle of the four
+    // doctrine verbs. docs/AFFORDANCES.md § Stances is the argument.
+    // -----------------------------------------------------------------
+
+    /// A footman of `team`, in `squad`, standing at the origin.
+    fn squad_member(app: &mut App, team: Team, squad: u8) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                team,
+                Transform::from_translation(Vec3::ZERO),
+                Health::new(100.0),
+                Order::Idle,
+                SquadId(squad),
+            ))
+            .id()
+    }
+
+    fn stance(squad: u8, word: &str, at: Option<Vec3>) -> Intent {
+        Intent::Stance {
+            squad,
+            stance: word.to_string(),
+            x: at.map(|p| p.x),
+            z: at.map(|p| p.z),
+            region: None,
+        }
+    }
+
+    /// **The bundle.** One word installs the posture, the leash, the retreat
+    /// threshold and the focus list that `stances.ron` says it does — through
+    /// the same components the four individual verbs write, which is what makes
+    /// doctrine.rs unable to tell the difference.
+    #[test]
+    fn a_stance_compiles_to_the_bundle_its_row_describes() {
+        let mut app = compiler_app();
+        let member = squad_member(&mut app, Team::Human, 1);
+        let anchor = Vec3::new(20.0, 0.0, -30.0);
+
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "secure", Some(anchor))));
+        app.update();
+
+        let def = StanceKind::Secure.def();
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "a stance on a squad with a member is not a refusal"
+        );
+
+        // 1. The posture, in the same map `posture` writes.
+        match app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1)) {
+            Some(SquadPosture::Defend { pos, radius }) => {
+                assert_eq!(*pos, anchor);
+                assert_eq!(*radius, def.radius);
+            }
+            other => panic!("secure must install a Defend ring, got {other:?}"),
+        }
+
+        // 2. The three per-unit policies, on the squad's members.
+        let world = app.world();
+        let leash = world.entity(member).get::<LeashPolicy>().expect("secure leashes");
+        assert_eq!(leash.anchor, anchor);
+        assert_eq!(leash.radius, def.leash);
+        let retreat = world
+            .entity(member)
+            .get::<RetreatPolicy>()
+            .expect("secure sets a retreat threshold");
+        assert_eq!(retreat.below_frac, def.retreat_below);
+        // `rally: Anchor` — a defensive stance pulls its wounded INTO the ring.
+        assert_eq!(retreat.rally, anchor);
+        let prio = world
+            .entity(member)
+            .get::<TargetPriority>()
+            .expect("secure sets a focus list");
+        assert_eq!(prio.0, def.priority);
+
+        // 3. The word, for the snapshot to echo.
+        assert_eq!(
+            world.resource::<SquadStances>().0.get(&(Team::Human, 1)),
+            Some(&StanceKind::Secure)
+        );
+    }
+
+    /// **The default is persistence.** The whole point of the feature: a
+    /// commander that says nothing for as many polls as you like still has the
+    /// stance it set, and the engine is still executing it. r21 lost a match to
+    /// the opposite — 98 seconds in which nothing continued the last decision.
+    #[test]
+    fn a_stance_survives_any_number_of_silent_polls() {
+        let mut app = compiler_app();
+        let member = squad_member(&mut app, Team::Human, 1);
+        let anchor = Vec3::new(-40.0, 0.0, 10.0);
+
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "harass", Some(anchor))));
+        app.update();
+
+        // Twenty frames in which the commander says nothing at all.
+        for _ in 0..20 {
+            app.update();
+        }
+
+        assert_eq!(
+            app.world().resource::<SquadStances>().0.get(&(Team::Human, 1)),
+            Some(&StanceKind::Harass),
+            "silence must never dissolve a stance"
+        );
+        assert!(matches!(
+            app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1)),
+            Some(SquadPosture::Push { pos }) if *pos == anchor
+        ));
+        assert!(
+            app.world().entity(member).get::<LeashPolicy>().is_some(),
+            "the bundle is still installed after twenty silent frames"
+        );
+    }
+
+    /// **Switching replaces the bundle whole.** The failure this guards is
+    /// specific and would be invisible: `turtle` installs a 20-unit leash, and
+    /// if `push` merely failed to mention leashes, the pushing squad would walk
+    /// twenty metres and be hauled back by a policy nobody can see and nobody
+    /// set. Absent pieces REMOVE.
+    #[test]
+    fn switching_stance_replaces_the_whole_bundle() {
+        let mut app = compiler_app();
+        let member = squad_member(&mut app, Team::Human, 1);
+
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "turtle", None)));
+        app.update();
+        assert!(
+            app.world().entity(member).get::<LeashPolicy>().is_some(),
+            "turtle leashes its members"
+        );
+
+        let objective = Vec3::new(70.0, 0.0, 70.0);
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "push", Some(objective))));
+        app.update();
+
+        let world = app.world();
+        assert!(
+            world.entity(member).get::<LeashPolicy>().is_none(),
+            "push has no leash, so switching to it must REMOVE turtle's"
+        );
+        // ...and the pieces push does have are push's, not turtle's.
+        let retreat = world.entity(member).get::<RetreatPolicy>().unwrap();
+        assert_eq!(retreat.below_frac, StanceKind::Push.def().retreat_below);
+        // `rally: Base` — an offensive stance sends its wounded out of the
+        // fight, not back to the objective it is attacking.
+        assert_eq!(retreat.rally, clamp_to_map(Team::Human.base_pos()));
+        assert_eq!(
+            world.resource::<SquadStances>().0.get(&(Team::Human, 1)),
+            Some(&StanceKind::Push)
+        );
+    }
+
+    /// A hand-set posture takes the squad OUT of its stance, because the word
+    /// is no longer true. The readout is what a commander steers by; a
+    /// `squads[].stance` that lied would be worse than no field at all.
+    #[test]
+    fn a_hand_set_posture_clears_the_stance_word() {
+        let mut app = compiler_app();
+        squad_member(&mut app, Team::Human, 1);
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "turtle", None)));
+        app.update();
+
+        app.world_mut().send_event(SubmitIntent::ui(
+            Team::Human,
+            Intent::Posture {
+                id: 1,
+                posture: Some(PostureIntent::Push {
+                    x: Some(10.0),
+                    z: Some(10.0),
+                    region: None,
+                }),
+            },
+        ));
+        app.update();
+
+        assert!(
+            app.world().resource::<SquadStances>().0.get(&(Team::Human, 1)).is_none(),
+            "a squad tasked by hand is in no stance"
+        );
+        // Stand-down clears it too — same arm, before the early return.
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "stage", None)));
+        app.update();
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, Intent::Posture { id: 1, posture: None }));
+        app.update();
+        assert!(app.world().resource::<SquadStances>().0.get(&(Team::Human, 1)).is_none());
+    }
+
+    /// **`squad` then `stance`, in ONE batch.** The obvious opening a commander
+    /// writes, and the one shape that could silently half-work: `squad` inserts
+    /// `SquadId` through `Commands`, Bevy does not flush a command queue until
+    /// the system ends, so the stance's per-unit half would find an empty squad
+    /// and install nothing while its posture — which is per-squad — landed
+    /// fine. Half a doctrine, no error, and a leash the commander believes is
+    /// on. `batch_squads` is what makes the two sentences agree.
+    #[test]
+    fn a_squad_and_a_stance_in_one_batch_reach_the_same_units() {
+        let mut app = compiler_app();
+        // Deliberately NOT pre-enrolled: this is a bare unit, exactly as it is
+        // the moment it walks out of a barracks.
+        let unit = app
+            .world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Footman },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                Health::new(100.0),
+                Order::Idle,
+            ))
+            .id();
+
+        // Both sentences in the same frame, in the order a commander writes
+        // them. `apply_intents` drains them together.
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: Intent::Squad {
+                units: vec![unit.to_bits()],
+                id: Some(1),
+                select: None,
+            },
+            trigger: None,
+            plan: None,
+        });
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 1".to_string(),
+            intent: stance(1, "turtle", None),
+            trigger: None,
+            plan: None,
+        });
+        app.update();
+
+        assert!(
+            app.world().entity(unit).get::<LeashPolicy>().is_some(),
+            "the stance must reach a unit the sentence before it enrolled"
+        );
+        assert!(app.world().entity(unit).get::<RetreatPolicy>().is_some());
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "and must not claim the squad was empty"
+        );
+    }
+
+    /// A stance reaches only ITS OWN squad, and only its own team. The same
+    /// ownership rule every other verb obeys, asked of the one verb here that
+    /// finds its units by membership rather than by an id list.
+    #[test]
+    fn a_stance_touches_only_its_own_squad_and_team() {
+        let mut app = compiler_app();
+        let mine = squad_member(&mut app, Team::Human, 1);
+        let other_squad = squad_member(&mut app, Team::Human, 2);
+        let enemy = squad_member(&mut app, Team::Claude, 1);
+
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "turtle", None)));
+        app.update();
+
+        let world = app.world();
+        assert!(world.entity(mine).get::<LeashPolicy>().is_some());
+        assert!(
+            world.entity(other_squad).get::<LeashPolicy>().is_none(),
+            "squad 2 was not spoken to"
+        );
+        assert!(
+            world.entity(enemy).get::<LeashPolicy>().is_none(),
+            "red's squad 1 is not blue's squad 1"
+        );
+        assert!(world.resource::<SquadStances>().0.get(&(Team::Claude, 1)).is_none());
+    }
+
+    /// **The refusal teaches.** An unknown word names all five rather than
+    /// leaving a commander to guess, and installs nothing.
+    #[test]
+    fn an_unknown_stance_word_lists_the_five() {
+        let mut app = compiler_app();
+        squad_member(&mut app, Team::Human, 1);
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Human, stance(1, "aggressive", None)));
+        app.update();
+
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).to_vec();
+        let line = errors.first().expect("an unknown stance is refused");
+        for word in ["turtle", "stage", "push", "secure", "harass"] {
+            assert!(line.contains(word), "the refusal must name '{word}': {line}");
+        }
+        assert!(
+            app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1)).is_none(),
+            "a refused stance installs nothing"
+        );
+    }
+
+    /// Every stance word is spellable however a commander types it, and every
+    /// one of the five actually resolves to a row. The cheap guard against a
+    /// word being added to the enum and forgotten in the data file — which the
+    /// loader would catch at startup, but a test catches at `cargo test`.
+    #[test]
+    fn every_stance_word_round_trips_and_has_a_row() {
+        for kind in ALL_STANCES {
+            assert_eq!(parse_stance(kind.word()), Some(kind));
+            assert_eq!(parse_stance(&kind.word().to_uppercase()), Some(kind));
+            let def = kind.def();
+            assert_eq!(def.kind, kind);
+            assert!(!def.label.is_empty());
+        }
+        // And the cycle the human's tile walks visits all five and returns.
+        let mut seen = vec![ALL_STANCES[0]];
+        let mut at = ALL_STANCES[0];
+        for _ in 1..ALL_STANCES.len() {
+            at = at.next();
+            seen.push(at);
+        }
+        assert_eq!(seen, ALL_STANCES.to_vec());
+        assert_eq!(at.next(), ALL_STANCES[0], "the cycle wraps");
+    }
+
+    /// A stance with no anchor means the team's own base — which is what
+    /// `turtle` means with no argument, and the reason the verb has a legal
+    /// one-word form at all.
+    #[test]
+    fn a_stance_with_no_anchor_holds_the_teams_own_base() {
+        let mut app = compiler_app();
+        squad_member(&mut app, Team::Claude, 4);
+        app.world_mut()
+            .send_event(SubmitIntent::ui(Team::Claude, stance(4, "turtle", None)));
+        app.update();
+
+        assert!(matches!(
+            app.world().resource::<SquadOrders>().0.get(&(Team::Claude, 4)),
+            Some(SquadPosture::Defend { pos, .. })
+                if *pos == clamp_to_map(Team::Claude.base_pos())
+        ));
+    }
+
     /// A built-in needs no arming: "defend the center ford" is a legal
     /// sentence in the first second of a match on a map that has one.
     #[test]
@@ -7372,6 +7961,37 @@ mod tests {
             errors[0].contains("no mine left on the map"),
             "{}",
             errors[0]
+        );
+    }
+
+    /// **A dry mine is a place, not a job.** economy.rs keeps a mined-out gold
+    /// mine on the board — `mine_dry`, the income alarm and `mines[].remaining`
+    /// all need a dry mine they can look at, and blue-r23's expand trigger never
+    /// fired because the node was despawned in the same statement that emptied
+    /// it. The cost of keeping it is that its id still resolves, so `harvest`
+    /// owes the commander a refusal that names the way to ask again: without one
+    /// the harvest loop would silently re-aim the crew at a node nobody named.
+    #[test]
+    fn harvesting_a_dry_mine_is_refused_and_names_the_selector() {
+        let mut app = compiler_app();
+        let worker = spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        let dry = spawn_node(&mut app, ResourceKind::Gold, Vec3::new(5.0, 0.0, 0.0), 0);
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"harvest","units":[{}],"target":{}}}"#,
+                worker.to_bits(),
+                dry.to_bits()
+            ),
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("is empty"), "{}", errors[0]);
+        assert!(errors[0].contains("nearest mine"), "{}", errors[0]);
+        assert!(
+            matches!(order_of(&app, worker), Order::Idle),
+            "a refused harvest orders nobody"
         );
     }
 
