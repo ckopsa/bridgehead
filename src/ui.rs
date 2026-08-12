@@ -5366,7 +5366,7 @@ fn command_input(
                 say(
                     &mut submissions,
                     Intent::Template {
-                        building: intent_id(entity),
+                        building: Some(intent_id(entity)),
                         squad: next.squad,
                         retreat: next.retreat.map(|below| RetreatIntent {
                             below,
@@ -5376,6 +5376,7 @@ fn command_input(
                         priority: priority_component(next.prio)
                             .map(|p| p.0.iter().map(|c| c.name().to_string()).collect()),
                         autocast: next.autocast.then_some(AUTOCAST_MIN_ENEMIES),
+                        select: None,
                     },
                 );
             }
@@ -5422,8 +5423,9 @@ fn command_input(
                     say(
                         &mut submissions,
                         Intent::Train {
-                            building: intent_id(entity),
+                            building: Some(intent_id(entity)),
                             unit: kind_name(kind).to_string(),
+                            select: None,
                         },
                     );
                 }
@@ -5476,8 +5478,9 @@ fn panel_clicks(
                     say(
                         &mut submissions,
                         Intent::Cancel {
-                            building: intent_id(entity),
+                            building: Some(intent_id(entity)),
                             index: i,
+                            select: None,
                         },
                     );
                 }
@@ -6379,11 +6382,12 @@ fn right_mouse(
             say(
                 &mut submissions,
                 Intent::Rally {
-                    building: intent_id(e),
+                    building: Some(intent_id(e)),
                     x,
                     z,
                     region: None,
                     target,
+                    select: None,
                 },
             );
         }

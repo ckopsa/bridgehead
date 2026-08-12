@@ -2003,8 +2003,9 @@ mod tests {
             select: None,
         };
         let train = Intent::Train {
-            building: 1,
+            building: Some(1),
             unit: "Footman".to_string(),
+            select: None,
         };
         let attack = Intent::Attack {
             units: vec![1],
@@ -2083,11 +2084,12 @@ mod tests {
                 region: None,
             },
             Intent::Template {
-                building: 1,
+                building: Some(1),
                 squad: None,
                 retreat: None,
                 priority: None,
                 autocast: None,
+                select: None,
             },
         ];
         let passing: Vec<&'static str> = samples
@@ -2117,8 +2119,9 @@ mod tests {
                 name: "home-guard".to_string(),
                 when: TriggerWhen::BaseUnderAttack,
                 then: Box::new(Intent::Train {
-                    building: 1,
+                    building: Some(1),
                     unit: "Footman".to_string(),
+                    select: None,
                 }),
                 repeat: None,
             },
@@ -2144,8 +2147,9 @@ mod tests {
     #[test]
     fn a_refusal_shows_the_wrapper() {
         let intent = Intent::Train {
-            building: 1,
+            building: Some(1),
             unit: "Footman".to_string(),
+            select: None,
         };
         let err = needs_proposal_error("cmd 0", &intent, TrustPolicy::Split);
         assert!(err.starts_with("cmd 0: 'train' needs the human's approval"));
@@ -2226,8 +2230,9 @@ mod tests {
         assert_eq!(
             intent_pos(
                 &Intent::Train {
-                    building: 1,
-                    unit: "Footman".to_string()
+                    building: Some(1),
+                    unit: "Footman".to_string(),
+                    select: None,
                 },
                 Team::Human,
                 &Regions::default()

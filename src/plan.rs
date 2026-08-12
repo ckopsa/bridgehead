@@ -990,15 +990,17 @@ mod tests {
             .push(plan(vec![
                 step(
                     Intent::Train {
-                        building: 1,
+                        building: Some(1),
                         unit: "Footman".into(),
+                        select: None,
                     },
                     PlanAdvance::OnApplied,
                 ),
                 step(
                     Intent::Train {
-                        building: 2,
+                        building: Some(2),
                         unit: "Knight".into(),
+                        select: None,
                     },
                     PlanAdvance::OnApplied,
                 ),
@@ -1068,8 +1070,9 @@ mod tests {
         let mut app = plan_app();
         let mut p = plan(vec![step(
             Intent::Train {
-                building: 4294967298,
+                building: Some(4294967298),
                 unit: "Footman".into(),
+                select: None,
             },
             PlanAdvance::OnApplied,
         )]);

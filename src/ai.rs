@@ -2392,8 +2392,9 @@ fn think(
     // already respected, which is why this is a conversion and not a nerf.
     for (entity, kind) in orders {
         voice.say(Intent::Train {
-            building: intent_id(entity),
+            building: Some(intent_id(entity)),
             unit: kind_name(kind).to_string(),
+            select: None,
         });
     }
 
@@ -4410,8 +4411,9 @@ mod tests {
         app.world_mut().send_event(SubmitIntent::script(
             Team::Claude,
             Intent::Train {
-                building: 999_999_999,
+                building: Some(999_999_999),
                 unit: "Footman".to_string(),
+                select: None,
             },
         ));
         app.update();

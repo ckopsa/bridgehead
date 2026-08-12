@@ -1957,6 +1957,15 @@ pub struct CatalogSelectors {
     pub nodes: Vec<&'static str>,
     /// Phrases legal in `build`'s `"site"`.
     pub sites: Vec<&'static str>,
+    /// Phrases legal in the `"select"` of the four building verbs — `train`,
+    /// `template`, `rally`, `cancel`. A fourth channel rather than a widening
+    /// of `units`, because a selector in the wrong channel earns a sentence
+    /// naming the right list and that sentence is only as good as the split.
+    ///
+    /// Additive: a document rendered beside an older `catalog.json` falls back
+    /// (tools/affordances.py `SELECTOR_FALLBACK`), and one rendered beside a
+    /// newer one gains a domain.
+    pub buildings: Vec<&'static str>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -2193,6 +2202,7 @@ pub fn game_catalog() -> Catalog {
             units: SELECTOR_UNIT_NAMES.split(", ").collect(),
             nodes: SELECTOR_NODE_NAMES.split(", ").collect(),
             sites: SELECTOR_SITE_NAMES.split(", ").collect(),
+            buildings: SELECTOR_BUILDING_NAMES.split(", ").collect(),
         },
     }
 }
@@ -7950,6 +7960,62 @@ pub enum Selector {
     /// to blue-r23's farm trigger that reported `site blocked` all match
     /// without ever moving the site.
     NearestLegalSite,
+    /// This seat's own FINISHED buildings of one kind — "my barracks", or
+    /// "idle barracks" for the ones with nothing in the training queue.
+    ///
+    /// The production half of the same argument. `train`, `template`, `rally`
+    /// and `cancel` all took a building entity id and nothing else, so the one
+    /// thing a small commander does every cycle was the one thing it could not
+    /// say without reading an id out of the snapshot first — and a repeating
+    /// `train` trigger armed with that id trains nothing the moment the
+    /// barracks is razed and rebuilt. docs/INTENT.md's plan section named this
+    /// gap and declined to close it with a `{"kind":..,"nth":..}` object,
+    /// because that would be a second way to name a building; a phrase on the
+    /// existing footing is not.
+    ///
+    /// **`idle` is the one that wins games.** A repeating "train a Footman"
+    /// rule wants a producer that is actually free, and `idle barracks`
+    /// resolves to one at fire time or refuses in words naming what the others
+    /// are busy with.
+    Buildings {
+        /// Which building. A kind by name, or the hall ladder by role.
+        what: BuildingRef,
+        /// Only the ones with an empty training queue.
+        idle: bool,
+    },
+}
+
+/// Which buildings a [`Selector::Buildings`] is about.
+///
+/// Two arms rather than one because the hall is a LADDER: a TownHall becomes a
+/// Keep becomes a Castle, in place, keeping its queue and its rally. A rule
+/// that said `my town hall` would stop matching the instant the hall it names
+/// upgraded — which is the same author-time-fact bug selectors exist to delete,
+/// wearing a different hat. `my hall` means whichever tier is standing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BuildingRef {
+    /// One named kind, spelled as `catalog.buildings[].id`.
+    Kind(BuildingKind),
+    /// Whatever tier of hall this seat has right now ([`is_hall`]).
+    Hall,
+}
+
+impl BuildingRef {
+    /// Does `kind` answer to this reference?
+    pub fn matches(&self, kind: BuildingKind) -> bool {
+        match self {
+            BuildingRef::Kind(k) => *k == kind,
+            BuildingRef::Hall => is_hall(kind),
+        }
+    }
+
+    /// The word a phrase and a refusal spell it with.
+    pub fn word(&self) -> &'static str {
+        match self {
+            BuildingRef::Kind(k) => building_name(*k),
+            BuildingRef::Hall => "hall",
+        }
+    }
 }
 
 impl Selector {
@@ -7964,6 +8030,9 @@ impl Selector {
             Selector::NearestTree => "nearest tree".to_string(),
             Selector::NearestMine => "nearest mine".to_string(),
             Selector::NearestLegalSite => "nearest legal site".to_string(),
+            Selector::Buildings { what, idle } => {
+                format!("{} {}", if *idle { "idle" } else { "my" }, what.word())
+            }
         }
     }
 
@@ -7983,6 +8052,26 @@ impl Selector {
     pub fn is_node_selector(&self) -> bool {
         matches!(self, Selector::NearestTree | Selector::NearestMine)
     }
+
+    /// Does this selector name a set of the seat's own finished buildings?
+    pub fn is_building_selector(&self) -> bool {
+        matches!(self, Selector::Buildings { .. })
+    }
+
+    /// What a refusal calls this selector when it turned up in the wrong
+    /// channel. One phrasing for all four channels, so `"select":"nearest tree"`
+    /// on a `move` and `"select":"my hero"` on a `train` teach the same way.
+    pub fn channel_noun(&self) -> &'static str {
+        if self.is_unit_selector() {
+            "units"
+        } else if self.is_node_selector() {
+            "a resource node"
+        } else if self.is_building_selector() {
+            "a building"
+        } else {
+            "a build site"
+        }
+    }
 }
 
 impl std::fmt::Display for Selector {
@@ -7999,12 +8088,19 @@ pub const SELECTOR_NODE_NAMES: &str = "nearest tree, nearest mine";
 /// rather than a literal at the one call site so `Catalog::selectors` can serve
 /// all three channels as splits of the same words the refusals print.
 pub const SELECTOR_SITE_NAMES: &str = "nearest legal site";
+/// The building-naming half — `train`, `template`, `rally` and `cancel`.
+///
+/// A SHAPE rather than a word list, like `squad <n>` beside it: `<building>` is
+/// any `catalog.buildings[].id`, folded by the same `normalize_name` every other
+/// name on this wire folds through, singular or plural. `my hall` is spelled out
+/// because it is the one phrase that is not a kind — see [`BuildingRef::Hall`].
+pub const SELECTOR_BUILDING_NAMES: &str = "my <building>, idle <building>, my hall";
 /// Everything a selector phrase may be. Printed by the unknown-phrase refusal,
 /// on the same rule as `Regions::unknown`: a refusal that names no alternative
 /// is a refusal to help.
 pub const SELECTOR_NAMES: &str =
     "my hero, all army, all units, workers, squad <n>, nearest tree, nearest mine, \
-     nearest legal site";
+     nearest legal site, my <building>, idle <building>, my hall";
 
 /// Parse a selector phrase, or `None` if it is not one.
 ///
@@ -8039,8 +8135,75 @@ pub fn parse_selector(raw: &str) -> Option<Selector> {
         "nearest mine" | "nearest gold" | "nearest gold mine" | "mine" => Selector::NearestMine,
         "nearest legal site" | "nearest legal" | "nearest free site" | "nearest free"
         | "nearest site" | "auto" => Selector::NearestLegalSite,
-        _ => return None,
+        // Last, and only last: the building family is open-ended (any kind in
+        // the catalog), so it must not get a chance to shadow a fixed phrase
+        // above it. Nothing collides today — no building is called "mine" or
+        // "hero" — and putting the open set behind the closed one means nothing
+        // can start to.
+        rest => return parse_building_selector(rest),
     })
+}
+
+/// `my barracks` / `barracks` / `idle barracks` / `my hall`, or `None`.
+///
+/// Split out of [`parse_selector`] rather than inlined because it is the one
+/// arm that is a *grammar* instead of a list: an optional `idle`, an optional
+/// possessive, then a building kind spelled however the commander likes. The
+/// possessive is dropped here and NOT in `normalize_place` — `our base` and
+/// `their base` are two different places (see that function), so the article
+/// stripping has to be local to the family that wants it.
+fn parse_building_selector(folded: &str) -> Option<Selector> {
+    /// `my` / `our` / `the` / `a` / `an` / `all` — noise in front of a kind, and
+    /// noise the unit family does not want stripped globally.
+    fn strip_article(s: &str) -> &str {
+        for article in ["my ", "our ", "the ", "a ", "an ", "all ", "any "] {
+            if let Some(rest) = s.strip_prefix(article) {
+                return rest;
+            }
+        }
+        s
+    }
+    // `idle barracks` and `my idle barracks` are the same request. The word may
+    // sit on either side of the possessive because both readings are natural
+    // and refusing one of them teaches nothing.
+    let (idle_a, rest) = match folded.strip_prefix("idle ") {
+        Some(rest) => (true, rest),
+        None => (false, folded),
+    };
+    let rest = strip_article(rest);
+    let (idle_b, rest) = match rest.strip_prefix("idle ") {
+        Some(rest) => (true, strip_article(rest)),
+        None => (false, rest),
+    };
+    Some(Selector::Buildings {
+        what: building_ref_named(rest)?,
+        idle: idle_a || idle_b,
+    })
+}
+
+/// A building kind (or the hall ladder) by name, singular or plural.
+///
+/// The plural is a suffix strip rather than a table because every kind in this
+/// game pluralises with an `s` and the one that already ends in one — Barracks —
+/// matches before the strip is tried. `normalize_name` does the rest, so
+/// `"war mill"`, `"WarMill"` and `"war_mill"` are one word here exactly as they
+/// are in `build`'s `kind`.
+fn building_ref_named(name: &str) -> Option<BuildingRef> {
+    let wanted = normalize_name(name);
+    if wanted.is_empty() {
+        return None;
+    }
+    if wanted == "hall" || wanted == "halls" {
+        return Some(BuildingRef::Hall);
+    }
+    let singular = wanted.strip_suffix('s').unwrap_or(&wanted);
+    ALL_BUILDING_KINDS
+        .into_iter()
+        .find(|k| {
+            let folded = normalize_name(building_name(*k));
+            folded == wanted || folded == singular
+        })
+        .map(BuildingRef::Kind)
 }
 
 /// The refusal an unrecognised selector phrase earns. One wording, so every
@@ -8188,9 +8351,19 @@ pub enum Intent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         site: Option<String>,
     },
+    /// Queue a unit at one of our own finished production buildings.
+    ///
+    /// `building` is an entity id; `select` is the same question asked as a
+    /// role — `"my barracks"`, `"idle barracks"`, `"my hall"` — and resolved at
+    /// compile time, which for a trigger or a plan step is *fire* time. Given
+    /// both, `select` wins, on the same precedence rule the unit channel uses.
+    /// A `select` that names more than one takes the lowest-id match.
     Train {
-        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        building: Option<IntentId>,
         unit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Convert one of our own finished buildings into its next tier IN PLACE
     /// (`catalog.buildings[].upgrades_to`). Paid in full the moment it is
@@ -8199,9 +8372,14 @@ pub enum Intent {
     Upgrade {
         building: IntentId,
     },
+    /// Drop one entry from a building's training queue. `select` names the
+    /// building by role instead of by id — see [`Intent::Train`].
     Cancel {
-        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        building: Option<IntentId>,
         index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Start the next rung of a team-wide research ladder at one of our own
     /// finished Blacksmiths (`catalog.research`). `upgrade` is a ladder id —
@@ -8223,7 +8401,8 @@ pub enum Intent {
     /// `target` for a resource node (new workers harvest it) or an own unit
     /// (new units follow it).
     Rally {
-        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        building: Option<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8232,6 +8411,9 @@ pub enum Intent {
         region: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<IntentId>,
+        /// The building, named by role instead of by id — see [`Intent::Train`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
 
     // --- abilities & items ---
@@ -8437,7 +8619,8 @@ pub enum Intent {
     /// the whole template, and every piece omitted or null is left unset. An
     /// intent with no pieces at all removes the template entirely.
     Template {
-        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        building: Option<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         squad: Option<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8446,6 +8629,9 @@ pub enum Intent {
         priority: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         autocast: Option<u32>,
+        /// The building, named by role instead of by id — see [`Intent::Train`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
 
     // --- triggers: contingent standing policy ---
@@ -8742,6 +8928,20 @@ impl Intent {
                 (None, None) => "(unspecified)".to_string(),
             }
         }
+        /// The same rule again for the building channel. `one` would do the
+        /// job, but the four building verbs read "building <x>" and a phrase
+        /// wants the word without it — "my barracks trains Footman", not
+        /// "building my barracks trains Footman".
+        fn one_building(id: &Option<IntentId>, select: &Option<String>) -> String {
+            match (select, id) {
+                (Some(raw), _) => match parse_selector(raw) {
+                    Some(sel) => sel.phrase(),
+                    None => format!("'{raw}'"),
+                },
+                (None, Some(id)) => format!("building {id}"),
+                (None, None) => "(unspecified building)".to_string(),
+            }
+        }
         /// How a sentence names an ability slot. The id reads as itself; a
         /// bare index has no name to give, so it says which slot it is.
         fn ability_name(sel: &Option<AbilitySelector>) -> String {
@@ -8830,14 +9030,25 @@ impl Intent {
                 };
                 format!("worker {} builds {kind} at {where_}", one(worker, select))
             }
-            Intent::Train { building, unit } => {
-                format!("building {building} trains {unit}")
+            Intent::Train {
+                building,
+                unit,
+                select,
+            } => {
+                format!("{} trains {unit}", one_building(building, select))
             }
             Intent::Upgrade { building } => {
                 format!("building {building} upgrades to its next tier")
             }
-            Intent::Cancel { building, index } => {
-                format!("building {building} cancels queue slot {index}")
+            Intent::Cancel {
+                building,
+                index,
+                select,
+            } => {
+                format!(
+                    "{} cancels queue slot {index}",
+                    one_building(building, select)
+                )
             }
             Intent::Research { building, upgrade } => {
                 format!("building {building} researches {upgrade}")
@@ -8848,16 +9059,20 @@ impl Intent {
                 z,
                 region,
                 target,
-            } => match (x, z, region, target) {
-                (_, _, Some(name), _) => {
-                    format!("building {building} rallies to {name}")
+                select,
+            } => {
+                let who = one_building(building, select);
+                match (x, z, region, target) {
+                    (_, _, Some(name), _) => {
+                        format!("{who} rallies to {name}")
+                    }
+                    (Some(x), Some(z), _, _) => {
+                        format!("{who} rallies to {}", at(*x, *z))
+                    }
+                    (_, _, _, Some(t)) => format!("{who} rallies onto {t}"),
+                    _ => format!("{who} rally (unspecified)"),
                 }
-                (Some(x), Some(z), _, _) => {
-                    format!("building {building} rallies to {}", at(*x, *z))
-                }
-                (_, _, _, Some(t)) => format!("building {building} rallies onto {t}"),
-                _ => format!("building {building} rally (unspecified)"),
-            },
+            }
             // The sentence carries the AIM, because "who cast what" stopped
             // being the whole story the moment a cast could miss by being
             // pointed somewhere else. A log line that read `7 casts Slow` for
@@ -9057,6 +9272,7 @@ impl Intent {
                 retreat,
                 priority,
                 autocast,
+                select,
             } => {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(s) = squad {
@@ -9076,13 +9292,11 @@ impl Intent {
                 if let Some(a) = autocast {
                     parts.push(format!("auto-cast at {a}+"));
                 }
+                let who = one_building(building, select);
                 if parts.is_empty() {
-                    format!("building {building} clears its doctrine template")
+                    format!("{who} clears its doctrine template")
                 } else {
-                    format!(
-                        "building {building} stamps every unit it trains with {}",
-                        parts.join(", ")
-                    )
+                    format!("{who} stamps every unit it trains with {}", parts.join(", "))
                 }
             }
             // A trigger's sentence carries BOTH halves — the condition and the
@@ -13137,12 +13351,31 @@ mod tests {
         assert!(push.priority.contains(&"Siege"));
 
         // Every phrase served as a domain is a phrase the parser accepts —
-        // except `squad <n>`, which is a shape rather than a word.
+        // except the two SHAPES, which are patterns rather than words. Each one
+        // is pinned by an instance so the shape cannot be served by a channel
+        // whose parser never learned to fill it in.
         let sel = &catalog.selectors;
-        for phrase in sel.units.iter().chain(&sel.nodes).chain(&sel.sites) {
+        let shapes: &[(&str, &str)] = &[
+            ("squad <n>", "squad 3"),
+            ("my <building>", "my barracks"),
+            ("idle <building>", "idle barracks"),
+        ];
+        for phrase in sel
+            .units
+            .iter()
+            .chain(&sel.nodes)
+            .chain(&sel.sites)
+            .chain(&sel.buildings)
+        {
             if phrase.contains('<') {
-                assert_eq!(*phrase, "squad <n>");
-                assert!(parse_selector("squad 3").is_some());
+                let (_, instance) = shapes
+                    .iter()
+                    .find(|(shape, _)| shape == phrase)
+                    .unwrap_or_else(|| panic!("catalog serves the unpinned shape '{phrase}'"));
+                assert!(
+                    parse_selector(instance).is_some(),
+                    "catalog serves '{phrase}' but '{instance}' does not parse"
+                );
                 continue;
             }
             assert!(parse_selector(phrase).is_some(), "catalog serves '{phrase}' but nothing parses it");
@@ -13150,6 +13383,10 @@ mod tests {
         assert!(sel.units.contains(&"my hero") && sel.units.contains(&"all army"));
         assert_eq!(sel.nodes, vec!["nearest tree", "nearest mine"]);
         assert_eq!(sel.sites, vec!["nearest legal site"]);
+        assert_eq!(
+            sel.buildings,
+            vec!["my <building>", "idle <building>", "my hall"]
+        );
     }
 
     /// A synthetic two-ability caster: the shape every content bead will use.

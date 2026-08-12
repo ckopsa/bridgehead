@@ -196,10 +196,13 @@ type IntentUnits<'w, 's> = Query<
     ),
 >;
 
+/// `Entity` first for the same reason [`IntentUnits`] carries it: a building
+/// selector has to *find* buildings, not merely check the one it was handed.
 type IntentBuildings<'w, 's> = Query<
     'w,
     's,
     (
+        Entity,
         &'static Building,
         &'static Team,
         Option<&'static UnderConstruction>,
@@ -241,7 +244,7 @@ type IntentSquads<'w, 's> = Query<'w, 's, &'static SquadId>;
 /// in this file for one caller's benefit.
 type IntentResearching<'w, 's> = Query<'w, 's, &'static Researching>;
 
-/// The three queries late binding may read, as one system param.
+/// The four queries late binding may read, as one system param.
 ///
 /// Split out of [`IntentWorld`] rather than listed twice because the resolver
 /// has **two** readers now. The compiler is one. The other is copilot.rs's
@@ -250,18 +253,23 @@ type IntentResearching<'w, 's> = Query<'w, 's, &'static Researching>;
 /// only honest way to do that is to run the same resolver over the same world.
 /// Two statements of "what a selector may see" would drift; one cannot.
 ///
-/// It is read-only, so a second system holding it conflicts with nothing.
+/// **Late binding reads all four read-only.** `buildings` carries
+/// `&mut TrainingQueue` because the compiler's `train` and `cancel` arms push
+/// and pop it, and it lives *here* rather than beside them because the building
+/// selector family needs the same rows to answer "which barracks" — one query
+/// over the buildings, iterated immutably by the resolver and mutably by the two
+/// arms, instead of two queries that Bevy would refuse to schedule together.
 #[derive(SystemParam)]
 pub struct LateBindWorld<'w, 's> {
     units: IntentUnits<'w, 's>,
     nodes: IntentNodes<'w, 's>,
     squads: IntentSquads<'w, 's>,
+    buildings: IntentBuildings<'w, 's>,
 }
 
 #[derive(SystemParam)]
 pub struct IntentWorld<'w, 's> {
     bind: LateBindWorld<'w, 's>,
-    buildings: IntentBuildings<'w, 's>,
     targets: IntentTargets<'w, 's>,
     researching: IntentResearching<'w, 's>,
 }
@@ -692,6 +700,10 @@ pub(crate) struct LateBind<'a, 'w, 's> {
     units: &'a IntentUnits<'w, 's>,
     squads: &'a IntentSquads<'w, 's>,
     nodes: &'a IntentNodes<'w, 's>,
+    /// This seat's own buildings, read-only. Same fog argument as `units`: your
+    /// own structures are yours to know about, and there is deliberately no
+    /// selector that reaches an enemy one.
+    buildings: &'a IntentBuildings<'w, 's>,
     nav: &'a NavGrid,
 }
 
@@ -716,6 +728,7 @@ impl<'a, 'w, 's> LateBind<'a, 'w, 's> {
             units: &world.units,
             squads: &world.squads,
             nodes: &world.nodes,
+            buildings: &world.buildings,
             nav,
         }
     }
@@ -777,6 +790,76 @@ impl LateBind<'_, '_, '_> {
         best.map(|(_, _, _, bits)| bits)
     }
 
+    /// Every FINISHED building of this seat that a building selector matches,
+    /// as ids, sorted by entity bits.
+    ///
+    /// Finished, always: a Barracks with scaffolding on it trains nothing, and
+    /// a selector that resolved to one would turn a good sentence into the
+    /// compiler's `under construction` refusal for reasons the commander never
+    /// wrote. Sorted for the same reason `units_matching` sorts — the
+    /// single-referent verbs take `first()`, and "the lowest id" has to mean the
+    /// same thing on two runs of the same seed.
+    fn buildings_matching(&self, sel: Selector) -> Vec<IntentId> {
+        let Selector::Buildings { what, idle } = sel else {
+            return Vec::new();
+        };
+        let mut out: Vec<Entity> = self
+            .buildings
+            .iter()
+            .filter(|(_, building, team, under, queue, _)| {
+                **team == self.me
+                    && under.is_none()
+                    && what.matches(building.kind)
+                    // "Idle" is about the QUEUE, not about the progress bar: a
+                    // building three seconds from finishing its last Footman is
+                    // idle enough to take the next order, and one with four in
+                    // the queue is not.
+                    && (!idle || queue.as_ref().is_none_or(|q| q.queue.is_empty()))
+            })
+            .map(|(entity, ..)| entity)
+            .collect();
+        out.sort_by_key(|e| e.to_bits());
+        out.into_iter().map(intent_id).collect()
+    }
+
+    /// What this seat has standing, as `Kind ×2, Kind` — the alternative half of
+    /// a building selector's refusal.
+    ///
+    /// Own buildings only, so this leaks nothing (docs/FOG.md): it is the same
+    /// list the seat's own snapshot already prints in full. Kinds in
+    /// `ALL_BUILDING_KINDS` order rather than query order, because a refusal
+    /// that reads differently on two runs of one seed is a determinism hole in
+    /// the one place a commander is definitely reading.
+    fn finished_building_roster(&self) -> String {
+        let mut counts: Vec<(BuildingKind, usize)> = Vec::new();
+        for kind in ALL_BUILDING_KINDS {
+            let n = self
+                .buildings
+                .iter()
+                .filter(|(_, b, team, under, _, _)| {
+                    **team == self.me && under.is_none() && b.kind == kind
+                })
+                .count();
+            if n > 0 {
+                counts.push((kind, n));
+            }
+        }
+        if counts.is_empty() {
+            return "you have no finished buildings".to_string();
+        }
+        let list: Vec<String> = counts
+            .into_iter()
+            .map(|(k, n)| {
+                if n == 1 {
+                    building_name(k).to_string()
+                } else {
+                    format!("{} \u{d7}{n}", building_name(k))
+                }
+            })
+            .collect();
+        format!("you have: {}", list.join(", "))
+    }
+
     /// Where a resolved unit list is standing, for the "nearest X" selectors.
     /// The FIRST living own unit in the list (they are sorted, so this is
     /// stable), or `None` if the list reaches nobody.
@@ -794,11 +877,25 @@ fn unit_selector(verb: &str, raw: &str) -> Result<Selector, String> {
         return Err(format!(
             "{verb}: '{raw}' names {}, not units — unit selectors are: \
              {SELECTOR_UNIT_NAMES}",
-            if sel.is_node_selector() {
-                "a resource node"
-            } else {
-                "a build site"
-            }
+            sel.channel_noun()
+        ));
+    }
+    Ok(sel)
+}
+
+/// The same, for the four verbs whose `select` names a BUILDING.
+///
+/// A separate channel rather than a widening of the unit one, because
+/// `{"type":"train","select":"my hero"}` is a real mistake with a helpful
+/// answer, and the only way to give it is to know which list the phrase should
+/// have come from.
+fn building_selector(verb: &str, raw: &str) -> Result<Selector, String> {
+    let sel = parse_selector(raw).ok_or_else(|| unknown_selector(raw))?;
+    if !sel.is_building_selector() {
+        return Err(format!(
+            "{verb}: '{raw}' names {}, not a building — building selectors are: \
+             {SELECTOR_BUILDING_NAMES}",
+            sel.channel_noun()
         ));
     }
     Ok(sel)
@@ -904,6 +1001,66 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
                  nothing was ordered"
             )),
         }
+    }
+    /// The building channel: `train`'s producer, `template`'s stamper,
+    /// `rally`'s source, `cancel`'s queue.
+    ///
+    /// Single-referent by the same documented tie-break as `soloist` above —
+    /// the LOWEST entity id among the matches — because these four verbs act on
+    /// exactly one building and picking "all of them" would turn one `train`
+    /// into six Footmen. `idle barracks` is how you say "and pick a free one".
+    ///
+    /// Both channels empty is a refusal here rather than in the four arms,
+    /// because `building` widened to `Option` to make room for the phrase and
+    /// somebody has to notice when neither was given. The arms keep a defensive
+    /// re-check, exactly as `resolved_point` does for the place channel.
+    fn producer(
+        verb: &str,
+        id: Option<IntentId>,
+        select: &Option<String>,
+        bind: &LateBind,
+    ) -> Result<Option<IntentId>, String> {
+        let Some(raw) = select else {
+            if id.is_none() {
+                return Err(format!(
+                    "{verb} needs a building id or a 'select' phrase — \
+                     building selectors are: {SELECTOR_BUILDING_NAMES}"
+                ));
+            }
+            return Ok(id);
+        };
+        let sel = building_selector(verb, raw)?;
+        // Sorted by entity bits already, so `first` IS the lowest id.
+        if let Some(found) = bind.buildings_matching(sel).first() {
+            return Ok(Some(*found));
+        }
+        // The empty match teaches, and `idle` gets its own sentence: "you have
+        // no barracks" and "both your barracks are busy" are different problems
+        // with different fixes, and one wording for both would send a commander
+        // to build a third barracks it did not need.
+        if let Selector::Buildings { what, idle: true } = sel {
+            let busy = bind
+                .buildings_matching(Selector::Buildings { what, idle: false })
+                .len();
+            if busy > 0 {
+                // Singular and plural read differently enough that one wording
+                // for both is the sort of thing a commander notices instead of
+                // the thing the sentence is about.
+                let count = if busy == 1 {
+                    format!("your only {} already has", what.word())
+                } else {
+                    format!("all {busy} of your {} already have", what.word())
+                };
+                return Err(format!(
+                    "{verb}: '{raw}' matches none of your finished buildings — \
+                     {count} something queued; drop 'idle' to queue behind it"
+                ));
+            }
+        }
+        Err(format!(
+            "{verb}: '{raw}' matches none of your finished buildings — {}",
+            bind.finished_building_roster()
+        ))
     }
     /// `(x, z, radius_from_region)`. A region always supplies a radius; only
     /// the two verbs that have a radius to give away actually use it.
@@ -1160,7 +1317,9 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
             z,
             region,
             target,
+            select,
         } => {
+            let building = producer("rally", building, &select, bind)?;
             let (x, z, _) = shape(regions, me, x, z, &region)?;
             Intent::Rally {
                 building,
@@ -1168,8 +1327,42 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
                 z,
                 region,
                 target,
+                select,
             }
         }
+        Intent::Train {
+            building,
+            unit,
+            select,
+        } => Intent::Train {
+            building: producer("train", building, &select, bind)?,
+            unit,
+            select,
+        },
+        Intent::Cancel {
+            building,
+            index,
+            select,
+        } => Intent::Cancel {
+            building: producer("cancel", building, &select, bind)?,
+            index,
+            select,
+        },
+        Intent::Template {
+            building,
+            squad,
+            retreat,
+            priority,
+            autocast,
+            select,
+        } => Intent::Template {
+            building: producer("template", building, &select, bind)?,
+            squad,
+            retreat,
+            priority,
+            autocast,
+            select,
+        },
         Intent::Retreat {
             units,
             below,
@@ -1354,7 +1547,6 @@ fn compile_intent(
     // one interface's private applier.
     let IntentWorld {
         bind,
-        buildings,
         targets,
         researching,
     } = world;
@@ -1362,6 +1554,7 @@ fn compile_intent(
         units,
         nodes,
         squads,
+        buildings,
     } = bind;
     // Names become coordinates and roles become rosters here and nowhere else.
     // Everything below this line sees the language it has always seen.
@@ -1373,6 +1566,7 @@ fn compile_intent(
             units,
             squads,
             nodes,
+            buildings,
             nav,
         },
     ) {
@@ -1391,6 +1585,15 @@ fn compile_intent(
             (Some(x), Some(z)) => Some(Vec3::new(x, 0.0, z)),
             _ => None,
         }
+    }
+    /// The same defence for the building channel: `resolve_places`'s `producer`
+    /// has already refused an intent that names neither an id nor a phrase, so
+    /// this is the arm's guard against a future path that skipped the resolver.
+    fn needs_building(verb: &str) -> String {
+        format!(
+            "{verb} needs a building id or a 'select' phrase — \
+             building selectors are: {SELECTOR_BUILDING_NAMES}"
+        )
     }
     match intent {
         Intent::Move { units: ids, x, z, .. } => {
@@ -1697,7 +1900,7 @@ fn compile_intent(
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((b, team, under, _, upgrading)) = buildings.get(entity) else {
+            let Ok((_, b, team, under, _, upgrading)) = buildings.get(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -1731,7 +1934,11 @@ fn compile_intent(
             // same single owner of every payment the UI goes through.
             events.upgrades.write(UpgradeBuilding { building: entity });
         }
-        Intent::Train { building, unit } => {
+        Intent::Train { building, unit, .. } => {
+            let Some(building) = building else {
+                errors.push(format!("{tag}: {}", needs_building("train")));
+                return;
+            };
             let Some(kind) = parse_unit_kind(&unit) else {
                 errors.push(format!("{tag}: unknown unit kind '{unit}'"));
                 return;
@@ -1770,7 +1977,7 @@ fn compile_intent(
                         .filter(|(_, u, t, ..)| **t == me && is_hero_kind(u.kind))
                         .map(|(_, u, ..)| u.kind),
                 );
-                for (_, b_team, _, b_queue, _) in buildings.iter() {
+                for (_, _, b_team, _, b_queue, _) in buildings.iter() {
                     if *b_team != me {
                         continue;
                     }
@@ -1800,7 +2007,7 @@ fn compile_intent(
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((b, team, under, queue, _)) = buildings.get_mut(entity) else {
+            let Ok((_, b, team, under, queue, _)) = buildings.get_mut(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -1862,12 +2069,16 @@ fn compile_intent(
             // Gate only — economy.rs deducts when training starts.
             queue.queue.push_back(kind);
         }
-        Intent::Cancel { building, index } => {
+        Intent::Cancel { building, index, .. } => {
+            let Some(building) = building else {
+                errors.push(format!("{tag}: {}", needs_building("cancel")));
+                return;
+            };
             let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((_, team, _, queue, _)) = buildings.get_mut(entity) else {
+            let Ok((_, _, team, _, queue, _)) = buildings.get_mut(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -1897,7 +2108,7 @@ fn compile_intent(
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((b, team, under, _, upgrading)) = buildings.get(entity) else {
+            let Ok((_, b, team, under, _, upgrading)) = buildings.get(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -1969,11 +2180,15 @@ fn compile_intent(
             target,
             ..
         } => {
+            let Some(building) = building else {
+                errors.push(format!("{tag}: {}", needs_building("rally")));
+                return;
+            };
             let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((b, team, _, _, _)) = buildings.get(entity) else {
+            let Ok((_, b, team, _, _, _)) = buildings.get(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -2066,7 +2281,7 @@ fn compile_intent(
             let building_hit = buildings
                 .get(entity)
                 .ok()
-                .map(|(b, team, under, _, _)| (b.kind, *team, under.is_some()));
+                .map(|(_, b, team, under, _, _)| (b.kind, *team, under.is_some()));
 
             // Where the caster is standing, when it is a unit. `None` means a
             // building caster, which needs no position: `abilities_of_building`
@@ -2274,7 +2489,7 @@ fn compile_intent(
                 errors.push(format!("{tag}: building {shop} not found/not yours"));
                 return;
             };
-            let Ok((b, team, under, _, _)) = buildings.get(entity) else {
+            let Ok((_, b, team, under, _, _)) = buildings.get(entity) else {
                 errors.push(format!("{tag}: building {shop} not found/not yours"));
                 return;
             };
@@ -2302,8 +2517,8 @@ fn compile_intent(
             let tier = tech_tier_for(
                 buildings
                     .iter()
-                    .filter(|(_, team, under, _, _)| **team == me && under.is_none())
-                    .map(|(b, _, _, _, _)| b.kind),
+                    .filter(|(_, _, team, under, _, _)| **team == me && under.is_none())
+                    .map(|(_, b, _, _, _, _)| b.kind),
             );
             if !item_unlocked(item, tier) {
                 errors.push(format!(
@@ -2365,7 +2580,7 @@ fn compile_intent(
                 Some(id) => {
                     let hall = intent_entity(id)
                         .and_then(|e| buildings.get(e).ok().map(|b| (e, b)))
-                        .filter(|(_, (b, team, under, _, _))| {
+                        .filter(|(_, (_, b, team, under, _, _))| {
                             **team == me && under.is_none() && is_hall(b.kind)
                         })
                         .map(|(e, _)| e);
@@ -2780,14 +2995,19 @@ fn compile_intent(
             retreat,
             priority,
             autocast,
+            ..
         } => {
+            let Some(building) = building else {
+                errors.push(format!("{tag}: {}", needs_building("template")));
+                return;
+            };
             // Only our own, finished, unit-producing buildings can carry a
             // template — anywhere else it would never be read.
             let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
-            let Ok((b, team, under, queue, _)) = buildings.get(entity) else {
+            let Ok((_, b, team, under, queue, _)) = buildings.get(entity) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
             };
@@ -3051,6 +3271,7 @@ fn compile_intent(
                         units,
                         squads,
                         nodes,
+                        buildings,
                         nav,
                     },
                 ) {
@@ -3610,8 +3831,8 @@ fn own_units(
 fn completed_kinds(buildings: &IntentBuildings, me: Team) -> Vec<BuildingKind> {
     buildings
         .iter()
-        .filter(|(_, team, under, _, _)| **team == me && under.is_none())
-        .map(|(building, ..)| building.kind)
+        .filter(|(_, _, team, under, _, _)| **team == me && under.is_none())
+        .map(|(_, building, ..)| building.kind)
         .collect()
 }
 
@@ -6452,8 +6673,9 @@ mod tests {
             app.world_mut().send_event(SubmitIntent::ui(
                 Team::Human,
                 Intent::Train {
-                    building: intent_id(hall),
+                    building: Some(intent_id(hall)),
                     unit: kind_name(kind).to_string(),
+                    select: None,
                 },
             ));
             app.update();
@@ -8449,6 +8671,47 @@ mod tests {
                 },
                 serde_json::json!({"type":"priority","units":[7],"classes":["ranged"]}),
             ),
+            // The four building verbs, whose `building` widened to `Option` to
+            // make room for the phrase. A historical command always carries it,
+            // so it serializes exactly as it always did — this is the pin.
+            (
+                Intent::Train {
+                    building: Some(7),
+                    unit: "Footman".to_string(),
+                    select: None,
+                },
+                serde_json::json!({"type":"train","building":7,"unit":"Footman"}),
+            ),
+            (
+                Intent::Cancel {
+                    building: Some(7),
+                    index: 0,
+                    select: None,
+                },
+                serde_json::json!({"type":"cancel","building":7,"index":0}),
+            ),
+            (
+                Intent::Rally {
+                    building: Some(7),
+                    x: Some(1.0),
+                    z: Some(2.0),
+                    region: None,
+                    target: None,
+                    select: None,
+                },
+                serde_json::json!({"type":"rally","building":7,"x":1.0,"z":2.0}),
+            ),
+            (
+                Intent::Template {
+                    building: Some(7),
+                    squad: Some(2),
+                    retreat: None,
+                    priority: None,
+                    autocast: None,
+                    select: None,
+                },
+                serde_json::json!({"type":"template","building":7,"squad":2}),
+            ),
         ];
         for (intent, expected) in cases {
             let got = serde_json::to_value(&intent).unwrap();
@@ -8483,6 +8746,14 @@ mod tests {
             r#"{"type":"leash","select":"squad 2","region":"home"}"#,
             r#"{"type":"autocast","select":"my hero","min_enemies":3}"#,
             r#"{"type":"squad","select":"all army","id":1}"#,
+            // The building channel (`wc3clone-3ji`). Four verbs, every one of
+            // which used to demand an entity id.
+            r#"{"type":"train","select":"my barracks","unit":"Footman"}"#,
+            r#"{"type":"train","select":"idle Barracks","unit":"Footman"}"#,
+            r#"{"type":"train","select":"my hall","unit":"Worker"}"#,
+            r#"{"type":"rally","select":"my barracks","x":1.0,"z":2.0}"#,
+            r#"{"type":"template","select":"my barracks","squad":2}"#,
+            r#"{"type":"cancel","select":"my barracks","index":0}"#,
         ];
         for form in forms {
             let parsed: Intent =
@@ -8517,6 +8788,23 @@ mod tests {
             "nearest tree",
             "nearest mine",
             "nearest legal site",
+            // The building family: possessive, bare, plural, idle, and the
+            // hall ladder. Every one of these is a spelling a commander writes.
+            "my barracks",
+            "barracks",
+            "My Barracks",
+            "my_barracks",
+            "the barracks",
+            "idle barracks",
+            "my idle barracks",
+            "my farms",
+            "farm",
+            "my hall",
+            "hall",
+            "idle hall",
+            "my town hall",
+            "townhall",
+            "war mill",
         ] {
             assert!(
                 parse_selector(phrase).is_some(),
@@ -8527,5 +8815,577 @@ mod tests {
         assert_eq!(parse_selector("squad 300"), None, "a squad id is a u8");
         assert_eq!(parse_selector(""), None);
         assert_eq!(parse_selector("north-pass"), None, "a place is not a role");
+    }
+
+    // -----------------------------------------------------------------------
+    // The building channel (wc3clone-3ji)
+    // -----------------------------------------------------------------------
+
+    /// The grammar, spelled out: what each phrase means, and what the open set
+    /// must NOT swallow.
+    #[test]
+    fn the_building_grammar_folds_case_articles_and_plurals() {
+        let barracks = Selector::Buildings {
+            what: BuildingRef::Kind(BuildingKind::Barracks),
+            idle: false,
+        };
+        for phrase in ["my barracks", "Barracks", "the barracks", "our BARRACKS", "a barracks"] {
+            assert_eq!(parse_selector(phrase), Some(barracks), "{phrase}");
+        }
+        assert_eq!(
+            parse_selector("my farms"),
+            Some(Selector::Buildings {
+                what: BuildingRef::Kind(BuildingKind::Farm),
+                idle: false
+            }),
+            "a plural is the same building"
+        );
+        let idle_barracks = Selector::Buildings {
+            what: BuildingRef::Kind(BuildingKind::Barracks),
+            idle: true,
+        };
+        for phrase in ["idle barracks", "my idle barracks", "idle my barracks"] {
+            assert_eq!(parse_selector(phrase), Some(idle_barracks), "{phrase}");
+        }
+        assert_eq!(
+            parse_selector("my hall"),
+            Some(Selector::Buildings { what: BuildingRef::Hall, idle: false })
+        );
+
+        // The open set is LAST, so it cannot shadow a fixed phrase. These are
+        // the collisions that would hurt if it ran first.
+        assert_eq!(parse_selector("mine"), Some(Selector::NearestMine));
+        assert_eq!(parse_selector("hero"), Some(Selector::Heroes));
+        assert_eq!(parse_selector("workers"), Some(Selector::Workers));
+        assert_eq!(parse_selector("north-pass"), None);
+        assert_eq!(parse_selector("nonsense"), None);
+
+        // And the channels know each other apart, so a refusal can name the
+        // right list.
+        assert!(barracks.is_building_selector() && !barracks.is_unit_selector());
+        assert!(!Selector::Heroes.is_building_selector());
+        assert_eq!(barracks.phrase(), "my Barracks");
+        assert_eq!(idle_barracks.phrase(), "idle Barracks");
+    }
+
+    /// A barracks, finished, with an empty training queue.
+    fn spawn_barracks(app: &mut App, team: Team, at: Vec3) -> Entity {
+        let e = spawn_hall_at(app, BuildingKind::Barracks, team, at, false);
+        app.world_mut().entity_mut(e).insert(TrainingQueue::default());
+        e
+    }
+
+    fn queue_of(app: &App, entity: Entity) -> Vec<UnitKind> {
+        app.world()
+            .entity(entity)
+            .get::<TrainingQueue>()
+            .map(|q| q.queue.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn rich(app: &mut App, team: Team) {
+        let mut economies = app.world_mut().resource_mut::<Economies>();
+        let e = economies.get_mut(team);
+        e.gold = 5000;
+        e.lumber = 5000;
+        e.supply_cap = 200;
+    }
+
+    /// **The bead, in one test.** A repeating `train` rule armed against the
+    /// ROLE keeps producing after the barracks it would have named is rubble.
+    ///
+    /// This is the production half of `a_selector_binds_to_the_hero_that_
+    /// exists_when_the_rule_fires`, and it is the r23-class failure both
+    /// commanders described: every cycle spent re-reading a building id out of
+    /// `buildings[]`, and a rule that stopped working the moment the building
+    /// died.
+    #[test]
+    fn a_building_selector_finds_the_producer_that_exists_when_the_rule_fires() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"steady","repeat":5,
+                "when":{"type":"base_under_attack"},
+                "then":{"type":"train","select":"my barracks","unit":"Footman"}}"#,
+        );
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "arming against a building the team has not built yet must not refuse"
+        );
+
+        let first = spawn_barracks(&mut app, Team::Human, Vec3::new(10.0, 0.0, 10.0));
+        fire(&mut app, Team::Human, "steady");
+        assert_eq!(queue_of(&app, first), vec![UnitKind::Footman]);
+
+        // The barracks is razed and another goes up. A frozen id names rubble.
+        app.world_mut().despawn(first);
+        let second = spawn_barracks(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.update();
+        drain_errors(&mut app, Team::Human);
+
+        fire(&mut app, Team::Human, "steady");
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "the re-fire must not report a dead building"
+        );
+        assert_eq!(
+            queue_of(&app, second),
+            vec![UnitKind::Footman],
+            "the barracks built AFTER the rule was armed is the one that trains"
+        );
+
+        // And nothing was written back: the stored sentence is still the role.
+        let then = app
+            .world()
+            .resource::<Triggers>()
+            .get(Team::Human)
+            .iter()
+            .find(|t| t.name.as_str() == "steady")
+            .unwrap()
+            .then
+            .clone();
+        match then {
+            Intent::Train { building, select, .. } => {
+                assert_eq!(building, None, "resolution must not be written back");
+                assert_eq!(select.as_deref(), Some("my barracks"));
+            }
+            other => panic!("stored then changed shape: {other:?}"),
+        }
+    }
+
+    /// The documented tie-break: lowest entity id, the same rule `build`'s
+    /// worker and `cast`'s caster already use. One `train`, one unit — a
+    /// selector that queued at every match would turn one sentence into four.
+    #[test]
+    fn a_single_referent_building_selector_takes_the_lowest_id() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let first = spawn_barracks(&mut app, Team::Human, Vec3::new(10.0, 0.0, 10.0));
+        let second = spawn_barracks(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        assert!(first.to_bits() < second.to_bits(), "spawn order is id order here");
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"train","select":"my barracks","unit":"Footman"}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert_eq!(queue_of(&app, first), vec![UnitKind::Footman]);
+        assert!(queue_of(&app, second).is_empty(), "one sentence, one unit");
+    }
+
+    /// `idle` is the phrase that wins games: it walks past a producer that is
+    /// already working, and when they are all working it says so in words
+    /// naming the fix rather than queueing six deep on one building.
+    #[test]
+    fn idle_walks_past_a_busy_producer_and_teaches_when_they_are_all_busy() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let busy = spawn_barracks(&mut app, Team::Human, Vec3::new(10.0, 0.0, 10.0));
+        let free = spawn_barracks(&mut app, Team::Human, Vec3::new(20.0, 0.0, 20.0));
+        app.world_mut()
+            .entity_mut(busy)
+            .get_mut::<TrainingQueue>()
+            .unwrap()
+            .queue
+            .push_back(UnitKind::Footman);
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"train","select":"idle barracks","unit":"Archer"}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert_eq!(
+            queue_of(&app, free),
+            vec![UnitKind::Archer],
+            "the lowest-id match is the lowest-id IDLE match"
+        );
+
+        // Now both are busy. The refusal names the count and the way out.
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"train","select":"idle barracks","unit":"Archer"}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'idle barracks' matches none of your finished buildings")
+                && errors[0].contains("all 2 of your Barracks already have something queued")
+                && errors[0].contains("drop 'idle'"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    /// An empty match teaches by naming what the seat DOES have — the
+    /// `Regions::unknown` rule applied to buildings. Own buildings only, so it
+    /// leaks nothing the snapshot did not already print.
+    #[test]
+    fn an_empty_building_selector_names_the_buildings_you_do_have() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        spawn_hall_at(&mut app, BuildingKind::Keep, Team::Human, Vec3::ZERO, false);
+        spawn_barracks(&mut app, Team::Human, Vec3::new(5.0, 0.0, 5.0));
+        spawn_barracks(&mut app, Team::Human, Vec3::new(9.0, 0.0, 9.0));
+        // An enemy Workshop must not appear in our refusal.
+        spawn_hall_at(
+            &mut app,
+            BuildingKind::Workshop,
+            Team::Claude,
+            Vec3::new(40.0, 0.0, 40.0),
+            false,
+        );
+        // ...and neither must our own unfinished one.
+        spawn_hall_at(
+            &mut app,
+            BuildingKind::Sanctum,
+            Team::Human,
+            Vec3::new(12.0, 0.0, 12.0),
+            true,
+        );
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"train","select":"my workshop","unit":"Catapult"}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'my workshop' matches none of your finished buildings")
+                && errors[0].contains("you have: Barracks \u{d7}2, Keep"),
+            "{}",
+            errors[0]
+        );
+        assert!(
+            !errors[0].contains("Workshop") || errors[0].starts_with("cmd 1: train: 'my workshop'"),
+            "the enemy's Workshop must not be in our roster: {}",
+            errors[0]
+        );
+        assert!(
+            !errors[0].contains("Sanctum"),
+            "an unfinished building is not a producer: {}",
+            errors[0]
+        );
+    }
+
+    /// A phrase from the wrong channel earns the RIGHT list. This is the whole
+    /// argument for a fourth channel rather than one widened `units`.
+    #[test]
+    fn a_selector_in_the_wrong_channel_names_the_list_it_should_have_come_from() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        spawn_barracks(&mut app, Team::Human, Vec3::ZERO);
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"train","select":"my hero","unit":"Footman"}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'my hero' names units, not a building")
+                && errors[0].contains(SELECTOR_BUILDING_NAMES),
+            "{}",
+            errors[0]
+        );
+
+        // ...and in the other direction.
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"move","select":"my barracks","x":1.0,"z":2.0}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'my barracks' names a building, not units")
+                && errors[0].contains(SELECTOR_UNIT_NAMES),
+            "{}",
+            errors[0]
+        );
+    }
+
+    /// **`my hall` follows the ladder.** A hall upgrades in place, so a rule
+    /// that named the rung would stop matching the moment it climbed — the
+    /// author-time-fact bug wearing a different hat.
+    #[test]
+    fn my_hall_matches_whichever_rung_is_standing() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        app.world_mut()
+            .resource_mut::<TechTiers>()
+            .set(Team::Human, TechTier::T2);
+        let keep = spawn_hall_at(&mut app, BuildingKind::Keep, Team::Human, Vec3::ZERO, false);
+        app.world_mut().entity_mut(keep).insert(TrainingQueue::default());
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"train","select":"my hall","unit":"Worker"}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert_eq!(queue_of(&app, keep), vec![UnitKind::Worker]);
+
+        // The rung's own name still works, and still means only that rung.
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"train","select":"my town hall","unit":"Worker"}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'my town hall' matches none of your finished buildings"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    /// The other three building verbs go through the same resolver, so one
+    /// test each is enough to prove the channel is wired rather than special.
+    #[test]
+    fn rally_template_and_cancel_take_the_same_phrase() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let barracks = spawn_barracks(&mut app, Team::Human, Vec3::new(10.0, 0.0, 10.0));
+
+        for json in [
+            r#"{"type":"rally","select":"my barracks","x":5.0,"z":6.0}"#,
+            r#"{"type":"template","select":"my barracks","squad":2}"#,
+            r#"{"type":"train","select":"my barracks","unit":"Footman"}"#,
+            r#"{"type":"cancel","select":"my barracks","index":0}"#,
+        ] {
+            app.world_mut().send_event(from_the_wire(Team::Human, json));
+            app.update();
+            let errors = drain_errors(&mut app, Team::Human);
+            assert!(errors.is_empty(), "{json}: {errors:?}");
+        }
+        assert!(
+            app.world().entity(barracks).get::<RallyPoint>().is_some(),
+            "rally landed on the building the phrase named"
+        );
+        assert!(
+            app.world().entity(barracks).get::<DoctrineTemplate>().is_some(),
+            "template landed on the building the phrase named"
+        );
+        assert!(
+            queue_of(&app, barracks).is_empty(),
+            "the train queued a Footman and the cancel took it back out"
+        );
+    }
+
+    /// Neither channel given is a refusal that names both ways to fix it,
+    /// rather than a silent no-op — `building` widened to `Option` and
+    /// something has to notice.
+    #[test]
+    fn a_building_verb_with_neither_id_nor_phrase_teaches() {
+        let mut app = compiler_app();
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"train","unit":"Footman"}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("train needs a building id or a 'select' phrase")
+                && errors[0].contains(SELECTOR_BUILDING_NAMES),
+            "{}",
+            errors[0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-pins: the exact JSON `tools/*.py` writes (wc3clone-3xr)
+    // -----------------------------------------------------------------------
+
+    /// **The two sides of the wire pin each other.**
+    ///
+    /// Every string below was copied verbatim from a Python tool's own output —
+    /// `tools/intent_compile.py` compiling the directives
+    /// `tools/test_intent_compile.py` pins, and `tools/affordances.py` rendering
+    /// the templates `tools/test_affordances.py` pins. Nothing here is a shape
+    /// invented in Rust to describe what the tooling *probably* emits, which is
+    /// exactly the hole this test closes: the NL compiler and the affordance
+    /// document are the biggest producers of bridge traffic in the project and
+    /// no Rust test crossed the wire with either of them.
+    ///
+    /// A form template legitimately carries `null` in its judgment-shaped
+    /// holes — the commander fills them in — so those are filled here with the
+    /// value a commander would send, and the KEY SET is what is being pinned.
+    ///
+    /// If this test starts failing, read it as "a tool now writes something the
+    /// engine does not accept" and fix whichever side is wrong. Do not delete
+    /// the line.
+    #[test]
+    fn the_json_the_tooling_writes_parses_and_compiles() {
+        let cases: &[(&str, &str)] = &[
+            // -- tools/intent_compile.py -----------------------------------
+            // "hold mid with the cavalry" — a squad enrolment followed by the
+            // posture. The pair is why `squad` exists in this list at all.
+            (
+                "hold mid with the cavalry",
+                r#"{"type": "squad", "units": [4294968130, 4294968131, 4294968132], "id": 1}"#,
+            ),
+            (
+                "hold mid with the cavalry",
+                r#"{"type": "posture", "id": 1, "posture": {"type": "defend", "x": 0.0, "z": 0.0, "radius": 18.0}}"#,
+            ),
+            (
+                "harvest lumber",
+                r#"{"type": "harvest", "select": "workers", "target_select": "nearest tree"}"#,
+            ),
+            (
+                "build a farm at our base",
+                r#"{"type": "build", "kind": "Farm", "x": 62.0, "z": 62.0, "worker": 4294968100, "site": "nearest legal site"}"#,
+            ),
+            ("squad 1 stages", r#"{"type": "stance", "squad": 1, "stance": "stage"}"#),
+            (
+                "squad 1 turtles at our base",
+                r#"{"type": "stance", "squad": 1, "stance": "turtle", "x": 70.0, "z": 70.0}"#,
+            ),
+            (
+                "retreat at 35%",
+                r#"{"type": "retreat", "select": "all army", "below": 0.35, "x": 70.0, "z": 70.0}"#,
+            ),
+            (
+                "autocast at 3",
+                r#"{"type": "autocast", "select": "my hero", "min_enemies": 3}"#,
+            ),
+            (
+                "focus siege > cavalry",
+                r#"{"type": "priority", "select": "all army", "classes": ["Siege", "Cavalry"]}"#,
+            ),
+            (
+                "when my base is attacked, squad 1 defends our base",
+                r#"{"type": "trigger_set", "name": "base-attacked", "when": {"type": "base_under_attack"}, "then": {"type": "posture", "id": 1, "posture": {"type": "defend", "x": 70.0, "z": 70.0, "radius": 18.0}}}"#,
+            ),
+            // The `then` that carries a SELECT — the shape the tool writes for
+            // every rule since it stopped freezing ids.
+            (
+                "when my hero drops below 30%, fall back at 50% to our base",
+                r#"{"type": "trigger_set", "name": "hero-30", "when": {"type": "hero_below", "frac": 0.3}, "then": {"type": "retreat", "select": "all army", "below": 0.5, "x": 70.0, "z": 70.0}}"#,
+            ),
+            // ...and the building selector reaching the same channel.
+            (
+                "whenever my base is attacked, train a footman",
+                r#"{"type": "trigger_set", "name": "base-attacked", "when": {"type": "base_under_attack"}, "then": {"type": "train", "select": "idle Barracks", "unit": "Footman"}, "repeat": 45.0}"#,
+            ),
+            (
+                "train a footman (immediate)",
+                r#"{"type": "train", "building": 4294968202, "unit": "Footman"}"#,
+            ),
+            // -- tools/affordances.py templates, holes filled --------------
+            (
+                "affordance form: squad",
+                r#"{"type": "squad", "select": "all army", "id": 1}"#,
+            ),
+            (
+                "affordance form: build",
+                r#"{"type": "build", "select": "workers", "kind": "Farm", "region": "home", "site": "nearest legal site"}"#,
+            ),
+            (
+                "affordance form: train:Barracks",
+                r#"{"type": "train", "select": "my Barracks", "unit": "Footman"}"#,
+            ),
+            (
+                "affordance form: train:TownHall",
+                r#"{"type": "train", "select": "idle TownHall", "unit": "Worker"}"#,
+            ),
+            (
+                "affordance form: stance",
+                r#"{"type": "stance", "squad": 1, "stance": "push", "target": "home"}"#,
+            ),
+            (
+                "affordance recipe: hero-save",
+                r#"{"type": "trigger_set", "name": "hero-save", "repeat": 45, "when": {"type": "hero_below", "frac": 0.35}, "then": {"type": "move", "select": "my hero", "region": "home"}}"#,
+            ),
+            (
+                "affordance recipe: expand",
+                r#"{"type": "trigger_set", "name": "expand", "when": {"type": "mine_dry"}, "then": {"type": "build", "select": "workers", "kind": "TownHall", "region": "home", "site": "nearest legal site"}}"#,
+            ),
+            (
+                "affordance recipe: steady-production",
+                r#"{"type": "trigger_set", "name": "steady-production", "repeat": 20, "when": {"type": "unit_count", "kind": "Footman", "count": 6}, "then": {"type": "train", "select": "idle TownHall", "unit": "Worker"}}"#,
+            ),
+        ];
+
+        // Half one: every string is an `Intent` and re-serializes under its own
+        // verb, which is what the replay log and the snapshot echo depend on.
+        for (source, json) in cases {
+            let parsed: Intent = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("{source}: {json} failed to parse: {e}"));
+            assert!(!parsed.sentence().is_empty(), "{source}: no sentence");
+            let round: serde_json::Value = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(
+                round.get("type").and_then(|v| v.as_str()),
+                Some(parsed.verb()),
+                "{source}: re-serialized under a different tag"
+            );
+        }
+
+        // Half two: every string COMPILES against a world shaped like the one
+        // the tool was reading — a hall, two barracks, a hero, workers, an
+        // army, a squad, a tree, a mine and a named region. Parsing proves the
+        // shape; compiling proves the sentence does something.
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        app.world_mut()
+            .resource_mut::<TechTiers>()
+            .set(Team::Human, TechTier::T2);
+        let hall = spawn_hall_at(&mut app, BuildingKind::TownHall, Team::Human, Vec3::ZERO, false);
+        app.world_mut().entity_mut(hall).insert(TrainingQueue::default());
+        spawn_barracks(&mut app, Team::Human, Vec3::new(6.0, 0.0, 6.0));
+        spawn_barracks(&mut app, Team::Human, Vec3::new(9.0, 0.0, 9.0));
+        spawn_hero(&mut app, Team::Human, Vec3::new(2.0, 0.0, 2.0));
+        let worker = spawn_worker(&mut app, Team::Human, Vec3::new(3.0, 0.0, 3.0));
+        let footman = spawn_footman(&mut app, Team::Human, Vec3::new(4.0, 0.0, 4.0));
+        spawn_node(&mut app, ResourceKind::Lumber, Vec3::new(8.0, 0.0, 0.0), 500);
+        spawn_node(&mut app, ResourceKind::Gold, Vec3::new(0.0, 0.0, 8.0), 500);
+        app.world_mut()
+            .entity_mut(footman)
+            .insert(SquadId(1));
+        app.update();
+        region_set(&mut app, Team::Human, "home", 0.0, 0.0, 18.0);
+        drain_errors(&mut app, Team::Human);
+
+        // The tool's ids belong to the fixture's world, not to this one, so the
+        // two id-bearing cases are re-pointed at this world's equivalents. The
+        // KEY SET — which is what the cross-pin is about — is untouched.
+        let repoint = |json: &str| {
+            json.replace("4294968130", &intent_id(footman).to_string())
+                .replace("4294968131", &intent_id(footman).to_string())
+                .replace("4294968132", &intent_id(footman).to_string())
+                .replace("4294968100", &intent_id(worker).to_string())
+                .replace("4294968202", &intent_id(hall).to_string())
+        };
+        let mut queues = app.world_mut().query::<&mut TrainingQueue>();
+        for (source, json) in cases {
+            // Each case is checked against the SAME world, so the ones that
+            // queue a unit must not decide whether `idle <kind>` still matches
+            // for the ones after them. This is a shape pin, not a scenario.
+            for mut queue in queues.iter_mut(app.world_mut()) {
+                queue.queue.clear();
+            }
+            let json = repoint(json);
+            // The hall trains Workers, not Footmen: the one case whose verb
+            // depends on the fixture's Barracks becomes the hall's own unit.
+            let json = if source == &"train a footman (immediate)" {
+                json.replace("\"Footman\"", "\"Worker\"")
+            } else {
+                json
+            };
+            app.world_mut()
+                .send_event(from_the_wire(Team::Human, &json));
+            app.update();
+            let errors = drain_errors(&mut app, Team::Human);
+            assert!(errors.is_empty(), "{source}: {json} refused: {errors:?}");
+        }
     }
 }
