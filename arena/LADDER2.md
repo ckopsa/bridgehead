@@ -147,3 +147,53 @@ problem down to the prompt line; whether a playbooked-by-default small model
 closes distance on a bigger one is the next measurable question — and the
 executor arm (a script that only ever confirms) is the control that finally
 separates the playbook's strength from the model's.
+
+---
+
+## Addendum: the opt-out rematches (r34–r35)
+
+*Same day. Recommendation 1 implemented — `arena_run` writes
+`{"playbook": "standard-kingdom"}` into every scaffolded seat's prefs file at
+creation (`--playbook none` opts out; a seat's own edits are never clobbered;
+`seats[].playbook` lands in the ledger) — and the Sonnet and Haiku mirrors
+rerun with the book open by default.*
+
+| round | tier | result | duration | the split inside the mirror |
+|---|---|---|---|---|
+| r34 | Sonnet 5 | blue wins, **razed** | 387s | book-follower beat book-abandoner |
+| r35 | Haiku 4.5 | blue wins, surrender | 473s | **autopilot from t=316** beat book-follower |
+
+**r34 is the strongest result either ladder produced.** The first raze in ten
+LLM rounds — every prior game ended in surrender. Blue kept the book open all
+match, consumed two accurate INVALIDATED forks, and played with genuine
+tempo: push at t=200, lose half the army, regroup and heal (hero-save caught
+its hero at 17%), decisive second push. That regroup-then-recommit
+discipline is steps 8–9's exact lesson, executed by the tier that floated
+4,000 gold in r27 and 9,255 lumber in r32. Red went off-book after a muddled
+step 1 and lost the old Sonnet way — lumber-starved past honest gates it
+read and never acted on. One mirror, follower versus abandoner, decided by
+raze.
+
+**r35 sharpened the autopilot question past deferring.** Red played the
+floor tier's best own-hands game on record — the book to step 6, 29 workers,
+two halls, every automation correct — and surrendered to a seat that took
+the book through step 4, wiped its army at t=290, and handed the faction to
+the scripted AI at t=316, never taking it back. Everything red lost to
+(tier 2, the Spearman counter, the pressure) was scripted play. Across
+r33+r35 that is two of four Haiku seats delegating and both ending on the
+winning side: **at the floor tier, delegation dominates playing.** Either
+ladder rules ban mid-match autopilot, or the measured skill at small tiers
+is officially "knowing when to hand off" — but the ledger cannot keep
+calling those rounds Haiku victories without a seat-flag. (Also the fourth
+instance of Haiku's self-report diverging from the logs — blue reported a
+raze; the ledger says surrender.)
+
+**Verdict on recommendation 1:** adoption solved. Three of four pre-declared
+seats engaged with the book (r34 both, r35 red); the fourth consumed its
+opening before delegating. The remaining authoring gaps are exactly where
+the book goes quiet: a tech-path decision point (Keep vs Workshop), a
+scout-before-commit gate on the push step, and the mid/late-game chapters —
+all filed. The next measurable question is unchanged from the report body,
+now with a working delivery mechanism: the cross-tier round, playbooked
+small model versus a larger one, with the confirm-everything executor as
+control — and an autopilot ruling in the round rules first.
