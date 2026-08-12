@@ -78,6 +78,38 @@ const COHESION_SPREAD: f32 = 14.0;
 /// blob creeping toward the objective instead of standing still.
 const COHESION_STEP: f32 = 8.0;
 
+/// How long a Push squad keeps gathering while **neither tightening up nor
+/// getting any closer to its objective**, before it gives up on the stragglers
+/// and presses on with what it has. `gate_gather` is where this is applied.
+///
+/// The rule above is written for a tail that is *closing*: catapults walking up
+/// behind their footmen, a squad that got strung out through a gap. That tail
+/// shrinks the spread every second, so a gather that is working never spends
+/// this patience at all.
+///
+/// A tail that is not closing is a different animal, and r22 is what it costs.
+/// The rusher's Barracks kept training into the same squad, so every few
+/// seconds a fresh body appeared at home, a hundred units behind the front. The
+/// squad was therefore *permanently* strung out; the regroup point sat halfway
+/// back down the map; and the leaders, who had already reached the ford, were
+/// walked back off it. Net progress for roughly four hundred game seconds was
+/// zero, the AAR called it "the costliest single technical issue", and the
+/// commander escaped it by abandoning the posture for raw `attackmove` — which
+/// is to say, by turning cohesion off by hand.
+///
+/// So: wait for a formation that is forming, or a push that is moving. Twelve
+/// seconds is about fifty world units for the slowest siege engine in the game
+/// and eighty for a Footman — long enough to close any gap a march across this
+/// map opens between two units that set out together, and short enough that
+/// discovering the tail is a mirage costs a fifth of what it cost r22 in a
+/// single one of its many cycles.
+const COHESION_PATIENCE: f32 = 12.0;
+/// How much tighter the formation has to get to count as "still gathering".
+/// Slack enough that separation jitter between packed bodies is not mistaken
+/// for progress, small enough that a real straggler closing at walking pace
+/// re-arms the patience on every single tick.
+const COHESION_PROGRESS: f32 = 0.5;
+
 /// How far past a known emplacement's attack range a squad treats the ground
 /// as covered. A squad that stops exactly on the range ring is already being
 /// shot at by the time it works out that it is: the margin is the approach.
@@ -98,6 +130,37 @@ const DEFENDED_SPREAD: f32 = 7.0;
 #[derive(Component, Clone, Copy, Debug)]
 struct Retreating {
     rally: Vec3,
+}
+
+/// One Push squad's in-progress gather, so the executor can tell a formation
+/// that is closing up from one that never will (see `COHESION_PATIENCE`).
+///
+/// It lives in a `Local` on `run_squad_postures` rather than in a resource:
+/// nothing outside this system has any business reading it, and it is a memo
+/// about a decision, not a fact about the world.
+#[derive(Clone, Copy, Debug)]
+struct Gather {
+    /// The objective this gather is for. A commander who re-aims the push is
+    /// starting a new gather, and gets fresh patience for it.
+    objective: Vec3,
+    /// Tightest the formation has been since the gather began. Ratchets down
+    /// only, so a straggler that closes and a *replacement* straggler that
+    /// appears behind it do not read as the same progress twice.
+    best_spread: f32,
+    /// Closest the squad's *leading edge* has been to the objective since the
+    /// gather began, ratcheting down for the same reason.
+    ///
+    /// Tightening is not the only kind of progress and it was a mistake to
+    /// treat it as one: a squad that sets out from a rally point is already
+    /// about `COHESION_SPREAD` wide, so the gather fires on the first heartbeat
+    /// of every push and marching only makes the formation *looser*. Judged on
+    /// spread alone that push looked stuck twelve seconds later and went in
+    /// piecemeal — which is the very death the cohesion rule exists to prevent.
+    /// A squad closing on its objective is not stuck, whatever its spread is
+    /// doing.
+    best_dist: f32,
+    /// When either of the two last improved.
+    improved_at: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +255,91 @@ fn cohesion_point(positions: &[Vec3], target: Vec3) -> Option<Vec3> {
     }
     let dir = Vec3::new(target.x - centroid.x, 0.0, target.z - centroid.z).normalize_or_zero();
     Some(Vec3::new(centroid.x, 0.0, centroid.z) + dir * COHESION_STEP)
+}
+
+/// `cohesion_point`, plus the answer to "is this squad getting anywhere?".
+///
+/// The geometry is unchanged and still lives in `cohesion_point`; what this
+/// adds is a clock on the *waiting*, and the clock is re-armed by **progress of
+/// either kind**:
+///
+///   * the formation tightening — the tail is closing, which is what the whole
+///     rule is for; or
+///   * the squad's leading edge getting nearer the objective — the push is
+///     working, and a working push is not a stall whatever its spread is doing.
+///
+/// A squad doing neither for `COHESION_PATIENCE` seconds is not forming up and
+/// is not advancing. Something behind it is replacing stragglers as fast as
+/// they arrive, and the gather point it keeps being sent to sits halfway back
+/// down the map. That squad presses on with what it has rather than marching
+/// back and forth in front of a chokepoint until the match is over. See
+/// `COHESION_PATIENCE` for the r22 story, and `Gather::best_dist` for what
+/// happened when this only counted the first kind of progress.
+///
+/// The memo is kept while the squad presses on, deliberately: the condition
+/// that defeated the gather is still true next tick, and re-arming here would
+/// buy back the oscillation one patience-window at a time. Cohesion comes back
+/// the moment the squad IS cohesive, which is also when the memo is dropped.
+fn gate_gather(
+    gathers: &mut std::collections::BTreeMap<(Team, u8), Gather>,
+    key: (Team, u8),
+    positions: &[Vec3],
+    objective: Vec3,
+    now: f32,
+) -> Option<Vec3> {
+    let Some(point) = cohesion_point(positions, objective) else {
+        // Cohesive (or trivially small): nothing to wait for, and the next
+        // gather starts from a clean slate.
+        gathers.remove(&key);
+        return None;
+    };
+    let (_, spread) = formation(positions, objective);
+    // The LEADING edge, not the centre of mass. The centroid is exactly the
+    // quantity the refilled tail poisons — every body that appears at home
+    // drags it backwards, and every body that walks up drags it forwards again,
+    // so a squad standing still in front of a ford reads as advancing. The
+    // member nearest the objective is the honest answer to "has this push got
+    // any further?", and it bottoms out when the push has arrived.
+    let dist = positions
+        .iter()
+        .map(|p| xz_dist(*p, objective))
+        .fold(f32::INFINITY, f32::min);
+    let entry = gathers.entry(key).or_insert(Gather {
+        objective,
+        best_spread: spread,
+        best_dist: dist,
+        improved_at: now,
+    });
+    // A re-aimed push is a new gather. `ORDER_EPS` is the same slack the order
+    // comparison uses, so "the commander moved the objective" means the same
+    // thing here as it does there.
+    if xz_dist(entry.objective, objective) > ORDER_EPS {
+        *entry = Gather {
+            objective,
+            best_spread: spread,
+            best_dist: dist,
+            improved_at: now,
+        };
+    }
+    if spread < entry.best_spread - COHESION_PROGRESS {
+        entry.best_spread = spread;
+        entry.improved_at = now;
+    }
+    // Ground, unlike tightness, needs a real margin: a squad parked in front of
+    // a ford with bodies trickling up behind it drifts a metre or two closer
+    // every so often, and counting that as an advance re-arms the patience
+    // forever. `COHESION_STEP` is one gather-step's worth of ground — the same
+    // distance the regroup point itself moves — so "the squad advanced" means
+    // the same thing here as it does there. This is r22's "net progress",
+    // written down.
+    if dist < entry.best_dist - COHESION_STEP {
+        entry.best_dist = dist;
+        entry.improved_at = now;
+    }
+    if now - entry.improved_at > COHESION_PATIENCE {
+        return None;
+    }
+    Some(point)
 }
 
 /// Centre of mass on the ground plane, and the distance of the widest member
@@ -870,8 +1018,13 @@ fn run_squad_postures(
     fog: Res<FogGrids>,
     ai: Res<AiControlled>,
     external: Res<ExternallyCommanded>,
+    // One entry per Push squad that is currently gathering. `BTreeMap` because
+    // it is on a gameplay path (BUILDER_BRIEF §6.4) even though nothing here
+    // iterates it.
+    mut gathers: Local<std::collections::BTreeMap<(Team, u8), Gather>>,
 ) {
     if squad_orders.0.is_empty() {
+        gathers.clear();
         return;
     }
     let now = time.elapsed_secs();
@@ -966,8 +1119,13 @@ fn run_squad_postures(
             .map(|(_, _, _, tf, ..)| tf.translation)
             .collect();
         let regroup = match posture {
-            SquadPosture::Push { pos } => cohesion_point(&squad_positions, pos),
-            _ => None,
+            SquadPosture::Push { pos } => {
+                gate_gather(&mut gathers, (team, squad), &squad_positions, pos, now)
+            }
+            _ => {
+                gathers.remove(&(team, squad));
+                None
+            }
         };
 
         // Forage gets its own planner, because cohesion is only half of what a
@@ -1091,6 +1249,10 @@ fn run_squad_postures(
     for key in lapsed {
         squad_orders.0.remove(&key);
     }
+    // A squad whose posture was cleared (or which lapsed above) is never
+    // visited by the loop, so its gather memo would outlive it and greet the
+    // next push on that id with somebody else's patience.
+    gathers.retain(|key, _| squad_orders.0.contains_key(key));
 }
 
 /// A retreat is a trip to the infirmary, not permanent leave: once regen
@@ -2262,5 +2424,380 @@ mod probe {
         );
         // …and the bar has to be one master actually fails, or it proves nothing.
         assert!(old_in > 0 && pct(old_bad, m) > 50.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reproduction: a Push squad at a crossings ford (wc3clone-egy)
+// ---------------------------------------------------------------------------
+
+/// The r22 defect, on a bench.
+///
+/// The rusher's `posture:push` "oscillated near the center and southeast fords
+/// for nearly 400 seconds without making net progress"; the same commander then
+/// switched to raw `attackmove` and the army moved immediately. So the defect
+/// is not in the pathing — the scripted AI walks its armies through these fords
+/// all match with plain `AttackMove` orders — it is in what `Push` adds on top,
+/// which is the cohesive advance.
+///
+/// This module builds the smallest world that can tell those two apart: the
+/// real `crossings` nav grid, the real movement pipeline out of units.rs, and
+/// the real `run_squad_postures` on its real 1 Hz heartbeat. No combat, no
+/// economy, no AI, so what it measures is a property of the doctrine rule and
+/// of nothing else.
+///
+/// **The shape that reproduces it** is the shape every real push has and no
+/// hand-built formation does: a squad whose tail is *refilled*. Barracks train
+/// into the squad all match, and a retreat policy sends the wounded home to
+/// heal, so there is always a fresh body a hundred units behind the front. The
+/// squad is therefore permanently strung out, the regroup point sits halfway
+/// back down the map, and the leaders who have already taken the ford are
+/// walked off it. `reinforce_every` is that Barracks.
+#[cfg(test)]
+mod ford {
+    use super::*;
+    use crate::terrain::{terrain_blocks, MapKind};
+    use bevy::time::TimeUpdateStrategy;
+
+    /// Fixed step, for the reason `BH_FIXED_DT` exists: this whole module is a
+    /// claim about how many game seconds something took.
+    const DT: f64 = 0.05;
+    /// Half-thickness of the impassable channel, restated (terrain.rs keeps its
+    /// own copy private). The centre ford is the gap at `along == 0`.
+    const CHANNEL_HALF: f32 = 5.0;
+
+    /// Signed distance across the canyon. Negative on the human/SW half, which
+    /// is the side a Push starts from, so "crossed" means `across > CHANNEL_HALF`.
+    fn across(p: Vec3) -> f32 {
+        const INV: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        (p.x + p.z) * INV
+    }
+
+    /// The crossings nav grid, built from the same predicate the real map is.
+    fn crossings_nav() -> NavGrid {
+        let mut nav = NavGrid::default();
+        for cz in 0..GRID_DIM {
+            for cx in 0..GRID_DIM {
+                if terrain_blocks(MapKind::Crossings, NavGrid::cell_to_world(cx, cz)) {
+                    nav.blocked[NavGrid::idx(cx, cz)] = true;
+                }
+            }
+        }
+        nav
+    }
+
+    /// Doctrine's heartbeat and units.rs's movement, in the shipping frame
+    /// order, over the crossings barrier. Everything else is absent.
+    fn bench() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            Duration::from_secs_f64(DT),
+        ));
+        app.init_resource::<Races>()
+            .init_resource::<SquadOrders>()
+            .init_resource::<FogGrids>()
+            .init_resource::<ExternallyCommanded>()
+            .insert_resource(AiControlled { human: false, claude: false })
+            .insert_resource(crossings_nav());
+        app.configure_sets(Update, (SimSet::Think, SimSet::Movement).chain());
+        app.add_systems(
+            Update,
+            run_squad_postures
+                .run_if(on_timer(Duration::from_millis(SQUAD_MS)))
+                .in_set(SimSet::Think),
+        );
+        crate::units::add_movement_systems_for_test(&mut app);
+        app
+    }
+
+    /// `n` Footmen packed around `at`, deterministically, in the rank-and-file
+    /// block a rally point produces.
+    fn squad(app: &mut App, at: Vec3, n: usize) -> Vec<Entity> {
+        (0..n)
+            .map(|i| {
+                let (row, col) = (i / 4, i % 4);
+                let p = at + Vec3::new(col as f32 * 2.6 - 3.9, 0.0, row as f32 * 2.6 - 2.6);
+                app.world_mut()
+                    .spawn((
+                        Unit { kind: UnitKind::Footman },
+                        Team::Human,
+                        SquadId(1),
+                        Transform::from_translation(Vec3::new(p.x, 0.0, p.z)),
+                        Health::new(100.0),
+                        Order::Idle,
+                    ))
+                    .id()
+            })
+            .collect()
+    }
+
+    /// What the twelve bodies that set out actually achieved.
+    struct Run {
+        /// Game time the squad's median member first stood on the objective.
+        arrived: Option<f32>,
+        /// Did the median ever get over the channel at all?
+        ever_across: bool,
+        /// How many times the median left the objective again after landing on
+        /// it. Every one of these is ground taken and given back — this is the
+        /// number the r22 AAR was describing when it said "oscillated ...
+        /// without making net progress".
+        gave_ground: usize,
+        /// Fraction of the second half of the run spent on the objective.
+        held: f32,
+        /// Game seconds spent off the objective after first landing on it —
+        /// the headline number, and the bench's version of r22's "four hundred
+        /// seconds without net progress".
+        off_objective: f32,
+        /// How far the squad's median stood from the objective at the end.
+        end_dist: f32,
+    }
+
+    /// Step the bench and watch the squad's median member — the median, not the
+    /// leader, because one scout over the water is not a crossing and one
+    /// straggler at home is not a failure.
+    fn run(
+        app: &mut App,
+        members: &[Entity],
+        objective: Vec3,
+        secs: f32,
+        reinforce_every: Option<f32>,
+        attackmove: bool,
+    ) -> Run {
+        if attackmove {
+            for m in members {
+                app.world_mut()
+                    .entity_mut(*m)
+                    .insert(Order::AttackMove(objective));
+            }
+        } else {
+            app.world_mut()
+                .resource_mut::<SquadOrders>()
+                .0
+                .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+        }
+
+        let frames = (secs as f64 / DT) as usize;
+        let mut next_recruit = reinforce_every.unwrap_or(f32::INFINITY);
+        let (mut arrived, mut gave_ground, mut on_it, mut was_on) = (None, 0usize, 0usize, false);
+        let mut median = 0.0_f32;
+        let mut ever_across = false;
+        let mut off_objective = 0.0_f32;
+        for f in 0..frames {
+            app.update();
+            let t = (f + 1) as f32 * DT as f32;
+            if t >= next_recruit {
+                next_recruit += reinforce_every.unwrap_or(f32::INFINITY);
+                // A fresh body at the Barracks, enrolled in the pushing squad.
+                // Under `attackmove` it is given no order at all, which is
+                // exactly what a raw order does: it commands the units named in
+                // it and nothing else, forever.
+                squad(app, HUMAN_BASE, 1);
+            }
+            let here: Vec<Vec3> = members
+                .iter()
+                .map(|e| app.world().entity(*e).get::<Transform>().unwrap().translation)
+                .collect();
+            let mut dists: Vec<f32> = here.iter().map(|p| xz_dist(*p, objective)).collect();
+            dists.sort_by(f32::total_cmp);
+            median = dists[dists.len() / 2];
+            let mut acr: Vec<f32> = here.iter().map(|p| across(*p)).collect();
+            acr.sort_by(f32::total_cmp);
+            ever_across |= acr[acr.len() / 2] > CHANNEL_HALF;
+            // "On the objective" is generous: `SQUAD_ARRIVE` plus a body's
+            // worth of jostling, so ordinary separation is not a retreat.
+            let now_on = median <= ON_OBJECTIVE;
+            if now_on && arrived.is_none() {
+                arrived = Some(t);
+            }
+            if arrived.is_some() {
+                if now_on != was_on {
+                    gave_ground += 1;
+                }
+                if f as f64 * DT >= secs as f64 / 2.0 && now_on {
+                    on_it += 1;
+                }
+                if !now_on {
+                    off_objective += DT as f32;
+                }
+            }
+            was_on = now_on;
+        }
+        Run {
+            arrived,
+            ever_across,
+            // Two transitions per round trip; report round trips.
+            gave_ground: gave_ground / 2,
+            held: on_it as f32 / (frames as f32 / 2.0),
+            off_objective,
+            end_dist: median,
+        }
+    }
+
+    /// How close the squad's median has to be for the push to count as landed.
+    /// `SQUAD_ARRIVE` is what the executor itself calls "there"; the rest is one
+    /// body's worth of jostling in a packed blob.
+    const ON_OBJECTIVE: f32 = SQUAD_ARRIVE + 6.0;
+
+    fn report(name: &str, r: &Run, floor: f32) {
+        let arrived = match r.arrived {
+            Some(t) => format!("{t:6.1}s"),
+            None => "  never".to_string(),
+        };
+        println!(
+            "  {name:<34} landed={arrived}  back-and-forth={:2}x  off-objective={:6.0}s  \
+             held={:5.1}%  end_dist={:6.1}  crossed={}\t[walk floor {floor:.0}s]",
+            r.gave_ground,
+            r.off_objective,
+            100.0 * r.held,
+            r.end_dist,
+            if r.ever_across { "yes" } else { "NO " },
+        );
+    }
+
+    /// Footman speed over the straight line, as a floor on an honest crossing.
+    fn walk_secs(from: Vec3, to: Vec3) -> f32 {
+        xz_dist(from, to) / unit_stats(UnitKind::Footman).speed
+    }
+
+    /// **The bead, measured.** Run with `--nocapture` for the numbers.
+    ///
+    /// Twelve Footmen at the Barracks, told to push to a point just over the
+    /// centre ford. The only variable is whether the Barracks keeps training
+    /// into the squad while they walk.
+    #[test]
+    fn probe_a_push_squad_crosses_the_centre_ford() {
+        // Just over the far bank: close enough that the squad ARRIVES and goes
+        // idle, which is when the posture executor gets to have an opinion
+        // about it. A squad still walking is never re-tasked (`re_taskable`),
+        // so an objective on the far side of the map would measure the walk
+        // and not the doctrine.
+        let objective = Vec3::new(20.0, 0.0, 20.0);
+        let floor = walk_secs(HUMAN_BASE, objective);
+        let secs = 600.0;
+
+        println!("\n=== posture:push over the centre ford (16 wide, channel 10 thick) ===");
+        for (every, label) in [
+            (None, "no reinforcement"),
+            (Some(30.0), "+1 body every 30s"),
+            (Some(15.0), "+1 body every 15s"),
+            (Some(8.0), "+1 body every  8s"),
+            (Some(5.0), "+1 body every  5s"),
+        ] {
+            let mut app = bench();
+            let members = squad(&mut app, HUMAN_BASE, 12);
+            let r = run(&mut app, &members, objective, secs, every, false);
+            report(&format!("push, {label}"), &r, floor);
+        }
+        println!("  --- control: raw attackmove, the workaround r22 fell back on ---");
+        for (every, label) in [(None, "no reinforcement"), (Some(8.0), "+1 body every  8s")] {
+            let mut app = bench();
+            let members = squad(&mut app, HUMAN_BASE, 12);
+            let r = run(&mut app, &members, objective, secs, every, true);
+            report(&format!("attackmove, {label}"), &r, floor);
+        }
+        println!();
+    }
+
+    /// **A push whose tail is refilled must still take the ford and keep it.**
+    ///
+    /// The regression bar, stated as the thing r22 could not do. A Barracks
+    /// feeding the squad every eight seconds keeps it permanently strung out,
+    /// so the cohesion rule fires on every heartbeat forever. Before
+    /// `COHESION_PATIENCE` that meant the leaders were walked back off the
+    /// crossing on every heartbeat forever too.
+    ///
+    /// Measured on this bench with `COHESION_PATIENCE` disabled — which is
+    /// exactly the shipping code before this bead — a body every eight seconds
+    /// costs 30 game seconds off the objective in four round trips, and a body
+    /// every five costs 73. With the patience in they cost 7 and 24. Raw
+    /// `attackmove` and an unreinforced push cost nothing either way.
+    ///
+    /// The bar is the eight-second stream, which is already about twice the
+    /// rate two Barracks can sustain, and it is set between the two numbers.
+    /// It is not zero on purpose: a squad that is momentarily cohesive and then
+    /// strung out again is starting a *new* gather and gets fresh patience for
+    /// it, which is correct and which costs a few seconds each time it happens.
+    #[test]
+    fn a_reinforced_push_takes_the_ford_and_keeps_it() {
+        let objective = Vec3::new(20.0, 0.0, 20.0);
+        let floor = walk_secs(HUMAN_BASE, objective);
+        let secs = 600.0;
+
+        let mut app = bench();
+        let members = squad(&mut app, HUMAN_BASE, 12);
+        let r = run(&mut app, &members, objective, secs, Some(8.0), false);
+        report("push, +1 body every  8.0s", &r, floor);
+
+        assert!(r.ever_across, "the squad never got over the ford at all");
+        let arrived = r.arrived.unwrap_or(f32::INFINITY);
+        assert!(
+            arrived < floor * 4.0,
+            "a reinforced push took {arrived:.0}s to land on an objective {floor:.0}s of \
+             walking away (or never landed) — the gather is holding the squad short of it"
+        );
+        assert!(
+            r.held > 0.98,
+            "the squad stood on its objective only {:.0}% of the second half of the \
+             match — it is taking the ground and giving it back",
+            100.0 * r.held
+        );
+        assert!(
+            r.off_objective < 15.0,
+            "the squad spent {:.0}s walked off its own objective — this is r22's \
+             oscillation, at bench scale",
+            r.off_objective
+        );
+        assert!(
+            r.gave_ground <= 2,
+            "the squad walked off its own objective and back {} times",
+            r.gave_ground
+        );
+    }
+
+    /// The other half of the bar, and the reason `COHESION_PATIENCE` re-arms on
+    /// progress rather than simply expiring: **a gather that is working still
+    /// works.** A squad whose slow half is genuinely walking up is not allowed
+    /// to leave it behind — that is the "defeat in detail" death `COHESION_SPREAD`
+    /// was added for (R5 & R7), and a patience that ignored a closing tail
+    /// would have traded one AAR's bug for another's.
+    ///
+    /// Six bodies at the ford and six a long walk behind them, no reinforcement:
+    /// the tail closes, so the squad must wait for it and go over together.
+    #[test]
+    fn a_gather_that_is_closing_is_still_waited_for() {
+        let objective = Vec3::new(20.0, 0.0, 20.0);
+        let mut app = bench();
+        let mut members = squad(&mut app, Vec3::new(-14.0, 0.0, -14.0), 6);
+        members.extend(squad(&mut app, Vec3::new(-64.0, 0.0, -64.0), 6));
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+
+        // Long enough for the leaders to have strolled over on their own, and
+        // nowhere near `COHESION_PATIENCE` past that.
+        let mut crossed_early = 0usize;
+        for f in 0..(10.0 / DT) as usize {
+            app.update();
+            let ahead: Vec<Vec3> = members[..6]
+                .iter()
+                .map(|e| app.world().entity(*e).get::<Transform>().unwrap().translation)
+                .collect();
+            let tail: Vec<Vec3> = members[6..]
+                .iter()
+                .map(|e| app.world().entity(*e).get::<Transform>().unwrap().translation)
+                .collect();
+            let spread = formation(&ahead.iter().chain(&tail).copied().collect::<Vec<_>>(), objective).1;
+            if f > 20 && spread > COHESION_SPREAD && ahead.iter().all(|p| across(*p) > CHANNEL_HALF)
+            {
+                crossed_early += 1;
+            }
+        }
+        assert_eq!(
+            crossed_early, 0,
+            "the leading half went over the ford while the squad was still \
+             strung out — the cohesive advance stopped working"
+        );
     }
 }
