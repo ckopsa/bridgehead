@@ -18,6 +18,7 @@ via a file on disk — a mocked marker would test the mock.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -43,9 +44,11 @@ class Seat:
         self.dir = Path(tmp)
         (self.dir / SEAT).mkdir(parents=True)
         self.state = self.dir / SEAT / "state.json"
-        self.marker = Path("/tmp/claude-1000") / ("bridge_wait_" + SEAT.replace("/", "_"))
-        self.marker.parent.mkdir(parents=True, exist_ok=True)
-        self.marker.unlink(missing_ok=True)
+        # BH_MARKER_DIR points the tool's marker into this throwaway dir, so
+        # parallel test runs (and real matches on this machine) never share
+        # read positions.
+        self.marker_dir = self.dir / "markers"
+        self.marker = self.marker_dir / ("bridge_wait_" + SEAT.replace("/", "_"))
         self.t = 0.0
 
     def write(self, *, errors=None, events=None, game_over=None, bump=1.0):
@@ -59,12 +62,13 @@ class Seat:
         out = subprocess.run(
             [sys.executable, str(TOOL), "--seat", SEAT, "--max", "0"],
             cwd=self.dir, capture_output=True, text=True, timeout=30,
+            env={**os.environ, "BH_MARKER_DIR": str(self.marker_dir)},
         )
         assert out.returncode == 0, out.stderr
         return out.stdout.strip()
 
     def close(self):
-        self.marker.unlink(missing_ok=True)
+        pass  # the TemporaryDirectory owns everything, marker included
 
 
 def seat_test(fn):

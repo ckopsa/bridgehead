@@ -42,8 +42,13 @@ against different mistakes, and the cheap one lives on this side.
 """
 import hashlib
 import json
+import os
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from markers import marker_path  # noqa: E402
 
 #: Marker schema version. Bumping it is how a future change to what gets
 #: remembered invalidates stale markers instead of misreading them.
@@ -123,7 +128,7 @@ def main():
             max_wait = float(args.pop(0))
 
     state_path = f"{seat}/state.json"
-    marker = "/tmp/claude-1000/bridge_wait_" + seat.replace("/", "_")
+    marker = marker_path("bridge_wait", seat)
 
     def read():
         try:
