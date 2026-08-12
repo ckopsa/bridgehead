@@ -699,11 +699,28 @@ the bridge is a live singleton and these write into seat directories.
 ### A.5 Python tooling tests
 
 ```bash
-python3 -m pytest tools/            # or: for f in tools/test_*.py; do python3 "$f"; done
+for f in tools/test_*.py; do python3 "$f"; done   # what verify.sh's python stage runs
 ```
 
-`tools/test_arena.py`, `tools/test_arena_run.py`, `tools/test_bridge_wait.py`,
-`tools/test_intent_compile.py`. Touch a `tools/*.py` and you own these.
+Every `tools/test_*.py` file MUST run standalone under bare `python3` — a
+`_run()` main, not a hard pytest dependency. pytest is not installed on every
+machine this repo builds on (`python3 -m pytest` fails here), and `verify.sh`
+invokes the files directly, so a suite that imports pytest at module scope or
+in `__main__` fails the python stage everywhere it matters. The files stay
+pytest-*compatible* (plain `test_*` functions, zero-arg after decorators) for
+anyone who has it. Touch a `tools/*.py` and you own these.
+
+### A.5b Capturing bridge fixtures
+
+A bridged seat LOSES its scripted AI (`bridge.rs` flips that faction's
+`AiControlled` off), so `BH_AI_BOTH=1 BH_BRIDGE=red` is *not* an AI-vs-AI
+match with an observer — the bridged side sits still and gets razed. To
+capture realistic seat snapshots, bridge the seat and hand it straight back:
+
+```bash
+BH_HEADLESS=1 BH_AI_BOTH=1 BH_BRIDGE=red BH_SPEED=16 BH_SEED=42 ./target/debug/bridgehead &
+python3 tools/bridge_send.py --seat bridge/red '[{"type":"autopilot","on":true},{"type":"ready"}]'
+```
 
 ### A.6 Other useful envs
 

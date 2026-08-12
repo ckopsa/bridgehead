@@ -57,7 +57,9 @@ will verify a stale binary.
 ```bash
 cargo build          # the binary — required before running the game
 cargo test           # the Rust test suite
-python3 -m pytest tools/   # the tooling tests (tools/test_*.py)
+for f in tools/test_*.py; do python3 "$f"; done   # the tooling tests — each file
+                           # runs standalone; pytest is NOT installed here, so
+                           # `python3 -m pytest` does not work on this machine
 ```
 
 Verification is a named tier (`tools/verify.sh`, composing the raw commands
