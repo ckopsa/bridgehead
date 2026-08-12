@@ -1606,6 +1606,222 @@ mod tests {
         assert!(lines[1].contains("the site is blocked"));
     }
 
+    // -- chains: a plan whose steps are stances (wc3clone-0uu.6) -------------
+
+    /// A hero of `team` in squad 1, at `frac` of its health.
+    fn hurt_hero(app: &mut App, team: Team, frac: f32) -> Entity {
+        app.world_mut()
+            .spawn((
+                Unit { kind: UnitKind::Hero },
+                team,
+                Transform::from_xyz(0.0, 0.0, 0.0),
+                Health {
+                    current: 100.0 * frac,
+                    max: 100.0,
+                },
+                Hero {
+                    level: 1,
+                    xp: 0.0,
+                    mana: 80.0,
+                },
+                SquadId(1),
+                Order::Idle,
+            ))
+            .id()
+    }
+
+    fn stance_of(app: &App) -> Option<StanceKind> {
+        app.world()
+            .resource::<SquadStances>()
+            .0
+            .get(&(Team::Human, 1))
+            .copied()
+    }
+
+    /// **THE CHAIN, END TO END.** "Turtle until the hero is healed, then secure
+    /// the northwest mine" — one wire sentence, armed before the fight, walked
+    /// by the engine across its own transition with nobody at the keyboard.
+    ///
+    /// Everything this needs already existed: a `PlanStep` holds any `Intent`,
+    /// and `stance` is an intent. The only new word is the wait-condition
+    /// `hero_above`, which reached plans through the predicate seam without
+    /// plan.rs learning anything (see
+    /// `a_plan_advances_on_a_predicate_a_later_bead_added`). That is why this
+    /// test is the deliverable and there is no `stance_plan` verb: a chain is a
+    /// plan whose steps are stances.
+    #[test]
+    fn the_turtle_heal_secure_chain_walks_itself() {
+        let mut app = full_app();
+        let hero = hurt_hero(&mut app, Team::Human, 0.3);
+        // No setup: `northwest mine` is the MAP's own word for that ground, so
+        // the chain is armable on the opening poll with nothing named first.
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: serde_json::from_str(
+                r#"{"type":"plan_set","name":"hold","steps":[
+                     {"intent":{"type":"stance","squad":1,"stance":"turtle"},
+                      "advance":{"type":"when","when":{"type":"hero_above","frac":0.8}}},
+                     {"intent":{"type":"stance","squad":1,"stance":"secure",
+                                "target":"northwest mine"}}]}"#,
+            )
+            .expect("the chain in COMMANDER_BRIEF.md parses"),
+            trigger: None,
+            plan: None,
+        });
+        app.update();
+        assert_eq!(app.world().resource::<Plans>().get(Team::Human).len(), 1);
+
+        // Step 1 goes out and is compiled in the same frame.
+        advance_clock(&mut app, 0.5);
+        app.update();
+        assert_eq!(stance_of(&app), Some(StanceKind::Turtle), "step 1 ran");
+        assert!(
+            app.world().resource::<IntentErrors>().get(Team::Human).is_empty(),
+            "nothing was refused: {:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+
+        // The hero is still hurt, so the chain holds — for as long as it takes.
+        for _ in 0..8 {
+            advance_clock(&mut app, 10.0);
+            app.update();
+            assert_eq!(at(&app), 0, "the hero is at 30%, so we are still turtling");
+            assert_eq!(stance_of(&app), Some(StanceKind::Turtle));
+        }
+
+        // Healed.
+        app.world_mut().entity_mut(hero).insert(Health {
+            current: 95.0,
+            max: 100.0,
+        });
+        advance_clock(&mut app, 0.5);
+        app.update();
+        assert_eq!(at(&app), 1, "healed, so the chain moves");
+        assert_eq!(
+            stance_of(&app),
+            Some(StanceKind::Secure),
+            "and step 2's stance is installed"
+        );
+        // The late-bound target really became the anchor, and the RING is the
+        // stance's rather than the region's — the stance rule, unchanged by
+        // being inside a chain.
+        match app.world().resource::<SquadOrders>().0.get(&(Team::Human, 1)) {
+            Some(SquadPosture::Defend { pos, radius }) => {
+                assert_eq!(*pos, Vec3::new(-60.0, 0.0, 60.0));
+                assert_eq!(*radius, StanceKind::Secure.def().radius);
+            }
+            other => panic!("secure installs a Defend ring, got {other:?}"),
+        }
+
+        advance_clock(&mut app, 0.5);
+        app.update();
+        assert_eq!(state(&app), PlanState::Done);
+    }
+
+    /// **Armed, not refused — and it says which step is holding.**
+    ///
+    /// The chain names a region this seat has not scouted, so step 2 cannot be
+    /// resolved at arm time. docs/AFFORDANCES.md § Chains is explicit that this
+    /// must arm and report rather than refuse, because a policy decided at
+    /// leisure is precisely the one whose target is not known yet. When the
+    /// step's turn comes and the name is *still* unknown, it blocks with the
+    /// resolver's own words — the same failure shape as `cannot afford` — and
+    /// recovers the moment the ground is named.
+    #[test]
+    fn a_chain_whose_target_is_unscouted_arms_holds_and_then_resolves() {
+        let mut app = full_app();
+        let hero = hurt_hero(&mut app, Team::Human, 0.3);
+
+        app.world_mut().send_event(SubmitIntent {
+            team: Team::Human,
+            source: IntentSource::Bridge,
+            tag: "cmd 0".to_string(),
+            intent: serde_json::from_str(
+                r#"{"type":"plan_set","name":"hold","steps":[
+                     {"intent":{"type":"stance","squad":1,"stance":"turtle"},
+                      "advance":{"type":"when","when":{"type":"hero_above","frac":0.8}}},
+                     {"intent":{"type":"stance","squad":1,"stance":"secure",
+                                "target":"their-expansion"}}]}"#,
+            )
+            .expect("parses"),
+            trigger: None,
+            plan: None,
+        });
+        app.update();
+
+        // ARMED. Not refused, and the plan is really in the list.
+        assert_eq!(
+            app.world().resource::<Plans>().get(Team::Human).len(),
+            1,
+            "an unscouted target must never cost a commander the plan"
+        );
+        let told = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+        assert!(
+            told.iter().any(|e| e.contains("chain holds at step 2")
+                && e.contains("their-expansion")
+                && e.contains("armed")),
+            "the seat is told which step holds and why, at arm time: {told:?}"
+        );
+
+        // Step 1 still runs — a holding step 2 does not stop the sequence
+        // starting.
+        advance_clock(&mut app, 0.5);
+        app.update();
+        assert_eq!(stance_of(&app), Some(StanceKind::Turtle));
+
+        // The hero heals before the ground is named, so step 2's turn comes
+        // while its target is still nothing. It blocks THERE, in the resolver's
+        // own words, and never skips.
+        app.world_mut().entity_mut(hero).insert(Health {
+            current: 95.0,
+            max: 100.0,
+        });
+        advance_clock(&mut app, 0.5);
+        app.update();
+        assert_eq!(at(&app), 1);
+        let status = app.world().resource::<Plans>().get(Team::Human)[0].status();
+        assert!(
+            status.starts_with("blocked: no region named 'their-expansion'"),
+            "the chain blocks on the step whose target is missing: {status}"
+        );
+        assert_eq!(
+            stance_of(&app),
+            Some(StanceKind::Turtle),
+            "and the squad keeps the stance it had — a blocked step changes nothing"
+        );
+
+        // The scout comes home and the commander names the ground. The retry
+        // that the plan was already making resolves the name it always meant.
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .set(
+                Team::Human,
+                Region::new("their-expansion", Vec3::new(60.0, 0.0, -60.0), 18.0),
+            )
+            .expect("legal");
+        advance_clock(&mut app, PLAN_RETRY_S + 0.5);
+        app.update();
+        assert_eq!(
+            stance_of(&app),
+            Some(StanceKind::Secure),
+            "the late-bound target resolved when it finally could"
+        );
+        // The verdict lands after this sweep, so the "unblocked" line is the
+        // next one — one line in when it stuck, one line out when it moved.
+        advance_clock(&mut app, 0.5);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<GameEvents>()
+                .feed(Team::Human)
+                .iter()
+                .any(|e| e.message.contains("unblocked")),
+            "and the recovery is announced, as any unblock is"
+        );
+    }
+
     /// A step the compiler really refuses, through the real compiler: the plan
     /// blocks with the compiler's actual words rather than a paraphrase.
     #[test]
