@@ -494,6 +494,58 @@ const PROP_VETO_KEY: KeyCode = hotkeys::VETO_PROPOSAL;
 /// The co-commander's colour. Deliberately NOT one of the three severity
 /// colours: "my partner said this" must never read as "the game says this".
 const PROP_ACCENT: Color = Color::srgb(0.68, 0.63, 1.0);
+
+// --- Standing alarms: the human's level view --------------------------------
+//
+// `wc3clone-uew`. An alarm is computed once, for both seats (alarm.rs), and
+// until now it was *rendered* twice in two different tenses. The bridge seat
+// reads `alarms` in `state.json` — a level-triggered array, present in every
+// snapshot for exactly as long as the condition holds, which a commander can
+// re-read on any poll. The human got only the two edges of the same fact, as
+// alert-stack rows: one line when it fired, one when it cleared, both gone
+// nine seconds later. Look away for ten seconds and the level view was still
+// there for one seat and irrecoverable for the other.
+//
+// This panel is the human catching up, and it is **rendering only**: it reads
+// `Alarms::get(Team::Human)` and writes nothing. No new fact, no new source,
+// no new mutation path — the same rule the alert stack keeps, and the reason
+// there is nothing here for the fairness invariant to be about. Fog is
+// likewise inherited rather than re-derived: `Alarms` is stored per team and
+// the getter takes one, so a renderer for this seat has no way to ask for the
+// other's, exactly as `GameEvents::feed` works (BUILDER_BRIEF §6.10).
+//
+// Where it sits: bottom-left, on the strip of screen directly above the
+// console. The HUD's two floating panels already own the top corners — news
+// on the right, standing decisions on the left (see the proposal-panel note
+// above) — and both have variable, unbounded-ish height, so a third panel up
+// there would either overlap one of them or spend every frame chasing it. Down
+// here it is pinned to the console's top edge, it never moves except on a
+// resize, and it is next to the minimap, which is where an eye already goes to
+// ask "what is the state of the world".
+
+/// One row per kind, which is exact rather than a guess: `ALL_ALARM_KINDS` is a
+/// closed set, and shared.rs argues at length that a fifth kind should have to
+/// earn its way in. `Alarms` sorts its list into that order, so row N is the
+/// same kind between two frames.
+const ALARM_SLOTS: usize = ALL_ALARM_KINDS.len();
+const ALARM_W: f32 = 330.0;
+/// Same narrow-window guard the other two floating panels carry. The alert
+/// stack's `NOTIF_MAX_FRAC` is the constraint that matters at the bottom-left:
+/// nothing else claims this strip, so half the window is generous already.
+const ALARM_MAX_FRAC: f32 = 0.5;
+const ALARM_FONT: f32 = 12.0;
+const ALARM_HEAD_FONT: f32 = 11.0;
+const ALARM_GAP: f32 = 3.0;
+/// Height budgeted per row when hit-testing, and for the header line. Generous
+/// for the reason `NOTIF_ROW_HIT_H` is: a row is two lines of text until a long
+/// fact wraps, no analytic guess knows which, and swallowing a click just above
+/// the panel beats leaking one through as a move order onto the battlefield.
+const ALARM_ROW_HIT_H: f32 = 2.0 * ALARM_FONT + 12.0 + ALARM_GAP;
+const ALARM_HEAD_H: f32 = ALARM_HEAD_FONT + 6.0;
+/// The panel's own quiet grey. An alarm row is already severity-coloured on its
+/// spine and its fact line; the running default is deliberately duller than
+/// both, because "what is already happening" is the part you read second.
+const ALARM_DEFAULT_FG: Color = Color::srgb(0.62, 0.66, 0.76);
 /// An urgent proposal's spine and headline. The alert stack's Warning amber —
 /// the one exception to the rule above, and it earns it: urgency is a claim
 /// about the GAME ("this window closes"), not about who is speaking, so it is
@@ -634,6 +686,11 @@ impl Plugin for UiPlugin {
                     // so filing it with its sibling would be a cycle. It draws
                     // and nothing else, which is what `Cosmetic` is for.
                     update_proposals.in_set(SimSet::Cosmetic).after(CopilotSet),
+                    // Same slot, same reason: alarm.rs sweeps in `SimSet::Feed`
+                    // and `Cosmetic` is the phase after it, so the panel paints
+                    // this frame's standing list rather than last frame's. No
+                    // explicit `.after` is needed — the frame order says it.
+                    update_alarm_panel.in_set(SimSet::Cosmetic),
                 ),
             );
     }
@@ -711,6 +768,11 @@ struct UiState {
     /// `update_proposals`), for the same reason `notif_rows` exists: a click
     /// on "Approve" must not also be a move order on the ground behind it.
     prop_cards: usize,
+    /// Number of visible standing-alarm rows (refreshed by
+    /// `update_alarm_panel`), for the same reason again. The panel has no
+    /// buttons, but a click that lands on it is a click the player aimed at a
+    /// readout, and it must not also walk the army there.
+    alarm_rows: usize,
     /// The hero the player most recently had selected — the Shop's customer.
     ///
     /// A Shop's buy card is drawn for a BUILDING selection, so at the moment of
@@ -793,6 +855,40 @@ struct NotifText(usize);
 /// The "[Space] focus" footer under the stack; hidden when the stack is empty.
 #[derive(Component)]
 struct NotifHint;
+
+/// The standing-alarm panel's root, so `update_alarm_panel` can re-pin it to
+/// the console's top edge when the window resizes.
+#[derive(Component)]
+struct AlarmPanel;
+
+/// The panel's header line. Hidden with the panel, so an empty alarm list
+/// leaves nothing at all on screen — silence is the normal state and a
+/// permanently visible "ALARMS (none)" would be furniture.
+#[derive(Component)]
+struct AlarmHead;
+
+/// One pooled alarm row, by index into this seat's standing list.
+#[derive(Component)]
+struct AlarmRow(usize);
+
+/// Which line of which alarm row a text node is. One marker with a part tag
+/// rather than two marker types, for the reason `PropText` gives: two
+/// `&mut Text` queries in one system need mutually-exclusive `Without` filters
+/// to satisfy Bevy B0001, and a discriminant is the same information with no
+/// aliasing puzzle.
+#[derive(Component, Clone, Copy)]
+struct AlarmText {
+    row: usize,
+    part: AlarmPart,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AlarmPart {
+    /// The triggering fact, in the words the feed used for the same thing.
+    Fact,
+    /// `default: <what is already being done>  ·  ETA 22s`.
+    Default,
+}
 
 /// The single world-space ring shown under whatever the cursor would pick.
 /// One pooled proposal card, by queue index (0 = oldest = the hotkeys' target).
@@ -2896,6 +2992,7 @@ fn cursor_over_hud(cursor: Vec2, window: &Window, ui: &UiState, hud: &HudLayout)
     }
     notif_rect(window, ui.notif_rows).is_some_and(|r| r.contains(cursor))
         || prop_rect(window, ui.prop_cards).is_some_and(|r| r.contains(cursor))
+        || alarm_rect(window, hud, ui.alarm_rows).is_some_and(|r| r.contains(cursor))
 }
 
 // --- Responsive console ----------------------------------------------------
@@ -3050,6 +3147,29 @@ fn notif_rect(window: &Window, rows: usize) -> Option<Rect> {
 /// node carries, or the hit rect and the pixels drift apart.
 fn notif_width(window: &Window) -> f32 {
     NOTIF_W.min(window.width() * NOTIF_MAX_FRAC)
+}
+
+/// Screen-space rectangle of the standing-alarm panel, or `None` when nothing
+/// stands. Analytic like its two siblings, and bottom-anchored because the
+/// panel is: it is pinned `PAD` above the console and grows UPWARD as alarms
+/// arrive, so the rect is derived from its bottom edge and its row count.
+///
+/// Bounded by construction — `ALARM_SLOTS` is `ALL_ALARM_KINDS.len()`, so the
+/// tallest this can ever be is four rows and a header, which no window this
+/// game runs in can fail to hold.
+fn alarm_rect(window: &Window, hud: &HudLayout, rows: usize) -> Option<Rect> {
+    if rows == 0 {
+        return None;
+    }
+    let width = ALARM_W.min(window.width() * ALARM_MAX_FRAC);
+    let bottom = (window.height() - hud.console_h - PAD).max(0.0);
+    let height = ALARM_HEAD_H + rows as f32 * ALARM_ROW_HIT_H;
+    Some(Rect::new(
+        PAD,
+        (bottom - height).max(0.0),
+        PAD + width,
+        bottom,
+    ))
 }
 
 /// Screen-space rectangle of the minimap. The console is a strip pinned to the
@@ -3523,6 +3643,7 @@ fn setup_ui(
 
     spawn_notifications(&mut commands);
     spawn_proposals(&mut commands);
+    spawn_alarms(&mut commands);
 }
 
 /// The co-commander's pending directives: a fixed pool of cards in the
@@ -3709,6 +3830,93 @@ fn spawn_notifications(commands: &mut Commands) {
                 TextColor(Color::srgb(0.55, 0.60, 0.70)),
                 NotifHint,
             ));
+        });
+}
+
+/// The standing-alarm panel: a header and a fixed pool of two-line rows in the
+/// bottom-left, above the console, hidden until something stands. Pooled and
+/// mutated in place like every other refreshed node in this file.
+///
+/// See the constants above for why it is down here rather than in a corner
+/// with the other two floating panels, and for the fairness note (the bridge
+/// seat has read this same level view out of `state.json` since alarms landed;
+/// this is the human's rendering of it, and nothing but a rendering).
+fn spawn_alarms(commands: &mut Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(PAD),
+                // Re-pinned by `update_alarm_panel` whenever the console
+                // resizes; this is the full-size answer so frame one is right.
+                bottom: Val::Px(HudLayout::default().console_h + PAD),
+                width: Val::Px(ALARM_W),
+                max_width: Val::Percent(ALARM_MAX_FRAC * 100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(ALARM_GAP),
+                ..default()
+            },
+            AlarmPanel,
+        ))
+        .with_children(|panel| {
+            // Hidden by holding an empty string, the idiom `NotifHint` already
+            // uses: one fewer `&mut Node` query for the paint system to keep
+            // disjoint from the two it already needs.
+            panel.spawn((
+                Text::new(""),
+                TextFont {
+                    font_size: ALARM_HEAD_FONT,
+                    ..default()
+                },
+                TextColor(ALARM_DEFAULT_FG),
+                AlarmHead,
+            ));
+            for i in 0..ALARM_SLOTS {
+                panel
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(1.0),
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                            // The same severity spine the alert stack and the
+                            // proposal cards wear: this is the same HUD saying
+                            // the same kind of thing, in a different tense.
+                            border: UiRect::left(Val::Px(3.0)),
+                            display: Display::None,
+                            ..default()
+                        },
+                        BackgroundColor(PANEL_BG),
+                        BorderColor(EDGE),
+                        AlarmRow(i),
+                    ))
+                    .with_children(|row| {
+                        row.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: ALARM_FONT,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                            AlarmText {
+                                row: i,
+                                part: AlarmPart::Fact,
+                            },
+                        ));
+                        row.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: ALARM_FONT,
+                                ..default()
+                            },
+                            TextColor(ALARM_DEFAULT_FG),
+                            AlarmText {
+                                row: i,
+                                part: AlarmPart::Default,
+                            },
+                        ));
+                    });
+            }
         });
 }
 
@@ -9687,6 +9895,105 @@ fn update_notifications(
 }
 
 // ---------------------------------------------------------------------------
+// Standing alarms: the level view, for the seat that only had the edges
+// ---------------------------------------------------------------------------
+
+/// The second line of an alarm row.
+///
+/// `running_default` is never empty — shared.rs makes it a `String` rather than
+/// an `Option<String>` precisely so no alarm can be raised without saying what
+/// is already happening about it — so this always has something to print, and
+/// "nothing recovers this automatically" prints as readily as a recall does.
+///
+/// The ETA rides along on the same line rather than getting a column of its
+/// own: `None` is a real answer ("the default is to stand still"), and a column
+/// that was blank two rows out of three would read as missing data.
+fn alarm_default_line(running_default: &str, eta_s: Option<f32>) -> String {
+    match eta_s {
+        Some(eta) => format!("default: {running_default}   ·   ETA {}s", trim_num(eta)),
+        None => format!("default: {running_default}"),
+    }
+}
+
+/// Paint this seat's standing alarms. Reads `Alarms`, writes pixels — see the
+/// constants block for why that is the whole contract.
+///
+/// `SimSet::Cosmetic` rather than the input chain, for the reason
+/// `update_proposals` is there: alarm.rs sweeps in `SimSet::Feed`, which is
+/// downstream of `Input`, so a panel filed with the gesture systems would
+/// always be showing the previous frame's list.
+fn update_alarm_panel(
+    alarms: Res<Alarms>,
+    hud: Res<HudLayout>,
+    mut ui: ResMut<UiState>,
+    mut panel: Query<&mut Node, (With<AlarmPanel>, Without<AlarmHead>, Without<AlarmRow>)>,
+    mut rows: Query<(&AlarmRow, &mut Node, &mut BorderColor), Without<AlarmHead>>,
+    mut head: Query<&mut Text, (With<AlarmHead>, Without<AlarmText>)>,
+    mut texts: Query<(&AlarmText, &mut Text, &mut TextColor), Without<AlarmHead>>,
+) {
+    // `Team::Human` is the whole filter, and it is the same one the bridge
+    // applies to its seat: `Alarms::get` takes a team and there is no call that
+    // returns both, so this renderer cannot see the other side's situation.
+    let standing = alarms.get(Team::Human);
+    ui.alarm_rows = standing.len().min(ALARM_SLOTS);
+
+    // Follow the console's top edge. Written only when it actually changes,
+    // like `apply_hud_layout` does, so Bevy's change detection stays useful.
+    let want_bottom = Val::Px(hud.console_h + PAD);
+    for mut node in &mut panel {
+        if node.bottom != want_bottom {
+            node.bottom = want_bottom;
+        }
+    }
+
+    if let Ok(mut text) = head.single_mut() {
+        let wanted = if standing.is_empty() {
+            ""
+        } else {
+            "STANDING ALARMS"
+        };
+        if text.0 != wanted {
+            text.0 = wanted.to_string();
+        }
+    }
+
+    for (row, mut node, mut border) in &mut rows {
+        let Some(alarm) = standing.get(row.0) else {
+            node.display = Display::None;
+            continue;
+        };
+        node.display = Display::Flex;
+        border.0 = severity_color(alarm.severity);
+    }
+
+    for (slot, mut text, mut color) in &mut texts {
+        let wanted = standing.get(slot.row).map(|alarm| match slot.part {
+            AlarmPart::Fact => (
+                alarm.fact.clone(),
+                lighten(severity_color(alarm.severity), 0.15),
+            ),
+            AlarmPart::Default => (
+                alarm_default_line(&alarm.running_default, alarm.eta_s),
+                ALARM_DEFAULT_FG,
+            ),
+        });
+        match wanted {
+            Some((line, tint)) => {
+                if text.0 != line {
+                    text.0 = line;
+                }
+                color.0 = tint;
+            }
+            None => {
+                if !text.0.is_empty() {
+                    text.0.clear();
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Co-command: answering the partner
 // ---------------------------------------------------------------------------
 //
@@ -10047,6 +10354,197 @@ mod tests {
         // drained by `seq`, and a rejection is news exactly once.
         app.update();
         assert_eq!(app.world().resource::<Notifications>().live.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Standing alarms: the human's level view (wc3clone-uew)
+    // -----------------------------------------------------------------
+
+    /// The panel and its paint system, with no window and no renderer — the
+    /// same headless-App discipline every other renderer test here uses.
+    fn alarm_panel_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<UiState>()
+            .init_resource::<HudLayout>()
+            .init_resource::<Alarms>()
+            .add_systems(Startup, |mut commands: Commands| spawn_alarms(&mut commands))
+            .add_systems(Update, update_alarm_panel);
+        app
+    }
+
+    /// Raise (or, with `raised: None`, clear) one alarm through the production
+    /// path. `Alarms`'s only writer is `observe`, and a test that reached past
+    /// it would be testing a state the engine cannot produce; `grace_s: 0.0`
+    /// skips the reflex window, which is alarm.rs's business and not the HUD's.
+    fn stand(app: &mut App, kind: AlarmKind, raised: Option<Alarm>) {
+        app.world_mut()
+            .resource_mut::<Alarms>()
+            .observe(Team::Human, kind, 1.0, 0.0, raised);
+    }
+
+    fn an_alarm(kind: AlarmKind, fact: &str, default: &str, eta_s: Option<f32>) -> Alarm {
+        Alarm {
+            kind,
+            fact: fact.to_string(),
+            running_default: default.to_string(),
+            since_t: 1.0,
+            severity: EventSeverity::Warning,
+            eta_s,
+            pos: None,
+        }
+    }
+
+    fn row_line(app: &mut App, row: usize, part: AlarmPart) -> String {
+        let mut q = app.world_mut().query::<(&AlarmText, &Text)>();
+        q.iter(app.world())
+            .find(|(slot, _)| slot.row == row && slot.part == part)
+            .map(|(_, text)| text.0.clone())
+            .expect("the pool has a node for every row")
+    }
+
+    /// **The bead in one assertion.** The bridge seat has been able to re-read
+    /// a standing alarm — its fact AND what is already being done about it —
+    /// out of `state.json` on every poll since alarms landed; the human got two
+    /// alert-stack lines that expired after nine seconds. This is the human's
+    /// rendering of the identical level view, so the two seats can triage from
+    /// the same list.
+    ///
+    /// The running default is the half that matters: "base under attack" is a
+    /// shout, and "base under attack — home-guard is recalling squad 1 (ETA
+    /// 22s)" is a decision.
+    #[test]
+    fn a_standing_alarm_shows_its_fact_and_its_running_default() {
+        let mut app = alarm_panel_app();
+        app.update();
+        assert_eq!(
+            app.world().resource::<UiState>().alarm_rows,
+            0,
+            "silence is the normal state"
+        );
+        assert_eq!(row_line(&mut app, 0, AlarmPart::Fact), "");
+
+        stand(
+            &mut app,
+            AlarmKind::PlacesUnderAttack,
+            Some(an_alarm(
+                AlarmKind::PlacesUnderAttack,
+                "buildings under attack in 2 places",
+                "home-guard is recalling squad 1",
+                Some(22.0),
+            )),
+        );
+        app.update();
+
+        assert_eq!(app.world().resource::<UiState>().alarm_rows, 1);
+        assert_eq!(
+            row_line(&mut app, 0, AlarmPart::Fact),
+            "buildings under attack in 2 places"
+        );
+        assert_eq!(
+            row_line(&mut app, 0, AlarmPart::Default),
+            "default: home-guard is recalling squad 1   ·   ETA 22s"
+        );
+
+        // A status is not news: painting the same list twice changes nothing,
+        // which is the whole difference between this panel and the stack.
+        app.update();
+        assert_eq!(app.world().resource::<UiState>().alarm_rows, 1);
+    }
+
+    /// The exit half. The alert stack forgets a row after nine seconds whether
+    /// or not the condition ended; this panel must show a thing for exactly as
+    /// long as it is true, and stop the moment it is not.
+    #[test]
+    fn the_panel_empties_when_the_condition_lapses() {
+        let mut app = alarm_panel_app();
+        stand(
+            &mut app,
+            AlarmKind::IncomeCollapse,
+            Some(an_alarm(
+                AlarmKind::IncomeCollapse,
+                "every mine we work is dry",
+                "nothing recovers this automatically",
+                None,
+            )),
+        );
+        app.update();
+        assert_eq!(
+            row_line(&mut app, 0, AlarmPart::Default),
+            "default: nothing recovers this automatically",
+            "no ETA is a real answer — the default is to stand still",
+        );
+
+        stand(&mut app, AlarmKind::IncomeCollapse, None);
+        app.update();
+        assert_eq!(app.world().resource::<UiState>().alarm_rows, 0);
+        assert_eq!(row_line(&mut app, 0, AlarmPart::Fact), "");
+        assert_eq!(row_line(&mut app, 0, AlarmPart::Default), "");
+    }
+
+    /// **Fog is inherited, not re-derived.** `Alarms::get` takes a team and
+    /// there is no call that returns both, so the panel cannot render the other
+    /// seat's situation even by accident — the same structural claim the alert
+    /// stack's `Team::Human` filter makes. An enemy learning that your income
+    /// collapsed would be the most valuable leak in the protocol.
+    #[test]
+    fn the_panel_never_shows_the_other_seats_alarms() {
+        let mut app = alarm_panel_app();
+        app.world_mut().resource_mut::<Alarms>().observe(
+            Team::Claude,
+            AlarmKind::SquadBelowHalf,
+            1.0,
+            0.0,
+            Some(an_alarm(
+                AlarmKind::SquadBelowHalf,
+                "squad 2 is below half strength",
+                "squad 2 falls back to our base",
+                Some(9.0),
+            )),
+        );
+        app.update();
+        assert_eq!(app.world().resource::<UiState>().alarm_rows, 0);
+        assert_eq!(row_line(&mut app, 0, AlarmPart::Fact), "");
+    }
+
+    /// The pool is exactly `ALL_ALARM_KINDS` long, and `Alarms` sorts its list
+    /// into that order, so a full board fills every row and row N keeps meaning
+    /// the same kind between two frames.
+    #[test]
+    fn every_alarm_kind_has_a_row_of_its_own() {
+        let mut app = alarm_panel_app();
+        for kind in ALL_ALARM_KINDS {
+            stand(
+                &mut app,
+                kind,
+                Some(an_alarm(kind, kind.label(), "nothing", None)),
+            );
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<UiState>().alarm_rows,
+            ALARM_SLOTS,
+            "a full board must not overflow the pool",
+        );
+        for (row, kind) in ALL_ALARM_KINDS.iter().enumerate() {
+            assert_eq!(row_line(&mut app, row, AlarmPart::Fact), kind.label());
+        }
+    }
+
+    /// Geometry. The panel is pinned above the console and grows upward, so the
+    /// thing that can go wrong is a full board climbing into the resource bar
+    /// on a small window — where it would be drawn over and would also claim
+    /// clicks the bar owns.
+    #[test]
+    fn a_full_alarm_panel_fits_above_the_console_at_every_size() {
+        let full = ALARM_HEAD_H + ALARM_SLOTS as f32 * ALARM_ROW_HIT_H;
+        for (w, h) in SIZES {
+            let hud = hud_layout(w, h);
+            let top = h - hud.console_h - PAD - full;
+            assert!(
+                top >= TOP_BAR_H,
+                "{w}x{h}: four alarms reach {top}px, above the {TOP_BAR_H}px bar",
+            );
+        }
     }
 
     // -----------------------------------------------------------------
