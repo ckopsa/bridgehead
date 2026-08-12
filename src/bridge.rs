@@ -3023,7 +3023,11 @@ fn poll_commands(
                     });
                     continue;
                 }
-                match serde_json::from_value::<Intent>(raw.clone()) {
+                // `intent::parse_command`, not `serde_json::from_value`: null
+                // is an omitted key on this wire, at every depth, and a hole
+                // left in a form the document printed earns a sentence rather
+                // than serde's opinion of it.
+                match crate::intent::parse_command(raw) {
                     Ok(intent) => {
                         submissions.write(SubmitIntent {
                             team: seat.team,
@@ -3036,9 +3040,7 @@ fn poll_commands(
                             plan: None,
                         });
                     }
-                    Err(err) => intent_errors
-                        .get_mut(seat.team)
-                        .push(format!("{tag}: unrecognized command ({err})")),
+                    Err(err) => intent_errors.get_mut(seat.team).push(format!("{tag}: {err}")),
                 }
             }
         }

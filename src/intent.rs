@@ -1238,6 +1238,104 @@ impl LateBind<'_, '_, '_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The wire's one door: JSON → Intent
+//
+// `null` on the wire MEANS "this key is not here", everywhere, at every depth.
+//
+// That rule is not a convenience, it is the document's own convention made
+// true. `tools/affordances.py` prints every form as a complete template with a
+// `null` in each hole the commander is meant to fill, and the r34 blue seat did
+// what a template invites: it sent one back with a hole still in it and got
+// serde's `invalid type: null, expected u8` — a sentence about Rust, for a
+// commander that had never left the JSON. Worse, the OPTIONAL holes had the
+// same problem for the same reason: `{"repeat": null}` on a rule that fires
+// once is exactly what the form prints and exactly what a commander means, and
+// serde accepted it only where the field happened to be an `Option`.
+//
+// So the acceptance is widened once, here, rather than field by field: strip
+// the nulls, then parse. Nothing about what the engine *writes* moves — every
+// snapshot and every serialized intent is byte-identical, because this touches
+// only what the wire will TAKE. Widening acceptance is the additive direction
+// (tools/BUILDER_BRIEF.md §6.9); a command that parsed before parses to the
+// same intent now.
+//
+// And where the hole was a REQUIRED one, the refusal teaches instead of quoting
+// serde: the door remembers which keys it removed, so "you left `squad` null"
+// is a sentence it can say.
+// ---------------------------------------------------------------------------
+
+/// Remove every `null`-valued key, recursively, collecting the dotted path of
+/// each one removed.
+///
+/// Array *elements* are recursed into but never removed: a `null` sitting in
+/// `units[]` or `steps[]` is not an omitted key, it is a malformed list, and
+/// deleting it would silently shorten a sequence the commander wrote.
+fn strip_nulls(value: &mut serde_json::Value, prefix: &str, removed: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let path = format!("{prefix}{key}");
+                if map.get(&key).is_some_and(serde_json::Value::is_null) {
+                    map.remove(&key);
+                    removed.push(path);
+                } else if let Some(child) = map.get_mut(&key) {
+                    strip_nulls(child, &format!("{path}."), removed);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, child) in items.iter_mut().enumerate() {
+                strip_nulls(child, &format!("{prefix}{i}."), removed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The field name out of serde's `missing field \`x\`` — `None` for any other
+/// parse failure, which is then reported in serde's own words.
+fn missing_field_of(err: &str) -> Option<String> {
+    let rest = err.strip_prefix("missing field `")?;
+    Some(rest.split('`').next()?.to_string())
+}
+
+/// **Wire JSON → [`Intent`], the one door.** `bridge.rs` and `copilot.rs` both
+/// come through here so that "null means omitted" is one rule and not three.
+///
+/// Returns the *body* of the refusal, without the `cmd <i>:` prefix its callers
+/// own — the prefix is a fact about which command failed and is pinned by
+/// `tools/verify_intent_bridge.py`.
+pub fn parse_command(raw: &serde_json::Value) -> Result<Intent, String> {
+    let mut value = raw.clone();
+    let mut nulled: Vec<String> = Vec::new();
+    strip_nulls(&mut value, "", &mut nulled);
+    serde_json::from_value::<Intent>(value).map_err(|err| {
+        let text = err.to_string();
+        let verb = raw
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("that command");
+        // Only when the key serde is missing is one the commander actually sent
+        // as `null`. An honestly absent key keeps serde's wording, which is
+        // already the right sentence for it.
+        let left_null = missing_field_of(&text).filter(|field| {
+            nulled
+                .iter()
+                .any(|path| path.rsplit('.').next() == Some(field.as_str()))
+        });
+        match left_null {
+            Some(field) => format!(
+                "{verb} needs '{field}', and you left it null — null on this wire means \
+                 the key is not there at all. The document prints null in every hole \
+                 that is yours to fill, so fill '{field}' and re-send"
+            ),
+            None => format!("unrecognized command ({text})"),
+        }
+    })
+}
+
 /// The refusal a unit phrase earns when it reaches nobody. One wording, so
 /// every channel teaches the same lesson — and so an `Err` here is the reason
 /// "move 0 units" is inexpressible (see `resolve_places`).
@@ -1562,10 +1660,11 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
             Some(found.radius),
         ))
     }
-    /// The refusal a place-taking verb earns when it named no ground at all.
-    /// One wording, so `move` and `defend` teach the same lesson.
+    /// The refusal a place-taking verb earns when it named no ground at all —
+    /// [`needs_ground`], so the arm-time warning and the fire-time refusal are
+    /// one sentence rather than two spellings of it.
     fn needs(verb: &str) -> String {
-        format!("{verb} needs x/z or a region name")
+        needs_ground(verb)
     }
     fn both(verb: &str, x: Option<f32>, z: Option<f32>) -> Result<(f32, f32), String> {
         match (x, z) {
@@ -3698,6 +3797,23 @@ fn compile_intent(
             // arming. It is validated in full when it fires, by this same
             // compiler, and the refusal reaches the arming seat's own error
             // channel tagged `trigger:<name>`.
+            //
+            // ONE exception, and it is an exception precisely because it is not
+            // late binding: a `then` that names NO GROUND has a hole no later
+            // world can fill (`groundless_verb`). The rule still arms — this is
+            // teaching, never a gate, on the same terms as a plan's chain-holds
+            // — but the seat is told now, while it can still re-send, instead of
+            // at the one moment the rule was for. Written in the resolver's own
+            // words, which is the same string the fire will produce.
+            if let Some(verb) = groundless_verb(&then) {
+                errors.push(format!(
+                    "{tag}: trigger {name} holds when it fires: {} — the rule is armed \
+                     anyway, but nothing that happens later can fill that hole; re-send \
+                     it with \"region\": \"<place>\" in the `then` (known places: {})",
+                    needs_ground(verb),
+                    regions.known_names(me).join(", ")
+                ));
+            }
             let trigger = TriggerRule {
                 name,
                 when,
@@ -3997,6 +4113,56 @@ fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result
         }
     }
     Ok(())
+}
+
+/// The refusal a place-taking verb earns when it named no ground at all. One
+/// wording, so `move` and `defend` teach the same lesson — and so the warning a
+/// trigger earns at ARM time is byte-for-byte the refusal its `then` will earn
+/// at FIRE time.
+pub(crate) fn needs_ground(verb: &str) -> String {
+    format!("{verb} needs x/z or a region name")
+}
+
+/// **The one thing about a deferred action that can be judged at arm time: a
+/// hole no later world can fill.**
+///
+/// `Some(verb)` when `intent` is a verb that must name ground and names none —
+/// no `x`/`z`, no `region`. Everything else about a trigger's `then` is
+/// deliberately unjudged (see the `trigger_set` arm), because the world at fire
+/// time is the point: the units may not be trained yet, the enemy may not be
+/// visible yet, the place may not be named yet. **This is the exception, and it
+/// is an exception because it is not late binding at all.** A `build` with no
+/// ground does not become resolvable when a worker walks out of a barracks; it
+/// is a form the commander sent back with the hole still in it, and it will
+/// refuse identically on every fire for the rest of the match.
+///
+/// Blue's r34 `expand` recipe is the worked example: armed at t=0 with
+/// `then.region` left `null`, it fired once when the mine ran dry at t=322 and
+/// spent its one fire on `build needs x/z or a region name`. The seat never got
+/// a second base, and nothing had told it — at the moment it could still have
+/// fixed it — that the hole was fatal.
+///
+/// Deliberately narrow: half a coordinate (`x` without `z`) counts, because
+/// `both` refuses that too and for the same permanent reason. A missing
+/// `radius` on `defend` does NOT, because a named region supplies one.
+fn groundless_verb(intent: &Intent) -> Option<&'static str> {
+    fn hole(verb: &'static str, x: &Option<f32>, z: &Option<f32>, region: &Option<String>)
+        -> Option<&'static str>
+    {
+        (region.is_none() && !(x.is_some() && z.is_some())).then_some(verb)
+    }
+    match intent {
+        Intent::Move { x, z, region, .. } => hole("move", x, z, region),
+        Intent::AttackMove { x, z, region, .. } => hole("attackmove", x, z, region),
+        Intent::Build { x, z, region, .. } => hole("build", x, z, region),
+        Intent::Posture { posture, .. } => match posture {
+            Some(PostureIntent::Defend { x, z, region, .. }) => hole("defend", x, z, region),
+            Some(PostureIntent::Push { x, z, region }) => hole("push", x, z, region),
+            Some(PostureIntent::Forage { x, z, region }) => hole("forage", x, z, region),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// **The place a predicate asks about, if it asks about one.**
@@ -6159,6 +6325,182 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The wire's one door (`parse_command`) — wc3clone-2su4
+    // -----------------------------------------------------------------------
+
+    /// **Null is an omitted key, everywhere.**
+    ///
+    /// The document prints every form as a complete template with a `null` in
+    /// each hole, so `{"repeat": null}` on a fire-once rule and
+    /// `{"target": null}` on a turtle stance are exactly what a commander that
+    /// read the page sends back. Before this they were accepted only where the
+    /// field happened to be an `Option` and the commander could not tell which
+    /// those were.
+    #[test]
+    fn a_null_key_reads_as_an_omitted_key() {
+        let cases = [
+            // The r34 spellings, verbatim off the page.
+            (
+                r#"{"type":"trigger_set","name":"home-guard","repeat":30,
+                    "when":{"type":"base_under_attack"},
+                    "then":{"type":"stance","squad":0,"stance":"turtle","target":null}}"#,
+                r#"{"type":"trigger_set","name":"home-guard","repeat":30,
+                    "when":{"type":"base_under_attack"},
+                    "then":{"type":"stance","squad":0,"stance":"turtle"}}"#,
+            ),
+            (
+                r#"{"type":"trigger_set","name":"once","when":{"type":"mine_dry"},
+                    "then":{"type":"stop","select":"all army"},"repeat":null}"#,
+                r#"{"type":"trigger_set","name":"once","when":{"type":"mine_dry"},
+                    "then":{"type":"stop","select":"all army"}}"#,
+            ),
+            // A null inside a nested predicate, and one inside a plan step.
+            (
+                r#"{"type":"plan_set","name":"p","steps":[
+                    {"intent":{"type":"stop","select":"all army"},"advance":null}]}"#,
+                r#"{"type":"plan_set","name":"p","steps":[
+                    {"intent":{"type":"stop","select":"all army"}}]}"#,
+            ),
+            (
+                r#"{"type":"template","select":"my Barracks","squad":null}"#,
+                r#"{"type":"template","select":"my Barracks"}"#,
+            ),
+            (
+                r#"{"type":"build","select":"workers","kind":"Farm","region":"our base",
+                    "site":"nearest legal site","x":null,"z":null}"#,
+                r#"{"type":"build","select":"workers","kind":"Farm","region":"our base",
+                    "site":"nearest legal site"}"#,
+            ),
+        ];
+        for (nulled, omitted) in cases {
+            let with_nulls = parse_command(&serde_json::from_str(nulled).unwrap())
+                .unwrap_or_else(|e| panic!("{nulled}: {e}"));
+            let without = parse_command(&serde_json::from_str(omitted).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&with_nulls).unwrap(),
+                serde_json::to_value(&without).unwrap(),
+                "{nulled} did not mean the same thing as the same command with the \
+                 null keys left out"
+            );
+        }
+    }
+
+    /// **Widening acceptance never widens output.** Every historical command
+    /// still parses to the same intent through the new door, and re-serializes
+    /// byte-identically — the append-only half of tools/BUILDER_BRIEF.md §6.9.
+    #[test]
+    fn the_new_door_parses_every_legacy_command_to_the_same_intent() {
+        for case in [
+            r#"{"type":"move","units":[1],"x":1.0,"z":2.0}"#,
+            r#"{"type":"stance","squad":1,"stance":"turtle"}"#,
+            r#"{"type":"posture","id":1,"posture":{"type":"escort","unit":4}}"#,
+            r#"{"type":"template","building":1,"squad":1,"priority":["Hero"],"autocast":3}"#,
+            r#"{"type":"trigger_set","name":"h","when":{"type":"hero_below","frac":0.35},
+                "then":{"type":"move","units":[1],"x":-70.0,"z":-70.0},"repeat":60.0}"#,
+            r#"{"type":"cancel","building":1,"index":0}"#,
+        ] {
+            let value: serde_json::Value = serde_json::from_str(case).unwrap();
+            let direct: Intent = serde_json::from_value(value.clone()).unwrap();
+            let door = parse_command(&value).unwrap();
+            assert_eq!(
+                serde_json::to_value(&direct).unwrap(),
+                serde_json::to_value(&door).unwrap(),
+                "{case} changed shape going through parse_command"
+            );
+        }
+    }
+
+    /// A hole the commander had to fill earns a SENTENCE, not serde's opinion.
+    ///
+    /// r34 blue got *invalid type: null, expected u8* — a message about Rust,
+    /// for a seat that had never left the JSON, naming neither the field nor
+    /// the fix (docs/INTENT.md § Legibility).
+    #[test]
+    fn a_required_field_left_null_is_refused_in_words() {
+        let err = parse_command(
+            &serde_json::from_str(
+                r#"{"type":"stance","squad":null,"stance":"turtle","target":null}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("'squad'"), "{err} does not name the field");
+        assert!(err.contains("null"), "{err} does not name what went wrong");
+        assert!(
+            err.contains("fill 'squad' and re-send"),
+            "{err} does not name the fix"
+        );
+        assert!(
+            !err.contains("expected u8"),
+            "{err} is still quoting serde at a commander"
+        );
+
+        // A key that was never sent at all keeps serde's wording, which is
+        // already the right sentence for it — this door widens acceptance, it
+        // does not paper over an honestly absent field.
+        let absent = parse_command(&serde_json::from_str(r#"{"type":"stance"}"#).unwrap())
+            .unwrap_err();
+        assert!(absent.contains("unrecognized command"), "{absent}");
+        assert!(absent.contains("missing field"), "{absent}");
+
+        // And a verb nobody has is still a verb nobody has —
+        // `tools/verify_intent_bridge.py` greps for this exact phrase.
+        let bogus = parse_command(&serde_json::from_str(r#"{"type":"nonsense_verb"}"#).unwrap())
+            .unwrap_err();
+        assert!(bogus.contains("unrecognized command"), "{bogus}");
+    }
+
+    /// **THE ONE RULE, from the document's own mouth.**
+    ///
+    /// *A template the document prints must be sendable after filling ONLY the
+    /// fields marked yours.* `tools/fixtures/doc_wire_cases.json` is generated
+    /// by `tools/test_affordances.py` from real match snapshots — every form
+    /// the page prints, filled at its REQUIRED holes and at nothing else, plus
+    /// every complete link and every authored playbook command. One artifact,
+    /// read by both sides, so a Rust copy cannot drift from the page.
+    ///
+    /// A failure here is not this test being wrong. It is the document
+    /// printing a command the engine will not take, which is what cost r34
+    /// blue a `home-guard` rule and a second base.
+    #[test]
+    fn every_template_the_document_prints_survives_the_wire() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            fixture: String,
+            rel: String,
+            filled: serde_json::Value,
+        }
+        #[derive(serde::Deserialize)]
+        struct Cases {
+            cases: Vec<Case>,
+        }
+        let raw = include_str!("../tools/fixtures/doc_wire_cases.json");
+        let cases: Cases = serde_json::from_str(raw).expect("the generated fixture parses");
+        assert!(
+            cases.cases.len() > 100,
+            "the fixture went thin: {} cases",
+            cases.cases.len()
+        );
+        for case in &cases.cases {
+            match parse_command(&case.filled) {
+                Ok(intent) => assert!(
+                    !intent.sentence().is_empty(),
+                    "{}/{} parsed into a command with no sentence",
+                    case.fixture,
+                    case.rel
+                ),
+                Err(err) => panic!(
+                    "{}/{}: the document prints a command the wire refuses.\n  sent: {}\n  {}",
+                    case.fixture,
+                    case.rel,
+                    serde_json::to_string(&case.filled).unwrap(),
+                    err
+                ),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Triggers (docs/INTENT.md § Triggers)
     // -----------------------------------------------------------------------
 
@@ -6392,6 +6734,95 @@ mod tests {
 
         arm(&mut app, Team::Human, r#"{"type":"trigger_clear"}"#);
         assert!(trigger_names(&app, Team::Human).is_empty(), "the whole slate");
+    }
+
+    /// **A `then` that names no ground arms, and says so now.**
+    ///
+    /// The r34 `expand` recipe: armed at t=0 with `then.region` left `null`,
+    /// fired once when the mine ran dry 322 seconds later, and spent its one
+    /// fire on `build needs x/z or a region name`. The seat never got a second
+    /// base and nothing had told it, at the moment it could still have fixed
+    /// it, that the hole was fatal.
+    ///
+    /// Teaching and never a gate — the rule is armed either way — on exactly
+    /// the terms a plan's chain-holds warning is. And narrow: this is the one
+    /// thing about a deferred action that is knowable at arm time, because a
+    /// missing coordinate is not late binding, it is a hole.
+    #[test]
+    fn a_trigger_whose_then_names_no_ground_arms_and_says_which_hole() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"expand","when":{"type":"mine_dry"},
+                "then":{"type":"build","select":"workers","kind":"TownHall",
+                        "site":"nearest legal site"}}"#,
+        );
+        let err = first_error(&app, Team::Human);
+        assert!(err.contains("trigger expand holds when it fires"), "{err}");
+        assert!(
+            err.contains("build needs x/z or a region name"),
+            "{err} does not use the resolver's own words"
+        );
+        assert!(
+            err.contains("nothing that happens later can fill that hole"),
+            "{err} does not say the hole is permanent rather than pending"
+        );
+        assert!(
+            err.contains("southeast mine"),
+            "{err} does not name a place that would work"
+        );
+        assert_eq!(
+            trigger_names(&app, Team::Human),
+            vec!["expand"],
+            "teaching, never a gate — the rule is armed anyway"
+        );
+        app.world_mut()
+            .resource_mut::<IntentErrors>()
+            .get_mut(Team::Human)
+            .clear();
+
+        // The same recipe with its hole filled — which is what the document
+        // now prints — arms in silence.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"expand","when":{"type":"mine_dry"},
+                "then":{"type":"build","select":"workers","kind":"TownHall",
+                        "region":"southeast mine","site":"nearest legal site"}}"#,
+        );
+        assert!(
+            app.world()
+                .resource::<IntentErrors>()
+                .get(Team::Human)
+                .is_empty(),
+            "a filled recipe must not be nagged at: {:?}",
+            app.world().resource::<IntentErrors>().get(Team::Human)
+        );
+
+        // And a `then` that names no ground because it never needed any is
+        // silent too — the check is about verbs that MUST have a place, not
+        // about every verb.
+        for quiet in [
+            r#"{"type":"trigger_set","name":"q1","when":{"type":"mine_dry"},
+                "then":{"type":"stance","squad":0,"stance":"turtle"}}"#,
+            r#"{"type":"trigger_set","name":"q2","when":{"type":"mine_dry"},
+                "then":{"type":"train","select":"idle TownHall","unit":"Worker"}}"#,
+            // A unit this seat does not own yet is LATE BINDING and must stay
+            // unjudged — the whole reason `then` is otherwise not validated.
+            r#"{"type":"trigger_set","name":"q3","when":{"type":"mine_dry"},
+                "then":{"type":"move","select":"my hero","region":"mid"}}"#,
+        ] {
+            arm(&mut app, Team::Human, quiet);
+            assert!(
+                app.world()
+                    .resource::<IntentErrors>()
+                    .get(Team::Human)
+                    .is_empty(),
+                "{quiet} was nagged at: {:?}",
+                app.world().resource::<IntentErrors>().get(Team::Human)
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
