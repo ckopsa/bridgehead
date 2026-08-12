@@ -50,6 +50,9 @@ FIX = HERE / "fixtures"
 LIVE = [FIX / "digest_open_mid.json", FIX / "digest_crossings_mid.json"]
 #: t=8s: five workers, no army, nothing scouted.
 EARLY = FIX / "digest_open_early.json"
+#: t=236s: squad 1 stanced `stage` with a `defend@(0,0)` anchor underneath it,
+#: two named regions, two armed triggers, a running plan.
+ARMED = FIX / "doc_open_armed.json"
 #: t=388s with an `income_collapse` alarm ringing — the shipped `AlarmOut`
 #: shape, whose `running_default` names every standing squad by number.
 ALARM = FIX / "doc_open_alarm.json"
@@ -392,14 +395,50 @@ def test_a_squad_with_no_posture_says_so_rather_than_inventing_one():
     assert "no standing posture" in props["default"]
 
 
-def test_a_named_stance_passes_through_untouched():
-    """When 0uu.2 lands, `squads[].stance` is a bare word and outranks posture."""
+def test_a_named_stance_keeps_the_anchor_underneath_it():
+    """`squads[].stance` is a bare doctrine word and it OUTRANKS posture — but
+    it does not replace it. A stanced squad carries both: the stance names the
+    doctrine, the posture underneath carries the ground the stance was
+    installed at.
+
+    WAS `test_a_named_stance_passes_through_untouched`, which asserted the
+    phrase was the bare word. That threw the anchor away, so a squad staging at
+    mid and a squad staging on its own hall both read "stage" — in a document
+    whose entire job is to say where things are.
+
+    `stance` stays the bare word, because it is the FACT and the phrase is the
+    sentence: a caller matching on the doctrine must not have to strip a
+    parenthesis off it.
+    """
     s = load(LIVE[0])
     s["squads"][0]["stance"] = "turtle"
     props = bridge_view.digest(s)
     assert props["squads"][0]["stance"] == "turtle"
+    assert props["squads"][0]["stance_phrase"] == "turtle (near our base)"
+    assert "squad 0 keeps turtle (near our base)" in props["default"]
+
+
+def test_a_real_stanced_squad_says_where_it_is_staging():
+    """The shipped fixtures, not a hand-edited one: squad 1 is `stage` with a
+    `defend@(0,0)` underneath it, and read "stage" for as long as the anchor
+    was being dropped."""
+    props = bridge_view.digest(load(ARMED))
+    stanced = [sq for sq in props["squads"] if sq["id"] == 1][0]
+    assert stanced["stance"] == "stage"
+    assert stanced["stance_phrase"] == "stage (near mid)"
+    line = [ln for ln in bridge_view.render_digest(props)
+            if ln.startswith("SQUAD 1")][0]
+    assert "stage (near mid)" in line
+
+
+def test_a_stance_with_no_ground_under_it_is_still_a_bare_word():
+    """A squad whose only record is the stance has no anchor to name, and an
+    empty parenthesis would be the renderer inventing punctuation."""
+    s = load(LIVE[0])
+    s["squads"][0].pop("posture", None)
+    s["squads"][0]["stance"] = "turtle"
+    props = bridge_view.digest(s)
     assert props["squads"][0]["stance_phrase"] == "turtle"
-    assert "squad 0 keeps turtle" in props["default"]
 
 
 # -- places ------------------------------------------------------------------
