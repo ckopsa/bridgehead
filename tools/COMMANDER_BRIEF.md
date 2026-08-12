@@ -22,10 +22,13 @@ co-commander section near the end, which is the only part that differs.
    buildings you have SEEN (the win-condition line), the last five events, any
    active alarms, and one line naming what happens if you send nothing this
    cycle. Add `--doc` instead for the whole affordance document: that digest,
-   plus every command you could send right now with its precondition truth
-   already computed — see **The affordance document** below. All three read the
-   same `state.json` and none of them writes anything; the full readout is there
-   whenever you want the ids the digest drops.
+   plus every command you could send right now — one line each, command
+   included — with its precondition truth already computed. It is ~75 lines and
+   affordable every cycle; `--doc --all` unfolds every field and domain (~650
+   lines) and is the one to read once, at the start. See **The affordance
+   document** below. All read the same `state.json` and none of them writes
+   anything; the full readout is there whenever you want the ids the digest
+   drops.
 3. Decide. 4. Write commands (see below).
 Repeat until `game_over` is non-null, then stop and report the result.
 
@@ -999,9 +1002,10 @@ in front of you beats a sequence written before the match.
 ## The affordance document: everything above, as one page you can read
 
 ```bash
-python3 tools/bridge_view.py --doc <SEAT>/state.json          # to read
-python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse
-python3 tools/bridge_view.py --doc-version                    # affordance-doc/1.3
+python3 tools/bridge_view.py --doc <SEAT>/state.json          # ~75 lines: read every cycle
+python3 tools/bridge_view.py --doc --all <SEAT>/state.json    # ~650 lines: read once
+python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse; never folded
+python3 tools/bridge_view.py --doc-version                    # affordance-doc/2.0
 ```
 
 The digest tells you **what is going on**. The document tells you **what you can
@@ -1019,15 +1023,53 @@ Five sections, in this order.
 | `default` | **what happens if you send nothing this cycle**, with `command: null` |
 | `alarms` | each ringing alarm, leading with the reflex that already fired |
 | `actions` | every link and every form (below) |
-| `preference` | your own declared doctrine, if you declared one |
+| `preference` | your own declared doctrine and focus, if you declared them |
 
 Plus `doc_version` — the version of this scaffold, which an arena round records
 in its `ruleset` so a result can be read as model+scaffold rather than as model.
 
+### The page is folded (`affordance-doc/2.0`)
+
+`--doc` used to print every action with all of its fields and all of their
+domains: ~650 lines. Every commander in the model ladder — four models, ten
+seats — read that page once and then never re-opened it, which meant the
+readiness facts on it were served every cycle and read none of them
+(`arena/LADDER.md`, Findings 2 and 5). So the default render **folds each action
+onto one line**:
+
+```
+  READY (39) — the command as printed is complete
+    army (24)
+      stance:squad-1:secure · squad 1 → secure · Hold ground away from home. · {"type":"stance","squad":1,"stance":"secure","target":"mid"}
+      train:Barracks · train at your Barracks — no building id … · {"type":"train","select":"my Barracks","unit":null} · you fill: unit
+    …
+  NOT READY (4) — listed and still sendable; NOT READY is a fact, never a refusal
+    stance:squad-1:push · squad 1 → push · {"type":"stance","squad":1,"stance":"push","target":"mid"} · BLOCKED: push gates: not consolidated: 3 of your 9 army units are outside squad 1 · intel: last seen: 7 troops … — not since
+```
+
+Read a folded line left to right: the **name** (`rel`), what it does, **the
+complete command**, then whichever of these apply — `you fill:` the fields that
+are yours, the collection's slot pressure, `BLOCKED:` and the facts that stop it,
+and your `intel` ledger. A folded link is still rung 2: copy the JSON and send
+it. A folded form is still rung 3: fill the `null`s and send the template.
+
+**Nothing is hidden — only folded.** Every action is on the page, with its
+count. What the fold drops is authoring detail: the per-field notes and the
+served `domain` lists. Three ways to get them back:
+
+- `--doc --all` — every action in full. This is the old page, unchanged, and it
+  is the one to read at t=0 when you have time and no clock;
+- **declare a focus** (next section) — one section rendered in full, every cycle;
+- `--doc --json` — **never folded**. A parser has no page to run out of, so the
+  JSON always carries every field, every domain and every reason. Each action
+  also carries `sections` (which of `economy` / `tech` / `army` / `harass` /
+  `standing` it belongs to) and `collapsed` (whether the text render folded it).
+
 ### The ladder: default, link, form, raw
 
 Four rungs, in increasing order of how much you have to decide. Take the lowest
-one that says what you mean.
+one that says what you mean. *The blocks below are the `--all` render; the
+default page carries the same facts folded onto one line each.*
 
 1. **`default`** — zero decisions. Say nothing and this is what happens. Your
    stances persist, your triggers keep watching, your plans keep stepping. A
@@ -1136,6 +1178,9 @@ The `unit` domain prices every row against your own bank, your own tech and
 (for heroes) your own slots, so a refusal that would have cost a poll cycle
 arrives with the menu instead.
 
+`affordance-doc/2.0` folds the text render (above) and adds the declared focus
+(below); the action set, the JSON and every command are unchanged, which is why
+the minor half went back to zero and the major half moved.
 `affordance-doc/1.3` fixes the steady-production recipe (a served template now always compiles); `1.2` added `rally:<kind>`, `template:<kind>` and `cancel:<kind>`
 beside them, the other three verbs a building selector made sayable without an
 id. `rally:` states the current rally point in its reason line (off
@@ -1143,15 +1188,17 @@ id. `rally:` states the current rally point in its reason line (off
 out when there is nothing to cancel — the menu never hides an option, it explains
 why it would refuse.
 
-### Declaring a doctrine (optional)
+### Declaring a doctrine and a focus (optional)
 
-The engine will **sort** the menu under your own values. It will never generate
-them. Write a file and point the view at it:
+The engine will **sort** the menu under your own values, and **expand** the part
+of it you say you are working on. It will never generate either. Write a file
+and point the view at it:
 
 ```json
 {"doctrine": "aggression: high, risk: low",
  "prefer": ["harass", "push"],
- "avoid":  ["turtle"]}
+ "avoid":  ["turtle"],
+ "focus":  "army"}
 ```
 
 ```bash
@@ -1162,6 +1209,28 @@ python3 tools/bridge_view.py --doc --prefs doctrine.json <SEAT>/state.json
 Preference reorders the page and does nothing else: not one `ready`, `reason` or
 `command` changes. With no file, the order is facts only — anything an alarm
 points at, then links before forms, then ready before not-ready.
+
+`focus` is one of **`economy`**, **`tech`**, **`army`**, **`harass`**. The
+section you name is rendered **in full** — every field, every domain, exactly as
+`--all` would — and everything else stays folded. Three things it is not:
+
+- **It is not a filter.** Every other action is still listed, still counted,
+  still carries its complete command. Nothing you could send yesterday became
+  unsayable.
+- **It is not the engine's opinion.** The engine never infers a focus. Leave the
+  key out and the page is fact-collapsed, which is the default and costs you
+  nothing. You declare a focus because you decided to work on something; the
+  page renders your decision back at you.
+- **It does not survive an alarm.** Anything a ringing alarm points at is
+  expanded whatever your focus says, and the alarm block itself is on top of the
+  page as always. A focus can never be the reason you did not see the fork.
+
+Rewrite the file whenever your plan changes — that is the point. A focus you
+declared at t=60 and a different one at t=400 is a phase transition you can
+name, and an arena round can measure it against what you actually did.
+
+An unrecognised word is ignored and the page says so, rather than quietly
+serving you the default while you think you are reading a focused page.
 
 ## Speakable strategy: `tools/intent_compile.py`
 

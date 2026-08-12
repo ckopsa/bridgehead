@@ -146,7 +146,8 @@ document version is recorded in the round's ruleset like every other scaffold
 layer (constraint 3).
 
 **Shipped** (`wc3clone-0uu.3`) as `tools/affordances.py`, rendered by
-`bridge_view.py --doc` / `--doc --json`, versioned `affordance-doc/1.3` and
+`bridge_view.py --doc` / `--doc --all` / `--doc --json`, versioned
+`affordance-doc/2.0` and
 readable from `bridge_view.py --doc-version`. The wire is untouched: the
 document is composed entirely from `state.json` and `catalog.json`, and the
 only engine change was three additive catalog keys (`stances`, `selectors`,
@@ -158,6 +159,37 @@ channel is a `--prefs` file rather than a wire verb (a doctrine statement the
 engine is forbidden to act on does not belong in the protocol), and the push
 gates were fixed at one consolidated squad, six units and heroes at 80% — the
 scaffold's own numbers, which is exactly what `doc_version` is for.
+
+**`2.0` — the page folded** (`wc3clone-npn`, after the model ladder). The
+document as first shipped was ~650 lines mid-game, and `arena/LADDER.md`
+Findings 2 and 5 measured what that cost: every commander at every tier read it
+once, at t=0, and then ran its loop off the eight-line digest — *"a good
+orientation page and a poor loop page"* — so the readiness annotations that
+directly addressed the mid-tier losing moves were served every cycle and read
+never. The text render now folds each action onto **one line** that still
+carries its complete command, its `you fill:` holes, its slot pressure, its
+intel and, for anything not ready, the facts that stop it; the actions are
+grouped, and the not-ready tail is where the push gates now land. 76 lines
+mid-game against 643, on the same document. **Nothing was deleted**: `--doc
+--all` is the old render exactly, `--doc --json` is never folded (a parser has
+no page to run out of), and every action is still listed with its count,
+because constraint 1's "invisible is inexpressible" applies to a fold as much
+as to a filter.
+
+The second half is **commander-declared focus**, and it is the owner's
+phase-scoped proposal made fair. Engine-*inferred* phase filtering was rejected
+twice over: base/tech/army are concurrent budgets rather than sequential
+states, so the allocation ratio *is* the skill the arena measures and a phase
+model would bless one allocation; and an inferred phase is an opinion, which is
+the one thing this document may not have. Declared, through the same `--prefs`
+file the doctrine already travels in, it is a fact — `{"focus": "army"}`
+expands that section in full and leaves everything else folded, counted and
+sendable. Alarms break through any focus by design: they are the
+phase-transition machinery the r23 commanders described, and a focus that could
+hide the fork one just named would be soft enforcement. Because the focus is
+written rather than derived, a persona can declare its transitions as strategy
+— which makes the phase itself something a round can measure against what the
+commander then did.
 
 ### Chains: stance plans with late-bound references
 
