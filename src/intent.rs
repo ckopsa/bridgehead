@@ -250,6 +250,15 @@ type IntentNodes<'w, 's> = Query<'w, 's, (Entity, &'static ResourceNode, &'stati
 /// every `units.get` destructure in this file for one caller's benefit.
 type IntentSquads<'w, 's> = Query<'w, 's, &'static SquadId>;
 
+/// What each unit is currently doing, for the two selectors that ask —
+/// `idle workers`, and `build`'s worker pick, which must not steal a body that
+/// is already walking to somebody else's foundation.
+///
+/// Separate from [`IntentUnits`] on the identical reasoning as
+/// [`IntentSquads`] above it: one caller's column is not worth rewriting every
+/// destructure in this file for.
+type IntentOrders<'w, 's> = Query<'w, 's, &'static Order>;
+
 /// Forges currently working. A separate query rather than a sixth column on
 /// `IntentBuildings` on purpose: `research` is the only verb that asks, and
 /// widening the shared tuple would rewrite every `buildings.get` destructure
@@ -277,6 +286,7 @@ pub struct LateBindWorld<'w, 's> {
     nodes: IntentNodes<'w, 's>,
     squads: IntentSquads<'w, 's>,
     buildings: IntentBuildings<'w, 's>,
+    orders: IntentOrders<'w, 's>,
 }
 
 #[derive(SystemParam)]
@@ -473,6 +483,11 @@ fn apply_intents(
     // which no query can see yet. See `compile_intent`'s `batch_squads`.
     let mut batch_squads: std::collections::BTreeMap<Entity, Option<u8>> =
         std::collections::BTreeMap::new();
+    // Workers a `build` earlier in this frame's batch already sent to a site —
+    // invisible to every query for exactly the same reason `batch_squads` is.
+    // A `BTreeSet` and not a `HashSet`: it is on a gameplay path and std's
+    // hasher reseeds per process (tools/BUILDER_BRIEF.md §6.4).
+    let mut batch_builders: std::collections::BTreeSet<Entity> = std::collections::BTreeSet::new();
     for submission in batch {
         let mut errors: Vec<String> = Vec::new();
         // See `compile_intent`'s `reached` parameter. Per submission, because
@@ -543,6 +558,7 @@ fn apply_intents(
             &mut issuer,
             &mut reached,
             &mut batch_squads,
+            &mut batch_builders,
         );
         // **The plan's verdict, straight back to the plan.** In the same frame
         // it submitted, before its evaluator's next sweep — so a step that
@@ -716,8 +732,26 @@ pub(crate) struct LateBind<'a, 'w, 's> {
     /// own structures are yours to know about, and there is deliberately no
     /// selector that reaches an enemy one.
     buildings: &'a IntentBuildings<'w, 's>,
+    /// What every unit is currently doing. Read by `idle workers` and by
+    /// `build`'s worker pick.
+    orders: &'a IntentOrders<'w, 's>,
     nav: &'a NavGrid,
+    /// **Workers an EARLIER build in this same batch already claimed.**
+    ///
+    /// The `batch_squads` problem wearing its other hat, and the mechanism
+    /// behind r26-blue's three vanished expansions. `build` issues
+    /// `Order::Build` through `Commands`, which Bevy does not flush until the
+    /// system ends (tools/BUILDER_BRIEF.md §6.3), so within one
+    /// `apply_intents` the second build in a batch sees the first one's builder
+    /// still standing idle — picks it, and the first foundation is abandoned
+    /// before ground is broken, silently. The set closes that window the only
+    /// way a deferred write can be closed: by remembering it here.
+    claimed_builders: &'a std::collections::BTreeSet<Entity>,
 }
+
+/// The empty claim set, for every reader that is not the compiler walking a
+/// batch. `const` so it needs no allocation and no lifetime gymnastics.
+static NO_CLAIMED_BUILDERS: std::collections::BTreeSet<Entity> = std::collections::BTreeSet::new();
 
 impl<'a, 'w, 's> LateBind<'a, 'w, 's> {
     /// The binding a reader outside this file assembles, from the one param
@@ -741,7 +775,11 @@ impl<'a, 'w, 's> LateBind<'a, 'w, 's> {
             squads: &world.squads,
             nodes: &world.nodes,
             buildings: &world.buildings,
+            orders: &world.orders,
             nav,
+            // copilot.rs's preview reads ONE proposal against the world as it
+            // stands; it is not walking a batch, so nothing is claimed.
+            claimed_builders: &NO_CLAIMED_BUILDERS,
         }
     }
 }
@@ -765,6 +803,14 @@ impl LateBind<'_, '_, '_> {
                         Selector::Army => !is_worker_kind(unit.kind),
                         Selector::AllUnits => true,
                         Selector::Workers => is_worker_kind(unit.kind),
+                        Selector::IdleWorkers => {
+                            is_worker_kind(unit.kind) && self.is_idle(*entity)
+                        }
+                        // The SET this phrase narrows. It names one worker, but
+                        // which one depends on a measuring point that only the
+                        // caller has, so the ranking happens in `crew_near` and
+                        // `builder` and this stays the honest roster.
+                        Selector::NearestWorker => is_worker_kind(unit.kind),
                         // The membership the squad has RIGHT NOW, which is the
                         // whole reason this selector exists.
                         Selector::Squad(n) => {
@@ -777,6 +823,36 @@ impl LateBind<'_, '_, '_> {
             .collect();
         out.sort_by_key(|e| e.to_bits());
         out.into_iter().map(intent_id).collect()
+    }
+
+    /// Is this unit doing nothing at all?
+    ///
+    /// `Order::Idle` and nothing else, because that is what "idle" already
+    /// means everywhere else a commander reads it: `units[].order == "Idle"` on
+    /// the wire, and the `workers N (idle M)` count the digest prints from it.
+    /// A second, cleverer definition here (arrived-but-still-flagged-Move, say)
+    /// would make the phrase and the readout disagree, which is the one thing
+    /// a vocabulary may never do.
+    fn is_idle(&self, entity: Entity) -> bool {
+        matches!(self.orders.get(entity), Ok(Order::Idle))
+    }
+
+    /// Is this worker already walking to a foundation that has not been laid?
+    ///
+    /// Two windows, and both have to be closed or the bug comes back through
+    /// the other one. The world's answer is `Order::Build`, which the worker
+    /// wears from the moment the order lands until economy.rs pays at the site
+    /// and clears it. The batch's answer is `claimed_builders`, because an
+    /// order issued earlier in THIS `apply_intents` is still sitting in the
+    /// command queue where no query can see it.
+    fn is_walking_to_a_site(&self, entity: Entity) -> bool {
+        self.claimed_builders.contains(&entity)
+            || matches!(self.orders.get(entity), Ok(Order::Build { .. }))
+    }
+
+    /// Where a unit of this seat is standing, or `None` if the id is not ours.
+    fn unit_pos(&self, id: IntentId) -> Option<Vec3> {
+        own_unit(id, self.units, self.me).map(|(_, pos)| pos)
     }
 
     /// The nearest live node of `kind` to `from`, or `None` if the map has none
@@ -881,6 +957,26 @@ impl LateBind<'_, '_, '_> {
     }
 }
 
+/// The refusal a unit phrase earns when it reaches nobody. One wording, so
+/// every channel teaches the same lesson — and so an `Err` here is the reason
+/// "move 0 units" is inexpressible (see `resolve_places`).
+fn empty_match_error(verb: &str, raw: &str) -> String {
+    format!("{verb}: '{raw}' matches none of your units right now — nothing was ordered")
+}
+
+/// The refusal `nearest worker` earns from a verb that names no ground.
+///
+/// It is a *channel* refusal, in the same family as "'my hero' names units,
+/// not a building": the phrase is real and the domain publishes it, but this
+/// sentence gave it nothing to measure from. So it names the verb that can.
+fn measuring_point_error(verb: &str, raw: &str) -> String {
+    format!(
+        "{verb}: '{raw}' has to measure from somewhere and {verb} names no ground — \
+         it is build's phrase (the site is the measuring point); for {verb} say \
+         'workers' or 'idle workers'"
+    )
+}
+
 /// Parse one selector phrase for a channel that takes units, refusing with a
 /// sentence that names the fix.
 fn unit_selector(verb: &str, raw: &str) -> Result<Selector, String> {
@@ -982,19 +1078,28 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
             return Ok(ids);
         };
         let sel = unit_selector(verb, raw)?;
+        // A phrase that has to measure needs somewhere to measure FROM, and a
+        // group verb has nowhere honest to get it. Refused by name rather than
+        // silently answered from the map origin or from the first worker in
+        // the query, either of which is a decision the commander did not make.
+        if sel.needs_a_measuring_point() {
+            return Err(measuring_point_error(verb, raw));
+        }
         let found = bind.units_matching(sel);
         if found.is_empty() {
-            return Err(format!(
-                "{verb}: '{raw}' matches none of your units right now — \
-                 nothing was ordered"
-            ));
+            return Err(empty_match_error(verb, raw));
         }
         Ok(found)
     }
-    /// The single-referent form of `crew`: a build's worker, a cast's caster, a
-    /// follow's leader. Narrowed to the lowest entity id among the matches,
-    /// which is the same documented tie-break `own_hero` already uses for an
-    /// omitted `hero` field — one rule for "which one did you mean", not two.
+    /// The single-referent form of `crew`: a cast's caster, a follow's leader.
+    /// Narrowed to the lowest entity id among the matches, which is the same
+    /// documented tie-break `own_hero` already uses for an omitted `hero`
+    /// field — one rule for "which one did you mean", not two.
+    ///
+    /// **`build` does NOT come through here any more.** Its worker is a body
+    /// that has to walk, so "which one did you mean" has a better answer than
+    /// "the oldest one"; see `builder` below for the rule and the arena round
+    /// that bought it.
     fn soloist(
         verb: &str,
         id: Option<IntentId>,
@@ -1005,13 +1110,94 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
             return Ok(id);
         };
         let sel = unit_selector(verb, raw)?;
+        if sel.needs_a_measuring_point() {
+            return Err(measuring_point_error(verb, raw));
+        }
         // Sorted by entity bits already, so `first` IS the lowest id.
         match bind.units_matching(sel).first() {
             Some(found) => Ok(Some(*found)),
-            None => Err(format!(
-                "{verb}: '{raw}' matches none of your units right now — \
-                 nothing was ordered"
+            None => Err(empty_match_error(verb, raw)),
+        }
+    }
+    /// **`build`'s worker, picked the way a foreman would pick one.**
+    ///
+    /// The rule this replaces was `soloist`'s: the lowest entity id among the
+    /// matches, every single time. That is correct for a hero (there is one)
+    /// and catastrophic for a worker (there are fifteen, and the lowest-id one
+    /// is already carrying gold, or already walking to the foundation the
+    /// previous sentence in this very batch ordered). r26-blue lost three
+    /// expansions and a Blacksmith to it — each new build re-tasked the same
+    /// body, the previous foundation was abandoned before ground was broken,
+    /// and not one line of the digest said so. r25-red hit the same wall from
+    /// the other side: three accepted `build`s, no Barracks, no error.
+    ///
+    /// So, in order:
+    ///
+    ///  1. **An explicit `worker` id always wins.** No `select`, no opinion —
+    ///     naming a body is the commander saying "that one, I know it is busy".
+    ///  2. **Exclude anyone already walking to an unbroken site**, from the
+    ///     world *and* from this batch ([`LateBind::is_walking_to_a_site`]).
+    ///     This is the fix. Everything else is preference.
+    ///  3. **Prefer an idle worker** to one that is harvesting, so a build
+    ///     costs the economy the cheapest body available — the same preference
+    ///     ai.rs's `pick_builder` has always had for its own placements.
+    ///     `nearest worker` says "distance, never mind idleness" out loud and
+    ///     is the one phrase that skips this rung.
+    ///  4. **Then nearest to the site**, because the walk is the cost.
+    ///  5. **Then the lowest id**, which keeps the answer identical on two runs
+    ///     of one seed — the determinism rule `units_matching` sorts for.
+    fn builder(
+        id: Option<IntentId>,
+        select: &Option<String>,
+        site: Vec3,
+        bind: &LateBind,
+    ) -> Result<Option<IntentId>, String> {
+        let Some(raw) = select else {
+            return Ok(id);
+        };
+        let sel = unit_selector("build", raw)?;
+        let found = bind.units_matching(sel);
+        if found.is_empty() {
+            return Err(empty_match_error("build", raw));
+        }
+        // Distance ranked first for `nearest worker`, idleness first for
+        // everything else. Both keep the entity id as the last word.
+        let distance_first = sel == Selector::NearestWorker;
+        let mut best: Option<((u8, f32, u64), IntentId)> = None;
+        let mut busy_with_a_site = 0usize;
+        for id in found {
+            let Some(entity) = intent_entity(id) else {
+                continue;
+            };
+            if bind.is_walking_to_a_site(entity) {
+                busy_with_a_site += 1;
+                continue;
+            }
+            let Some(pos) = bind.unit_pos(id) else {
+                continue;
+            };
+            let idle_rank = if distance_first || bind.is_idle(entity) {
+                0
+            } else {
+                1
+            };
+            let key = (idle_rank, site.distance(pos), entity.to_bits());
+            if best.as_ref().is_none_or(|(b, _)| key < *b) {
+                best = Some((key, id));
+            }
+        }
+        match best {
+            Some((_, id)) => Ok(Some(id)),
+            // Everyone the phrase reaches is already on a foundation. Saying
+            // so — and saying what to do about it — is the whole point of this
+            // bead: the old code took one of them anyway and abandoned its
+            // build without a word.
+            None if busy_with_a_site > 0 => Err(format!(
+                "build: every worker '{raw}' reaches ({busy_with_a_site}) is already walking to \
+                 a build site — wait for one to break ground, or name a \"worker\" id to \
+                 re-task one deliberately"
             )),
+            None => Err(empty_match_error("build", raw)),
         }
     }
     /// The building channel: `train`'s producer, `template`'s stamper,
@@ -1225,7 +1411,12 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
             select,
             site,
         } => {
-            let worker = soloist("build", worker, &select, bind)?;
+            // **Ground first, body second**, which is the reverse of the order
+            // every other arm uses and the reverse of what this arm used to
+            // do. `builder` ranks candidates by how far they have to walk, so
+            // the site has to be a settled fact before the question can be
+            // asked at all — and the site never depends on who is carrying the
+            // hammer, so there is no cycle to break.
             let (x, z, _) = shape(regions, me, x, z, &region)?;
             let (px, pz) = both("build", x, z)?;
             // **The site selector, and the loop it exists to break.** The
@@ -1270,6 +1461,7 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
                     }
                 }
             };
+            let worker = builder(worker, &select, Vec3::new(px, 0.0, pz), bind)?;
             Intent::Build {
                 worker,
                 kind,
@@ -1571,6 +1763,12 @@ fn compile_intent(
     // half a doctrine installed, with nothing said about the other half. Last
     // writer wins inside the batch, exactly as it does outside it.
     batch_squads: &mut std::collections::BTreeMap<Entity, Option<u8>>,
+    // **Workers a `build` EARLIER IN THIS BATCH already sent to a site.**
+    //
+    // `batch_squads`' problem, one verb over, and the one that actually cost an
+    // arena match. See [`LateBind::claimed_builders`] for the mechanism and
+    // `resolve_places`' `builder` for what the set is used for.
+    batch_builders: &mut std::collections::BTreeSet<Entity>,
 ) {
     // Named locally so the arms below read exactly as they did when this was
     // one interface's private applier.
@@ -1584,6 +1782,7 @@ fn compile_intent(
         nodes,
         squads,
         buildings,
+        orders,
     } = bind;
     // Names become coordinates and roles become rosters here and nowhere else.
     // Everything below this line sees the language it has always seen.
@@ -1596,7 +1795,9 @@ fn compile_intent(
             squads,
             nodes,
             buildings,
+            orders,
             nav,
+            claimed_builders: batch_builders,
         },
     ) {
         Ok(intent) => intent,
@@ -1923,6 +2124,12 @@ fn compile_intent(
                 },
                 mark.order("build"),
             );
+            // **Claimed for the rest of the batch.** The `Order::Build` above
+            // went into the command queue and will not be visible to a query
+            // until this system ends, so the next `build` in the same batch
+            // would pick this same body and abandon this foundation. It is one
+            // line and it is the whole of r26-blue's lost midgame.
+            batch_builders.insert(entity);
         }
         Intent::Upgrade { building, .. } => {
             // Defensive re-check, exactly as `train` and `rally` keep one:
@@ -3333,7 +3540,13 @@ fn compile_intent(
                         squads,
                         nodes,
                         buildings,
+                        orders,
                         nav,
+                        // A dry run of a step that has not fired: nothing in
+                        // this batch has claimed a builder on its behalf, and
+                        // whoever is walking to a site now will have arrived
+                        // long before its turn comes.
+                        claimed_builders: &NO_CLAIMED_BUILDERS,
                     },
                 ) {
                     errors.push(format!(
@@ -9001,6 +9214,284 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // build's worker pick (wc3clone-phc / wc3clone-ksu, from arena r25/r26)
+    // -----------------------------------------------------------------
+
+    /// Every `Order::Build` standing in the world, as `(builder, kind, pos)`.
+    fn build_orders(app: &mut App) -> Vec<(Entity, BuildingKind, Vec3)> {
+        let mut out: Vec<(Entity, BuildingKind, Vec3)> = app
+            .world_mut()
+            .query::<(Entity, &Order)>()
+            .iter(app.world())
+            .filter_map(|(e, o)| match o {
+                Order::Build { kind, pos } => Some((e, *kind, *pos)),
+                _ => None,
+            })
+            .collect();
+        out.sort_by_key(|(e, ..)| e.to_bits());
+        out
+    }
+
+    /// **The bug that lost r26-blue three expansions and a Blacksmith.**
+    ///
+    /// Three `build`s in one batch, one `"select":"workers"` each. Under the
+    /// old lowest-id rule all three resolved to the same peasant and the first
+    /// two foundations were abandoned before ground was broken, with no error
+    /// anywhere. Three commands must reach three bodies.
+    #[test]
+    fn a_batch_of_builds_reaches_a_different_worker_each_time() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let a = spawn_worker(&mut app, Team::Human, Vec3::new(-30.0, 0.0, 0.0));
+        let b = spawn_worker(&mut app, Team::Human, Vec3::new(0.0, 0.0, 0.0));
+        let c = spawn_worker(&mut app, Team::Human, Vec3::new(30.0, 0.0, 0.0));
+        for (x, z) in [(-30.0, 20.0), (0.0, 20.0), (30.0, 20.0)] {
+            app.world_mut().send_event(from_the_wire(
+                Team::Human,
+                &format!(
+                    r#"{{"type":"build","select":"workers","kind":"Farm","x":{x},"z":{z}}}"#
+                ),
+            ));
+        }
+        app.update();
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "three affordable builds with three free workers must all land"
+        );
+        let orders = build_orders(&mut app);
+        assert_eq!(orders.len(), 3, "three builds, three builders: {orders:?}");
+        // ...and each one went to the worker standing nearest its site, which
+        // is the rest of the rule doing its job on top of the fix.
+        let by_worker: std::collections::BTreeMap<Entity, Vec3> =
+            orders.iter().map(|(e, _, p)| (*e, *p)).collect();
+        assert_eq!(by_worker[&a].x, -30.0, "{by_worker:?}");
+        assert_eq!(by_worker[&b].x, 0.0, "{by_worker:?}");
+        assert_eq!(by_worker[&c].x, 30.0, "{by_worker:?}");
+    }
+
+    /// **The same defect through the other door.** A repeating build trigger
+    /// fires again while its previous builder is still walking. The world can
+    /// see that one (`Order::Build`), unlike a same-batch claim, so this is the
+    /// half of the fix that survives across frames — and it is the half
+    /// r26-blue's supply valve tripped over.
+    #[test]
+    fn a_repeating_build_trigger_does_not_cannibalise_its_own_site() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let first = spawn_worker(&mut app, Team::Human, Vec3::new(0.0, 0.0, 0.0));
+        let second = spawn_worker(&mut app, Team::Human, Vec3::new(4.0, 0.0, 0.0));
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"trigger_set","name":"farms","repeat":1,
+                "when":{"type":"game_time","at":0.0},
+                "then":{"type":"build","select":"workers","kind":"Farm",
+                        "x":0.0,"z":24.0,"site":"nearest legal site"}}"#,
+        );
+        drain_errors(&mut app, Team::Human);
+
+        fire(&mut app, Team::Human, "farms");
+        assert!(
+            matches!(order_of(&app, first), Order::Build { .. }),
+            "the nearest free worker takes the first firing"
+        );
+        fire(&mut app, Team::Human, "farms");
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "a second firing with a second worker free is not an error"
+        );
+        assert!(
+            matches!(order_of(&app, first), Order::Build { .. }),
+            "the first site must NOT be abandoned"
+        );
+        assert!(
+            matches!(order_of(&app, second), Order::Build { .. }),
+            "the second firing takes the other worker"
+        );
+    }
+
+    /// When every worker the phrase reaches is already on a foundation, the
+    /// answer is a sentence, not a stolen builder. Stealing one is what used to
+    /// happen, and it is silent by construction — the abandonment has no
+    /// error, only an absence.
+    #[test]
+    fn a_build_with_every_worker_already_on_a_site_refuses_in_words() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let only = spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"build","select":"workers","kind":"Farm","x":0.0,"z":24.0}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert!(matches!(order_of(&app, only), Order::Build { .. }));
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"build","select":"workers","kind":"Farm","x":24.0,"z":0.0}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("already walking to a build site"),
+            "{}",
+            errors[0]
+        );
+        // The refusal names the way to say it anyway.
+        assert!(errors[0].contains("worker"), "{}", errors[0]);
+        // And the first foundation still belongs to the first worker.
+        assert!(
+            matches!(order_of(&app, only), Order::Build { pos, .. } if pos.z > 0.0),
+            "the standing build must be untouched"
+        );
+    }
+
+    /// An explicit `"worker"` id is the commander overruling all of it, and it
+    /// still works — including on a body that is already building. Naming a
+    /// unit has always meant "that one".
+    #[test]
+    fn an_explicit_worker_id_still_outranks_the_pick() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let busy = spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        spawn_worker(&mut app, Team::Human, Vec3::new(4.0, 0.0, 0.0));
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"build","worker":{},"kind":"Farm","x":0.0,"z":24.0}}"#,
+                busy.to_bits()
+            ),
+        ));
+        app.update();
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"build","worker":{},"kind":"Farm","x":24.0,"z":0.0}}"#,
+                busy.to_bits()
+            ),
+        ));
+        app.update();
+        assert!(
+            drain_errors(&mut app, Team::Human).is_empty(),
+            "an explicitly named worker is never refused for being busy"
+        );
+        assert!(
+            matches!(order_of(&app, busy), Order::Build { pos, .. } if pos.x > 0.0),
+            "the second, explicit order wins the body"
+        );
+    }
+
+    /// `idle workers` skips the ones with a job even when they are closer, and
+    /// `workers` prefers idle for the same reason — the economy pays for a
+    /// build with the cheapest body it has.
+    #[test]
+    fn idle_beats_near_unless_the_phrase_says_otherwise() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let node = spawn_node(&mut app, ResourceKind::Gold, Vec3::new(0.0, 0.0, 30.0), 100);
+        // Standing ON the site, but harvesting.
+        let close_and_busy = spawn_worker(&mut app, Team::Human, Vec3::new(0.0, 0.0, 22.0));
+        app.world_mut()
+            .entity_mut(close_and_busy)
+            .insert(Order::Harvest(node));
+        // Far away, and free.
+        let far_and_free = spawn_worker(&mut app, Team::Human, Vec3::new(0.0, 0.0, -40.0));
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"build","select":"workers","kind":"Farm","x":0.0,"z":24.0}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert!(
+            matches!(order_of(&app, far_and_free), Order::Build { .. }),
+            "'workers' prefers the idle body over the near one"
+        );
+        assert!(
+            matches!(order_of(&app, close_and_busy), Order::Harvest(_)),
+            "and leaves the harvester on the gold"
+        );
+
+        // `nearest worker` says distance out loud, and gets it.
+        app.world_mut()
+            .entity_mut(far_and_free)
+            .insert(Order::Idle);
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"build","select":"nearest worker","kind":"Farm","x":0.0,"z":26.0}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert!(
+            matches!(order_of(&app, close_and_busy), Order::Build { .. }),
+            "'nearest worker' takes the shortest walk regardless of the job"
+        );
+    }
+
+    /// `idle workers` with nobody idle is a refusal in words, on the same rule
+    /// as `idle barracks` with every barracks busy.
+    #[test]
+    fn idle_workers_with_nobody_idle_teaches() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let node = spawn_node(&mut app, ResourceKind::Gold, Vec3::new(0.0, 0.0, 30.0), 100);
+        let busy = spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().entity_mut(busy).insert(Order::Harvest(node));
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"build","select":"idle workers","kind":"Farm","x":0.0,"z":24.0}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("matches none of your units right now"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    /// `nearest worker` has to measure from somewhere, and only `build` names
+    /// ground. A verb that does not gets the channel refusal, naming the two
+    /// phrases that would have worked — the `'my hero' names units, not a
+    /// building` shape.
+    #[test]
+    fn nearest_worker_outside_build_says_which_phrase_to_use() {
+        let mut app = compiler_app();
+        spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"move","select":"nearest worker","x":1.0,"z":1.0}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("nearest worker"), "{}", errors[0]);
+        assert!(errors[0].contains("idle workers"), "{}", errors[0]);
+    }
+
+    /// Both new phrases are in the vocabulary the catalog publishes and the
+    /// refusals print, so a form's domain and the engine agree.
+    #[test]
+    fn the_two_new_worker_phrases_are_published_and_parse() {
+        assert_eq!(parse_selector("idle workers"), Some(Selector::IdleWorkers));
+        assert_eq!(parse_selector("Idle_Worker"), Some(Selector::IdleWorkers));
+        assert_eq!(
+            parse_selector("nearest worker"),
+            Some(Selector::NearestWorker)
+        );
+        assert!(SELECTOR_UNIT_NAMES.contains("idle workers"));
+        assert!(SELECTOR_UNIT_NAMES.contains("nearest worker"));
+        assert!(SELECTOR_NAMES.contains("idle workers"));
+        assert!(SELECTOR_NAMES.contains("nearest worker"));
+        let units = game_catalog().selectors.units;
+        assert!(units.contains(&"idle workers"), "{units:?}");
+        assert!(units.contains(&"nearest worker"), "{units:?}");
+    }
+
     /// A misspelled phrase earns the list of phrases that exist — the
     /// `Regions::unknown` rule applied to roles.
     #[test]
@@ -9949,6 +10440,12 @@ mod tests {
             for mut queue in queues.iter_mut(app.world_mut()) {
                 queue.queue.clear();
             }
+            // The same courtesy for the one worker. A `build` case leaves it
+            // walking to a site, and `build`'s worker pick deliberately refuses
+            // to steal a builder (wc3clone-phc) — so without this the second
+            // build-shaped case would be refused by a *scenario* this pin is
+            // not about.
+            app.world_mut().entity_mut(worker).insert(Order::Idle);
             let json = repoint(json);
             // The hall trains Workers, not Footmen: the one case whose verb
             // depends on the fixture's Barracks becomes the hall's own unit.

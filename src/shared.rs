@@ -8144,6 +8144,24 @@ pub enum Selector {
     AllUnits,
     /// Every living worker of the seat.
     Workers,
+    /// Every living worker of the seat that is **doing nothing** — `Order::Idle`
+    /// and nothing else, which is the same word `workers N (idle M)` already
+    /// counts with in the digest.
+    ///
+    /// The economy half of `idle barracks`, and it arrived for the same reason:
+    /// a repeating rule wants a body that is actually free. r26-blue armed a
+    /// supply valve on `"select":"workers"` and watched it re-task the one
+    /// lowest-id worker every firing; `idle workers` says out loud the thing
+    /// that rule meant.
+    IdleWorkers,
+    /// The single living worker **nearest the ground the same sentence names**.
+    ///
+    /// A "which one" phrase, like `nearest tree` and `nearest legal site`, and
+    /// like them it is legal only where the sentence gives it something to
+    /// measure from: `build`'s site. A verb that names no ground refuses it
+    /// with a sentence saying so, rather than quietly measuring from somewhere
+    /// the commander did not choose.
+    NearestWorker,
     /// The CURRENT members of squad `n` — the whole point of the selector, and
     /// the answer to red-r23's stale rosters. A unit trained into the squad
     /// after the trigger was armed is in it; a unit that died is not.
@@ -8232,6 +8250,8 @@ impl Selector {
             Selector::Army => "all army".to_string(),
             Selector::AllUnits => "all units".to_string(),
             Selector::Workers => "workers".to_string(),
+            Selector::IdleWorkers => "idle workers".to_string(),
+            Selector::NearestWorker => "nearest worker".to_string(),
             Selector::Squad(n) => format!("squad {n}"),
             Selector::NearestTree => "nearest tree".to_string(),
             Selector::NearestMine => "nearest mine".to_string(),
@@ -8250,8 +8270,21 @@ impl Selector {
                 | Selector::Army
                 | Selector::AllUnits
                 | Selector::Workers
+                | Selector::IdleWorkers
+                | Selector::NearestWorker
                 | Selector::Squad(_)
         )
+    }
+
+    /// Does this selector name exactly ONE unit by construction?
+    ///
+    /// `nearest worker` does; every other unit phrase names a set that the
+    /// single-referent channels then narrow. The distinction is not cosmetic:
+    /// a set phrase in a `crew` channel orders everybody it reaches, and
+    /// `{"type":"move","select":"nearest worker"}` would be a sentence whose
+    /// meaning depends on a measuring point the verb never supplied.
+    pub fn needs_a_measuring_point(&self) -> bool {
+        matches!(self, Selector::NearestWorker)
     }
 
     /// Does this selector name a resource node?
@@ -8287,7 +8320,14 @@ impl std::fmt::Display for Selector {
 }
 
 /// The unit-naming half of the vocabulary, for error messages that teach.
-pub const SELECTOR_UNIT_NAMES: &str = "my hero, all army, all units, workers, squad <n>";
+///
+/// `nearest worker` is in this list and not in a fifth one because it *is* a
+/// unit phrase — it simply needs the sentence to name ground before it can
+/// answer. The verb that cannot give it one refuses it by name
+/// ([`Selector::needs_a_measuring_point`]), which teaches better than hiding
+/// the phrase from the domain a form serves.
+pub const SELECTOR_UNIT_NAMES: &str =
+    "my hero, all army, all units, workers, idle workers, nearest worker, squad <n>";
 /// The node-naming half.
 pub const SELECTOR_NODE_NAMES: &str = "nearest tree, nearest mine";
 /// The site-naming half — `build`'s `"site"`, and nowhere else. Third const
@@ -8305,7 +8345,8 @@ pub const SELECTOR_BUILDING_NAMES: &str = "my <building>, idle <building>, my ha
 /// on the same rule as `Regions::unknown`: a refusal that names no alternative
 /// is a refusal to help.
 pub const SELECTOR_NAMES: &str =
-    "my hero, all army, all units, workers, squad <n>, nearest tree, nearest mine, \
+    "my hero, all army, all units, workers, idle workers, nearest worker, squad <n>, \
+     nearest tree, nearest mine, \
      nearest legal site, my <building>, idle <building>, my hall";
 
 /// Parse a selector phrase, or `None` if it is not one.
@@ -8335,6 +8376,15 @@ pub fn parse_selector(raw: &str) -> Option<Selector> {
             Selector::AllUnits
         }
         "workers" | "worker" | "all workers" | "my workers" | "our workers" => Selector::Workers,
+        // Ahead of the building family for the reason the comment below that
+        // family gives: `idle <kind>` is an open grammar, and "idle workers"
+        // would otherwise be parsed as a request for a building called
+        // "workers" and refused with the building list.
+        "idle workers" | "idle worker" | "my idle workers" | "our idle workers"
+        | "free workers" | "free worker" => Selector::IdleWorkers,
+        "nearest worker" | "closest worker" | "nearest builder" | "nearest free worker" => {
+            Selector::NearestWorker
+        }
         "nearest tree" | "nearest trees" | "nearest lumber" | "nearest wood" | "tree" => {
             Selector::NearestTree
         }
