@@ -1,0 +1,53 @@
+[2m2026-08-12T19:23:41.753466Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m BH_SPEED: game speed set to 1x
+[2m2026-08-12T19:23:41.753486Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m BH_SEED: match seed 8729205210016674481 (set BH_SEED=8729205210016674481 to replay this match)
+[2m2026-08-12T19:23:41.753491Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m fog of war: ON (BH_FOG=0 to disable)
+[2m2026-08-12T19:23:41.754500Z[0m [32m INFO[0m [2mbridgehead::bridge[0m[2m:[0m BH_BRIDGE: wrote content catalog bridge/red/catalog.json
+[2m2026-08-12T19:23:41.754546Z[0m [32m INFO[0m [2mbridgehead::bridge[0m[2m:[0m BH_BRIDGE: live bridge seat 'red' active — Claude is under external control (snapshot bridge/red/state.json, commands bridge/red/commands.json)
+[2m2026-08-12T19:23:41.755126Z[0m [32m INFO[0m [2mbridgehead::bridge[0m[2m:[0m BH_BRIDGE: wrote content catalog bridge/blue/catalog.json
+[2m2026-08-12T19:23:41.755164Z[0m [32m INFO[0m [2mbridgehead::bridge[0m[2m:[0m BH_BRIDGE: live bridge seat 'blue' active — Human is under external control (snapshot bridge/blue/state.json, commands bridge/blue/commands.json)
+[2m2026-08-12T19:23:41.755203Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m BH_READY: match HELD at t=0 — waiting for red blue to send {"type":"ready"} (auto-start after 120s wall)
+[2m2026-08-12T19:23:41.755596Z[0m [32m INFO[0m [2mbridgehead::terrain[0m[2m:[0m map "crossings": A canyon river runs corner to corner between the bases. It is impassable: every army, worker and expansion must use one of three fords, and the two flank fords are the neutral gold mines. Ground held at a ford is ground the enemy cannot walk around.
+[2m2026-08-12T19:23:41.755614Z[0m [32m INFO[0m [2mbridgehead::terrain[0m[2m:[0m map "crossings": northwest ford at (-60,60), 30 wide
+[2m2026-08-12T19:23:41.755621Z[0m [32m INFO[0m [2mbridgehead::terrain[0m[2m:[0m map "crossings": center ford at (0,0), 16 wide
+[2m2026-08-12T19:23:41.755623Z[0m [32m INFO[0m [2mbridgehead::terrain[0m[2m:[0m map "crossings": southeast ford at (60,-60), 30 wide
+[2m2026-08-12T19:23:41.755657Z[0m [32m INFO[0m [2mbridgehead::terrain[0m[2m:[0m map "crossings": 502 nav cells are impassable terrain
+[2m2026-08-12T19:23:41.763466Z[0m [31mERROR[0m [2mbevy_ecs::schedule::schedule[0m[2m:[0m Schedule Update has redundant edges:
+ hierarchy contains redundant edge(s) -- system `refresh_command_nodes (in sets (refresh_command_nodes, dispatch_pending, dispatch_pending_casts), CommandNodeRefresh, Input)` cannot be child of set `Input`, longer path exists
+
+[2m2026-08-12T19:24:56.012041Z[0m [32m INFO[0m [2mbridgehead::intent[0m[2m:[0m intent log: bridge/intent_log.jsonl
+[2m2026-08-12T19:24:56.012562Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m BH_READY: blue is ready — still waiting for red
+[2m2026-08-12T19:25:11.762617Z[0m [32m INFO[0m [2mbridgehead::economy[0m[2m:[0m [   0.0s] [Claude] Hero fielded at (70,70) — 0g 0l (free — this team's first hero)
+[2m2026-08-12T19:25:11.762656Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m BH_READY: red is ready — every seat is in
+[2m2026-08-12T19:25:11.762661Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m BH_READY: match start — every seat readied, the clock runs from t=0
+[2m2026-08-12T19:25:26.763774Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  15.0s] Human: gold 345 lumber 130 supply 6/16 | 6 units, 2 buildings | 6 Worker
+[2m2026-08-12T19:25:26.763791Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  15.0s] Claude: gold 700 lumber 150 supply 5/10 | 5 units, 1 buildings | 5 Worker
+[2m2026-08-12T19:25:41.764557Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  30.0s] Human: gold 140 lumber 70 supply 7/16 | 7 units, 3 buildings | 7 Worker
+[2m2026-08-12T19:25:41.764580Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  30.0s] Claude: gold 505 lumber 70 supply 10/16 | 6 units, 3 buildings | 5 Worker, 1 Hero
+[2m2026-08-12T19:25:56.764938Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  45.0s] Human: gold 345 lumber 70 supply 7/16 | 7 units, 3 buildings | 7 Worker
+[2m2026-08-12T19:25:56.764958Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  45.0s] Claude: gold 655 lumber 70 supply 11/16 | 7 units, 3 buildings | 6 Worker, 1 Hero
+[2m2026-08-12T19:26:11.765441Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  60.0s] Human: gold 625 lumber 70 supply 8/16 | 8 units, 3 buildings | 8 Worker
+[2m2026-08-12T19:26:11.765465Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  60.0s] Claude: gold 710 lumber 70 supply 12/16 | 8 units, 3 buildings | 7 Worker, 1 Hero
+[2m2026-08-12T19:26:24.762101Z[0m [32m INFO[0m [2mbridgehead::economy[0m[2m:[0m [  73.0s] [Human] Hero fielded at (-70,-70) — 0g 0l (free — this team's first hero)
+[2m2026-08-12T19:26:26.765538Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  75.0s] Human: gold 645 lumber 50 supply 9/16 | 9 units, 4 buildings | 9 Worker
+[2m2026-08-12T19:26:26.765560Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  75.0s] Claude: gold 715 lumber 100 supply 12/16 | 8 units, 3 buildings | 7 Worker, 1 Hero
+[2m2026-08-12T19:26:41.765779Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  90.0s] Human: gold 780 lumber 50 supply 11/22 | 10 units, 4 buildings | 9 Worker, 1 Footman
+[2m2026-08-12T19:26:41.765802Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [  90.0s] Claude: gold 600 lumber 150 supply 15/16 | 10 units, 4 buildings | 8 Worker, 1 Footman, 1 Hero
+[2m2026-08-12T19:26:56.765834Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 105.0s] Human: gold 810 lumber 60 supply 18/22 | 12 units, 4 buildings | 9 Worker, 2 Footman, 1 Hero
+[2m2026-08-12T19:26:56.765855Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 105.0s] Claude: gold 530 lumber 250 supply 17/22 | 11 units, 4 buildings | 8 Worker, 1 Footman, 1 Archer, 1 Hero
+[2m2026-08-12T19:27:11.766076Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 120.0s] Human: gold 1050 lumber 110 supply 21/22 | 14 units, 4 buildings | 10 Worker, 3 Footman, 1 Hero
+[2m2026-08-12T19:27:11.766099Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 120.0s] Claude: gold 640 lumber 290 supply 20/22 | 13 units, 4 buildings | 9 Worker, 2 Footman, 1 Archer, 1 Hero
+[2m2026-08-12T19:27:26.766487Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 135.0s] Human: gold 1135 lumber 150 supply 22/22 | 15 units, 4 buildings | 11 Worker, 3 Footman, 1 Hero
+[2m2026-08-12T19:27:26.766518Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 135.0s] Claude: gold 610 lumber 330 supply 22/22 | 14 units, 6 buildings | 9 Worker, 2 Footman, 2 Archer, 1 Hero
+[2m2026-08-12T19:27:41.763832Z[0m [32m INFO[0m [2mbridgehead::bounty[0m[2m:[0m bounty: 225g at (-29,-15)
+[2m2026-08-12T19:27:41.766657Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 150.0s] Human: gold 980 lumber 240 supply 20/22 | 14 units, 5 buildings | 11 Worker, 2 Footman, 1 Hero
+[2m2026-08-12T19:27:41.766680Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 150.0s] Claude: gold 640 lumber 370 supply 22/28 | 14 units, 6 buildings | 9 Worker, 2 Footman, 2 Archer, 1 Hero
+[2m2026-08-12T19:27:56.767171Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 165.0s] Human: gold 905 lumber 320 supply 22/28 | 15 units, 5 buildings | 11 Worker, 3 Footman, 1 Hero
+[2m2026-08-12T19:27:56.767200Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 165.0s] Claude: gold 800 lumber 390 supply 25/28 | 16 units, 6 buildings | 10 Worker, 3 Footman, 2 Archer, 1 Hero
+[2m2026-08-12T19:28:11.767302Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 180.0s] Human: gold 920 lumber 410 supply 24/28 | 16 units, 5 buildings | 11 Worker, 4 Footman, 1 Hero
+[2m2026-08-12T19:28:11.767329Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 180.0s] Claude: gold 440 lumber 185 supply 27/28 | 17 units, 8 buildings | 10 Worker, 3 Footman, 3 Archer, 1 Hero
+[2m2026-08-12T19:28:26.767325Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 195.0s] Human: gold 950 lumber 470 supply 26/28 | 17 units, 5 buildings | 11 Worker, 5 Footman, 1 Hero
+[2m2026-08-12T19:28:26.767351Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 195.0s] Claude: gold 615 lumber 225 supply 31/34 | 19 units, 8 buildings | 10 Worker, 4 Footman, 4 Archer, 1 Hero
+[2m2026-08-12T19:28:41.767476Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 210.0s] Human: gold 435 lumber 205 supply 30/28 | 19 units, 7 buildings | 11 Worker, 5 Footman, 2 Archer, 1 Hero
+[2m2026-08-12T19:28:41.767500Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 210.0s] Claude: gold 720 lumber 235 supply 33/44 | 20 units, 8 buildings | 10 Worker, 5 Footman, 4 Archer, 1 Hero
+[2m2026-08-12T19:28:56.768072Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 225.0s] Human: gold 525 lumber 205 supply 30/28 | 19 units, 7 buildings | 11 Worker, 5 Footman, 2 Archer, 1 Hero
+[2m2026-08-12T19:28:56.768099Z[0m [32m INFO[0m [2mbridgehead::shared[0m[2m:[0m [ 225.0s] Claude: gold 985 lumber 225 supply 37/50 | 22 units, 9 buildings | 10 Worker, 6 Footman, 5 Archer, 1 Hero
