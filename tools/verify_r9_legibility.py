@@ -227,11 +227,14 @@ def main():
     env.update(
         BH_BRIDGE="1",
         BH_HEADLESS="1",
-        # Deliberately slow. `headless_exit` quits ~5 GAME seconds after a
-        # verdict, and at high speed that window can close before another
-        # snapshot is written — so the final `game_over_reason` this script
-        # exists to read would never reach disk.
-        BH_SPEED="2",
+        # The workhorse speed, like every other verification run. This script
+        # used to run at 2x because a decided match could exit before the next
+        # snapshot write and take the `game_over_reason` of section [5] with
+        # it. That is fixed at the source (`wc3clone-0i9`): a verdict is now
+        # itself a reason to publish, and the exit waits until every seat has
+        # been written to. Slowing the clock to widen a window that no longer
+        # needs widening would leave the bug documented as a constraint.
+        BH_SPEED="16",
         BH_MAX_GAME_SECS="4000",
         BH_MAP="open",
         RUST_LOG="bridgehead=info",

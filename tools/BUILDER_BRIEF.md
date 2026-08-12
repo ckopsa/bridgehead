@@ -697,7 +697,7 @@ They do **not** all work the same way, and the difference matters:
 | --- | --- | --- |
 | `verify_intent_bridge.py` | **you do** | Expects a live `BH_BRIDGE=1` seat (`bridge/red`) already running, and drives it with `bridge_send.py`. Asserts `state.json`'s exact historical top-level key set (`EXPECTED_TOP_KEYS` + `OPTIONAL_TOP_KEYS`), that refusals keep the `cmd <i>:` prefix, and that every intent reaches `bridge/intent_log.jsonl` as a sentence. Fast, if the seat is up. |
 | `verify_research_bridge.py` | itself, via `cargo run` | Headless, `BH_SPEED=16`, cap 4000. Drives five workers to a completed research level over the wire. |
-| `verify_r9_legibility.py` | itself, via `cargo run` | Headless, `BH_SPEED=2` **on purpose** (so the final snapshot survives `headless_exit`'s post-verdict window), cap 4000, waits for a real `game_over`. The slowest of the four. |
+| `verify_r9_legibility.py` | itself, via `cargo run` | Headless, `BH_SPEED=16`, cap 4000, drives four rejections over the wire and then surrenders to read a real `game_over` and its `game_over_reason`. |
 | `verify_territory_bridge.py` | itself, from the **pre-built binary** | `python3 tools/verify_territory_bridge.py [--bin target/debug/bridgehead]`. Exits immediately if the binary is missing — it will not build one for you. Runs `crossings`, `BH_FOG=0`, `BH_SEED=7`. |
 
 So: `cargo build` first (§4) — the territory verifier demands it and the others
