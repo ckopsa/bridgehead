@@ -35,6 +35,7 @@ class Args:
         self.speed = 1.0
         self.cap = 1800.0
         self.windowed = False
+        self.no_autopilot = False
         self.env = []
         self.out = "arena"
         self.id = "r99"
@@ -139,6 +140,25 @@ def test_an_explicit_override_beats_the_derived_value():
     env = env_for("red=scripted", "blue=scripted", env=["BH_FOG=0", "BH_AI_BOTH=0"])
     assert env["BH_FOG"] == "0"
     assert env["BH_AI_BOTH"] == "0"
+
+
+def test_autopilot_is_allowed_unless_the_round_says_otherwise():
+    """The lever is MECHANISM, default off. Banning a documented verb is a
+    round rule and the owner has not made it one (docs/ARENA.md, "Autopilot in
+    a ladder round"), so the runner must not decide by omission."""
+    assert "BH_NO_AUTOPILOT" not in env_for("red=commander:a", "blue=commander:b")
+    banned = env_for("red=commander:a", "blue=commander:b", no_autopilot=True)
+    assert banned["BH_NO_AUTOPILOT"] == "1"
+    # The round records the rule it was played under, either way.
+    assert "BH_NO_AUTOPILOT" in banned
+
+
+def test_an_explicit_env_still_overrides_the_autopilot_lever():
+    """`--env` wins over every derived value, which is how a round asks for the
+    opposite of whatever the default becomes."""
+    env = env_for("red=commander:a", "blue=commander:b",
+                  no_autopilot=True, env=["BH_NO_AUTOPILOT=0"])
+    assert env["BH_NO_AUTOPILOT"] == "0"
 
 
 def test_screenshots_are_filed_with_the_round():
@@ -748,6 +768,89 @@ def test_a_seat_that_never_readied_carries_no_ready_wait_into_the_ledger():
     assert rec["seats"][0]["ready_wait_s"] == 9.0
     assert "ready_wait_s" not in rec["seats"][1]
     assert not any("ready_wait_s" in u for u in rec["unknown"])
+
+
+# ---------------------------------------------------------------------------
+# Autopilot: what the round records about delegation
+# ---------------------------------------------------------------------------
+
+
+def ap_line(t, team, on, ok=True):
+    return json.dumps({"t": t, "team": team, "source": "bridge", "verb": "autopilot",
+                       "sentence": "hand the faction to the scripted AI", "ok": ok,
+                       "intent": {"type": "autopilot", "on": on}})
+
+
+def test_the_round_keeps_only_its_own_slice_of_the_intent_log():
+    """`bridge/intent_log.jsonl` is append-only across matches, so a round that
+    read it whole would credit itself with the previous round's autopilot. The
+    offset is taken before the engine can write a byte."""
+    with tempfile.TemporaryDirectory() as tmp:
+        live = Path(tmp) / "intent_log.jsonl"
+        out = Path(tmp) / "r99"
+        out.mkdir()
+        earlier = ap_line(50.0, "Claude", True) + "\n"
+        live.write_text(earlier)
+        offset = live.stat().st_size
+        with live.open("a") as fh:
+            fh.write(ap_line(100.0, "Human", True) + "\n")
+            fh.write(ap_line(160.0, "Human", False) + "\n")
+
+        records, kept = collect(out, offset, live)
+        assert [r["team"] for r in records] == ["Human", "Human"]
+        assert kept and kept.endswith("bridge-logs/intent_log.jsonl")
+        copied = (out / "bridge-logs" / "intent_log.jsonl").read_text()
+        assert "Claude" not in copied, "the previous match leaked into this round"
+
+
+def collect(out, offset, live):
+    """`collect_intent_log`, with the copy landing outside the repo."""
+    records, kept = arena_run.collect_intent_log(out, offset, live)
+    return records, kept
+
+
+def test_a_round_that_wrote_no_intents_keeps_nothing_and_stamps_nothing():
+    """No log, no measurement — an absent key, not a zero. The distinction is
+    the reason r33 and r35 could sit in the ledger unflagged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "r99"
+        out.mkdir()
+        records, kept = collect(out, 0, Path(tmp) / "never-written.jsonl")
+        assert records == [] and kept is None
+        assert not (out / "bridge-logs").exists()
+
+
+def test_a_recorded_round_carries_the_delegation_its_log_shows():
+    """The end-to-end shape of what r33 should have carried: the winner's seat
+    with the span, the loser's with a measured zero, and a record that
+    validates."""
+    seats = [arena_run.parse_seat("red=commander:standard"),
+             arena_run.parse_seat("blue=commander:standard")]
+    args = Args(notes="", commit=None, hypothesis="haiku mirror", id="r99")
+    env = arena_run.derive_env(seats, args)
+    rec = arena_run.build_record(args, seats, env, arena_run.read_log(DECISIVE_LOG))
+    records = [json.loads(ap_line(189.3, "Claude", True)),
+               json.loads(ap_line(300.0, "Claude", False))]
+    arena.stamp_autopilot(rec, records, "arena/r99/bridge-logs/intent_log.jsonl")
+    assert arena.validate(rec) == [], arena.validate(rec)
+    red, blue = rec["seats"]
+    assert red["autopilot_secs"] == 110.7
+    assert red["autopilot_spans"] == [{"from": 189.3, "to": 300.0}]
+    assert blue["autopilot_secs"] == 0.0
+    assert "autopilot_spans" not in blue, "no spans is a zero, not an empty list"
+    assert arena.winner_delegated(rec), "Claude won this log and delegated in it"
+    assert "arena/r99/bridge-logs/intent_log.jsonl" in rec["evidence"]["logs"]
+
+
+def test_a_scripted_seat_is_never_stamped_with_autopilot():
+    seats = [arena_run.parse_seat("red=commander:rusher"), arena_run.parse_seat("blue=scripted")]
+    args = Args(notes="", commit=None, hypothesis="one commander", id="r99")
+    env = arena_run.derive_env(seats, args)
+    rec = arena_run.build_record(args, seats, env, arena_run.read_log(DECISIVE_LOG))
+    arena.stamp_autopilot(rec, [], None)
+    assert rec["seats"][0]["autopilot_secs"] == 0.0
+    assert "autopilot_secs" not in rec["seats"][1]
+    assert arena.validate(rec) == [], arena.validate(rec)
 
 
 def test_a_scaffolded_seat_gets_the_starter_prefs_file(tmp_path=None):

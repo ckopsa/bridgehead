@@ -14,6 +14,11 @@
     tools/arena_run.py --hypothesis "does the scaffold carry a smaller model?" \
         --seat red=commander:haiku --seat blue=commander:boomer --scaffold red
 
+    # a measured round with the handover to the scripted AI refused outright
+    tools/arena_run.py --hypothesis "haiku vs fable, both playing it themselves" \
+        --seat red=commander:standard --seat blue=commander:standard \
+        --model red=haiku,blue=fable --no-autopilot
+
     tools/arena_run.py --hypothesis ... --dry-run    # print the plan, launch nothing
 
 WHAT THIS OWNS, AND WHAT IT DOES NOT
@@ -37,6 +42,21 @@ agents against those directories while the match runs.
 
 It also does not write after-action reports, which do not exist yet when the
 match ends. `tools/arena.py add-aar` attaches them afterwards.
+
+WHAT IT RECORDS ABOUT DELEGATION
+--------------------------------
+`autopilot` hands a faction to `ai.rs`, it is a documented verb, and a round's
+verdict stops measuring the commander the moment it engages. Rounds r33 and r35
+sat in the ledger as Haiku victories with 57% and 33% of the match — including
+both winning stretches — played by the scripted AI, because nothing read the
+intent log for it.
+
+So this keeps each round's slice of `bridge/intent_log.jsonl` and stamps
+`seats[].autopilot_secs` on every commander seat, zero included. That is
+unconditional and has nothing to do with whether the verb should be allowed:
+recording is what lets the question be asked later, and `--no-autopilot` is the
+separate, default-off lever for a round that wants it banned. The policy is the
+owner's (docs/ARENA.md, "Autopilot in a ladder round").
 
 SAFETY
 ------
@@ -359,6 +379,20 @@ def derive_env(seats: list[dict], args) -> dict[str, str]:
     # repo-relative — this string is copied verbatim into a record that lives in
     # git, and an absolute path there is one machine's private detail.
     env["BH_SHOT_DIR"] = os.path.join(args.out, args.id, "shots")
+    # The enforcement lever, DEFAULT OFF. `autopilot` is a documented verb and
+    # banning it is a ROUND rule, not a game rule, so the runner owns the
+    # switch and nothing here decides for the owner (docs/ARENA.md, "Autopilot
+    # in a ladder round"). It is a flag rather than a remembered
+    # `--env BH_NO_AUTOPILOT=1` because r36 was run that way and a round rule
+    # you have to spell from memory is a round rule that will be forgotten in
+    # exactly the round it mattered for.
+    #
+    # Round-level, not per seat: `intent.rs` reads one process-wide env var,
+    # so a per-seat ban would need an engine change. `--env` still overrides,
+    # which is how a round asks for the opposite of whatever the default
+    # becomes.
+    if getattr(args, "no_autopilot", False):
+        env["BH_NO_AUTOPILOT"] = "1"
     for pair in args.env:
         if "=" not in pair:
             raise ValueError(f"--env {pair!r} must look like KEY=VALUE")
@@ -597,6 +631,39 @@ def wait_for_seat_game_over(seat_dirs: list[Path], deadline: float, poll: float 
     return {"winner": None, "reason": None, "duration_s": None, "decisive": False, "metrics": {}}
 
 
+def collect_intent_log(
+    out_dir: Path, start: int, live: Path | None = None
+) -> tuple[list[dict], str | None]:
+    """This round's slice of the intent log, kept with the round.
+
+    Returns the parsed records and the repo-relative path of the copy, or
+    `(…, None)` if there was nothing to keep.
+
+    The slice matters. `bridge/intent_log.jsonl` is append-only across matches
+    (`intent.rs`, `IntentLog`), so the live file holds every round anybody has
+    played from this checkout; reading it whole would credit this round with
+    the last one's autopilot. The runner notes the size before it launches and
+    reads from there, which is exact and needs no session-header heuristic.
+
+    The copy is kept because the live log is the next match's log too. Rounds
+    r28 onward already carry `arena/<id>/bridge-logs/intent_log.jsonl`, copied
+    by hand; this is the same file, filed by the tool that knows the offset.
+    """
+    live = live or REPO / arena.INTENT_LOG
+    records = arena.read_intent_log(live, start)
+    try:
+        raw = live.read_bytes()
+    except OSError:
+        return [], None
+    slice_ = raw[start:] if 0 < start <= len(raw) else raw
+    if not slice_.strip():
+        return records, None
+    dst = out_dir / "bridge-logs" / "intent_log.jsonl"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(slice_)
+    return records, (str(dst.relative_to(REPO)) if dst.is_relative_to(REPO) else str(dst))
+
+
 def collect_snapshots(seats: list[dict], out_dir: Path) -> list[str]:
     """Keep each seat's final snapshot with the round. The bridge is overwritten
     by the next match; this is the only copy that survives it."""
@@ -718,12 +785,24 @@ def build_record(args, seats: list[dict], env: dict, verdict: dict) -> dict:
     # ready and a round from before the handshake existed never had the key at
     # all; emitting `null` for either would put a line in `unknown` claiming we
     # failed to learn something there was nothing to learn.
+    #
+    # `autopilot_secs` / `autopilot_spans` are the one key pair that breaks the
+    # absent-not-null habit deliberately, and the bead that added them says
+    # why: `autopilot` hands the faction to ai.rs, it is legal ("emergency
+    # only"), and r33 and r35 are in the ledger as Haiku wins with 57% and 33%
+    # of the match — including both winning stretches — played by the scripted
+    # AI, with nothing in the record saying so. A ZERO is stamped on every
+    # commander seat of a round whose intent log was read, because "we looked
+    # and nobody delegated" is the claim those rounds needed and an absent key
+    # cannot make it. `stamp_autopilot` writes them; they are listed here so
+    # the filter passes them through.
     rec["seats"] = [
         {
             k: v
             for k, v in s.items()
             if k in ("seat", "team", "kind", "persona", "prompt", "model",
-                     "scaffold", "playbook", "ready_wait_s")
+                     "scaffold", "playbook", "ready_wait_s",
+                     "autopilot_secs", "autopilot_spans")
             and not (k in ("prompt", "model", "scaffold", "playbook") and v is None)
         }
         for s in seats
@@ -777,6 +856,13 @@ def main(argv: list[str] | None = None) -> int:
                         "windowed round before it is called a wedge and stopped "
                         "(0 to wait out the full wall timeout, which is what r32 "
                         "did). The engine has its own detector: BH_WATCHDOG")
+    p.add_argument("--no-autopilot", action="store_true",
+                   help="set BH_NO_AUTOPILOT=1, so the compiler refuses a "
+                        "mid-match handover to the scripted AI. DEFAULT OFF — "
+                        "banning a documented verb is a round rule and the "
+                        "owner's call (docs/ARENA.md, 'Autopilot in a ladder "
+                        "round'). The round records it either way, in "
+                        "ruleset.env and seats[].autopilot_secs")
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                    help="extra environment; overrides the derived value")
     p.add_argument("--notes", default="", help="what changed in the ruleset this round")
@@ -921,6 +1007,11 @@ def main(argv: list[str] | None = None) -> int:
     launch = dict(os.environ)
     launch.update(env)
     launch.pop("BH_INTENT_LOG", None)
+    # Where this round's intents will start in a file that already holds every
+    # earlier one. Read before the engine can write a byte; everything past it
+    # when the match ends is this round and nothing else.
+    live_log = REPO / arena.INTENT_LOG
+    log_offset = live_log.stat().st_size if live_log.exists() else 0
     timeout = (args.cap / max(args.speed, 0.01) + 180) if args.cap else 3600
     # The handshake budget, on top. The engine holds at t=0 until every bridged
     # seat readies, and that hold is wall time the game cap knows nothing about
@@ -986,6 +1077,16 @@ def main(argv: list[str] | None = None) -> int:
     rec = build_record(args, seats, env, verdict)
     rec["evidence"]["logs"] = [str(log_path.relative_to(REPO)) if log_path.is_relative_to(REPO) else str(log_path)]
     rec["evidence"]["logs"] += collect_snapshots(seats, out_dir)
+    # Delegation, stamped whatever the owner eventually rules about it. The
+    # spans are in the intent log and nowhere else, and a round that does not
+    # write them down cannot be re-read later for a question nobody had asked
+    # yet — which is exactly what happened to r33 and r35.
+    intents, kept_log = collect_intent_log(out_dir, log_offset, live_log)
+    # No log, no stamp. A measured zero and an unmeasured round are different
+    # claims (arena.autopilot_measured), and a run whose log never appeared —
+    # `BH_INTENT_LOG=0`, an unwritable bridge/, a crash before the first order
+    # — has not measured anything.
+    delegated = arena.stamp_autopilot(rec, intents, kept_log) if kept_log else {}
     shots = Path(env["BH_SHOT_DIR"])
     if not shots.is_absolute():
         shots = REPO / shots
@@ -1006,6 +1107,18 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         print(f"no verdict after {wall:.0f}s wall — recorded as undecided")
+
+    # Said out loud at the end of the round, not left for whoever reads the
+    # ledger next month. A round in which a seat handed its faction to ai.rs
+    # is a round whose verdict measures when that seat delegated.
+    if any(secs > 0 for secs in delegated.values()):
+        for seat, secs in sorted(delegated.items()):
+            if secs > 0:
+                print(f"autopilot: {seat} ran the scripted AI for {secs}s of game time")
+        if arena.winner_delegated(rec):
+            print("  ...and that seat won — this round measures delegation, not play")
+    elif delegated:
+        print("autopilot: no seat delegated (measured from the intent log)")
 
     problems = arena.validate(rec)
     if problems:
