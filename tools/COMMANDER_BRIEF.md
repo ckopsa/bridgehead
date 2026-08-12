@@ -1082,6 +1082,13 @@ The `unit` domain prices every row against your own bank, your own tech and
 (for heroes) your own slots, so a refusal that would have cost a poll cycle
 arrives with the menu instead.
 
+`affordance-doc/1.2` adds `rally:<kind>`, `template:<kind>` and `cancel:<kind>`
+beside them, the other three verbs a building selector made sayable without an
+id. `rally:` states the current rally point in its reason line (off
+`buildings[].rally`), and `cancel:` is listed NOT-READY with your queues spelled
+out when there is nothing to cancel — the menu never hides an option, it explains
+why it would refuse.
+
 ### Declaring a doctrine (optional)
 
 The engine will **sort** the menu under your own values. It will never generate

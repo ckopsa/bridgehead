@@ -146,11 +146,12 @@ document version is recorded in the round's ruleset like every other scaffold
 layer (constraint 3).
 
 **Shipped** (`wc3clone-0uu.3`) as `tools/affordances.py`, rendered by
-`bridge_view.py --doc` / `--doc --json`, versioned `affordance-doc/1.1` and
+`bridge_view.py --doc` / `--doc --json`, versioned `affordance-doc/1.2` and
 readable from `bridge_view.py --doc-version`. The wire is untouched: the
 document is composed entirely from `state.json` and `catalog.json`, and the
-only engine change was two additive catalog keys (`stances`, `selectors`) so a
-form's field domain and the refusal a bad value earns are the same words. Its
+only engine change was three additive catalog keys (`stances`, `selectors`,
+`predicates`) so a form's field domain and the refusal a bad value earns are
+the same words. Its
 user documentation is tools/COMMANDER_BRIEF.md § "The affordance document".
 Two things the design left open and the implementation settled: the preference
 channel is a `--prefs` file rather than a wire verb (a doctrine statement the
