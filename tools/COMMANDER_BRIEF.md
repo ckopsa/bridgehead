@@ -112,7 +112,10 @@ Production:
 - `{"type":"cancel","building":id,"index":n}` — **refunds in full** whatever had already been
   charged for that item, and nothing when nothing was charged (cancelling your free first
   hero returns 0; cancelling a 400g/100l revival returns 400g/100l).
-- `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}`
+- `{"type":"rally","building":id,"x":..,"z":..}` or `{"target":node_or_own_unit_id}` —
+  read back as `buildings[].rally` on your own buildings (`{"pos":[x,z]}` or
+  `{"target":id}`), so you never have to re-send one to find out what it is.
+  Absent means no rally point is set. Never present on an enemy building.
 - `{"type":"cast","hero":id}` — cast the caster's first available ability (heroes: their class
   ability; a TownHall id works too: CallToArms turns nearby workers into fighters for 40s,
   90s cooldown). Add `"ability":<index>` or `"ability":"Slam"` to pick a specific one — casters
@@ -330,8 +333,9 @@ Two more phrases answer "which one", not "which units":
 | `"nearest tree"` / `"nearest mine"` | `harvest`'s `"target_select"` | the nearest live node of that kind to the workers you are sending |
 | `"nearest legal site"` | `build`'s `"site"` | move the footprint to the nearest legal one within 15 of the point you named, instead of refusing |
 
-And a fourth channel names a **building**, for the four verbs that act on one —
-`train`, `template`, `rally`, `cancel`. Send `"select"` instead of `"building"`:
+And a fourth channel names a **building**, for the six verbs that act on one —
+`train`, `template`, `rally`, `cancel`, `upgrade`, `research`. Send `"select"`
+instead of `"building"`:
 
 | phrase | means |
 |---|---|
@@ -339,7 +343,7 @@ And a fourth channel names a **building**, for the four verbs that act on one �
 | `"idle barracks"` | the same, narrowed to the ones with **nothing in the training queue** |
 | `"my hall"` | whichever rung of the hall ladder you have standing — TownHall, Keep or Castle. Use this rather than `"my town hall"`, which stops matching the moment you upgrade |
 
-All four verbs act on exactly one building, so they take the **lowest-id
+All six act on exactly one building, so they take the **lowest-id
 match**, the same tie-break as `build`'s worker. `"idle"` is the one to reach
 for in a repeating rule: it walks past a producer that is already working, and
 when they are all working it refuses in words rather than queueing six deep.
@@ -367,7 +371,14 @@ Where each channel lives:
 {"type":"rally","select":"my barracks","region":"north-pass"}
 {"type":"template","select":"my barracks","squad":2}
 {"type":"cancel","select":"my barracks","index":0}
+{"type":"upgrade","select":"my hall"}
+{"type":"research","select":"idle blacksmith","upgrade":"attack"}
 ```
+
+`"upgrade":"my hall"` is the one worth learning by heart. A hall's entity id
+changes when it is razed and rebuilt, and a plan written before the match has no
+id to write down at all — so the phrase is what makes a tier-up something a
+chain can contain.
 
 `build`, `cast` and `follow`'s `target_select` need exactly one unit, so they
 take the **lowest-id match** — the same documented tie-break `buy` and
@@ -693,6 +704,27 @@ one member of a listed squad has died, the survivors are still ordered, the dead
 id is still reported in `errors`, and the plan carries on. Only a step that
 reaches nothing blocks.
 
+### If a step's `when` names a place you have not named
+
+`{"type":"when","when":{"type":"enemy_in","region":"staging",...}}` is legal in a
+plan step **before** `staging` is a place — you may `region_set` it later by
+hand, or in an earlier step of the same plan. `plan_set` arms it and tells you
+which step is holding, in the same words a late-bound target gets:
+
+    cmd 1: chain holds at step 2: no region named 'staging' - known places: … —
+    plan commit is armed anyway; the step waits there until the place is named
+
+If the step's turn comes and the name is still not a place, the plan's `status`
+becomes `held: no region named 'staging' - known places: …` and one line goes
+into `events`. **`held` is not `blocked`**: the step's order already ran, so
+nothing is retried and nothing halts — the plan simply waits, for as long as you
+leave it, and says `plan <name> step k/n no longer held` on the sweep after you
+name the ground.
+
+(A **trigger** is stricter: `trigger_set` refuses an unknown `enemy_in` region
+outright, because a trigger has no earlier step to name ground in and re-arming
+it costs you one line.)
+
 ### THE CANONICAL EXAMPLE: the boomer opening as one plan
 
 Economy first, workers second, tech third, army buildings last — sequenced so
@@ -915,7 +947,7 @@ in front of you beats a sequence written before the match.
 ```bash
 python3 tools/bridge_view.py --doc <SEAT>/state.json          # to read
 python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse
-python3 tools/bridge_view.py --doc-version                    # affordance-doc/1.1
+python3 tools/bridge_view.py --doc-version                    # affordance-doc/1.2
 ```
 
 The digest tells you **what is going on**. The document tells you **what you can
@@ -1049,6 +1081,13 @@ when they are all busy — both facts about your own buildings, neither advice.
 The `unit` domain prices every row against your own bank, your own tech and
 (for heroes) your own slots, so a refusal that would have cost a poll cycle
 arrives with the menu instead.
+
+`affordance-doc/1.2` adds `rally:<kind>`, `template:<kind>` and `cancel:<kind>`
+beside them, the other three verbs a building selector made sayable without an
+id. `rally:` states the current rally point in its reason line (off
+`buildings[].rally`), and `cancel:` is listed NOT-READY with your queues spelled
+out when there is nothing to cancel — the menu never hides an option, it explains
+why it would refuse.
 
 ### Declaring a doctrine (optional)
 
@@ -1418,6 +1457,12 @@ a finished building standing that trains it, so `Footman` is false until a
 Barracks is up. No cross-check needed; if `unlocked` says true, `build`/`train`
 will accept it. Use catalog `requires` for PLANNING (what you'd need to build
 first), `unlocked` for ACTING.
+
+The catalog also carries the **vocabularies** — `stances`, `selectors` (by
+channel) and `predicates`. `predicates` is the table below in machine-readable
+form: one row per `when` arm, each with the fields it takes, whether each is
+required, and the value the engine fills in when it is not. If you generate
+commands, read that instead of parsing this document.
 
 ## The rules of the world (not in the catalog)
 - **FOG OF WAR — read this before you read `units`.** Your snapshot shows only what your

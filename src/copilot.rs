@@ -825,7 +825,10 @@ fn ingest_wire(
         let id = copilot.next_id;
         copilot.next_id += 1;
         let sentences: Vec<String> = intents.iter().map(Intent::sentence).collect();
-        let conflicts = conflict_tags(
+        let Preview {
+            tags: conflicts,
+            pos,
+        } = conflict_tags(
             team,
             &intents,
             &squad_orders,
@@ -833,9 +836,6 @@ fn ingest_wire(
             now,
             &LateBind::new(team, &regions, &nav, &bind_world),
         );
-        let pos = intents
-            .iter()
-            .find_map(|i| intent_pos(i, team, &regions));
         let note = if wrapper.note.trim().is_empty() {
             "(no reason given)".to_string()
         } else {
@@ -894,6 +894,18 @@ enum Scope {
     Nothing,
 }
 
+/// Everything one pass over a proposal's resolved commands learns: what the
+/// human is told it would step on, and where on the map it is about.
+///
+/// One return value rather than two functions because there is one resolution.
+/// `intent_pos` used to be its own pass over the RAW intents with its own copy
+/// of the region-wins precedence, so a proposal could in principle be described
+/// by one reading of a place name and flown to by another.
+struct Preview {
+    tags: Vec<String>,
+    pos: Option<Vec3>,
+}
+
 fn scope_of(intent: &Intent) -> Scope {
     match intent {
         Intent::Move { units, .. }
@@ -917,53 +929,43 @@ fn scope_of(intent: &Intent) -> Scope {
 
 /// Somewhere on the map a proposal is about, so `[Space]` can go look at it.
 ///
-/// A proposal is held UNRESOLVED — it has not been through the compiler and may
-/// never be — so a partner that proposed "push to north-pass" carries a name
-/// here rather than coordinates. `regions` is the reviewing seat's own
-/// vocabulary, which is the right one to look the name up in: the two
-/// co-commanders share a team, and therefore share its regions.
-fn intent_pos(intent: &Intent, team: Team, regions: &Regions) -> Option<Vec3> {
-    /// Coordinates if given, else the named region's centre. Same precedence
-    /// the compiler's `resolve_places` uses — region wins — so the camera flies
-    /// to the ground the order would actually act on.
-    fn spot(
-        x: &Option<f32>,
-        z: &Option<f32>,
-        region: &Option<String>,
-        team: Team,
-        regions: &Regions,
-    ) -> Option<(f32, f32)> {
-        if let Some(name) = region {
-            let found = regions.find(team, name)?;
-            return Some((found.center.x, found.center.z));
-        }
-        match (x, z) {
-            (Some(x), Some(z)) => Some((*x, *z)),
-            _ => None,
-        }
-    }
-    let (x, z) = match intent {
-        Intent::Move { x, z, region, .. }
-        | Intent::AttackMove { x, z, region, .. }
-        | Intent::Build { x, z, region, .. }
-        | Intent::Leash { x, z, region, .. }
-        | Intent::Retreat { x, z, region, .. }
-        // A stance whose anchor was omitted means the team's base, which
-        // `spot` reports as "no place" — correct here: the camera has nothing
-        // to fly to that the reviewer is not already looking at.
-        | Intent::Stance { x, z, region, .. } => spot(x, z, region, team, regions)?,
+/// **It reads a RESOLVED intent**, and that is the whole of this function's
+/// design. It used to take the raw intent plus the seat's `Regions` and
+/// re-implement `resolve_places`' region-wins precedence in a private `spot()`
+/// — a second copy of the one rule that says what a place name means, living
+/// two hundred lines from the first copy of the same claim in `scope_of`'s doc
+/// about why it must not do that. `conflict_tags` already runs every command in
+/// the batch through the one resolver, and a resolved intent carries `x`/`z`
+/// filled in from whatever region it named, so the coordinates are simply there
+/// to be read. One resolver, one precedence, no chance of disagreeing about
+/// where a proposal is.
+///
+/// An intent whose place channel resolved to nothing — a `stance` with no
+/// anchor, which means the team's own base — reports no place, and correctly:
+/// the camera has nothing to fly to that the reviewer is not already looking at.
+fn intent_pos(resolved: &Intent) -> Option<Vec3> {
+    let (x, z) = match resolved {
+        Intent::Move { x, z, .. }
+        | Intent::AttackMove { x, z, .. }
+        | Intent::Build { x, z, .. }
+        | Intent::Leash { x, z, .. }
+        | Intent::Retreat { x, z, .. }
+        | Intent::Stance { x, z, .. } => (x, z),
         Intent::Posture {
             posture: Some(posture),
             ..
         } => match posture {
-            PostureIntent::Defend { x, z, region, .. }
-            | PostureIntent::Push { x, z, region }
-            | PostureIntent::Forage { x, z, region } => spot(x, z, region, team, regions)?,
+            PostureIntent::Defend { x, z, .. }
+            | PostureIntent::Push { x, z, .. }
+            | PostureIntent::Forage { x, z, .. } => (x, z),
             PostureIntent::Escort { .. } => return None,
         },
         _ => return None,
     };
-    Some(Vec3::new(x, 0.0, z))
+    match (x, z) {
+        (Some(x), Some(z)) => Some(Vec3::new(*x, 0.0, *z)),
+        _ => None,
+    }
 }
 
 /// What this batch would step on, phrased in the human's own terms.
@@ -998,6 +1000,11 @@ fn intent_pos(intent: &Intent, team: Team, regions: &Regions) -> Option<Vec3> {
 /// property (`overrides your move on 4 unit(s), 6s ago` was already a
 /// measurement); selectors just make it visible, because a phrase can change
 /// what it means while a list of ids cannot.
+///
+/// **And one level down**, through [`preview_deferred`]: a proposed `plan_set`
+/// or `trigger_set` carries intents of its own, which the resolver deliberately
+/// does not descend into, so a five-step opening used to preview as scoping
+/// nothing at all.
 fn conflict_tags(
     me: Team,
     intents: &[Intent],
@@ -1005,8 +1012,12 @@ fn conflict_tags(
     units: &CopilotUnits,
     now: f32,
     bind: &LateBind,
-) -> Vec<String> {
+) -> Preview {
     let mut tags: Vec<String> = Vec::new();
+    // The first place in the batch that resolves to real ground, for `[Space]`.
+    // Computed HERE rather than by a second pass over the raw intents, because
+    // this loop is already holding the resolved copy — see `intent_pos`.
+    let mut pos: Option<Vec3> = None;
     let mut squads_touched: Vec<u8> = Vec::new();
     // Human orders this batch would overwrite: verb -> how many units, and the
     // freshest one, because "4 seconds ago" is the part that stings.
@@ -1046,6 +1057,13 @@ fn conflict_tags(
         // Everything below weighs the RESOLVED batch, which is the one the
         // human would be approving.
         let intent = &resolved;
+        if pos.is_none() {
+            pos = intent_pos(intent);
+        }
+        // One level down. `resolve_places` stops at the top-level intent, so a
+        // proposed plan or trigger scopes to nothing above and the human is
+        // told a five-step opening reaches nobody.
+        preview_deferred(intent, bind, &mut tags);
         match scope {
             Scope::Squad(id) => {
                 if let Some(old) = squad_orders.0.get(&(me, id)) {
@@ -1138,7 +1156,87 @@ fn conflict_tags(
             format!("overrides your {verb} on {n} unit(s), {age:.0}s ago"),
         );
     }
-    tags
+    Preview { tags, pos }
+}
+
+/// **The preview, one level down.** What a proposed `plan_set` or `trigger_set`
+/// would scope to, step by step.
+///
+/// `resolve_places` deliberately does not recurse into a plan's steps or a
+/// trigger's `then`, and that rule is right for the *compiler*: the action is
+/// validated when it runs, against the world that runs it, which is what lets an
+/// armed rule keep naming *my hero* and *the perimeter* instead of freezing an
+/// id and a coordinate. But it does not transfer to the **preview**, where the
+/// question is not "what should this mean later" but "what am I agreeing to".
+/// A human handed
+///
+/// ```text
+/// copilot proposes #3: the standard boomer opening
+///   plan opening (5 steps): worker 'workers' builds Farm at … ; …
+/// ```
+///
+/// with no tags at all reads a batch that overrides nothing and re-tasks nobody,
+/// while step 3 is about to take the whole army. That is exactly the misreading
+/// the top-level recursion was written to fix, one rung further in.
+///
+/// **Preview only, and through the same one resolver.** Nothing is written back,
+/// nothing is cached, and the plan the compiler eventually stores is the plan
+/// that was proposed — phrases and all. What comes out is dated `as of now` for
+/// the same reason every other tag here is: a step resolves again when its turn
+/// comes, which may be minutes later, and saying otherwise would promise
+/// something the engine never made.
+///
+/// Two rungs, which is the whole graph: a plan step may arm a trigger, and a
+/// trigger's `then` may not defer anything further (docs/INTENT.md § "The
+/// deferral graph is two rungs deep").
+fn preview_deferred(intent: &Intent, bind: &LateBind, tags: &mut Vec<String>) {
+    match intent {
+        Intent::PlanSet { steps, .. } => {
+            // Only the steps that could ever run. A longer sequence is refused
+            // outright by the compiler, and previewing step 12 of a plan that
+            // will never have one would describe a world nobody is agreeing to.
+            for (i, step) in steps.iter().take(MAX_PLAN_STEPS).enumerate() {
+                let k = i + 1;
+                preview_one(&step.intent, bind, tags, &format!("step {k}"));
+                if let Intent::TriggerSet { then, .. } = &step.intent {
+                    preview_one(then, bind, tags, &format!("step {k}'s trigger"));
+                }
+            }
+        }
+        Intent::TriggerSet { then, .. } => preview_one(then, bind, tags, "its action"),
+        _ => {}
+    }
+}
+
+/// One deferred intent, asked the same question the batch above it was asked.
+///
+/// Says something only when there is something to say: a step that names ids
+/// rather than roles is already as legible as its sentence, and a tag repeating
+/// the count would be noise on a panel a human is reading in order to press one
+/// key.
+fn preview_one(sub: &Intent, bind: &LateBind, tags: &mut Vec<String>, label: &str) {
+    match crate::intent::resolve_places(sub.clone(), bind) {
+        Ok(resolved) => {
+            if let (Scope::Units(before), Scope::Units(after)) =
+                (scope_of(sub), scope_of(&resolved))
+            {
+                if before != after {
+                    push_unique(
+                        tags,
+                        format!("{label} would reach {} unit(s) as of now", after.len()),
+                    );
+                }
+            }
+        }
+        // NOT phrased as "this would refuse", the way a top-level command's
+        // failure is. A deferred step that cannot resolve yet is the normal,
+        // intended case — a chain is written before the ground it names is
+        // scouted — and the compiler arms it with a `chain holds at step k`
+        // notice rather than a refusal. The tag says the same thing the setter
+        // will be told, so the reviewer is not warned about something that is
+        // going to be fine.
+        Err(why) => push_unique(tags, format!("{label} does not resolve yet: {why}")),
+    }
 }
 
 fn push_unique(tags: &mut Vec<String>, tag: String) {
@@ -1906,6 +2004,106 @@ mod tests {
         );
     }
 
+    /// **The same misreading, one level down.** A proposed plan carries intents
+    /// the resolver does not descend into, so a five-step opening previewed as
+    /// scoping nothing at all — the reviewer was shown an empty conflict list
+    /// for a sequence whose step 2 takes the entire army.
+    #[test]
+    fn a_proposed_plans_steps_preview_what_each_one_would_reach() {
+        let mut app = co_app();
+        for _ in 0..3 {
+            footman(&mut app, Vec3::ZERO);
+        }
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"the opening","commands":[
+                 {"type":"plan_set","name":"opening","steps":[
+                   {"intent":{"type":"squad","select":"all army","id":1}},
+                   {"intent":{"type":"stop","units":[41,42]}},
+                   {"intent":{"type":"move","select":"all army","x":-70.0,"z":-70.0}}]}]}"#,
+        );
+        let conflicts = &pending(&app)[0].conflicts;
+        assert!(
+            conflicts.contains(&"step 1 would reach 3 unit(s) as of now".to_string()),
+            "got {conflicts:?}"
+        );
+        assert!(
+            conflicts.contains(&"step 3 would reach 3 unit(s) as of now".to_string()),
+            "got {conflicts:?}"
+        );
+        assert!(
+            !conflicts.iter().any(|c| c.starts_with("step 2")),
+            "a step that names ids is already as legible as its sentence: {conflicts:?}"
+        );
+    }
+
+    /// A step that cannot resolve YET is the normal case for a chain, not a
+    /// warning — the compiler arms it with `chain holds at step k` rather than
+    /// refusing it — so the tag says so in those terms and does not tell the
+    /// reviewer the batch would be refused.
+    #[test]
+    fn a_step_that_cannot_resolve_yet_previews_as_pending_not_as_refused() {
+        let mut app = co_app();
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"secure it when we find it","commands":[
+                 {"type":"plan_set","name":"later","steps":[
+                   {"intent":{"type":"stance","squad":1,"stance":"secure",
+                              "target":"their-expansion"}}]}]}"#,
+        );
+        let conflicts = &pending(&app)[0].conflicts;
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.starts_with("step 1 does not resolve yet:")
+                    && c.contains("no region named 'their-expansion'")),
+            "got {conflicts:?}"
+        );
+        assert!(
+            !conflicts.iter().any(|c| c.contains("would refuse")),
+            "a chain step is not a refusal: {conflicts:?}"
+        );
+    }
+
+    /// A trigger's `then` gets the same look, and so does a trigger armed by a
+    /// plan step — the two rungs the deferral graph actually has.
+    #[test]
+    fn a_proposed_triggers_action_previews_too_at_both_rungs() {
+        let mut app = co_app();
+        for _ in 0..2 {
+            footman(&mut app, Vec3::ZERO);
+        }
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"home guard","commands":[
+                 {"type":"trigger_set","name":"guard",
+                  "when":{"type":"base_under_attack"},
+                  "then":{"type":"move","select":"all army","x":0.0,"z":0.0}}]}"#,
+        );
+        assert!(
+            pending(&app)[0]
+                .conflicts
+                .contains(&"its action would reach 2 unit(s) as of now".to_string()),
+            "got {:?}",
+            pending(&app)[0].conflicts
+        );
+
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"open then guard","commands":[
+                 {"type":"plan_set","name":"opening","steps":[
+                   {"intent":{"type":"trigger_set","name":"guard",
+                              "when":{"type":"base_under_attack"},
+                              "then":{"type":"move","select":"all army",
+                                      "x":0.0,"z":0.0}}}]}]}"#,
+        );
+        let conflicts = &pending(&app)[1].conflicts;
+        assert!(
+            conflicts.contains(&"step 1's trigger would reach 2 unit(s) as of now".to_string()),
+            "got {conflicts:?}"
+        );
+    }
+
     /// **Preview and apply are two moments, and the tags say so.** The scope is
     /// measured when the proposal arrives; the order is resolved again when the
     /// human approves. Between them the army can change — here two of the three
@@ -2217,28 +2415,63 @@ mod tests {
 
     /// `[Space]` should be able to send the camera to what a proposal is
     /// about — but only when the batch actually names a place.
+    ///
+    /// The input is a RESOLVED intent, which is why there is no `Regions` here
+    /// any more: a region name has already become coordinates by the time this
+    /// is asked, through the one resolver. A `push` still carrying a bare name
+    /// and no `x`/`z` is one that failed to resolve, and reports no place.
     #[test]
     fn a_proposal_about_ground_carries_that_ground() {
         let push = Intent::Posture {
             id: 1,
             posture: Some(PostureIntent::Push { x: Some(12.0), z: Some(-34.0), region: None }),
         };
+        assert_eq!(intent_pos(&push), Some(Vec3::new(12.0, 0.0, -34.0)));
         assert_eq!(
-            intent_pos(&push, Team::Human, &Regions::default()),
-            Some(Vec3::new(12.0, 0.0, -34.0))
-        );
-        assert_eq!(
-            intent_pos(
-                &Intent::Train {
-                    building: Some(1),
-                    unit: "Footman".to_string(),
-                    select: None,
-                },
-                Team::Human,
-                &Regions::default()
-            ),
+            intent_pos(&Intent::Train {
+                building: Some(1),
+                unit: "Footman".to_string(),
+                select: None,
+            }),
             None
         );
+        assert_eq!(
+            intent_pos(&Intent::Posture {
+                id: 1,
+                posture: Some(PostureIntent::Push {
+                    x: None,
+                    z: None,
+                    region: Some("north-pass".to_string()),
+                }),
+            }),
+            None,
+            "an unresolved name is not a place — the resolver fills x/z or refuses"
+        );
+    }
+
+    /// The other half of the same change: a proposal that names its ground by
+    /// REGION still flies the camera there, because the position comes off the
+    /// resolved copy `conflict_tags` already computes. Before this the private
+    /// `spot()` looked the name up itself, which is where a second reading of
+    /// "what does north-pass mean" could have grown.
+    #[test]
+    fn a_proposal_that_names_a_region_still_carries_its_ground() {
+        let mut app = co_app();
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .set(
+                Team::Human,
+                Region::new("north-pass", Vec3::new(-60.0, 0.0, 60.0), 20.0),
+            )
+            .expect("the test's own region is legal");
+        wire(
+            &mut app,
+            r#"{"type":"propose","note":"take the pass","commands":[
+                 {"type":"posture","id":1,
+                  "posture":{"type":"push","region":"north-pass"}}]}"#,
+        );
+        let pos = pending(&app)[0].pos.expect("a named place is a place");
+        assert_eq!(pos, Vec3::new(-60.0, 0.0, 60.0));
     }
 
     // -----------------------------------------------------------------------

@@ -1371,6 +1371,29 @@ never gave — `move all army to north-pass` reads identically at two units and
 at twenty. The second is the empty case, which must be said out loud for the
 same reason the compiler refuses it out loud rather than moving nobody.
 
+**And one level down** (`wc3clone-e2i`). `resolve_places` deliberately stops at
+the top-level intent — a plan's steps and a trigger's `then` are validated when
+they *run*, which is what lets an armed rule keep naming *my hero* instead of
+freezing an id. That rule is right for the compiler and does not transfer to the
+preview, where the question is not "what should this mean later" but "what am I
+agreeing to". A proposed five-step opening previewed as scoping **nothing at
+all**, while step 3 was about to take the whole army — the same misreading the
+paragraph above fixed for direct orders, one rung in. So each step, and each
+trigger a step arms, is run through the same resolver and reported beside the
+rest:
+
+```
+ ! step 1 would reach 5 unit(s) as of now
+ ! step 3 does not resolve yet: no region named 'their-expansion' - known places: …
+```
+
+A step that names ids says nothing — its sentence is already the whole story.
+A step that cannot resolve *yet* is phrased as pending rather than as a refusal,
+because that is what it is: the compiler arms such a plan with `chain holds at
+step k` (§ *Arm time and late binding*), and warning a reviewer about something
+that is going to be fine is how a channel gets ignored. Nothing is written back,
+so apply-time behaviour is byte-for-byte what it was.
+
 Both are dated, and so is the whole list by implication. **The preview resolves
 at arrival; approval resolves again, up to 20 seconds later, and what lands is
 the second answer.** A list of ids cannot change meaning in that window; a
@@ -2035,6 +2058,60 @@ Three properties are load-bearing:
   already speak — and the *step* remains the thing that decides, when its turn
   comes, whether the sentence is true.
 
+### Arm time and late binding
+
+*`wc3clone-8hu`. Which half of a sentence gets judged now, and which gets judged
+when its turn comes.*
+
+A plan step has two places a name can appear: its **target** (`stance ... target:
+"staging"`) and its **advance predicate** (`enemy_in` over `"staging"`). For one
+release they were judged by opposite rules — the target armed-and-taught, per the
+block above; the predicate refused the entire plan. A commander writing
+
+> push until twelve of them are in staging, then stage there
+
+got a notice for one half of one sentence and a refusal for the other, over the
+same word about the same ground. Worse, a plan step *may* `region_set` — that
+verb is banned from a trigger's `then` and deliberately not from a plan step — so
+"name the staging ground, then wait for twelve of them to reach it" was a
+coherent sequence the compiler would not accept.
+
+So the rule is now split by **what kind of thing is wrong**, not by which channel
+it is in:
+
+| | judged at arm time | late-bound |
+|---|---|---|
+| plan step | the predicate's **shape** — a count of zero, a misspelt target class, a fraction outside (0,1] | the predicate's **place**, and the step's own target |
+| trigger | shape **and** place | its `then`, entirely |
+
+Shape is a typo: no amount of later world turns `"count":0` into a sentence, so
+refusing it is the only honest answer. A place is *vocabulary*, and vocabulary
+grows during a match.
+
+**A trigger keeps the arm-time refusal**, and that is not an oversight. A trigger
+has no earlier step to name ground in; its `then` may not name ground at all; and
+it is one statement a commander re-sends in one line, so a refusal costs a line
+rather than a sequence. A plan is the construct explicitly written before the
+world it describes exists.
+
+**Late binding is only honest because the hold is audible.** `holds()` answers
+`false` for a region it cannot find — correct, and completely silent — so a plan
+armed over an unnamed place would otherwise sit `running` on step 2 forever,
+which is precisely the 3 a.m. failure the arm-time refusal used to prevent. The
+lesson is therefore paid twice:
+
+* at arm time, the same `chain holds at step k: …` notice the target channel
+  gives, with the resolver's own words and the menu of places;
+* at the step's turn, `PlanState::Held` — announced once on the edge, carried
+  continuously in `plans[].status` as `held: <why>`, and announced once more as
+  `no longer held` when the name becomes a place.
+
+`Held` is deliberately **not** `blocked`. `blocked` means the compiler refused
+the step, so retrying it is right and halting after `PLAN_BLOCK_GRACE_S` is the
+honest end. Here the step *ran*: re-submitting its intent would re-order an army
+that is already doing as it was told, and a missing place name is a thing a
+commander can still supply at minute ten. A held plan waits, and says so.
+
 ### Transitions are announced; states are displayed
 
 *`wc3clone-vax`, and the sharpest edge any vocabulary in this document has cut
@@ -2386,8 +2463,10 @@ territory buys something specific: an armed rule keeps naming *the perimeter*, s
   own error channel, rather than silently acting on stale coordinates.
 
 The `when` half is the opposite case and is checked immediately: a predicate's
-parameters are constants the commander typed, so `enemy_in`'s region is
-validated at **arm time**, with the same menu attached.
+parameters are constants the commander typed, so **for a trigger** `enemy_in`'s
+region is validated at **arm time**, with the same menu attached. A plan step's
+advance predicate late-binds the same field instead — the split, and the reason
+for it, are in § *Arm time and late binding*.
 
 A trigger may not `region_set` or `region_clear`, for the same reason it may not
 arm another trigger and one step further out: a rule that renamed ground while
@@ -2415,6 +2494,11 @@ If a rule's region is cleared after arming, the rule goes **quiet** rather than
 falling back to the whole map. An unresolvable name is not a bigger question; it
 is no question, and firing a defence of nowhere is strictly worse than firing
 nothing.
+
+Quiet is the right answer for a *trigger*, which is a standing offer to act. It
+is the wrong answer for a plan **step**, which parks on it: a sequence stopped
+for good has to be able to say so, and `PlanState::Held` is how it does. See §
+*Arm time and late binding*.
 
 ### Both seats, again
 

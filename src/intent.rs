@@ -1348,6 +1348,23 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
             index,
             select,
         },
+        // The two verbs that spend on a BUILDING rather than through one. They
+        // joined the channel late and the asymmetry was visible from the brief:
+        // `train` and `rally` were sayable without an entity id while "upgrade
+        // my hall" — the most obvious sentence in the family — was not.
+        Intent::Upgrade { building, select } => Intent::Upgrade {
+            building: producer("upgrade", building, &select, bind)?,
+            select,
+        },
+        Intent::Research {
+            building,
+            upgrade,
+            select,
+        } => Intent::Research {
+            building: producer("research", building, &select, bind)?,
+            upgrade,
+            select,
+        },
         Intent::Template {
             building,
             squad,
@@ -1895,7 +1912,14 @@ fn compile_intent(
                 mark.order("build"),
             );
         }
-        Intent::Upgrade { building } => {
+        Intent::Upgrade { building, .. } => {
+            // Defensive re-check, exactly as `train` and `rally` keep one:
+            // `producer` refuses both-channels-empty in `resolve_places`, and
+            // the arm does not get to assume it ran.
+            let Some(building) = building else {
+                errors.push(format!("{tag}: {}", needs_building("upgrade")));
+                return;
+            };
             let Some(entity) = intent_entity(building) else {
                 errors.push(format!("{tag}: building {building} not found/not yours"));
                 return;
@@ -2099,9 +2123,15 @@ fn compile_intent(
                 queue.progress = 0.0;
             }
         }
-        Intent::Research { building, upgrade } => {
+        Intent::Research {
+            building, upgrade, ..
+        } => {
             let Some(kind) = parse_research_kind(&upgrade) else {
                 errors.push(format!("{tag}: unknown research '{upgrade}'"));
+                return;
+            };
+            let Some(building) = building else {
+                errors.push(format!("{tag}: {}", needs_building("research")));
                 return;
             };
             let Some(entity) = intent_entity(building) else {
@@ -3219,14 +3249,53 @@ fn compile_intent(
                 match &step.advance {
                     PlanAdvance::OnApplied => {}
                     PlanAdvance::When { when } => {
-                        // The same arm-time judgement a trigger gets, for the
-                        // same reason and now including territory: a plan step
-                        // that advances on `enemy_in` names a PLACE, and a
-                        // misspelled place should be refused with the menu here
-                        // rather than silently stall the sequence at step k.
-                        if let Err(err) = validate_predicate(when, me, regions) {
+                        // **The predicate's SHAPE is judged now.** A count of
+                        // zero, a misspelt target class, a fraction outside
+                        // (0,1] — none of those becomes a sentence later, so
+                        // refusing the plan is the only honest answer and the
+                        // refusal names the fix.
+                        if let Err(err) = validate_predicate_shape(when) {
                             errors.push(format!("{tag}: plan {name} step {k}: {err}"));
                             return;
+                        }
+                        // **The predicate's PLACE is late-bound**, on the same
+                        // terms as the step's own target below — and this is a
+                        // deliberate split from `trigger_set`, which still
+                        // refuses an unknown place at arm time.
+                        //
+                        // The asymmetry a commander could feel was inside ONE
+                        // sentence: "push until 12 of them are in staging, then
+                        // stage there" armed-and-taught for the target half and
+                        // was refused outright for the predicate half, though
+                        // both halves are the same word about the same ground.
+                        // Worse, a plan may `region_set` in a step — that verb
+                        // is banned from a trigger's `then` and deliberately NOT
+                        // from a plan step — so "name the staging ground, then
+                        // wait for twelve of them to reach it" was a coherent
+                        // sequence the compiler refused to accept.
+                        //
+                        // A trigger keeps the arm-time refusal because none of
+                        // that applies to it: its `then` may not name ground, it
+                        // has no earlier step to name ground in, and it fires
+                        // against a vocabulary that was already complete when it
+                        // was armed. See docs/INTENT.md § "Arm time and late
+                        // binding".
+                        //
+                        // Late binding does not cost the lesson, because the
+                        // lesson is paid twice: here, and again by plan.rs when
+                        // the step's turn comes and the name is still not a
+                        // place — the plan goes `held: <this same sentence>`
+                        // rather than sitting `running` on a condition that can
+                        // never come true.
+                        if let Some(place) = predicate_place(when) {
+                            if regions.find(me, place).is_none() {
+                                errors.push(format!(
+                                    "{tag}: chain holds at step {k}: {} — plan {name} is \
+                                     armed anyway; the step waits there until the place \
+                                     is named",
+                                    regions.unknown(me, place)
+                                ));
+                            }
                         }
                     }
                     PlanAdvance::AfterSeconds { secs } => {
@@ -3391,7 +3460,42 @@ fn compile_intent(
 /// Is this predicate expressible? Checked at arm time, because a predicate is
 /// the one half of a trigger that CAN be judged before the world moves — every
 /// parameter in it is a constant the commander typed.
+///
+/// **Two halves, and callers pick how much of the second one they want.** The
+/// SHAPE ([`validate_predicate_shape`]) is judged the same way everywhere: a
+/// count of zero, a misspelt target class, a fraction outside `(0,1]` is a typo
+/// that no amount of later world can turn into a sentence. The PLACE
+/// ([`predicate_place`]) is vocabulary, and vocabulary grows during a match, so
+/// a plan step late-binds it where a trigger does not — see the plan-step arm
+/// of `compile_intent` for the argument.
 fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result<(), String> {
+    validate_predicate_shape(when)?;
+    if let Some(name) = predicate_place(when) {
+        if regions.find(me, name).is_none() {
+            return Err(regions.unknown(me, name));
+        }
+    }
+    Ok(())
+}
+
+/// **The place a predicate asks about, if it asks about one.**
+///
+/// One function so that "which predicates name ground?" has a single answer,
+/// read by three callers that must agree: the trigger arm (refuse now), the
+/// plan-step arm (arm and teach) and plan.rs's evaluator (hold the step and say
+/// so). A new predicate that names a place is one arm here and all three
+/// inherit it.
+pub(crate) fn predicate_place(when: &TriggerWhen) -> Option<&str> {
+    match when {
+        TriggerWhen::EnemyIn { region, .. } => Some(region.as_str()),
+        _ => None,
+    }
+}
+
+/// Everything about a predicate that is a **typo rather than a pending fact**:
+/// counts, classes, fractions, tiers, unit kinds. All of it is judged at arm
+/// time by every caller, because none of it can become true later.
+fn validate_predicate_shape(when: &TriggerWhen) -> Result<(), String> {
     /// The class check `enemy_sighted` and `enemy_in` share. One matcher, one
     /// wording — the two predicates ask the same question about the same word.
     fn class_ok(class: &Option<String>) -> Result<(), String> {
@@ -3428,16 +3532,11 @@ fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result
             }
             class_ok(class)
         }
-        TriggerWhen::EnemyIn {
-            region,
-            class,
-            count,
-        } => {
+        // The region is NOT checked here — it is the place channel, and
+        // `predicate_place` above is the one place that names it.
+        TriggerWhen::EnemyIn { class, count, .. } => {
             if *count == 0 {
                 return Err("enemy_in count must be at least 1".to_string());
-            }
-            if regions.find(me, region).is_none() {
-                return Err(regions.unknown(me, region));
             }
             class_ok(class)
         }
@@ -5320,6 +5419,84 @@ mod tests {
         assert!(plan_names(&app, Team::Human).contains(&"push".to_string()));
     }
 
+    /// **One sentence, one rule.** A chain step's TARGET region and its ADVANCE
+    /// predicate's region are the same word about the same ground, and until
+    /// this bead the compiler judged them by opposite rules: the target armed
+    /// and taught, the predicate refused the whole plan. "Push until twelve of
+    /// them are in staging, then stage there" got a notice for one half and a
+    /// refusal for the other.
+    ///
+    /// So a plan step late-binds both, and the notice is the same notice. The
+    /// half that makes it honest rather than merely permissive is plan.rs:
+    /// `a_step_held_on_an_unnamed_place_says_so_and_says_when_it_clears`.
+    #[test]
+    fn a_plan_step_late_binds_the_place_its_advance_predicate_names() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"commit","steps":[
+                {"intent":{"type":"stance","squad":1,"stance":"push","target":"mid"},
+                 "advance":{"type":"when",
+                            "when":{"type":"enemy_in","region":"staging","count":12}}},
+                {"intent":{"type":"stance","squad":1,"stance":"stage"}}]}"#,
+        );
+        assert_eq!(
+            plan_names(&app, Team::Human),
+            vec!["commit"],
+            "armed. A place the seat has not named yet must not cost it the sequence"
+        );
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+        assert_eq!(errors.len(), 1, "one line, about the one step: {errors:?}");
+        assert!(
+            errors[0].contains("chain holds at step 1")
+                && errors[0].contains("no region named 'staging'")
+                && errors[0].contains("known places")
+                && errors[0].contains("armed anyway"),
+            "the predicate half teaches exactly as the target half does: {}",
+            errors[0]
+        );
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+
+        // The sequence the old rule made inexpressible: a plan may `region_set`
+        // in a step (a trigger's `then` may not), so a plan can legitimately
+        // name the ground a LATER step waits on. Arm-time refusal made that
+        // coherent sentence unsayable.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"watch","steps":[
+                {"intent":{"type":"region_set","name":"staging",
+                           "x":-40.0,"z":30.0,"radius":20.0}},
+                {"intent":{"type":"stance","squad":1,"stance":"push","target":"mid"},
+                 "advance":{"type":"when",
+                            "when":{"type":"enemy_in","region":"staging","count":3}}}]}"#,
+        );
+        assert!(plan_names(&app, Team::Human).contains(&"watch".to_string()));
+    }
+
+    /// The other half of the split: a predicate's SHAPE is still judged at arm
+    /// time for a plan, because no amount of later world turns a count of zero
+    /// into a sentence. Late binding is about vocabulary, never about typos.
+    #[test]
+    fn a_plan_step_still_refuses_a_predicate_that_can_never_hold() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"never","steps":[
+                {"intent":{"type":"stop","units":[]},
+                 "advance":{"type":"when",
+                            "when":{"type":"enemy_in","region":"staging","count":0}}}]}"#,
+        );
+        let err = first_error(&app, Team::Human);
+        assert!(err.contains("enemy_in count must be at least 1"), "{err}");
+        assert!(
+            plan_names(&app, Team::Human).is_empty(),
+            "a shape that cannot come true is refused, place or no place"
+        );
+    }
+
     /// The wait-condition half. `hero_above` is judged at arm time like every
     /// other predicate parameter, and it reaches plans through the one seam —
     /// `PlanAdvance::When` carries a whole `TriggerWhen`, so a predicate added
@@ -6264,7 +6441,10 @@ mod tests {
     #[test]
     fn upgrade_is_one_verb_for_both_seats() {
         let typed: Intent = serde_json::from_str(r#"{"type":"upgrade","building":77}"#).unwrap();
-        let gesture = Intent::Upgrade { building: 77 };
+        let gesture = Intent::Upgrade {
+            building: Some(77),
+            select: None,
+        };
         assert_eq!(
             serde_json::to_value(&gesture).unwrap(),
             serde_json::to_value(&typed).unwrap()
@@ -6273,6 +6453,11 @@ mod tests {
             gesture.sentence(),
             "building 77 upgrades to its next tier"
         );
+        // And the phrase form, which the human seat never speaks (it already
+        // has a referent) but the wire now can.
+        let by_role: Intent =
+            serde_json::from_str(r#"{"type":"upgrade","select":"my hall"}"#).unwrap();
+        assert_eq!(by_role.sentence(), "my hall upgrades to its next tier");
     }
 
     /// A round trip through JSON must not change what an intent means — this
@@ -6407,8 +6592,9 @@ mod tests {
         // [Q] on a selected Blacksmith. ui.rs spells the ladder with the
         // catalog id, which is exactly what a commander types.
         let gesture = Intent::Research {
-            building: 77,
+            building: Some(77),
             upgrade: ResearchKind::Attack.id().to_string(),
+            select: None,
         };
         let typed: Intent =
             serde_json::from_str(r#"{"type":"research","building":77,"upgrade":"attack"}"#)
@@ -7961,8 +8147,16 @@ mod tests {
 
     // -- triggers -----------------------------------------------------------
 
-    /// `enemy_in`'s region is a constant the commander typed, so it is judged
-    /// at ARM time — with the menu attached, like every other unknown name.
+    /// `enemy_in`'s region is a constant the commander typed, so for a TRIGGER
+    /// it is judged at ARM time — with the menu attached, like every other
+    /// unknown name.
+    ///
+    /// A plan STEP now late-binds the same field
+    /// (`a_plan_step_late_binds_the_place_its_advance_predicate_names`), and the
+    /// split is deliberate: a trigger has no earlier step to name ground in, its
+    /// `then` may not name ground at all, and it is one statement a commander
+    /// re-sends in one line. A plan is a sequence written before the world it
+    /// describes exists. docs/INTENT.md § "Arm time and late binding".
     #[test]
     fn arming_enemy_in_with_an_unknown_region_is_refused_immediately() {
         let mut app = compiler_app();
@@ -8754,6 +8948,9 @@ mod tests {
             r#"{"type":"rally","select":"my barracks","x":1.0,"z":2.0}"#,
             r#"{"type":"template","select":"my barracks","squad":2}"#,
             r#"{"type":"cancel","select":"my barracks","index":0}"#,
+            // The two that joined the channel in round 2 (`wc3clone-3w9`).
+            r#"{"type":"upgrade","select":"my hall"}"#,
+            r#"{"type":"research","select":"idle blacksmith","upgrade":"attack"}"#,
         ];
         for form in forms {
             let parsed: Intent =
@@ -9177,6 +9374,80 @@ mod tests {
         assert!(
             queue_of(&app, barracks).is_empty(),
             "the train queued a Footman and the cancel took it back out"
+        );
+    }
+
+    /// **Round two: the two verbs that spend ON a building rather than through
+    /// one.** `upgrade my hall` is the most obvious sentence in the family and
+    /// it was the one the channel did not serve, which made the asymmetry
+    /// visible from tools/COMMANDER_BRIEF.md: four verbs took a phrase and two
+    /// demanded an entity id.
+    ///
+    /// The id it demanded is also the one least worth freezing. A hall's id
+    /// changes when it is razed and rebuilt, and a plan written before the match
+    /// has no id to write down at all — so `upgrade` was the one production verb
+    /// a chain could not contain.
+    #[test]
+    fn upgrade_and_research_take_the_same_phrase() {
+        let mut app = compiler_app();
+        rich(&mut app, Team::Human);
+        let hall = spawn_hall_at(
+            &mut app,
+            BuildingKind::TownHall,
+            Team::Human,
+            Vec3::ZERO,
+            false,
+        );
+        let forge = spawn_hall_at(
+            &mut app,
+            BuildingKind::Blacksmith,
+            Team::Human,
+            Vec3::new(20.0, 0.0, 20.0),
+            false,
+        );
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"upgrade","select":"my hall"}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        assert_eq!(
+            app.world().resource::<Events<UpgradeBuilding>>().len(),
+            1,
+            "the phrase reached the payer, which is what makes the rule true"
+        );
+
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"research","select":"my blacksmith","upgrade":"attack"}"#,
+        ));
+        app.update();
+        assert!(drain_errors(&mut app, Team::Human).is_empty());
+        let jobs = app.world().resource::<Events<StartResearch>>();
+        let mut reader = jobs.get_cursor();
+        assert_eq!(
+            reader.read(jobs).map(|j| j.building).collect::<Vec<_>>(),
+            vec![forge],
+            "the forge the phrase named, not the hall beside it"
+        );
+        // The ids are still in play for both, unchanged.
+        assert!(hall.to_bits() < forge.to_bits());
+
+        // And the empty match teaches from the same roster every other building
+        // verb teaches from.
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            r#"{"type":"upgrade","select":"my workshop"}"#,
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("upgrade: 'my workshop' matches none of your finished buildings")
+                && errors[0].contains("you have:"),
+            "{}",
+            errors[0]
         );
     }
 

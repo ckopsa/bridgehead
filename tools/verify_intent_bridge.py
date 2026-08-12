@@ -227,10 +227,19 @@ def main():
     assert any(s["id"] == 2 for s in st["squads"]), "FAIL: squad 2 posture never took"
     hall_out = next(b for b in st["buildings"] if b["id"] == hall)
     assert hall_out.get("queue"), "FAIL: train never queued"
-    # `rally` is deliberately not in the snapshot (it never was), so it is
-    # verified below by its intent log record carrying no errors.
+    # `rally` reads back now (`wc3clone-3w9`). It is an ADDITIVE, optional key
+    # inside `buildings[]` — `skip_serializing_if` keeps it off a building that
+    # has none, so the top-level EXPECTED/OPTIONAL sets above are untouched and
+    # a snapshot from a match where nobody says the word is shape-identical to
+    # the pre-feature one. What is asserted here is the positive case: the seat
+    # sent one above, so the readback must carry it.
+    assert hall_out.get("rally", {}).get("pos") == [55.0, 55.0], \
+        f"FAIL: rally never read back: {hall_out.get('rally')}"
+    assert all("rally" not in b for b in st["buildings"] if b["team"] != "Claude"), \
+        "FAIL: a rally point is command structure and must never leave its own seat"
     print(f"[5] effects confirmed: order={[u['order'] for u in moved]}, squad=2, "
-          f"retreat+prio policies set, queue={hall_out['queue']}")
+          f"retreat+prio policies set, queue={hall_out['queue']}, "
+          f"rally={hall_out['rally']}")
 
     # --- second batch: the tier-up, once the lumber is actually in ----------
     gold, lumber = upgrade_price(st)

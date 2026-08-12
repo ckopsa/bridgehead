@@ -207,6 +207,27 @@ fn xz_dist(a: Vec3, b: Vec3) -> f32 {
 /// remembers, or subscribes: a predicate that needed its own bookkeeping would
 /// be a predicate whose truth could drift from the world, and the whole value
 /// of firing at machine speed is that the world is what fired it.
+/// **Is this predicate even askable right now?** `Some(why)` when it names
+/// ground `me` cannot resolve, in the resolver's own words.
+///
+/// The companion `holds` needs and cannot express. `holds` returns `bool`, so an
+/// `enemy_in` over a region that is not a place answers "no" — indistinguishable
+/// from "not yet", and correct for a trigger, which simply stays quiet. A plan
+/// STEP cannot afford the ambiguity: it parks on that answer forever, and a
+/// sequence stopped for good on a typo has to be able to say so. See
+/// `PlanState::Held`.
+///
+/// Which field is the place is `intent::predicate_place`'s call, not this
+/// function's — one place names the place channel and the arm-time notice, the
+/// arm-time refusal and this hold all read it.
+pub fn unresolved_place(when: &TriggerWhen, me: Team, world: &TriggerWorld) -> Option<String> {
+    let name = crate::intent::predicate_place(when)?;
+    if world.regions.find(me, name).is_some() {
+        return None;
+    }
+    Some(world.regions.unknown(me, name))
+}
+
 pub fn holds(when: &TriggerWhen, me: Team, now: f32, world: &TriggerWorld) -> bool {
     match when {
         // Our own BUILDINGS, damaged inside the window. Buildings only: a

@@ -288,11 +288,16 @@ fn plan_line(plans: &Plans) -> String {
             match &p.state {
                 PlanState::Running => head,
                 PlanState::Done => format!("{head} (done)"),
-                PlanState::Blocked(why) | PlanState::Halted(why) => {
-                    let word = if matches!(p.state, PlanState::Blocked(_)) {
-                        "blocked"
-                    } else {
-                        "halted"
+                // Three reasons, one rendering. `held` joined the pair because
+                // the human seat has to be able to read the same three states
+                // the snapshot publishes — a plan stopped on a place it cannot
+                // name looks exactly like a plan waiting patiently, and only
+                // this line can tell them apart.
+                PlanState::Blocked(why) | PlanState::Held(why) | PlanState::Halted(why) => {
+                    let word = match p.state {
+                        PlanState::Blocked(_) => "blocked",
+                        PlanState::Held(_) => "held",
+                        _ => "halted",
                     };
                     let short: String = if why.chars().count() > WHY_MAX {
                         why.chars().take(WHY_MAX).collect::<String>() + "…"
@@ -5214,8 +5219,12 @@ fn command_input(
                         say(
                             &mut submissions,
                             Intent::Research {
-                                building: intent_id(entity),
+                                building: Some(intent_id(entity)),
                                 upgrade: kind.id().to_string(),
+                                // The human seat already HAS a referent — the
+                                // building it selected — so it never speaks the
+                                // phrase. Same as `train` above it.
+                                select: None,
                             },
                         );
                     }
@@ -5229,7 +5238,8 @@ fn command_input(
                         say(
                             &mut submissions,
                             Intent::Upgrade {
-                                building: intent_id(entity),
+                                building: Some(intent_id(entity)),
+                                select: None,
                             },
                         );
                     }

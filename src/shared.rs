@@ -1968,6 +1968,48 @@ pub struct CatalogSelectors {
     pub buildings: Vec<&'static str>,
 }
 
+/// One field of one `when` predicate, as a form should render it.
+///
+/// `type` is the DOMAIN word, not the JSON type: `place` and `class` are both
+/// strings on the wire, and a document that told a commander "string" would have
+/// sent it to guess at exactly the two fields whose legal values it can look up.
+/// The words are the ones tools/affordances.py already uses for a field's type,
+/// so a rendered form's `fields[].type` is this value verbatim.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogPredicateField {
+    pub name: &'static str,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// False when the key may be omitted. An optional field with no `default`
+    /// below means "absent asks the wider question" — `enemy_sighted` with no
+    /// `class` counts every class.
+    pub required: bool,
+    /// What the engine fills in when an optional key is absent. Present only on
+    /// the count-shaped fields, which are the only ones that have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<u32>,
+}
+
+/// One `when` predicate, with the fields its arm actually carries.
+///
+/// **Why this is in the catalog at all.** `TriggerWhen` is a tagged enum with
+/// per-arm fields, so the vocabulary was never machine-readable and
+/// tools/affordances.py kept a hand copy of the predicate list — honest only
+/// because a test parsed the table out of tools/COMMANDER_BRIEF.md and compared
+/// them. That caught `hero_above` arriving, which is exactly the failure it was
+/// written for, and it still could not tell a form what `enemy_in` *takes*: the
+/// domain a `when` field served was fourteen bare type names.
+///
+/// Additive, like `stances` and `selectors` before it: a document rendered beside
+/// an older `catalog.json` simply has no predicate schemas to serve.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogPredicate {
+    /// The `"type"` value a `when` object carries.
+    pub id: &'static str,
+    /// In the order the arm declares them. Empty for the four that take nothing.
+    pub fields: Vec<CatalogPredicateField>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct Catalog {
     pub units: Vec<CatalogUnit>,
@@ -1984,6 +2026,68 @@ pub struct Catalog {
     pub stances: Vec<CatalogStance>,
     /// The selector phrases, by channel.
     pub selectors: CatalogSelectors,
+    /// The `when` vocabulary — every predicate `trigger_set` and a plan step's
+    /// `advance` accept, with the fields each arm carries. In the order
+    /// [`TriggerWhen`] declares them, which is the order
+    /// tools/COMMANDER_BRIEF.md's table lists them in.
+    pub predicates: Vec<CatalogPredicate>,
+}
+
+/// The `when` schema, as one table.
+///
+/// Hand-written and deliberately so: `TriggerWhen`'s arms are the vocabulary,
+/// and a derive would export serde's idea of them (`Option<String>`, `f32`)
+/// rather than the DOMAIN words a form needs to serve a legal value. What keeps
+/// it honest is `the_exported_predicate_schema_is_a_command_the_engine_accepts`,
+/// which builds a `when` object out of every row here and parses it back into a
+/// `TriggerWhen` — a field named wrong, typed wrong, or marked required when it
+/// is not fails there.
+fn catalog_predicates() -> Vec<CatalogPredicate> {
+    /// A required field.
+    fn req(name: &'static str, kind: &'static str) -> CatalogPredicateField {
+        CatalogPredicateField { name, kind, required: true, default: None }
+    }
+    /// An optional field whose absence asks the wider question.
+    fn opt(name: &'static str, kind: &'static str) -> CatalogPredicateField {
+        CatalogPredicateField { name, kind, required: false, default: None }
+    }
+    /// An optional field the engine fills in.
+    fn dflt(name: &'static str, kind: &'static str, value: u32) -> CatalogPredicateField {
+        CatalogPredicateField { name, kind, required: false, default: Some(value) }
+    }
+    let p = |id, fields: Vec<CatalogPredicateField>| CatalogPredicate { id, fields };
+    vec![
+        p("base_under_attack", vec![]),
+        p("hero_below", vec![req("frac", "fraction")]),
+        p("hero_above", vec![req("frac", "fraction")]),
+        p("squad_below", vec![req("id", "squad"), req("frac", "fraction")]),
+        p(
+            "enemy_sighted",
+            vec![opt("class", "class"), dflt("count", "integer", 1)],
+        ),
+        p(
+            "enemy_in",
+            vec![
+                req("region", "place"),
+                opt("class", "class"),
+                dflt("count", "integer", 1),
+            ],
+        ),
+        p(
+            "enemy_army_seen",
+            vec![dflt("size", "integer", 1), opt("within_s", "seconds")],
+        ),
+        p("enemy_hero_down", vec![opt("class", "hero_class")]),
+        p("bounty_spawned", vec![]),
+        p("mine_dry", vec![]),
+        p("supply_capped", vec![]),
+        p("tier_reached", vec![req("tier", "integer")]),
+        p(
+            "unit_count",
+            vec![req("kind", "unit_kind"), req("count", "integer")],
+        ),
+        p("game_time", vec![req("at", "seconds")]),
+    ]
 }
 
 /// Assemble the full content catalog from the stat/requirement tables.
@@ -2204,6 +2308,7 @@ pub fn game_catalog() -> Catalog {
             sites: SELECTOR_SITE_NAMES.split(", ").collect(),
             buildings: SELECTOR_BUILDING_NAMES.split(", ").collect(),
         },
+        predicates: catalog_predicates(),
     }
 }
 
@@ -7096,10 +7201,13 @@ pub enum TriggerWhen {
     /// "do we know of an army at all". Eyes-on versus remembered, and a
     /// commander wants both words.
     ///
-    /// An unknown region name is refused **at arm time** by the compiler, so
-    /// this predicate never has to have an opinion about a name that is not a
-    /// place. If its region is cleared after arming, it goes quiet rather than
-    /// firing on the whole map — see `trigger.rs`.
+    /// An unknown region name is refused **at arm time** in a TRIGGER, so this
+    /// predicate never has to have an opinion about a name that is not a place.
+    /// In a PLAN STEP the same field is late-bound — the step arms with a notice
+    /// and goes [`PlanState::Held`] when its turn comes with the name still
+    /// unresolved (docs/INTENT.md § "Arm time and late binding"). Either way, if
+    /// the region is cleared out from under a live rule this predicate goes
+    /// quiet rather than firing on the whole map — see `trigger.rs`.
     EnemyIn {
         region: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7565,6 +7673,27 @@ pub enum PlanState {
     /// [`PLAN_RETRY_S`]; it will halt if it is still refused after
     /// [`PLAN_BLOCK_GRACE_S`].
     Blocked(String),
+    /// The current step's intent LANDED, and the step's advance-condition names
+    /// something this seat cannot currently resolve — today, an `enemy_in`
+    /// region that is not a place (never named, or `region_clear`ed out from
+    /// under the plan).
+    ///
+    /// **Not `Blocked`, and the difference is the whole reason for the
+    /// variant.** `Blocked` means the compiler refused the step, so retrying it
+    /// is the right move and giving up after [`PLAN_BLOCK_GRACE_S`] is the
+    /// honest end. Here the step *ran*: re-submitting its intent would re-order
+    /// an army that is already doing what it was told, and halting would throw
+    /// away a sequence whose missing word a commander may `region_set` at minute
+    /// ten. So a held plan does neither — it waits, says so once, and says so
+    /// again when it comes unstuck.
+    ///
+    /// It exists because the alternative was silence. `holds()` answers "no" for
+    /// a region it cannot find, which is correct and completely quiet, and a
+    /// plan parked forever on step 2 with `status: running` is the 3 a.m.
+    /// failure the arm-time refusal used to prevent. Late-binding the predicate
+    /// (docs/INTENT.md § "Arm time and late binding") is only defensible with
+    /// this on the other end of it.
+    Held(String),
     /// The current step was still refused after the grace window. The plan
     /// stops here, on this step, forever — it never skips ahead.
     Halted(String),
@@ -7696,6 +7825,7 @@ impl PlanRun {
         match &self.state {
             PlanState::Running => "running".to_string(),
             PlanState::Blocked(why) => format!("blocked: {why}"),
+            PlanState::Held(why) => format!("held: {why}"),
             PlanState::Halted(why) => format!("halted: {why}"),
             PlanState::Done => "done".to_string(),
         }
@@ -7703,7 +7833,10 @@ impl PlanRun {
 
     /// Is this plan still going to do anything?
     pub fn live(&self) -> bool {
-        matches!(self.state, PlanState::Running | PlanState::Blocked(_))
+        matches!(
+            self.state,
+            PlanState::Running | PlanState::Blocked(_) | PlanState::Held(_)
+        )
     }
 }
 
@@ -8381,8 +8514,18 @@ pub enum Intent {
     /// (`catalog.buildings[].upgrades_to`). Paid in full the moment it is
     /// accepted; the building keeps its position, footprint, rally and
     /// training queue, but trains nothing until the conversion finishes.
+    ///
+    /// `select` names the building by role instead of by id — see
+    /// [`Intent::Train`]. `"upgrade my hall"` is the obvious want, and it is
+    /// what makes a tier-up armable in a trigger or a plan step: the hall's
+    /// entity id is knowable at arm time, but an id frozen into a rule outlives
+    /// nothing (a razed and rebuilt hall is a new id), and a plan written before
+    /// the match has no id to freeze.
     Upgrade {
-        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        building: Option<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Drop one entry from a building's training queue. `select` names the
     /// building by role instead of by id — see [`Intent::Train`].
@@ -8405,9 +8548,15 @@ pub enum Intent {
     /// wrong. Refused if the forge is already researching something — one job
     /// per Blacksmith, and requests are rejected rather than queued (see
     /// `Researching`).
+    /// `select` names the forge by role instead of by id — see
+    /// [`Intent::Train`]. `"idle blacksmith"` is the useful phrase here, because
+    /// one job per forge is exactly the rule this verb bounces off.
     Research {
-        building: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        building: Option<IntentId>,
         upgrade: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Where units this building trains should go. `x`/`z` for ground, or
     /// `target` for a resource node (new workers harvest it) or an own unit
@@ -9082,8 +9231,11 @@ impl Intent {
             } => {
                 format!("{} trains {unit}", one_building(building, select))
             }
-            Intent::Upgrade { building } => {
-                format!("building {building} upgrades to its next tier")
+            Intent::Upgrade { building, select } => {
+                format!(
+                    "{} upgrades to its next tier",
+                    one_building(building, select)
+                )
             }
             Intent::Cancel {
                 building,
@@ -9095,8 +9247,12 @@ impl Intent {
                     one_building(building, select)
                 )
             }
-            Intent::Research { building, upgrade } => {
-                format!("building {building} researches {upgrade}")
+            Intent::Research {
+                building,
+                upgrade,
+                select,
+            } => {
+                format!("{} researches {upgrade}", one_building(building, select))
             }
             Intent::Rally {
                 building,
@@ -12816,6 +12972,66 @@ mod determinism_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The exported `when` schema has to be a command the engine accepts.**
+    ///
+    /// `catalog.predicates` is hand-written — a derive would export serde's idea
+    /// of the arms (`Option<String>`, `f32`) rather than the domain words a form
+    /// needs to serve a legal value — so something has to stop it drifting from
+    /// the enum it describes. This is that something: every row is assembled
+    /// into a `when` object out of its own field names and types and parsed back
+    /// through the real `TriggerWhen` deserializer. A field named wrong, typed
+    /// wrong, or marked required when it is optional fails here.
+    ///
+    /// It also pins the two halves of `required`: the required fields alone must
+    /// parse (so nothing optional is secretly load-bearing), and every field
+    /// together must parse (so no name is invented).
+    #[test]
+    fn the_exported_predicate_schema_is_a_command_the_engine_accepts() {
+        /// A plausible value for one of the domain words the table uses. These
+        /// are the words, and an unknown one is a typo the `panic` catches.
+        fn value(kind: &str) -> serde_json::Value {
+            match kind {
+                "fraction" => serde_json::json!(0.5),
+                "integer" | "squad" => serde_json::json!(2),
+                "seconds" => serde_json::json!(30.0),
+                "place" => serde_json::json!("north-pass"),
+                "class" => serde_json::json!("Siege"),
+                "hero_class" => serde_json::json!("Hero"),
+                "unit_kind" => serde_json::json!("Footman"),
+                other => panic!("catalog_predicates uses an unknown domain word '{other}'"),
+            }
+        }
+        let rows = catalog_predicates();
+        assert_eq!(rows.len(), 14, "the count the brief's heading also states");
+        for row in &rows {
+            for all in [false, true] {
+                let mut when = serde_json::Map::new();
+                when.insert("type".to_string(), serde_json::json!(row.id));
+                for f in &row.fields {
+                    if all || f.required {
+                        when.insert(f.name.to_string(), value(f.kind));
+                    }
+                }
+                let json = serde_json::Value::Object(when);
+                let parsed = serde_json::from_value::<TriggerWhen>(json.clone());
+                assert!(
+                    parsed.is_ok(),
+                    "catalog says {} takes {:?}, and the wire disagrees: {json} -> {:?}",
+                    row.id,
+                    row.fields.iter().map(|f| f.name).collect::<Vec<_>>(),
+                    parsed.err()
+                );
+            }
+        }
+        // And the defaults are the engine's actual defaults, not a hopeful
+        // annotation: omit the key and the parsed value must be the one exported.
+        let count: TriggerWhen = serde_json::from_value(
+            serde_json::json!({"type": "enemy_in", "region": "north-pass"}),
+        )
+        .expect("enemy_in parses with only its required field");
+        assert!(matches!(count, TriggerWhen::EnemyIn { count: 1, .. }));
+    }
 
     /// Every rung of the chain of command renders to one compact line, and
     /// those lines are the literal contract: the bridge snapshot's

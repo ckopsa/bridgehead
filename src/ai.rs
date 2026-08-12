@@ -1808,7 +1808,8 @@ fn think(
                         gold -= cost_gold;
                         lumber -= cost_lumber;
                         voice.say(Intent::Upgrade {
-                            building: intent_id(hall.entity),
+                            building: Some(intent_id(hall.entity)),
+                            select: None,
                         });
                         info!(
                             "[ai {me:?}] teching up: {} -> {} at ({:.0},{:.0}) for \
@@ -1883,11 +1884,12 @@ fn think(
                     gold -= step.cost_gold;
                     lumber -= step.cost_lumber;
                     voice.say(Intent::Research {
-                        building: intent_id(forge.entity),
+                        building: Some(intent_id(forge.entity)),
                         // The ladder id the catalog publishes, which is what
                         // `parse_research_kind` reads and what a commander
                         // would have typed.
                         upgrade: kind.id().to_string(),
+                        select: None,
                     });
                     info!(
                         "[ai {me:?}] researching {} {} at ({:.0},{:.0}) for {}g {}l (army {})",
