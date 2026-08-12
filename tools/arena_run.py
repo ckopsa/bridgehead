@@ -112,6 +112,29 @@ def file_digest(path: Path, chars: int = DIGEST_CHARS) -> str | None:
     return hashlib.sha256(raw).hexdigest()[:chars]
 
 
+def head_commit() -> str | None:
+    """`git rev-parse --short HEAD`, or None outside a checkout.
+
+    `ruleset.commit` was null on every recorded round because nobody typed
+    `--commit`, and the one thing it records is not otherwise recoverable: the
+    engine normally runs the `include_str!` copy of the stat tables compiled
+    into the binary, so without a commit the round's tuning is a shrug. The
+    default makes provenance the thing you have to opt OUT of.
+
+    None rather than a raise: a round played from an exported tree is still a
+    round, and `unknown[]` is where that gap belongs.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = out.stdout.strip()
+    return sha if out.returncode == 0 and sha else None
+
+
 def scaffold_version() -> str:
     """The affordance document's media-type version, from the module that owns it.
 
@@ -241,6 +264,53 @@ def mark_scaffolds(seats: list[dict], sides: list[str], version: str) -> None:
                 f"scripted AI never reads one — scaffold a commander seat instead."
             )
         seat["scaffold"] = version
+
+
+def mark_models(seats: list[dict], specs: list[str]) -> None:
+    """`--model red=opus,blue=haiku` -> `seats[].model`.
+
+    A flag rather than a fourth colon-field on `--seat`, because the seat spec
+    already carries an optional persona and an optional prompt and a model id
+    contains no reliable separator — `--seat red=commander:rusher:brief:opus`
+    is a line nobody can read and a parse nobody can defend. `--model` also
+    mirrors `--scaffold`: both answer "what was in this chair", both are
+    per-side, both accept `both`.
+
+    Refuses a scripted seat, for the same reason `mark_scaffolds` does. The
+    scripted AI is `ai.rs`; calling it opus in the ledger would make a
+    model-vs-model comparison include a round that had no model in it.
+    """
+    by_side = {s["side"]: s for s in seats}
+    for spec in specs:
+        for raw in spec.split(","):
+            item = raw.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError(
+                    f"--model {item!r} must look like side=model-id "
+                    f"(e.g. red=opus, or both=haiku)"
+                )
+            side, model = item.split("=", 1)
+            side, model = side.strip().lower(), model.strip()
+            if not model:
+                raise ValueError(f"--model {item!r}: the model id is empty")
+            sides = sorted(SIDES) if side in ("both", "all") else [side]
+            for one in sides:
+                if one not in SIDES:
+                    raise ValueError(
+                        f"--model {side!r} — use {', '.join(sorted(SIDES))} or both"
+                    )
+                seat = by_side.get(one)
+                if seat is None:
+                    raise ValueError(f"--model {one}: this round has no {one} seat")
+                if seat["kind"] != "commander":
+                    raise ValueError(
+                        f"--model {one}: the {one} seat is {seat['kind']}. The scripted "
+                        f"AI is ai.rs and no model plays it — naming one here would put "
+                        f"a round with no model in it into a model comparison."
+                    )
+                seat["model"] = model
 
 
 def derive_env(seats: list[dict], args) -> dict[str, str]:
@@ -579,6 +649,12 @@ def build_record(args, seats: list[dict], env: dict, verdict: dict) -> dict:
     # round-level version is in `ruleset.constants.affordance_doc`; this is
     # which chair it was sitting in.
     #
+    # `model` is the OTHER half of the pair AFFORDANCES.md constraint 3 names
+    # ("an arena result measures model+scaffold"): the ledger recorded the
+    # scaffold and left the model to a commit message, so half of every result
+    # was unrecorded. Same absent-not-null rule — a scripted seat has no model
+    # and never gets the key.
+    #
     # `ready_wait_s` follows exactly that precedent (docs/INTENT.md, "The ready
     # handshake"): wall seconds from launch until this seat sent `ready`, and
     # ABSENT — never null — on a seat that never waited. A scripted seat is born
@@ -589,8 +665,9 @@ def build_record(args, seats: list[dict], env: dict, verdict: dict) -> dict:
         {
             k: v
             for k, v in s.items()
-            if k in ("seat", "team", "kind", "persona", "prompt", "scaffold", "ready_wait_s")
-            and not (k in ("prompt", "scaffold") and v is None)
+            if k in ("seat", "team", "kind", "persona", "prompt", "model",
+                     "scaffold", "ready_wait_s")
+            and not (k in ("prompt", "model", "scaffold") and v is None)
         }
         for s in seats
     ]
@@ -622,6 +699,12 @@ def main(argv: list[str] | None = None) -> int:
                         "(tools/bridge_view.py --doc): red, blue, both, or a comma list. "
                         "Its version lands in the round's ruleset — AFFORDANCES.md "
                         "constraint 3")
+    p.add_argument("--model", action="append", default=[], metavar="SIDE=MODEL",
+                   help="which model sits in a commander seat, e.g. "
+                        "red=opus,blue=haiku (or both=haiku). Lands in "
+                        "seats[].model — an arena result measures model+scaffold "
+                        "and this is the half the ledger used to leave to a "
+                        "commit message")
     p.add_argument("--map", default="open", choices=list(arena.MAPS))
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--cap", type=float, default=1800.0, help="BH_MAX_GAME_SECS; 0 for none")
@@ -629,7 +712,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                    help="extra environment; overrides the derived value")
     p.add_argument("--notes", default="", help="what changed in the ruleset this round")
-    p.add_argument("--commit", default=None, help="the commit the round was played at")
+    p.add_argument("--commit", default=None,
+                   help="the commit the round was played at "
+                        "(default: git rev-parse --short HEAD)")
     p.add_argument("--bin", type=Path, default=REPO / "target" / "debug" / "bridgehead")
     p.add_argument("--out", default="arena", help="where round evidence goes (repo-relative)")
     p.add_argument("--bridge-root", type=Path, default=REPO / "bridge")
@@ -658,6 +743,19 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as err:
             print(f"error: {err}", file=sys.stderr)
             return 2
+
+    if args.model:
+        try:
+            mark_models(seats, args.model)
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+
+    # Provenance you have to opt OUT of. `ruleset.commit` was null on every
+    # recorded round because it was a flag nobody remembered, and it is the
+    # only record of which stat tables the binary was compiled with.
+    if args.commit is None:
+        args.commit = head_commit()
 
     args.id = args.id or arena.next_id(arena.load(args.ledger))
     if any(r.get("id") == args.id for r in arena.load(args.ledger)):
@@ -688,7 +786,12 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = REPO / out_dir
     out_dir = out_dir / args.id
     print(f"round {args.id}: {args.hypothesis}")
-    print(f"  seats:  " + ",  ".join(f"{s['side']}={s['kind']}:{s['persona']}" for s in seats))
+    print(f"  seats:  " + ",  ".join(
+        f"{s['side']}={s['kind']}:{s['persona']}"
+        + (f" ({s['model']})" if s.get("model") else "")
+        for s in seats
+    ))
+    print(f"  commit: {args.commit or '(unknown — not a git checkout)'}")
     print(f"  env:    " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
     # The half of the ruleset that is not the environment, printed where the
     # environment is: a dry run should show the whole record's `ruleset`, and

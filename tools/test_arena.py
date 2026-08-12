@@ -131,6 +131,26 @@ def test_the_scaffold_a_seat_played_with_is_recorded_per_seat():
     assert any("seats.0.scaffold" in m for m in arena.validate(rec))
 
 
+def test_the_model_that_sat_in_a_seat_is_recorded_on_the_seat():
+    """The other half of docs/AFFORDANCES.md constraint 3's "model+scaffold".
+    The schema example has shown `model` on a seat since the document was
+    written; nothing wrote one and nothing checked one, so an arena result
+    recorded half its own independent variable.
+
+    Free-form, because model ids are somebody else's vocabulary and change
+    faster than this file: a closed set here would refuse a valid round every
+    time a model shipped, which is a worse failure than a typo you can grep
+    for. Optional and absent-not-null, like `scaffold` beside it.
+    """
+    rec = good()
+    rec["seats"][0]["model"] = "opus"
+    assert arena.validate(rec) == [], arena.validate(rec)
+    assert "seats.1.model" not in arena.null_paths(rec)
+    for bad in ("", "   ", 1, None, ["opus"]):
+        rec["seats"][0]["model"] = bad
+        assert any("seats.0.model" in m for m in arena.validate(rec)), bad
+
+
 def test_the_tuning_digests_must_look_like_digests():
     """`alarms_ron` and `stances_ron` are written by a tool and compared for
     equality across rounds, so a truncated or uppercased one would read as a

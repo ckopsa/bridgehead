@@ -27,7 +27,7 @@ Every record answers six questions, in this order:
 | Field | The question it answers |
 |---|---|
 | `ruleset` | **Under what rules?** Map, environment, the balance constants at play, the scaffold version in force, the commit. |
-| `seats` | **Who was playing?** Which side, which team, scripted or commander, which creed, and which seat read the affordance document. |
+| `seats` | **Who was playing?** Which side, which team, scripted or commander, which creed, which model, and which seat read the affordance document. |
 | `hypothesis` | **What did we want to find out?** Written before the match. |
 | `result` | **What happened?** Winner, length, and which of the engine's endings it was. |
 | `evidence` | **How do we know?** AARs, logs, final snapshots, screenshots, metrics, sources. |
@@ -106,7 +106,8 @@ diff shows what changed about a round rather than that a dict reordered itself.
   },
   "seats": [
     {"seat": "bridge/red",  "team": "Claude", "kind": "commander",
-     "persona": "rusher", "model": "opus",
+     "persona": "rusher",
+     "model": "opus",                    // optional; absent on a scripted seat
      "scaffold": "affordance-doc/1"}     // optional; absent on a seat that played bare
   ],
   "hypothesis": "Does the rusher line still win with 40% more gold in the ground?",
@@ -167,19 +168,30 @@ diff shows what changed about a round rather than that a dict reordered itself.
   hand-written or backfilled record has no such habit, and the claim belongs to
   the ledger rather than to whoever filled it in.
 
-### What the ruleset records about the scaffold
+### What the ruleset records about the model and the scaffold
 
 `docs/AFFORDANCES.md` constraint 3: *once the scaffold encodes any judgment, an
 arena result measures model+scaffold. That is fine — it is the experiment we
 want — but the scaffold version must appear in the round's `ruleset` so ledger
-comparisons stay honest.* Three keys carry that, and they are written by
+comparisons stay honest.* Five keys carry that, and they are written by
 `tools/arena_run.py` rather than typed:
 
 | Key | Where | When | What it is |
 |---|---|---|---|
+| `seats[].model` | seat | only on commander seats somebody named a model for | the model id that sat in that chair — `--model red=opus,blue=haiku`. |
 | `ruleset.constants.affordance_doc` | round | only when a seat read the document | `tools/affordances.py`'s `DOC_VERSION` — the media type of the affordance document (`bridge_view.py --doc`). |
 | `seats[].scaffold` | seat | only on the seats that read it | the same version, on the chair it sat in. |
 | `ruleset.constants.alarms_ron`, `.stances_ron` | round | **always** | the first 12 hex of the sha256 of `assets/data/alarms.ron` and `stances.ron`. |
+| `ruleset.commit` | round | **always**, in a git checkout | `git rev-parse --short HEAD` at launch. Defaulted rather than typed: it was null on every round the runner ever recorded, and it is the only record of which stat tables the binary was compiled with. |
+
+**`model` is free-form and per seat.** Free-form because model ids are somebody
+else's vocabulary and they change faster than this repo does — a closed set
+here would refuse a valid round every time a model shipped, which is a worse
+failure than a typo you can grep for. Per seat because the interesting rounds
+are the asymmetric ones, and the sentence the ladder is built to say is *this
+model, with this scaffold, in this chair, beat that one*. A scripted seat
+cannot be given a model and the runner refuses to stamp one: `ai.rs` is not a
+model, and a round with no model in it must not enter a model comparison.
 
 Three decisions in there are worth their reasons:
 
@@ -243,8 +255,23 @@ tools/arena_run.py --hypothesis "does the rush still win at 5000g?" \
 
 # an A/B round: red plays with the affordance document, blue plays bare
 tools/arena_run.py --hypothesis "does the scaffold carry a smaller model?" \
-    --seat red=commander:haiku --seat blue=commander:haiku --scaffold red
+    --seat red=commander:haiku --seat blue=commander:haiku \
+    --model both=haiku --scaffold red
+
+# a ladder round: two models, same persona pair, same everything else
+tools/arena_run.py --hypothesis "does opus still out-macro haiku at 16x?" \
+    --seat red=commander:rusher --seat blue=commander:rusher \
+    --model red=opus,blue=haiku
 ```
+
+`--model SIDE=ID` (comma-separated, `both=` accepted) records which model sat
+in each commander chair. It is a flag rather than a fourth colon-field on
+`--seat` because a model id has no reliable separator and
+`red=commander:rusher:brief:opus` is a line nobody can read. It refuses a
+scripted seat: `ai.rs` is not a model, and naming one there would put a round
+with no model in it into a model comparison. **Every ladder round needs it** —
+without it the ledger records the scaffold and leaves the model to a commit
+message, which is half an experiment.
 
 `--scaffold red|blue|both` says which commander seats read
 `tools/bridge_view.py --doc`, and it does two things: it stamps the round (the
@@ -330,3 +357,30 @@ Recorded here so the gaps are a known quantity rather than a surprise:
   carry their substance in `lessons` and `verdicts`.
 - **Per-round seeds.** There are none to recover: `MAP_SEED` is a compile-time
   constant and the world is identical every run.
+- **`seats[].model` and `ruleset.commit` for rounds r1–r23.** Both keys start
+  at the next round and the earlier ones **stay empty** rather than being
+  filled in. This is a decision, not an omission.
+
+  `ruleset.commit` is null on every round the runner has recorded so far,
+  because it was a flag nobody typed; it now defaults to
+  `git rev-parse --short HEAD`. Reconstructing the old values from the ledger's
+  dates would mean picking the commit nearest each round's `date`, which is a
+  guess dressed as provenance — and provenance that might be wrong is worse
+  than provenance that is absent, because the second kind announces itself.
+  A round whose commit genuinely is recoverable can be corrected by hand with
+  the source cited in `evidence.sources`, which is what that field is for.
+
+  `seats[].model` is worse to guess at, because the ledger contains no trace
+  of it at all. The rounds were played by whatever model the orchestrator was
+  running that day, and "whatever we were probably using in mid-August" is not
+  a variable anybody may compare against. So r1–r23 carry no `model` key, the
+  ladder starts from the first round that does, and the honest reading of the
+  earlier series is *these rounds tested personas and rules, not models*.
+
+  The two absences read differently in `unknown[]`, and correctly so.
+  `ruleset.commit` is a `null` on r1–r23, so every one of those rounds already
+  carries `"ruleset.commit"` in its `unknown` list — the ledger says out loud
+  that it does not know, which is the whole point of that list. `model` is a
+  key those records simply do not have, and an absent key is not a null: "this
+  round was not a model experiment" is a fact, not a gap, the same rule
+  `scaffold` and `ready_wait_s` already follow.
