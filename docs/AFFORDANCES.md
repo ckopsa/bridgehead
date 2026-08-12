@@ -3,7 +3,9 @@
 *Design distilled from arena rounds r21–r23 (see `arena/ledger.jsonl` and each
 round's AARs) and the orchestration discussion of 2026-08-11. Status: design,
 not yet implemented. The work breakdown is the Implementation plan section at
-the end of this document.*
+the end of this document, filed as epic `wc3clone-0uu`. 2026-08-12: the
+affordance menu and the commander digest were merged into a single hypermedia
+document — see "One document" below.*
 
 ## The problem
 
@@ -92,6 +94,57 @@ constraint 1), annotated on two strictly separated channels:
   generates the preference — it renders the commander's own values back.
   The engine computes readiness; it does not have opinions.
 
+### One document: links, forms, and a running default
+
+The menu and the digest (below) ship as a single per-seat, per-cycle
+**hypermedia document** (`affordances.json`, or a mode of `bridge_view.py`):
+the digest is its properties, the affordances are its actions, and it always
+names its running default — what silence does right now, rendered as a title
+with `"command": null`. One document serves both a Haiku and a Fable because
+it offers a ladder of degrees of freedom:
+
+1. **The default** — zero decisions; silence follows it.
+2. **A link** — zero fields: a pre-filled command the commander sends back
+   verbatim.
+3. **A form** — the engine fills every fact-shaped field; the commander fills
+   only the judgment-shaped ones.
+4. **A raw intent** — off-document, the full vocabulary, always open
+   (constraint 1: the document is the floor, never the ceiling; the engine
+   never rejects an off-document command the human UI could express).
+
+A link carries the two channels above plus its command: `{rel, title, ready,
+reason, intel, cost, command}`. The command is written in *selectors*, never
+entity IDs, so it is valid whenever it is sent — which promotes late-bound
+references (implementation item 1) from helpful to prerequisite: without
+fire-time resolution the engine would freeze IDs into every rendered control,
+and the scaffold itself would automate the exact staleness failure class it
+exists to kill.
+
+Forms make explicit what the wire already is: CRUD by name. `trigger_set`
+with a fresh name creates; the snapshot echo reads; the same name updates in
+place, free; `trigger_clear` deletes — likewise regions, plans, and squads.
+So the document renders standing state as resources: each collection carries
+its slot pressure ("5 of 8 trigger names in use"), each armed rule an edit
+form pre-filled with its current values plus a delete link, and each form
+field its served, fog-legal domain — place fields list `map.places` plus the
+seat's own regions, unit fields the selector vocabulary, kind fields the
+catalog entries annotated with cost and readiness facts, numeric fields their
+real ranges. Validation-as-teaching moves from fire time to authoring time:
+the list a typo would have been refused with arrives in the document before
+anything is written, while the refusal path stays intact underneath for the
+raw tier. The commander brief's opening recipes become served forms —
+pre-filled in selectors, one or two judgment fields open — instead of prose
+transcribed by hand (r21 transcribed one wrong, and died of it).
+
+Two guards keep the document on the right side of the fact/judgment line.
+Form defaults come only from engine facts or the commander's own pregame
+declarations — a default that encodes strategy makes the arena measure the
+form author, so every other field ships empty. And the document never
+contains a link the engine *recommends*: ready, cost, staleness, and ETA are
+facts; "best move" is an opinion, and the engine does not have opinions. The
+document version is recorded in the round's ruleset like every other scaffold
+layer (constraint 3).
+
 ### Chains: stance plans with late-bound references
 
 "Turtle until the hero is healed, then secure an expansion" is a plan whose
@@ -177,7 +230,9 @@ win-condition line), last five events, active alarms. Red's drop list agrees:
 per-unit ID rosters (obsolete once selectors exist), tree IDs, per-farm HP,
 the full plans echo. This is a *view* (`bridge_view.py` or a `--digest`
 mode), not a change to `state.json` — the full snapshot remains for any
-commander that wants it, and the wire format stays append-only.
+commander that wants it, and the wire format stays append-only. It ships as
+the properties section of the hypermedia document above, not as a second
+artifact.
 
 ### Composition counter-hints (static table, maybe)
 
@@ -207,21 +262,25 @@ verifiable (`tools/verify.sh identity` for any "no behaviour change" claim).
    anchor + retreat + leash + priority, executed by existing doctrine between
    polls. Default is persistence: no command means continue. All mutation via
    `Intent` → `apply_intents`.
-3. **Affordance menu** *(needs 2; benefits from 1)*. From the current stance,
-   render ALL transitions — advisory, never blocking — with the two channels
-   above: fog-legal readiness (precondition truth + reason, intel staleness,
-   push gates) and commander-declared preference ordering. View layer:
-   `bridge_view.py` / the digest.
+3. **Hypermedia affordance document** *(needs 1 and 2 — rendered commands are
+   written in selectors)*. From the current stance, render ALL transitions —
+   advisory, never blocking — as one document: the two channels above
+   (fog-legal readiness with precondition truth + reason, intel staleness,
+   push gates; commander-declared preference ordering), links and forms with
+   served fog-legal domains, standing state as CRUD-by-name resources with
+   slot pressure, and a named running default. View layer: `bridge_view.py` /
+   the digest.
 4. **Alarms** *(independent; pairs with 2's reflexes)*. The four events above,
    each naming its running default, re-rendering the menu, never acting.
 5. **Commander digest** *(independent)*. The ~15-line view: resources,
    army-by-squad, queues, enemy production buildings remaining, last 5
    events, active alarms. View-only; `state.json` unchanged; wire stays
-   append-only.
+   append-only. Ships as the properties section of item 3's document.
 6. **Stance chains** *(needs 1 and 2)*. `stance_plan`: steps are stance
    transitions with wait-conditions, compiled through the one compiler into
    stance-sets plus armed transitions; teaching-only validation ("chain holds
-   at step 1 until scouted").
+   at step 1 until scouted"). In the document, a chain is a multi-step form
+   with per-step readiness.
 7. **Haiku A/B validation** *(needs 3 and 5)*. The experiment in the next
    section.
 
