@@ -173,6 +173,12 @@ pub enum Action {
     CycleLeash,
     CyclePriority,
     AutoCastSlot(usize),
+    /// Step the doctrine page's SCOPE — who its sentences are about — one rung
+    /// along "the selection, my hero, all army, all units, workers, squad 1-3".
+    /// A cycle over a closed vocabulary for the same reason `CycleStance` is
+    /// one: eight rungs, and this page has no eight spare letters. See
+    /// docs/INTENT.md § Selectors ("Both seats") for the gap it closes.
+    DoctrineScope,
     /// Arm (or disarm) the `home-guard` trigger: when the base is attacked,
     /// this squad falls back and defends it. A preset, not an authoring UI —
     /// see docs/INTENT.md on the asymmetry this leaves open.
@@ -532,6 +538,15 @@ pub const REGISTRY: &[Binding] = &[
     b(Action::CycleFallback, KeyCode::KeyF, Ctx::DoctrinePage),
     b(Action::CycleLeash, KeyCode::KeyG, Ctx::DoctrinePage),
     b(Action::CyclePriority, KeyCode::KeyP, Ctx::DoctrinePage),
+    // [A] for "applies to" — the role this page's doctrine is written about.
+    // It is the orders card's attack-move and the two never share a context
+    // (`CardContext::UnitsDoctrine` carries no `Ctx::Orders` tag), so this is
+    // the same reuse [S] Stance already makes one line above. The letter with
+    // the strongest muscle memory in the game is the safest one to reuse here
+    // besides: a mis-press from habit steps a cycle, submits no intent and is
+    // undone by pressing it seven more times. Every other free letter on this
+    // card (B D J K L O U V Y) is free because it means nothing to anybody.
+    b(Action::DoctrineScope, KeyCode::KeyA, Ctx::DoctrinePage),
     b(Action::AutoCastSlot(0), KeyCode::KeyZ, Ctx::DoctrinePage),
     b(Action::AutoCastSlot(1), KeyCode::KeyX, Ctx::DoctrinePage),
     b(Action::AutoCastSlot(2), KeyCode::KeyC, Ctx::DoctrinePage),

@@ -65,16 +65,22 @@
 //!
 //! ## The human seat
 //!
-//! Nothing in ui.rs changed, and that is the point rather than an omission.
-//! Alarms surface for the human through `GameEvents`, which the alert stack
-//! already renders for `Team::Human` — one producer, two renderers, the rule
-//! this codebase keeps. What the two seats get is what they have always got:
-//! the bridge seat gets the level-triggered `alarms` array in its snapshot
-//! (a file reader can hold forty lines of history and a triage list), the
-//! human gets the edge-triggered line in the corner of the screen, coloured
-//! and pinged. Rendering is where the two seats are allowed to differ
+//! One producer, three renderers, which is the rule this codebase keeps.
+//! Alarms reach the human first through `GameEvents`, which the alert stack
+//! already renders for `Team::Human`: the firing edge and the clearing edge,
+//! coloured and pinged.
+//!
+//! That was the whole of it when this module landed, and it left the two seats
+//! in different *tenses* — the bridge seat could re-read the level-triggered
+//! `alarms` array on any poll, while the human's two lines expired after nine
+//! seconds and the standing list was irrecoverable. `wc3clone-uew` closed it
+//! with a third renderer: `ui::update_alarm_panel` reads `Alarms::get(Team::
+//! Human)` into a small persistent HUD panel, fact and running default per row,
+//! for exactly as long as the condition holds. It writes nothing — no new
+//! source, no new mutation path — so the *fact* is still computed once, here,
+//! for both seats. Rendering is where the two seats are allowed to differ
 //! (docs/INTENT.md, AFFORDANCES.md § "What the fairness invariant does and
-//! does not constrain"); the *fact* is computed once, for both.
+//! does not constrain"), and now they differ only in the shape of the pixels.
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;

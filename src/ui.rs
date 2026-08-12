@@ -494,6 +494,58 @@ const PROP_VETO_KEY: KeyCode = hotkeys::VETO_PROPOSAL;
 /// The co-commander's colour. Deliberately NOT one of the three severity
 /// colours: "my partner said this" must never read as "the game says this".
 const PROP_ACCENT: Color = Color::srgb(0.68, 0.63, 1.0);
+
+// --- Standing alarms: the human's level view --------------------------------
+//
+// `wc3clone-uew`. An alarm is computed once, for both seats (alarm.rs), and
+// until now it was *rendered* twice in two different tenses. The bridge seat
+// reads `alarms` in `state.json` — a level-triggered array, present in every
+// snapshot for exactly as long as the condition holds, which a commander can
+// re-read on any poll. The human got only the two edges of the same fact, as
+// alert-stack rows: one line when it fired, one when it cleared, both gone
+// nine seconds later. Look away for ten seconds and the level view was still
+// there for one seat and irrecoverable for the other.
+//
+// This panel is the human catching up, and it is **rendering only**: it reads
+// `Alarms::get(Team::Human)` and writes nothing. No new fact, no new source,
+// no new mutation path — the same rule the alert stack keeps, and the reason
+// there is nothing here for the fairness invariant to be about. Fog is
+// likewise inherited rather than re-derived: `Alarms` is stored per team and
+// the getter takes one, so a renderer for this seat has no way to ask for the
+// other's, exactly as `GameEvents::feed` works (BUILDER_BRIEF §6.10).
+//
+// Where it sits: bottom-left, on the strip of screen directly above the
+// console. The HUD's two floating panels already own the top corners — news
+// on the right, standing decisions on the left (see the proposal-panel note
+// above) — and both have variable, unbounded-ish height, so a third panel up
+// there would either overlap one of them or spend every frame chasing it. Down
+// here it is pinned to the console's top edge, it never moves except on a
+// resize, and it is next to the minimap, which is where an eye already goes to
+// ask "what is the state of the world".
+
+/// One row per kind, which is exact rather than a guess: `ALL_ALARM_KINDS` is a
+/// closed set, and shared.rs argues at length that a fifth kind should have to
+/// earn its way in. `Alarms` sorts its list into that order, so row N is the
+/// same kind between two frames.
+const ALARM_SLOTS: usize = ALL_ALARM_KINDS.len();
+const ALARM_W: f32 = 330.0;
+/// Same narrow-window guard the other two floating panels carry. The alert
+/// stack's `NOTIF_MAX_FRAC` is the constraint that matters at the bottom-left:
+/// nothing else claims this strip, so half the window is generous already.
+const ALARM_MAX_FRAC: f32 = 0.5;
+const ALARM_FONT: f32 = 12.0;
+const ALARM_HEAD_FONT: f32 = 11.0;
+const ALARM_GAP: f32 = 3.0;
+/// Height budgeted per row when hit-testing, and for the header line. Generous
+/// for the reason `NOTIF_ROW_HIT_H` is: a row is two lines of text until a long
+/// fact wraps, no analytic guess knows which, and swallowing a click just above
+/// the panel beats leaking one through as a move order onto the battlefield.
+const ALARM_ROW_HIT_H: f32 = 2.0 * ALARM_FONT + 12.0 + ALARM_GAP;
+const ALARM_HEAD_H: f32 = ALARM_HEAD_FONT + 6.0;
+/// The panel's own quiet grey. An alarm row is already severity-coloured on its
+/// spine and its fact line; the running default is deliberately duller than
+/// both, because "what is already happening" is the part you read second.
+const ALARM_DEFAULT_FG: Color = Color::srgb(0.62, 0.66, 0.76);
 /// An urgent proposal's spine and headline. The alert stack's Warning amber —
 /// the one exception to the rule above, and it earns it: urgency is a claim
 /// about the GAME ("this window closes"), not about who is speaking, so it is
@@ -634,6 +686,11 @@ impl Plugin for UiPlugin {
                     // so filing it with its sibling would be a cycle. It draws
                     // and nothing else, which is what `Cosmetic` is for.
                     update_proposals.in_set(SimSet::Cosmetic).after(CopilotSet),
+                    // Same slot, same reason: alarm.rs sweeps in `SimSet::Feed`
+                    // and `Cosmetic` is the phase after it, so the panel paints
+                    // this frame's standing list rather than last frame's. No
+                    // explicit `.after` is needed — the frame order says it.
+                    update_alarm_panel.in_set(SimSet::Cosmetic),
                 ),
             );
     }
@@ -670,6 +727,16 @@ struct UiState {
     /// frame, so a selection that shrinks under the player cannot leave the card
     /// showing nothing.
     card_page: usize,
+    /// **Who the doctrine page's sentences are about.** `None` — the default —
+    /// is "whatever is selected", which freezes the selection's entity ids into
+    /// the intent exactly as it always did. `Some(sel)` names a ROLE instead,
+    /// and the intent carries the phrase on `select` while `units` goes empty.
+    ///
+    /// A field on `UiState` rather than a modifier on each gesture because it
+    /// is a *mode*, and the card shows which one you are in — the same reason
+    /// `page` lives here. Deliberately NOT cleared by a change of selection:
+    /// the whole point of saying `all army` is that you stopped pointing.
+    doctrine_scope: Option<Selector>,
     /// A posture waiting for the player to click its point on the ground.
     /// Same shape as `placement`: an armed mode the next left-click consumes.
     posture_place: Option<PostureArm>,
@@ -711,6 +778,11 @@ struct UiState {
     /// `update_proposals`), for the same reason `notif_rows` exists: a click
     /// on "Approve" must not also be a move order on the ground behind it.
     prop_cards: usize,
+    /// Number of visible standing-alarm rows (refreshed by
+    /// `update_alarm_panel`), for the same reason again. The panel has no
+    /// buttons, but a click that lands on it is a click the player aimed at a
+    /// readout, and it must not also walk the army there.
+    alarm_rows: usize,
     /// The hero the player most recently had selected — the Shop's customer.
     ///
     /// A Shop's buy card is drawn for a BUILDING selection, so at the moment of
@@ -793,6 +865,40 @@ struct NotifText(usize);
 /// The "[Space] focus" footer under the stack; hidden when the stack is empty.
 #[derive(Component)]
 struct NotifHint;
+
+/// The standing-alarm panel's root, so `update_alarm_panel` can re-pin it to
+/// the console's top edge when the window resizes.
+#[derive(Component)]
+struct AlarmPanel;
+
+/// The panel's header line. Hidden with the panel, so an empty alarm list
+/// leaves nothing at all on screen — silence is the normal state and a
+/// permanently visible "ALARMS (none)" would be furniture.
+#[derive(Component)]
+struct AlarmHead;
+
+/// One pooled alarm row, by index into this seat's standing list.
+#[derive(Component)]
+struct AlarmRow(usize);
+
+/// Which line of which alarm row a text node is. One marker with a part tag
+/// rather than two marker types, for the reason `PropText` gives: two
+/// `&mut Text` queries in one system need mutually-exclusive `Without` filters
+/// to satisfy Bevy B0001, and a discriminant is the same information with no
+/// aliasing puzzle.
+#[derive(Component, Clone, Copy)]
+struct AlarmText {
+    row: usize,
+    part: AlarmPart,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AlarmPart {
+    /// The triggering fact, in the words the feed used for the same thing.
+    Fact,
+    /// `default: <what is already being done>  ·  ETA 22s`.
+    Default,
+}
 
 /// The single world-space ring shown under whatever the cursor would pick.
 /// One pooled proposal card, by queue index (0 = oldest = the hotkeys' target).
@@ -1160,6 +1266,11 @@ enum CmdAction {
     /// same shape as [P] Priority, and the same reason: one tile for a small
     /// fixed set beats five tiles the doctrine page has no letters for.
     CycleStance,
+    /// Step the doctrine page's scope one rung: the selection, then each role
+    /// in `Selector`'s unit half. Submits nothing by itself — it changes what
+    /// the NEXT gesture on this card will be about. See the selector-picker
+    /// block above.
+    CycleScope,
     /// Step the retreat threshold: off -> 25% -> 35% -> 50% -> off. The
     /// parameterised form of [V], and the reason it exists: the bridge sends a
     /// number, so the human must be able to choose one too.
@@ -1191,6 +1302,102 @@ enum CmdAction {
     ClearRegions,
     /// Free-entry radius for the next mark; `true` is bigger.
     NudgeRegion(bool),
+}
+
+// ---------------------------------------------------------------------------
+// The selector picker: the human seat writes roles too
+// ---------------------------------------------------------------------------
+//
+// `wc3clone-1zv`, closing the gap docs/INTENT.md § Selectors ("Both seats")
+// leaves open in as many words:
+//
+// > What the human seat does **not** have is a way to *type* a role into a
+// > rule, because there is no text entry in this HUD. […] A selector-picker on
+// > the doctrine page would close it; nothing about the wire needs to change
+// > for that.
+//
+// So: no wire change, no new verb, no second vocabulary. The doctrine page
+// grows one field — [`UiState::doctrine_scope`] — and the gestures that used
+// to freeze `own_ids()` into their intent put the same sentence on the role
+// channel instead: `units: []`, `select: Some("all army")`. Precedence makes
+// that unambiguous (a `select` outranks the `units` beside it), the resolver is
+// `intent::resolve_places` for both seats, and the replay log cannot tell which
+// chair typed it — which is the whole standard.
+//
+// **A cycle over a closed vocabulary, not an authoring surface.** The same
+// shape (and the same argument) as [P] Priority and [S] Stance: the doctrine
+// page has no five spare letters, the vocabulary is five words long, and one
+// tile that names its current value reads as state rather than as a verb.
+//
+// The vocabulary is exactly `Selector`'s unit half, and the phrase each rung
+// sends is `Selector::phrase()` — not a string literal here. That is the point
+// of routing through the shared type: a picker with its own spelling of
+// `"all army"` would be a second vocabulary one rename away from refusals.
+
+/// The scope rungs, in cycle order: the selection, then the four whole-army
+/// roles, then the three squads.
+///
+/// Squads last because they are the most specific and the ones a player is
+/// least likely to want by accident, and `MAX_UI_SQUAD` rather than "any
+/// number" for the reason `resolve_squad` mints inside the same range: the
+/// human's squads are the three control groups. A bridge commander may still
+/// say `squad 7`, and that asymmetry is a *rendering* difference — there are
+/// only three digit keys — rather than a capability one.
+fn scope_rungs() -> Vec<Option<Selector>> {
+    let mut out = vec![
+        None,
+        Some(Selector::Heroes),
+        Some(Selector::Army),
+        Some(Selector::AllUnits),
+        Some(Selector::Workers),
+    ];
+    out.extend((1..=MAX_UI_SQUAD).map(|n| Some(Selector::Squad(n))));
+    out
+}
+
+/// One press: step to the next rung, wrapping back to the selection.
+fn next_scope(current: Option<Selector>) -> Option<Selector> {
+    let rungs = scope_rungs();
+    let at = rungs.iter().position(|r| *r == current).unwrap_or(0);
+    rungs[(at + 1) % rungs.len()]
+}
+
+/// The tile's caption. Names the CURRENT scope, like [P] and [F] do, because
+/// the field is state — the thing you need to know before pressing anything
+/// else on this card is who it will be about.
+fn scope_label(scope: Option<Selector>) -> String {
+    match scope {
+        None => "Scope: selection".to_string(),
+        Some(sel) => format!("Scope: {}", sel.phrase()),
+    }
+}
+
+/// Where a role-scoped doctrine sentence anchors, when the verb wants a place.
+///
+/// A selection supplies its own centre of mass; a role does not, and ui.rs must
+/// not go resolving one — `intent::resolve_places` is the single resolver and a
+/// second answer computed here is exactly the divergence the choke-point rule
+/// forbids. So the sentence names the place on the *other* late-bound channel
+/// and lets the one resolver answer both halves: `region: "our base"`, a
+/// built-in place every team has.
+///
+/// The precedent is already in this file: a production template's rally cannot
+/// be a centroid either (the units do not exist yet), and it uses the hall
+/// nearest the base for the same reason.
+const SCOPED_ANCHOR: &str = "our base";
+
+/// Which squad a doctrine-page gesture is about.
+///
+/// `Scope: squad 2` names one outright — and that rung is the reason this
+/// function exists, because `posture` and `stance` take a squad NUMBER rather
+/// than a roster, so a squad scope reaches them with nothing selected and no
+/// membership sentence in front. Every other scope falls back to the
+/// selection's own squad, which is what the page has always used.
+fn scoped_squad(scope: Option<Selector>, selection: Option<u8>) -> Option<u8> {
+    match scope {
+        Some(Selector::Squad(n)) => Some(n),
+        _ => selection,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2490,6 +2697,9 @@ struct DoctrineCard {
     stance_next: StanceKind,
     /// The stance the squad is actually in, if any. Lights the tile.
     stance: Option<StanceKind>,
+    /// Who this page's sentences are about: `None` is the live selection and
+    /// its frozen ids, `Some(sel)` is a role phrase on the `select` channel.
+    scope: Option<Selector>,
     tmpl: TemplateView,
     /// Is the `home-guard` trigger armed right now? The tile is a toggle, so
     /// this is what decides whether pressing it arms or clears.
@@ -2514,11 +2724,17 @@ struct DoctrineCard {
 /// production template. Every button submits an intent that a commander could
 /// have typed, and the log cannot tell which happened.
 ///
-///   units selected      Q Defend  W Push  E Forage | R Escort  T Stand Down
+///   units selected      A Scope | Q Defend  W Push  E Forage | R Escort
+///                       T Stand Down  S Stance
 ///                       F Fall back%  G Guard r  P Priority
-///                       Z/X/C Auto <ability>, one per slot | I Orders  (<=12)
+///                       Z/X/C Auto <ability>, one per slot
+///                       H Home guard | M Mark  N Forget | I Orders
 ///   production building Q Squad  W Fall back%  E Priority  R Auto-cast
 ///                       T Clear | I Orders                              (6)
+///
+/// `[A] Scope` comes first because it is the *subject* of every sentence after
+/// it — "the selection", or one of `Selector`'s five roles. See the
+/// selector-picker block above `PrioPreset` for the whole argument.
 ///
 /// Every posture arms a click, exactly like building placement does:
 /// Defend/Push/Forage want a point, Escort wants one of our own units.
@@ -2529,6 +2745,27 @@ fn doctrine_entries(own_units: usize, card: DoctrineCard) -> Vec<CmdEntry> {
     let mut out: Vec<CmdEntry> = Vec::new();
 
     if own_units > 0 {
+        // **The scope tile, first, because it is the subject of every sentence
+        // below it.** One press steps the rung and nothing else happens: this
+        // is a field, not a verb, and the card reads "Scope: all army" the way
+        // it reads "Fall back 35%" — current state, not the thing a press will
+        // do. See the selector-picker block for why it is one cycling tile.
+        let mut scope = CmdEntry::plain(
+            CmdAction::CycleScope,
+            bind(Hk::DoctrineScope),
+            &scope_label(card.scope),
+        )
+        .active(card.scope.is_some());
+        scope.cost = match card.scope {
+            None => "these units".to_string(),
+            // Named rather than counted: ui.rs must not resolve a role (that
+            // is `intent::resolve_places`, once, for both seats), so the honest
+            // thing to print is what the sentence will say, not a headcount
+            // this file would have to compute a second way.
+            Some(_) => "by role".to_string(),
+        };
+        out.push(scope);
+
         for (kind, action) in [
             (PostureKind::Defend, Hk::PostureDefend),
             (PostureKind::Push, Hk::PosturePush),
@@ -2896,6 +3133,7 @@ fn cursor_over_hud(cursor: Vec2, window: &Window, ui: &UiState, hud: &HudLayout)
     }
     notif_rect(window, ui.notif_rows).is_some_and(|r| r.contains(cursor))
         || prop_rect(window, ui.prop_cards).is_some_and(|r| r.contains(cursor))
+        || alarm_rect(window, hud, ui.alarm_rows).is_some_and(|r| r.contains(cursor))
 }
 
 // --- Responsive console ----------------------------------------------------
@@ -3050,6 +3288,29 @@ fn notif_rect(window: &Window, rows: usize) -> Option<Rect> {
 /// node carries, or the hit rect and the pixels drift apart.
 fn notif_width(window: &Window) -> f32 {
     NOTIF_W.min(window.width() * NOTIF_MAX_FRAC)
+}
+
+/// Screen-space rectangle of the standing-alarm panel, or `None` when nothing
+/// stands. Analytic like its two siblings, and bottom-anchored because the
+/// panel is: it is pinned `PAD` above the console and grows UPWARD as alarms
+/// arrive, so the rect is derived from its bottom edge and its row count.
+///
+/// Bounded by construction — `ALARM_SLOTS` is `ALL_ALARM_KINDS.len()`, so the
+/// tallest this can ever be is four rows and a header, which no window this
+/// game runs in can fail to hold.
+fn alarm_rect(window: &Window, hud: &HudLayout, rows: usize) -> Option<Rect> {
+    if rows == 0 {
+        return None;
+    }
+    let width = ALARM_W.min(window.width() * ALARM_MAX_FRAC);
+    let bottom = (window.height() - hud.console_h - PAD).max(0.0);
+    let height = ALARM_HEAD_H + rows as f32 * ALARM_ROW_HIT_H;
+    Some(Rect::new(
+        PAD,
+        (bottom - height).max(0.0),
+        PAD + width,
+        bottom,
+    ))
 }
 
 /// Screen-space rectangle of the minimap. The console is a strip pinned to the
@@ -3523,6 +3784,7 @@ fn setup_ui(
 
     spawn_notifications(&mut commands);
     spawn_proposals(&mut commands);
+    spawn_alarms(&mut commands);
 }
 
 /// The co-commander's pending directives: a fixed pool of cards in the
@@ -3709,6 +3971,93 @@ fn spawn_notifications(commands: &mut Commands) {
                 TextColor(Color::srgb(0.55, 0.60, 0.70)),
                 NotifHint,
             ));
+        });
+}
+
+/// The standing-alarm panel: a header and a fixed pool of two-line rows in the
+/// bottom-left, above the console, hidden until something stands. Pooled and
+/// mutated in place like every other refreshed node in this file.
+///
+/// See the constants above for why it is down here rather than in a corner
+/// with the other two floating panels, and for the fairness note (the bridge
+/// seat has read this same level view out of `state.json` since alarms landed;
+/// this is the human's rendering of it, and nothing but a rendering).
+fn spawn_alarms(commands: &mut Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(PAD),
+                // Re-pinned by `update_alarm_panel` whenever the console
+                // resizes; this is the full-size answer so frame one is right.
+                bottom: Val::Px(HudLayout::default().console_h + PAD),
+                width: Val::Px(ALARM_W),
+                max_width: Val::Percent(ALARM_MAX_FRAC * 100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(ALARM_GAP),
+                ..default()
+            },
+            AlarmPanel,
+        ))
+        .with_children(|panel| {
+            // Hidden by holding an empty string, the idiom `NotifHint` already
+            // uses: one fewer `&mut Node` query for the paint system to keep
+            // disjoint from the two it already needs.
+            panel.spawn((
+                Text::new(""),
+                TextFont {
+                    font_size: ALARM_HEAD_FONT,
+                    ..default()
+                },
+                TextColor(ALARM_DEFAULT_FG),
+                AlarmHead,
+            ));
+            for i in 0..ALARM_SLOTS {
+                panel
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(1.0),
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                            // The same severity spine the alert stack and the
+                            // proposal cards wear: this is the same HUD saying
+                            // the same kind of thing, in a different tense.
+                            border: UiRect::left(Val::Px(3.0)),
+                            display: Display::None,
+                            ..default()
+                        },
+                        BackgroundColor(PANEL_BG),
+                        BorderColor(EDGE),
+                        AlarmRow(i),
+                    ))
+                    .with_children(|row| {
+                        row.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: ALARM_FONT,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                            AlarmText {
+                                row: i,
+                                part: AlarmPart::Fact,
+                            },
+                        ));
+                        row.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: ALARM_FONT,
+                                ..default()
+                            },
+                            TextColor(ALARM_DEFAULT_FG),
+                            AlarmText {
+                                row: i,
+                                part: AlarmPart::Default,
+                            },
+                        ));
+                    });
+            }
         });
 }
 
@@ -4471,14 +4820,27 @@ fn command_input(
         .collect();
 
     // Which squad the doctrine page is about, and what it is already doing.
-    let live_stance = doc
-        .squad
+    // `Scope: squad 2` names it outright — the point of that rung is to
+    // address a squad without having to have it selected.
+    //
+    // `None` for every gesture outside the doctrine page: the orders card's
+    // quick toggles ([G] [V] [P] [T]) are the fast path for "what I have
+    // selected right now", and a mode set on the other page silently
+    // redirecting them would be exactly the hidden state this HUD spends its
+    // comments avoiding. Read once, here, so a `TogglePage` later in the same
+    // frame cannot change what a keypress already meant.
+    let scope = match ui.page {
+        CardPage::Doctrine => ui.doctrine_scope,
+        CardPage::Orders => None,
+    };
+    let card_squad = scoped_squad(scope, doc.squad);
+    let live_stance = card_squad
         .and_then(|s| cast.stances.0.get(&(Team::Human, s)))
         .copied();
     let card = DoctrineCard {
         doc,
-        posture: doc
-            .squad
+        scope,
+        posture: card_squad
             .and_then(|s| cast.squads.0.get(&(Team::Human, s)))
             .map(posture_kind),
         // Step from whatever is already armed, so holding the key walks all
@@ -4619,6 +4981,45 @@ fn command_input(
             })
             .unwrap_or(HUMAN_BASE)
     };
+    // --- the scope, and the two channels it picks between ------------------
+    //
+    // Which units a doctrine sentence names, on whichever of the language's
+    // two channels the scope picked. With a role the frozen list goes EMPTY
+    // rather than being sent and overruled: precedence would discard it either
+    // way (a `select` outranks the `units` beside it), but a sentence carrying
+    // both says two things and means one, and the intent log is read by people.
+    let scoped_units = || -> (Vec<IntentId>, Option<String>) {
+        match scope {
+            None => (own_ids(), None),
+            Some(sel) => (Vec::new(), Some(sel.phrase())),
+        }
+    };
+    // Where a role-scoped doctrine sentence anchors: the other late-bound
+    // channel, so `intent::resolve_places` answers both halves of the sentence
+    // and ui.rs resolves neither. A selection still supplies its own geometry,
+    // which is what it has always done and the reason the tuple exists.
+    let scoped_place = |own: Vec3| -> (Option<f32>, Option<f32>, Option<String>) {
+        match scope {
+            None => (Some(own.x), Some(own.z), None),
+            Some(_) => (None, None, Some(SCOPED_ANCHOR.to_string())),
+        }
+    };
+    // A doctrine gesture needs SOMETHING to be about. A role is enough on its
+    // own — that is the point of it — so an empty selection only stops the
+    // gesture when nothing else named anybody.
+    let no_subject = own_units.is_empty() && scope.is_none();
+    // The lowest control-group id nobody is using, so [I][W] works without a
+    // Ctrl+N first and still lines up with the digit that recalls it.
+    let free_squad = || -> u8 {
+        let taken: Vec<u8> = all_units
+            .iter()
+            .filter(|(_, _, t, _, _, _, _)| **t == Team::Human)
+            .filter_map(|(_, _, _, _, _, _, s)| s.map(|s| s.0))
+            .collect();
+        (1..=MAX_UI_SQUAD)
+            .find(|id| !taken.contains(id))
+            .unwrap_or(1)
+    };
     // Which squad a doctrine-page gesture is about, submitting the `squad`
     // verb first when the selection is not already one squad. A compound
     // gesture becomes two sentences rather than a special case — the same rule
@@ -4626,6 +5027,30 @@ fn command_input(
     // "3 units join squad 2" / "squad 2 pushes to (…)", which is exactly what
     // a bridge commander would have had to send.
     let resolve_squad = |submissions: &mut EventWriter<SubmitIntent>| -> Option<u8> {
+        // `Scope: squad 2` IS the answer, and this is the rung that pays for
+        // the whole picker: `posture` and `stance` take a squad NUMBER, never
+        // a roster, so a squad scope reaches them with nothing selected and no
+        // membership sentence in front of them. shared.rs's `Selector::Squad`
+        // note recommends exactly this ("address the squad by number with
+        // `posture`, which never needed the roster at all").
+        if let Some(Selector::Squad(n)) = scope {
+            return Some(n);
+        }
+        if let Some(sel) = scope {
+            // Any other role: the same two-sentence compound the selection
+            // path uses, with the roster named by phrase instead of by ids.
+            // "all army joins squad 1" / "squad 1 pushes to (…)".
+            let squad = free_squad();
+            say(
+                submissions,
+                Intent::Squad {
+                    units: Vec::new(),
+                    id: Some(squad),
+                    select: Some(sel.phrase()),
+                },
+            );
+            return Some(squad);
+        }
         if own_units.is_empty() {
             return None;
         }
@@ -4642,17 +5067,8 @@ fn command_input(
             }
             return Some(squad);
         }
-        // Nobody selected is in a squad: mint the lowest control-group id that
-        // is free, so [I][W] works without a Ctrl+N first and still lines up
-        // with the digit that recalls it.
-        let taken: Vec<u8> = all_units
-            .iter()
-            .filter(|(_, _, t, _, _, _, _)| **t == Team::Human)
-            .filter_map(|(_, _, _, _, _, _, s)| s.map(|s| s.0))
-            .collect();
-        let squad = (1..=MAX_UI_SQUAD)
-            .find(|id| !taken.contains(id))
-            .unwrap_or(1);
+        // Nobody selected is in a squad: mint the lowest free control-group id.
+        let squad = free_squad();
         say(
             submissions,
             Intent::Squad {
@@ -4947,21 +5363,28 @@ fn command_input(
                 }
             }
             CmdAction::CyclePriority => {
-                if own_units.is_empty() {
+                if no_subject {
                     continue;
                 }
                 // The whole selection lands on the same preset, derived from
                 // the first unit, so repeated presses stay in lock-step. An
                 // empty class list is how the language spells "clear".
+                //
+                // The preset is stepped from what the SELECTION shows even
+                // when a role is what receives it. That is the honest
+                // arrangement rather than a compromise: reading the current
+                // value of "all army" would mean resolving the role here, and
+                // there is one resolver. The card shows what it read.
                 let classes = priority_component(doc.prio.next())
                     .map(|p| p.0.iter().map(|c| c.name().to_string()).collect())
                     .unwrap_or_default();
+                let (units, select) = scoped_units();
                 say(
                     &mut submissions,
                     Intent::Priority {
-                        units: own_ids(),
+                        units,
                         classes,
-                        select: None,
+                        select,
                     },
                 );
             }
@@ -4992,11 +5415,24 @@ fn command_input(
                 );
             }
             CmdAction::ToggleAutoCastSlot(slot) => {
-                if own_casters.is_empty() {
+                if own_casters.is_empty() && scope.is_none() {
                     continue;
                 }
-                let units: Vec<IntentId> =
-                    own_casters.iter().map(|(e, _, _, _)| intent_id(*e)).collect();
+                // Scoped like every other doctrine sentence on this page. The
+                // slot still comes from the selected caster's ability list —
+                // that is what put the tile on the card — and `Autocast` has
+                // always named a SLOT rather than a spell, so the rule lands on
+                // whichever of the role's members has one.
+                let (units, select) = match scope {
+                    None => (
+                        own_casters
+                            .iter()
+                            .map(|(e, _, _, _)| intent_id(*e))
+                            .collect::<Vec<IntentId>>(),
+                        None,
+                    ),
+                    Some(sel) => (Vec::new(), Some(sel.phrase())),
+                };
                 say(
                     &mut submissions,
                     Intent::Autocast {
@@ -5011,11 +5447,20 @@ fn command_input(
                         // intent.rs edits that rule and leaves the others
                         // standing, so two spells can carry two policies.
                         ability: Some(AbilitySelector::Index(slot)),
-                        select: None,
+                        select,
                     },
                 );
             }
             // --- page two: the doctrine card -------------------------------
+            //
+            // The one gesture on this page that submits nothing: it changes
+            // WHO the next one will be about. Not cleared by a change of
+            // selection and not cleared by Esc, because it is a field the card
+            // is showing rather than an armed mode waiting for a click — the
+            // whole point of saying `all army` is that you stopped pointing,
+            // and a scope that reset itself whenever you clicked something
+            // would be a scope you could never hold.
+            CmdAction::CycleScope => ui.doctrine_scope = next_scope(ui.doctrine_scope),
             CmdAction::TogglePage => {
                 ui.page = match ui.page {
                     CardPage::Orders => CardPage::Doctrine,
@@ -5173,7 +5618,14 @@ fn command_input(
                 // Clearing a posture leaves membership intact: the squad stops
                 // being re-tasked but stays a squad, exactly as the bridge's
                 // `{"type":"posture","id":N}` does.
-                let Some(squad) = doc.squad else { continue };
+                //
+                // The SCOPED squad, so the tile clears whatever the card is
+                // showing as lit. `Scope: squad 2` stands squad 2 down without
+                // having to select it, and never enrols anybody on the way —
+                // clearing is the one posture gesture with nothing to enrol.
+                let Some(squad) = scoped_squad(scope, doc.squad) else {
+                    continue;
+                };
                 say(
                     &mut submissions,
                     Intent::Posture {
@@ -5183,33 +5635,34 @@ fn command_input(
                 );
             }
             CmdAction::CycleFallback => {
-                if own_units.is_empty() {
+                if no_subject {
                     continue;
                 }
+                let (units, select) = scoped_units();
                 match cycle_step(doc.fallback_value(), &FALLBACK_STEPS) {
                     Some(below) => {
-                        let rally = nearest_hall(centroid());
+                        let (x, z, region) = scoped_place(nearest_hall(centroid()));
                         say(
                             &mut submissions,
                             Intent::Retreat {
-                                units: own_ids(),
+                                units,
                                 below: Some(below),
-                                x: Some(rally.x),
-                                z: Some(rally.z),
-                                region: None,
-                                select: None,
+                                x,
+                                z,
+                                region,
+                                select,
                             },
                         );
                     }
                     None => say(
                         &mut submissions,
                         Intent::Retreat {
-                            units: own_ids(),
+                            units,
                             below: Some(0.0),
                             x: None,
                             z: None,
                             region: None,
-                            select: None,
+                            select,
                         },
                     ),
                 }
@@ -5220,9 +5673,10 @@ fn command_input(
             // free-entry control that produced a DIFFERENT intent would be a
             // second dialect of the same idea.
             CmdAction::NudgeFallback(up) => {
-                if own_units.is_empty() {
+                if no_subject {
                     continue;
                 }
+                let (units, select) = scoped_units();
                 match nudge_value(
                     doc.fallback_value(),
                     up,
@@ -5232,36 +5686,37 @@ fn command_input(
                     FALLBACK_MAX,
                 ) {
                     Some(below) => {
-                        let rally = nearest_hall(centroid());
+                        let (x, z, region) = scoped_place(nearest_hall(centroid()));
                         say(
                             &mut submissions,
                             Intent::Retreat {
-                                units: own_ids(),
+                                units,
                                 below: Some(below),
-                                x: Some(rally.x),
-                                z: Some(rally.z),
-                                region: None,
-                                select: None,
+                                x,
+                                z,
+                                region,
+                                select,
                             },
                         );
                     }
                     None => say(
                         &mut submissions,
                         Intent::Retreat {
-                            units: own_ids(),
+                            units,
                             below: Some(0.0),
                             x: None,
                             z: None,
                             region: None,
-                            select: None,
+                            select,
                         },
                     ),
                 }
             }
             CmdAction::NudgeLeash(up) => {
-                if own_units.is_empty() {
+                if no_subject {
                     continue;
                 }
+                let (units, select) = scoped_units();
                 match nudge_value(
                     doc.leash_value(),
                     up,
@@ -5271,60 +5726,61 @@ fn command_input(
                     LEASH_MAX,
                 ) {
                     Some(radius) => {
-                        let anchor = clamp_to_map(centroid());
+                        let (x, z, region) = scoped_place(clamp_to_map(centroid()));
                         say(
                             &mut submissions,
                             Intent::Leash {
-                                units: own_ids(),
-                                x: Some(anchor.x),
-                                z: Some(anchor.z),
-                                region: None,
+                                units,
+                                x,
+                                z,
+                                region,
                                 radius: Some(radius),
-                                select: None,
+                                select,
                             },
                         );
                     }
                     None => say(
                         &mut submissions,
                         Intent::Leash {
-                            units: own_ids(),
+                            units,
                             x: None,
                             z: None,
                             region: None,
                             radius: Some(0.0),
-                            select: None,
+                            select,
                         },
                     ),
                 }
             }
             CmdAction::CycleLeash => {
-                if own_units.is_empty() {
+                if no_subject {
                     continue;
                 }
+                let (units, select) = scoped_units();
                 match cycle_step(doc.leash_value(), &LEASH_STEPS) {
                     Some(radius) => {
-                        let anchor = clamp_to_map(centroid());
+                        let (x, z, region) = scoped_place(clamp_to_map(centroid()));
                         say(
                             &mut submissions,
                             Intent::Leash {
-                                units: own_ids(),
-                                x: Some(anchor.x),
-                                z: Some(anchor.z),
-                                region: None,
+                                units,
+                                x,
+                                z,
+                                region,
                                 radius: Some(radius),
-                                select: None,
+                                select,
                             },
                         );
                     }
                     None => say(
                         &mut submissions,
                         Intent::Leash {
-                            units: own_ids(),
+                            units,
                             x: None,
                             z: None,
                             region: None,
                             radius: Some(0.0),
-                            select: None,
+                            select,
                         },
                     ),
                 }
@@ -8206,13 +8662,16 @@ fn update_hud(
     // What doctrine.rs is executing for that squad right now. Since the
     // executor was ungated this is a live readout of the engine acting on the
     // player's behalf, not a stored preference — so it belongs on screen.
-    let live_posture = doc
-        .squad
-        .and_then(|s| cast.squads.0.get(&(Team::Human, s)));
+    //
+    // The squad is the SCOPED one, exactly as `command_input` resolves it, so
+    // the card the player is looking at and the sentence the key sends are
+    // about the same squad even when `Scope: squad 2` named one nothing in the
+    // selection belongs to.
+    let card_squad = scoped_squad(ui.doctrine_scope, doc.squad);
+    let live_posture = card_squad.and_then(|s| cast.squads.0.get(&(Team::Human, s)));
     // ...and the word that put it there, if a stance did. Same lookup, same
     // squad, so the tile's caption and its lit state cannot disagree.
-    let live_stance = doc
-        .squad
+    let live_stance = card_squad
         .and_then(|s| cast.stances.0.get(&(Team::Human, s)))
         .copied();
     // The one selected own building: kind, finished, ability cooldown.
@@ -8394,6 +8853,7 @@ fn update_hud(
         hero_cmds,
         DoctrineCard {
             doc,
+            scope: ui.doctrine_scope,
             posture: live_posture.map(posture_kind),
             stance_next: ui
                 .posture_place
@@ -9691,6 +10151,105 @@ fn update_notifications(
 }
 
 // ---------------------------------------------------------------------------
+// Standing alarms: the level view, for the seat that only had the edges
+// ---------------------------------------------------------------------------
+
+/// The second line of an alarm row.
+///
+/// `running_default` is never empty — shared.rs makes it a `String` rather than
+/// an `Option<String>` precisely so no alarm can be raised without saying what
+/// is already happening about it — so this always has something to print, and
+/// "nothing recovers this automatically" prints as readily as a recall does.
+///
+/// The ETA rides along on the same line rather than getting a column of its
+/// own: `None` is a real answer ("the default is to stand still"), and a column
+/// that was blank two rows out of three would read as missing data.
+fn alarm_default_line(running_default: &str, eta_s: Option<f32>) -> String {
+    match eta_s {
+        Some(eta) => format!("default: {running_default}   ·   ETA {}s", trim_num(eta)),
+        None => format!("default: {running_default}"),
+    }
+}
+
+/// Paint this seat's standing alarms. Reads `Alarms`, writes pixels — see the
+/// constants block for why that is the whole contract.
+///
+/// `SimSet::Cosmetic` rather than the input chain, for the reason
+/// `update_proposals` is there: alarm.rs sweeps in `SimSet::Feed`, which is
+/// downstream of `Input`, so a panel filed with the gesture systems would
+/// always be showing the previous frame's list.
+fn update_alarm_panel(
+    alarms: Res<Alarms>,
+    hud: Res<HudLayout>,
+    mut ui: ResMut<UiState>,
+    mut panel: Query<&mut Node, (With<AlarmPanel>, Without<AlarmHead>, Without<AlarmRow>)>,
+    mut rows: Query<(&AlarmRow, &mut Node, &mut BorderColor), Without<AlarmHead>>,
+    mut head: Query<&mut Text, (With<AlarmHead>, Without<AlarmText>)>,
+    mut texts: Query<(&AlarmText, &mut Text, &mut TextColor), Without<AlarmHead>>,
+) {
+    // `Team::Human` is the whole filter, and it is the same one the bridge
+    // applies to its seat: `Alarms::get` takes a team and there is no call that
+    // returns both, so this renderer cannot see the other side's situation.
+    let standing = alarms.get(Team::Human);
+    ui.alarm_rows = standing.len().min(ALARM_SLOTS);
+
+    // Follow the console's top edge. Written only when it actually changes,
+    // like `apply_hud_layout` does, so Bevy's change detection stays useful.
+    let want_bottom = Val::Px(hud.console_h + PAD);
+    for mut node in &mut panel {
+        if node.bottom != want_bottom {
+            node.bottom = want_bottom;
+        }
+    }
+
+    if let Ok(mut text) = head.single_mut() {
+        let wanted = if standing.is_empty() {
+            ""
+        } else {
+            "STANDING ALARMS"
+        };
+        if text.0 != wanted {
+            text.0 = wanted.to_string();
+        }
+    }
+
+    for (row, mut node, mut border) in &mut rows {
+        let Some(alarm) = standing.get(row.0) else {
+            node.display = Display::None;
+            continue;
+        };
+        node.display = Display::Flex;
+        border.0 = severity_color(alarm.severity);
+    }
+
+    for (slot, mut text, mut color) in &mut texts {
+        let wanted = standing.get(slot.row).map(|alarm| match slot.part {
+            AlarmPart::Fact => (
+                alarm.fact.clone(),
+                lighten(severity_color(alarm.severity), 0.15),
+            ),
+            AlarmPart::Default => (
+                alarm_default_line(&alarm.running_default, alarm.eta_s),
+                ALARM_DEFAULT_FG,
+            ),
+        });
+        match wanted {
+            Some((line, tint)) => {
+                if text.0 != line {
+                    text.0 = line;
+                }
+                color.0 = tint;
+            }
+            None => {
+                if !text.0.is_empty() {
+                    text.0.clear();
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Co-command: answering the partner
 // ---------------------------------------------------------------------------
 //
@@ -10051,6 +10610,197 @@ mod tests {
         // drained by `seq`, and a rejection is news exactly once.
         app.update();
         assert_eq!(app.world().resource::<Notifications>().live.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Standing alarms: the human's level view (wc3clone-uew)
+    // -----------------------------------------------------------------
+
+    /// The panel and its paint system, with no window and no renderer — the
+    /// same headless-App discipline every other renderer test here uses.
+    fn alarm_panel_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<UiState>()
+            .init_resource::<HudLayout>()
+            .init_resource::<Alarms>()
+            .add_systems(Startup, |mut commands: Commands| spawn_alarms(&mut commands))
+            .add_systems(Update, update_alarm_panel);
+        app
+    }
+
+    /// Raise (or, with `raised: None`, clear) one alarm through the production
+    /// path. `Alarms`'s only writer is `observe`, and a test that reached past
+    /// it would be testing a state the engine cannot produce; `grace_s: 0.0`
+    /// skips the reflex window, which is alarm.rs's business and not the HUD's.
+    fn stand(app: &mut App, kind: AlarmKind, raised: Option<Alarm>) {
+        app.world_mut()
+            .resource_mut::<Alarms>()
+            .observe(Team::Human, kind, 1.0, 0.0, raised);
+    }
+
+    fn an_alarm(kind: AlarmKind, fact: &str, default: &str, eta_s: Option<f32>) -> Alarm {
+        Alarm {
+            kind,
+            fact: fact.to_string(),
+            running_default: default.to_string(),
+            since_t: 1.0,
+            severity: EventSeverity::Warning,
+            eta_s,
+            pos: None,
+        }
+    }
+
+    fn row_line(app: &mut App, row: usize, part: AlarmPart) -> String {
+        let mut q = app.world_mut().query::<(&AlarmText, &Text)>();
+        q.iter(app.world())
+            .find(|(slot, _)| slot.row == row && slot.part == part)
+            .map(|(_, text)| text.0.clone())
+            .expect("the pool has a node for every row")
+    }
+
+    /// **The bead in one assertion.** The bridge seat has been able to re-read
+    /// a standing alarm — its fact AND what is already being done about it —
+    /// out of `state.json` on every poll since alarms landed; the human got two
+    /// alert-stack lines that expired after nine seconds. This is the human's
+    /// rendering of the identical level view, so the two seats can triage from
+    /// the same list.
+    ///
+    /// The running default is the half that matters: "base under attack" is a
+    /// shout, and "base under attack — home-guard is recalling squad 1 (ETA
+    /// 22s)" is a decision.
+    #[test]
+    fn a_standing_alarm_shows_its_fact_and_its_running_default() {
+        let mut app = alarm_panel_app();
+        app.update();
+        assert_eq!(
+            app.world().resource::<UiState>().alarm_rows,
+            0,
+            "silence is the normal state"
+        );
+        assert_eq!(row_line(&mut app, 0, AlarmPart::Fact), "");
+
+        stand(
+            &mut app,
+            AlarmKind::PlacesUnderAttack,
+            Some(an_alarm(
+                AlarmKind::PlacesUnderAttack,
+                "buildings under attack in 2 places",
+                "home-guard is recalling squad 1",
+                Some(22.0),
+            )),
+        );
+        app.update();
+
+        assert_eq!(app.world().resource::<UiState>().alarm_rows, 1);
+        assert_eq!(
+            row_line(&mut app, 0, AlarmPart::Fact),
+            "buildings under attack in 2 places"
+        );
+        assert_eq!(
+            row_line(&mut app, 0, AlarmPart::Default),
+            "default: home-guard is recalling squad 1   ·   ETA 22s"
+        );
+
+        // A status is not news: painting the same list twice changes nothing,
+        // which is the whole difference between this panel and the stack.
+        app.update();
+        assert_eq!(app.world().resource::<UiState>().alarm_rows, 1);
+    }
+
+    /// The exit half. The alert stack forgets a row after nine seconds whether
+    /// or not the condition ended; this panel must show a thing for exactly as
+    /// long as it is true, and stop the moment it is not.
+    #[test]
+    fn the_panel_empties_when_the_condition_lapses() {
+        let mut app = alarm_panel_app();
+        stand(
+            &mut app,
+            AlarmKind::IncomeCollapse,
+            Some(an_alarm(
+                AlarmKind::IncomeCollapse,
+                "every mine we work is dry",
+                "nothing recovers this automatically",
+                None,
+            )),
+        );
+        app.update();
+        assert_eq!(
+            row_line(&mut app, 0, AlarmPart::Default),
+            "default: nothing recovers this automatically",
+            "no ETA is a real answer — the default is to stand still",
+        );
+
+        stand(&mut app, AlarmKind::IncomeCollapse, None);
+        app.update();
+        assert_eq!(app.world().resource::<UiState>().alarm_rows, 0);
+        assert_eq!(row_line(&mut app, 0, AlarmPart::Fact), "");
+        assert_eq!(row_line(&mut app, 0, AlarmPart::Default), "");
+    }
+
+    /// **Fog is inherited, not re-derived.** `Alarms::get` takes a team and
+    /// there is no call that returns both, so the panel cannot render the other
+    /// seat's situation even by accident — the same structural claim the alert
+    /// stack's `Team::Human` filter makes. An enemy learning that your income
+    /// collapsed would be the most valuable leak in the protocol.
+    #[test]
+    fn the_panel_never_shows_the_other_seats_alarms() {
+        let mut app = alarm_panel_app();
+        app.world_mut().resource_mut::<Alarms>().observe(
+            Team::Claude,
+            AlarmKind::SquadBelowHalf,
+            1.0,
+            0.0,
+            Some(an_alarm(
+                AlarmKind::SquadBelowHalf,
+                "squad 2 is below half strength",
+                "squad 2 falls back to our base",
+                Some(9.0),
+            )),
+        );
+        app.update();
+        assert_eq!(app.world().resource::<UiState>().alarm_rows, 0);
+        assert_eq!(row_line(&mut app, 0, AlarmPart::Fact), "");
+    }
+
+    /// The pool is exactly `ALL_ALARM_KINDS` long, and `Alarms` sorts its list
+    /// into that order, so a full board fills every row and row N keeps meaning
+    /// the same kind between two frames.
+    #[test]
+    fn every_alarm_kind_has_a_row_of_its_own() {
+        let mut app = alarm_panel_app();
+        for kind in ALL_ALARM_KINDS {
+            stand(
+                &mut app,
+                kind,
+                Some(an_alarm(kind, kind.label(), "nothing", None)),
+            );
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<UiState>().alarm_rows,
+            ALARM_SLOTS,
+            "a full board must not overflow the pool",
+        );
+        for (row, kind) in ALL_ALARM_KINDS.iter().enumerate() {
+            assert_eq!(row_line(&mut app, row, AlarmPart::Fact), kind.label());
+        }
+    }
+
+    /// Geometry. The panel is pinned above the console and grows upward, so the
+    /// thing that can go wrong is a full board climbing into the resource bar
+    /// on a small window — where it would be drawn over and would also claim
+    /// clicks the bar owns.
+    #[test]
+    fn a_full_alarm_panel_fits_above_the_console_at_every_size() {
+        let full = ALARM_HEAD_H + ALARM_SLOTS as f32 * ALARM_ROW_HIT_H;
+        for (w, h) in SIZES {
+            let hud = hud_layout(w, h);
+            let top = h - hud.console_h - PAD - full;
+            assert!(
+                top >= TOP_BAR_H,
+                "{w}x{h}: four alarms reach {top}px, above the {TOP_BAR_H}px bar",
+            );
+        }
     }
 
     // -----------------------------------------------------------------
@@ -10644,6 +11394,250 @@ mod tests {
             said(&app).iter().all(|i| i.verb() == "squad"),
             "stepping the tile arms; only the ground click speaks a stance"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The selector picker (wc3clone-1zv)
+    // -----------------------------------------------------------------
+
+    /// Step the doctrine page's scope to `want`, through the production key.
+    /// Asserts it got there, so a test that meant `all army` cannot quietly
+    /// assert something about `workers` if the rung order ever changes.
+    fn scope_to(app: &mut App, want: Option<Selector>) {
+        for _ in 0..scope_rungs().len() {
+            if app.world().resource::<UiState>().doctrine_scope == want {
+                return;
+            }
+            press(app, &[KeyCode::KeyA]);
+        }
+        panic!("[A] never reached {want:?}");
+    }
+
+    /// **One vocabulary, not two.** Every rung sends `Selector::phrase()`, and
+    /// every phrase parses back to the selector it came from — so the picker
+    /// cannot drift from the wire's spelling, which is the failure a HUD with
+    /// its own `"all army"` literal would be one rename away from.
+    ///
+    /// Also: the cycle is a cycle. Eight presses return to the selection, so
+    /// no rung is a one-way door.
+    #[test]
+    fn the_scope_picker_speaks_the_shared_selector_vocabulary() {
+        let rungs = scope_rungs();
+        assert_eq!(rungs[0], None, "the selection is the default and the way back");
+        for rung in &rungs {
+            let Some(sel) = rung else { continue };
+            assert!(
+                sel.is_unit_selector(),
+                "{sel:?} does not name units — the doctrine page has no use for it",
+            );
+            assert_eq!(
+                parse_selector(&sel.phrase()),
+                Some(*sel),
+                "the phrase the picker sends must be one the wire parses",
+            );
+        }
+        let mut at = None;
+        for _ in 0..rungs.len() {
+            at = next_scope(at);
+        }
+        assert_eq!(at, None, "the cycle closes");
+        // Every rung is reachable, and none twice. `Selector` is not `Ord`, so
+        // the dedup is a linear scan rather than a set — eight rungs.
+        let mut walked = vec![None];
+        for _ in 1..rungs.len() {
+            walked.push(next_scope(*walked.last().unwrap()));
+        }
+        for (i, rung) in walked.iter().enumerate() {
+            assert!(
+                !walked[..i].contains(rung),
+                "{rung:?} came round twice in {walked:?}",
+            );
+        }
+        assert_eq!(walked.len(), rungs.len());
+    }
+
+    /// **The bead in one assertion.** docs/INTENT.md § Selectors ("Both seats")
+    /// says the human has no way to type a role into a doctrine sentence and
+    /// that a picker on this page would close it with no wire change. This is
+    /// that picker: `[I]`, `[A]` to `all army`, `[F]` to set the threshold, and
+    /// what leaves is byte-identical to the JSON a commander sends.
+    ///
+    /// Two things ride on the same assertion. The frozen id list goes **empty**
+    /// rather than being sent and overruled by precedence — a sentence carrying
+    /// both says two things and means one. And the anchor moves to the *other*
+    /// late-bound channel: a role has no centre of mass, and ui.rs must not
+    /// invent one, because `intent::resolve_places` is the only resolver either
+    /// seat gets.
+    #[test]
+    fn a_scoped_fall_back_names_the_role_and_lets_the_resolver_place_it() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        press(&mut app, &[KeyCode::KeyI]);
+        scope_to(&mut app, Some(Selector::Army));
+        assert!(said(&app).is_empty(), "picking a scope says nothing");
+
+        press(&mut app, &[KeyCode::KeyF]);
+        let out = said(&app);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].sentence(),
+            "all army fall back to our base below 25% health",
+        );
+        let typed: Intent = serde_json::from_str(
+            r#"{"type":"retreat","below":0.25,"region":"our base","select":"all army"}"#,
+        )
+        .unwrap();
+        assert_eq!(json(&out[0]), json(&typed));
+    }
+
+    /// The same for the leash, which is the other doctrine verb that wants a
+    /// place. Named separately because the two derive their anchor differently
+    /// for a selection (a centroid against the nearest hall) and must collapse
+    /// to the same late-bound place for a role.
+    #[test]
+    fn a_scoped_guard_radius_is_the_sentence_a_commander_sends() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        press(&mut app, &[KeyCode::KeyI]);
+        scope_to(&mut app, Some(Selector::Heroes));
+        press(&mut app, &[KeyCode::KeyG]);
+
+        let out = said(&app);
+        assert_eq!(out.len(), 1);
+        let typed: Intent = serde_json::from_str(
+            r#"{"type":"leash","radius":10.0,"region":"our base","select":"my hero"}"#,
+        )
+        .unwrap();
+        assert_eq!(json(&out[0]), json(&typed));
+    }
+
+    /// The placeless doctrine verb. `priority` takes no ground, so the only
+    /// thing the scope changes is which channel names the units — which makes
+    /// this the cleanest statement of the precedence rule the picker relies on.
+    #[test]
+    fn a_scoped_priority_travels_on_the_role_channel_alone() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        press(&mut app, &[KeyCode::KeyI]);
+        scope_to(&mut app, Some(Selector::Workers));
+        press(&mut app, &[KeyCode::KeyP]);
+
+        let out = said(&app);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Intent::Priority { units, select, .. } => {
+                assert!(units.is_empty(), "the overruled list is not sent: {units:?}");
+                assert_eq!(select.as_deref(), Some("workers"));
+            }
+            other => panic!("expected a priority intent, got {other:?}"),
+        }
+    }
+
+    /// **The rung that pays for the whole picker.** `posture` and `stance` take
+    /// a squad NUMBER rather than a roster, so `Scope: squad 2` reaches them
+    /// with no membership sentence in front — which is exactly what shared.rs's
+    /// `Selector::Squad` note recommends over sending a `squad` verb and a
+    /// `select: "squad 2"` in one batch, where the deferred enrolment means the
+    /// second cannot see the first.
+    #[test]
+    fn a_squad_scope_addresses_the_squad_by_number_and_enrols_nobody() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        press(&mut app, &[KeyCode::KeyI]);
+        scope_to(&mut app, Some(Selector::Squad(2)));
+        press(&mut app, &[KeyCode::KeyS]);
+
+        assert!(
+            said(&app).is_empty(),
+            "a squad scope needs no `squad` sentence in front of the stance",
+        );
+        let arm = app
+            .world()
+            .resource::<UiState>()
+            .posture_place
+            .expect("the stance tile still arms its click");
+        assert_eq!(arm.squad, 2, "the scope named the squad, not the selection");
+    }
+
+    /// A role that is not a squad still has to become one, because that is what
+    /// `posture` takes. The compound is the same two sentences the selection
+    /// path already produces — the roster is just named by phrase instead of by
+    /// ids, which is precisely what a commander would have had to send.
+    #[test]
+    fn a_role_scoped_posture_enrols_the_role_and_then_postures_it() {
+        let mut app = ui_app();
+        spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        press(&mut app, &[KeyCode::KeyI]);
+        scope_to(&mut app, Some(Selector::Army));
+        press(&mut app, &[KeyCode::KeyQ]);
+
+        let out = said(&app);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].sentence(), "all army join squad 1");
+        let typed: Intent =
+            serde_json::from_str(r#"{"type":"squad","id":1,"select":"all army"}"#).unwrap();
+        assert_eq!(json(&out[0]), json(&typed));
+
+        let arm = app
+            .world()
+            .resource::<UiState>()
+            .posture_place
+            .expect("and the posture click is armed on that squad");
+        assert_eq!(arm.squad, 1);
+    }
+
+    /// **The scope is a doctrine-page field and it governs the doctrine page.**
+    /// The orders card's quick toggles are the fast path for "what I have
+    /// selected right now"; a mode set on the other page silently redirecting
+    /// them would be the worst kind of hidden state, and the one that costs you
+    /// a fight.
+    #[test]
+    fn the_orders_card_quick_toggles_ignore_the_doctrine_scope() {
+        let mut app = ui_app();
+        let footman = spawn_selected_footman(&mut app, Vec3::new(-10.0, 0.0, -10.0));
+        press(&mut app, &[KeyCode::KeyI]);
+        scope_to(&mut app, Some(Selector::Army));
+        // Back to the orders card, where [P] is the quick priority toggle.
+        press(&mut app, &[KeyCode::KeyI]);
+        press(&mut app, &[KeyCode::KeyP]);
+
+        let out = said(&app);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Intent::Priority { units, select, .. } => {
+                assert_eq!(units, &vec![intent_id(footman)]);
+                assert_eq!(select.as_deref(), None);
+            }
+            other => panic!("expected a priority intent, got {other:?}"),
+        }
+        // ...and the field is still set, waiting on the page it belongs to.
+        assert_eq!(
+            app.world().resource::<UiState>().doctrine_scope,
+            Some(Selector::Army),
+        );
+    }
+
+    /// The card says which scope it is in, and says it as the phrase the wire
+    /// uses. A picker whose caption disagreed with the sentence it sends would
+    /// be worse than no picker.
+    #[test]
+    fn the_scope_tile_names_the_current_scope() {
+        assert_eq!(scope_label(None), "Scope: selection");
+        for rung in scope_rungs().into_iter().flatten() {
+            assert_eq!(scope_label(Some(rung)), format!("Scope: {}", rung.phrase()));
+        }
+        let card = DoctrineCard {
+            scope: Some(Selector::Army),
+            ..default()
+        };
+        let entries = doctrine_entries(2, card);
+        let tile = entries
+            .iter()
+            .find(|e| e.action == CmdAction::CycleScope)
+            .expect("the doctrine card offers the picker");
+        assert_eq!(tile.label, "Scope: all army");
+        assert_eq!(tile.key, hotkeys::key(Hk::DoctrineScope).unwrap());
+        assert!(tile.active, "a role scope lights the tile");
     }
 
     /// **The human's trigger gesture is a sentence a commander could type.**

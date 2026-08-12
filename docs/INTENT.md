@@ -2590,11 +2590,55 @@ every second). So the human's deferred authoring surface is late-bound today by
 a different mechanism, and neither seat can currently arm a rule the other
 cannot express.
 
-What the human seat does **not** have is a way to *type* a role into a rule,
-because there is no text entry in this HUD. That is the same limitation that
-makes the human's regions `mark 1`..`mark 8` rather than `north-pass`, and it is
-a rendering difference rather than a capability one. A selector-picker on the
-doctrine page would close it; nothing about the wire needs to change for that.
+What the human seat did **not** have was a way to say a role out loud in a
+doctrine sentence, because there is no text entry in this HUD — the same
+limitation that makes the human's regions `mark 1`..`mark 8` rather than
+`north-pass`, and a rendering difference rather than a capability one.
+
+*`wc3clone-1zv`.* A **picker**, not a text field, closes it, and nothing about
+the wire changed. The doctrine page grew one cycling tile — `[A] Scope` — over
+the eight rungs the vocabulary actually has: the selection, `my hero`,
+`all army`, `all units`, `workers`, `squad 1`..`squad 3`. One cycle rather than
+eight tiles for the same reason `[P] Priority` and `[S] Stance` are one each:
+this card has no eight spare letters, and a small closed vocabulary behind a
+switch is the human's fast path through it. The tile names the current scope,
+because it is a *field* — the subject of every sentence below it — and not a
+verb.
+
+With a role picked, the gestures that used to freeze `own_ids()` into their
+intent put the phrase on the role channel instead: `units: []`,
+`select: "all army"`. The list goes empty rather than being sent and overruled —
+precedence would discard it either way, but a sentence carrying both says two
+things and means one, and the intent log is read by people. The phrase itself is
+`Selector::phrase()` rather than a literal in ui.rs, so the picker cannot drift
+from the spelling the wire parses.
+
+Two details are the interesting part.
+
+**A role has no centre of mass, and ui.rs must not invent one.** `retreat` and
+`leash` want a place, and with a selection they derive it from the group (the
+nearest hall; the centroid). A role cannot be measured without resolving it, and
+`intent::resolve_places` is the only resolver either seat gets. So a role-scoped
+sentence names the place on the *other* late-bound channel and lets the one
+resolver answer both halves: `{"select":"all army","region":"our base"}`. The
+two channels compose, which is what putting them on the same footing was for.
+
+**`squad <n>` is the rung that pays for the picker.** `posture` and `stance`
+take a squad *number*, never a roster, so `Scope: squad 2` reaches them with no
+membership sentence in front and nothing selected — which is exactly what
+`Selector::Squad`'s own note recommends over sending a `squad` verb and a
+`select: "squad 2"` in one batch, where the deferred enrolment means the second
+cannot see the first. Every other role still has to become a squad first, and
+does it with the same two-sentence compound the selection path already produces:
+`all army join squad 1`, then `squad 1 defends …`.
+
+The scope governs the doctrine page and nothing else. The orders card's quick
+toggles stay the fast path for "what I have selected right now"; a mode set on
+another page silently redirecting them would be the worst kind of hidden state.
+
+What remains is not a capability gap but a keyboard one: a commander may write
+`squad 7`, and the human's picker stops at three because there are three digit
+keys to recall them with.
 
 ### Wire compatibility
 
