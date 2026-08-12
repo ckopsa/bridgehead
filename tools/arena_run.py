@@ -344,6 +344,15 @@ def derive_env(seats: list[dict], args) -> dict[str, str]:
     }
     if not args.windowed:
         env["BH_HEADLESS"] = "1"
+    else:
+        # No arena round is "a human at the mouse", so no arena round wants the
+        # display pacing a human wants. The engine already defaults to this
+        # whenever `BH_MAX_GAME_SECS` is set, but an uncapped windowed round
+        # (`--cap 0`) is exactly as unwatched, and this is the ledger's chance
+        # to *record* which pacing a round was run with — r32 is the round we
+        # cannot answer that question about. `--env BH_PRESENT=vsync`
+        # overrides, below.
+        env["BH_PRESENT"] = "novsync"
     if args.cap:
         env["BH_MAX_GAME_SECS"] = f"{args.cap:g}"
     # Screenshots file themselves with the round they belong to. Kept

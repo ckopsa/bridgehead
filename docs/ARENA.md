@@ -329,8 +329,11 @@ Three things follow, and all three are on by default:
   fire-and-forget rather than a slot in a queue the compositor has to drain)
   plus a 60 Hz timer-driven winit update mode instead of `Continuous`, whose
   only wakeup is a redraw round-trip through the window system. Force either
-  with `BH_PRESENT=vsync|novsync`. A human's game is unchanged — vsync, because
-  a human is present to notice a freeze and tearing is a real cost.
+  with `BH_PRESENT=vsync|novsync`. The runner sets it for **every** windowed
+  round regardless of the cap, so the ledger records which pacing a round was
+  played on — r32 is the round nobody can answer that about. A human's game is
+  unchanged — vsync, because a human is present to notice a freeze and tearing
+  is a real cost.
 - **The engine watches its own frame counter.** `BH_WATCHDOG=<wall seconds>`
   (default 45 on an unattended windowed run, off otherwise, `0` disables) logs
   loudly when no frame has been stepped for that long, naming the game second
@@ -345,10 +348,18 @@ Three things follow, and all three are on by default:
   the whole ready handshake. A wedged round records **no** verdict: a wedge is
   not a match, and `game_over_reason` stays null with the story in `engine.log`.
 
-This is mitigation, not a cure. The root cause was never confirmed — see below
-— and the sim is still not decoupled from the presenter, so a hard GPU-side
-wedge would still stop the game. What changed is that it now announces itself
-and costs two minutes.
+**What that changes about a hidden window.** Before this, a windowed round
+whose window was minimised, occluded or on another workspace slowed to
+whatever rate the compositor chose to take frames at — including zero — and
+said nothing about it, so a round could quietly stop being played while the
+runner waited. An unblocked present has no such back-pressure: the match keeps
+simulating at 60 Hz with nobody looking at it, which is what an arena round
+was always supposed to do.
+
+This is mitigation, not a cure. The root cause was never confirmed — the
+backtrace note below is how to change that — and the simulation is still not
+decoupled from the presenter, so a hard GPU-side wedge would still stop the
+game. What changed is that it now announces itself and costs two minutes.
 
 **Getting a backtrace from the next one.** `arena/r32-frozen/freeze-backtrace.txt`
 contains one line — `ptrace: Operation not permitted` — because this machine

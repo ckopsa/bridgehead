@@ -116,6 +116,18 @@ def test_headless_is_the_default_and_windowed_removes_it():
     assert "BH_HEADLESS" not in env_for("red=commander:a", "blue=commander:b", windowed=True)
 
 
+def test_a_windowed_round_is_never_paced_by_the_display():
+    """No arena round has a human at the mouse, and r32 froze behind a vsync
+    present queue the compositor had stopped draining. The engine defaults the
+    same way whenever a cap is set; recording it here is what makes a future
+    round's pacing answerable from the ledger."""
+    assert env_for("red=commander:a", "blue=commander:b",
+                   windowed=True)["BH_PRESENT"] == "novsync"
+    assert "BH_PRESENT" not in env_for("red=scripted", "blue=scripted"), (
+        "a headless round has no presenter to pace"
+    )
+
+
 def test_the_cap_is_optional():
     assert env_for("red=scripted", "blue=scripted", cap=600)["BH_MAX_GAME_SECS"] == "600"
     assert "BH_MAX_GAME_SECS" not in env_for("red=scripted", "blue=scripted", cap=0)
