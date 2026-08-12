@@ -49,6 +49,115 @@ fn window_resolution() -> bevy::window::WindowResolution {
     }
 }
 
+/// **What paces a windowed frame: the display, or a clock we own.**
+///
+/// Two settings — the swapchain's present mode and winit's update mode —
+/// decided together because they answer one question. `Display` is Bevy's
+/// default pair and the right one for a human at a mouse: `AutoVsync` (FIFO)
+/// hands each frame to the compositor's queue and waits its turn, and
+/// `Continuous` re-runs the app as fast as the redraws come back. `Unblocked`
+/// is for a run nobody is holding the mouse for: `AutoNoVsync` resolves to
+/// `Immediate` (falling back through `Mailbox` to `Fifo`; the two `Auto` modes
+/// are the only ones wgpu promises not to *crash* on when the surface does not
+/// support them), so presenting is fire-and-forget rather than a slot in a
+/// queue somebody else has to drain — and the update loop is woken by a 60 Hz
+/// timer instead of by a redraw round-trip through the window system.
+///
+/// **Why it exists: arena r32.** A windowed round on Hyprland/XWayland wedged
+/// at t=1495.7 of an 1800s cap with the window parked on an inactive
+/// workspace: every thread futex-parked, ~zero CPU, the game clock stopped,
+/// the snapshot five minutes stale — and no recovery when the workspace came
+/// back. It had to be killed by PID. The shape is a presenter whose consumer
+/// stopped consuming: under FIFO the frame *after* the queue fills blocks, and
+/// because Bevy's pipelined renderer hands the render app back to the main
+/// schedule once per frame, a blocked present stops the **simulation** — a
+/// windowed arena round therefore stalls silently whenever the compositor
+/// stops taking frames. `Unblocked` removes the queue that fills and removes
+/// the dependency on redraw delivery; it does not make the GPU path
+/// unwedgeable, which is what `BH_WATCHDOG` below is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WindowPacing {
+    Display,
+    Unblocked,
+}
+
+/// `BH_PRESENT=vsync|novsync` — force one pacing or the other.
+const PRESENT_ENV: &str = "BH_PRESENT";
+
+/// `Unblocked` when nobody is watching, `Display` when somebody is.
+///
+/// The default turns on `BH_MAX_GAME_SECS`, which is already this file's mark
+/// of an unattended windowed run (it is what registers `headless_exit` for a
+/// window, so the session can open, photograph itself and get out of the way).
+/// A human's game keeps vsync — tearing and an uncapped GPU are a real cost
+/// and a human is present to notice a freeze; an arena round is neither.
+fn window_pacing(unattended: bool) -> WindowPacing {
+    window_pacing_of(&std::env::var(PRESENT_ENV).unwrap_or_default(), unattended)
+}
+
+/// The decision itself, with the environment lifted out — env is process-global
+/// and this suite runs in parallel, so the testable half takes the string.
+fn window_pacing_of(raw: &str, unattended: bool) -> WindowPacing {
+    let default = if unattended {
+        WindowPacing::Unblocked
+    } else {
+        WindowPacing::Display
+    };
+    match raw.trim() {
+        "" => default,
+        "vsync" | "display" => WindowPacing::Display,
+        "novsync" | "unblocked" => WindowPacing::Unblocked,
+        other => {
+            eprintln!(
+                "{PRESENT_ENV}=\"{other}\" is not vsync or novsync — ignoring \
+                 (vsync: present in step with the display; novsync: never \
+                 block the update loop on a present)"
+            );
+            default
+        }
+    }
+}
+
+impl WindowPacing {
+    fn present_mode(self) -> bevy::window::PresentMode {
+        use bevy::window::PresentMode;
+        match self {
+            WindowPacing::Display => PresentMode::AutoVsync,
+            WindowPacing::Unblocked => PresentMode::AutoNoVsync,
+        }
+    }
+
+    /// `None` keeps Bevy's own default (`WinitSettings::game()`).
+    ///
+    /// The `Unblocked` pair mirrors that default with one substitution:
+    /// `Continuous` becomes a 60 Hz `Reactive`. Continuous on Linux parks the
+    /// event loop in `ControlFlow::Wait` and relies on its own redraw request
+    /// coming back to it; `Reactive` arms a `WaitUntil`, which is a wakeup the
+    /// window system cannot fail to deliver. It also caps an unattended round
+    /// at 60 updates a second, which vsync used to do and `AutoNoVsync` no
+    /// longer will.
+    fn winit_settings(self) -> Option<bevy::winit::WinitSettings> {
+        use bevy::winit::{UpdateMode, WinitSettings};
+        let frame = std::time::Duration::from_secs_f64(1.0 / 60.0);
+        match self {
+            WindowPacing::Display => None,
+            WindowPacing::Unblocked => Some(WinitSettings {
+                focused_mode: UpdateMode::reactive(frame),
+                unfocused_mode: UpdateMode::reactive_low_power(frame),
+            }),
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            WindowPacing::Display => "vsync — presents in step with the display",
+            WindowPacing::Unblocked => {
+                "novsync — presents never block the update loop, updates on a 60Hz timer"
+            }
+        }
+    }
+}
+
 fn main() {
     // BH_HEADLESS=1: full-fidelity simulation with no window, no renderer,
     // no GPU — for agents, CI, and balance testing. Combine with BH_SPEED,
@@ -74,23 +183,50 @@ fn main() {
         // Reads the finished frame and decides whether there is another one;
         // that is reporting, not simulation.
         .add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));
+        // Opt-in only without a window: a headless run has no presenter to
+        // wedge, so the default is off and `BH_WATCHDOG=<secs>` is for the
+        // person who suspects something else has stopped the loop.
+        if let Some(stall) = watchdog_stall_secs(false) {
+            app.add_systems(Update, watchdog_heartbeat.in_set(shared::SimSet::Feed));
+            arm_watchdog(stall, watchdog_abort_secs());
+        }
     } else {
+        // A windowed run normally ends when the player closes it. Setting the
+        // cap opts a windowed run into the same self-termination headless has,
+        // which is what lets an unattended session open a window, photograph
+        // itself (`BH_SHOT_AT`) and get out of the way. It is therefore also
+        // the flag that says "nobody is watching this window", which is what
+        // `window_pacing` reads it as.
+        let unattended = std::env::var("BH_MAX_GAME_SECS").is_ok();
+        let pacing = window_pacing(unattended);
         app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Bridgehead — Human vs Claude".into(),
                 resolution: window_resolution(),
+                present_mode: pacing.present_mode(),
                 ..default()
             }),
             ..default()
         }))
         .add_plugins(ui::UiPlugin);
-        // A windowed run normally ends when the player closes it. Setting the
-        // cap opts a windowed run into the same self-termination headless has,
-        // which is what lets an unattended session open a window, photograph
-        // itself (`BH_SHOT_AT`) and get out of the way. Registered only when
-        // the variable is set, so an ordinary game is untouched.
-        if std::env::var("BH_MAX_GAME_SECS").is_ok() {
+        // After the plugin group, for the same reason `TimeUpdateStrategy` is
+        // below it: `WinitPlugin` has by now run `init_resource::<WinitSettings>`,
+        // and `insert_resource` overwrites that default — which is the
+        // intended direction.
+        if let Some(settings) = pacing.winit_settings() {
+            app.insert_resource(settings);
+        }
+        info!("{PRESENT_ENV}: {}", pacing.describe());
+        // Registered only when the variable is set, so an ordinary game is
+        // untouched.
+        if unattended {
             app.add_systems(Update, headless_exit.in_set(shared::SimSet::Feed));
+        }
+        // The stall detector, armed by default for exactly the runs that have
+        // nobody to notice a freeze. See `watchdog_stall_secs`.
+        if let Some(stall) = watchdog_stall_secs(unattended) {
+            app.add_systems(Update, watchdog_heartbeat.in_set(shared::SimSet::Feed));
+            arm_watchdog(stall, watchdog_abort_secs());
         }
     }
 
@@ -655,6 +791,105 @@ mod tests {
             "an ungated match must run from the first frame"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Windowed pacing and the stall detector (wc3clone-yom)
+    // -----------------------------------------------------------------------
+
+    /// **A human's window is unchanged.** The whole mitigation is opt-in for
+    /// the seat that has somebody sitting in it: vsync, Bevy's own
+    /// `WinitSettings`, no watchdog thread. If this test ever flips, an
+    /// ordinary game started tearing.
+    #[test]
+    fn a_human_game_keeps_the_display_pacing_bevy_ships() {
+        let pacing = window_pacing_of("", false);
+        assert_eq!(pacing, WindowPacing::Display);
+        assert_eq!(pacing.present_mode(), bevy::window::PresentMode::AutoVsync);
+        assert!(
+            pacing.winit_settings().is_none(),
+            "Display must leave WinitSettings to Bevy"
+        );
+        assert_eq!(watchdog_stall_of(None, false), None);
+    }
+
+    /// **An unattended window defends itself.** `BH_MAX_GAME_SECS` is this
+    /// file's existing mark of a run nobody is watching — an arena round, a
+    /// screenshot session — and that is the run r32 froze.
+    #[test]
+    fn an_unattended_window_never_blocks_its_update_loop_on_a_present() {
+        let pacing = window_pacing_of("", true);
+        assert_eq!(pacing, WindowPacing::Unblocked);
+        assert_eq!(
+            pacing.present_mode(),
+            bevy::window::PresentMode::AutoNoVsync,
+            "the queue that fills under FIFO is the one r32 wedged behind"
+        );
+        let settings = pacing.winit_settings().expect("Unblocked sets its own");
+        // Continuous is the mode whose only wakeup is a redraw round-trip
+        // through the window system; Reactive arms a timer instead.
+        assert!(
+            !matches!(settings.focused_mode, bevy::winit::UpdateMode::Continuous),
+            "a timer wakeup is the point"
+        );
+        assert!(!matches!(
+            settings.unfocused_mode,
+            bevy::winit::UpdateMode::Continuous
+        ));
+        assert_eq!(watchdog_stall_of(None, true), Some(WATCHDOG_DEFAULT_SECS));
+    }
+
+    /// Both directions can be forced, because the first thing anyone will want
+    /// to do with a freeze report is run the same round the other way.
+    #[test]
+    fn the_present_env_forces_either_pacing_and_shrugs_off_a_typo() {
+        assert_eq!(window_pacing_of("novsync", false), WindowPacing::Unblocked);
+        assert_eq!(window_pacing_of(" vsync ", true), WindowPacing::Display);
+        assert_eq!(
+            window_pacing_of("mailbox", true),
+            WindowPacing::Unblocked,
+            "an unreadable value must fall back to the default, not to a mode \
+             wgpu crashes on when the surface lacks it"
+        );
+    }
+
+    /// An explicit `0` beats the default: somebody debugging a slow machine
+    /// must be able to turn the alarm off without also turning off the run.
+    #[test]
+    fn the_watchdog_can_be_set_disabled_or_mistyped() {
+        assert_eq!(watchdog_stall_of(Some("90"), false), Some(90.0));
+        assert_eq!(watchdog_stall_of(Some("0"), true), None);
+        assert_eq!(watchdog_stall_of(Some(" 12.5 "), false), Some(12.5));
+        assert_eq!(
+            watchdog_stall_of(Some("soon"), true),
+            Some(WATCHDOG_DEFAULT_SECS),
+            "a typo falls back to the default rather than silently disarming"
+        );
+    }
+
+    /// **The heartbeat is a report, not a simulation.** It counts frames and
+    /// copies the clock; it takes no `&mut` anything. The claim that it cannot
+    /// move the sim is `tools/verify.sh identity`, but this pins the shape.
+    #[test]
+    fn the_heartbeat_counts_frames_and_touches_nothing_else() {
+        use std::sync::atomic::Ordering;
+        let before = WATCHDOG_FRAMES.load(Ordering::Relaxed);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_secs_f64(TEST_DT),
+            ))
+            .add_systems(Update, watchdog_heartbeat);
+        app.update();
+        app.update();
+        assert!(
+            WATCHDOG_FRAMES.load(Ordering::Relaxed) >= before + 2,
+            "two frames, two beats"
+        );
+        assert!(
+            watchdog_game_secs() > 0.0,
+            "the stall report names the game second the match stopped at"
+        );
+    }
 }
 
 /// Headless runs terminate themselves: shortly after a game over, or at a
@@ -716,6 +951,166 @@ fn headless_exit(
     // One exit path for all three endings: whatever decided the match, the
     // bridged seats are told before the process is allowed to stop.
     check_decided(time, &game_over, bridge, decided_at, exit);
+}
+
+// ---------------------------------------------------------------------------
+// The stall detector (wc3clone-yom)
+// ---------------------------------------------------------------------------
+//
+// Arena r32 froze mid-match and nobody found out for five minutes; the round
+// then burned the rest of its wall timeout and had to be killed by PID, and
+// the post-mortem got nothing because `ptrace_scope` refused the debugger.
+// This is the cheap half of the answer: a thread that is not on the frame's
+// critical path, watching the one number that is zero if and only if the
+// engine has stopped stepping, and saying so **in the log the round keeps**.
+//
+// It watches *frames*, not the game clock, deliberately. The game clock is
+// legitimately frozen during the ready handshake (up to `BH_READY_TIMEOUT`
+// wall seconds), and it is legitimately still while the sim is paused — so a
+// game-clock watchdog would cry wolf at the start of every commander round.
+// A frame counter that stops means the loop stopped, which is the bug.
+
+/// `BH_WATCHDOG=<wall seconds>` — how long a frozen frame counter is tolerated
+/// before the engine says so. `0` disables it.
+const WATCHDOG_ENV: &str = "BH_WATCHDOG";
+
+/// `BH_WATCHDOG_ABORT=<wall seconds>` — a longer threshold at which the engine
+/// aborts itself. Off (`0`) by default, because killing a live match is the
+/// runner's call and not the engine's. When it is on, `abort()` is chosen over
+/// `exit()` on purpose: it is the one exit that leaves a **core file**, and a
+/// core is a backtrace that does not need `ptrace_scope` to be relaxed — which
+/// is exactly the evidence r32 could not produce.
+const WATCHDOG_ABORT_ENV: &str = "BH_WATCHDOG_ABORT";
+
+/// Default tolerance for an unattended windowed run. Long enough that a slow
+/// asset load, a stop-the-world compositor hiccup or a laptop's lid cannot
+/// trip it; far shorter than the five minutes r32 spent frozen before anybody
+/// looked.
+const WATCHDOG_DEFAULT_SECS: f32 = 45.0;
+
+/// Frames the app has stepped. Written by `watchdog_heartbeat` on the main
+/// thread, read by the watchdog thread; `Relaxed` is enough because the only
+/// question ever asked of it is "is this the same number as last second".
+static WATCHDOG_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The game clock in hundredths, so the stall report can name the moment the
+/// match stopped — the number an arena AAR is written in.
+static WATCHDOG_GAME_CENTIS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn watchdog_stall_secs(default_on: bool) -> Option<f32> {
+    watchdog_stall_of(std::env::var(WATCHDOG_ENV).ok().as_deref(), default_on)
+}
+
+/// Same split as `window_pacing_of`, for the same reason.
+fn watchdog_stall_of(raw: Option<&str>, default_on: bool) -> Option<f32> {
+    let default = default_on.then_some(WATCHDOG_DEFAULT_SECS);
+    let Some(raw) = raw else { return default };
+    match raw.trim().parse::<f32>() {
+        // An explicit 0 is "off", and it must beat the default.
+        Ok(secs) if secs <= 0.0 => None,
+        Ok(secs) => Some(secs),
+        // A typo is not a setting: say so rather than silently arming
+        // something the author did not ask for.
+        Err(_) => {
+            eprintln!("{WATCHDOG_ENV}=\"{raw}\" is not a number of seconds — ignoring");
+            default
+        }
+    }
+}
+
+fn watchdog_abort_secs() -> Option<f32> {
+    std::env::var(WATCHDOG_ABORT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f32>().ok())
+        .filter(|secs| *secs > 0.0)
+}
+
+/// One `fetch_add` per frame, in `SimSet::Feed` beside the other system that
+/// reads a finished frame and reports on it. It mutates nothing in the world,
+/// so it cannot move the sim: `tools/verify.sh identity` is the proof.
+fn watchdog_heartbeat(time: Res<Time>) {
+    use std::sync::atomic::Ordering;
+    WATCHDOG_FRAMES.fetch_add(1, Ordering::Relaxed);
+    WATCHDOG_GAME_CENTIS.store((time.elapsed_secs().max(0.0) * 100.0) as u64, Ordering::Relaxed);
+}
+
+/// Spawn the watcher. Detached and daemon-ish: it holds no lock the frame path
+/// wants, which is the whole point — a thread that could be blocked by the
+/// wedge it is watching for is not a watchdog.
+fn arm_watchdog(stall: f32, abort_after: Option<f32>) {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let abort_note = match abort_after {
+        Some(secs) => format!(", aborting at {secs:.0}s ({WATCHDOG_ABORT_ENV})"),
+        None => String::new(),
+    };
+    info!("{WATCHDOG_ENV}: stall detector armed at {stall:.0}s{abort_note}");
+
+    let spawned = std::thread::Builder::new()
+        .name("bh-watchdog".into())
+        .spawn(move || {
+            let poll = Duration::from_secs(1);
+            let mut last_frames = 0u64;
+            let mut last_change = Instant::now();
+            let mut reported = false;
+            loop {
+                std::thread::sleep(poll);
+                let frames = WATCHDOG_FRAMES.load(Ordering::Relaxed);
+                // Nothing has been stepped yet: plugin setup, asset loading and
+                // GPU init all happen before the first frame, and none of them
+                // is the stall this is looking for.
+                if frames == 0 {
+                    last_change = Instant::now();
+                    continue;
+                }
+                if frames != last_frames {
+                    last_frames = frames;
+                    last_change = Instant::now();
+                    // The exit edge. Told once that something is stuck and
+                    // never told it recovered, a reader has to poll — which is
+                    // the polling this layer exists to delete
+                    // (tools/BUILDER_BRIEF.md §6.11).
+                    if reported {
+                        reported = false;
+                        info!(
+                            "{WATCHDOG_ENV}: frames are moving again (t={:.1}s)",
+                            watchdog_game_secs()
+                        );
+                    }
+                    continue;
+                }
+                let idle = last_change.elapsed().as_secs_f32();
+                if !reported && idle >= stall {
+                    reported = true;
+                    error!(
+                        "{WATCHDOG_ENV}: the engine has not stepped a frame in {idle:.0}s \
+                         — the game clock is stopped at t={:.1}s after {frames} frames. \
+                         A windowed run that does this is wedged in the present path \
+                         (docs/ARENA.md, \"When a windowed round freezes\"); kill it by \
+                         PID and keep the seat snapshots.",
+                        watchdog_game_secs()
+                    );
+                }
+                if abort_after.is_some_and(|limit| idle >= limit) {
+                    error!(
+                        "{WATCHDOG_ABORT_ENV}: {idle:.0}s without a frame — aborting so \
+                         this leaves a core file to read"
+                    );
+                    std::process::abort();
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        // Not fatal: the game is playable without a watchdog, and a match that
+        // refused to start because its *diagnostics* would not start is worse
+        // than one that runs unwatched.
+        warn!("{WATCHDOG_ENV}: could not spawn the stall detector ({err}) — running unwatched");
+    }
+}
+
+fn watchdog_game_secs() -> f32 {
+    use std::sync::atomic::Ordering;
+    WATCHDOG_GAME_CENTIS.load(Ordering::Relaxed) as f32 / 100.0
 }
 
 /// **The cap's referee, and the sentence it says.** More assets wins; exactly
