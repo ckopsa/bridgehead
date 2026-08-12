@@ -757,6 +757,8 @@ python3 tools/bridge_send.py --seat bridge/red '[{"type":"autopilot","on":true},
 | `BH_COMMAND_LATENCY` | Chain of Command travel delay — **off by default**. The `BH_LINK_*` vars tune it. If your bead touches ordering or doctrine, run once with it on. |
 | `BH_COPILOT_TRUST` | `split` (default) / `full` / `strict` — what a co-commander may do directly vs must propose. |
 | `BH_WINDOW=WxH` | window size, min 320x240. |
+| `BH_PRESENT=vsync\|novsync` | windowed pacing. `novsync` (`AutoNoVsync` + a 60Hz timer-driven winit update mode) never blocks the update loop on a present; it is the **default when `BH_MAX_GAME_SECS` is set**, because a windowed run nobody is watching is the one arena r32 froze. A human's game defaults to `vsync`. docs/ARENA.md §"When a windowed round freezes". |
+| `BH_WATCHDOG=<wall secs>` | log loudly when the engine has not stepped a frame in that long (and again when it recovers). Default 45 on an unattended windowed run, off otherwise; `0` disables. `BH_WATCHDOG_ABORT=<wall secs>` additionally aborts — for the core file, since `ptrace_scope` blocks live debuggers here. |
 | `BH_INTENT_LOG` | path to the intent log (default `bridge/intent_log.jsonl`). |
 
 ---

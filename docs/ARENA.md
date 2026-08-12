@@ -309,6 +309,66 @@ somebody was playing. Two rules follow, enforced rather than documented:
   snapshot is *renamed aside*, never removed — a stale `game_over` from the last
   match would otherwise read as this match ending instantly.
 
+### When a windowed round freezes
+
+A windowed round runs the simulation on the same loop that draws the window, so
+**anything that stops the presenter stops the match.** Round 32 is the worked
+example: on Hyprland/XWayland, with the window parked on an inactive workspace,
+the engine stopped stepping at t=1495.7 of an 1800s cap — every thread parked,
+~zero CPU, both seats' snapshots five minutes stale — and it did *not* recover
+when the workspace came back. It had to be killed by PID and the round was
+abandoned (evidence: `arena/r32-frozen/`). Five headless rounds and two watched
+windowed rounds on the same binary were clean, so it is rare and it is
+windowed-only.
+
+Three things follow, and all three are on by default:
+
+- **An unattended windowed run does not present in step with the display.**
+  `BH_MAX_GAME_SECS` is the engine's mark of a run nobody is watching, and it
+  now also selects `AutoNoVsync` (an `Immediate`/`Mailbox` present, which is
+  fire-and-forget rather than a slot in a queue the compositor has to drain)
+  plus a 60 Hz timer-driven winit update mode instead of `Continuous`, whose
+  only wakeup is a redraw round-trip through the window system. Force either
+  with `BH_PRESENT=vsync|novsync`. A human's game is unchanged — vsync, because
+  a human is present to notice a freeze and tearing is a real cost.
+- **The engine watches its own frame counter.** `BH_WATCHDOG=<wall seconds>`
+  (default 45 on an unattended windowed run, off otherwise, `0` disables) logs
+  loudly when no frame has been stepped for that long, naming the game second
+  the match stopped at, and logs again when frames resume.
+  `BH_WATCHDOG_ABORT=<wall seconds>` (off by default) aborts the process at a
+  longer threshold — `abort()` rather than `exit()` because it leaves a **core
+  file**, which is a backtrace that needs no debugger permissions.
+- **The runner stops waiting.** `arena_run.py --stall SECS` (default 120, `0`
+  to disable) ends a windowed round whose game clock has stopped moving, so a
+  wedge costs two minutes instead of the round's whole wall timeout. It only
+  starts counting once the clock has moved at all — `t` is legitimately 0 for
+  the whole ready handshake. A wedged round records **no** verdict: a wedge is
+  not a match, and `game_over_reason` stays null with the story in `engine.log`.
+
+This is mitigation, not a cure. The root cause was never confirmed — see below
+— and the sim is still not decoupled from the presenter, so a hard GPU-side
+wedge would still stop the game. What changed is that it now announces itself
+and costs two minutes.
+
+**Getting a backtrace from the next one.** `arena/r32-frozen/freeze-backtrace.txt`
+contains one line — `ptrace: Operation not permitted` — because this machine
+runs with `kernel.yama.ptrace_scope=1`, which forbids attaching to a process
+that is not your child. Options, in order of preference:
+
+```bash
+# 1. Let the engine dump its own core (no ptrace involved at all):
+BH_WATCHDOG=45 BH_WATCHDOG_ABORT=180 ...        # then: coredumpctl gdb bridgehead
+# 2. Relax the restriction for the session (root, resets on reboot):
+sudo sysctl kernel.yama.ptrace_scope=0          # then: gdb -p <pid> / eu-stack -p <pid>
+# 3. Start the engine under the debugger, so it IS your child:
+gdb --args ./target/debug/bridgehead
+```
+
+`thread apply all bt` is the wanted artifact: whether the wedged thread is in
+`vkQueuePresentKHR`/`eglSwapBuffers` (a presenter whose consumer stopped) or in
+winit's event wait (a redraw that never arrived) decides which half of the
+mitigation above is the real one.
+
 ## Screenshots
 
 `F10` writes a PNG of the window to `shots/`, or to `$BH_SHOT_DIR` — which the
