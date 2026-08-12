@@ -76,7 +76,11 @@ says command 3 was accepted but took 1.8s to reach the units it named — see
 Unit orders (ids from state):
 - `{"type":"move"|"attackmove","units":[ids],"x":..,"z":..}` — or
   `{"type":"move","units":[ids],"region":"north-pass"}`. **Every verb below that
-  takes `x`/`z` also takes `"region":"<name>"` instead**; see *Territory*.
+  takes `x`/`z` also takes `"region":"<name>"` instead**; see *Territory*. And
+  **every verb below that takes `units` also takes `"select":"my hero"` /
+  `"all army"` / `"squad 2"` instead**, resolved when the command runs rather
+  than when you wrote it; see *Selectors*. Both channels are optional and both
+  outrank the frozen form beside them.
 
 - `{"type":"attack","units":[ids],"target":enemy_id}`
 - `{"type":"harvest","units":[worker_ids],"target":node_id}` (mines AND trees — tree ids in `trees_near`)
@@ -224,6 +228,76 @@ be 4..60. You may not take a name `map.places` already owns.
 A name you have not defined is refused with the list of names you do have, so a
 typo costs you one error line rather than a silent order to the map's centre.
 
+## Selectors: name a ROLE once, and stop plumbing ids
+
+Regions are late-bound *places*. Selectors are late-bound *roles*, and they work
+the same way: the phrase travels in the command, and the engine resolves it when
+the command is **compiled** — which for a trigger's `then` and a plan's step is
+when it **fires**, not when you wrote it.
+
+Anywhere a verb takes `units`, send `"select":"<phrase>"` instead:
+
+| phrase | means |
+|---|---|
+| `"my hero"` | every living hero of yours (`"hero"`, `"heroes"` are the same phrase) |
+| `"all army"` | every living non-worker of yours, heroes included (`"army"`) |
+| `"all units"` | every living unit of yours, workers included |
+| `"workers"` | every living worker of yours |
+| `"squad 2"` | the members squad 2 has **right now** |
+
+Two more phrases answer "which one", not "which units":
+
+| phrase | where | means |
+|---|---|---|
+| `"nearest tree"` / `"nearest mine"` | `harvest`'s `"target_select"` | the nearest live node of that kind to the workers you are sending |
+| `"nearest legal site"` | `build`'s `"site"` | move the footprint to the nearest legal one within 15 of the point you named, instead of refusing |
+
+Case, spaces, dashes and underscores are noise, exactly as in every other name
+on this wire. A phrase that is not one of these is refused with the list.
+
+Where each channel lives:
+
+```json
+{"type":"move","select":"all army","region":"north-pass"}
+{"type":"attackmove","select":"squad 2","x":40,"z":-12}
+{"type":"retreat","select":"all army","below":0.35,"region":"home"}
+{"type":"priority","select":"all army","classes":["Archer","Hero"]}
+{"type":"squad","select":"all army","id":1}
+{"type":"harvest","select":"workers","target_select":"nearest tree"}
+{"type":"follow","select":"all army","target_select":"my hero"}
+{"type":"build","select":"workers","kind":"Farm","region":"home","site":"nearest legal site"}
+{"type":"cast","select":"my hero","ability":"Slam"}
+```
+
+`build`, `cast` and `follow`'s `target_select` need exactly one unit, so they
+take the **lowest-id match** — the same documented tie-break `buy` and
+`use_item` already use for an omitted `hero`.
+
+**Three rules worth knowing before you rely on it:**
+
+1. **A selector outranks the `units` list beside it.** Send both and the phrase
+   wins, and the stale ids are not even reported. Send neither and nothing has
+   changed: `"units":[…]` still means exactly what it always did.
+2. **An empty match is a refusal, not a silent nothing.** `"select":"all army"`
+   with no army alive orders *nobody* and tells you so — `'all army' matches
+   none of your units right now — nothing was ordered`. You cannot express
+   "move 0 units", which is the exact command that got a hero killed in r21.
+   In a plan, that refusal **blocks the step** rather than skipping it.
+3. **Nothing is written back.** The armed rule still says `"my hero"` on its
+   hundredth firing. Your hero can die, be revived with a brand-new id, and the
+   same rule keeps working.
+
+**One caveat.** A `squad` command and a `"select":"squad 1"` in the **same
+batch** do not see each other — enrolment lands after the batch compiles. Send
+the enrolment, then use the selector next cycle; or address the squad by number
+with `posture`, which never needed a roster. You get the ordinary
+"matches none of your units right now" refusal, never a stale roster.
+
+**What this replaces.** Everything you used to do with id plumbing: re-reading
+`units[]` every poll to refresh a `priority` list; arming a hero-save rule
+against an id that becomes a corpse; memorising a tree id that gets chopped
+down; a `build` trigger on fixed coordinates that reports `site blocked` for the
+rest of the match. Write the role once and stop.
 ## Alarms: the four things worth re-deciding
 
 Everything else defaults to **continue**. Silence is a legal, and usually
@@ -283,7 +357,6 @@ policy-shaped and stays valid over a thirty-second window — *"full recall, or
 sacrifice the expansion?"* is still the right question a minute later; *"dodge
 the ambush"* never was. Arm the fast answers ahead of time and spend your polls
 on the slow ones.
-
 ## Triggers: make the engine react for you
 
 **This is the single biggest thing you can do about your own latency.** You poll
@@ -590,7 +663,18 @@ Four things to copy from this, because all four are easy to get wrong:
 **A step's unit ids are frozen when you set the plan.** You cannot write "the 8
 footmen I will have by then" — those units do not exist and have no ids.
 
-The answer is already in the language: **name a SQUAD.** `template` stamps every
+Two answers, and you will usually want both:
+
+**Send a selector.** `"select":"all army"` or `"select":"squad 2"` in place of
+`units` resolves when the step runs, so a step written before the army exists
+still finds it:
+
+```json
+{"intent":{"type":"attackmove","select":"squad 2","region":"their-base"},
+ "advance":{"type":"when","when":{"type":"unit_count","kind":"Footman","count":6}}}
+```
+
+**And name a SQUAD in the doctrine.** `template` stamps every
 unit a building trains into squad 2; `posture` addresses squad 2 by number and
 resolves its membership when the step runs:
 

@@ -7603,12 +7603,190 @@ impl std::fmt::Display for PlanStamp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Late-bound references: saying WHO and WHERE without freezing an entity id
+// ---------------------------------------------------------------------------
+//
+// An entity id is a fact about one instant. `{"units":[4294967297]}` names the
+// hero that was alive when the sentence was written, and a sentence the engine
+// stores and runs later — a trigger's `then`, a plan step — is exactly the
+// place where that instant has already passed. Arena rounds r21–r23 traced five
+// distinct failure classes to it: a hero-save trigger armed with `"units":[]`
+// because the hero had not been trained yet; dead hero ids in triggers; stale
+// unit lists in `priority`; a memorized tree chopped out from under a harvest
+// order; and the wrong worker frozen into a repeating trigger. Every one of
+// them is the same bug — an author-time id used at fire time.
+//
+// A [`Selector`] is the fix and it is deliberately the same shape as a region
+// name. `"region":"north-pass"` has always been a late-bound *place*: the name
+// travels in the stored intent and becomes coordinates when the intent is
+// compiled, so moving the region re-aims every rule that names it. A selector
+// is a late-bound *role*, on the identical footing, resolved at the identical
+// moment: [`intent::resolve_places`], at the top of the one compiler, which a
+// trigger reaches only when it FIRES.
+//
+// The vocabulary is small on purpose. Roles a commander already thinks in
+// (my hero, all army, workers, squad N), and the two "nearest X" phrases that
+// answer the questions ids answered badly (which tree, which build site).
+
+/// A role, a squad, or a nearest-thing — written as a phrase, resolved against
+/// the world at the moment the intent is compiled.
+///
+/// Parsed by [`parse_selector`]; the channels each verb accepts it on are
+/// listed on [`Intent`]. Which selectors are legal in which channel is decided
+/// by the resolver, so `{"units": …, "select":"nearest tree"}` earns a sentence
+/// explaining that a tree is not an army rather than a silent miss.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Selector {
+    /// Every living hero of the seat. Plural because hero slots scale with the
+    /// hall ladder — "my hero" said by a Keep team with two of them means both,
+    /// and the channels that can only take one (a cast's caster) say so.
+    Heroes,
+    /// Every living non-worker of the seat, heroes included. What a commander
+    /// means by "all army": the things that fight.
+    Army,
+    /// Every living unit of the seat, workers included.
+    AllUnits,
+    /// Every living worker of the seat.
+    Workers,
+    /// The CURRENT members of squad `n` — the whole point of the selector, and
+    /// the answer to red-r23's stale rosters. A unit trained into the squad
+    /// after the trigger was armed is in it; a unit that died is not.
+    ///
+    /// One caveat, and it is the standing one about `Commands`: the `squad`
+    /// verb enrols members through deferred commands, so a `squad` and a
+    /// `select: "squad 1"` in the SAME batch do not see each other. The second
+    /// sentence earns the ordinary "matches none of your units right now"
+    /// refusal rather than acting on a stale roster, which is the safe half of
+    /// the trade; the fix is to send the two in successive batches, or to
+    /// address the squad by number with `posture`, which never needed the
+    /// roster at all.
+    Squad(u8),
+    /// The nearest living tree to the units being ordered.
+    NearestTree,
+    /// The nearest un-exhausted gold mine to the units being ordered.
+    NearestMine,
+    /// The nearest legal footprint to the point the sentence names. Not a unit
+    /// and not a node — the one selector that answers "where", and the answer
+    /// to blue-r23's farm trigger that reported `site blocked` all match
+    /// without ever moving the site.
+    NearestLegalSite,
+}
+
+impl Selector {
+    /// The canonical phrase, as the replay log and every error print it.
+    pub fn phrase(&self) -> String {
+        match self {
+            Selector::Heroes => "my hero".to_string(),
+            Selector::Army => "all army".to_string(),
+            Selector::AllUnits => "all units".to_string(),
+            Selector::Workers => "workers".to_string(),
+            Selector::Squad(n) => format!("squad {n}"),
+            Selector::NearestTree => "nearest tree".to_string(),
+            Selector::NearestMine => "nearest mine".to_string(),
+            Selector::NearestLegalSite => "nearest legal site".to_string(),
+        }
+    }
+
+    /// Does this selector name a set of the seat's own units?
+    pub fn is_unit_selector(&self) -> bool {
+        matches!(
+            self,
+            Selector::Heroes
+                | Selector::Army
+                | Selector::AllUnits
+                | Selector::Workers
+                | Selector::Squad(_)
+        )
+    }
+
+    /// Does this selector name a resource node?
+    pub fn is_node_selector(&self) -> bool {
+        matches!(self, Selector::NearestTree | Selector::NearestMine)
+    }
+}
+
+impl std::fmt::Display for Selector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.phrase())
+    }
+}
+
+/// The unit-naming half of the vocabulary, for error messages that teach.
+pub const SELECTOR_UNIT_NAMES: &str = "my hero, all army, all units, workers, squad <n>";
+/// The node-naming half.
+pub const SELECTOR_NODE_NAMES: &str = "nearest tree, nearest mine";
+/// Everything a selector phrase may be. Printed by the unknown-phrase refusal,
+/// on the same rule as `Regions::unknown`: a refusal that names no alternative
+/// is a refusal to help.
+pub const SELECTOR_NAMES: &str =
+    "my hero, all army, all units, workers, squad <n>, nearest tree, nearest mine, \
+     nearest legal site";
+
+/// Parse a selector phrase, or `None` if it is not one.
+///
+/// Folded through [`normalize_place`] rather than [`normalize_name`]: a
+/// selector is a phrase with word boundaries that matter (`squad 1`), and
+/// stripping the space would leave `squad1` needing its own parser. Case,
+/// dashes and underscores are noise exactly as they are everywhere else on this
+/// wire, so `"My Hero"`, `"my_hero"` and `"my hero"` are one phrase.
+pub fn parse_selector(raw: &str) -> Option<Selector> {
+    let folded = normalize_place(raw);
+    // `squad 3`, and the two spellings a commander reaches for when it forgets
+    // the space. Bounded by u8 like every other squad id on this wire.
+    if let Some(rest) = folded
+        .strip_prefix("squad ")
+        .or_else(|| folded.strip_prefix("squad:"))
+        .or_else(|| folded.strip_prefix("squad"))
+    {
+        if let Ok(n) = rest.trim().parse::<u8>() {
+            return Some(Selector::Squad(n));
+        }
+    }
+    Some(match folded.as_str() {
+        "my hero" | "hero" | "heroes" | "my heroes" | "our hero" | "our heroes" => Selector::Heroes,
+        "all army" | "army" | "my army" | "our army" | "all my army" | "the army" => Selector::Army,
+        "all units" | "all" | "everything" | "my units" | "our units" | "everyone" => {
+            Selector::AllUnits
+        }
+        "workers" | "worker" | "all workers" | "my workers" | "our workers" => Selector::Workers,
+        "nearest tree" | "nearest trees" | "nearest lumber" | "nearest wood" | "tree" => {
+            Selector::NearestTree
+        }
+        "nearest mine" | "nearest gold" | "nearest gold mine" | "mine" => Selector::NearestMine,
+        "nearest legal site" | "nearest legal" | "nearest free site" | "nearest free"
+        | "nearest site" | "auto" => Selector::NearestLegalSite,
+        _ => return None,
+    })
+}
+
+/// The refusal an unrecognised selector phrase earns. One wording, so every
+/// channel teaches the same lesson — the [`Regions::unknown`] rule applied to
+/// roles instead of places.
+pub fn unknown_selector(raw: &str) -> String {
+    format!("unknown selector '{raw}' — known selectors: {SELECTOR_NAMES}")
+}
+
 /// Everything a player can mean.
 ///
 /// Grouped by what it is for: unit orders, production, the doctrine layer that
 /// runs at machine speed for whoever set it, abilities and items, and the three
 /// match-level statements. Adding a verb here is adding it to *both* seats at
 /// once, which is the point.
+///
+/// **Two late-binding channels run through this vocabulary**, and both are
+/// optional keys that outrank the frozen form beside them:
+///
+///   * `"region": "<name>"` wherever `x`/`z` appear — the place channel, which
+///     has always been here.
+///   * `"select": "<phrase>"` wherever `units`, `worker` or a cast's `hero`
+///     appear — the role channel. See [`Selector`]. Plus `"target_select"` for
+///     the node a `harvest` gathers and the unit a `follow` follows, and
+///     `"site"` for `build`'s footprint.
+///
+/// Both resolve in `intent::resolve_places`, which runs at the top of the one
+/// compiler — so a trigger's `then` and a plan's step resolve when they FIRE,
+/// against the world that fired them.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Intent {
@@ -7620,6 +7798,10 @@ pub enum Intent {
     /// all" is now a thing a sentence can say, and it earns a refusal that
     /// names both spellings rather than serde's "missing field x".
     Move {
+        /// Frozen ids. `#[serde(default)]` so a sentence may name its units by
+        /// `select` alone and omit this key entirely — the array still
+        /// serializes exactly as it always did, so nothing on the wire moved.
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
@@ -7627,8 +7809,15 @@ pub enum Intent {
         z: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
+        /// The role channel. See [`Selector`]. Given, it OUTRANKS `units`, on
+        /// the same rule that makes a region outrank the coordinates beside it.
+        /// Last in the struct because new wire keys are appended, never
+        /// interleaved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     AttackMove {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
@@ -7636,31 +7825,74 @@ pub enum Intent {
         z: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     Attack {
+        #[serde(default)]
         units: Vec<IntentId>,
         target: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Gold mines and trees alike; workers only.
+    ///
+    /// `target_select` — `"nearest tree"` or `"nearest mine"` — is the answer to
+    /// the memorized-tree bug: the node is chosen when the order is COMPILED,
+    /// measured from the workers being sent, so a repeating trigger that says
+    /// "idle workers, nearest tree" keeps working after the tree it would have
+    /// frozen is felled.
     Harvest {
+        #[serde(default)]
         units: Vec<IntentId>,
-        target: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_select: Option<String>,
     },
     Return {
+        #[serde(default)]
         units: Vec<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     Follow {
+        #[serde(default)]
         units: Vec<IntentId>,
-        target: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
+        /// A unit selector naming the leader. Resolves to ONE unit — the lowest
+        /// entity id among the matches — so `"my hero"` escorts the hero this
+        /// team has *now*, not the one it had when the trigger was armed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_select: Option<String>,
     },
     /// Halt in place and drop any attack target.
     Stop {
+        #[serde(default)]
         units: Vec<IntentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
 
     // --- production ---
+    /// `select` names the worker by role instead of by id and resolves to ONE —
+    /// the lowest entity id among the matches — which is what kills the "wrong
+    /// worker frozen into a repeating trigger" class.
+    ///
+    /// `site: "nearest legal site"` lets the engine move the footprint to the
+    /// nearest legal one within [`crate::intent::PLACEMENT_HINT_RADIUS`] of the
+    /// point named, instead of refusing. Blue-r23 armed a farm trigger on fixed
+    /// coordinates, watched it report `site blocked` every retry for the whole
+    /// match, and never got the farm; the hint the refusal already computed was
+    /// right there and nothing could accept it.
     Build {
-        worker: IntentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<IntentId>,
         kind: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
@@ -7668,6 +7900,10 @@ pub enum Intent {
         z: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
     },
     Train {
         building: IntentId,
@@ -7746,8 +7982,8 @@ pub enum Intent {
     /// into: a caster that closed the gap by itself would undo the reason
     /// targeted casting exists.
     Cast {
-        #[serde(alias = "caster")]
-        hero: IntentId,
+        #[serde(alias = "caster", default, skip_serializing_if = "Option::is_none")]
+        hero: Option<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ability: Option<AbilitySelector>,
         /// Ground point for a `"point"` ability. Both `x` and `z` or neither.
@@ -7758,6 +7994,13 @@ pub enum Intent {
         /// Victim/beneficiary for a `"unit"` ability.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<IntentId>,
+        /// A unit selector naming the CASTER, resolved when the cast compiles
+        /// and narrowed to one — the lowest entity id among the matches. This
+        /// is the one that kills red-r23's dead-hero-id trigger: a hero-save
+        /// rule armed as `"select":"my hero"` still finds the hero after it has
+        /// died and been revived into a new entity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Buy a consumable at one of our own finished Shops.
     ///
@@ -7796,13 +8039,17 @@ pub enum Intent {
     // --- doctrine: standing policy, executed by the engine at machine speed ---
     /// Focus-fire order. An empty/omitted `classes` clears the policy.
     Priority {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default)]
         classes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Break off below `below` (a fraction in the open range 0..1) and fall
     /// back to x/z. `below` omitted, null, or 0 clears the policy.
     Retreat {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         below: Option<f32>,
@@ -7812,6 +8059,8 @@ pub enum Intent {
         z: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Anchor to x/z within `radius`. `radius <= 0` clears the policy.
     ///
@@ -7820,6 +8069,7 @@ pub enum Intent {
     /// not also require remembering how big you said the perimeter was. An
     /// explicit `radius` still wins.
     Leash {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         x: Option<f32>,
@@ -7829,23 +8079,31 @@ pub enum Intent {
         region: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         radius: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Heroes only. `min_enemies` omitted, null, or 0 clears the rule.
     /// `ability` names the slot the rule governs; omitted, it means the first
     /// slot, which is what it always meant. Rules are per-slot: a hero told to
     /// auto-heal does not thereby stop auto-slamming.
     Autocast {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         min_enemies: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ability: Option<AbilitySelector>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// Squad membership. `id` omitted or null removes the units from any squad.
     Squad {
+        #[serde(default)]
         units: Vec<IntentId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<String>,
     },
     /// What a squad is for. `posture` omitted or null clears the entry, which
     /// leaves the members where they are without disbanding the squad.
@@ -8132,10 +8390,35 @@ impl Intent {
                 _ => "(unspecified)".to_string(),
             }
         }
-        fn group(units: &[IntentId]) -> String {
+        /// How a sentence names the units it is about. **A selector is spoken
+        /// as its phrase**, for the same reason a region is spoken as its name:
+        /// the replay line for a hero-save rule should read "my hero falls back
+        /// to home", not "unit 4294967297 falls back to (0.0, 0.0)" — and after
+        /// the hero has died and been revived, the id in that second line would
+        /// be a lie besides. An unparseable phrase is quoted verbatim so the log
+        /// shows the typo the commander actually wrote.
+        fn group(units: &[IntentId], select: &Option<String>) -> String {
+            if let Some(raw) = select {
+                return match parse_selector(raw) {
+                    Some(sel) => sel.phrase(),
+                    None => format!("'{raw}'"),
+                };
+            }
             match units.len() {
                 1 => format!("unit {}", units[0]),
                 n => format!("{n} units"),
+            }
+        }
+        /// The same rule for the single-referent channels — a `build`'s worker,
+        /// a `cast`'s caster, a `follow`'s leader.
+        fn one(id: &Option<IntentId>, select: &Option<String>) -> String {
+            match (select, id) {
+                (Some(raw), _) => match parse_selector(raw) {
+                    Some(sel) => sel.phrase(),
+                    None => format!("'{raw}'"),
+                },
+                (None, Some(id)) => format!("{id}"),
+                (None, None) => "(unspecified)".to_string(),
             }
         }
         /// How a sentence names an ability slot. The id reads as itself; a
@@ -8148,30 +8431,84 @@ impl Intent {
             }
         }
         match self {
-            Intent::Move { units, x, z, region } => {
-                format!("move {} to {}", group(units), place(x, z, region))
+            Intent::Move {
+                units,
+                x,
+                z,
+                region,
+                select,
+            } => {
+                format!("move {} to {}", group(units, select), place(x, z, region))
             }
-            Intent::AttackMove { units, x, z, region } => {
-                format!("attack-move {} to {}", group(units), place(x, z, region))
+            Intent::AttackMove {
+                units,
+                x,
+                z,
+                region,
+                select,
+            } => {
+                format!(
+                    "attack-move {} to {}",
+                    group(units, select),
+                    place(x, z, region)
+                )
             }
-            Intent::Attack { units, target } => {
-                format!("{} attack {target}", group(units))
+            Intent::Attack {
+                units,
+                target,
+                select,
+            } => {
+                format!("{} attack {target}", group(units, select))
             }
-            Intent::Harvest { units, target } => {
-                format!("{} harvest node {target}", group(units))
+            Intent::Harvest {
+                units,
+                target,
+                select,
+                target_select,
+            } => {
+                format!(
+                    "{} harvest node {}",
+                    group(units, select),
+                    one(target, target_select)
+                )
             }
-            Intent::Return { units } => format!("{} return cargo", group(units)),
-            Intent::Follow { units, target } => {
-                format!("{} follow {target}", group(units))
+            Intent::Return { units, select } => {
+                format!("{} return cargo", group(units, select))
             }
-            Intent::Stop { units } => format!("{} hold position", group(units)),
+            Intent::Follow {
+                units,
+                target,
+                select,
+                target_select,
+            } => {
+                format!(
+                    "{} follow {}",
+                    group(units, select),
+                    one(target, target_select)
+                )
+            }
+            Intent::Stop { units, select } => {
+                format!("{} hold position", group(units, select))
+            }
             Intent::Build {
                 worker,
                 kind,
                 x,
                 z,
                 region,
-            } => format!("worker {worker} builds {kind} at {}", place(x, z, region)),
+                select,
+                site,
+            } => {
+                // The site selector is part of the sentence because "build the
+                // farm at (10, 20)" and "build the farm near (10, 20), wherever
+                // it fits" are different instructions, and a log that spelled
+                // them identically would hide which one was given.
+                let where_ = match site {
+                    Some(_) => format!("the nearest legal site to {}", place(x, z, region)),
+                    None => place(x, z, region),
+                };
+                format!("worker {} builds {kind} at {where_}", one(worker, select))
+            }
             Intent::Train { building, unit } => {
                 format!("building {building} trains {unit}")
             }
@@ -8205,13 +8542,20 @@ impl Intent {
             // pointed somewhere else. A log line that read `7 casts Slow` for
             // both a clump-shattering hit and a shot at empty ground would
             // hide the only decision the caster made.
-            Intent::Cast { hero, ability, x, z, target } => {
+            Intent::Cast {
+                hero,
+                ability,
+                x,
+                z,
+                target,
+                select,
+            } => {
                 let aim = match (x, z, target) {
                     (Some(x), Some(z), _) => format!(" at {}", at(*x, *z)),
                     (_, _, Some(t)) => format!(" on {t}"),
                     _ => String::new(),
                 };
-                format!("{hero} casts {}{aim}", ability_name(ability))
+                format!("{} casts {}{aim}", one(hero, select), ability_name(ability))
             }
             Intent::Buy { shop, item, hero } => match hero {
                 Some(hero) => format!("hero {hero} buys {item} at shop {shop}"),
@@ -8236,26 +8580,44 @@ impl Intent {
                     None => format!("hero uses item in slot {slot}{to}"),
                 }
             }
-            Intent::Priority { units, classes } => {
+            Intent::Priority {
+                units,
+                classes,
+                select,
+            } => {
                 if classes.is_empty() {
-                    format!("{} clear focus-fire priority", group(units))
+                    format!("{} clear focus-fire priority", group(units, select))
                 } else {
-                    format!("{} focus {}", group(units), classes.join(" > "))
+                    format!("{} focus {}", group(units, select), classes.join(" > "))
                 }
             }
-            Intent::Retreat { units, below, x, z, region } => {
+            Intent::Retreat {
+                units,
+                below,
+                x,
+                z,
+                region,
+                select,
+            } => {
                 let has_place = region.is_some() || (x.is_some() && z.is_some());
                 match below {
                     Some(b) if *b > 0.0 && has_place => format!(
                         "{} fall back to {} below {:.0}% health",
-                        group(units),
+                        group(units, select),
                         place(x, z, region),
                         b * 100.0
                     ),
-                    _ => format!("{} clear retreat policy", group(units)),
+                    _ => format!("{} clear retreat policy", group(units, select)),
                 }
             }
-            Intent::Leash { units, x, z, region, radius } => {
+            Intent::Leash {
+                units,
+                x,
+                z,
+                region,
+                radius,
+                select,
+            } => {
                 let has_place = region.is_some() || (x.is_some() && z.is_some());
                 // A leash whose radius came from the region has no number to
                 // print, so it names the shape instead — and "hold the
@@ -8263,35 +8625,36 @@ impl Intent {
                 match (radius, has_place) {
                     (Some(r), true) if *r > 0.0 => format!(
                         "{} hold within {r:.0} of {}",
-                        group(units),
+                        group(units, select),
                         place(x, z, region)
                     ),
                     (None, true) => match region {
-                        Some(name) => format!("{} hold {name}", group(units)),
-                        None => format!("{} clear leash", group(units)),
+                        Some(name) => format!("{} hold {name}", group(units, select)),
+                        None => format!("{} clear leash", group(units, select)),
                     },
-                    _ => format!("{} clear leash", group(units)),
+                    _ => format!("{} clear leash", group(units, select)),
                 }
             }
             Intent::Autocast {
                 units,
                 min_enemies,
                 ability,
+                select,
             } => match min_enemies {
                 Some(n) if *n > 0 => format!(
                     "{} auto-cast {} at {n}+ enemies",
-                    group(units),
+                    group(units, select),
                     ability_name(ability)
                 ),
                 _ => format!(
                     "{} clear auto-cast for {}",
-                    group(units),
+                    group(units, select),
                     ability_name(ability)
                 ),
             },
-            Intent::Squad { units, id } => match id {
-                Some(id) => format!("{} join squad {id}", group(units)),
-                None => format!("{} leave their squad", group(units)),
+            Intent::Squad { units, id, select } => match id {
+                Some(id) => format!("{} join squad {id}", group(units, select)),
+                None => format!("{} leave their squad", group(units, select)),
             },
             Intent::Posture { id, posture } => match posture {
                 None => format!("squad {id} stands down (posture cleared)"),

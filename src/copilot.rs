@@ -858,6 +858,16 @@ fn ingest_wire(
 // ---------------------------------------------------------------------------
 
 /// Which of the issuer's own units a verb is about.
+///
+/// **A proposal carrying a `select` phrase scopes to nothing here, and that is
+/// deliberate.** A proposal is held UNRESOLVED — it has not been through the
+/// compiler and may never be — so the only honest way to expand `"all army"`
+/// into ids would be to resolve it *here*, which is a second resolution path
+/// and the one thing docs/INTENT.md forbids. The cost is a narrower conflict
+/// preview for selector-written proposals (the reviewer is told the batch
+/// overrides nothing rather than told what it overrides); the fix, when it is
+/// worth a bead, is to route the preview through `intent::resolve_places`
+/// rather than to teach this function the vocabulary a second time.
 enum Scope {
     Units(Vec<IntentId>),
     Squad(u8),
@@ -870,15 +880,15 @@ fn scope_of(intent: &Intent) -> Scope {
         | Intent::AttackMove { units, .. }
         | Intent::Attack { units, .. }
         | Intent::Harvest { units, .. }
-        | Intent::Return { units }
+        | Intent::Return { units, .. }
         | Intent::Follow { units, .. }
-        | Intent::Stop { units }
+        | Intent::Stop { units, .. }
         | Intent::Priority { units, .. }
         | Intent::Retreat { units, .. }
         | Intent::Leash { units, .. }
         | Intent::Autocast { units, .. }
         | Intent::Squad { units, .. } => Scope::Units(units.clone()),
-        Intent::Build { worker, .. } => Scope::Units(vec![*worker]),
+        Intent::Build { worker, .. } => Scope::Units(worker.iter().copied().collect()),
         Intent::Posture { id, .. } => Scope::Squad(*id),
         _ => Scope::Nothing,
     }
@@ -1797,6 +1807,7 @@ mod tests {
             x: Some(0.0),
             z: Some(0.0),
             region: None,
+            select: None,
         };
         let train = Intent::Train {
             building: 1,
@@ -1805,6 +1816,7 @@ mod tests {
         let attack = Intent::Attack {
             units: vec![1],
             target: 2,
+            select: None,
         };
         let surrender = Intent::Surrender;
 
@@ -1834,12 +1846,42 @@ mod tests {
     #[test]
     fn the_advertised_direct_verbs_are_the_ones_that_pass() {
         let samples: Vec<Intent> = vec![
-            Intent::Priority { units: vec![1], classes: Vec::new() },
-            Intent::Retreat { units: vec![1], below: None, x: None, z: None, region: None },
-            Intent::Leash { units: vec![1], x: None, z: None, region: None, radius: None },
-            Intent::Autocast { units: vec![1], min_enemies: None, ability: None },
-            Intent::Squad { units: vec![1], id: None },
-            Intent::Posture { id: 1, posture: None },
+            Intent::Priority {
+                units: vec![1],
+                classes: Vec::new(),
+                select: None,
+            },
+            Intent::Retreat {
+                units: vec![1],
+                below: None,
+                x: None,
+                z: None,
+                region: None,
+                select: None,
+            },
+            Intent::Leash {
+                units: vec![1],
+                x: None,
+                z: None,
+                region: None,
+                radius: None,
+                select: None,
+            },
+            Intent::Autocast {
+                units: vec![1],
+                min_enemies: None,
+                ability: None,
+                select: None,
+            },
+            Intent::Squad {
+                units: vec![1],
+                id: None,
+                select: None,
+            },
+            Intent::Posture {
+                id: 1,
+                posture: None,
+            },
             Intent::Template {
                 building: 1,
                 squad: None,
@@ -1921,6 +1963,7 @@ mod tests {
                     x: Some(1.0),
                     z: Some(2.0),
                     region: None,
+                    select: None,
                 },
                 2,
             ),
@@ -1928,20 +1971,29 @@ mod tests {
                 Intent::Attack {
                     units: vec![7],
                     target: 9,
+                    select: None,
                 },
                 1,
             ),
             (
                 Intent::Build {
-                    worker: 7,
+                    worker: Some(7),
                     kind: "Farm".to_string(),
                     x: Some(0.0),
                     z: Some(0.0),
                     region: None,
+                    select: None,
+                    site: None,
                 },
                 1,
             ),
-            (Intent::Stop { units: vec![7, 8, 9] }, 3),
+            (
+                Intent::Stop {
+                    units: vec![7, 8, 9],
+                    select: None,
+                },
+                3,
+            ),
         ];
         for (intent, want) in cases {
             match scope_of(&intent) {
