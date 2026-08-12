@@ -257,16 +257,16 @@ fn cohesion_point(positions: &[Vec3], target: Vec3) -> Option<Vec3> {
     Some(Vec3::new(centroid.x, 0.0, centroid.z) + dir * COHESION_STEP)
 }
 
-/// `cohesion_point`, plus the answer to "is this squad getting anywhere?".
+/// Update one squad's gather memo and answer the only question a gather has:
+/// **is this squad getting anywhere?**
 ///
-/// The geometry is unchanged and still lives in `cohesion_point`; what this
-/// adds is a clock on the *waiting*, and the clock is re-armed by **progress of
-/// either kind**:
+/// The clock is re-armed by **progress of either kind**:
 ///
 ///   * the formation tightening — the tail is closing, which is what the whole
 ///     rule is for; or
-///   * the squad's leading edge getting nearer the objective — the push is
-///     working, and a working push is not a stall whatever its spread is doing.
+///   * the squad's leading edge getting nearer the objective — the advance is
+///     working, and a working advance is not a stall whatever its spread is
+///     doing.
 ///
 /// A squad doing neither for `COHESION_PATIENCE` seconds is not forming up and
 /// is not advancing. Something behind it is replacing stragglers as fast as
@@ -279,20 +279,20 @@ fn cohesion_point(positions: &[Vec3], target: Vec3) -> Option<Vec3> {
 /// The memo is kept while the squad presses on, deliberately: the condition
 /// that defeated the gather is still true next tick, and re-arming here would
 /// buy back the oscillation one patience-window at a time. Cohesion comes back
-/// the moment the squad IS cohesive, which is also when the memo is dropped.
-fn gate_gather(
+/// the moment the squad IS cohesive — which is when the caller drops the memo.
+///
+/// Split out of `gate_gather` for wc3clone-b8x, because Forage's second arm
+/// gathers on a *different* threshold (`DEFENDED_SPREAD`, not
+/// `COHESION_SPREAD`) and so cannot ask the question through `cohesion_point`.
+/// There is still one clock per squad and one definition of progress; only the
+/// geometry that opens a gather differs.
+fn gather_has_patience(
     gathers: &mut std::collections::BTreeMap<(Team, u8), Gather>,
     key: (Team, u8),
     positions: &[Vec3],
     objective: Vec3,
     now: f32,
-) -> Option<Vec3> {
-    let Some(point) = cohesion_point(positions, objective) else {
-        // Cohesive (or trivially small): nothing to wait for, and the next
-        // gather starts from a clean slate.
-        gathers.remove(&key);
-        return None;
-    };
+) -> bool {
     let (_, spread) = formation(positions, objective);
     // The LEADING edge, not the centre of mass. The centroid is exactly the
     // quantity the refilled tail poisons — every body that appears at home
@@ -310,9 +310,10 @@ fn gate_gather(
         best_dist: dist,
         improved_at: now,
     });
-    // A re-aimed push is a new gather. `ORDER_EPS` is the same slack the order
-    // comparison uses, so "the commander moved the objective" means the same
-    // thing here as it does there.
+    // A re-aimed advance is a new gather — a commander who moves the objective,
+    // or a forager whose nearest visible cache changed, gets fresh patience for
+    // it. `ORDER_EPS` is the same slack the order comparison uses, so "the
+    // objective moved" means the same thing here as it does there.
     if xz_dist(entry.objective, objective) > ORDER_EPS {
         *entry = Gather {
             objective,
@@ -336,10 +337,27 @@ fn gate_gather(
         entry.best_dist = dist;
         entry.improved_at = now;
     }
-    if now - entry.improved_at > COHESION_PATIENCE {
+    now - entry.improved_at <= COHESION_PATIENCE
+}
+
+/// `cohesion_point`, gated by `gather_has_patience`: the regroup point a Push
+/// squad should be sent to this tick, or `None` for "go straight at the
+/// objective" — either because the squad is already cohesive, or because the
+/// gather has run out of patience and is pressing on with what it has.
+fn gate_gather(
+    gathers: &mut std::collections::BTreeMap<(Team, u8), Gather>,
+    key: (Team, u8),
+    positions: &[Vec3],
+    objective: Vec3,
+    now: f32,
+) -> Option<Vec3> {
+    let Some(point) = cohesion_point(positions, objective) else {
+        // Cohesive (or trivially small): nothing to wait for, and the next
+        // gather starts from a clean slate.
+        gathers.remove(&key);
         return None;
-    }
-    Some(point)
+    };
+    gather_has_patience(gathers, key, positions, objective, now).then_some(point)
 }
 
 /// Centre of mass on the ground plane, and the distance of the widest member
@@ -478,11 +496,35 @@ enum ForagePlan {
 /// What it deliberately does not do is refuse to go. A forager that will not
 /// walk past a tower it once saw is a forager that never leaves home, and the
 /// posture's whole job is to be out on the map.
+///
+/// **Both of the gathers below wear r22's clock** (wc3clone-b8x). Each one
+/// regroups the squad through the centre of mass of *every* member, which is
+/// precisely the quantity a refilled tail poisons: a Barracks training into the
+/// forage squad puts a fresh body at home every few seconds, the centroid sits
+/// halfway back down the map, and the foragers who already reached the treasure
+/// are walked off it — the same oscillation that cost r22's rusher four hundred
+/// seconds under `posture:push`, on the posture COMMANDER_BRIEF sells as the
+/// set-and-forget midfield owner. `gather_has_patience` is the shared answer:
+/// a gather that is neither tightening nor closing on its objective for
+/// `COHESION_PATIENCE` gives up on the stragglers.
+///
+/// What each arm does when the patience runs out is the arm's own business, and
+/// they differ because the danger does:
+///
+///   * arm 1 falls back to `Scatter`, which is free hunting — the pre-cohesion
+///     behaviour, and the right answer when nothing known is shooting;
+///   * arm 2 falls back to `Together(objective)`, going in as one body with
+///     whoever is actually here. Deliberately **not** `Scatter`: single file
+///     into a tower is exactly the R10 death, and a squad that has stopped
+///     gathering still owes itself one order to one point.
 fn plan_forage(
+    gathers: &mut std::collections::BTreeMap<(Team, u8), Gather>,
+    key: (Team, u8),
     positions: &[Vec3],
     bounties: &[Vec3],
     defenses: &[(Vec3, f32)],
     muster: Vec3,
+    now: f32,
 ) -> ForagePlan {
     let (centroid, spread) = formation(positions, muster);
 
@@ -494,20 +536,27 @@ fn plan_forage(
         .collect();
     if !open.is_empty() {
         let objective = nearest_point(&open, centroid).unwrap_or(muster);
-        return match cohesion_point(positions, objective) {
+        return match gate_gather(gathers, key, positions, objective, now) {
             Some(p) => ForagePlan::Together(p),
             None => ForagePlan::Scatter(open),
         };
     }
 
     // 2. Everything left is covered. One objective for everybody, and nobody
-    //    crosses the line until the squad is actually a squad.
+    //    crosses the line until the squad is actually a squad — or until the
+    //    squad stops becoming one.
     let objective = nearest_point(bounties, centroid).unwrap_or(muster);
-    if spread > DEFENDED_SPREAD {
+    if spread > DEFENDED_SPREAD && gather_has_patience(gathers, key, positions, objective, now) {
         let dir =
             Vec3::new(objective.x - centroid.x, 0.0, objective.z - centroid.z).normalize_or_zero();
         let stage = centroid + dir * COHESION_STEP;
         return ForagePlan::Together(clear_of_defenses(stage, defenses));
+    }
+    // Gathered (or done trying). Either way the memo has served its purpose and
+    // the next gather starts from a clean slate — same rule `gate_gather`
+    // applies when `cohesion_point` says the squad is cohesive.
+    if spread <= DEFENDED_SPREAD {
+        gathers.remove(&key);
     }
     ForagePlan::Together(objective)
 }
@@ -1018,9 +1067,11 @@ fn run_squad_postures(
     fog: Res<FogGrids>,
     ai: Res<AiControlled>,
     external: Res<ExternallyCommanded>,
-    // One entry per Push squad that is currently gathering. `BTreeMap` because
-    // it is on a gameplay path (BUILDER_BRIEF §6.4) even though nothing here
-    // iterates it.
+    // One entry per squad that is currently gathering — Push through
+    // `gate_gather`, Forage through `plan_forage`. One clock per squad, which
+    // is well defined because a squad has exactly one posture. `BTreeMap`
+    // because it is on a gameplay path (BUILDER_BRIEF §6.4) even though nothing
+    // here iterates it.
     mut gathers: Local<std::collections::BTreeMap<(Team, u8), Gather>>,
 ) {
     if squad_orders.0.is_empty() {
@@ -1122,6 +1173,11 @@ fn run_squad_postures(
             SquadPosture::Push { pos } => {
                 gate_gather(&mut gathers, (team, squad), &squad_positions, pos, now)
             }
+            // Forage keeps its memo — `plan_forage` owns that clock below, and
+            // clearing it here would hand the forage gather fresh patience on
+            // every heartbeat, which is the bug with extra steps. Every other
+            // posture gathers not at all.
+            SquadPosture::Forage { .. } => None,
             _ => {
                 gathers.remove(&(team, squad));
                 None
@@ -1136,10 +1192,13 @@ fn run_squad_postures(
             SquadPosture::Forage { muster } if !bounty_points.is_empty() => {
                 let defenses = known_defenses(team_fog, team, &emplacements);
                 Some(plan_forage(
+                    &mut gathers,
+                    (team, squad),
                     &squad_positions,
                     &bounty_points,
                     &defenses,
                     muster,
+                    now,
                 ))
             }
             _ => None,
@@ -1605,10 +1664,63 @@ mod tests {
             Vec3::new(0.0, 0.0, 2.0),
             Vec3::new(-1.0, 0.0, 0.0),
         ];
+        let mut clock = std::collections::BTreeMap::new();
         assert_eq!(
-            plan_forage(&tight, &[T_COVERED], &defenses, Vec3::ZERO),
+            plan_forage(
+                &mut clock,
+                (Team::Human, 2),
+                &tight,
+                &[T_COVERED],
+                &defenses,
+                Vec3::ZERO,
+                0.0
+            ),
             ForagePlan::Together(T_COVERED),
             "a gathered squad must commit to the cache, not sit outside forever"
+        );
+        assert!(
+            clock.is_empty(),
+            "a gathered squad left a gather memo behind for the next one to inherit"
+        );
+    }
+
+    /// The other half of "never leaves home", and the arm-2 twin of r22
+    /// (wc3clone-b8x): a squad that *cannot* gather must eventually go in too.
+    ///
+    /// Nothing moves in this test, which is the point — a tail refilled as fast
+    /// as it closes looks exactly like a formation that never tightens, and the
+    /// stage point (centroid + a step) walks backwards with the centroid while
+    /// it happens. Before the patience this squad staged forever.
+    #[test]
+    fn a_forage_gather_that_never_closes_gives_up_and_goes_in() {
+        let defenses = vec![(T_TOWER, tower_radius())];
+        // Strung out by `DEFENDED_SPREAD`'s standard and cohesive by the
+        // general one, so this is arm 2's gate and nothing else.
+        let strung = [
+            Vec3::new(0.0, 0.0, -10.0),
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+        ];
+        let key = (Team::Human, 2);
+        let mut clock = std::collections::BTreeMap::new();
+        let plan_at = |clock: &mut std::collections::BTreeMap<(Team, u8), Gather>, now: f32| {
+            plan_forage(clock, key, &strung, &[T_COVERED], &defenses, Vec3::ZERO, now)
+        };
+
+        for t in [0.0, COHESION_PATIENCE - 1.0] {
+            match plan_at(&mut clock, t) {
+                ForagePlan::Together(p) => assert!(
+                    xz_dist(p, T_COVERED) > 0.1,
+                    "at t={t} the squad walked onto the covered cache without gathering"
+                ),
+                other => panic!("at t={t} the squad scattered under known guns: {other:?}"),
+            }
+        }
+        assert_eq!(
+            plan_at(&mut clock, COHESION_PATIENCE + 1.0),
+            ForagePlan::Together(T_COVERED),
+            "a gather that has not closed in {COHESION_PATIENCE}s is still staging — \
+             this is r22's oscillation on the forage arm"
         );
     }
 
@@ -2370,8 +2482,20 @@ mod probe {
                     let obj = nearest_point(caches, c).unwrap();
                     cohesion_point(&squad, obj).unwrap_or(obj)
                 };
+                // A fresh clock per call: this probe is a statement about the
+                // geometry on the first heartbeat of a gather, and a shared
+                // memo would let one sample's patience decide another's.
                 let new = |caches: &[Vec3]| -> Vec3 {
-                    match plan_forage(&squad, caches, &defenses, centre) {
+                    let mut clock = std::collections::BTreeMap::new();
+                    match plan_forage(
+                        &mut clock,
+                        (Team::Human, 2),
+                        &squad,
+                        caches,
+                        &defenses,
+                        centre,
+                        0.0,
+                    ) {
                         ForagePlan::Together(p) => p,
                         ForagePlan::Scatter(ts) => nearest_point(&ts, centre).unwrap(),
                     }
@@ -2496,7 +2620,12 @@ mod ford {
         ));
         app.init_resource::<Races>()
             .init_resource::<SquadOrders>()
-            .init_resource::<FogGrids>()
+            // Lit, and pinned rather than inherited: `Forage` only hunts
+            // treasure its team can see, so a bench that read the ambient
+            // `BH_FOG` would measure a blind forager on one machine and a
+            // sighted one on the next. Push consults no fog at all, so this is
+            // free for the rows that were here before.
+            .insert_resource(FogGrids::test_revealed())
             .init_resource::<ExternallyCommanded>()
             .insert_resource(AiControlled { human: false, claude: false })
             .insert_resource(crossings_nav());
@@ -2553,6 +2682,22 @@ mod ford {
         end_dist: f32,
     }
 
+    /// What the squad was told to do. Three rules over one map, one movement
+    /// pipeline and one heartbeat, which is the only way to say that a
+    /// difference between them belongs to the rule.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        /// `posture:push` — the cohesive advance.
+        Push,
+        /// `posture:forage`, with one visible cache sitting on the objective.
+        /// `plan_forage`'s divert arm regroups through `cohesion_point` on the
+        /// same all-members population the Push arm used, so a refilled tail
+        /// poisons it in exactly the same way (wc3clone-b8x).
+        Forage,
+        /// Raw `attackmove`: the control, and the workaround r22 fell back on.
+        AttackMove,
+    }
+
     /// Step the bench and watch the squad's median member — the median, not the
     /// leader, because one scout over the water is not a crossing and one
     /// straggler at home is not a failure.
@@ -2562,19 +2707,37 @@ mod ford {
         objective: Vec3,
         secs: f32,
         reinforce_every: Option<f32>,
-        attackmove: bool,
+        mode: Mode,
     ) -> Run {
-        if attackmove {
-            for m in members {
-                app.world_mut()
-                    .entity_mut(*m)
-                    .insert(Order::AttackMove(objective));
+        match mode {
+            Mode::AttackMove => {
+                for m in members {
+                    app.world_mut()
+                        .entity_mut(*m)
+                        .insert(Order::AttackMove(objective));
+                }
             }
-        } else {
-            app.world_mut()
-                .resource_mut::<SquadOrders>()
-                .0
-                .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+            Mode::Push => {
+                app.world_mut()
+                    .resource_mut::<SquadOrders>()
+                    .0
+                    .insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+            }
+            Mode::Forage => {
+                // One cache, on the objective, that never expires — bounty.rs
+                // is not in this bench, so "still in the query" is liveness and
+                // nothing ever claims it. The muster is home, so a squad that
+                // somehow lost sight of the treasure would walk backwards
+                // visibly rather than quietly stand still.
+                app.world_mut().spawn((
+                    Bounty { gold: 270, expires_at: f32::MAX },
+                    Transform::from_translation(objective),
+                ));
+                app.world_mut()
+                    .resource_mut::<SquadOrders>()
+                    .0
+                    .insert((Team::Human, 1), SquadPosture::Forage { muster: HUMAN_BASE });
+            }
         }
 
         let frames = (secs as f64 / DT) as usize;
@@ -2686,14 +2849,29 @@ mod ford {
         ] {
             let mut app = bench();
             let members = squad(&mut app, HUMAN_BASE, 12);
-            let r = run(&mut app, &members, objective, secs, every, false);
+            let r = run(&mut app, &members, objective, secs, every, Mode::Push);
             report(&format!("push, {label}"), &r, floor);
+        }
+        // The same measurement for the other posture that regroups through the
+        // centroid. `posture:forage` is sold in COMMANDER_BRIEF as the
+        // set-and-forget midfield owner, so it is the arm a ladder commander is
+        // most likely to leave running while a Barracks refills its tail.
+        println!("  --- posture:forage, one cache sitting on the same objective ---");
+        for (every, label) in [
+            (None, "no reinforcement"),
+            (Some(8.0), "+1 body every  8s"),
+            (Some(5.0), "+1 body every  5s"),
+        ] {
+            let mut app = bench();
+            let members = squad(&mut app, HUMAN_BASE, 12);
+            let r = run(&mut app, &members, objective, secs, every, Mode::Forage);
+            report(&format!("forage, {label}"), &r, floor);
         }
         println!("  --- control: raw attackmove, the workaround r22 fell back on ---");
         for (every, label) in [(None, "no reinforcement"), (Some(8.0), "+1 body every  8s")] {
             let mut app = bench();
             let members = squad(&mut app, HUMAN_BASE, 12);
-            let r = run(&mut app, &members, objective, secs, every, true);
+            let r = run(&mut app, &members, objective, secs, every, Mode::AttackMove);
             report(&format!("attackmove, {label}"), &r, floor);
         }
         println!();
@@ -2726,7 +2904,7 @@ mod ford {
 
         let mut app = bench();
         let members = squad(&mut app, HUMAN_BASE, 12);
-        let r = run(&mut app, &members, objective, secs, Some(8.0), false);
+        let r = run(&mut app, &members, objective, secs, Some(8.0), Mode::Push);
         report("push, +1 body every  8.0s", &r, floor);
 
         assert!(r.ever_across, "the squad never got over the ford at all");
@@ -2751,6 +2929,54 @@ mod ford {
         assert!(
             r.gave_ground <= 2,
             "the squad walked off its own objective and back {} times",
+            r.gave_ground
+        );
+    }
+
+    /// **The same bar for `posture:forage`** (wc3clone-b8x).
+    ///
+    /// `plan_forage`'s divert arm regrouped through `cohesion_point` on the same
+    /// all-members population the Push arm did, so it had the identical defect
+    /// and this bench measured it identically: with the patience off, twelve
+    /// foragers taking one cache over the centre ford with a body joining every
+    /// eight seconds spend 30 game seconds walked off the treasure across four
+    /// round trips, and 73 seconds at one every five — the very numbers the
+    /// unpatched Push arm produced. It matters more here than there, because
+    /// COMMANDER_BRIEF sells forage as the posture you set once and leave
+    /// running, which is precisely the posture a Barracks refills all match.
+    #[test]
+    fn a_reinforced_forage_takes_the_cache_and_keeps_it() {
+        let objective = Vec3::new(20.0, 0.0, 20.0);
+        let floor = walk_secs(HUMAN_BASE, objective);
+        let secs = 600.0;
+
+        let mut app = bench();
+        let members = squad(&mut app, HUMAN_BASE, 12);
+        let r = run(&mut app, &members, objective, secs, Some(8.0), Mode::Forage);
+        report("forage, +1 body every  8.0s", &r, floor);
+
+        assert!(r.ever_across, "the foragers never got over the ford at all");
+        let arrived = r.arrived.unwrap_or(f32::INFINITY);
+        assert!(
+            arrived < floor * 4.0,
+            "a reinforced forage took {arrived:.0}s to reach a cache {floor:.0}s of walking \
+             away (or never reached it) — the gather is holding the squad short of it"
+        );
+        assert!(
+            r.held > 0.98,
+            "the foragers stood on the cache only {:.0}% of the second half of the match \
+             — they are taking the treasure and giving it back",
+            100.0 * r.held
+        );
+        assert!(
+            r.off_objective < 15.0,
+            "the foragers spent {:.0}s walked off their own cache — this is r22's \
+             oscillation, on the forage arm",
+            r.off_objective
+        );
+        assert!(
+            r.gave_ground <= 2,
+            "the foragers walked off their own cache and back {} times",
             r.gave_ground
         );
     }
