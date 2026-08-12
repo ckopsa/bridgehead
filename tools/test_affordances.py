@@ -30,6 +30,7 @@ of the author's imagination.
 
 from __future__ import annotations
 
+import atexit
 import copy
 import json
 import re
@@ -122,10 +123,12 @@ def test_the_document_has_the_five_top_level_sections():
 def test_the_document_carries_its_own_version():
     """AFFORDANCES.md constraint 3: the scaffold's version travels with the
     result, or the ledger cannot tell model from model+scaffold."""
-    # `1.3`: r25's steady-production recipe fix — a served template that never
-    # compiled now does, which changes what a trusting commander arms. The
-    # major half is the document's SHAPE and has not moved.
-    assert affordances.DOC_VERSION == "affordance-doc/1.3"
+    # `2.0`: the SHAPE moved. The text render is fact-collapsed — one line per
+    # action, grouped, with the blocking fact on everything not ready and the
+    # full render behind `--all` — and the preference channel gained a
+    # commander-declared `focus`. A ledger row that could not tell the ~600-line
+    # page from the ~76-line one would be comparing two different experiments.
+    assert affordances.DOC_VERSION == "affordance-doc/2.0"
     assert doc()["doc_version"] == affordances.DOC_VERSION
     assert run("--doc-version").strip() == affordances.DOC_VERSION
     assert subprocess.run(
@@ -902,12 +905,350 @@ def test_the_digest_and_the_full_readout_are_untouched():
 def test_the_text_render_is_readable_and_terminates():
     for path in LIVE + [EARLY, LEGACY]:
         lines = affordances.render_document(affordances.document(load(path), catalog()))
-        assert lines[0].startswith("DOC affordance-doc/1")
+        assert lines[0].startswith("DOC affordance-doc/")
         assert any(ln.startswith("ACTIONS") for ln in lines)
         assert any(ln.startswith("DEFAULT") for ln in lines)
         assert any(ln.startswith("RAW") for ln in lines)
         for ln in lines:
-            assert len(ln) <= 400, ln
+            # 2.0 trades height for width on purpose, and a folded line carries
+            # a whole template: `plan_set:<name>` reads back two plan steps,
+            # which is ~350 characters of JSON wherever it is printed. Prose is
+            # clipped (`_clip`); a command never is, because a clipped command
+            # is not a command.
+            assert len(ln) <= 500, ln
+
+
+# -- 2.0: fact-collapsed rendering -------------------------------------------
+#
+# arena/LADDER.md Finding 2: all four scaffolded rounds' commanders disobeyed
+# their own spawn instruction to re-read the document each cycle, because ~600
+# lines is uneconomical at a 15-second cadence. Finding 5: the readiness
+# annotations that directly addressed the mid-tier losing moves therefore sat in
+# a render nobody re-opened — served every cycle, read never. These tests are
+# the budget that stops the page growing back.
+
+
+#: The line counts this bead inherited: `render_document` at 1.3, beside
+#: `catalog_full.json`, on these two fixtures. Kept as the thing the collapse is
+#: measured against — and as the pin on `--all`, whose whole promise is that it
+#: is still that render.
+FULL_LINES = {"doc_open_armed.json": 643, "doc_open_alarm.json": 803}
+
+#: What the collapsed render must fit in. The real numbers when this landed were
+#: **76** (armed, 43 actions) and **94** (alarm, 51 actions and a ringing
+#: alarm) — an 8.5x fold both times. The floor is one line per action, because
+#: constraint 1 forbids dropping any, so this budget is really a cap on how many
+#: actions the document may grow before somebody has to think about grouping
+#: them. It is not a pin: a couple of new actions should not fail a suite.
+COLLAPSED_BUDGET = 100
+
+
+def render(path=ARMED, prefs=None, full=False):
+    return affordances.render_document(doc(path, prefs), full=full)
+
+
+def test_the_collapsed_render_fits_on_a_loop_page():
+    """The bead's acceptance criterion, in lines."""
+    for path in LIVE:
+        collapsed = render(path)
+        full = render(path, full=True)
+        assert len(collapsed) <= COLLAPSED_BUDGET, "{}: {} lines".format(
+            path.name, len(collapsed))
+        assert len(full) == FULL_LINES[path.name], (
+            "{}: `--all` is meant to BE the old render; it is now {} lines and was {}".format(
+                path.name, len(full), FULL_LINES[path.name]))
+        assert len(full) >= 6 * len(collapsed), "{}: {} -> {} is not a compression".format(
+            path.name, len(full), len(collapsed))
+
+
+def test_the_collapse_loses_no_action():
+    """Folding is not filtering. Every `rel` the document carries has at least
+    one line of its own in the collapsed render — AFFORDANCES.md constraint 1:
+    invisible is inexpressible for a weak model, so hiding is soft enforcement
+    and this document does not enforce."""
+    for path in LIVE + [EARLY, LEGACY]:
+        d = doc(path)
+        lines = affordances.render_document(d)
+        for a in d["actions"]:
+            owned = [ln for ln in lines if a["rel"] in ln]
+            assert owned, "{}: {} vanished from the collapsed render".format(
+                path.name, a["rel"])
+
+
+def test_a_folded_line_still_carries_its_complete_command():
+    """Rung 2's promise — "send it back verbatim" — has to survive the fold, or
+    the collapse compressed the wrong half and a commander has to re-open the
+    page to act."""
+    d = doc(ARMED)
+    for a in d["actions"]:
+        line = affordances.collapse_action(a)
+        blob = a["command"] if a["kind"] == "link" else a["template"]
+        assert json.dumps(blob, separators=(",", ":")) in line, a["rel"]
+        if a["kind"] == "form":
+            for f in a["fields"]:
+                if f["default"] is None:
+                    assert f["path"] in line, "{}: {} is not named as yours".format(
+                        a["rel"], f["path"])
+
+
+def test_the_blocking_fact_rides_on_every_not_ready_line():
+    """Finding 5, addressed. r26 red committed 13 units into 12 defenders with
+    the push gates and the staleness sentence served — on page eight of a render
+    it had not re-opened since t=0. Now they are on the line."""
+    lines = render(ARMED)
+    blocked = [ln for ln in lines if "BLOCKED:" in ln]
+    d = doc(ARMED)
+    assert len(blocked) == len([a for a in d["actions"] if not a["ready"]])
+    push = next(ln for ln in blocked if "stance:squad-1:push" in ln)
+    assert "size 6/6" not in push, "the met half is `--all`'s job; the news is what stops it"
+    assert "3 of your 9 army units are outside squad 1" in push
+    assert "not since" in push, "the intel ledger rides free — same line, more characters"
+    # And the met half really is still there under `--all`.
+    assert "(met: size 6/6" in "\n".join(render(ARMED, full=True))
+
+
+def test_a_collection_form_keeps_its_slot_pressure_when_it_folds():
+    """"7 of 8 trigger names in use" changes what a commander writes; the field
+    notes under it do not. So the slot line survives the fold and the fields do
+    not."""
+    line = affordances.collapse_action(by_rel(doc(ARMED), "trigger_set"))
+    assert "2 of 8 trigger names in use" in line
+    assert "a fresh name creates" not in line, "the field notes are `--all`'s"
+
+
+def test_the_default_block_still_leads_the_page():
+    """Silence is rung 1 and it must be the first option a reader meets. The
+    properties above it are facts, not options."""
+    for path in LIVE:
+        lines = render(path)
+        heads = [i for i, ln in enumerate(lines) if ln and not ln.startswith(" ")]
+        named = [lines[i].split()[0] for i in heads]
+        assert named.index("DEFAULT") < named.index("ACTIONS")
+        if "ALARMS" in named:
+            assert named.index("DEFAULT") < named.index("ALARMS")
+
+
+def test_every_action_is_grouped_under_exactly_one_section():
+    for path in LIVE + [EARLY, LEGACY]:
+        d = doc(path)
+        grouped = affordances.group_sections(d["actions"])
+        seen = [a["rel"] for _, rows in grouped for a in rows]
+        assert sorted(seen) == sorted(a["rel"] for a in d["actions"])
+        assert len(seen) == len(set(seen)), "an action printed twice is a fact counted twice"
+        for sec, _rows in grouped:
+            assert sec in affordances.SECTION_ORDER
+
+
+def test_the_sections_are_read_off_the_verb_and_the_catalog():
+    """Mechanical, never a judgment: the rejected half of this bead was
+    engine-INFERRED phase filtering, and an engine that decided which of your
+    buildings were "economy" would be having exactly that opinion."""
+    d = doc(ARMED)
+    assert by_rel(d, "build")["sections"] == ["economy", "tech"]
+    assert by_rel(d, "train:TownHall")["sections"][:2] == ["economy", "army"], \
+        "a hall trains Workers and heroes, so it is both"
+    assert by_rel(d, "train:Barracks")["sections"] == ["army", "tech"], \
+        "Knight is NOT AVAILABLE at this seat's tech, and that is the tech question"
+    assert by_rel(d, "stance:squad-0:harass")["sections"] == ["army", "harass"]
+    assert by_rel(d, "stance:squad-0:push")["sections"] == ["army"]
+    assert by_rel(d, "trigger_set")["sections"] == ["standing"]
+    assert by_rel(d, "recipe:expand")["sections"] == ["economy"]
+
+
+# -- 2.0: --all restores the render it replaced ------------------------------
+
+
+def test_all_restores_the_full_render_exactly():
+    """`--all` is the reason the collapse is allowed to be aggressive: no fact
+    left the document, only the default page. So it must be 1.3's render — the
+    same heading, the same order, the same `render_action` for every action —
+    and everything outside the ACTIONS section must be identical in both modes.
+    """
+    for path in LIVE:
+        d = doc(path)
+        full, collapsed = render(path, full=True), render(path)
+        head = "ACTIONS ({} — rungs 2 and 3; sorted by fact only (no doctrine declared))".format(
+            len(d["actions"]))
+        i, j = full.index(head), full.index("RAW (rung 4)")
+        assert full[: i - 1] == collapsed[: _actions_head(collapsed)], \
+            "everything above ACTIONS is the same page in both modes"
+        assert full[i + 1: j - 1] == [
+            ln for a in d["actions"] for ln in affordances.render_action(a)
+        ], "the body is render_action over order_actions, unchanged"
+        assert full[j:] == collapsed[collapsed.index("RAW (rung 4)"):]
+
+
+def _actions_head(lines):
+    return next(i for i, ln in enumerate(lines) if ln.startswith("ACTIONS ")) - 1
+
+
+def test_the_cli_all_flag_is_the_renderer():
+    with tempfile.TemporaryDirectory() as tmp:
+        seat = Path(tmp) / "red"
+        seat.mkdir()
+        state = seat / "state.json"
+        shutil.copy(ARMED, state)
+        shutil.copy(CATALOG, seat / "catalog.json")
+        assert run("--doc", "--all", str(state)).splitlines() == render(ARMED, full=True)
+        assert run("--doc", str(state)).splitlines() == render(ARMED)
+        assert state.read_bytes() == ARMED.read_bytes()
+
+
+def test_the_json_mode_pays_no_line_cost_and_therefore_takes_no_collapse():
+    """A machine reader has no page to run out of, so `--json` serves every
+    action complete in both modes and `--all` changes nothing about it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        seat = Path(tmp) / "red"
+        seat.mkdir()
+        state = seat / "state.json"
+        shutil.copy(ALARM, state)
+        shutil.copy(CATALOG, seat / "catalog.json")
+        plain = json.loads(run("--doc", "--json", str(state)))
+        every = json.loads(run("--doc", "--all", "--json", str(state)))
+    assert plain == every
+    d = doc(ALARM)
+    assert json.dumps(plain, sort_keys=True) == json.dumps(d, sort_keys=True)
+    fields = [f for a in plain["actions"] for f in a.get("fields") or []]
+    domain_rows = [row for f in fields for row in f.get("domain") or []]
+    assert len(fields) > 40 and len(domain_rows) > 100, (len(fields), len(domain_rows))
+    for a in plain["actions"]:
+        if a["kind"] == "form":
+            assert a["fields"], a["rel"]
+        assert "collapsed" in a and "sections" in a
+    # The folded TEXT render is where the domains went; the JSON kept them.
+    # Checked on the long, distinctive rows — a `squad` field's domain is
+    # ["0", "1"], and "0" appears in every other command on the page.
+    text = "\n".join(affordances.render_document(d))
+    long_rows = [row for row in domain_rows if len(row) > 30]
+    assert len(long_rows) > 40
+    assert not [row for row in long_rows if row in text], \
+        "the collapse is the text render only"
+    assert all(row in "\n".join(affordances.render_document(d, full=True))
+               for row in long_rows), "`--all` serves every one of them"
+
+
+# -- 2.0: commander-declared focus -------------------------------------------
+
+
+_PREF_DIR = []
+
+
+def prefs_file(**raw):
+    """A prefs side-file on disk, because `load_prefs` reading a real file is
+    half of what the preference channel IS (no wire verb carries doctrine)."""
+    if not _PREF_DIR:
+        _PREF_DIR.append(tempfile.mkdtemp(prefix="affordance-prefs-"))
+        atexit.register(shutil.rmtree, _PREF_DIR[0], True)
+    p = Path(_PREF_DIR[0]) / "prefs-{}.json".format(len(list(Path(_PREF_DIR[0]).iterdir())))
+    p.write_text(json.dumps(raw))
+    return affordances.load_prefs(str(p))
+
+
+def test_the_engine_never_infers_a_focus():
+    """Absent means the fact-collapsed default. The whole reason the owner's
+    phase proposal was reshaped: an inferred phase is an opinion."""
+    for path in LIVE + [EARLY, LEGACY]:
+        d = doc(path)
+        assert d["preference"]["focus"] is None
+        assert all(a["collapsed"] for a in d["actions"])
+    assert affordances.load_prefs(None) is None
+    assert prefs_file(doctrine="aggression: high")["focus"] is None
+
+
+def test_a_declared_focus_expands_its_section_and_folds_the_rest():
+    d = doc(ARMED, prefs_file(focus="army"))
+    assert d["preference"]["focus"] == "army"
+    for a in d["actions"]:
+        assert a["collapsed"] is ("army" not in a["sections"]), a["rel"]
+    lines = affordances.render_document(d)
+    text = "\n".join(lines)
+    # The focused section is rendered as it always was, domains and all...
+    assert "\n".join(affordances.render_action(by_rel(d, "stance:squad-0:turtle"))) in text
+    # ...and the sections it did not name are still every one of them, folded.
+    for rel in ("build", "trigger_set", "region_set", "plan_clear:opening"):
+        assert affordances.collapse_action(by_rel(d, rel)) in text, rel
+
+
+def test_a_declared_focus_hides_nothing_and_still_counts_everything():
+    plain, focused = doc(ARMED), doc(ARMED, prefs_file(focus="economy"))
+    assert rels(plain) == rels(focused), "focus is a render, not a filter"
+    for path in LIVE:
+        for word in affordances.FOCUS_WORDS:
+            d = doc(path, prefs_file(focus=word))
+            lines = affordances.render_document(d)
+            for a in d["actions"]:
+                assert any(a["rel"] in ln for ln in lines), "{}/{}: {}".format(
+                    path.name, word, a["rel"])
+            head = next(ln for ln in lines if ln.startswith("ACTIONS ("))
+            assert "{}:".format(len(d["actions"])) in head, "the counts stay honest"
+
+
+def test_a_declared_focus_changes_no_fact():
+    """Preference sorts and renders. It may not touch a `ready`, a `reason`, a
+    `command` or a `cost` — 2.0 adds the `collapsed` hint to that list of things
+    it MAY touch, and nothing else."""
+    plain, focused = doc(ARMED), doc(ARMED, prefs_file(focus="harass"))
+    for a, b in zip(plain["actions"], focused["actions"]):
+        assert a["rel"] == b["rel"], "no focus reorders the menu"
+        x = {k: v for k, v in a.items() if k != "collapsed"}
+        y = {k: v for k, v in b.items() if k != "collapsed"}
+        assert json.dumps(x, sort_keys=True) == json.dumps(y, sort_keys=True), a["rel"]
+
+
+def test_an_alarm_breaks_through_any_focus():
+    """By design: an alarm is the phase-transition machinery the r23 commanders
+    described, and a focus that could hide the fork it just named would be the
+    soft enforcement this document refuses."""
+    for word in affordances.FOCUS_WORDS:
+        d = doc(ALARM, prefs_file(focus=word))
+        for rel in ("build", "recipe:expand"):
+            a = by_rel(d, rel)
+            assert a["collapsed"] is False, "{}: {} came back folded".format(word, rel)
+        text = "\n".join(affordances.render_document(d))
+        assert "\n".join(affordances.render_action(by_rel(d, "build"))) in text
+        # The alarm block itself is untouched by the focus and still leads.
+        lines = affordances.render_document(d)
+        assert lines.index(next(ln for ln in lines if ln.startswith("ALARMS "))) < \
+            lines.index(next(ln for ln in lines if ln.startswith("ACTIONS ")))
+
+
+def unwrapped(lines):
+    """The render with its hanging indents folded back, so a test can match a
+    sentence the renderer wrapped."""
+    return " ".join(x.strip() for x in lines)
+
+
+def test_the_preference_source_line_reports_the_focus():
+    prefs = prefs_file(doctrine="hold the line", focus="tech")
+    text = unwrapped(affordances.render_document(doc(ARMED, prefs)))
+    assert "your declared focus: tech" in text
+    assert "the engine never infers one" in text
+    assert prefs["source"] in text, "the file it came from is named"
+
+
+def test_an_unrecognised_focus_is_ignored_out_loud():
+    """A commander that thinks it is reading a filtered page and is not has been
+    lied to by a view, so the word it wrote comes back with the reason."""
+    prefs = prefs_file(focus="macro")
+    assert prefs["focus"] is None
+    assert "focus 'macro' is not one of economy/tech/army/harass — ignored" in prefs["source"]
+    d = doc(ARMED, prefs)
+    assert d["preference"]["focus"] is None
+    assert all(a["collapsed"] for a in d["actions"])
+    text = unwrapped(affordances.render_document(d))
+    assert "no focus declared, so this page is fact-collapsed" in text
+    assert "is not one of economy/tech/army/harass — ignored" in text
+
+
+def test_a_focus_and_a_doctrine_are_independent_channels():
+    d = doc(ARMED, prefs_file(doctrine="raid", prefer=["harass"], avoid=["turtle"],
+                              focus="economy"))
+    order = rels(d)
+    assert order.index("stance:squad-0:harass") < order.index("stance:squad-0:secure"), \
+        "`prefer` still sorts"
+    assert by_rel(d, "build")["collapsed"] is False, "`focus` still expands"
+    assert by_rel(d, "stance:squad-0:harass")["collapsed"] is True, \
+        "a preferred action is sorted, not expanded — they are different channels"
 
 
 def _run():

@@ -2,6 +2,7 @@
 """The hypermedia affordance document — the ACTIONS half of the commander view.
 
     python3 tools/bridge_view.py --doc  bridge/red/state.json
+    python3 tools/bridge_view.py --doc --all  bridge/red/state.json
     python3 tools/bridge_view.py --doc --json  bridge/red/state.json
     python3 tools/affordances.py --version        # the media-type version
 
@@ -33,7 +34,21 @@ TWO ANNOTATION CHANNELS, STRICTLY SEPARATED (AFFORDANCES.md):
     recommendation is an opinion, and the engine does not have opinions.
   * **preference** — commander-declared doctrine, engine-SORTED and never
     engine-generated. See `load_prefs` for the mechanism and the argument for
-    why it is a file rather than a wire key.
+    why it is a file rather than a wire key. Since 2.0 it also carries an
+    optional `focus`, which chooses what the TEXT render expands — declared by
+    the commander, never inferred by the engine.
+
+FACT-COLLAPSED RENDERING (2.0). The arena's model ladder (arena/LADDER.md,
+Findings 2 and 5) measured the cost of the full render: ~600 lines mid-game,
+every tier abandoning the document for the digest at loop cadence, and the
+readiness annotations that would have prevented the mid-tier losing moves
+served every cycle and read never. So the default TEXT render folds each action
+onto ONE line that still carries its complete command, groups them, and puts
+the blocking fact on the line of every action that is not ready. Nothing is
+deleted: `--all` restores the full render, a declared `focus` expands a section,
+and `--json` is untouched — a machine reader pays no line cost and therefore
+gets no collapse. `collapsed` on each JSON action is the hint that says which
+way the text render went.
 
 FOG-LEGALITY, STRUCTURALLY. The actions half reads the seat's own resources,
 its own units, its own standing state, the public map, the static catalog, and
@@ -91,7 +106,44 @@ from bridge_view import dist, load_catalog  # noqa: E402
 #: that no longer has to leave the document to find out what an arm takes writes
 #: different commands — so the ledger has to be able to tell the two scaffolds
 #: apart.
-DOC_VERSION = "affordance-doc/1.3"
+#: `2.0` — the SHAPE moved, which is what the major half is for. The text
+#: render is fact-collapsed by default: one line per action carrying its
+#: complete command, grouped by section, with the blocking fact on the line of
+#: everything that is not ready, and the full render behind `--all`. The
+#: preference channel gained a commander-DECLARED `focus`, which expands one
+#: section. No action was added, removed or reworded and the JSON grew only two
+#: additive per-action hints (`sections`, `collapsed`), so a machine reader sees
+#: 1.3 plus two keys — but a commander reads a different page, and the ledger
+#: has to be able to tell the two apart. Evidence: arena/LADDER.md Findings 2
+#: and 5 (every tier used the document as an orientation page and the digest as
+#: the loop page; the annotations that addressed the mid-tier losing moves were
+#: served every cycle and read never).
+DOC_VERSION = "affordance-doc/2.0"
+
+# ---------------------------------------------------------------------------
+# Sections: what a declared focus can expand, and how the collapsed render
+# groups
+#
+# Every action carries a `sections` list. The assignment is MECHANICAL — read
+# off the verb, off the catalog's `trains`, off `unlocked` — and never a
+# judgment about what belongs to a strategy: the engine does not have opinions
+# about phases either (this bead's rejected half was engine-INFERRED phase
+# filtering, docs/AFFORDANCES.md constraint 1 and arena/LADDER.md Finding 5).
+#
+# `standing` is not a focus word. The trigger/region/plan CRUD family belongs to
+# no phase — it is the machinery every phase is written in — so it groups
+# together and is expanded only by `--all`.
+# ---------------------------------------------------------------------------
+
+#: The words a commander may declare in its prefs file. Anything else is
+#: ignored with a note, because a focus the render silently dropped is a
+#: commander that thinks it is reading a filtered page and is not.
+FOCUS_WORDS = ("economy", "tech", "army", "harass")
+
+#: Group order in the collapsed render. A declared focus jumps to the front of
+#: it; otherwise this is the order, and it is fixed so the same snapshot always
+#: renders the same page.
+SECTION_ORDER = ("army", "harass", "economy", "tech", "standing", "other")
 
 # ---------------------------------------------------------------------------
 # Engine constants this view mirrors
@@ -452,11 +504,13 @@ def affordable(state, gold, lumber):
 # ---------------------------------------------------------------------------
 
 
-def link(rel, title, ready, reason, command, intel=None, cost=None, note=None):
+def link(rel, title, ready, reason, command, intel=None, cost=None, note=None,
+         sections=()):
     """One LINK: a complete command and the facts about sending it now."""
     a = {
         "kind": "link",
         "rel": rel,
+        "sections": list(sections),
         "title": title,
         "ready": bool(ready),
         "reason": reason,
@@ -488,11 +542,13 @@ def field(path, ftype, note, domain=None, rng=None, default=None):
     return f
 
 
-def form(rel, title, template, fields, ready=True, reason="", slots=None, note=None, cost=None):
+def form(rel, title, template, fields, ready=True, reason="", slots=None, note=None,
+         cost=None, sections=()):
     """One FORM: a template with the judgment-shaped holes left `null`."""
     a = {
         "kind": "form",
         "rel": rel,
+        "sections": list(sections),
         "title": title,
         "ready": bool(ready),
         "reason": reason,
@@ -588,6 +644,10 @@ def stance_actions(state, props, catalog):
                     command,
                     intel=intel if word in ("push", "harass") else None,
                     note=note,
+                    # `harass` is the one stance word that is also a focus word,
+                    # so it belongs to both sections. That is the word matching
+                    # the word, not the engine deciding what harassment is.
+                    sections=["army", "harass"] if word == "harass" else ["army"],
                 )
             )
     return out
@@ -630,6 +690,7 @@ def stance_form(state, catalog):
             ),
         ],
         note="`x`/`z` are accepted instead of `target` if you would rather give numbers.",
+        sections=["army"],
     )
 
 
@@ -653,6 +714,7 @@ def squad_form(state, catalog=None):
         note="A `squad` and a `\"select\":\"squad N\"` in the SAME batch do not see each "
              "other — enrolment lands after the batch compiles. A `stance` in the same "
              "batch does.",
+        sections=["army"],
     )
 
 
@@ -704,6 +766,7 @@ def trigger_forms(state, catalog):
             + ("" if room else " — re-use one of those names to replace a rule in place, "
                                 "or `trigger_clear` one first"),
             slots=slots,
+            sections=["standing"],
         )
     ]
     for t in triggers:
@@ -733,6 +796,7 @@ def trigger_forms(state, catalog):
                 ),
                 slots=slots,
                 note="Re-sending under the same name replaces it in place and costs no slot.",
+                sections=["standing"],
             )
         )
         out.append(
@@ -742,6 +806,7 @@ def trigger_forms(state, catalog):
                 True,
                 "frees one of {} trigger slots".format(MAX_TRIGGERS),
                 {"type": "trigger_clear", "name": name},
+                sections=["standing"],
             )
         )
     return out
@@ -772,6 +837,7 @@ def region_forms(state):
             reason=slots + ("" if room else " — re-use a name to MOVE that circle rather than "
                                             "spending a slot"),
             slots=slots,
+            sections=["standing"],
         )
     ]
     for r in regions:
@@ -797,6 +863,7 @@ def region_forms(state):
                 reason="re-using the name MOVES the circle and spends no slot; every posture "
                        "and every rule that says '{}' re-aims with it".format(name),
                 slots=slots,
+                sections=["standing"],
             )
         )
         out.append(
@@ -806,6 +873,7 @@ def region_forms(state):
                 True,
                 "any rule naming '{}' goes quiet rather than firing on the whole map".format(name),
                 {"type": "region_clear", "name": name},
+                sections=["standing"],
             )
         )
     return out
@@ -845,6 +913,7 @@ def plan_forms(state):
             ready=room,
             reason=slots + ("" if room else " — clear one first, or re-use its name"),
             slots=slots,
+            sections=["standing"],
         )
     ]
     for p in plans:
@@ -863,6 +932,7 @@ def plan_forms(state):
                     " — current: " + p["current"] if p.get("current") else "",
                 ),
                 slots=slots,
+                sections=["standing"],
             )
         )
         out.append(
@@ -872,6 +942,7 @@ def plan_forms(state):
                 True,
                 "frees one of {} plan slots".format(MAX_PLANS),
                 {"type": "plan_clear", "name": name},
+                sections=["standing"],
             )
         )
     return out
@@ -942,6 +1013,12 @@ def build_form(state, catalog):
         reason="you hold {}g/{}l at tier {}".format(
             me.get("gold", 0), me.get("lumber", 0), me.get("tier", 1)
         ),
+        # Both, and mechanically so: every farm and every expansion is bought
+        # here and so is every tech building, and the `kind` domain is the one
+        # place a `requires Keep` row is printed. Splitting one form across two
+        # sections would be the engine deciding which of your buildings are
+        # "economy".
+        sections=["economy", "tech"],
     )
 
 
@@ -992,6 +1069,26 @@ def producer_kinds(state, catalog):
         idle = [x for x in held if not (x.get("queue") or [])]
         rows.append((kid, len(held), len(idle), list(trains)))
     return rows
+
+
+def producer_sections(state, trains, with_tech=False):
+    """Which sections a producer's forms belong to, read off what it trains.
+
+    A building that turns out Workers is economy; one that turns out anything
+    else is army; a hall that does both is both. `with_tech` is set only for
+    `train:` — a producer with a row its own `unlocked` currently forbids is
+    exactly the tech question ("Knight — NOT AVAILABLE at your tech"), and that
+    is a fact about this seat's tech, not an opinion about its plan.
+    """
+    unlocked = state.get("unlocked") or {}
+    out = []
+    if any(t == "Worker" for t in trains):
+        out.append("economy")
+    if any(t != "Worker" for t in trains):
+        out.append("army")
+    if with_tech and any(unlocked.get(t) is False for t in trains):
+        out.append("tech")
+    return out or ["other"]
 
 
 def unit_domain(state, catalog, trains):
@@ -1080,6 +1177,7 @@ def production_forms(state, catalog):
                 note="the same phrase is legal in a trigger's or a plan step's `then`, and it "
                      "resolves when the rule FIRES — which is how a repeating `train` rule "
                      "survives the building it names being razed and rebuilt.",
+                sections=producer_sections(state, trains, with_tech=True),
             )
         )
     out.extend(rally_forms(state, catalog))
@@ -1112,7 +1210,7 @@ def rally_readback(held):
 def rally_forms(state, catalog):
     """`rally`, written as a role — where a producer sends what it trains."""
     out = []
-    for kind, held, _idle, _trains in producer_kinds(state, catalog):
+    for kind, held, _idle, trains in producer_kinds(state, catalog):
         mine = [b for b in own_buildings(state)
                 if b.get("done") and b.get("kind") == kind]
         out.append(
@@ -1143,6 +1241,7 @@ def rally_forms(state, catalog):
                 ),
                 note="the snapshot reads it back as `buildings[].rally`, so you never have to "
                      "re-send one to find out what it is.",
+                sections=producer_sections(state, trains),
             )
         )
     return out
@@ -1160,7 +1259,7 @@ def template_forms(state, catalog):
     """
     out = []
     squads = [str(sq.get("id")) for sq in state.get("squads") or [] if sq.get("id") is not None]
-    for kind, held, _idle, _trains in producer_kinds(state, catalog):
+    for kind, held, _idle, trains in producer_kinds(state, catalog):
         mine = [b for b in own_buildings(state)
                 if b.get("done") and b.get("kind") == kind]
         set_on = sum(1 for b in mine if b.get("template"))
@@ -1192,6 +1291,7 @@ def template_forms(state, catalog):
                 note="`retreat`, `priority` and `autocast` are the other pieces. WHATEVER YOU "
                      "SEND REPLACES THE WHOLE TEMPLATE — a piece you omit is unset, not kept — "
                      "and a `template` with no pieces at all removes it.",
+                sections=producer_sections(state, trains),
             )
         )
     return out
@@ -1207,7 +1307,7 @@ def cancel_forms(state, catalog):
     hides the option is worse than one that explains why it would refuse.
     """
     out = []
-    for kind, held, _idle, _trains in producer_kinds(state, catalog):
+    for kind, held, _idle, trains in producer_kinds(state, catalog):
         mine = [b for b in own_buildings(state)
                 if b.get("done") and b.get("kind") == kind]
         queues = [list(b.get("queue") or []) for b in mine]
@@ -1244,6 +1344,7 @@ def cancel_forms(state, catalog):
                 note="`select` resolves to the LOWEST-id match, which may not be the one whose "
                      "queue you are reading. Send `building: <id>` off `buildings[]` when you "
                      "mean a particular one.",
+                sections=producer_sections(state, trains),
             )
         )
     return out
@@ -1298,6 +1399,7 @@ def recipe_forms(state, catalog):
             ],
             reason="repeating, because a base is raided more than once. `turtle` anchors on "
                    "your own base, so this rule needs no coordinate and cannot go stale.",
+            sections=["army"],
         ),
         form(
             "recipe:hero-save",
@@ -1318,6 +1420,7 @@ def recipe_forms(state, catalog):
                    "cycle. `\"select\":\"my hero\"` resolves at FIRE time, so the rule survives "
                    "the hero dying and being revived with a new id — this is the exact command "
                    "r21 armed as `\"units\":[]`.",
+            sections=["army"],
         ),
         form(
             "recipe:expand",
@@ -1343,6 +1446,7 @@ def recipe_forms(state, catalog):
                      "" if unlocked.get("TownHall", True) else " and is NOT currently available",
                  ),
             cost=hall_price,
+            sections=["economy"],
         ),
         form(
             "recipe:counter-punch",
@@ -1360,6 +1464,7 @@ def recipe_forms(state, catalog):
             reason="`enemy_hero_down` is what you WATCHED, not what is true — a hero that died "
                    "out of your sight is not in this predicate. Once, because you only get to "
                    "spend that window once.",
+            sections=["army", "harass"],
         ),
     ]
     # STEADY PRODUCTION — the r23 win the building selector was for. Both
@@ -1410,6 +1515,7 @@ def recipe_forms(state, catalog):
                  if producers else
                  "you hold no finished producer yet, so `then.select` has no fact-shaped "
                  "default — name one from the domain.",
+            sections=producer_sections(state, producers[0][3]) if producers else ["army"],
         )
     )
     return out
@@ -1502,22 +1608,47 @@ def load_prefs(path):
 
         {"doctrine": "aggression: high, risk: low",
          "prefer": ["push", "harass", "trigger"],
-         "avoid":  ["turtle"]}
+         "avoid":  ["turtle"],
+         "focus":  "army"}
 
     `prefer` and `avoid` are plain substrings matched, case-folded, against
     each action's `rel` and `title`. Nothing here changes a `ready`, a `reason`
     or a `command`: preference reorders the menu and annotates it, and that is
     the entire extent of its power.
+
+    `focus` (2.0) is the same channel used for the same reason. It is one of
+    `economy` / `tech` / `army` / `harass`, it EXPANDS that section of the text
+    render and leaves every other action on its one line, and it hides nothing:
+    the counts and the one-liners stay, and alarms break through it. The engine
+    never infers one — absent means the fact-collapsed default. The owner's
+    original proposal was engine-inferred phase *filtering*, and it was rejected
+    twice over: base/tech/army are concurrent budgets rather than sequential
+    states, so the allocation ratio IS the skill being measured and a phase
+    model would bless one allocation; and an inferred phase is an opinion, which
+    is the one thing this document may not have. Declared, the same idea is a
+    fact — the commander's own judgment rendered back at it, and measurable
+    against what it then did.
+
+    An unrecognised focus word is IGNORED and said so in `source`, never
+    silently dropped: a commander that thinks it is reading a filtered page and
+    is not has been lied to by a view.
     """
     if not path:
         return None
     with open(path) as f:
         raw = json.load(f)
+    focus, source = raw.get("focus"), path
+    if focus is not None and str(focus).lower() not in FOCUS_WORDS:
+        source = "{} (focus {!r} is not one of {} — ignored)".format(
+            path, focus, "/".join(FOCUS_WORDS)
+        )
+        focus = None
     return {
         "doctrine": raw.get("doctrine"),
         "prefer": [str(x).lower() for x in raw.get("prefer") or []],
         "avoid": [str(x).lower() for x in raw.get("avoid") or []],
-        "source": path,
+        "focus": str(focus).lower() if focus else None,
+        "source": source,
     }
 
 
@@ -1567,6 +1698,42 @@ def order_actions(actions, alarms, prefs):
     return [a for _, a in ordered]
 
 
+def alarm_pointed(alarms):
+    """Every `rel` a ringing alarm points at. `alarm:confirm` is not one — it
+    is the running default wearing a link's clothes and carries no command."""
+    return {
+        x["rel"]
+        for a in alarms or []
+        for x in a.get("actions") or []
+        if x.get("command") is not None or x.get("template") is not None
+    }
+
+
+def expands(action, focus, alarms):
+    """Whether the TEXT render prints this action in full rather than folded.
+
+    THE RULE, in one sentence: **expansion is what a declared focus buys, and an
+    alarm breaks through it.**
+
+    The fact-collapsed default expands nothing, and that is deliberate rather
+    than a budget accident. Every action is still on the page, still carries its
+    complete command, and still says what stops it; what it no longer carries is
+    the field-by-field domain listing, which is authoring detail. arena/LADDER.md
+    Finding 2: every tier of commander read the full document once, at t=0, and
+    never again, because ~600 lines is uneconomical at a 15-second cadence. A
+    page nobody re-opens has no annotations, however good they are (Finding 5).
+
+    A declared focus expands its own section — the commander asked for the
+    detail there, so it gets today's render for it. Anything a ringing alarm
+    points at expands too whenever a focus is declared, so a focus can never be
+    the reason the fork the alarm just named arrived folded. `--all` expands
+    everything and is exempt from all of this.
+    """
+    if not focus:
+        return False
+    return focus in (action.get("sections") or []) or action["rel"] in alarm_pointed(alarms)
+
+
 # ---------------------------------------------------------------------------
 # The document
 # ---------------------------------------------------------------------------
@@ -1595,6 +1762,10 @@ def document(state, catalog=None, prefs=None):
     alarms = alarm_entries(state, actions)
     actions = order_actions(actions, alarms, prefs)
 
+    focus = (prefs or {}).get("focus")
+    for a in actions:
+        a["collapsed"] = not expands(a, focus, alarms)
+
     return {
         "doc_version": DOC_VERSION,
         "seq": state.get("seq_applied", 0),
@@ -1614,7 +1785,9 @@ def document(state, catalog=None, prefs=None):
             "doctrine": (prefs or {}).get("doctrine"),
             "prefer": (prefs or {}).get("prefer") or [],
             "avoid": (prefs or {}).get("avoid") or [],
-            "source": (prefs or {}).get("source") or "none — fact order only",
+            "focus": focus,
+            "source": (prefs or {}).get("source")
+            or "none — fact order, fact-collapsed, no declared focus",
         },
         "raw": (
             "Every verb in tools/COMMANDER_BRIEF.md is legal whether or not it appears "
@@ -1681,14 +1854,126 @@ def render_action(a, width=100):
     return out
 
 
-def render_document(doc):
-    """The whole document as text.
+def _compact(obj):
+    """A command as a commander pastes it: no spaces to pay for.
 
-    Unlike the digest there is no line ceiling here, and deliberately: the
-    digest answers "what is going on" in fifteen lines and this answers "what
-    can I say", which is a menu. A commander that wants the short version reads
-    `--digest`; this is the one that lists everything so that nothing has to be
-    remembered.
+    The full render keeps `json.dumps`'s default spacing because it has room;
+    a folded line does not, and forty of them is a paragraph of separators.
+    Both spellings parse to the same object, which is the only promise a
+    rendered command makes.
+    """
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def _clip(text, limit):
+    """Prose, cut on a word boundary. Never used on a command or a template —
+    a clipped JSON object is not a command, it is a paste that fails."""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rsplit(" ", 1)[0] + "…"
+
+
+def _blocking_half(reason, limit=240):
+    """The clauses that STOP an action, without the ones that do not.
+
+    `push_gate_facts` deliberately writes both halves — the gates that failed,
+    then a trailing `(met: …)` for the ones that passed — because a link that
+    only explains itself when refusing teaches nothing on the cycle you needed
+    it. On a folded line the failed half is the whole news; the met half is one
+    `--all` away and unchanged.
+    """
+    return _clip(str(reason or "").split(" (met:")[0], limit)
+
+
+def collapse_action(a):
+    """One action, folded onto ONE line that is still enough to act on.
+
+    What survives the fold, and why each one:
+
+    * the `rel`, so `--all` and every test can find the same action again;
+    * the title, which is the only prose a scanning reader gets;
+    * **the complete command or template**, so rung 2's promise — "send it back
+      verbatim" — survives the collapse. A folded menu that made you re-open the
+      page to get the JSON would have compressed the wrong half;
+    * which fields are yours (`you fill:`), the form's judgment-shaped holes;
+    * the collection's slot pressure, because "7 of 8 trigger names in use" is
+      the fact that changes what you write, not decoration;
+    * `BLOCKED:` and the failing clauses for anything NOT READY. This is the
+      line arena/LADDER.md Finding 5 is about: r26 red committed 13 units into
+      12 defenders with the push gates and the staleness warning served, on a
+      page it had not re-opened since t=0;
+    * the intel ledger, where the action carries one. It rides free — same line,
+      more characters — and it is the sentence a commander lost a match for not
+      having.
+
+    What does not survive: the field-by-field notes, the served domains, and the
+    per-action `note`. All authoring detail, all one `--all` away, none of it
+    deleted from `--json`.
+    """
+    bits = [a["rel"]]
+    if a.get("title"):
+        # An edit form's title is a READBACK of the thing it edits — a whole
+        # armed trigger's sentence, sometimes 200 characters of it — and the
+        # same content is in the template on this very line, structured. So the
+        # prose half is clipped and the machine half is not.
+        bits.append(_clip(a["title"], 120))
+    if a["kind"] == "link":
+        bits.append(_compact(a["command"]))
+    else:
+        bits.append(_compact(a["template"]))
+        open_fields = [f["path"] for f in a.get("fields") or [] if f.get("default") is None]
+        if open_fields:
+            bits.append("you fill: " + ", ".join(open_fields))
+    if a.get("slots"):
+        bits.append(a["slots"])
+    if a.get("cost"):
+        bits.append("cost " + str(a["cost"]))
+    if not a["ready"]:
+        bits.append("BLOCKED: " + _blocking_half(a.get("reason")))
+    if a.get("intel"):
+        bits.append("intel: " + a["intel"])
+    return " · ".join(bits)
+
+
+def group_sections(actions, focus=None):
+    """`[(section, [action, …]), …]` — the collapsed render's grouping.
+
+    An action lands in the FIRST of its sections that `SECTION_ORDER` names, so
+    the grouping is a partition and no action is printed twice. A declared focus
+    jumps its own section to the front; otherwise the order is fixed, because
+    the same snapshot must always render the same page.
+    """
+    order = [s for s in SECTION_ORDER if s != focus]
+    if focus:
+        order.insert(0, focus)
+    out = []
+    for sec in order:
+        rows = [
+            a
+            for a in actions
+            if next((s for s in SECTION_ORDER if s in (a.get("sections") or [])), "other") == sec
+        ]
+        if rows:
+            out.append((sec, rows))
+    return out
+
+
+def render_document(doc, full=False):
+    """The whole document as text — fact-collapsed by default, all of it under
+    `full`.
+
+    The information hierarchy, outermost first, is the fork the seat actually
+    faces: what silence does, then what changed under it, then what it can say.
+    `DEFAULT` therefore stays ahead of `ALARMS` and `ACTIONS` in both modes —
+    silence is rung 1 and it must be the first option a reader meets, not a
+    footnote under forty of them.
+
+    `full=True` is `--doc --all` and restores 1.3's render exactly: the same
+    ACTIONS heading, the same order (`order_actions`), the same `render_action`
+    for every action, nothing folded and nothing grouped. It is the reason the
+    collapse is allowed to be aggressive — no fact left the document, only the
+    default page.
     """
     lines = [
         "DOC {} seq={} t={:.0f}s".format(doc["doc_version"], doc["seq"], doc["t"]),
@@ -1722,18 +2007,89 @@ def render_document(doc):
     elif doc["alarms"] is not None:
         lines += ["", "ALARMS none ringing"]
 
-    pref = doc["preference"]
-    lines += ["", "ACTIONS ({} — rungs 2 and 3; sorted {})".format(
-        len(doc["actions"]),
-        "by your declared doctrine, then by fact" if pref["doctrine"] or pref["prefer"]
-        else "by fact only (no doctrine declared)",
-    )]
-    if pref["doctrine"]:
-        lines.append("  your declared doctrine: {} (from {})".format(pref["doctrine"], pref["source"]))
-    for a in doc["actions"]:
-        lines += render_action(a)
+    lines += _render_actions(doc, full)
     lines += ["", "RAW (rung 4)"]
     lines += ["  " + x for x in _wrap(doc["raw"], 100, "  ")]
+    return lines
+
+
+def _preference_lines(pref, focus):
+    """What the commander declared, said back to it.
+
+    The `source` is reported whenever there IS one, even when nothing usable
+    came out of the file — that is where `load_prefs` puts "focus 'macro' is not
+    one of …", and a commander that believes it is reading a focused page while
+    reading the default one has been lied to by a view.
+    """
+    lines = []
+    if pref.get("doctrine"):
+        lines.append("  your declared doctrine: {} (from {})".format(
+            pref["doctrine"], pref["source"]))
+    if focus:
+        lines += ["  " + x for x in _wrap(
+            "your declared focus: {} — that section is rendered in full below, everything else "
+            "stays folded, and an alarm breaks through it. Declared by you in {}; the engine "
+            "never infers one.".format(focus, pref["source"]), 100, "  ")]
+    elif not pref.get("doctrine") and not str(pref.get("source", "")).startswith("none"):
+        lines += ["  " + x for x in _wrap(
+            "no focus declared, so this page is fact-collapsed (from {})".format(pref["source"]),
+            100, "  ")]
+    return lines
+
+
+def _render_actions(doc, full):
+    pref = doc["preference"]
+    focus = pref.get("focus")
+    actions = doc["actions"]
+
+    if full:
+        # 1.3's section, word for word. `--all` is a promise that nothing about
+        # the old page moved, and a reworded heading would be a small lie in the
+        # one mode whose whole point is that it is not a new render.
+        lines = ["", "ACTIONS ({} — rungs 2 and 3; sorted {})".format(
+            len(actions),
+            "by your declared doctrine, then by fact" if pref["doctrine"] or pref["prefer"]
+            else "by fact only (no doctrine declared)",
+        )]
+        if pref["doctrine"]:
+            lines.append("  your declared doctrine: {} (from {})".format(
+                pref["doctrine"], pref["source"]))
+        if focus:
+            lines.append("  your declared focus: {} — ignored here; `--all` expands "
+                         "everything".format(focus))
+        for a in actions:
+            lines += render_action(a)
+        return lines
+
+    ready = [a for a in actions if a["ready"]]
+    lines = ["", "ACTIONS ({}: {} ready, {} blocked — folded; `--doc --all` for every field, "
+                 "domain and reason)".format(
+                     len(actions), len(ready), len(actions) - len(ready))]
+    lines += _preference_lines(pref, focus)
+
+    expanded = [a for a in actions if not a.get("collapsed", True)]
+    folded = [a for a in actions if a.get("collapsed", True)]
+
+    if expanded:
+        lines.append("")
+        lines.append("  IN FULL ({}) — your declared focus '{}', plus anything an alarm "
+                     "points at".format(len(expanded), focus))
+        for a in expanded:
+            lines += render_action(a)
+
+    fready = [a for a in folded if a["ready"]]
+    if fready:
+        lines.append("  READY ({}) — the command as printed is complete".format(len(fready)))
+        for sec, rows in group_sections(fready, focus):
+            lines.append("    {} ({})".format(sec, len(rows)))
+            lines += ["      " + collapse_action(a) for a in rows]
+
+    fblocked = [a for a in folded if not a["ready"]]
+    if fblocked:
+        lines.append("")
+        lines.append("  NOT READY ({}) — listed and still sendable; NOT READY is a fact the "
+                     "engine can measure, never a refusal".format(len(fblocked)))
+        lines += ["    " + collapse_action(a) for a in fblocked]
     return lines
 
 
@@ -1746,6 +2102,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="the hypermedia affordance document")
     ap.add_argument("path", nargs="?", default="bridge/red/state.json")
     ap.add_argument("--json", action="store_true", help="the document as JSON")
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_actions",
+        help="every action in full — the pre-2.0 render. The default folds each "
+        "action onto one line that still carries its command",
+    )
     ap.add_argument("--prefs", help="a JSON file of commander-declared doctrine (see load_prefs)")
     ap.add_argument(
         "--version",
@@ -1760,9 +2123,11 @@ def main(argv=None):
         state = json.load(f)
     doc = document(state, load_catalog(args.path), load_prefs(args.prefs))
     if args.json:
+        # `--json` is never collapsed: a machine reader pays no line cost, so
+        # the compression it would buy is a fact it would lose.
         print(json.dumps(doc, indent=2))
     else:
-        for line in render_document(doc):
+        for line in render_document(doc, full=args.all_actions):
             print(line)
     return 0
 

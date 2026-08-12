@@ -676,9 +676,18 @@ def main():
         "link and form (tools/affordances.py)",
     )
     ap.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_actions",
+        help="with --doc: every action in full — the pre-2.0 render. The "
+        "default folds each action onto one line that still carries its "
+        "complete command, and hides nothing",
+    )
+    ap.add_argument(
         "--prefs",
         help="with --doc: a JSON file of commander-declared doctrine, which "
-        "SORTS the actions and nothing else",
+        "SORTS the actions and — via its optional `focus` — chooses which "
+        "section the text render expands. It changes no fact",
     )
     ap.add_argument(
         "--doc-version",
@@ -713,7 +722,7 @@ def main():
         if args.json:
             print(json.dumps(doc, indent=2))
         else:
-            for line in affordances.render_document(doc):
+            for line in affordances.render_document(doc, full=args.all_actions):
                 print(line)
         return
 
