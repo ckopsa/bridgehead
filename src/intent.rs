@@ -250,13 +250,35 @@ type IntentNodes<'w, 's> = Query<'w, 's, (Entity, &'static ResourceNode, &'stati
 /// every `units.get` destructure in this file for one caller's benefit.
 type IntentSquads<'w, 's> = Query<'w, 's, &'static SquadId>;
 
+/// **Finished halls, and where they stand.** The one thing
+/// [`nearest_free_site`] needs that [`IntentBuildings`] cannot answer: that
+/// query carries no `Transform`, because until the site picker learned about
+/// worker lanes nothing in this file needed to know where a building *was*.
+///
+/// A separate query rather than a seventh column, on the precedent
+/// [`IntentResearching`] set two features ago: widening the shared tuple would
+/// rewrite every `buildings.get` destructure in this file so that one caller
+/// could read one field. Bevy schedules the two together happily — this one
+/// borrows nothing mutably, and `IntentBuildings`' only mutable column
+/// (`TrainingQueue`) is not in it.
+///
+/// `Without<UnderConstruction>` is the same "finished" this file means
+/// everywhere else (`buildings_matching`, `completed_kinds`): scaffolding works
+/// no mine, so it opens no lane.
+type IntentHalls<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Transform, &'static Team, &'static Building),
+    Without<UnderConstruction>,
+>;
+
 /// Forges currently working. A separate query rather than a sixth column on
 /// `IntentBuildings` on purpose: `research` is the only verb that asks, and
 /// widening the shared tuple would rewrite every `buildings.get` destructure
 /// in this file for one caller's benefit.
 type IntentResearching<'w, 's> = Query<'w, 's, &'static Researching>;
 
-/// The four queries late binding may read, as one system param.
+/// The queries late binding may read, as one system param.
 ///
 /// Split out of [`IntentWorld`] rather than listed twice because the resolver
 /// has **two** readers now. The compiler is one. The other is copilot.rs's
@@ -265,7 +287,7 @@ type IntentResearching<'w, 's> = Query<'w, 's, &'static Researching>;
 /// only honest way to do that is to run the same resolver over the same world.
 /// Two statements of "what a selector may see" would drift; one cannot.
 ///
-/// **Late binding reads all four read-only.** `buildings` carries
+/// **Late binding reads all of them read-only.** `buildings` carries
 /// `&mut TrainingQueue` because the compiler's `train` and `cancel` arms push
 /// and pop it, and it lives *here* rather than beside them because the building
 /// selector family needs the same rows to answer "which barracks" — one query
@@ -277,6 +299,10 @@ pub struct LateBindWorld<'w, 's> {
     nodes: IntentNodes<'w, 's>,
     squads: IntentSquads<'w, 's>,
     buildings: IntentBuildings<'w, 's>,
+    /// Where the finished halls stand — read by nothing but [`worker_lanes`],
+    /// which is what keeps `site: "nearest legal site"` from bricking up the
+    /// haul between a hall and the mine it works.
+    halls: IntentHalls<'w, 's>,
 }
 
 #[derive(SystemParam)]
@@ -716,6 +742,11 @@ pub(crate) struct LateBind<'a, 'w, 's> {
     /// own structures are yours to know about, and there is deliberately no
     /// selector that reaches an enemy one.
     buildings: &'a IntentBuildings<'w, 's>,
+    /// Finished halls with their ground, for [`worker_lanes`]. Same fog
+    /// argument again — and the lanes it builds are drawn from this seat's own
+    /// halls and the public mine table, so a site suggestion cannot leak an
+    /// enemy's base layout.
+    halls: &'a IntentHalls<'w, 's>,
     nav: &'a NavGrid,
 }
 
@@ -741,6 +772,7 @@ impl<'a, 'w, 's> LateBind<'a, 'w, 's> {
             squads: &world.squads,
             nodes: &world.nodes,
             buildings: &world.buildings,
+            halls: &world.halls,
             nav,
         }
     }
@@ -800,6 +832,14 @@ impl LateBind<'_, '_, '_> {
             }
         }
         best.map(|(_, _, _, bits)| bits)
+    }
+
+    /// This seat's hall→mine worker lanes, for the site picker. One line
+    /// because the definition lives in [`worker_lanes`] and the compiler's
+    /// build arm reads the same one from its own unbundled queries — two
+    /// callers, one rule.
+    fn worker_lanes(&self) -> WorkerLanes {
+        worker_lanes(self.me, self.halls, self.nodes)
     }
 
     /// Every FINISHED building of this seat that a building selector matches,
@@ -1255,7 +1295,18 @@ pub(crate) fn resolve_places(intent: Intent, bind: &LateBind) -> Result<Intent, 
                         Some(k) => {
                             let size = building_stats(k).size;
                             let want = snap_footprint(clamp_to_map(Vec3::new(px, 0.0, pz)), size);
-                            match nearest_free_site(bind.nav, want, size, PLACEMENT_HINT_RADIUS) {
+                            // Corridor-aware, and it has to be *here* and not
+                            // only in the hint text: this is the arm that
+                            // silently accepts a site on the commander's
+                            // behalf, so it is the arm that can silently wall
+                            // the mine. Both consumers now read one picker.
+                            match nearest_free_site(
+                                bind.nav,
+                                want,
+                                size,
+                                PLACEMENT_HINT_RADIUS,
+                                &bind.worker_lanes(),
+                            ) {
                                 Some(p) => (p.x, p.z),
                                 None => {
                                     return Err(format!(
@@ -1584,6 +1635,7 @@ fn compile_intent(
         nodes,
         squads,
         buildings,
+        halls,
     } = bind;
     // Names become coordinates and roles become rosters here and nowhere else.
     // Everything below this line sees the language it has always seen.
@@ -1596,6 +1648,7 @@ fn compile_intent(
             squads,
             nodes,
             buildings,
+            halls,
             nav,
         },
     ) {
@@ -1892,7 +1945,7 @@ fn compile_intent(
             if !nav.rect_is_free(pos, stats.size) {
                 errors.push(format!(
                     "{tag}: {}",
-                    blocked_site_error(nav, pos, building_kind)
+                    blocked_site_error(nav, pos, building_kind, &worker_lanes(me, halls, nodes))
                 ));
                 return;
             }
@@ -3333,6 +3386,7 @@ fn compile_intent(
                         squads,
                         nodes,
                         buildings,
+                        halls,
                         nav,
                     },
                 ) {
@@ -4135,6 +4189,159 @@ pub fn snap_footprint(p: Vec3, size: f32) -> Vec3 {
 /// half-footprint, near enough that the answer is still the base you meant.
 pub const PLACEMENT_HINT_RADIUS: f32 = 15.0;
 
+/// Half the width of the lane the site picker keeps open between a hall and a
+/// mine it works.
+///
+/// **Derived from the worker, not chosen.** `shared::UNIT_RADIUS` (1.33) is the
+/// body radius everything in this game is separated by — units.rs's
+/// `SEPARATION_DIST` is literally `UNIT_RADIUS * 2.0`. Harvest is a *round
+/// trip*, so this lane carries two-way traffic and has to fit two bodies
+/// abreast (`4.0 * UNIT_RADIUS` = 5.32) with a body's slack on top: three radii
+/// each side, `7.98` of lane.
+///
+/// The corridor is quantised to nav cells (see [`WorkerLanes::intrusion`]), so
+/// the channel the rule *guarantees* is narrower than the nominal width by half
+/// a cell each side: `2.0 * (3.0 * UNIT_RADIUS - CELL * 0.5)` = 5.98, still
+/// wider than the 5.32 two workers need. `the_worker_lane_fits_two_abreast`
+/// pins that inequality, so a later tweak to `UNIT_RADIUS`, `CELL` or this
+/// constant cannot quietly close the lane it exists to hold open.
+///
+/// For provenance: terrain.rs already keeps trees off exactly these segments
+/// (`spot_is_free`, half-width 7.0 from each base to its home mine). This rule
+/// is deliberately the narrower of the two — a tree is scenery the map may
+/// simply decline to grow, and a building is a choice a commander made, so the
+/// picker steers rather than forbids.
+pub const WORKER_LANE_HALF_WIDTH: f32 = UNIT_RADIUS * 3.0;
+
+/// The hall→mine hauls a site picker must not brick up.
+///
+/// **Why this exists.** `nearest_free_site` was a plain nearest-tile scan, and
+/// the tiles nearest a hall are the ones its workers walk. Ladder r25: blue
+/// anchored build after build at `our base` with `site: "nearest legal site"`,
+/// the picker packed the hall's own doorstep first, and the gold lane closed a
+/// footprint at a time until the crew was pathing the long way round. Nothing
+/// errored; the income just quietly halved.
+///
+/// A lane is one `(finished friendly hall, live gold mine)` pair inside
+/// [`MINE_HOME_RADIUS`], and the corridor is the capsule around that segment
+/// with [`WORKER_LANE_HALF_WIDTH`] to a side. The order lanes are collected in
+/// does not matter: `intrusion` is a `max` over them, so two runs of one seed
+/// score a tile identically however Bevy iterated the archetypes.
+#[derive(Clone, Debug, Default)]
+pub struct WorkerLanes {
+    lanes: Vec<(Vec3, Vec3)>,
+}
+
+impl WorkerLanes {
+    /// No lanes at all — every tile scores zero and the picker behaves exactly
+    /// as the pre-corridor nearest-tile scan did. What a caller with no world
+    /// to read (a unit test, a map with no live gold left) passes.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Every hall/mine pair within working distance of each other.
+    ///
+    /// `MINE_HOME_RADIUS` and **not** a fresh number: it is already this
+    /// project's answer to "which mine does that hall work" —
+    /// `TriggerWhen::MineDry`, `alarm::income_alarm` and economy.rs's
+    /// `announce_mine_dry` all ask it this way. A second radius here would be a
+    /// second answer, and the commander would have to learn both.
+    pub fn between(halls: &[Vec3], mines: &[Vec3]) -> Self {
+        let mut lanes = Vec::new();
+        for &hall in halls {
+            for &mine in mines {
+                if (hall.x - mine.x).hypot(hall.z - mine.z) <= MINE_HOME_RADIUS {
+                    lanes.push((hall, mine));
+                }
+            }
+        }
+        WorkerLanes { lanes }
+    }
+
+    /// How deep a `size`-edge footprint centred at `center` reaches into the
+    /// worst lane it touches; `0.0` when it is clear of every one of them.
+    ///
+    /// A *graded* answer rather than a yes/no because the picker needs to rank
+    /// its fallback: when a cramped base leaves nothing but lane tiles, "the
+    /// shallowest intrusion" is a real answer and `None` is not. A Farm placed
+    /// awkwardly beats no Farm and a commander who cannot tell why.
+    ///
+    /// Measured over the **nav cells the footprint occupies**, obtained by the
+    /// same `min`/`max`/`world_to_cell` walk `NavGrid::rect_is_free` just used
+    /// to call the tile legal — so "the ground this building takes" means one
+    /// thing here and there, rather than two functions agreeing about a rect.
+    pub fn intrusion(&self, center: Vec3, size: f32) -> f32 {
+        if self.lanes.is_empty() {
+            return 0.0;
+        }
+        let half = size * 0.5;
+        let min = Vec3::new(center.x - half, 0.0, center.z - half);
+        let max = Vec3::new(center.x + half - 0.01, 0.0, center.z + half - 0.01);
+        let (Some((x0, z0)), Some((x1, z1))) =
+            (NavGrid::world_to_cell(min), NavGrid::world_to_cell(max))
+        else {
+            // Off the grid entirely. `rect_is_free` has already refused this
+            // one, so the score never reaches a comparison.
+            return 0.0;
+        };
+        let mut worst = 0.0f32;
+        for cz in z0..=z1 {
+            for cx in x0..=x1 {
+                let cell = NavGrid::cell_to_world(cx, cz);
+                for &(hall, mine) in &self.lanes {
+                    worst = worst.max(WORKER_LANE_HALF_WIDTH - lane_distance(cell, hall, mine));
+                }
+            }
+        }
+        worst
+    }
+}
+
+/// Ground-plane distance from `p` to the segment `a`–`b`.
+///
+/// A local copy for the same reason seven modules here keep their own
+/// `xz_dist`: ten lines of clamped projection read better in place than a
+/// dependency from the intent compiler to the terrain generator. terrain.rs's
+/// `point_segment_distance` — which keeps trees off these very lanes — is the
+/// sibling, and the two agree by being the same three lines of algebra.
+fn lane_distance(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let p = Vec2::new(p.x, p.z);
+    let a = Vec2::new(a.x, a.z);
+    let b = Vec2::new(b.x, b.z);
+    let ab = b - a;
+    let len_sq = ab.length_squared();
+    if len_sq <= f32::EPSILON {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
+/// This team's worker lanes, read off the world.
+///
+/// Halls must be **finished** (scaffolding works no mine) and **this seat's**;
+/// mines must be **live** (`remaining > 0`), because a worked-out mine is
+/// unblocked in the nav grid, still listed in the snapshot, and no longer worth
+/// a lane — the same `remaining > 0` pin `verify_r9_legibility.py` makes for the
+/// same reason.
+fn worker_lanes(me: Team, halls: &IntentHalls, nodes: &IntentNodes) -> WorkerLanes {
+    let mines: Vec<Vec3> = nodes
+        .iter()
+        .filter(|(_, node, _)| node.kind == ResourceKind::Gold && node.remaining > 0)
+        .map(|(_, _, tf)| tf.translation)
+        .collect();
+    if mines.is_empty() {
+        return WorkerLanes::none();
+    }
+    let halls: Vec<Vec3> = halls
+        .iter()
+        .filter(|(_, team, building)| **team == me && is_hall(building.kind))
+        .map(|(tf, _, _)| tf.translation)
+        .collect();
+    WorkerLanes::between(&halls, &mines)
+}
+
 /// The nearest site within `radius` of `around` where a `size`-edge footprint
 /// would actually fit, or `None` if the whole neighbourhood is taken.
 ///
@@ -4144,15 +4351,28 @@ pub const PLACEMENT_HINT_RADIUS: f32 = 15.0;
 /// which is the property `a_blocked_placement_hint_is_itself_legal` asserts by
 /// feeding the hint straight back to the validator.
 ///
-/// Ties break on (distance, x, z) so two seats reading the same board are
-/// given the same advice. There is no fog consideration on purpose: the nav
-/// grid is map furniture (terrain, trees, mines) plus buildings, and
+/// **`lanes` is the corridor rule** ([`WorkerLanes`]), and it is the primary
+/// sort key: a tile clear of every hall→mine haul beats a nearer tile inside
+/// one, always. It *ranks* rather than *rejects*, which is the whole of the
+/// fallback — a base with nothing but lane tiles left still gets an answer, the
+/// shallowest intrusion available, instead of a refusal that names no
+/// alternative. Pass [`WorkerLanes::none`] to get the plain nearest-tile scan.
+///
+/// Ties break on (intrusion, distance, x, z) so two seats reading the same
+/// board are given the same advice. There is no fog consideration on purpose:
+/// the nav grid is map furniture (terrain, trees, mines) plus buildings, and
 /// docs/FOG.md already holds that map geography is public. A hint can point at
 /// a cell an enemy building has since taken, and the commander then gets the
 /// ordinary rejection there — the same thing that happens to the human's ghost.
-pub fn nearest_free_site(nav: &NavGrid, around: Vec3, size: f32, radius: f32) -> Option<Vec3> {
+pub fn nearest_free_site(
+    nav: &NavGrid,
+    around: Vec3,
+    size: f32,
+    radius: f32,
+    lanes: &WorkerLanes,
+) -> Option<Vec3> {
     let steps = (radius / CELL).ceil() as i32;
-    let mut best: Option<(f32, Vec3)> = None;
+    let mut best: Option<(f32, f32, Vec3)> = None;
     for dz in -steps..=steps {
         for dx in -steps..=steps {
             let candidate = snap_footprint(
@@ -4167,24 +4387,32 @@ pub fn nearest_free_site(nav: &NavGrid, around: Vec3, size: f32, radius: f32) ->
             if d > radius || !nav.rect_is_free(candidate, size) {
                 continue;
             }
+            let intrusion = lanes.intrusion(candidate, size);
             let better = match best {
                 None => true,
-                Some((bd, bp)) => (d, candidate.x, candidate.z) < (bd, bp.x, bp.z),
+                Some((bi, bd, bp)) => {
+                    (intrusion, d, candidate.x, candidate.z) < (bi, bd, bp.x, bp.z)
+                }
             };
             if better {
-                best = Some((d, candidate));
+                best = Some((intrusion, d, candidate));
             }
         }
     }
-    best.map(|(_, p)| p)
+    best.map(|(_, _, p)| p)
 }
 
 /// The whole blocked-site rejection, hint included. One function because the
 /// bridge's `errors` array and the human's alert stack must read identically —
 /// docs/INTENT.md's "the text after the channel tag is byte-identical".
-pub fn blocked_site_error(nav: &NavGrid, pos: Vec3, kind: BuildingKind) -> String {
+pub fn blocked_site_error(
+    nav: &NavGrid,
+    pos: Vec3,
+    kind: BuildingKind,
+    lanes: &WorkerLanes,
+) -> String {
     let size = building_stats(kind).size;
-    let hint = match nearest_free_site(nav, pos, size, PLACEMENT_HINT_RADIUS) {
+    let hint = match nearest_free_site(nav, pos, size, PLACEMENT_HINT_RADIUS, lanes) {
         Some(p) => format!("nearest legal: ({:.1}, {:.1})", p.x, p.z),
         None => format!("no legal site within {PLACEMENT_HINT_RADIUS:.0}"),
     };
@@ -6286,9 +6514,378 @@ mod tests {
             nav.set_blocked_rect(mine, PLACEMENT_HINT_RADIUS * 2.0 + 20.0, true);
         }
         let nav = app.world().resource::<NavGrid>();
-        assert!(nearest_free_site(nav, mine, 8.0, PLACEMENT_HINT_RADIUS).is_none());
-        assert!(blocked_site_error(nav, mine, BuildingKind::TownHall)
+        // No hall and no live node in this app, so there is no lane to steer
+        // around and the picker's only question is legality — which is the
+        // question this test has always been about.
+        let lanes = WorkerLanes::none();
+        assert!(nearest_free_site(nav, mine, 8.0, PLACEMENT_HINT_RADIUS, &lanes).is_none());
+        assert!(blocked_site_error(nav, mine, BuildingKind::TownHall, &lanes)
             .contains("no legal site within 15"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The worker-lane corridor (`wc3clone-ydb`)
+    //
+    // The ladder-r25 bug: `nearest_free_site` was a plain nearest-tile scan, so
+    // a commander repeating `build ... site: "nearest legal site"` anchored at
+    // `our base` packed the tiles closest to the hall first — which are exactly
+    // the tiles its workers walk to the gold. The tests below drive the real
+    // picker over a real `NavGrid` laid out like the real map, because a bug
+    // about geometry deserves the geometry it happened in.
+    // -----------------------------------------------------------------------
+
+    /// The opening board of the human base: the hall's 8x8 and its home mine's
+    /// 6x6 on an otherwise empty grid, exactly as terrain.rs lays them down.
+    fn home_base_nav() -> (NavGrid, Vec3, Vec3) {
+        let hall = HUMAN_BASE;
+        let mine = GOLD_MINE_POSITIONS[0];
+        let mut nav = NavGrid::default();
+        nav.set_blocked_rect(hall, building_stats(BuildingKind::TownHall).size, true);
+        nav.set_blocked_rect(mine, 6.0, true);
+        (nav, hall, mine)
+    }
+
+    /// Every walkable nav cell whose centre sits inside the corridor — the
+    /// haul, in the only unit the pather counts in.
+    fn open_lane_cells(nav: &NavGrid, hall: Vec3, mine: Vec3) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for cz in 0..GRID_DIM {
+            for cx in 0..GRID_DIM {
+                let p = NavGrid::cell_to_world(cx, cz);
+                if lane_distance(p, hall, mine) <= WORKER_LANE_HALF_WIDTH && !nav.is_blocked(cx, cz)
+                {
+                    out.push((cx, cz));
+                }
+            }
+        }
+        out
+    }
+
+    /// Is every cell in `cells` reachable from the first one, walking only
+    /// through cells that are still free? The literal question a worker asks.
+    fn lane_is_one_piece(nav: &NavGrid, cells: &[(usize, usize)]) -> bool {
+        use std::collections::BTreeSet;
+        let want: BTreeSet<(usize, usize)> = cells.iter().copied().collect();
+        let Some(&start) = cells.first() else {
+            return true;
+        };
+        let mut seen: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let mut queue = vec![start];
+        while let Some((cx, cz)) = queue.pop() {
+            if !seen.insert((cx, cz)) {
+                continue;
+            }
+            for (nx, nz) in [
+                (cx.wrapping_sub(1), cz),
+                (cx + 1, cz),
+                (cx, cz.wrapping_sub(1)),
+                (cx, cz + 1),
+            ] {
+                if nx < GRID_DIM && nz < GRID_DIM && want.contains(&(nx, nz)) && !nav.is_blocked(nx, nz)
+                {
+                    queue.push((nx, nz));
+                }
+            }
+        }
+        want.iter().all(|c| seen.contains(c))
+    }
+
+    /// **The bug, and the fix, in one scenario.** Ten Farms placed by the real
+    /// picker anchored at the hall, each one made real in the grid before the
+    /// next is asked for — r25's repeated `site: "nearest legal site"`,
+    /// compressed. Run twice over the same board: once with no lanes (the
+    /// picker as it was) and once with the hall's haul declared.
+    ///
+    /// The metric is the haul itself: how many of the cells a worker had at the
+    /// start of the match are still walkable at the end of the build order.
+    #[test]
+    fn repeated_base_anchored_builds_leave_the_mine_lane_open() {
+        let size = building_stats(BuildingKind::Farm).size;
+
+        let ten_farms = |lanes: &WorkerLanes| -> (NavGrid, Vec<(usize, usize)>, usize) {
+            let (mut nav, hall, mine) = home_base_nav();
+            let watched = open_lane_cells(&nav, hall, mine);
+            for _ in 0..10 {
+                let Some(site) =
+                    nearest_free_site(&nav, hall, size, PLACEMENT_HINT_RADIUS, lanes)
+                else {
+                    break;
+                };
+                nav.set_blocked_rect(site, size, true);
+            }
+            let lost = watched
+                .iter()
+                .filter(|(cx, cz)| nav.is_blocked(*cx, *cz))
+                .count();
+            (nav, watched, lost)
+        };
+
+        let (walled, watched, before) = ten_farms(&WorkerLanes::none());
+        assert!(
+            !watched.is_empty(),
+            "the fixture has no haul to wall — check the map constants"
+        );
+        assert!(
+            before > 0,
+            "the pre-fix picker walled none of the {} lane cells; \
+             this test is no longer reproducing wc3clone-ydb",
+            watched.len()
+        );
+        // Not merely narrowed — *severed*. This is the r25 report in one
+        // assertion, and it is here so that a later change which quietly
+        // stops reproducing the bug says so instead of passing.
+        assert!(
+            !lane_is_one_piece(&walled, &watched),
+            "the pre-fix picker left the haul in one piece; wc3clone-ydb no longer reproduces"
+        );
+
+        let lanes = WorkerLanes::between(&[HUMAN_BASE], &[GOLD_MINE_POSITIONS[0]]);
+        let (nav, watched, after) = ten_farms(&lanes);
+        assert_eq!(
+            after, 0,
+            "the corridor-aware picker still took {after} of {} lane cells",
+            watched.len()
+        );
+        // And the lane a worker can see is one lane, not two halves with a
+        // Farm between them.
+        assert!(
+            lane_is_one_piece(&nav, &watched),
+            "the haul survived cell-by-cell but is no longer connected"
+        );
+    }
+
+    /// **The fallback: least-bad, never `None` when something is legal.** A
+    /// board where the *only* ground left is inside the haul. Refusing here
+    /// would be the r23 failure the site selector was built to end — a
+    /// commander told `no legal site` while a perfectly buildable tile sits in
+    /// front of them. So the picker takes the shallowest intrusion it can find
+    /// and lets the Farm go up awkwardly.
+    #[test]
+    fn the_picker_falls_back_to_the_least_bad_lane_tile() {
+        let size = building_stats(BuildingKind::Farm).size;
+        let (mut nav, hall, mine) = home_base_nav();
+        // Brick the world in, then re-open the haul and nothing else.
+        nav.blocked.iter_mut().for_each(|b| *b = true);
+        for cz in 0..GRID_DIM {
+            for cx in 0..GRID_DIM {
+                let p = NavGrid::cell_to_world(cx, cz);
+                if lane_distance(p, hall, mine) <= WORKER_LANE_HALF_WIDTH {
+                    nav.blocked[NavGrid::idx(cx, cz)] = false;
+                }
+            }
+        }
+        nav.set_blocked_rect(hall, building_stats(BuildingKind::TownHall).size, true);
+        nav.set_blocked_rect(mine, 6.0, true);
+
+        let lanes = WorkerLanes::between(&[hall], &[mine]);
+        let picked = nearest_free_site(&nav, hall, size, PLACEMENT_HINT_RADIUS, &lanes)
+            .expect("a legal tile exists, so a refusal is a bug and not a policy");
+
+        // It IS a compromise — the fixture left nothing else — and it is the
+        // cheapest one on the board, checked against a brute-force sweep of
+        // every candidate the picker considered.
+        assert!(
+            lanes.intrusion(picked, size) > 0.0,
+            "the fixture leaked a lane-free tile; the fallback is untested"
+        );
+        let steps = (PLACEMENT_HINT_RADIUS / CELL).ceil() as i32;
+        let mut cheapest = f32::MAX;
+        for dz in -steps..=steps {
+            for dx in -steps..=steps {
+                let c = snap_footprint(
+                    clamp_to_map(Vec3::new(
+                        hall.x + dx as f32 * CELL,
+                        0.0,
+                        hall.z + dz as f32 * CELL,
+                    )),
+                    size,
+                );
+                let d = (c.x - hall.x).hypot(c.z - hall.z);
+                if d > PLACEMENT_HINT_RADIUS || !nav.rect_is_free(c, size) {
+                    continue;
+                }
+                cheapest = cheapest.min(lanes.intrusion(c, size));
+            }
+        }
+        assert_eq!(
+            lanes.intrusion(picked, size),
+            cheapest,
+            "the fallback took a deeper tile than it had to"
+        );
+    }
+
+    /// **Clear ground beats near ground.** Two tiles on an otherwise solid
+    /// board: one eight units from the hall and squarely on the haul, one
+    /// twelve units away and clear of it. The corridor rule is the *primary*
+    /// sort key, so the farther tile wins — and passing no lanes gives the
+    /// nearer one back, which is what makes this a test of the corridor rather
+    /// than of the fixture.
+    #[test]
+    fn a_site_clear_of_the_haul_beats_a_nearer_one_inside_it() {
+        let size = building_stats(BuildingKind::Farm).size;
+        let (mut nav, hall, mine) = home_base_nav();
+        let dir = (mine - hall).normalize();
+        let on_lane = snap_footprint(hall + dir * 8.0, size);
+        let off_lane = snap_footprint(hall + Vec3::new(12.0, 0.0, 0.0), size);
+
+        nav.blocked.iter_mut().for_each(|b| *b = true);
+        nav.set_blocked_rect(on_lane, size, false);
+        nav.set_blocked_rect(off_lane, size, false);
+
+        let lanes = WorkerLanes::between(&[hall], &[mine]);
+        assert!(lanes.intrusion(on_lane, size) > 0.0, "fixture: on_lane is off it");
+        assert_eq!(lanes.intrusion(off_lane, size), 0.0, "fixture: off_lane is on it");
+        assert!(
+            (on_lane - hall).length() < (off_lane - hall).length(),
+            "fixture: the lane tile has to be the NEARER one"
+        );
+
+        assert_eq!(
+            nearest_free_site(&nav, hall, size, PLACEMENT_HINT_RADIUS, &WorkerLanes::none()),
+            Some(on_lane),
+            "without the corridor rule the nearest tile still wins"
+        );
+        assert_eq!(
+            nearest_free_site(&nav, hall, size, PLACEMENT_HINT_RADIUS, &lanes),
+            Some(off_lane),
+            "with it, clear ground outranks near ground"
+        );
+    }
+
+    /// A lane only exists between a hall that works a mine and a mine worth
+    /// working. Three ways that is not true, each of which would otherwise
+    /// have the picker steering around nothing.
+    #[test]
+    fn only_a_live_mine_within_working_distance_opens_a_lane() {
+        let size = building_stats(BuildingKind::Farm).size;
+        let hall = HUMAN_BASE;
+        let near = GOLD_MINE_POSITIONS[0];
+        let on_lane = snap_footprint(hall + (near - hall).normalize() * 8.0, size);
+
+        // The control: a live mine at working distance does open one.
+        assert!(WorkerLanes::between(&[hall], &[near]).intrusion(on_lane, size) > 0.0);
+
+        // Too far to be "yours" — `MINE_HOME_RADIUS`, the same predicate
+        // `TriggerWhen::MineDry` and the income alarm use.
+        let far = hall + (near - hall).normalize() * (MINE_HOME_RADIUS + 1.0);
+        assert!(
+            (far - hall).length() > MINE_HOME_RADIUS,
+            "fixture: the far mine must be out of working distance"
+        );
+        assert_eq!(
+            WorkerLanes::between(&[hall], &[far]).intrusion(on_lane, size),
+            0.0,
+            "a mine no hall of ours works is not a haul of ours"
+        );
+
+        // No halls, or no mines: nothing to connect, and the picker is the
+        // plain nearest-tile scan it always was.
+        assert_eq!(WorkerLanes::between(&[], &[near]).intrusion(on_lane, size), 0.0);
+        assert_eq!(WorkerLanes::between(&[hall], &[]).intrusion(on_lane, size), 0.0);
+    }
+
+    /// The width is an argument, not a taste, so the argument is pinned.
+    ///
+    /// The corridor is measured at nav-cell centres, so a cell can sit half a
+    /// cell further out than its centre says and still be walked; the channel
+    /// the rule *guarantees* is therefore `2 * (half_width - CELL/2)` wide. That
+    /// has to stay wider than two worker bodies, because harvest is a round
+    /// trip and the lane carries traffic both ways.
+    #[test]
+    fn the_worker_lane_fits_two_abreast() {
+        let guaranteed = 2.0 * (WORKER_LANE_HALF_WIDTH - CELL * 0.5);
+        let two_workers = 4.0 * UNIT_RADIUS;
+        assert!(
+            guaranteed >= two_workers,
+            "the guaranteed channel is {guaranteed}, two workers need {two_workers} — \
+             WORKER_LANE_HALF_WIDTH, CELL or UNIT_RADIUS moved and closed the lane"
+        );
+    }
+
+    /// **The plumbing, end to end.** The unit tests above hand `WorkerLanes` a
+    /// pair of points; this one makes the compiler find them — a finished hall
+    /// of this team's and a live gold node — and proves the accepted site moved
+    /// off the haul. It also proves the two halves of the fix are one: the
+    /// selector resolution and the hint text read the same picker.
+    #[test]
+    fn nearest_legal_site_steers_a_build_off_the_gold_haul() {
+        let hall_pos = HUMAN_BASE;
+        let mine_pos = GOLD_MINE_POSITIONS[0];
+        let size = building_stats(BuildingKind::Farm).size;
+        // Squarely on the haul, and — this is the point — perfectly legal
+        // ground. Nothing is blocked here, so the pre-fix picker returned it
+        // unchanged.
+        let asked = snap_footprint((hall_pos + mine_pos) * 0.5, size);
+
+        let build_at = |with_world: bool| -> Vec3 {
+            let mut app = compiler_app();
+            {
+                let mut nav = app.world_mut().resource_mut::<NavGrid>();
+                nav.set_blocked_rect(hall_pos, building_stats(BuildingKind::TownHall).size, true);
+                nav.set_blocked_rect(mine_pos, 6.0, true);
+            }
+            if with_world {
+                spawn_hall_at(&mut app, BuildingKind::TownHall, Team::Human, hall_pos, false);
+                spawn_node(&mut app, ResourceKind::Gold, mine_pos, 5000);
+            }
+            {
+                let mut economies = app.world_mut().resource_mut::<Economies>();
+                let e = economies.get_mut(Team::Human);
+                e.gold = 2000;
+                e.lumber = 2000;
+            }
+            let worker = app
+                .world_mut()
+                .spawn((
+                    Unit { kind: UnitKind::Worker },
+                    Team::Human,
+                    Transform::from_translation(hall_pos),
+                ))
+                .id();
+            app.world_mut().send_event(SubmitIntent {
+                team: Team::Human,
+                source: IntentSource::Bridge,
+                tag: "cmd 0".to_string(),
+                intent: Intent::Build {
+                    worker: Some(worker.to_bits()),
+                    kind: "Farm".to_string(),
+                    x: Some(asked.x),
+                    z: Some(asked.z),
+                    region: None,
+                    select: None,
+                    site: Some("nearest legal site".to_string()),
+                },
+                trigger: None,
+                plan: None,
+            });
+            app.update();
+            let errors = app.world().resource::<IntentErrors>().get(Team::Human).to_vec();
+            assert!(errors.is_empty(), "the build was refused: {errors:?}");
+            match app.world().entity(worker).get::<Order>() {
+                Some(Order::Build { pos, .. }) => *pos,
+                other => panic!("no build order on the worker: {other:?}"),
+            }
+        };
+
+        // With no hall and no node in the world there is no haul to know
+        // about, and the selector hands back the ground it was given.
+        assert_eq!(build_at(false), asked, "an empty world must not move a legal site");
+
+        // With them, it moves — and lands clear of the corridor.
+        let steered = build_at(true);
+        assert_ne!(steered, asked, "the site selector parked the Farm on the haul");
+        let lanes = WorkerLanes::between(&[hall_pos], &[mine_pos]);
+        assert_eq!(
+            lanes.intrusion(steered, size),
+            0.0,
+            "the steered site ({}, {}) is still inside the haul",
+            steered.x,
+            steered.z
+        );
+        assert!(
+            (steered - asked).length() <= PLACEMENT_HINT_RADIUS,
+            "the selector wandered past the radius it promises"
+        );
     }
 
     /// The ability selector is untagged on the wire: a bare number is a slot
