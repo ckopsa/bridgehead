@@ -95,6 +95,69 @@ def test_a_draw_is_a_winner_that_is_absent():
     assert any("decisive but names no winner" in m for m in arena.validate(rec))
 
 
+def test_a_score_round_is_never_decisive():
+    """The ledger boundary enforces what both readers already believe
+    (wc3clone-j84): a time-cap verdict names a winner on assets and is still
+    not a win the game recognises. Recorded rounds get this right by
+    construction; a backfill or a hand-written record has no such habit, and
+    this is the only place that catches one."""
+    rec = good()
+    rec["result"].update(game_over_reason="score", decisive=True)
+    assert any("decisive on a `score` round" in m for m in arena.validate(rec)), arena.validate(rec)
+    # The same round told honestly passes...
+    rec["result"]["decisive"] = False
+    assert arena.validate(rec) == [], arena.validate(rec)
+    # ...and `razed` at the same numbers is a real win, so the check cannot be
+    # reading `decisive` alone.
+    rec["result"].update(game_over_reason="razed", decisive=True)
+    assert arena.validate(rec) == []
+
+
+def test_the_scaffold_a_seat_played_with_is_recorded_per_seat():
+    """docs/AFFORDANCES.md constraint 3. Optional and additive: present on the
+    seat that read the affordance document, absent on the one that played bare
+    — which is what makes an A/B round legible."""
+    rec = good()
+    rec["seats"][0]["scaffold"] = "affordance-doc/1"
+    rec["ruleset"]["constants"]["affordance_doc"] = "affordance-doc/1"
+    assert arena.validate(rec) == [], arena.validate(rec)
+    # The unscaffolded seat omits the key; nothing lands in `unknown`, because
+    # "played bare" is a fact and not a gap.
+    assert "seats.1.scaffold" not in arena.null_paths(rec)
+    # An empty or mistyped version is caught rather than compared later.
+    rec["seats"][0]["scaffold"] = ""
+    assert any("seats.0.scaffold" in m for m in arena.validate(rec))
+    rec["seats"][0]["scaffold"] = 1
+    assert any("seats.0.scaffold" in m for m in arena.validate(rec))
+
+
+def test_the_tuning_digests_must_look_like_digests():
+    """`alarms_ron` and `stances_ron` are written by a tool and compared for
+    equality across rounds, so a truncated or uppercased one would read as a
+    retune that never happened."""
+    rec = good()
+    rec["ruleset"]["constants"].update(alarms_ron="0a1b2c3d4e5f", stances_ron="deadbeef1234")
+    assert arena.validate(rec) == [], arena.validate(rec)
+    for bad_digest in ("0A1B2C3D4E5F", "0a1b2c", "0a1b2c3d4e5f9", "not-a-hash"):
+        rec["ruleset"]["constants"]["alarms_ron"] = bad_digest
+        assert any("alarms_ron" in m for m in arena.validate(rec)), bad_digest
+
+
+def test_constants_stays_open_for_the_values_nobody_typed_a_rule_for():
+    """`mine_gold` is the whole reason the field exists (round 9 -> round 10).
+    Only the tool-written keys are typed; the rest is a round saying what it
+    was played under."""
+    rec = good()
+    rec["ruleset"]["constants"].update(mine_gold=5000, some_new_lever="on")
+    assert arena.validate(rec) == [], arena.validate(rec)
+
+
+def test_an_empty_affordance_doc_version_is_not_a_scaffold():
+    rec = good()
+    rec["ruleset"]["constants"]["affordance_doc"] = "  "
+    assert any("affordance_doc" in m for m in arena.validate(rec))
+
+
 def test_a_round_needs_a_seat():
     rec = good()
     rec["seats"] = []
