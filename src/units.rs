@@ -2085,3 +2085,29 @@ fn cleanup_orphan_paths(
         commands.entity(entity).try_remove::<PathFollow>();
     }
 }
+
+/// The real movement pipeline, minus the spawner, for tests in other modules
+/// that need units that actually *walk* — doctrine.rs's ford reproduction is
+/// the reason this exists. It is the same chain `UnitsPlugin` installs and it
+/// lands in the same `SimSet`, so a test app that also configures `SIM_ORDER`
+/// gets the shipping frame order rather than an approximation of it.
+///
+/// `spawn_units` is left out on purpose: it is the only member of the chain
+/// that touches `Assets<Mesh>`, and a test that spawns its own bodies has no
+/// use for meshes nobody will draw.
+#[cfg(test)]
+pub(crate) fn add_movement_systems_for_test(app: &mut App) {
+    app.init_resource::<PathScratch>().add_systems(
+        Update,
+        (
+            orders_to_movement,
+            follow_orders,
+            compute_paths,
+            steer_units,
+            separate_units,
+            cleanup_orphan_paths,
+        )
+            .chain()
+            .in_set(SimSet::Movement),
+    );
+}
