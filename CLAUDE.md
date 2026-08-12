@@ -78,7 +78,7 @@ documented in tools/BUILDER_BRIEF.md Appendix A):
 
 ```bash
 tools/verify.sh smoke      # compiles, tests pass, one short headless match reaches game over
-tools/verify.sh standard   # + both maps + the four bridge protocol verifiers
+tools/verify.sh standard   # + a decisive crossings sim + every tools/test_*.py suite
 tools/verify.sh full       # + longer caps, the arena runner path, screenshots
 tools/verify.sh identity   # two seeded fixed-dt runs, fingerprints diffed byte-for-byte
 ```
