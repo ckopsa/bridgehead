@@ -161,6 +161,21 @@ def place_of(pos, smap):
     return "at ({:.0f}, {:.0f})".format(pos[0], pos[1])
 
 
+def posture_anchor(posture, smap):
+    """The PLACE half of a posture string — "near mid" — or None if it has none.
+
+    `escort:<id>` and a bare word have no ground under them; only the
+    `verb@(x,z)` spellings do.
+    """
+    if not posture or "@" not in posture:
+        return None
+    _, _, rest = posture.partition("@")
+    m = _COORDS.search(rest)
+    if not m:
+        return None
+    return place_of([float(m.group(1)), float(m.group(2))], smap)
+
+
 def stance_phrase(stance, smap):
     """Turn a squad's posture string into something a sentence can hold.
 
@@ -172,11 +187,9 @@ def stance_phrase(stance, smap):
     if not stance:
         return "no standing posture"
     if "@" in stance:
-        verb, _, rest = stance.partition("@")
-        m = _COORDS.search(rest)
-        if m:
-            return "{} {}".format(verb, place_of([float(m.group(1)), float(m.group(2))], smap))
-        return verb
+        anchor = posture_anchor(stance, smap)
+        verb = stance.partition("@")[0]
+        return "{} {}".format(verb, anchor) if anchor else verb
     if ":" in stance:
         verb, _, arg = stance.partition(":")
         return "{} {}".format(verb, arg)
@@ -188,14 +201,26 @@ def _squad_props(sid, sq, members, smap):
     hp = sum(u.get("hp", 0.0) for u in members)
     max_hp = sum(u.get("max_hp", 0.0) for u in members)
     pos = centroid([u["pos"] for u in members if u.get("pos")])
-    # `stance` is AFFORDANCES.md item 2 and is not on the wire yet; `posture`
-    # is what every shipped snapshot carries. Prefer the newer key when it
-    # appears and never require it.
-    stance = sq.get("stance") or sq.get("posture")
+    # `stance` is AFFORDANCES.md item 2; `posture` is what every shipped
+    # snapshot carries, and a stanced squad carries BOTH — the stance names the
+    # doctrine, the posture underneath it carries the anchor the stance was
+    # installed at. Taking `stance or posture` threw the anchor away, so a
+    # squad staging at mid and a squad staging on its own hall both read
+    # "stage", and the digest's whole job is to say where things are.
+    stance = sq.get("stance")
+    posture = sq.get("posture")
+    if stance:
+        anchor = posture_anchor(posture, smap)
+        phrase = "{} ({})".format(stance, anchor) if anchor else stance
+    else:
+        phrase = stance_phrase(posture, smap)
     return {
         "id": sid,
-        "stance": stance,
-        "stance_phrase": stance_phrase(stance, smap),
+        # The bare doctrine word, unchanged: `stance` is the FACT and
+        # `stance_phrase` is the sentence. A caller matching on the word must
+        # not have to strip a parenthesis off it.
+        "stance": stance or posture,
+        "stance_phrase": phrase,
         # A snapshot always carries the count on the squad record; the unit
         # rosters are what we sum strength from. They agree, except on a
         # snapshot old enough to predate `units[].squad`, where the count is
@@ -400,16 +425,30 @@ def running_default(props):
     the reflex it is reporting has already acted and that reflex is the part of
     silence a commander most needs to know about; the standing stances follow,
     because they go on being true underneath it.
+
+    ...but only the ones the alarm did not already name. `income_collapse`'s
+    running default is a full sentence about what every squad is doing, so the
+    line read "squad 0 (15 units) holds defend near our base; …; squad 0 keeps
+    defend near our base" — the same squad twice, in two vocabularies, inside
+    one line a commander is meant to read at a glance. Where the two disagree
+    the ALARM's clause wins, because it is the engine's own account of what the
+    reflex left that squad doing.
     """
     parts = [a["default"] for a in props.get("alarms") or [] if a.get("default")]
-    stances = [
-        "{} keeps {}".format(
-            "squad {}".format(sq["id"]) if sq["id"] is not None else "loose army",
-            sq["stance_phrase"],
-        )
-        for sq in props["squads"]
-    ]
-    parts += stances or ["no squad has a standing posture"]
+    spoken_for = " ".join(parts).lower()
+    stances = []
+    for sq in props["squads"]:
+        who = "squad {}".format(sq["id"]) if sq["id"] is not None else "loose army"
+        # `\b` on both ends so "squad 1" does not swallow "squad 10".
+        if parts and re.search(r"\b{}\b".format(re.escape(who)), spoken_for):
+            continue
+        stances.append("{} keeps {}".format(who, sq["stance_phrase"]))
+    if props["squads"]:
+        # Every squad deduped away is not "no squad has a posture" — the alarm
+        # just said what all of them are doing.
+        parts += stances
+    else:
+        parts.append("no squad has a standing posture")
     queued = props["production"]["queued"]
     idle = props["production"]["idle"]
     if queued:

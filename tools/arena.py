@@ -239,6 +239,27 @@ def validate(rec: dict) -> list[str]:
             or (isinstance(seat["scaffold"], str) and seat["scaffold"].strip() != ""),
             f"{where}.scaffold must be a non-empty version string when present",
         )
+        # `model` — WHICH MODEL sat in this chair. The other half of the pair
+        # docs/AFFORDANCES.md constraint 3 names: "an arena result measures
+        # model+scaffold", and until this key existed the ledger recorded the
+        # scaffold and left the model to a commit message. Two rounds with the
+        # same persona, the same map and the same ruleset are still different
+        # experiments if one was opus and one was haiku, and the ladder is
+        # nothing but that comparison.
+        #
+        # Free-form string, not an enum: model ids are somebody else's
+        # vocabulary and they change faster than this file does. A closed set
+        # here would mean a bead every time a model shipped, and the failure
+        # mode of the wrong enum (a valid round refused) is worse than the
+        # failure mode of a free string (a typo you can grep for).
+        #
+        # OPTIONAL on the same terms as `scaffold`: absent, never null, on a
+        # scripted seat and on every round recorded before the key existed.
+        want(
+            "model" not in seat
+            or (isinstance(seat["model"], str) and seat["model"].strip() != ""),
+            f"{where}.model must be a non-empty model id when present",
+        )
         # `ready_wait_s` — wall seconds this seat took to send `ready` before
         # the match clock started (docs/INTENT.md, "The ready handshake").
         # Additive and OPTIONAL: rounds recorded before the handshake existed

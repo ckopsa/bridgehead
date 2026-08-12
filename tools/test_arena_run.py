@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -205,6 +206,115 @@ def test_a_scaffolded_round_names_the_document_version_in_the_ruleset():
     seats = scaffolded("red=commander:haiku", "blue=commander:haiku")
     consts = arena_run.ruleset_constants(seats, {})
     assert consts["affordance_doc"] == arena_run.scaffold_version()
+
+
+# ---------------------------------------------------------------------------
+# The other half of model+scaffold
+# ---------------------------------------------------------------------------
+
+
+def modelled(*specs, models=("red=opus",)):
+    seats = [arena_run.parse_seat(s) for s in specs]
+    arena_run.mark_models(seats, list(models))
+    return seats
+
+
+def test_each_seat_carries_the_model_that_sat_in_it():
+    """AFFORDANCES.md constraint 3 says an arena result measures
+    model+scaffold. The ledger recorded the scaffold and left the model to a
+    commit message, so half of every result was unrecorded — and the ladder is
+    nothing but a comparison of that half."""
+    red, blue = modelled("red=commander:rusher", "blue=commander:boomer",
+                         models=("red=opus,blue=haiku",))
+    assert red["model"] == "opus"
+    assert blue["model"] == "haiku"
+
+
+def test_both_puts_one_model_in_every_commander_chair():
+    """The A/B round the scaffold field exists for: the same model in both
+    chairs, the document in one of them."""
+    seats = modelled("red=commander:a", "blue=commander:b", models=("both=haiku",))
+    assert [s["model"] for s in seats] == ["haiku", "haiku"]
+
+
+def test_a_seat_nobody_named_a_model_for_has_no_model_key():
+    """Absence, not a null — the same rule `scaffold` and `ready_wait_s`
+    follow. A round run before anybody typed `--model` is not a round with an
+    unknown model in the sense `unknown[]` means."""
+    red, blue = modelled("red=commander:a", "blue=commander:b", models=("red=opus",))
+    assert red["model"] == "opus"
+    assert "model" not in blue
+
+
+def test_a_scripted_seat_cannot_be_given_a_model():
+    """The scripted AI is ai.rs. Calling it opus would put a round with no
+    model in it into a model-vs-model comparison."""
+    for models in (("blue=opus",), ("both=opus",)):
+        try:
+            modelled("red=commander:rusher", "blue=scripted", models=models)
+        except ValueError as err:
+            assert "scripted" in str(err), err
+        else:
+            raise AssertionError(f"--model {models} named a model for ai.rs")
+
+
+def test_the_model_flag_refuses_a_shape_it_cannot_read():
+    for models in (("opus",), ("green=opus",), ("red=",), ("blue=opus",)):
+        try:
+            modelled("red=commander:rusher", models=models)
+        except ValueError:
+            continue
+        raise AssertionError(f"--model {models} was accepted")
+
+
+def test_a_recorded_round_carries_the_model_and_validates():
+    seats = modelled("red=commander:rusher", "blue=commander:boomer",
+                     models=("red=opus,blue=haiku",))
+    args = Args(notes="", commit="abc1234", hypothesis="which model?", id="r99")
+    rec = arena_run.build_record(args, seats, arena_run.derive_env(seats, args),
+                                 arena_run.read_log(DECISIVE_LOG))
+    assert arena.validate(rec) == [], arena.validate(rec)
+    assert [s["model"] for s in rec["seats"]] == ["opus", "haiku"]
+    assert not any("model" in u for u in rec["unknown"])
+
+
+def test_the_commit_defaults_to_the_head_this_round_was_played_at():
+    """`ruleset.commit` was null on every recorded round because it was a flag
+    nobody remembered — and it is the only record of which stat tables the
+    binary was compiled with, since the engine normally runs the `include_str!`
+    copy."""
+    head = arena_run.head_commit()
+    assert head and re.match(r"^[0-9a-f]{4,40}$", head), head
+    out = subprocess.run(
+        [sys.executable, str(Path(arena_run.__file__)),
+         "--hypothesis", "whose commit?", "--id", "r999",
+         "--seat", "red=scripted", "--seat", "blue=scripted", "--dry-run"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert f"commit: {head}" in out.stdout
+    # ...and an explicit --commit still wins, for a round replayed from a tree.
+    out = subprocess.run(
+        [sys.executable, str(Path(arena_run.__file__)),
+         "--hypothesis", "whose commit?", "--id", "r999",
+         "--seat", "red=scripted", "--seat", "blue=scripted",
+         "--commit", "deadbee", "--dry-run"],
+        capture_output=True, text=True,
+    )
+    assert "commit: deadbee" in out.stdout
+
+
+def test_a_dry_run_names_the_model_in_each_chair():
+    out = subprocess.run(
+        [sys.executable, str(Path(arena_run.__file__)),
+         "--hypothesis", "does the plan print?", "--id", "r999",
+         "--seat", "red=commander:haiku", "--seat", "blue=commander:boomer",
+         "--model", "red=haiku,blue=opus", "--dry-run"],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "red=commander:haiku (haiku)" in out.stdout
+    assert "blue=commander:boomer (opus)" in out.stdout
 
 
 def test_the_tuning_digests_are_stable_and_content_addressed():
