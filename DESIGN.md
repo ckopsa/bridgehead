@@ -160,7 +160,8 @@ Win by destroying all enemy buildings.
   (docs/TEMPO.md). Off by default pending the owner's rematch (bead 4ez).
 - `copilot.rs`: the co-command seat (`BH_BRIDGE=copilot`) — proposals,
   approve/veto with reasons, conflict scoping against the human's own orders.
-- `alarm.rs`: the four forced re-decision conditions (docs/AFFORDANCES.md) —
+- `alarm.rs`: the forced re-decision conditions (docs/AFFORDANCES.md, plus
+  `mine_depleting` from r26/r27; the live set is `ALL_ALARM_KINDS`) —
   computed fog-legally per seat, each naming its running default. Never acts;
   renders into the snapshot's `alarms` array and the HUD event feed.
 - `bounty.rs`: midfield treasure spawns and claims.

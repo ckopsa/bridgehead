@@ -1039,7 +1039,13 @@ def test_the_text_render_is_readable_and_terminates():
 #: and the PLAYBOOK section is 5 lines with nothing declared. `--all` is still
 #: the pre-2.0 ACTIONS render exactly — the fold is what `--all` undoes, and a
 #: top-level section is not folded in either mode.
-FULL_LINES = {"doc_open_armed.json": 653, "doc_open_alarm.json": 813}
+#: kpp moved both by exactly one: the digest gained a RUNWAY line (the gold
+#: runway — bank, income/min, mine remaining, what the bank buys, and the
+#: commitment already standing against it). Both fixtures predate the engine
+#: keys it reads, so on these two the line is the `buys` clause alone, priced
+#: off `catalog_full.json` — which is the point of that clause degrading
+#: separately from the rest.
+FULL_LINES = {"doc_open_armed.json": 654, "doc_open_alarm.json": 814}
 
 #: What the collapsed render must fit in. The real numbers when this landed were
 #: **76** (armed, 43 actions) and **94** (alarm, 51 actions and a ringing
