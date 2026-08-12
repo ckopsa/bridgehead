@@ -87,7 +87,55 @@ Each command: `{"type":..., ...}`. Errors come back in the next snapshot's
 afford, not yours). `seq` is handled for you. If `applied` is present in the
 next snapshot it is the other half of that verdict: `[{"cmd":"cmd 3","delay":1.8}]`
 says command 3 was accepted but took 1.8s to reach the units it named — see
-**The chain of command** below. Commands not listed there cost nothing.
+**The chain of command** below. Commands not listed there cost nothing. And if
+`notes` is present, that is the third half — see **Acceptance notes** below.
+
+## Acceptance notes — the engine tells you when your order contradicts what it just told you
+
+**It never refuses.** Everything in `notes` is about a command that was accepted
+and has already applied, exactly as written. Re-sending it changes nothing;
+there is nothing to fix.
+
+```json
+"notes": ["cmd 1: accepted; note: push gates not met (squad 4/6, not consolidated: 3 of your 7 army units are outside squad 1, Hero 61%, gate is 80%); last enemy sighting 190s stale, threshold is 45s"]
+```
+
+Read it as: *your push went out; here is what the engine had already measured
+about it.* The same `cmd N` handle `errors` and `applied` use, so the three join
+into one verdict per command.
+
+**When you get one.** Only on a commitment, and only when it contradicts a fact
+this seat has been served all match:
+
+| You sent | The engine says something if |
+| --- | --- |
+| `stance push` / `posture push` | the squad is under `catalog.gates.push_min_units` bodies, or some of your army is outside it, or a hero in it is under `catalog.gates.push_hero_frac` |
+| `stance push` / `posture push` / `attackmove` | your last sighting of anything of theirs is older than `catalog.gates.intel_stale_s`, or your ledger is empty |
+
+Nothing else earns a note, and a commitment that clears every gate is echoed in
+silence. `attack <id>` is deliberately exempt: you are looking at the target.
+So is anything a **trigger or a plan step** fires — those are standing policy the
+engine is executing on its own clock, and a note per firing would repeat one
+unchanging fact into your loop every few seconds. The same three gates are on the
+affordance document's `push` link in every cycle, which is where a persisting
+condition belongs.
+
+**Why it exists.** Every one of these facts was already on the `push` link in
+the affordance document, with the same numbers. Nobody read them at the moment
+they committed, because the document is a page you read once and the digest is
+the page you read every cycle. So the fact is repeated where it cannot be
+missed. `bridge_view.py --digest` prints it as a `NOTE` line, beside `ERRORS`
+and never among them.
+
+**It is a fact, not advice.** Both sides of every comparison are printed so you
+can disagree with the threshold rather than with the engine, and the thresholds
+themselves are in `catalog.gates` so you can read them. Sending a four-unit push
+into an empty ledger is a legal, sometimes correct move — the engine's job is to
+make sure you knew, not to make the choice.
+
+Everything in a note comes from your own snapshot: your units, your squads, your
+`intel` ledger. There is nothing in one you could not have derived yourself. The
+point is *when* you are told.
 
 ## Command reference
 Unit orders (ids from state):
@@ -1086,9 +1134,12 @@ Three things about that block:
 - **NOT READY never blocks anything.** The command underneath is complete and
   the engine will accept it. `ready` is the engine telling you what it can
   measure, not what it thinks.
-- **The push gates are this scaffold's numbers** — one consolidated squad, six
-  or more units, heroes at 80% — and they are printed with both halves so you
-  can disagree with the threshold rather than with the engine.
+- **The push gates are the ENGINE's numbers** — one consolidated squad, six or
+  more units, heroes at 80%, published as `catalog.gates` — and they are printed
+  with both halves so you can disagree with the threshold rather than with the
+  engine. They are the same three it writes an acceptance note against, so this
+  page and the echo of your own `stance push` cannot tell you two different
+  things (see **Acceptance notes**).
 - **`intel` is your ledger, not your eyes.** "Last seen … — not since" is the
   sentence a commander lost a match for not having. An empty ledger says so in
   those words: what you cannot see is not what is not there.
