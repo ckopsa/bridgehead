@@ -531,6 +531,55 @@ def test_the_windowed_watcher_still_reads_a_real_win():
     assert v["decisive"] is True
 
 
+def test_the_windowed_watcher_calls_a_frozen_clock_a_wedge():
+    """r32: the engine stopped stepping at t=1495.7 and this loop waited out
+    the rest of its wall timeout. A clock that has stopped moving is the one
+    signal available from outside the process, and it must end the wait."""
+    with tempfile.TemporaryDirectory() as tmp:
+        seat = Path(tmp) / "red"
+        seat.mkdir()
+        (seat / "state.json").write_text(json.dumps({"t": 1495.7, "game_over": None}))
+        began = time.monotonic()
+        v = arena_run.wait_for_seat_game_over(
+            [seat], time.monotonic() + 30, poll=0.05, stall=0.3
+        )
+    assert time.monotonic() - began < 5, "a wedge must not be waited out"
+    assert v["winner"] is None and v["reason"] is None, (
+        "a wedge is not a verdict — the round records what it is: nothing"
+    )
+    assert v["decisive"] is False
+
+
+def test_a_round_still_held_at_t_zero_is_not_a_wedge():
+    """The ready handshake freezes the clock at 0 for as long as a commander
+    takes to think. A stall detector that started counting at launch would
+    report every thoughtful round as frozen."""
+    with tempfile.TemporaryDirectory() as tmp:
+        seat = Path(tmp) / "red"
+        seat.mkdir()
+        (seat / "state.json").write_text(json.dumps({"t": 0.0, "game_over": None}))
+        began = time.monotonic()
+        v = arena_run.wait_for_seat_game_over(
+            [seat], time.monotonic() + 0.6, poll=0.05, stall=0.2
+        )
+    assert time.monotonic() - began >= 0.5, "a held match must be waited for"
+    assert v["winner"] is None
+
+
+def test_the_stall_detector_can_be_turned_off():
+    """`--stall 0` is the pre-r32 behaviour, kept because a deliberately paused
+    engine (a human debugging a windowed round) is not a wedge."""
+    with tempfile.TemporaryDirectory() as tmp:
+        seat = Path(tmp) / "red"
+        seat.mkdir()
+        (seat / "state.json").write_text(json.dumps({"t": 42.0, "game_over": None}))
+        began = time.monotonic()
+        arena_run.wait_for_seat_game_over(
+            [seat], time.monotonic() + 0.5, poll=0.05, stall=0
+        )
+    assert time.monotonic() - began >= 0.4, "stall=0 waits for the deadline"
+
+
 def test_an_old_log_without_the_reason_or_clock_still_parses():
     """Rounds 1-8 were logged before either was printed. The reader widened
     rather than moved, so old sweep logs keep working."""

@@ -521,14 +521,33 @@ def read_log(log: str) -> dict:
     return out
 
 
-def wait_for_seat_game_over(seat_dirs: list[Path], deadline: float, poll: float = 1.0) -> dict:
-    """Windowed runs don't self-exit: watch the seats for the verdict instead."""
+def wait_for_seat_game_over(seat_dirs: list[Path], deadline: float, poll: float = 1.0,
+                            stall: float = 120.0) -> dict:
+    """Windowed runs don't self-exit: watch the seats for the verdict instead.
+
+    It also watches for the opposite of a verdict. Round 32 froze at t=1495.7
+    of an 1800s cap — the engine stopped stepping, every seat's snapshot went
+    stale, and this loop happily waited out the rest of its wall timeout before
+    anybody noticed. `stall` is how many wall seconds a *frozen game clock* is
+    tolerated before the round is called a wedge and the caller can stop it.
+
+    The clock has to have moved once first. `t` is legitimately 0 for the whole
+    ready handshake (up to `BH_READY_TIMEOUT` wall seconds, and a commander may
+    take all of it), so a stall clock that started at launch would report every
+    thoughtful round as frozen. Set `stall=0` to wait exactly as before.
+    """
+    clock, moved_at = None, time.monotonic()
     while time.monotonic() < deadline:
         for path in seat_dirs:
             try:
                 snap = json.loads((path / "state.json").read_text())
             except (OSError, json.JSONDecodeError):
                 continue
+            # Any seat's clock will do — they are the same match — and the max
+            # is the honest reading when one seat's file is mid-write.
+            now = float(snap.get("t", 0) or 0)
+            if clock is None or now > clock:
+                clock, moved_at = now, time.monotonic()
             if snap.get("game_over"):
                 reason = snap.get("game_over_reason")
                 # The wire and the ledger spell a draw differently, and this is
@@ -548,6 +567,23 @@ def wait_for_seat_game_over(seat_dirs: list[Path], deadline: float, poll: float 
                     "decisive": winner is not None and reason != "score",
                     "metrics": {},
                 }
+        idle = time.monotonic() - moved_at
+        if stall and clock and idle >= stall:
+            # Loud, because the failure it names is silent by nature: a wedged
+            # engine looks exactly like a slow one until you read the clock.
+            print(
+                f"error: the engine has not advanced its clock past t={clock:.1f}s in "
+                f"{idle:.1f}s — treating this round as a wedge, not a match "
+                f"(see docs/ARENA.md, \"When a windowed round freezes\")",
+                file=sys.stderr, flush=True,
+            )
+            # The record says the same thing a timed-out round says — nothing.
+            # A wedge is not a verdict, and `game_over_reason` is the engine's
+            # vocabulary (`arena.END_REASONS`), not a place to file an
+            # incident: the round lands in the ledger with its nulls in
+            # `unknown`, and the story is in this line and in engine.log.
+            return {"winner": None, "reason": None, "duration_s": None,
+                    "decisive": False, "metrics": {}}
         time.sleep(poll)
     return {"winner": None, "reason": None, "duration_s": None, "decisive": False, "metrics": {}}
 
@@ -727,6 +763,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--cap", type=float, default=1800.0, help="BH_MAX_GAME_SECS; 0 for none")
     p.add_argument("--windowed", action="store_true", help="run with a window (default headless)")
+    p.add_argument("--stall", type=float, default=120.0, metavar="SECS",
+                   help="wall seconds a frozen game clock is tolerated in a "
+                        "windowed round before it is called a wedge and stopped "
+                        "(0 to wait out the full wall timeout, which is what r32 "
+                        "did). The engine has its own detector: BH_WATCHDOG")
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                    help="extra environment; overrides the derived value")
     p.add_argument("--notes", default="", help="what changed in the ruleset this round")
@@ -895,7 +936,8 @@ def main(argv: list[str] | None = None) -> int:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         verdict = wait_for_seat_game_over(
-            [Path(s["dir"]) for s in commander_seats], time.monotonic() + timeout
+            [Path(s["dir"]) for s in commander_seats], time.monotonic() + timeout,
+            stall=args.stall,
         )
         if not args.keep_open:
             # Our own child, by handle — never a pattern match against the
