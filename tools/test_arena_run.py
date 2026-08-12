@@ -324,6 +324,7 @@ def test_the_tuning_digests_are_stable_and_content_addressed():
         data = Path(tmp)
         (data / "alarms.ron").write_text("([(id: \"push\", secs: 30.0)])\n")
         (data / "stances.ron").write_text("([(id: \"turtle\")])\n")
+        (data / "playbooks.ron").write_text("([(id: \"probe\")])\n")
         env = {"BH_DATA_DIR": str(data)}
         first = arena_run.ruleset_constants([], env)
         assert first == arena_run.ruleset_constants([], env), "the digest is not stable"
@@ -334,6 +335,28 @@ def test_the_tuning_digests_are_stable_and_content_addressed():
         after = arena_run.ruleset_constants([], env)
         assert after["alarms_ron"] != first["alarms_ron"], "a retune left no trace"
         assert after["stances_ron"] == first["stances_ron"], "an untouched table moved"
+
+
+def test_a_rewritten_playbook_makes_the_round_a_different_experiment():
+    """`playbooks.ron` is the one tuning file that carries authored STRATEGY,
+    which docs/AFFORDANCES.md constraint 3 permits only on condition that it is
+    versioned in the ruleset. Two rounds played under two build orders are two
+    experiments, and this digest is the only thing that can say so — the
+    `affordance_doc` version cannot, because rewriting a step changes no line
+    of tools/affordances.py."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data = Path(tmp)
+        (data / "playbooks.ron").write_text("([(id: \"rush\", steps: [])])\n")
+        env = {"BH_DATA_DIR": str(data)}
+        first = arena_run.ruleset_constants([], env)
+        assert arena.DIGEST_RE.match(first["playbooks_ron"])
+        (data / "playbooks.ron").write_text("([(id: \"greed\", steps: [])])\n")
+        assert arena_run.ruleset_constants([], env)["playbooks_ron"] != first["playbooks_ron"]
+    # And the shipped file reaches a real record, past the validator's shape
+    # rule for every tuning key.
+    seats = [arena_run.parse_seat("red=scripted"), arena_run.parse_seat("blue=scripted")]
+    consts = arena_run.ruleset_constants(seats, {})
+    assert arena.DIGEST_RE.match(consts["playbooks_ron"])
 
 
 def test_a_missing_tuning_file_is_an_absent_key_not_a_null():
@@ -398,6 +421,7 @@ def test_a_dry_run_prints_the_constants_it_would_record():
     )
     assert out.returncode == 0, out.stderr
     assert "alarms_ron=" in out.stdout and "stances_ron=" in out.stdout
+    assert "playbooks_ron=" in out.stdout
     assert f"affordance_doc={arena_run.scaffold_version()}" in out.stdout
     assert "red read tools/bridge_view.py --doc --all once at t=0" in out.stdout
 
