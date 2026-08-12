@@ -4342,6 +4342,67 @@ pub const DEFAULT_SQUAD: u8 = 0;
 #[derive(Resource, Default)]
 pub struct SquadOrders(pub std::collections::BTreeMap<(Team, u8), SquadPosture>);
 
+/// **Which way a squad is walking, and why** — the readout half of the posture.
+///
+/// A posture says what a squad is *for*; this says what it is doing about it
+/// this second, and the two can point in opposite directions. r22's rusher set
+/// `posture:push`, watched its army oscillate in front of the crossings fords
+/// for four hundred game seconds, and could not tell from any snapshot that the
+/// squad was walking *backwards* to a regroup point rather than forwards to the
+/// objective. Both look like "posture: push@(20,20), 12 members, moving". The
+/// defect was diagnosable only from the AAR, after the match.
+///
+/// So doctrine.rs publishes the branch it took. It is a **level**, not an event
+/// (BUILDER_BRIEF §6.11): a squad that is still gathering is still gathering,
+/// and a commander who wants to know can look at every snapshot for as long as
+/// it is true, rather than being interrupted once a second by a fact that has
+/// not changed.
+///
+/// **Two words, and no `engaged`.** One slot holds one word, and a squad that
+/// is both gathering and in contact must report the gathering — that is the
+/// fact this enum exists for and the only one the snapshot does not otherwise
+/// carry. Whether a squad is fighting is already answerable from `units[]`;
+/// shadowing the gather with it would rebuild r22's blind spot at a different
+/// address.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SquadActivity {
+    /// Waiting for the tail. Members are being sent to a regroup point behind
+    /// the front, or staged short of ground the team knows is covered — either
+    /// way the squad is deliberately not at its objective yet. This is the one
+    /// r22 needed and could not have.
+    Gathering,
+    /// Walking at the objective with whatever it has. Either the squad is
+    /// cohesive, or its gather ran out of patience (`COHESION_PATIENCE`) and
+    /// gave up on the stragglers.
+    PressingOn,
+}
+
+impl SquadActivity {
+    /// The word as it travels on the wire and appears in the digest. Two words
+    /// for `PressingOn` deliberately: this is read by a commander, and
+    /// `"pressing on"` says what `"pressing"` alone does not.
+    pub fn word(self) -> &'static str {
+        match self {
+            SquadActivity::Gathering => "gathering",
+            SquadActivity::PressingOn => "pressing on",
+        }
+    }
+}
+
+/// What each squad is doing right now, per `(team, squad)`. doctrine.rs writes
+/// it as it executes; bridge.rs's snapshot reads it.
+///
+/// The mirror image of [`SquadOrders`] above, and registered beside it: that
+/// map is what a commander told the engine, this one is what the engine is
+/// doing about it. Absent for a squad doctrine did not execute this heartbeat
+/// (no posture, or an escort, which has no walking to describe), and absence is
+/// the honest answer rather than a made-up one.
+///
+/// A `BTreeMap` for the reason `SquadOrders` is: it is written on a gameplay
+/// path and `HashMap` reseeds per process.
+#[derive(Resource, Default)]
+pub struct SquadActivities(pub std::collections::BTreeMap<(Team, u8), SquadActivity>);
+
 // ---------------------------------------------------------------------------
 // Stances: five fixed doctrine presets, one word each
 // ---------------------------------------------------------------------------
@@ -10718,6 +10779,12 @@ impl Plugin for CorePlugin {
             .init_resource::<AiControlled>()
             .init_resource::<ExternallyCommanded>()
             .init_resource::<SquadOrders>()
+            // The readout beside the orders: doctrine.rs writes it, bridge.rs
+            // and ui.rs read it. Registered here rather than in `DoctrinePlugin`
+            // for the same reason `Alarms` is registered here — a test app that
+            // stands up the snapshot without doctrine.rs should get an empty
+            // map rather than a panic inside Bevy's worker pool.
+            .init_resource::<SquadActivities>()
             .init_resource::<SquadStances>()
             .init_resource::<TechTiers>()
             .init_resource::<TeamResearch>()

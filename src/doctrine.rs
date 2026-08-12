@@ -465,6 +465,21 @@ fn clear_of_defenses(p: Vec3, defenses: &[(Vec3, f32)]) -> Vec3 {
     out
 }
 
+/// `plan_forage`'s whole answer: where the squad walks this tick, and whether
+/// that is the treasure or a point short of it.
+///
+/// The flag is not derivable from the plan — `Together` is both "regroup here"
+/// and "take the cache" — and it is exactly the distinction `squads[].status`
+/// exists to publish (wc3clone-6wa). Returned rather than recomputed at the
+/// call site because only this function knows which of its two arms it took.
+#[derive(Clone, Debug, PartialEq)]
+struct Foraging {
+    plan: ForagePlan,
+    /// True when the squad is being held short of the treasure — a cohesion
+    /// regroup, or a stage on the near side of covered ground.
+    gathering: bool,
+}
+
 /// What a Forage squad does this tick, once known static defense has had its
 /// say. Two shapes, and the difference between them is the bead:
 #[derive(Clone, Debug, PartialEq)]
@@ -525,7 +540,7 @@ fn plan_forage(
     defenses: &[(Vec3, f32)],
     muster: Vec3,
     now: f32,
-) -> ForagePlan {
+) -> Foraging {
     let (centroid, spread) = formation(positions, muster);
 
     // 1. Divert: prefer caches with a clean run to them.
@@ -537,8 +552,14 @@ fn plan_forage(
     if !open.is_empty() {
         let objective = nearest_point(&open, centroid).unwrap_or(muster);
         return match gate_gather(gathers, key, positions, objective, now) {
-            Some(p) => ForagePlan::Together(p),
-            None => ForagePlan::Scatter(open),
+            Some(p) => Foraging {
+                plan: ForagePlan::Together(p),
+                gathering: true,
+            },
+            None => Foraging {
+                plan: ForagePlan::Scatter(open),
+                gathering: false,
+            },
         };
     }
 
@@ -550,7 +571,10 @@ fn plan_forage(
         let dir =
             Vec3::new(objective.x - centroid.x, 0.0, objective.z - centroid.z).normalize_or_zero();
         let stage = centroid + dir * COHESION_STEP;
-        return ForagePlan::Together(clear_of_defenses(stage, defenses));
+        return Foraging {
+            plan: ForagePlan::Together(clear_of_defenses(stage, defenses)),
+            gathering: true,
+        };
     }
     // Gathered (or done trying). Either way the memo has served its purpose and
     // the next gather starts from a clean slate — same rule `gate_gather`
@@ -558,7 +582,10 @@ fn plan_forage(
     if spread <= DEFENDED_SPREAD {
         gathers.remove(&key);
     }
-    ForagePlan::Together(objective)
+    Foraging {
+        plan: ForagePlan::Together(objective),
+        gathering: false,
+    }
 }
 
 /// Closest of `points` to `from` on the ground plane. `None` = empty slice.
@@ -1073,11 +1100,23 @@ fn run_squad_postures(
     // because it is on a gameplay path (BUILDER_BRIEF §6.4) even though nothing
     // here iterates it.
     mut gathers: Local<std::collections::BTreeMap<(Team, u8), Gather>>,
+    // The readout: which way each squad is walking, for the seat (wc3clone-6wa).
+    // Written here and nowhere else, because here is the only place that knows.
+    mut activities: ResMut<SquadActivities>,
 ) {
     if squad_orders.0.is_empty() {
         gathers.clear();
+        if !activities.0.is_empty() {
+            activities.0.clear();
+        }
         return;
     }
+    // Rebuilt from scratch every heartbeat rather than patched: a squad this
+    // pass never reaches — cleared posture, lapsed escort, the `DEFAULT_SQUAD`
+    // carve-out below — must leave no stale answer behind, and the one way to
+    // be sure of that is to publish only what this pass actually decided.
+    let mut next: std::collections::BTreeMap<(Team, u8), SquadActivity> =
+        std::collections::BTreeMap::new();
     let now = time.elapsed_secs();
     // Every cache on the map. Which of them a given squad may hunt is decided
     // per team below — the same list filtered two ways, never two lists.
@@ -1204,6 +1243,44 @@ fn run_squad_postures(
             _ => None,
         };
 
+        // **The readout** (wc3clone-6wa). r22 could not tell "walking to the
+        // objective" from "walking backwards to a muster point", and both look
+        // identical in a snapshot that reports only the posture. The two arms
+        // above have just decided exactly that, so say so.
+        //
+        // Only the two postures that WALK somewhere get an answer. A Defend
+        // squad's answer is its ring and an Escort's is its charge; inventing a
+        // word for them would be a status that means nothing, and absence is
+        // the honest reading of "this posture raises no such question".
+        //
+        // No `engaged`, deliberately, though the bead offered it: one slot
+        // holds one word, and a squad that is both gathering and in contact
+        // must report the gathering — that is the fact this key exists for and
+        // the fact nothing else in the snapshot carries. Whether a squad is
+        // fighting is already answerable from `units[]`, and shadowing the
+        // gather with it would rebuild the blind spot at a different address.
+        //
+        // And nothing at all for an EMPTY squad. A `Push` with no bodies is
+        // trivially cohesive, so the arms below would call it "pressing on",
+        // which is a sentence about nobody. A stance set on a squad before it
+        // is trained into is a real and legal thing (see intent.rs), so this
+        // case is ordinary rather than exotic.
+        let walking = match posture {
+            SquadPosture::Push { .. } => Some(regroup.is_some()),
+            SquadPosture::Forage { .. } => forage_plan.as_ref().map(|f| f.gathering),
+            _ => None,
+        };
+        if let Some(gathering) = walking.filter(|_| !squad_positions.is_empty()) {
+            next.insert(
+                (team, squad),
+                if gathering {
+                    SquadActivity::Gathering
+                } else {
+                    SquadActivity::PressingOn
+                },
+            );
+        }
+
         // Every order this posture mints answers "why" the same way, so build
         // the stamp once per squad rather than once per member. Reactive
         // defense below is included deliberately: a defend squad diving a
@@ -1280,7 +1357,7 @@ fn run_squad_postures(
                 // The see-nothing case became Defend above, so `muster` here is
                 // only a defensive fallback.
                 SquadPosture::Forage { muster } => {
-                    let target = match &forage_plan {
+                    let target = match forage_plan.as_ref().map(|f| &f.plan) {
                         Some(ForagePlan::Together(point)) => *point,
                         Some(ForagePlan::Scatter(targets)) => {
                             nearest_point(targets, tf.translation).unwrap_or(muster)
@@ -1312,6 +1389,12 @@ fn run_squad_postures(
     // visited by the loop, so its gather memo would outlive it and greet the
     // next push on that id with somebody else's patience.
     gathers.retain(|key, _| squad_orders.0.contains_key(key));
+    // Published only when it actually moved. Nothing watches `Changed` on this
+    // resource today, but a readout that reports itself modified every second
+    // of every match is a trap laid for whatever does.
+    if activities.0 != next {
+        activities.0 = next;
+    }
 }
 
 /// A retreat is a trip to the infirmary, not permanent leave: once regen
@@ -1360,6 +1443,10 @@ mod tests {
         app.init_resource::<Races>();
         app.init_resource::<Time>()
             .init_resource::<SquadOrders>()
+            // `CorePlugin` supplies this too — `run_squad_postures` publishes
+            // its readout into it, and a `ResMut` of a missing resource is the
+            // same worker-pool panic `Races` is here to avoid.
+            .init_resource::<SquadActivities>()
             .init_resource::<FogGrids>()
             .init_resource::<ExternallyCommanded>()
             .insert_resource(AiControlled { human: false, claude: false });
@@ -1675,8 +1762,12 @@ mod tests {
                 Vec3::ZERO,
                 0.0
             ),
-            ForagePlan::Together(T_COVERED),
-            "a gathered squad must commit to the cache, not sit outside forever"
+            Foraging {
+                plan: ForagePlan::Together(T_COVERED),
+                gathering: false
+            },
+            "a gathered squad must commit to the cache, not sit outside forever \
+             — and must not report itself as still gathering"
         );
         assert!(
             clock.is_empty(),
@@ -1708,7 +1799,12 @@ mod tests {
         };
 
         for t in [0.0, COHESION_PATIENCE - 1.0] {
-            match plan_at(&mut clock, t) {
+            let staging = plan_at(&mut clock, t);
+            assert!(
+                staging.gathering,
+                "at t={t} the squad must report itself gathering while it stages"
+            );
+            match staging.plan {
                 ForagePlan::Together(p) => assert!(
                     xz_dist(p, T_COVERED) > 0.1,
                     "at t={t} the squad walked onto the covered cache without gathering"
@@ -1718,9 +1814,117 @@ mod tests {
         }
         assert_eq!(
             plan_at(&mut clock, COHESION_PATIENCE + 1.0),
-            ForagePlan::Together(T_COVERED),
+            Foraging {
+                plan: ForagePlan::Together(T_COVERED),
+                gathering: false
+            },
             "a gather that has not closed in {COHESION_PATIENCE}s is still staging — \
              this is r22's oscillation on the forage arm"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The readout: squads[].status (wc3clone-6wa)
+    // -----------------------------------------------------------------
+
+    /// **Doctrine says which way each squad is walking.** Two `Push` squads on
+    /// the same objective in one run of one system, one strung out and one
+    /// tight, plus a `Defend` ring that is not walking anywhere. Before this,
+    /// all three read identically in a snapshot — a posture and a member count
+    /// — which is why r22's four hundred seconds of oscillation were
+    /// diagnosable only from the AAR.
+    #[test]
+    fn a_squads_status_names_the_branch_the_gather_took() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+        let objective = Vec3::new(40.0, 0.0, 0.0);
+
+        let mut enrol = |app: &mut App, at: Vec3, squad: u8| {
+            let e = spawn_footman(app, Team::Human, at);
+            app.world_mut().entity_mut(e).insert(SquadId(squad));
+        };
+        // Squad 1: a tail forty units behind the front — spread well past
+        // `COHESION_SPREAD`, so the gather fires.
+        enrol(&mut app, Vec3::new(-40.0, 0.0, 0.0), 1);
+        enrol(&mut app, Vec3::ZERO, 1);
+        enrol(&mut app, Vec3::new(2.0, 0.0, 2.0), 1);
+        // Squad 2: a blob. Nothing to wait for.
+        enrol(&mut app, Vec3::new(0.0, 0.0, -2.0), 2);
+        enrol(&mut app, Vec3::new(0.0, 0.0, 2.0), 2);
+        // Squad 3: holding ground, which raises no such question.
+        let ring = Vec3::new(0.0, 0.0, 60.0);
+        enrol(&mut app, ring, 3);
+        {
+            let mut orders = app.world_mut().resource_mut::<SquadOrders>();
+            orders.0.insert((Team::Human, 1), SquadPosture::Push { pos: objective });
+            orders.0.insert((Team::Human, 2), SquadPosture::Push { pos: objective });
+            orders.0.insert(
+                (Team::Human, 3),
+                SquadPosture::Defend { pos: ring, radius: 20.0 },
+            );
+        }
+        app.update();
+
+        let acts = &app.world().resource::<SquadActivities>().0;
+        assert_eq!(
+            acts.get(&(Team::Human, 1)),
+            Some(&SquadActivity::Gathering),
+            "a strung-out push is walking backwards to a regroup point and must say so"
+        );
+        assert_eq!(
+            acts.get(&(Team::Human, 2)),
+            Some(&SquadActivity::PressingOn),
+            "a cohesive push is walking at its objective"
+        );
+        assert_eq!(
+            acts.get(&(Team::Human, 3)),
+            None,
+            "a defend ring is not walking anywhere; absence is the honest answer"
+        );
+        // The wire words, pinned where they are produced rather than only where
+        // they are serialized.
+        assert_eq!(SquadActivity::Gathering.word(), "gathering");
+        assert_eq!(SquadActivity::PressingOn.word(), "pressing on");
+
+        // A posture stood down takes its readout with it — a status left
+        // behind would be a level-triggered field asserting something that
+        // stopped being true.
+        app.world_mut()
+            .resource_mut::<SquadOrders>()
+            .0
+            .remove(&(Team::Human, 1));
+        app.update();
+        assert_eq!(
+            app.world().resource::<SquadActivities>().0.get(&(Team::Human, 1)),
+            None,
+            "the readout outlived the posture it was about"
+        );
+    }
+
+    /// A stance may be set on a squad before anything is trained into it
+    /// (intent.rs records it deliberately), so an empty push is ordinary. It
+    /// must not report "pressing on": an empty squad is trivially cohesive, and
+    /// that sentence would be about nobody.
+    #[test]
+    fn an_empty_squad_reports_no_status_at_all() {
+        let mut app = world();
+        app.add_systems(Update, run_squad_postures);
+        // One real squad, so the system does not early-return on an empty map.
+        let e = spawn_footman(&mut app, Team::Human, Vec3::ZERO);
+        app.world_mut().entity_mut(e).insert(SquadId(1));
+        {
+            let mut orders = app.world_mut().resource_mut::<SquadOrders>();
+            orders.0.insert((Team::Human, 1), SquadPosture::Push { pos: Vec3::new(40.0, 0.0, 0.0) });
+            orders.0.insert((Team::Human, 7), SquadPosture::Push { pos: Vec3::new(40.0, 0.0, 0.0) });
+        }
+        app.update();
+
+        let acts = &app.world().resource::<SquadActivities>().0;
+        assert!(acts.get(&(Team::Human, 1)).is_some(), "control: squad 1 has a body");
+        assert_eq!(
+            acts.get(&(Team::Human, 7)),
+            None,
+            "an empty squad is not pressing on anything"
         );
     }
 
@@ -2495,7 +2699,9 @@ mod probe {
                         &defenses,
                         centre,
                         0.0,
-                    ) {
+                    )
+                    .plan
+                    {
                         ForagePlan::Together(p) => p,
                         ForagePlan::Scatter(ts) => nearest_point(&ts, centre).unwrap(),
                     }
@@ -2620,6 +2826,7 @@ mod ford {
         ));
         app.init_resource::<Races>()
             .init_resource::<SquadOrders>()
+            .init_resource::<SquadActivities>()
             // Lit, and pinned rather than inherited: `Forage` only hunts
             // treasure its team can see, so a bench that read the ambient
             // `BH_FOG` would measure a blind forager on one machine and a

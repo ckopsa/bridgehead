@@ -169,7 +169,15 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
   `min_enemies:0` clears just that rule.
 - `{"type":"squad","units":[ids],"id":1}` then `{"type":"posture","id":1,"posture":{"type":"defend","x":..,"z":..,"radius":18}}`
   (`"push"` with x/z, `"escort"` with `"unit":id`, or `"forage"` with x/z muster) — squads
-  re-task themselves every second and ADVANCE COHESIVELY: a strung-out Push/Forage squad gathers before pressing on, so slow units set the pace and you arrive as one force. Defend postures are REACTIVE: enemies entering the radius
+  re-task themselves every second and ADVANCE COHESIVELY: a strung-out Push/Forage squad gathers before pressing on, so slow units set the pace and you arrive as one force.
+  **Watch `squads[].status` for which of those two it is doing** — `"gathering"` means the
+  squad is walking BACKWARDS to a regroup point behind its front, `"pressing on"` means it is
+  walking at the objective. Same posture, opposite directions, and the key is the only thing in
+  the snapshot that tells them apart. A gather that stops making progress gives up on its
+  stragglers after about twelve seconds and presses on by itself, so a squad stuck on
+  `"gathering"` is one whose tail keeps being refilled faster than it closes: stop training into
+  it, or split the front off into its own squad. Absent on postures that are not walking
+  anywhere (a defend ring, an escort, a forager with no treasure in sight). Defend postures are REACTIVE: enemies entering the radius
   pull the whole squad onto them. FORAGE squads continuously hunt the nearest bounty cache
   (attack-moving, so they fight what they meet) and hold at the muster point when none are up —
   the set-and-forget way to own the midfield. Squad 0 exists automatically (all army units

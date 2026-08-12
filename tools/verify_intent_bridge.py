@@ -71,6 +71,24 @@ OPTIONAL_TOP_KEYS = {
     "waiting_for", "match_started",
 }
 
+# The same contract, one level down, for the array this run always populates.
+# `squads[]` shipped as `{id, posture, members}` and has gained two optional
+# keys since, both `skip_serializing_if`:
+#   * stance (wc3clone-0uu.2) — the word a `stance` command put there, absent
+#     for a squad tasked by hand with `posture`.
+#   * status (wc3clone-6wa) — "gathering" or "pressing on", which is what
+#     doctrine is doing about the posture as opposed to what the posture says.
+#     Absent for a squad that is not walking anywhere: no posture, a defend
+#     ring, an escort, or a forager with no treasure in sight. r22's push
+#     oscillated in front of a ford for four hundred seconds and no snapshot
+#     could say so, which is why the key exists.
+# Both are absent-not-null, so a seat that never stances and never pushes
+# writes a `squads[]` byte-identical to the pre-feature one — and that is the
+# half worth pinning, because an accidental always-present key is exactly the
+# regression this whole file is here to catch.
+EXPECTED_SQUAD_KEYS = {"id", "posture", "members"}
+OPTIONAL_SQUAD_KEYS = {"stance", "status"}
+
 
 def upgrade_price(st):
     """What the catalog says the hall's next tier costs."""
@@ -153,9 +171,16 @@ def main():
     missing, extra = EXPECTED_TOP_KEYS - keys, keys - EXPECTED_TOP_KEYS - OPTIONAL_TOP_KEYS
     assert not missing, f"FAIL: snapshot lost keys {missing}"
     assert not extra, f"FAIL: snapshot gained keys {extra}"
+    for sq in st["squads"]:
+        sk = set(sq.keys())
+        sq_missing = EXPECTED_SQUAD_KEYS - sk
+        sq_extra = sk - EXPECTED_SQUAD_KEYS - OPTIONAL_SQUAD_KEYS
+        assert not sq_missing, f"FAIL: squad {sq.get('id')} lost keys {sq_missing}"
+        assert not sq_extra, f"FAIL: squad {sq.get('id')} gained keys {sq_extra}"
     unit_keys = set(st["units"][0].keys()) if st["units"] else set()
     print(f"[2] snapshot key set unchanged ({len(keys)} top-level keys)")
     print(f"    unit keys: {sorted(unit_keys)}")
+    print(f"    squad keys: {sorted({k for sq in st['squads'] for k in sq})}")
 
     mine = [u for u in st["units"] if u["team"] == "Claude"]
     workers = [u for u in mine if u["kind"] == "Worker"]

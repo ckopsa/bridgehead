@@ -1320,6 +1320,26 @@ struct SquadOut {
     /// produces a byte-identical snapshot to the one that shipped before it.
     #[serde(skip_serializing_if = "Option::is_none")]
     stance: Option<&'static str>,
+    /// **Which way this squad is walking**: `"gathering"` or `"pressing on"`.
+    ///
+    /// The posture says what the squad is *for*; this says what doctrine.rs is
+    /// doing about it right now, and r22 is what their difference costs. That
+    /// commander set `posture:push`, watched its army oscillate in front of the
+    /// crossings fords for four hundred game seconds, and had nothing in any
+    /// snapshot that could distinguish "walking to the objective" from "walking
+    /// backwards to a regroup point" — both read as `push@(20,20)`, 12 members,
+    /// moving. The defect was diagnosable only from the AAR, after the loss.
+    ///
+    /// A **level**, not an event (BUILDER_BRIEF §6.11): still gathering is
+    /// still gathering, so it is here in every snapshot for as long as it is
+    /// true rather than interrupting the feed once a second.
+    ///
+    /// Absent for a squad that is not walking anywhere — no posture, a `defend`
+    /// ring, an `escort`, or a forager with no treasure in sight. Absence means
+    /// "this posture raises no such question", which is the honest answer, and
+    /// keeps a match that never pushes byte-identical to the pre-6wa shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'static str>,
 }
 
 /// One armed trigger, as its owner reads it back.
@@ -1816,6 +1836,12 @@ struct StandingOrders<'w> {
     /// The stance word behind each squad's posture, travelling with the posture
     /// it produced so `SquadOut` cannot report one without the other.
     stances: Res<'w, SquadStances>,
+    /// And the third half of the same fact: what doctrine.rs is actually doing
+    /// about each posture this second. Written by doctrine.rs rather than by
+    /// the compiler — the one member of this bundle that is not a commander's
+    /// own words read back — and it is here anyway because it is keyed by
+    /// `(team, squad)` like the two above and read in the same breath.
+    activities: Res<'w, SquadActivities>,
     triggers: Res<'w, Triggers>,
     /// The third store on the same rule: written only by the intent compiler's
     /// two `region_*` verbs, read here and in the HUD, and it answers the same
@@ -1905,6 +1931,7 @@ fn write_snapshot(
             &match_state.ready,
             &standing.squads,
             &standing.stances,
+            &standing.activities,
             standing.triggers.get(seat.team),
             standing.regions.get(seat.team),
             standing.plans.get(seat.team),
@@ -1943,6 +1970,9 @@ fn write_seat_snapshot(
     // resource rather than pre-sliced because it is keyed by `(team, squad)`
     // exactly like `squad_orders` beside it, and the two are read together.
     squad_stances: &SquadStances,
+    // ...and what doctrine.rs is doing about each of them this second. Same
+    // key, same reason for arriving whole, same line of the readout.
+    squad_activities: &SquadActivities,
     // This seat's own armed triggers. Passed pre-sliced by team rather than as
     // the whole resource, so this function cannot read the opponent's plans
     // even by accident.
@@ -2266,6 +2296,7 @@ fn write_seat_snapshot(
             posture: squad_orders.0.get(&(me, id)).map(posture_name),
             members: members.get(&id).copied().unwrap_or(0),
             stance: squad_stances.0.get(&(me, id)).map(|s| s.word()),
+            status: squad_activities.0.get(&(me, id)).map(|a| a.word()),
         })
         .collect();
 
@@ -3292,12 +3323,14 @@ mod tests {
             posture: Some("push@(60,60)".to_string()),
             members: 6,
             stance: Some(StanceKind::Push.word()),
+            status: None,
         };
         let hand_tasked = SquadOut {
             id: 2,
             posture: Some("defend@(-70,-70)r=22".to_string()),
             members: 3,
             stance: None,
+            status: None,
         };
         let json =
             serde_json::to_string(&vec![stanced, hand_tasked]).expect("squads serialize");
@@ -3315,6 +3348,56 @@ mod tests {
             plain,
             ["id", "members", "posture"].into_iter().collect(),
             "a squad in no stance must serialize exactly as it always did"
+        );
+    }
+
+    /// **The walking readout rides the same shape** (wc3clone-6wa).
+    ///
+    /// The twin of the test above, for the same reason: `squads[].status` tells
+    /// a commander whether its push is closing on the objective or walking
+    /// backwards to a regroup point — the thing r22 could only learn from the
+    /// AAR — and it must do so without disturbing a byte of the old shape. A
+    /// squad with no walking to describe carries **no key**, not a `null`.
+    #[test]
+    fn a_squads_status_rides_the_snapshot_without_disturbing_the_old_shape() {
+        let gathering = SquadOut {
+            id: 1,
+            posture: Some("push@(60,60)".to_string()),
+            members: 12,
+            stance: None,
+            status: Some(SquadActivity::Gathering.word()),
+        };
+        let pressing = SquadOut {
+            id: 2,
+            posture: Some("forage@(0,0)".to_string()),
+            members: 5,
+            stance: None,
+            status: Some(SquadActivity::PressingOn.word()),
+        };
+        let holding = SquadOut {
+            id: 3,
+            posture: Some("defend@(-70,-70)r=22".to_string()),
+            members: 3,
+            stance: None,
+            status: None,
+        };
+        let json = serde_json::to_string(&vec![gathering, pressing, holding])
+            .expect("squads serialize");
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parses");
+
+        // The two words a commander has to be able to tell apart, spelled as a
+        // reader reads them rather than as an enum names them.
+        assert_eq!(back[0]["status"], "gathering");
+        assert_eq!(back[1]["status"], "pressing on");
+        assert_eq!(back[0]["posture"], "push@(60,60)");
+        assert_eq!(back[0]["members"], 12);
+
+        let holding_keys: std::collections::BTreeSet<&str> =
+            back[2].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            holding_keys,
+            ["id", "members", "posture"].into_iter().collect(),
+            "a squad with no walking to describe must serialize exactly as it always did"
         );
     }
 
