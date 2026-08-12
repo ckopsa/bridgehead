@@ -1599,10 +1599,7 @@ mod tests {
         let mine = app
             .world_mut()
             .spawn((
-                ResourceNode {
-                    kind: ResourceKind::Gold,
-                    remaining: 500,
-                },
+                ResourceNode::full(ResourceKind::Gold, 500),
                 Transform::from_xyz(-60.0, 0.0, -60.0),
             ))
             .id();
@@ -1616,6 +1613,7 @@ mod tests {
         app.world_mut().entity_mut(mine).insert(ResourceNode {
             kind: ResourceKind::Gold,
             remaining: 0,
+            capacity: 500,
         });
         app.update();
         assert!(fired(&mut app).is_empty(), "no hall, no home mine");

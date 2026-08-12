@@ -2041,6 +2041,27 @@ pub struct CatalogGates {
     pub sighting_ttl_s: f32,
 }
 
+/// One alarm kind as the catalog advertises it — see [`Catalog::alarms`].
+///
+/// The row is descriptive, never a control: nothing reads this back, and an
+/// arena round that wants a jumpier harness edits `assets/data/alarms.ron` and
+/// gets a catalog that says so on the next launch.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogAlarm {
+    /// The `alarms[].id` a commander keys off. Stable forever.
+    pub id: &'static str,
+    /// The short English name, as the clearing line on `events` spells it.
+    pub label: &'static str,
+    /// What raises it, in one sentence, naming the units of `threshold`.
+    pub fires_when: &'static str,
+    /// [`AlarmTuning::threshold`] — per-kind units, spelled out in `fires_when`.
+    pub threshold: f32,
+    /// [`AlarmTuning::grace_s`]: how long the condition holds before you are
+    /// told. Not a debounce — it is the window the reflex tier gets first, so
+    /// what you read in `running_default` is an answer and not a race.
+    pub grace_s: f32,
+}
+
 // ---------------------------------------------------------------------------
 // Playbooks — strategy as catalog content
 //
@@ -2221,6 +2242,16 @@ pub struct Catalog {
     /// The thresholds an acceptance note is written against. See
     /// [`CatalogGates`].
     pub gates: CatalogGates,
+    /// **The alarm vocabulary**: every kind that can appear in a snapshot's
+    /// `alarms` array, with the two numbers from `assets/data/alarms.ron` that
+    /// decide when it does.
+    ///
+    /// Here for the reason `predicates` is here: a commander that has to read
+    /// the brief to learn a category exists will not learn it. The thresholds
+    /// travel with the vocabulary because they are the half a round's `ruleset`
+    /// has to record (AFFORDANCES.md constraint 3) — and because the catalog is
+    /// where this game publishes numbers, so there is exactly one copy of each.
+    pub alarms: Vec<CatalogAlarm>,
     /// The declarative game-plans, from `assets/data/playbooks.ron`.
     ///
     /// Additive and `skip_serializing_if` empty, like every wire key before it:
@@ -2515,6 +2546,22 @@ pub fn game_catalog() -> Catalog {
             intel_stale_s: COMMIT_INTEL_STALE_S,
             sighting_ttl_s: SIGHTING_TTL_S,
         },
+        // Straight from `alarms.ron` through `alarm_tuning`, never a second
+        // copy of the numbers: publishing a threshold the evaluator does not
+        // use would be the drift this codebase spends its length refusing.
+        alarms: ALL_ALARM_KINDS
+            .iter()
+            .map(|&k| {
+                let t = alarm_tuning(k);
+                CatalogAlarm {
+                    id: k.id(),
+                    label: k.label(),
+                    fires_when: k.fires_when(),
+                    threshold: t.threshold,
+                    grace_s: t.grace_s,
+                }
+            })
+            .collect(),
         // Straight out of the data file, validated at load. Cloned rather than
         // borrowed because `Catalog` is an owned wire value that outlives the
         // call — the same shape every other table here takes.
@@ -2576,6 +2623,34 @@ pub enum ResourceKind {
 pub struct ResourceNode {
     pub kind: ResourceKind,
     pub remaining: u32,
+    /// What this node held when it was placed — the DENOMINATOR, and the whole
+    /// reason it exists.
+    ///
+    /// `remaining` alone is a level with no scale: 1,200 gold is a full mine on
+    /// one map and the last quarter of one on another, and r26-blue asked for
+    /// "mine remaining per hall" precisely because the raw number could not be
+    /// read as a fraction. Carried per node rather than derived from a constant
+    /// so a map (or a `BH_DATA_DIR` experiment) with richer or poorer mines
+    /// reports honest percentages instead of percentages of somebody else's
+    /// mine.
+    pub capacity: u32,
+}
+
+impl ResourceNode {
+    /// A brand-new node, full.
+    pub fn full(kind: ResourceKind, amount: u32) -> Self {
+        ResourceNode { kind, remaining: amount, capacity: amount }
+    }
+
+    /// How much of this node is left, `0.0..=1.0`. A node placed empty (which
+    /// only a test does) reads 0 rather than dividing by zero.
+    pub fn remaining_frac(&self) -> f32 {
+        if self.capacity == 0 {
+            0.0
+        } else {
+            self.remaining as f32 / self.capacity as f32
+        }
+    }
 }
 
 /// Resource a worker is carrying. economy.rs owns this.
@@ -6924,15 +6999,42 @@ pub struct Economy {
     pub lumber: u32,
     pub supply_used: u32,
     pub supply_cap: u32,
+    /// Every gold piece this team has ever BANKED, after upkeep — the running
+    /// total `GoldFlow` differentiates into an income rate.
+    ///
+    /// Only `earn` moves it, which is why `earn` exists: `gold` alone cannot be
+    /// differentiated, because spending is indistinguishable from a mine
+    /// running dry when all you can see is the level. A refund is deliberately
+    /// not income (it is money you already had), and neither is the starting
+    /// purse.
+    pub earned: u32,
 }
 
 impl Default for Economy {
     fn default() -> Self {
-        Economy { gold: STARTING_GOLD, lumber: STARTING_LUMBER, supply_used: 0, supply_cap: 0 }
+        Economy {
+            gold: STARTING_GOLD,
+            lumber: STARTING_LUMBER,
+            supply_used: 0,
+            supply_cap: 0,
+            earned: 0,
+        }
     }
 }
 
 impl Economy {
+    /// **Bank income.** The one place gold ARRIVES, counterpart to `pay`.
+    ///
+    /// Both callers are in economy.rs — a delivered load (taxed by upkeep) and
+    /// a claimed bounty (untaxed) — and they go through here rather than
+    /// touching `gold` so that "how much is coming in?" has exactly one
+    /// definition. A second `gold +=` somewhere else would not be wrong about
+    /// the bank; it would be invisible to the income rate, which is worse,
+    /// because a wrong derivative reads exactly like a right one.
+    pub fn earn(&mut self, gold: u32) {
+        self.gold = self.gold.saturating_add(gold);
+        self.earned = self.earned.saturating_add(gold);
+    }
     pub fn can_afford(&self, gold: u32, lumber: u32) -> bool {
         self.gold >= gold && self.lumber >= lumber
     }
@@ -6999,6 +7101,123 @@ impl Economies {
             Team::Claude => &mut self.claude,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The gold runway — a level, its derivative, and what is already spoken for
+//
+// r26-blue asked for "a gold-runway line: bank, income/min, mine remaining per
+// hall", and lost the game it asked from: `income_collapse` fires when the
+// mines are ALREADY dry, which is the moment after the decision. r27-red, a
+// different model on a different tier, asked for the same thing from the other
+// end — "nothing told me your banked gold buys K more units". r36 added the
+// third half: three standing trainers can commit more gold per minute than one
+// bank earns, and the only thing that ever said so was a stream of "cannot
+// afford" bounces.
+//
+// All three are ONE fact with three tenses — what you have, what is coming in,
+// and what is already going out — so they are computed once, here, and rendered
+// three times (the HUD's resource line, the snapshot's `me` block, the alarm
+// that watches the mines). Neither renderer derives any of it a second time.
+// ---------------------------------------------------------------------------
+
+/// How long a game-second window the income rate is measured over.
+///
+/// Sixty seconds because the thing it measures is bursty at every shorter
+/// scale: a worker walking home is not mining, so a ten-second window reports
+/// the gaps between deliveries as an economy in collapse. A minute is also the
+/// unit the number is quoted in, which means the commonest case — a match older
+/// than a minute — is a straight difference and not an extrapolation anybody
+/// has to trust.
+pub const INCOME_WINDOW_S: f32 = 60.0;
+
+/// Game seconds between samples of the running total.
+pub const INCOME_SAMPLE_S: f32 = 1.0;
+
+/// One team's income meter: a small ring of (game time, gold banked so far).
+#[derive(Clone, Debug, Default)]
+pub struct TeamFlow {
+    /// Oldest first, one per `INCOME_SAMPLE_S`, trimmed to the window. A
+    /// `VecDeque` of plain numbers — no hashing, no iteration order to get
+    /// wrong (BUILDER_BRIEF §6.4).
+    samples: VecDeque<(f32, u32)>,
+    /// Gold banked per minute over the window, published for the renderers.
+    pub income_per_min: f32,
+    /// Gold per minute this team's standing training queues will DEMAND if they
+    /// run as scheduled. Zero when nothing is queued.
+    pub commit_per_min: f32,
+}
+
+impl TeamFlow {
+    /// Take a sample and recompute the rate. Called on a game-time cadence, so
+    /// two runs of one seed sample at the same game times.
+    fn sample(&mut self, now: f32, earned: u32) {
+        self.samples.push_back((now, earned));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(t, _)| now - *t > INCOME_WINDOW_S)
+        {
+            self.samples.pop_front();
+        }
+        // The rate is over the window ACTUALLY held, which is the honest
+        // reading in the first minute of a match: a match 20 seconds old
+        // reports what it earned in 20 seconds, scaled, rather than a minute's
+        // worth of gold it has not had time to earn.
+        let (Some((t0, g0)), Some((t1, g1))) = (self.samples.front(), self.samples.back()) else {
+            return;
+        };
+        let span = t1 - t0;
+        self.income_per_min = if span <= 0.0 {
+            0.0
+        } else {
+            (g1.saturating_sub(*g0) as f32) * 60.0 / span
+        };
+    }
+}
+
+/// Both teams' income meters. Written only by `economy::sample_gold_flow`.
+#[derive(Resource, Default)]
+pub struct GoldFlow {
+    human: TeamFlow,
+    claude: TeamFlow,
+}
+
+impl GoldFlow {
+    pub fn get(&self, team: Team) -> &TeamFlow {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+    pub fn get_mut(&mut self, team: Team) -> &mut TeamFlow {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+    /// Sample one team. `pub` so the one writer can call it and everybody else
+    /// can only read — the shape `Alarms::observe` uses.
+    pub fn observe(&mut self, team: Team, now: f32, earned: u32, commit_per_min: f32) {
+        let flow = self.get_mut(team);
+        flow.sample(now, earned);
+        flow.commit_per_min = commit_per_min;
+    }
+}
+
+/// Is this gold mine one your halls work?
+///
+/// **The one definition of "our mine"** in a game where mines are neutral and
+/// unowned: within [`MINE_HOME_RADIUS`] of one of this team's completed halls,
+/// which is what `TriggerWhen::MineDry` has always meant and what the income
+/// alarm reads. Every new reader of the fact — the runway line, the depletion
+/// alarm, the snapshot's `mines[].home` flag — comes through here, because two
+/// readings of "your mine" would be two games.
+pub fn mine_is_home(halls: &[Vec3], mine: Vec3) -> bool {
+    halls.iter().any(|hall| {
+        let d = *hall - mine;
+        Vec2::new(d.x, d.z).length() <= MINE_HOME_RADIUS
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -11365,6 +11584,10 @@ impl Plugin for CorePlugin {
             // should get an empty list rather than a panic inside Bevy's
             // worker pool (which HANGS the suite rather than failing it).
             .init_resource::<Alarms>()
+            // Written by economy.rs, read by the HUD, the snapshot and the
+            // depletion alarm. Registered here, beside `Economies`, because it
+            // is the same fact one derivative later.
+            .init_resource::<GoldFlow>()
             .init_resource::<FogGrids>()
             .add_event::<SpawnUnitEvent>()
             .add_event::<SpawnBuildingEvent>()
@@ -13068,14 +13291,15 @@ fn diff_team(
 // standing and never told it stopped, a reader has to poll, which is the
 // polling this whole layer deletes.
 
-/// The four conditions worth interrupting a commander for.
+/// The five conditions worth interrupting a commander for.
 ///
 /// A closed set on purpose. AFFORDANCES.md's argument is that a small
 /// commander drowns in an open-ended question every cycle, so the alarm layer
-/// is valuable in proportion to how little it says: four events force a fresh
-/// choice and *everything else defaults to continue*. A fifth kind should have
-/// to argue that a round was lost for want of it, the way each of these four
-/// can (r21's unflagged income collapse, r23's stale-contact reads).
+/// is valuable in proportion to how little it says: these force a fresh choice
+/// and *everything else defaults to continue*. A new kind has to argue that a
+/// round was lost for want of it, the way each of these can (r21's unflagged
+/// income collapse, r23's stale-contact reads) — `MineDepleting` is the fifth
+/// and it paid that toll twice, in r26 and r27, on two different model tiers.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Deserialize)]
 pub enum AlarmKind {
     /// A body of enemy troops at or above the threshold is in this team's
@@ -13087,6 +13311,12 @@ pub enum AlarmKind {
     /// The gold has stopped: every mine this team's halls work is dry, or
     /// there are fewer workers on gold than the threshold.
     IncomeCollapse,
+    /// The mines this team's halls work are down to the threshold fraction of
+    /// what they held. The **early** half of `IncomeCollapse`, and the one
+    /// r26-blue asked for by name: an expansion takes a worker walk, a build
+    /// time and a fresh crew, so an alarm that fires when the gold has already
+    /// stopped fires after the only decision it could have informed.
+    MineDepleting,
     /// Buildings are being hit in two or more distinct **places** at once —
     /// the alarm r23's blue seat asked for, and the one that carries a recall
     /// ETA because "full recall or sacrifice the expansion?" is the question.
@@ -13095,10 +13325,11 @@ pub enum AlarmKind {
 
 /// Every alarm kind, in the order they are evaluated and reported. The
 /// `alarms.ron` loader refuses to start if any of them has no row.
-pub const ALL_ALARM_KINDS: [AlarmKind; 4] = [
+pub const ALL_ALARM_KINDS: [AlarmKind; 5] = [
     AlarmKind::EnemyArmySighted,
     AlarmKind::SquadBelowHalf,
     AlarmKind::IncomeCollapse,
+    AlarmKind::MineDepleting,
     AlarmKind::PlacesUnderAttack,
 ];
 
@@ -13110,7 +13341,37 @@ impl AlarmKind {
             AlarmKind::EnemyArmySighted => "enemy_army_sighted",
             AlarmKind::SquadBelowHalf => "squad_below_half",
             AlarmKind::IncomeCollapse => "income_collapse",
+            AlarmKind::MineDepleting => "mine_depleting",
             AlarmKind::PlacesUnderAttack => "places_under_attack",
+        }
+    }
+
+    /// One sentence saying what raises it, published in `catalog.alarms` so a
+    /// commander can discover the whole set from the wire instead of from the
+    /// brief. Written in the second person the refusals use, and it names the
+    /// threshold's UNITS — a bare number in a catalog row is a number nobody
+    /// can read.
+    pub fn fires_when(self) -> &'static str {
+        match self {
+            AlarmKind::EnemyArmySighted => {
+                "a body of enemy troops at or above `threshold` units is in your intel ledger, \
+                 seen recently"
+            }
+            AlarmKind::SquadBelowHalf => {
+                "one of your squads is below `threshold` of its pooled health"
+            }
+            AlarmKind::IncomeCollapse => {
+                "your gold has stopped — every mine your halls work is dry, or fewer than \
+                 `threshold` workers are on gold"
+            }
+            AlarmKind::MineDepleting => {
+                "the gold mines your halls work are down to `threshold` of what they held — \
+                 the early warning `income_collapse` cannot give you, because an expansion \
+                 takes longer to build than the last of a mine takes to run out"
+            }
+            AlarmKind::PlacesUnderAttack => {
+                "your buildings are being hit in `threshold` or more distinct places at once"
+            }
         }
     }
 
@@ -13123,6 +13384,7 @@ impl AlarmKind {
             AlarmKind::EnemyArmySighted => "enemy army sighted",
             AlarmKind::SquadBelowHalf => "squad below half strength",
             AlarmKind::IncomeCollapse => "income collapse",
+            AlarmKind::MineDepleting => "mines running out",
             AlarmKind::PlacesUnderAttack => "multiple places under attack",
         }
     }

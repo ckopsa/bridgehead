@@ -67,6 +67,9 @@ impl Plugin for EconomyPlugin {
                 harvest_loop,
                 training_queues,
                 buy_items,
+                // Last in the chain, so a sample describes the frame that just
+                // finished paying and banking rather than the one before it.
+                sample_gold_flow,
             )
                 .chain()
                 .in_set(SimSet::Economy),
@@ -80,11 +83,81 @@ impl Plugin for EconomyPlugin {
 fn bank_bounties(mut claims: EventReader<BountyClaim>, mut economies: ResMut<Economies>) {
     for claim in claims.read() {
         let economy = economies.get_mut(claim.team);
-        economy.gold += claim.gold;
+        economy.earn(claim.gold);
         debug!(
             "bounty banked: {:?} +{}g (untaxed) at ({:.0},{:.0}) -> {}g",
             claim.team, claim.gold, claim.pos.x, claim.pos.z, economy.gold
         );
+    }
+}
+
+/// **The gold runway, sampled.** Both derivatives of the bank, once per game
+/// second, for whichever renderer asks.
+///
+/// Two numbers, and they are different kinds of thing:
+///
+///   * `income_per_min` is MEASURED — the difference of `Economy::earned` over
+///     a trailing [`INCOME_WINDOW_S`] window. Measured rather than modelled
+///     because the model ("workers × trips × carry") is wrong about every
+///     interesting case: a crew walking past a raid, a mine that just ran out,
+///     an upkeep bracket the team crossed on the last supply. A commander that
+///     is being taxed 40% wants the taxed number, and that is the one that
+///     lands in the bank.
+///   * `commit_per_min` is PROJECTED — what the standing training queues will
+///     demand if they run as scheduled. This is r36's missing fact: three
+///     Barracks each cycling a 135g Footman every 20s want 1,215 gold a minute,
+///     and until now the only thing that ever said so was a stream of "cannot
+///     afford" bounces on a bank that never went up.
+///
+/// The projection deliberately prices heroes off the flat catalog row rather
+/// than through `hero_train_cost`, so a team's *first* hero — which is free —
+/// is counted at full fare for as long as it sits in a queue. Overstating a
+/// commitment by one waiver is the safe direction for a number whose whole job
+/// is to say "you have promised more than you earn", and it keeps this system
+/// off `HeroRecords`.
+///
+/// Sampled on a **game**-time cadence rather than `on_timer`'s virtual clock,
+/// so two runs of one seed at one fixed dt sample at identical game times and
+/// publish identical rates.
+fn sample_gold_flow(
+    time: Res<Time>,
+    economies: Res<Economies>,
+    mut flow: ResMut<GoldFlow>,
+    mut next_at: Local<f32>,
+    queues: Query<(&Team, &TrainingQueue), Without<UnderConstruction>>,
+) {
+    let now = time.elapsed_secs();
+    if now < *next_at {
+        return;
+    }
+    // Advance to the next whole sample boundary at or after `now`, so a long
+    // frame skips a sample instead of firing a burst of them.
+    *next_at = (now / INCOME_SAMPLE_S).floor() * INCOME_SAMPLE_S + INCOME_SAMPLE_S;
+
+    for team in [Team::Human, Team::Claude] {
+        // PER BUILDING and then summed, because that is how production
+        // actually parallelises: one building trains its queue serially (so
+        // its own rate is the queue's cost over the queue's time), and three
+        // buildings draw on the bank at once. Pooling the numerator and the
+        // denominator across buildings would have reported three Barracks as
+        // one, which is the exact reading r36 was missing.
+        let mut commit = 0.0f32;
+        for (owner, queue) in queues.iter() {
+            if *owner != team || queue.queue.is_empty() {
+                continue;
+            }
+            let mut cost = 0.0f32;
+            let mut secs = 0.0f32;
+            for kind in &queue.queue {
+                let stats = unit_stats(*kind);
+                cost += stats.cost_gold as f32;
+                secs += stats.train_time.max(0.1);
+            }
+            if secs > 0.0 {
+                commit += cost * 60.0 / secs;
+            }
+        }
+        flow.observe(team, now, economies.get(team).earned, commit);
     }
 }
 
@@ -2301,7 +2374,10 @@ fn harvest_loop(
                         ResourceKind::Gold => {
                             let taxed =
                                 (load.1 as f32 * upkeep_rate(economy.supply_used)).round() as u32;
-                            economy.gold += taxed.max(1);
+                            // Through `earn`, so the income meter sees exactly
+                            // the gold the team actually banks — after upkeep,
+                            // which is the number a runway is measured in.
+                            economy.earn(taxed.max(1));
                         }
                         ResourceKind::Lumber => economy.lumber += load.1,
                     }
@@ -3287,7 +3363,7 @@ mod tests {
     fn spawn_node(app: &mut App, kind: ResourceKind, remaining: u32, pos: Vec3) -> Entity {
         app.world_mut()
             .spawn((
-                ResourceNode { kind, remaining },
+                ResourceNode::full(kind, remaining),
                 Transform::from_translation(pos),
             ))
             .id()
@@ -3497,6 +3573,145 @@ mod tests {
         assert!(
             feed_lines(&app, Team::Human).is_empty(),
             "there are thousands of trees; a stump is not a fact anybody reasons about"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the gold runway (income measured, commitment projected)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+
+    /// The sampler alone, on a hand-driven clock.
+    fn flow_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<Economies>()
+            .init_resource::<GoldFlow>()
+            .add_systems(Update, sample_gold_flow);
+        app
+    }
+
+    fn tick(app: &mut App, secs: f32) {
+        let mut time = app.world_mut().resource_mut::<Time>();
+        time.advance_by(std::time::Duration::from_secs_f32(secs));
+        app.update();
+    }
+
+    fn rate(app: &App, team: Team) -> f32 {
+        app.world().resource::<GoldFlow>().get(team).income_per_min
+    }
+
+    /// Income is the DIFFERENCE of what was banked, not the level of the bank:
+    /// a team that earns 100 and spends 100 has an income of 100, and a team
+    /// that spends nothing and earns nothing has an income of zero. Reading the
+    /// level would have called the first one broke and the second one rich.
+    #[test]
+    fn income_measures_gold_banked_and_never_gold_held() {
+        let mut app = flow_app();
+        tick(&mut app, 0.0);
+        for _ in 0..30 {
+            {
+                let mut economies = app.world_mut().resource_mut::<Economies>();
+                let e = economies.get_mut(Team::Human);
+                e.earn(10);
+                // ...and spend every penny of it, which must not show up here.
+                e.pay(10, 0);
+            }
+            tick(&mut app, 1.0);
+        }
+        let r = rate(&app, Team::Human);
+        assert!(
+            (r - 600.0).abs() < 30.0,
+            "10g a second is 600g a minute, spent or not — got {r}"
+        );
+        assert_eq!(rate(&app, Team::Claude), 0.0, "and it is per team");
+    }
+
+    /// A refund is money you already had. Counting it would let a commander
+    /// queue and cancel its way to an imaginary economy.
+    #[test]
+    fn a_refund_is_not_income() {
+        let mut app = flow_app();
+        tick(&mut app, 0.0);
+        for _ in 0..30 {
+            app.world_mut()
+                .resource_mut::<Economies>()
+                .get_mut(Team::Human)
+                .refund(50, 0);
+            tick(&mut app, 1.0);
+        }
+        assert_eq!(rate(&app, Team::Human), 0.0);
+    }
+
+    /// r36's fact: three trainers on one bank. The rate is per BUILDING and
+    /// summed, because that is how they draw — pooling the queues would have
+    /// reported three Barracks as one and hidden the whole problem.
+    #[test]
+    fn three_standing_trainers_commit_three_trainers_worth_of_gold() {
+        let mut app = flow_app();
+        let stats = unit_stats(UnitKind::Footman);
+        let one = stats.cost_gold as f32 * 60.0 / stats.train_time;
+        for _ in 0..3 {
+            let mut queue = TrainingQueue::default();
+            queue.queue.push_back(UnitKind::Footman);
+            queue.queue.push_back(UnitKind::Footman);
+            app.world_mut().spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                queue,
+            ));
+        }
+        tick(&mut app, 1.0);
+        let commit = app.world().resource::<GoldFlow>().get(Team::Human).commit_per_min;
+        assert!(
+            (commit - 3.0 * one).abs() < 1.0,
+            "three trainers want three times one trainer: got {commit}, one is {one}"
+        );
+
+        // A building still going up commits nothing — it cannot train yet.
+        let site = app
+            .world_mut()
+            .spawn((
+                Building { kind: BuildingKind::Barracks },
+                Team::Human,
+                Transform::from_translation(Vec3::ZERO),
+                {
+                    let mut q = TrainingQueue::default();
+                    q.queue.push_back(UnitKind::Footman);
+                    q
+                },
+                UnderConstruction { remaining: 10.0 },
+            ))
+            .id();
+        tick(&mut app, 1.0);
+        let with_site = app.world().resource::<GoldFlow>().get(Team::Human).commit_per_min;
+        assert!(
+            (with_site - 3.0 * one).abs() < 1.0,
+            "a foundation is not a trainer"
+        );
+        let _ = site;
+    }
+
+    /// Empty queues are a commitment of nothing, and the snapshot skips the
+    /// key entirely rather than reporting a zero somebody has to interpret.
+    #[test]
+    fn nothing_queued_commits_nothing() {
+        let mut app = flow_app();
+        app.world_mut().spawn((
+            Building { kind: BuildingKind::Barracks },
+            Team::Human,
+            Transform::from_translation(Vec3::ZERO),
+            TrainingQueue::default(),
+        ));
+        tick(&mut app, 1.0);
+        assert_eq!(
+            app.world().resource::<GoldFlow>().get(Team::Human).commit_per_min,
+            0.0
         );
     }
 }

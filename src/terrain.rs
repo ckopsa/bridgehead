@@ -626,10 +626,7 @@ fn setup_resource_nodes(
         let ground = Vec3::new(pos.x, 0.0, pos.z);
         commands
             .spawn((
-                ResourceNode {
-                    kind: ResourceKind::Gold,
-                    remaining: MINE_GOLD,
-                },
+                ResourceNode::full(ResourceKind::Gold, MINE_GOLD),
                 Transform::from_translation(ground)
                     .with_rotation(Quat::from_rotation_y(i as f32 * 0.4)),
                 Visibility::default(),
@@ -726,10 +723,7 @@ fn setup_resource_nodes(
 
         commands
             .spawn((
-                ResourceNode {
-                    kind: ResourceKind::Lumber,
-                    remaining: TREE_LUMBER,
-                },
+                ResourceNode::full(ResourceKind::Lumber, TREE_LUMBER),
                 Transform::from_translation(pos)
                     .with_rotation(lean)
                     .with_scale(Vec3::splat(scale)),

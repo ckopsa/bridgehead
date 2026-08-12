@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// alarms.ron — the four forced re-decisions, and how loud each one is.
+// alarms.ron — the forced re-decisions, and how loud each one is.
 //
 // One record per `AlarmKind` variant, every variant exactly once; the loader
 // (src/data.rs) refuses to start otherwise, naming the variant it could not
@@ -77,6 +77,37 @@
             // and during the opening seconds before the first workers reach
             // the mine.
             grace_s: 20.0,
+        ),
+    ),
+    (
+        kind: MineDepleting,
+        tuning: (
+            // 0.3 — the mines your halls work are down to 30% of what they
+            // held, POOLED, so a fresh expansion genuinely buys the warning
+            // off again instead of merely muting it.
+            //
+            // Why not lower: this alarm exists to be actionable, and the
+            // action is an expansion. A hall is 400g and 40s of build time
+            // AFTER a worker has walked to the new mine, and the new crew then
+            // has to be trained and sent. At 30% of two 5,000g mines a team
+            // mining at ~400g/min has about seven minutes of gold left, which
+            // is roughly two expansion cycles — enough that the commander gets
+            // to CHOOSE rather than to react. r26-blue asked for this at 20%
+            // ("your-only-mine-is-20%-depleted") and lost the game it asked
+            // from; the extra ten points are the walk it did not have.
+            //
+            // Why not higher: at 50% every match raises it around the same
+            // clock time and an alarm that always fires is a status line
+            // wearing an interruption's clothes.
+            threshold: 0.3,
+            // 15s. Depletion is MONOTONIC — a mine never refills — so this
+            // window can never be a debounce and costs the commander nothing
+            // but fifteen seconds of a many-minute decision. It is here for
+            // the structural reason the other four have it: no alarm in this
+            // layer is allowed to be the first responder, and a `mine_dry`
+            // trigger or a standing expansion plan gets the window to answer
+            // and be named in the running default.
+            grace_s: 15.0,
         ),
     ),
     (
