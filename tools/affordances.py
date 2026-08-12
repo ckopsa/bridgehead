@@ -272,6 +272,14 @@ def squad_members(state, sid):
     ]
 
 
+def squad_headcount(state, sid):
+    """What the squad RECORD says it holds, which is not always what the unit
+    rosters say: a snapshot from before `units[].squad` existed carries the
+    count and no roster."""
+    record = next((sq for sq in state.get("squads") or [] if sq.get("id") == sid), {})
+    return record.get("members", 0)
+
+
 def push_gate_facts(state, props, sid):
     """The three push gates, each as a comparison with both numbers on it.
 
@@ -282,6 +290,12 @@ def push_gate_facts(state, props, sid):
     (DOC_VERSION), and the commander is free to disagree and send it anyway.
     """
     members = squad_members(state, sid)
+    if not members and squad_headcount(state, sid):
+        # A snapshot old enough to predate `units[].squad` still reports the
+        # count on the squad record, and reporting that as "no members" would
+        # be the one wrong answer: it is the r21 fact, said about a squad that
+        # is not empty. Defer to the reason that says so.
+        return stance_facts(state, props, sid)
     army = props["army"]["units"]
     outside = army - len(members)
     heroes = [u for u in members if u.get("hero")]
@@ -331,8 +345,7 @@ def stance_facts(state, props, sid):
     """
     members = squad_members(state, sid)
     if not members:
-        record = next((sq for sq in state.get("squads") or [] if sq.get("id") == sid), {})
-        counted = record.get("members", 0)
+        counted = squad_headcount(state, sid)
         if counted:
             return True, (
                 "squad {} reports {} members but this snapshot carries no roster for "

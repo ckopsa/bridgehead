@@ -614,8 +614,23 @@ def test_the_pre_everything_fixture_still_produces_a_document():
     d = affordances.document(s, load(FIX / "catalog.json"))
     assert by_rel(d, "trigger_set")["slots"] == "0 of 8 trigger names in use"
     assert by_rel(d, "region_set")["slots"] == "0 of 8 region names in use"
-    assert "stance:squad-0:push" in rels(d)
+    push = by_rel(d, "stance:squad-0:push")
+    assert push["ready"] is True and "push gates met" in push["reason"]
     assert affordances.render_document(d)
+
+
+def test_a_squad_with_a_headcount_and_no_roster_is_not_called_empty():
+    """A snapshot from before `units[].squad` carries the count on the squad
+    record and no roster. "Squad 0 has no members" would then be the r21 fact
+    said about a squad of ten — the one wrong answer available here."""
+    s = load(ARMED)
+    for u in s["units"]:
+        u.pop("squad", None)
+    d = affordances.document(s, catalog())
+    for word in ("push", "turtle"):
+        a = by_rel(d, "stance:squad-1:{}".format(word))
+        assert a["ready"] is True, word
+        assert "carries no roster" in a["reason"], a["reason"]
 
 
 def test_the_early_game_offers_the_things_an_early_game_can_do():
