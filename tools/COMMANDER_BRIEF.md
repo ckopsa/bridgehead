@@ -693,6 +693,27 @@ one member of a listed squad has died, the survivors are still ordered, the dead
 id is still reported in `errors`, and the plan carries on. Only a step that
 reaches nothing blocks.
 
+### If a step's `when` names a place you have not named
+
+`{"type":"when","when":{"type":"enemy_in","region":"staging",...}}` is legal in a
+plan step **before** `staging` is a place — you may `region_set` it later by
+hand, or in an earlier step of the same plan. `plan_set` arms it and tells you
+which step is holding, in the same words a late-bound target gets:
+
+    cmd 1: chain holds at step 2: no region named 'staging' - known places: … —
+    plan commit is armed anyway; the step waits there until the place is named
+
+If the step's turn comes and the name is still not a place, the plan's `status`
+becomes `held: no region named 'staging' - known places: …` and one line goes
+into `events`. **`held` is not `blocked`**: the step's order already ran, so
+nothing is retried and nothing halts — the plan simply waits, for as long as you
+leave it, and says `plan <name> step k/n no longer held` on the sweep after you
+name the ground.
+
+(A **trigger** is stricter: `trigger_set` refuses an unknown `enemy_in` region
+outright, because a trigger has no earlier step to name ground in and re-arming
+it costs you one line.)
+
 ### THE CANONICAL EXAMPLE: the boomer opening as one plan
 
 Economy first, workers second, tech third, army buildings last — sequenced so

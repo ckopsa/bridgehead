@@ -3219,14 +3219,53 @@ fn compile_intent(
                 match &step.advance {
                     PlanAdvance::OnApplied => {}
                     PlanAdvance::When { when } => {
-                        // The same arm-time judgement a trigger gets, for the
-                        // same reason and now including territory: a plan step
-                        // that advances on `enemy_in` names a PLACE, and a
-                        // misspelled place should be refused with the menu here
-                        // rather than silently stall the sequence at step k.
-                        if let Err(err) = validate_predicate(when, me, regions) {
+                        // **The predicate's SHAPE is judged now.** A count of
+                        // zero, a misspelt target class, a fraction outside
+                        // (0,1] — none of those becomes a sentence later, so
+                        // refusing the plan is the only honest answer and the
+                        // refusal names the fix.
+                        if let Err(err) = validate_predicate_shape(when) {
                             errors.push(format!("{tag}: plan {name} step {k}: {err}"));
                             return;
+                        }
+                        // **The predicate's PLACE is late-bound**, on the same
+                        // terms as the step's own target below — and this is a
+                        // deliberate split from `trigger_set`, which still
+                        // refuses an unknown place at arm time.
+                        //
+                        // The asymmetry a commander could feel was inside ONE
+                        // sentence: "push until 12 of them are in staging, then
+                        // stage there" armed-and-taught for the target half and
+                        // was refused outright for the predicate half, though
+                        // both halves are the same word about the same ground.
+                        // Worse, a plan may `region_set` in a step — that verb
+                        // is banned from a trigger's `then` and deliberately NOT
+                        // from a plan step — so "name the staging ground, then
+                        // wait for twelve of them to reach it" was a coherent
+                        // sequence the compiler refused to accept.
+                        //
+                        // A trigger keeps the arm-time refusal because none of
+                        // that applies to it: its `then` may not name ground, it
+                        // has no earlier step to name ground in, and it fires
+                        // against a vocabulary that was already complete when it
+                        // was armed. See docs/INTENT.md § "Arm time and late
+                        // binding".
+                        //
+                        // Late binding does not cost the lesson, because the
+                        // lesson is paid twice: here, and again by plan.rs when
+                        // the step's turn comes and the name is still not a
+                        // place — the plan goes `held: <this same sentence>`
+                        // rather than sitting `running` on a condition that can
+                        // never come true.
+                        if let Some(place) = predicate_place(when) {
+                            if regions.find(me, place).is_none() {
+                                errors.push(format!(
+                                    "{tag}: chain holds at step {k}: {} — plan {name} is \
+                                     armed anyway; the step waits there until the place \
+                                     is named",
+                                    regions.unknown(me, place)
+                                ));
+                            }
                         }
                     }
                     PlanAdvance::AfterSeconds { secs } => {
@@ -3391,7 +3430,42 @@ fn compile_intent(
 /// Is this predicate expressible? Checked at arm time, because a predicate is
 /// the one half of a trigger that CAN be judged before the world moves — every
 /// parameter in it is a constant the commander typed.
+///
+/// **Two halves, and callers pick how much of the second one they want.** The
+/// SHAPE ([`validate_predicate_shape`]) is judged the same way everywhere: a
+/// count of zero, a misspelt target class, a fraction outside `(0,1]` is a typo
+/// that no amount of later world can turn into a sentence. The PLACE
+/// ([`predicate_place`]) is vocabulary, and vocabulary grows during a match, so
+/// a plan step late-binds it where a trigger does not — see the plan-step arm
+/// of `compile_intent` for the argument.
 fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result<(), String> {
+    validate_predicate_shape(when)?;
+    if let Some(name) = predicate_place(when) {
+        if regions.find(me, name).is_none() {
+            return Err(regions.unknown(me, name));
+        }
+    }
+    Ok(())
+}
+
+/// **The place a predicate asks about, if it asks about one.**
+///
+/// One function so that "which predicates name ground?" has a single answer,
+/// read by three callers that must agree: the trigger arm (refuse now), the
+/// plan-step arm (arm and teach) and plan.rs's evaluator (hold the step and say
+/// so). A new predicate that names a place is one arm here and all three
+/// inherit it.
+pub(crate) fn predicate_place(when: &TriggerWhen) -> Option<&str> {
+    match when {
+        TriggerWhen::EnemyIn { region, .. } => Some(region.as_str()),
+        _ => None,
+    }
+}
+
+/// Everything about a predicate that is a **typo rather than a pending fact**:
+/// counts, classes, fractions, tiers, unit kinds. All of it is judged at arm
+/// time by every caller, because none of it can become true later.
+fn validate_predicate_shape(when: &TriggerWhen) -> Result<(), String> {
     /// The class check `enemy_sighted` and `enemy_in` share. One matcher, one
     /// wording — the two predicates ask the same question about the same word.
     fn class_ok(class: &Option<String>) -> Result<(), String> {
@@ -3428,16 +3502,11 @@ fn validate_predicate(when: &TriggerWhen, me: Team, regions: &Regions) -> Result
             }
             class_ok(class)
         }
-        TriggerWhen::EnemyIn {
-            region,
-            class,
-            count,
-        } => {
+        // The region is NOT checked here — it is the place channel, and
+        // `predicate_place` above is the one place that names it.
+        TriggerWhen::EnemyIn { class, count, .. } => {
             if *count == 0 {
                 return Err("enemy_in count must be at least 1".to_string());
-            }
-            if regions.find(me, region).is_none() {
-                return Err(regions.unknown(me, region));
             }
             class_ok(class)
         }
@@ -5318,6 +5387,84 @@ mod tests {
             "{errors:?}"
         );
         assert!(plan_names(&app, Team::Human).contains(&"push".to_string()));
+    }
+
+    /// **One sentence, one rule.** A chain step's TARGET region and its ADVANCE
+    /// predicate's region are the same word about the same ground, and until
+    /// this bead the compiler judged them by opposite rules: the target armed
+    /// and taught, the predicate refused the whole plan. "Push until twelve of
+    /// them are in staging, then stage there" got a notice for one half and a
+    /// refusal for the other.
+    ///
+    /// So a plan step late-binds both, and the notice is the same notice. The
+    /// half that makes it honest rather than merely permissive is plan.rs:
+    /// `a_step_held_on_an_unnamed_place_says_so_and_says_when_it_clears`.
+    #[test]
+    fn a_plan_step_late_binds_the_place_its_advance_predicate_names() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"commit","steps":[
+                {"intent":{"type":"stance","squad":1,"stance":"push","target":"mid"},
+                 "advance":{"type":"when",
+                            "when":{"type":"enemy_in","region":"staging","count":12}}},
+                {"intent":{"type":"stance","squad":1,"stance":"stage"}}]}"#,
+        );
+        assert_eq!(
+            plan_names(&app, Team::Human),
+            vec!["commit"],
+            "armed. A place the seat has not named yet must not cost it the sequence"
+        );
+        let errors = app.world().resource::<IntentErrors>().get(Team::Human).clone();
+        assert_eq!(errors.len(), 1, "one line, about the one step: {errors:?}");
+        assert!(
+            errors[0].contains("chain holds at step 1")
+                && errors[0].contains("no region named 'staging'")
+                && errors[0].contains("known places")
+                && errors[0].contains("armed anyway"),
+            "the predicate half teaches exactly as the target half does: {}",
+            errors[0]
+        );
+        app.world_mut().resource_mut::<IntentErrors>().get_mut(Team::Human).clear();
+
+        // The sequence the old rule made inexpressible: a plan may `region_set`
+        // in a step (a trigger's `then` may not), so a plan can legitimately
+        // name the ground a LATER step waits on. Arm-time refusal made that
+        // coherent sentence unsayable.
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"watch","steps":[
+                {"intent":{"type":"region_set","name":"staging",
+                           "x":-40.0,"z":30.0,"radius":20.0}},
+                {"intent":{"type":"stance","squad":1,"stance":"push","target":"mid"},
+                 "advance":{"type":"when",
+                            "when":{"type":"enemy_in","region":"staging","count":3}}}]}"#,
+        );
+        assert!(plan_names(&app, Team::Human).contains(&"watch".to_string()));
+    }
+
+    /// The other half of the split: a predicate's SHAPE is still judged at arm
+    /// time for a plan, because no amount of later world turns a count of zero
+    /// into a sentence. Late binding is about vocabulary, never about typos.
+    #[test]
+    fn a_plan_step_still_refuses_a_predicate_that_can_never_hold() {
+        let mut app = compiler_app();
+        arm(
+            &mut app,
+            Team::Human,
+            r#"{"type":"plan_set","name":"never","steps":[
+                {"intent":{"type":"stop","units":[]},
+                 "advance":{"type":"when",
+                            "when":{"type":"enemy_in","region":"staging","count":0}}}]}"#,
+        );
+        let err = first_error(&app, Team::Human);
+        assert!(err.contains("enemy_in count must be at least 1"), "{err}");
+        assert!(
+            plan_names(&app, Team::Human).is_empty(),
+            "a shape that cannot come true is refused, place or no place"
+        );
     }
 
     /// The wait-condition half. `hero_above` is judged at arm time like every
@@ -7961,8 +8108,16 @@ mod tests {
 
     // -- triggers -----------------------------------------------------------
 
-    /// `enemy_in`'s region is a constant the commander typed, so it is judged
-    /// at ARM time — with the menu attached, like every other unknown name.
+    /// `enemy_in`'s region is a constant the commander typed, so for a TRIGGER
+    /// it is judged at ARM time — with the menu attached, like every other
+    /// unknown name.
+    ///
+    /// A plan STEP now late-binds the same field
+    /// (`a_plan_step_late_binds_the_place_its_advance_predicate_names`), and the
+    /// split is deliberate: a trigger has no earlier step to name ground in, its
+    /// `then` may not name ground at all, and it is one statement a commander
+    /// re-sends in one line. A plan is a sequence written before the world it
+    /// describes exists. docs/INTENT.md § "Arm time and late binding".
     #[test]
     fn arming_enemy_in_with_an_unknown_region_is_refused_immediately() {
         let mut app = compiler_app();

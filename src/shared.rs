@@ -7096,10 +7096,13 @@ pub enum TriggerWhen {
     /// "do we know of an army at all". Eyes-on versus remembered, and a
     /// commander wants both words.
     ///
-    /// An unknown region name is refused **at arm time** by the compiler, so
-    /// this predicate never has to have an opinion about a name that is not a
-    /// place. If its region is cleared after arming, it goes quiet rather than
-    /// firing on the whole map — see `trigger.rs`.
+    /// An unknown region name is refused **at arm time** in a TRIGGER, so this
+    /// predicate never has to have an opinion about a name that is not a place.
+    /// In a PLAN STEP the same field is late-bound — the step arms with a notice
+    /// and goes [`PlanState::Held`] when its turn comes with the name still
+    /// unresolved (docs/INTENT.md § "Arm time and late binding"). Either way, if
+    /// the region is cleared out from under a live rule this predicate goes
+    /// quiet rather than firing on the whole map — see `trigger.rs`.
     EnemyIn {
         region: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7565,6 +7568,27 @@ pub enum PlanState {
     /// [`PLAN_RETRY_S`]; it will halt if it is still refused after
     /// [`PLAN_BLOCK_GRACE_S`].
     Blocked(String),
+    /// The current step's intent LANDED, and the step's advance-condition names
+    /// something this seat cannot currently resolve — today, an `enemy_in`
+    /// region that is not a place (never named, or `region_clear`ed out from
+    /// under the plan).
+    ///
+    /// **Not `Blocked`, and the difference is the whole reason for the
+    /// variant.** `Blocked` means the compiler refused the step, so retrying it
+    /// is the right move and giving up after [`PLAN_BLOCK_GRACE_S`] is the
+    /// honest end. Here the step *ran*: re-submitting its intent would re-order
+    /// an army that is already doing what it was told, and halting would throw
+    /// away a sequence whose missing word a commander may `region_set` at minute
+    /// ten. So a held plan does neither — it waits, says so once, and says so
+    /// again when it comes unstuck.
+    ///
+    /// It exists because the alternative was silence. `holds()` answers "no" for
+    /// a region it cannot find, which is correct and completely quiet, and a
+    /// plan parked forever on step 2 with `status: running` is the 3 a.m.
+    /// failure the arm-time refusal used to prevent. Late-binding the predicate
+    /// (docs/INTENT.md § "Arm time and late binding") is only defensible with
+    /// this on the other end of it.
+    Held(String),
     /// The current step was still refused after the grace window. The plan
     /// stops here, on this step, forever — it never skips ahead.
     Halted(String),
@@ -7696,6 +7720,7 @@ impl PlanRun {
         match &self.state {
             PlanState::Running => "running".to_string(),
             PlanState::Blocked(why) => format!("blocked: {why}"),
+            PlanState::Held(why) => format!("held: {why}"),
             PlanState::Halted(why) => format!("halted: {why}"),
             PlanState::Done => "done".to_string(),
         }
@@ -7703,7 +7728,10 @@ impl PlanRun {
 
     /// Is this plan still going to do anything?
     pub fn live(&self) -> bool {
-        matches!(self.state, PlanState::Running | PlanState::Blocked(_))
+        matches!(
+            self.state,
+            PlanState::Running | PlanState::Blocked(_) | PlanState::Held(_)
+        )
     }
 }
 

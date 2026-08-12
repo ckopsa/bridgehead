@@ -132,7 +132,7 @@ use bevy::time::common_conditions::on_timer;
 use std::time::Duration;
 
 use crate::shared::*;
-use crate::trigger::{holds, TriggerWorld};
+use crate::trigger::{holds, unresolved_place, TriggerWorld};
 
 /// Plan step cadence (~4 Hz). The same heartbeat as the trigger evaluator, and
 /// deliberately so: a plan's `when` advance-conditions ARE trigger predicates,
@@ -185,20 +185,37 @@ fn step_plans(
         // nothing in this loop adds to or removes from the list.
         let count = plans.get(me).len();
         for index in 0..count {
-            // Whether this plan's current advance-condition holds, computed
-            // while the world borrow is alive.
-            let ready = {
+            // Whether this plan's current advance-condition holds, and whether
+            // it is even askable — both computed while the world borrow is
+            // alive. The second is `Some(why)` when the predicate names ground
+            // this seat cannot resolve, which is a question with no answer
+            // rather than a question answered "no"; see `PlanState::Held`.
+            let (ready, held) = {
                 let plan = &plans.get(me)[index];
                 match (plan.live(), plan.applied, plan.current()) {
                     (true, true, Some(step)) => match &step.advance {
-                        PlanAdvance::OnApplied => true,
-                        PlanAdvance::When { when } => holds(when, me, now, &world),
-                        PlanAdvance::AfterSeconds { secs } => now - plan.applied_at >= *secs,
+                        PlanAdvance::OnApplied => (true, None),
+                        PlanAdvance::When { when } => (
+                            holds(when, me, now, &world),
+                            unresolved_place(when, me, &world),
+                        ),
+                        PlanAdvance::AfterSeconds { secs } => {
+                            (now - plan.applied_at >= *secs, None)
+                        }
                     },
-                    _ => false,
+                    _ => (false, None),
                 }
             };
-            step_one(me, index, now, ready, &mut plans, &mut submissions, &mut feed);
+            step_one(
+                me,
+                index,
+                now,
+                ready,
+                held,
+                &mut plans,
+                &mut submissions,
+                &mut feed,
+            );
         }
     }
 }
@@ -211,6 +228,7 @@ fn step_one(
     index: usize,
     now: f32,
     ready: bool,
+    held: Option<String>,
     plans: &mut Plans,
     submissions: &mut EventWriter<SubmitIntent>,
     feed: &mut GameEvents,
@@ -292,6 +310,54 @@ fn step_one(
             submissions.write(SubmitIntent::plan_step(me, plan.source, stamp, step.intent));
         }
         return;
+    }
+
+    // 2b. **Held.** The step's intent landed, and its advance-condition names
+    //     ground this seat cannot resolve — so the question is not "not yet",
+    //     it is unanswerable, and `holds()` says `false` to it forever.
+    //
+    //     This is the other end of late binding (docs/INTENT.md § "Arm time and
+    //     late binding"). The compiler now ARMS a plan whose step waits on
+    //     `enemy_in` over a place that is not named yet, because the step's own
+    //     target has always been allowed to do that and one sentence should not
+    //     be judged by two rules. The price of arming it is that the engine owes
+    //     the commander a word when the sequence actually stops there, and this
+    //     is that word: one line in on the edge, one line out when it clears,
+    //     and `plans[].status` reading `held: <why>` continuously in between
+    //     (tools/BUILDER_BRIEF.md §6.11).
+    //
+    //     No retry and no halt, unlike `Blocked` above: the intent already ran,
+    //     so re-submitting it would re-order an army that is doing as it was
+    //     told, and a missing place name is a thing a commander can still supply
+    //     at minute ten.
+    match held {
+        Some(why) => {
+            if plan.state != PlanState::Held(why.clone()) {
+                plan.state = PlanState::Held(why.clone());
+                feed.push(
+                    me,
+                    now,
+                    format!("plan {stamp} held: {why}"),
+                    EventSeverity::Warning,
+                    None,
+                );
+            }
+            return;
+        }
+        // The exit edge, owed the moment the name becomes a place. Told once
+        // that a sequence stopped and never told it started again, a reader has
+        // to poll — which is the polling this module exists to delete.
+        None if matches!(plan.state, PlanState::Held(_)) => {
+            plan.state = PlanState::Running;
+            feed.push(
+                me,
+                now,
+                format!("plan {stamp} no longer held — the place it waits on is named"),
+                EventSeverity::Info,
+                None,
+            );
+        }
+        None => {}
     }
 
     // 3. Out, accepted, and the advance-condition has not come true yet.
@@ -805,6 +871,110 @@ mod tests {
         advance_clock(&mut app, 5.0);
         app.update();
         assert_eq!(at(&app), 1, "seen is known");
+    }
+
+    /// **What buys late binding its honesty.** The compiler now arms a plan
+    /// whose step waits on `enemy_in` over a place nobody has named — the same
+    /// arm-and-teach the step's own target has always got — and the price of
+    /// that permission is paid here: when the step's turn comes and the name is
+    /// still not a place, the plan must SAY it stopped rather than sit
+    /// `running` on a question with no answer.
+    ///
+    /// Three properties, and the third is the one §6.11 of the builder's brief
+    /// is about: one line in, `held: <why>` in the status for as long as it is
+    /// true, and one line out when it clears. A reader told a sequence stalled
+    /// and never told it recovered has to poll.
+    #[test]
+    fn a_step_held_on_an_unnamed_place_says_so_and_says_when_it_clears() {
+        let mut app = plan_app();
+        app.world_mut()
+            .resource_mut::<Plans>()
+            .get_mut(Team::Human)
+            .push(plan(vec![
+                step(
+                    stop(),
+                    PlanAdvance::When {
+                        when: TriggerWhen::EnemyIn {
+                            region: "staging".to_string(),
+                            class: None,
+                            count: 1,
+                        },
+                    },
+                ),
+                step(stop(), PlanAdvance::OnApplied),
+            ]));
+
+        // Step 1 goes out and is accepted like any other. The hold is about the
+        // ADVANCE condition, never about the order — an army told to hold
+        // position is holding position.
+        app.update();
+        assert_eq!(sent(&mut app).len(), 1, "the step itself still ran");
+        accept(&mut app);
+
+        fn held_lines(app: &App) -> Vec<String> {
+            app.world()
+                .resource::<GameEvents>()
+                .feed(Team::Human)
+                .iter()
+                .filter(|e| e.message.contains("held"))
+                .map(|e| e.message.clone())
+                .collect()
+        }
+
+        // Sixty sweeps: one announcement, a continuously readable status, and
+        // nothing re-submitted. The last is the reason `Held` is not `Blocked` —
+        // retrying `stop` at PLAN_RETRY_S would re-order a settled army.
+        for _ in 0..60 {
+            advance_clock(&mut app, 0.25);
+            app.update();
+            assert_eq!(at(&app), 0, "an unanswerable condition never advances");
+            assert!(sent(&mut app).is_empty(), "and nothing is re-submitted");
+        }
+        let lines = held_lines(&app);
+        assert_eq!(lines.len(), 1, "one line, not one per sweep: {lines:?}");
+        assert!(
+            lines[0].contains("no region named 'staging'") && lines[0].contains("known places"),
+            "the notice carries the resolver's own words and the menu: {}",
+            lines[0]
+        );
+        let status = app.world().resource::<Plans>().get(Team::Human)[0].status();
+        assert!(
+            status.starts_with("held: no region named 'staging'"),
+            "the condition is level-triggered in the status the whole time, got {status}"
+        );
+
+        // Name the ground. The exit edge is owed and paid, and the plan is a
+        // plain running plan again — still on step 1, because the predicate is
+        // now askable and the answer is "not yet".
+        app.world_mut()
+            .resource_mut::<Regions>()
+            .set(
+                Team::Human,
+                Region::new("staging", Vec3::new(-40.0, 0.0, 30.0), 20.0),
+            )
+            .expect("the test's own region is legal");
+        advance_clock(&mut app, 0.25);
+        app.update();
+        assert_eq!(held_lines(&app).len(), 2, "one line out as well as one in");
+        assert!(held_lines(&app)[1].contains("no longer held"));
+        assert_eq!(
+            app.world().resource::<Plans>().get(Team::Human)[0].status(),
+            "running"
+        );
+        assert_eq!(at(&app), 0, "askable, and the answer is 'not yet'");
+
+        // And it advances on the answer, proving the hold cost the plan nothing
+        // but the wait.
+        app.insert_resource(FogGrids::test_revealed());
+        app.world_mut().spawn((
+            Unit { kind: UnitKind::Footman },
+            Team::Claude,
+            Transform::from_xyz(-40.0, 0.0, 30.0),
+            Health::new(100.0),
+        ));
+        advance_clock(&mut app, 0.25);
+        app.update();
+        assert_eq!(at(&app), 1, "the sequence resumes where it stopped");
     }
 
     /// The other half of the same seam, so both new arms are covered rather
