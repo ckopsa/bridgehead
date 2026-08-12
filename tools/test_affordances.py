@@ -122,9 +122,10 @@ def test_the_document_has_the_five_top_level_sections():
 def test_the_document_carries_its_own_version():
     """AFFORDANCES.md constraint 3: the scaffold's version travels with the
     result, or the ledger cannot tell model from model+scaffold."""
-    # `1.1`: the production forms joined the action set (building selectors).
-    # The major half is the document's SHAPE and has not moved.
-    assert affordances.DOC_VERSION == "affordance-doc/1.1"
+    # `1.2`: the `when` field serves real predicate schemas out of the catalog,
+    # and rally/template/cancel joined the production forms. The major half is
+    # the document's SHAPE and has not moved.
+    assert affordances.DOC_VERSION == "affordance-doc/1.2"
     assert doc()["doc_version"] == affordances.DOC_VERSION
     assert run("--doc-version").strip() == affordances.DOC_VERSION
     assert subprocess.run(
@@ -518,27 +519,56 @@ def test_a_form_that_spends_says_what_it_costs():
 
 
 def test_the_predicate_domain_matches_the_brief_a_commander_reads():
-    """The `when` predicates are not in the catalog, so this module keeps a
-    copy — and a copy that can rot quietly is worse than no copy. The brief's
-    own table is the referee.
+    """The `when` vocabulary now ships in `catalog.predicates`, so this test
+    changed what it is refereeing.
+
+    It used to compare the brief's table against a hand copy in this module —
+    the only thing keeping that copy honest, and it earned its keep when
+    `hero_above` arrived with stance chains (0uu.6). The copy is gone; the
+    catalog is the source. So the two documents a commander might read are what
+    is compared: the machine-readable one the engine writes and the prose one it
+    is told to consult. A predicate in one and not the other is a commander sent
+    to the wrong place, whichever direction it is missing in.
 
     The heading is matched loosely because it carries the count in words ("the
-    fourteen predicates") and that count is exactly the thing that moves: 0uu.6
-    added `hero_above` and this test is how the document found out.
+    fourteen predicates") and that count is exactly the thing that moves.
     """
     brief = (HERE / "COMMANDER_BRIEF.md").read_text()
     m = re.search(r"^### The \w+ predicates$", brief, re.M)
     assert m, "the brief no longer has a predicate table under a '### The N predicates' heading"
     section = brief[m.end():].split("\n###", 1)[0]
     listed = re.findall(r'\{"type":"(\w+)"', section)
-    assert listed == affordances.TRIGGER_PREDICATES, (
-        "the brief lists {} and this module serves {}".format(listed,
-                                                              affordances.TRIGGER_PREDICATES))
+    exported = [p["id"] for p in affordances.predicate_schemas(catalog())]
+    assert listed == exported, (
+        "the brief lists {} and catalog.predicates carries {}".format(listed, exported))
     # And the heading's own word has to agree with the table under it.
     words = {"twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16}
     count = words.get(m.group(0).split()[2])
     assert count == len(listed), "the heading says {} and the table has {}".format(
         m.group(0), len(listed))
+
+
+def test_the_predicate_domain_serves_fields_and_not_bare_names():
+    """The point of exporting the schema: the `when` field's domain used to be
+    fourteen bare type names, so a commander that wanted to know `enemy_in`
+    takes a `region` had to leave the document to find out."""
+    d = doc(ARMED)
+    when = next(f for f in by_rel(d, "trigger_set")["fields"] if f["path"] == "when")
+    assert "enemy_in(region, [class], [count=1])" in when["domain"]
+    assert "base_under_attack()" in when["domain"], "an arm with no fields says so"
+    assert "unit_count(kind, count)" in when["domain"], "both required, neither defaulted"
+
+
+def test_the_predicate_domain_is_absent_beside_a_catalog_that_has_none():
+    """No fallback list, deliberately: a second copy of a vocabulary is the
+    thing the catalog exists to delete, and 'this document does not know' beats
+    a fourteen-name guess that could be a predicate short."""
+    old = copy.deepcopy(catalog())
+    old.pop("predicates", None)
+    d = affordances.document(load(ARMED), old, None)
+    when = next(f for f in by_rel(d, "trigger_set")["fields"] if f["path"] == "when")
+    assert "domain" not in when
+    assert affordances.predicate_schemas(None) == []
 
 
 # -- the recipes -------------------------------------------------------------

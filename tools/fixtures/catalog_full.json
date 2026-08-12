@@ -2141,6 +2141,162 @@
     ],
     "sites": [
       "nearest legal site"
+    ],
+    "buildings": [
+      "my <building>",
+      "idle <building>",
+      "my hall"
     ]
-  }
+  },
+  "predicates": [
+    {
+      "id": "base_under_attack",
+      "fields": []
+    },
+    {
+      "id": "hero_below",
+      "fields": [
+        {
+          "name": "frac",
+          "type": "fraction",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "hero_above",
+      "fields": [
+        {
+          "name": "frac",
+          "type": "fraction",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "squad_below",
+      "fields": [
+        {
+          "name": "id",
+          "type": "squad",
+          "required": true
+        },
+        {
+          "name": "frac",
+          "type": "fraction",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "enemy_sighted",
+      "fields": [
+        {
+          "name": "class",
+          "type": "class",
+          "required": false
+        },
+        {
+          "name": "count",
+          "type": "integer",
+          "required": false,
+          "default": 1
+        }
+      ]
+    },
+    {
+      "id": "enemy_in",
+      "fields": [
+        {
+          "name": "region",
+          "type": "place",
+          "required": true
+        },
+        {
+          "name": "class",
+          "type": "class",
+          "required": false
+        },
+        {
+          "name": "count",
+          "type": "integer",
+          "required": false,
+          "default": 1
+        }
+      ]
+    },
+    {
+      "id": "enemy_army_seen",
+      "fields": [
+        {
+          "name": "size",
+          "type": "integer",
+          "required": false,
+          "default": 1
+        },
+        {
+          "name": "within_s",
+          "type": "seconds",
+          "required": false
+        }
+      ]
+    },
+    {
+      "id": "enemy_hero_down",
+      "fields": [
+        {
+          "name": "class",
+          "type": "hero_class",
+          "required": false
+        }
+      ]
+    },
+    {
+      "id": "bounty_spawned",
+      "fields": []
+    },
+    {
+      "id": "mine_dry",
+      "fields": []
+    },
+    {
+      "id": "supply_capped",
+      "fields": []
+    },
+    {
+      "id": "tier_reached",
+      "fields": [
+        {
+          "name": "tier",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "unit_count",
+      "fields": [
+        {
+          "name": "kind",
+          "type": "unit_kind",
+          "required": true
+        },
+        {
+          "name": "count",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "game_time",
+      "fields": [
+        {
+          "name": "at",
+          "type": "seconds",
+          "required": true
+        }
+      ]
+    }
+  ]
 }

@@ -936,7 +936,7 @@ in front of you beats a sequence written before the match.
 ```bash
 python3 tools/bridge_view.py --doc <SEAT>/state.json          # to read
 python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse
-python3 tools/bridge_view.py --doc-version                    # affordance-doc/1.1
+python3 tools/bridge_view.py --doc-version                    # affordance-doc/1.2
 ```
 
 The digest tells you **what is going on**. The document tells you **what you can
@@ -1439,6 +1439,12 @@ a finished building standing that trains it, so `Footman` is false until a
 Barracks is up. No cross-check needed; if `unlocked` says true, `build`/`train`
 will accept it. Use catalog `requires` for PLANNING (what you'd need to build
 first), `unlocked` for ACTING.
+
+The catalog also carries the **vocabularies** — `stances`, `selectors` (by
+channel) and `predicates`. `predicates` is the table below in machine-readable
+form: one row per `when` arm, each with the fields it takes, whether each is
+required, and the value the engine fills in when it is not. If you generate
+commands, read that instead of parsing this document.
 
 ## The rules of the world (not in the catalog)
 - **FOG OF WAR — read this before you read `units`.** Your snapshot shows only what your

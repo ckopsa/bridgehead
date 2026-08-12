@@ -1968,6 +1968,48 @@ pub struct CatalogSelectors {
     pub buildings: Vec<&'static str>,
 }
 
+/// One field of one `when` predicate, as a form should render it.
+///
+/// `type` is the DOMAIN word, not the JSON type: `place` and `class` are both
+/// strings on the wire, and a document that told a commander "string" would have
+/// sent it to guess at exactly the two fields whose legal values it can look up.
+/// The words are the ones tools/affordances.py already uses for a field's type,
+/// so a rendered form's `fields[].type` is this value verbatim.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogPredicateField {
+    pub name: &'static str,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// False when the key may be omitted. An optional field with no `default`
+    /// below means "absent asks the wider question" — `enemy_sighted` with no
+    /// `class` counts every class.
+    pub required: bool,
+    /// What the engine fills in when an optional key is absent. Present only on
+    /// the count-shaped fields, which are the only ones that have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<u32>,
+}
+
+/// One `when` predicate, with the fields its arm actually carries.
+///
+/// **Why this is in the catalog at all.** `TriggerWhen` is a tagged enum with
+/// per-arm fields, so the vocabulary was never machine-readable and
+/// tools/affordances.py kept a hand copy of the predicate list — honest only
+/// because a test parsed the table out of tools/COMMANDER_BRIEF.md and compared
+/// them. That caught `hero_above` arriving, which is exactly the failure it was
+/// written for, and it still could not tell a form what `enemy_in` *takes*: the
+/// domain a `when` field served was fourteen bare type names.
+///
+/// Additive, like `stances` and `selectors` before it: a document rendered beside
+/// an older `catalog.json` simply has no predicate schemas to serve.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogPredicate {
+    /// The `"type"` value a `when` object carries.
+    pub id: &'static str,
+    /// In the order the arm declares them. Empty for the four that take nothing.
+    pub fields: Vec<CatalogPredicateField>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct Catalog {
     pub units: Vec<CatalogUnit>,
@@ -1984,6 +2026,68 @@ pub struct Catalog {
     pub stances: Vec<CatalogStance>,
     /// The selector phrases, by channel.
     pub selectors: CatalogSelectors,
+    /// The `when` vocabulary — every predicate `trigger_set` and a plan step's
+    /// `advance` accept, with the fields each arm carries. In the order
+    /// [`TriggerWhen`] declares them, which is the order
+    /// tools/COMMANDER_BRIEF.md's table lists them in.
+    pub predicates: Vec<CatalogPredicate>,
+}
+
+/// The `when` schema, as one table.
+///
+/// Hand-written and deliberately so: `TriggerWhen`'s arms are the vocabulary,
+/// and a derive would export serde's idea of them (`Option<String>`, `f32`)
+/// rather than the DOMAIN words a form needs to serve a legal value. What keeps
+/// it honest is `the_exported_predicate_schema_is_a_command_the_engine_accepts`,
+/// which builds a `when` object out of every row here and parses it back into a
+/// `TriggerWhen` — a field named wrong, typed wrong, or marked required when it
+/// is not fails there.
+fn catalog_predicates() -> Vec<CatalogPredicate> {
+    /// A required field.
+    fn req(name: &'static str, kind: &'static str) -> CatalogPredicateField {
+        CatalogPredicateField { name, kind, required: true, default: None }
+    }
+    /// An optional field whose absence asks the wider question.
+    fn opt(name: &'static str, kind: &'static str) -> CatalogPredicateField {
+        CatalogPredicateField { name, kind, required: false, default: None }
+    }
+    /// An optional field the engine fills in.
+    fn dflt(name: &'static str, kind: &'static str, value: u32) -> CatalogPredicateField {
+        CatalogPredicateField { name, kind, required: false, default: Some(value) }
+    }
+    let p = |id, fields: Vec<CatalogPredicateField>| CatalogPredicate { id, fields };
+    vec![
+        p("base_under_attack", vec![]),
+        p("hero_below", vec![req("frac", "fraction")]),
+        p("hero_above", vec![req("frac", "fraction")]),
+        p("squad_below", vec![req("id", "squad"), req("frac", "fraction")]),
+        p(
+            "enemy_sighted",
+            vec![opt("class", "class"), dflt("count", "integer", 1)],
+        ),
+        p(
+            "enemy_in",
+            vec![
+                req("region", "place"),
+                opt("class", "class"),
+                dflt("count", "integer", 1),
+            ],
+        ),
+        p(
+            "enemy_army_seen",
+            vec![dflt("size", "integer", 1), opt("within_s", "seconds")],
+        ),
+        p("enemy_hero_down", vec![opt("class", "hero_class")]),
+        p("bounty_spawned", vec![]),
+        p("mine_dry", vec![]),
+        p("supply_capped", vec![]),
+        p("tier_reached", vec![req("tier", "integer")]),
+        p(
+            "unit_count",
+            vec![req("kind", "unit_kind"), req("count", "integer")],
+        ),
+        p("game_time", vec![req("at", "seconds")]),
+    ]
 }
 
 /// Assemble the full content catalog from the stat/requirement tables.
@@ -2204,6 +2308,7 @@ pub fn game_catalog() -> Catalog {
             sites: SELECTOR_SITE_NAMES.split(", ").collect(),
             buildings: SELECTOR_BUILDING_NAMES.split(", ").collect(),
         },
+        predicates: catalog_predicates(),
     }
 }
 
@@ -12844,6 +12949,66 @@ mod determinism_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The exported `when` schema has to be a command the engine accepts.**
+    ///
+    /// `catalog.predicates` is hand-written — a derive would export serde's idea
+    /// of the arms (`Option<String>`, `f32`) rather than the domain words a form
+    /// needs to serve a legal value — so something has to stop it drifting from
+    /// the enum it describes. This is that something: every row is assembled
+    /// into a `when` object out of its own field names and types and parsed back
+    /// through the real `TriggerWhen` deserializer. A field named wrong, typed
+    /// wrong, or marked required when it is optional fails here.
+    ///
+    /// It also pins the two halves of `required`: the required fields alone must
+    /// parse (so nothing optional is secretly load-bearing), and every field
+    /// together must parse (so no name is invented).
+    #[test]
+    fn the_exported_predicate_schema_is_a_command_the_engine_accepts() {
+        /// A plausible value for one of the domain words the table uses. These
+        /// are the words, and an unknown one is a typo the `panic` catches.
+        fn value(kind: &str) -> serde_json::Value {
+            match kind {
+                "fraction" => serde_json::json!(0.5),
+                "integer" | "squad" => serde_json::json!(2),
+                "seconds" => serde_json::json!(30.0),
+                "place" => serde_json::json!("north-pass"),
+                "class" => serde_json::json!("Siege"),
+                "hero_class" => serde_json::json!("Hero"),
+                "unit_kind" => serde_json::json!("Footman"),
+                other => panic!("catalog_predicates uses an unknown domain word '{other}'"),
+            }
+        }
+        let rows = catalog_predicates();
+        assert_eq!(rows.len(), 14, "the count the brief's heading also states");
+        for row in &rows {
+            for all in [false, true] {
+                let mut when = serde_json::Map::new();
+                when.insert("type".to_string(), serde_json::json!(row.id));
+                for f in &row.fields {
+                    if all || f.required {
+                        when.insert(f.name.to_string(), value(f.kind));
+                    }
+                }
+                let json = serde_json::Value::Object(when);
+                let parsed = serde_json::from_value::<TriggerWhen>(json.clone());
+                assert!(
+                    parsed.is_ok(),
+                    "catalog says {} takes {:?}, and the wire disagrees: {json} -> {:?}",
+                    row.id,
+                    row.fields.iter().map(|f| f.name).collect::<Vec<_>>(),
+                    parsed.err()
+                );
+            }
+        }
+        // And the defaults are the engine's actual defaults, not a hopeful
+        // annotation: omit the key and the parsed value must be the one exported.
+        let count: TriggerWhen = serde_json::from_value(
+            serde_json::json!({"type": "enemy_in", "region": "north-pass"}),
+        )
+        .expect("enemy_in parses with only its required field");
+        assert!(matches!(count, TriggerWhen::EnemyIn { count: 1, .. }));
+    }
 
     /// Every rung of the chain of command renders to one compact line, and
     /// those lines are the literal contract: the bridge snapshot's

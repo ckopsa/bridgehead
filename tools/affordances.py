@@ -80,7 +80,14 @@ from bridge_view import dist, load_catalog  # noqa: E402
 #: the `recipe:steady-production` rule) once the building selector family made
 #: `train` sayable without an entity id. The document's SHAPE did not move, so
 #: the major half did not either.
-DOC_VERSION = "affordance-doc/1.1"
+#: `1.2` — the `when` field serves the real predicate schema out of
+#: `catalog.predicates` (`enemy_in(region, [class], [count=1])`) instead of
+#: fourteen bare type names, and the rally/template/cancel forms arrived beside
+#: the `train` ones. Both are capability changes for a small commander — a model
+#: that no longer has to leave the document to find out what an arm takes writes
+#: different commands — so the ledger has to be able to tell the two scaffolds
+#: apart.
+DOC_VERSION = "affordance-doc/1.2"
 
 # ---------------------------------------------------------------------------
 # Engine constants this view mirrors
@@ -144,32 +151,6 @@ SELECTOR_FALLBACK = {
     "buildings": ["my <building>", "idle <building>", "my hall"],
 }
 
-#: Every `when` predicate, as `trigger_set` / `plan_set` accept them, in the
-#: order tools/COMMANDER_BRIEF.md's table lists them.
-#:
-#: Not in the catalog (a `TriggerWhen` is a tagged enum with per-arm fields, and
-#: exporting its schema is a bead of its own), so this list is a copy — and
-#: `tools/test_affordances.py` reads the table out of the brief and asserts the
-#: two agree, so the copy cannot rot quietly. It has already earned that:
-#: `hero_above` arrived with stance chains (0uu.6) and the test caught its
-#: absence here in the merge.
-TRIGGER_PREDICATES = [
-    "base_under_attack",
-    "hero_below",
-    "hero_above",
-    "squad_below",
-    "enemy_sighted",
-    "enemy_in",
-    "enemy_army_seen",
-    "enemy_hero_down",
-    "bounty_spawned",
-    "mine_dry",
-    "supply_capped",
-    "tier_reached",
-    "unit_count",
-    "game_time",
-]
-
 _COORDS = re.compile(r"\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)")
 _SQUAD_IN_TEXT = re.compile(r"squad (\d+)")
 
@@ -178,6 +159,39 @@ def stance_table(catalog):
     """The five stance words with their numbers."""
     rows = (catalog or {}).get("stances")
     return list(rows) if rows else list(STANCE_FALLBACK)
+
+
+def predicate_schemas(catalog):
+    """Every `when` predicate with the fields its arm carries.
+
+    Served straight from `catalog.predicates`, which the engine publishes from
+    `shared::catalog_predicates()`. There is deliberately NO fallback list here,
+    unlike `STANCE_FALLBACK` and `SELECTOR_FALLBACK`: this module used to keep a
+    hand copy of the fourteen names, kept honest only by a test that parsed the
+    table out of tools/COMMANDER_BRIEF.md, and a second copy of a vocabulary is
+    the thing the catalog exists to delete. Rendered beside a catalog written
+    before `predicates` landed, the `when` field simply serves no domain — which
+    is the honest answer ("this document does not know") rather than a
+    fourteen-name guess that could be a predicate short.
+    """
+    return list((catalog or {}).get("predicates") or [])
+
+
+def predicate_signature(row):
+    """One predicate as a form domain reads it: `enemy_in(region, [class], [count=1])`.
+
+    Square brackets are optional keys and `=` is the value the engine fills in,
+    which is the whole reason the schema was worth exporting: the domain used to
+    be fourteen bare type names and a commander had to go read the brief to find
+    out that `enemy_in` wants a place at all.
+    """
+    parts = []
+    for f in row.get("fields") or []:
+        name = f.get("name", "?")
+        if f.get("default") is not None:
+            name = "{}={}".format(name, f["default"])
+        parts.append(name if f.get("required") else "[{}]".format(name))
+    return "{}({})".format(row.get("id", "?"), ", ".join(parts))
 
 
 def selector_vocabulary(catalog):
@@ -653,7 +667,11 @@ def slots_line(used, cap, noun):
 
 def trigger_forms(state, catalog):
     triggers = list(state.get("triggers") or [])
-    predicates = ["{}".format(p) for p in TRIGGER_PREDICATES]
+    schemas = predicate_schemas(catalog)
+    #: `enemy_in(region, [class], [count=1])`, not `enemy_in` — the domain now
+    #: says what each arm TAKES, which is what a form is for. Empty (and so
+    #: absent from the field) beside a catalog written before `predicates`.
+    predicates = [predicate_signature(p) for p in schemas] or None
     slots = slots_line(len(triggers), MAX_TRIGGERS, "trigger names")
     room = len(triggers) < MAX_TRIGGERS
     out = [
@@ -665,8 +683,10 @@ def trigger_forms(state, catalog):
                 field("name", "string", "a fresh name creates; an existing one replaces that "
                                         "rule in place, free.",
                       domain=[t.get("name") for t in triggers] or None),
-                field("when", "predicate", "one of the thirteen predicates; see "
-                                           "tools/COMMANDER_BRIEF.md for each one's fields.",
+                field("when", "predicate",
+                      "a `{\"type\":\"<id>\", ...}` object. The domain lists every arm with "
+                      "its fields — `[square]` is optional, `=` is the value the engine "
+                      "fills in. tools/COMMANDER_BRIEF.md says what each one MEANS.",
                       domain=predicates),
                 field("then", "intent", "any intent. Prefer a `stance`/`posture` on a SQUAD, or a "
                                         "`\"select\"` phrase over a list of unit ids — a frozen "
