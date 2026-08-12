@@ -1220,7 +1220,7 @@ mod tests {
             .push(TriggerRule {
                 name: TriggerName::new("home-guard").unwrap(),
                 when: TriggerWhen::BaseUnderAttack,
-                then: Intent::Stop { units: vec![] },
+                then: Intent::Stop { units: vec![], select: None },
                 repeat: Some(30.0),
                 source: IntentSource::Bridge,
                 armed: true,
