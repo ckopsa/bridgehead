@@ -1446,6 +1446,21 @@ fn compile_intent(
                     return;
                 }
             };
+            // A mined-out gold mine stays on the board as geography (economy.rs:
+            // `mine_dry`, the income alarm and `mines[].remaining` all need a dry
+            // mine they can look at), so its id still resolves. Say so here
+            // rather than let it through: `harvest_loop` would silently
+            // re-target the crew to the nearest live node, and a worker doing
+            // something you did not ask for is worse than a refusal that names
+            // the way to ask for it.
+            if nodes.get(node).is_ok_and(|(_, n, _)| n.remaining == 0) {
+                errors.push(format!(
+                    "{tag}: resource node {target} is empty — use target_select \
+                     \"nearest mine\" (or \"nearest tree\") for the closest one \
+                     with anything left in it"
+                ));
+                return;
+            }
             // `reached` is recomputed rather than inherited from `own_units`:
             // every survivor can still be skipped here for not being a worker,
             // and a `harvest` that ordered nobody is a refusal, not a partial.
@@ -7946,6 +7961,37 @@ mod tests {
             errors[0].contains("no mine left on the map"),
             "{}",
             errors[0]
+        );
+    }
+
+    /// **A dry mine is a place, not a job.** economy.rs keeps a mined-out gold
+    /// mine on the board — `mine_dry`, the income alarm and `mines[].remaining`
+    /// all need a dry mine they can look at, and blue-r23's expand trigger never
+    /// fired because the node was despawned in the same statement that emptied
+    /// it. The cost of keeping it is that its id still resolves, so `harvest`
+    /// owes the commander a refusal that names the way to ask again: without one
+    /// the harvest loop would silently re-aim the crew at a node nobody named.
+    #[test]
+    fn harvesting_a_dry_mine_is_refused_and_names_the_selector() {
+        let mut app = compiler_app();
+        let worker = spawn_worker(&mut app, Team::Human, Vec3::ZERO);
+        let dry = spawn_node(&mut app, ResourceKind::Gold, Vec3::new(5.0, 0.0, 0.0), 0);
+        app.world_mut().send_event(from_the_wire(
+            Team::Human,
+            &format!(
+                r#"{{"type":"harvest","units":[{}],"target":{}}}"#,
+                worker.to_bits(),
+                dry.to_bits()
+            ),
+        ));
+        app.update();
+        let errors = drain_errors(&mut app, Team::Human);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("is empty"), "{}", errors[0]);
+        assert!(errors[0].contains("nearest mine"), "{}", errors[0]);
+        assert!(
+            matches!(order_of(&app, worker), Order::Idle),
+            "a refused harvest orders nobody"
         );
     }
 
