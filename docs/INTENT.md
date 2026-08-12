@@ -1583,7 +1583,7 @@ pay. Nothing about triggers needed to learn any of that.
 
 ### The predicates, exactly
 
-Thirteen, and the constraint that produced the list is worth stating: **every one is
+Fourteen, and the constraint that produced the list is worth stating: **every one is
 answerable from state the frame already has, for the arming team, with no new
 bookkeeping.** No event subscriptions, no history, no memo. A predicate that
 needed its own record-keeping would be a predicate whose truth could drift from
@@ -1594,6 +1594,7 @@ what fired it.
 |---|---|
 | `base_under_attack` | Any of **your buildings** has a `LastDamaged` inside `BASE_ATTACK_WINDOW_S` (8s). Buildings only — a skirmish in midfield is not the base being attacked. Half-built ones count: losing an expansion under construction is exactly this raid. |
 | `hero_below {frac}` | **Any** of your living heroes is under `frac` of max health. Any, not "the" — hero slots climb the hall ladder, and the useful reading of "save my hero" is "whichever one is dying". |
+| `hero_above {frac}` | **Every** living hero of yours is at or above `frac` of max health, and you have at least one. The wait-condition of a chain — "turtle until the hero is healed" — and deliberately **not** `not hero_below`, which this vocabulary could not spell anyway (no `and`, no `or`, no `not`; see *What this leaves open*). Two departures earn it its own name: a **dead** hero is not a healed hero, so an empty roster is false rather than vacuously true, and a chain waiting on it never advances at the instant the hero falls; and it asks about **all** of them rather than any, so a fresh second hero cannot release a wait that the first one is still crawling home from. With at least one hero alive the two predicates are exact complements; with none alive both are false, which is the honest answer to both questions. |
 | `squad_below {id, frac}` | Squad `id`'s living members hold, **pooled**, less than `frac` of their combined max HP. Pooled because a squad is a formation: one wounded footman in a healthy line is not a squad in trouble. **False for a squad with no living members** — a squad that is gone cannot be hurt, and firing a rescue at a corpse pile is worse than firing nothing. |
 | `enemy_sighted {class?, count}` | You can **see** at least `count` enemy units right now, optionally of one `TargetClass`. Fog-honest: counted against your own `FogGrid::sees`. Remembered buildings do **not** count — remembering where a barracks stood is not the news that an army came out of it. |
 | `bounty_spawned` | A neutral cache exists **and you can see it**. The same `fog.sees` filter the snapshot's `bounties` array uses, so the rule sees exactly the caches its owner is shown. |
@@ -1874,7 +1875,7 @@ middle one is the seam that matters:
 | `advance` | means |
 |---|---|
 | omitted / `{"type":"on_applied"}` | as soon as this step is **accepted**. The plain meaning of "then". |
-| `{"type":"when","when":{…}}` | when a **`TriggerWhen` predicate** holds — the *same* predicates triggers use (thirteen of them as of the supply bead, and whatever the next one adds), level-triggered, evaluated by the same function at the same 4 Hz. |
+| `{"type":"when","when":{…}}` | when a **`TriggerWhen` predicate** holds — the *same* predicates triggers use (fourteen of them as of the chain bead, and whatever the next one adds), level-triggered, evaluated by the same function at the same 4 Hz. |
 | `{"type":"after","secs":30}` | 30 seconds after this step was accepted. |
 
 *Accepted*, not *completed*: the engine does not wait for the barracks to
@@ -1932,6 +1933,52 @@ plan block on the most ordinary event in the game — a squad member dying betwe
 `plan_set` and the step — and then halt a sequence that was running correctly.
 The compiler therefore reports whether it *reached* anything, and only a step
 that reached nothing blocks. The error still goes to every other channel.
+
+### Chains: a plan whose steps are stances
+
+*`wc3clone-0uu.6`, and the shortest bead in this document, because the answer
+was "you can already say that".*
+
+docs/AFFORDANCES.md asks for a way to write *"turtle until the hero is healed,
+then secure the northwest mine"* — steps that are stance transitions with
+wait-conditions, the **pre-armed policy** tier that moves a commit/withdraw
+decision from fire time to arm time. That is a `plan_set` whose steps are
+`stance` intents and whose `advance` conditions are predicates, and every part
+of it already existed: a `PlanStep` carries any `Intent`, `stance` is an
+`Intent`, and `PlanAdvance::When` carries a whole `TriggerWhen`. So there is no
+`stance_plan` verb. A second spelling of a sentence the language already has is
+the second implementation this project keeps refusing to write, and it would
+have needed its own cap, its own snapshot array and its own failure semantics
+to say what two words of documentation say instead.
+
+What the bead added was the one word the wait was missing (`hero_above`, above)
+and one rule about *legibility*:
+
+**Per-step readiness is reported at arm time, and reports nothing else.** A
+chain is written precisely when its target is not knowable yet — the expansion
+you have not scouted, the anchor you have not named — so refusing a plan whose
+step names unresolvable ground would refuse the sentences the feature exists
+for. Instead `plan_set` **dry-runs `resolve_places`** over each step's intent
+against the world as it stands and, for each one that cannot resolve *yet*, adds
+
+    chain holds at step 2: no region named 'their-expansion' - known places: … —
+    plan hold is armed anyway; the step resolves when its turn comes, and blocks
+    there if it still cannot
+
+to the setter's error channel. The plan is armed either way; nothing returns.
+Three properties are load-bearing:
+
+* **It is the same resolver, so it cannot disagree with fire time.** The reason
+  printed at arm time is character-for-character the reason the step would block
+  with. A second "is this resolvable?" predicate would be a second opinion about
+  the first one, and the two would drift.
+* **It is an edge, not a level.** One line, at the moment of arming, about a
+  step's readiness *then*. The continuous rendering of "this step cannot run" is
+  what `plans[].status` already does, once the step is the current one.
+* **It teaches without gating** (§ Legibility, and the compiler/payer split):
+  the message names the fix — `region_set`, or the menu of places this seat can
+  already speak — and the *step* remains the thing that decides, when its turn
+  comes, whether the sentence is true.
 
 ### Transitions are announced; states are displayed
 
