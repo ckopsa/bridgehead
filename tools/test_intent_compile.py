@@ -660,6 +660,47 @@ def test_the_catalog_is_what_says_which_building_trains_what():
     assert sorcerer["building"] == 4294968207
 
 
+def test_a_trains_producer_is_a_role_when_the_clause_is_the_action_of_a_rule():
+    """The r23-class win. A `train` sent NOW may name the barracks it found; a
+    `train` armed as a rule may not, because that barracks can be rubble by the
+    time the rule fires. Same rule `build` already follows for its worker."""
+    s = snap(CATALOG)
+    trig = only(compile_one("whenever my base is attacked, train a footman", s),
+                "trigger_set")
+    then = trig["then"]
+    assert then["type"] == "train"
+    assert then["select"] == "idle Barracks", "one unit wants a FREE producer"
+    assert "building" not in then, "no frozen id in a rule that fires later"
+
+    # Several units cannot all want an idle producer: the second would find the
+    # one the first just filled, and refuse for a reason nobody meant.
+    plan = only(compile_one("build a barracks, then train 3 footmen", s), "plan_set")
+    trains = [st["intent"] for st in plan["steps"] if st["intent"]["type"] == "train"]
+    assert len(trains) == 3
+    assert all(t["select"] == "my Barracks" and "building" not in t for t in trains)
+
+
+def test_a_hall_producer_is_named_by_the_ladder_and_not_by_its_rung():
+    """The hall UPGRADES in place. A rule that said `my town hall` would stop
+    matching the instant it became a Keep, which is the author-time-fact bug
+    selectors exist to delete."""
+    s = snap(CATALOG)
+    trig = only(compile_one("whenever my base is attacked, train a worker", s),
+                "trigger_set")
+    assert trig["then"]["select"] == "idle hall"
+    assert ic.producer_phrase("Worker", s, idle=False) == "my hall"
+    assert ic.producer_phrase("Footman", s, idle=True) == "idle Barracks"
+    assert ic.producer_phrase("Nonesuch", s, idle=True) is None
+
+
+def test_an_ordinary_train_still_names_the_building_it_found():
+    """The immediate form is unchanged: an id sent now is an id that is alive
+    now, and spreading across producers by queue depth is a real optimisation a
+    single selector cannot express."""
+    result = compile_one("train 2 footmen")
+    assert all("building" in i and "select" not in i for i in result.intents)
+
+
 def test_without_a_catalog_the_tool_still_works_offline():
     """A seat always ships catalog.json next to state.json, so the catalog path
     is the real one — but the tool must still compile against a bare snapshot

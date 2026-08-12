@@ -76,7 +76,11 @@ from bridge_view import dist, load_catalog  # noqa: E402
 #: changed template) and the major half when the document's shape does. A
 #: renumbered scaffold and an unchanged one must never be confusable in the
 #: ledger, which is the whole point of the field.
-DOC_VERSION = "affordance-doc/1"
+#: `1.1` — the action SET grew a production section (`train:<kind>` forms and
+#: the `recipe:steady-production` rule) once the building selector family made
+#: `train` sayable without an entity id. The document's SHAPE did not move, so
+#: the major half did not either.
+DOC_VERSION = "affordance-doc/1.1"
 
 # ---------------------------------------------------------------------------
 # Engine constants this view mirrors
@@ -137,6 +141,7 @@ SELECTOR_FALLBACK = {
     "units": ["my hero", "all army", "all units", "workers", "squad <n>"],
     "nodes": ["nearest tree", "nearest mine"],
     "sites": ["nearest legal site"],
+    "buildings": ["my <building>", "idle <building>", "my hall"],
 }
 
 #: Every `when` predicate, as `trigger_set` / `plan_set` accept them, in the
@@ -176,7 +181,12 @@ def stance_table(catalog):
 
 
 def selector_vocabulary(catalog):
-    """The selector phrases, by channel."""
+    """The selector phrases, by channel.
+
+    Per-key fallback, not all-or-nothing: `catalog.selectors.buildings` arrived
+    after the other three, so a document rendered beside a catalog written
+    before it still serves the building phrases the engine has since learned.
+    """
     sel = (catalog or {}).get("selectors")
     if not sel:
         return dict(SELECTOR_FALLBACK)
@@ -905,6 +915,146 @@ def build_form(state, catalog):
 
 
 # ---------------------------------------------------------------------------
+# Production — the one thing a small commander does every cycle
+#
+# `train` used to be unreachable from this document for one reason: it took a
+# building ENTITY ID and no selector channel covered buildings, so the verb a
+# commander sends more often than any other was the one verb it had to
+# hand-write with a number read out of `buildings[]`. The building selector
+# family (`"select":"idle barracks"`) closes that, and this section is what it
+# was for.
+#
+# One form per producer KIND the seat actually owns, on exactly the pattern
+# `build_form` set: the judgment-shaped hole is `unit`, and its domain carries
+# the price and the availability of every row so a refusal that would have cost
+# a poll cycle arrives with the menu instead. The `select` default is
+# `idle <kind>` because "a producer with nothing queued" is a fact about the
+# phrase, never a claim about what to build.
+# ---------------------------------------------------------------------------
+
+
+def own_buildings(state):
+    """This seat's own buildings. Never the enemy's — the fog-legality rule in
+    this module's docstring is kept by not asking, not by filtering later."""
+    me = state.get("my_team")
+    return [b for b in state.get("buildings") or [] if not me or b.get("team") == me]
+
+
+def producer_kinds(state, catalog):
+    """`[(kind, finished, idle, trains)]` for every producer kind this seat has
+    standing, in the catalog's own order.
+
+    Finished only, because an unfinished Barracks trains nothing and a form
+    offering one is a menu row that refuses. `idle` is the count with an empty
+    queue — the number that decides whether `idle <kind>` resolves, so the
+    reason line can state it rather than let the commander discover it.
+    """
+    mine = [b for b in own_buildings(state) if b.get("done")]
+    rows = []
+    for b in (catalog or {}).get("buildings") or []:
+        kid, trains = b.get("id"), b.get("trains") or []
+        if not kid or not trains:
+            continue
+        held = [x for x in mine if x.get("kind") == kid]
+        if not held:
+            continue
+        idle = [x for x in held if not (x.get("queue") or [])]
+        rows.append((kid, len(held), len(idle), list(trains)))
+    return rows
+
+
+def unit_domain(state, catalog, trains):
+    """The `unit` field's domain: every unit this producer makes, priced, with
+    this seat's OWN tech and OWN bank against it.
+
+    The same three annotations `build_form`'s `kind` domain carries, from the
+    same two sources (`catalog.units` for the price, `unlocked` for the gate),
+    so the two production verbs read alike.
+    """
+    unlocked = state.get("unlocked") or {}
+    me = state.get("me") or {}
+    by_id = {u.get("id"): u for u in (catalog or {}).get("units") or []}
+    # A hero's price is a MATCH FACT and not a catalog one: the first hero a
+    # team fields is free and every one after it is not, so the catalog row is
+    # the wrong number for exactly the decision being made. `me.hero_costs` is
+    # what the engine will actually charge (bridge.rs `hero_costs`), per class.
+    hero_costs = {h.get("kind"): h for h in me.get("hero_costs") or []}
+    slots, used = me.get("hero_slots"), me.get("hero_slots_used")
+    rows = []
+    for uid in trains:
+        u = by_id.get(uid) or {}
+        g, l = u.get("cost_gold"), u.get("cost_lumber")
+        hero = hero_costs.get(uid)
+        if hero:
+            g, l = hero.get("gold", g), hero.get("lumber", l)
+        if g is None:
+            rows.append("{} — price not in this catalog".format(uid))
+            continue
+        ok, price, short = affordable(state, g, l or 0)
+        supply = " {}supply".format(u["supply"]) if u.get("supply") else ""
+        # Hero slots are a separate gate from tech and from money, and the one a
+        # commander forgets: with the slot full the queue refuses whatever the
+        # bank says. Stating both halves is the readiness rule, not advice.
+        if hero and slots is not None and used is not None and used >= slots:
+            rows.append(
+                "{} — {}{} — NOT AVAILABLE: hero slots full ({}/{}); upgrade a hall".format(
+                    uid, price, supply, used, slots
+                )
+            )
+        elif unlocked.get(uid) is False:
+            rows.append("{} — {}{} — NOT AVAILABLE at your tech".format(uid, price, supply))
+        elif not ok:
+            rows.append("{} — {}{} — cannot afford ({})".format(uid, price, supply, short))
+        else:
+            rows.append("{} — {}{} — available".format(uid, price, supply))
+    return rows
+
+
+def production_forms(state, catalog):
+    """`train`, written as a role — one form per producer kind the seat holds."""
+    me = state.get("me") or {}
+    domain = selector_vocabulary(catalog)["buildings"]
+    out = []
+    for kind, held, idle, trains in producer_kinds(state, catalog):
+        # `idle <kind>` when one is free, `my <kind>` when none is: a default
+        # that would refuse if sent as written is not a default, it is a trap.
+        # Both are facts about the seat's own buildings, so neither is advice.
+        phrase = "idle {}".format(kind) if idle else "my {}".format(kind)
+        supply = "{}/{} supply".format(me.get("supply_used", 0), me.get("supply_cap", 0))
+        out.append(
+            form(
+                "train:{}".format(kind),
+                "train at your {} — no building id, the role resolves when it runs".format(kind),
+                {"type": "train", "select": phrase, "unit": None},
+                [
+                    field(
+                        "select",
+                        "selector",
+                        "which producer. `idle {k}` takes one with an empty queue and refuses "
+                        "in words if they are all busy; `my {k}` takes the lowest-id one and "
+                        "queues behind whatever it is doing.".format(k=kind),
+                        domain=domain,
+                        default=phrase,
+                    ),
+                    field(
+                        "unit",
+                        "kind",
+                        "what to queue. Availability is your OWN tech, read off `unlocked`.",
+                        domain=unit_domain(state, catalog, trains) or None,
+                    ),
+                ],
+                reason="{} finished {}, {} idle; you hold {}g/{}l at {}".format(
+                    held, kind, idle, me.get("gold", 0), me.get("lumber", 0), supply
+                ),
+                note="the same phrase is legal in a trigger's or a plan step's `then`, and it "
+                     "resolves when the rule FIRES — which is how a repeating `train` rule "
+                     "survives the building it names being razed and rebuilt.",
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # The recipes, as served forms
 #
 # tools/COMMANDER_BRIEF.md's recipes were JSON blocks with `<hero id>` and
@@ -922,6 +1072,7 @@ def recipe_forms(state, catalog):
     places = place_domain(state)
     squads = [str(sq.get("id")) for sq in state.get("squads") or [] if sq.get("id") is not None]
     unlocked = state.get("unlocked") or {}
+    producers = producer_kinds(state, catalog)
     hall = next(
         (
             b
@@ -1016,6 +1167,48 @@ def recipe_forms(state, catalog):
                    "spend that window once.",
         ),
     ]
+    # STEADY PRODUCTION — the r23 win the building selector was for. Both
+    # commanders spent a poll cycle per unit re-reading a barracks id out of
+    # `buildings[]`; this is that whole loop as one armed rule, and it survives
+    # the barracks dying because it names a role and not an id.
+    steady_select = (
+        "idle {}".format(producers[0][0]) if producers else None
+    )
+    out.append(
+        form(
+            "recipe:steady-production",
+            "STEADY PRODUCTION — keep a producer working without spending a poll on it",
+            {
+                "type": "trigger_set",
+                "name": "steady-production",
+                "repeat": 20,
+                "when": {"type": "unit_count", "kind": None, "below": None},
+                "then": {"type": "train", "select": steady_select, "unit": None},
+            },
+            [
+                field("when.kind", "kind", "which unit to keep topped up.",
+                      domain=[k for _, _, _, trains in producers for k in trains] or None),
+                field("when.below", "integer", "the headcount that re-arms it.", rng=(1, 200)),
+                field(
+                    "then.select",
+                    "selector",
+                    "which producer answers. `idle <kind>` picks one with an empty queue at "
+                    "FIRE time, so the rule cannot stack six deep on one building.",
+                    domain=selector_vocabulary(catalog)["buildings"],
+                    default=steady_select,
+                ),
+                field("then.unit", "kind", "what it queues.",
+                      domain=[k for _, _, _, trains in producers for k in trains] or None),
+            ],
+            reason="repeating on a 20s cooldown, because production is a level and not an "
+                   "event. The gold is charged when it fires, never at arm time — and if the "
+                   "bank is short the fire is refused in words and the rule stays armed.",
+            note="`then.unit` and `when.kind` are usually the same word; they do not have to be."
+                 if producers else
+                 "you hold no finished producer yet, so `then.select` has no fact-shaped "
+                 "default — name one from the domain.",
+        )
+    )
     return out
 
 
@@ -1193,6 +1386,7 @@ def document(state, catalog=None, prefs=None):
     actions += region_forms(state)
     actions += plan_forms(state)
     actions.append(build_form(state, catalog))
+    actions += production_forms(state, catalog)
     actions += recipe_forms(state, catalog)
 
     alarms = alarm_entries(state, actions)

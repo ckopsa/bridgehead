@@ -122,7 +122,9 @@ def test_the_document_has_the_five_top_level_sections():
 def test_the_document_carries_its_own_version():
     """AFFORDANCES.md constraint 3: the scaffold's version travels with the
     result, or the ledger cannot tell model from model+scaffold."""
-    assert affordances.DOC_VERSION == "affordance-doc/1"
+    # `1.1`: the production forms joined the action set (building selectors).
+    # The major half is the document's SHAPE and has not moved.
+    assert affordances.DOC_VERSION == "affordance-doc/1.1"
     assert doc()["doc_version"] == affordances.DOC_VERSION
     assert run("--doc-version").strip() == affordances.DOC_VERSION
     assert subprocess.run(
@@ -323,6 +325,86 @@ def test_a_kind_domain_serves_this_seats_own_roster_and_its_own_tech():
     blacksmith = next(r for r in kinds["domain"] if r.startswith("Blacksmith"))
     assert "NOT AVAILABLE: requires Keep" in blacksmith
     assert "140g/80l" in blacksmith, "the price is a fact and rides along with the refusal"
+
+
+def test_production_is_reachable_without_an_entity_id():
+    """The gap 3ji closed. `train` took a building id and no selector channel
+    covered buildings, so the verb a commander sends every cycle was the one it
+    had to hand-write from `buildings[]`. One form per producer kind now, and
+    the producer is a ROLE."""
+    d = doc(ARMED)
+    rels = [a["rel"] for a in d["actions"] if a["rel"].startswith("train:")]
+    assert "train:Barracks" in rels and "train:TownHall" in rels
+    assert not any(r == "train:Blacksmith" for r in rels), \
+        "a building that trains nothing is not a producer"
+    assert not any(r == "train:Sanctum" for r in rels), \
+        "only kinds this seat actually has standing"
+    hall = by_rel(d, "train:TownHall")
+    assert hall["template"] == {
+        "type": "train", "select": "idle TownHall", "unit": None,
+    }
+    assert "building" not in hall["template"], "no id, ever"
+
+
+def test_the_producer_default_is_a_phrase_that_would_not_refuse():
+    """`idle <kind>` when one is free and `my <kind>` when none is. A default
+    that refuses as written is not a default, it is a trap — and both readings
+    are facts about the seat's own buildings, so neither is advice.
+
+    Both halves off ONE fixture, whose barracks are all busy and whose halls are
+    all free, so the two branches are read from real match state."""
+    d = doc(ARMED)
+    assert by_rel(d, "train:Barracks")["template"]["select"] == "my Barracks"
+    assert ", 0 idle" in by_rel(d, "train:Barracks")["reason"]
+    assert by_rel(d, "train:TownHall")["template"]["select"] == "idle TownHall"
+    assert ", 2 idle" in by_rel(d, "train:TownHall")["reason"]
+
+    s = load(ARMED)
+    for b in s["buildings"]:
+        if b["team"] == s["my_team"] and b.get("kind") == "Barracks":
+            b["queue"] = []
+    freed = affordances.document(s, catalog())
+    assert by_rel(freed, "train:Barracks")["template"]["select"] == "idle Barracks"
+
+
+def test_the_unit_domain_prices_every_row_against_this_seats_own_bank():
+    """Same three annotations `build`'s `kind` domain carries, from the same two
+    sources — and the hero row prices off `me.hero_costs`, which is a match fact
+    the catalog cannot know."""
+    d = doc(ARMED)
+    hall = by_rel(d, "train:TownHall")
+    unit = next(f for f in hall["fields"] if f["path"] == "unit")
+    served = [row.split(" — ")[0] for row in unit["domain"]]
+    assert "Worker" in served and "Hero" in served
+    assert "Footman" not in served, "a hall does not train footmen"
+    hero = next(r for r in unit["domain"] if r.startswith("Hero"))
+    assert "400g/100l" in hero, "the live price, not the catalog's"
+    assert "hero slots full (1/1)" in hero, \
+        "the gate a commander forgets, stated with both halves"
+    assert unit["default"] is None, "what to build is the commander's call"
+
+
+def test_the_steady_production_recipe_names_a_role_and_not_a_barracks():
+    """The r23-class win: a repeating train rule that finds a live, idle
+    producer every time it fires instead of a barracks that may be rubble."""
+    d = doc(ARMED)
+    a = by_rel(d, "recipe:steady-production")
+    then = a["template"]["then"]
+    assert then["type"] == "train"
+    assert then["select"].startswith("idle ")
+    assert "building" not in then
+    assert a["template"]["repeat"] == 20, "production is a level, not an event"
+
+
+def test_a_seat_with_no_producers_still_gets_the_recipe():
+    """Degradation: the empty snapshot has no producer kind to default with, so
+    the field ships empty and the note says why rather than raising."""
+    d = affordances.document({}, catalog())
+    a = by_rel(d, "recipe:steady-production")
+    sel = next(f for f in a["fields"] if f["path"] == "then.select")
+    assert sel["default"] is None
+    assert "no finished producer" in a["note"]
+    assert not [x for x in d["actions"] if x["rel"].startswith("train:")]
 
 
 # -- forms: slot pressure, templates, defaults -------------------------------

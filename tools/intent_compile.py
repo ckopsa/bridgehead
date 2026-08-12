@@ -1711,6 +1711,29 @@ def _rally(m, ctx, clause):
              "x": round(pos[0], 1), "z": round(pos[1], 1)} for b in producers]
 
 
+def producer_phrase(unit_kind, snap, idle):
+    """The building selector that names a producer of `unit_kind`, or `None`.
+
+    A phrase, not an id, so it can ride in a rule that fires later — the whole
+    point of the building selector family. `my hall` when every producer of the
+    kind is a rung of the hall ladder, because the hall UPGRADES and a rule that
+    said `my town hall` would stop matching the moment it became a Keep.
+    """
+    kinds = [b for b, made in snap.trains.items() if unit_kind in made]
+    if not kinds:
+        return None
+    if all(k in HALL_KINDS for k in kinds):
+        word = "hall"
+    else:
+        # Prefer a kind the seat actually has standing, so the phrase resolves
+        # on the first firing rather than after the next building goes up. The
+        # fallback is the first producer in catalog order, which is a stable
+        # answer rather than a query-order one.
+        held = {b.get("kind") for b in snap.own_buildings() if b.get("done")}
+        word = next((k for k in kinds if k in held), kinds[0])
+    return ("idle " if idle else "my ") + word
+
+
 @rule("train", r"^(?:train|make|build|queue|add)\s+(?:(?P<n>\d+)\s+)?"
                r"(?:a\s+|an\s+|the\s+)?(?:more\s+)?(?P<unit>[a-z ]+?)s?$")
 def _train(m, ctx, clause):
@@ -1719,13 +1742,30 @@ def _train(m, ctx, clause):
     kind = UNIT_WORDS.get(name) or UNIT_WORDS.get(name + "s")
     if kind is None:
         return None  # not a unit: let the `build` rule have this clause
+    n = int(m.group("n") or 1)
+    if ctx.late_bound:
+        # The action of a rule, so the producer must be a ROLE. A barracks id
+        # frozen here is a barracks that may be rubble when the rule fires, and
+        # a repeating "train a footman" rule is the single most valuable thing
+        # to arm — r23's commanders spent a poll cycle per unit re-reading an id
+        # out of `buildings[]`.
+        #
+        # `idle` for ONE unit, because a rule that wants a free producer should
+        # say so and refuse in words when there is none. For several, `my`:
+        # every copy but the first would find the producer it just filled no
+        # longer idle, and refuse for a reason the commander did not mean.
+        phrase = producer_phrase(kind, snap, idle=(n == 1))
+        if phrase is None:
+            ctx.result.fail(clause, f"nothing in this catalog trains {kind}")
+            return []
+        ctx.result.ok(clause, f"train {n}x {kind} at '{phrase}', chosen when the rule fires")
+        return [{"type": "train", "select": phrase, "unit": kind} for _ in range(n)]
     trains = snap.trains
     producers = [b for b in snap.own_buildings()
                  if b.get("done") and kind in trains.get(b.get("kind"), [])]
     if not producers:
         ctx.result.fail(clause, f"no finished building of yours trains {kind}")
         return []
-    n = int(m.group("n") or 1)
     out = []
     # Spread across producers by current queue length: two barracks should
     # build in parallel, not queue seven deep behind one.
