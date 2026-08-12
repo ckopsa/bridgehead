@@ -788,7 +788,13 @@ def region_forms(state):
 
 def plan_forms(state):
     plans = [p for p in (state.get("plans") or [])]
-    live = [p for p in plans if str(p.get("status", "")).startswith(("running", "blocked"))]
+    #: `held` is the third live word (docs/INTENT.md, "Arm time and late
+    #: binding"): a plan whose current step waits on a place that is not named
+    #: yet is stopped, not finished, and it is still holding one of the two
+    #: slots. Reading it as dead would tell a commander it has room it does not
+    #: have — which is the one number this form exists to state.
+    live = [p for p in plans
+            if str(p.get("status", "")).startswith(("running", "blocked", "held"))]
     slots = slots_line(len(live), MAX_PLANS, "plan slots")
     room = len(live) < MAX_PLANS
     out = [
