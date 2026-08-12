@@ -1916,6 +1916,49 @@ pub struct CatalogItem {
     pub description: &'static str,
 }
 
+/// One stance word, with the bundle it installs.
+///
+/// The catalog half of [`StanceDef`]: same numbers, wire-shaped. Published
+/// because a *form* has to be able to state a field's domain, and the five
+/// words are a domain. Without this the affordance document
+/// (`tools/bridge_view.py --doc`) would have to carry its own copy of the
+/// vocabulary, which is a second source of truth for the one thing the fixed
+/// vocabulary exists to keep single.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogStance {
+    /// The word the `stance` command takes.
+    pub id: &'static str,
+    pub label: String,
+    pub description: String,
+    /// `"defend"`, `"push"` or `"forage"` — the posture this stance installs.
+    pub posture: &'static str,
+    /// Ring radius for a `defend` stance; `0` for the two that have no ring.
+    pub radius: f32,
+    /// Leash radius; `0` means no leash, which is a setting and not an omission.
+    pub leash: f32,
+    /// Retreat threshold as a fraction of max HP; `0` installs none.
+    pub retreat_below: f32,
+    /// Where the retreat falls back TO: `"anchor"` or `"base"`.
+    pub rally: &'static str,
+    /// Focus-fire classes, in order. Empty leaves acquisition alone.
+    pub priority: Vec<&'static str>,
+}
+
+/// The late-bound role vocabulary, split by where each phrase is legal.
+///
+/// Every list here is a split of the `SELECTOR_*_NAMES` consts, so the refusal
+/// a commander reads and the domain a form serves can never drift apart. See
+/// [`Selector`] and docs/INTENT.md § "The role channel".
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogSelectors {
+    /// Phrases legal in `"select"`, wherever a verb takes `units`.
+    pub units: Vec<&'static str>,
+    /// Phrases legal in `harvest`'s `"target_select"`.
+    pub nodes: Vec<&'static str>,
+    /// Phrases legal in `build`'s `"site"`.
+    pub sites: Vec<&'static str>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct Catalog {
     pub units: Vec<CatalogUnit>,
@@ -1928,6 +1971,10 @@ pub struct Catalog {
     /// The status-effect vocabulary: what a buff/debuff means and how it
     /// stacks, so a commander can reason about them without reading the source.
     pub statuses: Vec<CatalogStatus>,
+    /// The five stance words and what each one installs.
+    pub stances: Vec<CatalogStance>,
+    /// The selector phrases, by channel.
+    pub selectors: CatalogSelectors,
 }
 
 /// Assemble the full content catalog from the stat/requirement tables.
@@ -2116,6 +2163,37 @@ pub fn game_catalog() -> Catalog {
                 description: k.description(),
             })
             .collect(),
+        stances: ALL_STANCES
+            .iter()
+            .map(|&s| {
+                let d = s.def();
+                CatalogStance {
+                    id: s.word(),
+                    label: d.label.clone(),
+                    description: d.description.clone(),
+                    posture: match d.posture {
+                        StancePosture::Defend => "defend",
+                        StancePosture::Push => "push",
+                        StancePosture::Forage => "forage",
+                    },
+                    radius: d.radius,
+                    leash: d.leash,
+                    retreat_below: d.retreat_below,
+                    rally: match d.rally {
+                        StanceRally::Anchor => "anchor",
+                        StanceRally::Base => "base",
+                    },
+                    priority: d.priority.iter().map(|c| c.name()).collect(),
+                }
+            })
+            .collect(),
+        // Split off the consts rather than re-listed, so the domain a form
+        // serves and the refusal a bad phrase earns are the same words.
+        selectors: CatalogSelectors {
+            units: SELECTOR_UNIT_NAMES.split(", ").collect(),
+            nodes: SELECTOR_NODE_NAMES.split(", ").collect(),
+            sites: SELECTOR_SITE_NAMES.split(", ").collect(),
+        },
     }
 }
 
@@ -7892,6 +7970,10 @@ impl std::fmt::Display for Selector {
 pub const SELECTOR_UNIT_NAMES: &str = "my hero, all army, all units, workers, squad <n>";
 /// The node-naming half.
 pub const SELECTOR_NODE_NAMES: &str = "nearest tree, nearest mine";
+/// The site-naming half — `build`'s `"site"`, and nowhere else. Third const
+/// rather than a literal at the one call site so `Catalog::selectors` can serve
+/// all three channels as splits of the same words the refusals print.
+pub const SELECTOR_SITE_NAMES: &str = "nearest legal site";
 /// Everything a selector phrase may be. Printed by the unknown-phrase refusal,
 /// on the same rule as `Regions::unknown`: a refusal that names no alternative
 /// is a refusal to help.
@@ -12964,6 +13046,43 @@ mod tests {
         let slam = catalog.abilities.iter().find(|a| a.id == "Slam").unwrap();
         assert_eq!(slam.target, "caster");
         assert_eq!(slam.target_range, None, "a caster-centred row publishes no range");
+    }
+
+    /// The affordance document (`tools/bridge_view.py --doc`) serves a form's
+    /// field domains out of the catalog. Both vocabularies therefore have to be
+    /// IN the catalog, and have to agree with the refusals a bad value earns —
+    /// a domain list and an error message that disagree teach two languages.
+    #[test]
+    fn the_catalog_publishes_the_stance_and_selector_vocabularies() {
+        let catalog = game_catalog();
+
+        let words: Vec<&str> = catalog.stances.iter().map(|s| s.id).collect();
+        assert_eq!(words, vec!["turtle", "stage", "push", "secure", "harass"]);
+        assert_eq!(
+            words.join(", "),
+            stance_words(),
+            "the catalog's order is `ALL_STANCES`, which is what the refusal lists"
+        );
+        let push = catalog.stances.iter().find(|s| s.id == "push").unwrap();
+        assert_eq!(push.posture, "push");
+        assert_eq!(push.leash, 0.0, "a push that could be recalled is not a push");
+        assert_eq!(push.rally, "base");
+        assert!(push.priority.contains(&"Siege"));
+
+        // Every phrase served as a domain is a phrase the parser accepts —
+        // except `squad <n>`, which is a shape rather than a word.
+        let sel = &catalog.selectors;
+        for phrase in sel.units.iter().chain(&sel.nodes).chain(&sel.sites) {
+            if phrase.contains('<') {
+                assert_eq!(*phrase, "squad <n>");
+                assert!(parse_selector("squad 3").is_some());
+                continue;
+            }
+            assert!(parse_selector(phrase).is_some(), "catalog serves '{phrase}' but nothing parses it");
+        }
+        assert!(sel.units.contains(&"my hero") && sel.units.contains(&"all army"));
+        assert_eq!(sel.nodes, vec!["nearest tree", "nearest mine"]);
+        assert_eq!(sel.sites, vec!["nearest legal site"]);
     }
 
     /// A synthetic two-ability caster: the shape every content bead will use.
