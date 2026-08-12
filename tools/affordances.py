@@ -139,14 +139,19 @@ SELECTOR_FALLBACK = {
     "sites": ["nearest legal site"],
 }
 
-#: The thirteen `when` predicates, as `trigger_set`/`plan_set` accept them.
+#: Every `when` predicate, as `trigger_set` / `plan_set` accept them, in the
+#: order tools/COMMANDER_BRIEF.md's table lists them.
+#:
 #: Not in the catalog (a `TriggerWhen` is a tagged enum with per-arm fields, and
 #: exporting its schema is a bead of its own), so this list is a copy — and
-#: `tools/test_affordances.py` reads the table out of tools/COMMANDER_BRIEF.md
-#: and asserts the two agree, so the copy cannot rot quietly.
+#: `tools/test_affordances.py` reads the table out of the brief and asserts the
+#: two agree, so the copy cannot rot quietly. It has already earned that:
+#: `hero_above` arrived with stance chains (0uu.6) and the test caught its
+#: absence here in the merge.
 TRIGGER_PREDICATES = [
     "base_under_attack",
     "hero_below",
+    "hero_above",
     "squad_below",
     "enemy_sighted",
     "enemy_in",

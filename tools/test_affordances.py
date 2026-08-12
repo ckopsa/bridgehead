@@ -436,14 +436,27 @@ def test_a_form_that_spends_says_what_it_costs():
 
 
 def test_the_predicate_domain_matches_the_brief_a_commander_reads():
-    """The thirteen `when` predicates are not in the catalog, so this module
-    keeps a copy — and a copy that can rot quietly is worse than no copy. The
-    brief's own table is the referee."""
+    """The `when` predicates are not in the catalog, so this module keeps a
+    copy — and a copy that can rot quietly is worse than no copy. The brief's
+    own table is the referee.
+
+    The heading is matched loosely because it carries the count in words ("the
+    fourteen predicates") and that count is exactly the thing that moves: 0uu.6
+    added `hero_above` and this test is how the document found out.
+    """
     brief = (HERE / "COMMANDER_BRIEF.md").read_text()
-    section = brief.split("### The thirteen predicates", 1)[1].split("\n###", 1)[0]
+    m = re.search(r"^### The \w+ predicates$", brief, re.M)
+    assert m, "the brief no longer has a predicate table under a '### The N predicates' heading"
+    section = brief[m.end():].split("\n###", 1)[0]
     listed = re.findall(r'\{"type":"(\w+)"', section)
-    assert len(listed) == 13, listed
-    assert listed == affordances.TRIGGER_PREDICATES
+    assert listed == affordances.TRIGGER_PREDICATES, (
+        "the brief lists {} and this module serves {}".format(listed,
+                                                              affordances.TRIGGER_PREDICATES))
+    # And the heading's own word has to agree with the table under it.
+    words = {"twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16}
+    count = words.get(m.group(0).split()[2])
+    assert count == len(listed), "the heading says {} and the table has {}".format(
+        m.group(0), len(listed))
 
 
 # -- the recipes -------------------------------------------------------------
