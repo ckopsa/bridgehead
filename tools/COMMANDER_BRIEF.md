@@ -142,6 +142,11 @@ Doctrine (standing orders, executed continuously — USE THESE, they fight for y
   (attack-moving, so they fight what they meet) and hold at the muster point when none are up —
   the set-and-forget way to own the midfield. Squad 0 exists automatically (all army units
   enroll unless you assign them elsewhere; default posture defends your base).
+- `{"type":"stance","squad":1,"stance":"push","target":"north-pass"}` — **the five doctrine
+  verbs above, in one word.** A stance is a fixed engine-defined bundle of posture + anchor +
+  leash + retreat threshold + focus priority, set atomically. Instead of `squad` + `posture` +
+  `leash` + `retreat` + `priority`, send one line. See "Stances" below for the five and what
+  each one is made of.
 - `{"type":"template","building":id,"squad":1,"retreat":{"below":0.35,"x":..,"z":..},"priority":["Hero",...],"autocast":3}`
   — stamp standing doctrine on a production building: every unit it trains spawns WITH these
   policies (null/omitted pieces skipped; all null clears). Set once, stop re-issuing per spawn.
@@ -162,6 +167,58 @@ Plans (SEQUENCED standing orders — see the section below; this is the shape):
 - `{"type":"ready"}` — start the clock (see step 0 of the loop). The one verb that is legal
   *before* the match exists. Idempotent and never refused, so re-sending it after a reconnect
   costs you nothing.
+
+## Stances: one word for a whole doctrine
+
+Five fixed words. Each sets a squad's posture, its anchor, its leash, its
+retreat threshold and its focus-fire list in one sentence, using the same
+machinery the individual verbs use — the engine cannot tell a stanced squad from
+a hand-tuned one, and neither can your opponent.
+
+```json
+{"type":"stance","squad":1,"stance":"push","target":"north-pass"}
+{"type":"stance","squad":2,"stance":"secure","x":-60.0,"z":60.0}
+{"type":"stance","squad":0,"stance":"turtle"}
+```
+
+`target` is a place name — anything from `map.places` or your own `regions`, and
+`"region"` is accepted as a synonym. Give `x`/`z` instead if you prefer numbers.
+Omit the anchor entirely and it is **your own base**, which is what `turtle`
+means anyway.
+
+| stance | what it does | ring | leash | falls back at | focus |
+|---|---|---|---|---|---|
+| `turtle` | hold home tight | defend r14 | 20 | 45%, to the anchor | Siege, Cavalry |
+| `stage` | gather forward and wait | defend r10 | 16 | 40%, to the anchor | — |
+| `push` | commit to the objective | push | none | 25%, to your base | Siege, Archer, Hero |
+| `secure` | hold ground away from home | defend r30 | 38 | 35%, to the anchor | Siege, Cavalry |
+| `harass` | hit soft targets, leave before the trade | push | 44 | 55%, to your base | Worker, Siege |
+
+Three things worth knowing:
+
+1. **Switching replaces the whole bundle**, never merges. `turtle` then `push`
+   leaves no leash behind — which matters, because a leash you did not know was
+   there would recall your push twenty metres from home.
+2. **The ring is the stance's, not the region's.** Unlike `posture defend`, a
+   named region's own radius does NOT become the ring: `secure north-pass` gets
+   `secure`'s 30 whatever size you drew the circle. That is what makes a preset a
+   preset. Use `posture` when you want to pick the number yourself — the full
+   vocabulary stays open and nothing here can be expressed only as a stance.
+3. **It applies to the squad's members as they stand.** The posture is per-squad
+   and covers anyone who joins later; the leash, threshold and focus list land on
+   whoever is in the squad *now*, exactly as `leash`/`retreat`/`priority` do.
+   Re-send the stance after reinforcing, or use `template` to stamp new units at
+   the barracks.
+
+**Silence continues a stance.** Nothing in the engine ever clears one — not a
+poll you skipped, not a fight, not a wipe. Your next snapshot echoes it back as
+`squads[].stance`, so "what is my army doing?" is answerable without remembering
+what you said four minutes ago, and a cycle in which you send nothing is a cycle
+in which your doctrine keeps running. The one thing that ends a stance is you:
+send a different one, or hand-task the squad with `posture` (which clears the
+word, because it is no longer true).
+
+An unknown word is refused with all five listed, and installs nothing.
 
 ## Territory: name the ground once, then speak in names
 
@@ -199,6 +256,7 @@ be 4..60. You may not take a name `map.places` already owns.
 | `posture` `defend` | centre is the anchor **and the region's own radius is the ring** — omit `radius` and stop carrying the number around |
 | `posture` `push` | push to the centre (a push has no radius) |
 | `posture` `forage` | the centre is the muster point |
+| `stance` | the centre is the anchor. The region's radius is **ignored** — a stance's ring is its own (see "Stances") |
 | `leash` | anchor at the centre; omit `radius` and the region's own is the leash |
 | `retreat` | fall back to the centre |
 
@@ -510,7 +568,7 @@ Four things to copy from this, because all four are easy to get wrong:
   of gold and 150 of the 160 lumber. A plan spends real resources on a real
   clock; if nothing is mining, the tech steps cannot pay.
 - **Put the cheap, always-legal steps early.** Steps that just re-task units
-  (`harvest`, `posture`, `squad`, `template`) cannot be refused for money, so a
+  (`harvest`, `posture`, `stance`, `squad`, `template`) cannot be refused for money, so a
   plan that opens with them starts earning while the expensive steps wait.
 
 ### The idiom for units you do not have yet
@@ -682,7 +740,7 @@ section is inert and you can ignore it.
 When it IS on: **a direct order to a unit does not take effect the moment you
 send it.** It arrives after a delay that grows with that unit's distance from
 your nearest *command node* — a finished hall, or a living hero. Standing orders
-do not pay: `squad`, `posture`, `retreat`, `leash`, `autocast`, `priority`,
+do not pay: `squad`, `posture`, `stance`, `retreat`, `leash`, `autocast`, `priority`,
 `template` all take effect at once, wherever the unit is. So does anything
 addressed to a building (`train`, `research`, `rally`, `upgrade`) and so does
 `build`.
@@ -726,7 +784,7 @@ next to them. Your snapshot's top-level `copilot` block confirms it:
 
 ```json
 "copilot": {"trust":"split",
-            "direct":["priority","retreat","leash","autocast","squad","posture","template"],
+            "direct":["priority","retreat","leash","autocast","squad","posture","stance","template"],
             "propose_ttl":20.0,"max_pending":4,
             "severities":["routine","urgent"],
             "veto_reasons":{"not_now":"re-propose when conditions change",

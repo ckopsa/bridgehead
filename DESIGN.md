@@ -180,14 +180,17 @@ conflicts loudly (both edited the same record) or not at all.
 | `abilities.ron` | `AbilityDef` rows + per-caster slot lists + default auto-cast | `abilities_of_unit`, `abilities_of_building`, `default_autocast` |
 | `items.ron` | `ItemDef` (Shop shelf) | `item_def` |
 | `research.ron` | ladder ids/labels/descriptions, the shared price list, the forge | `ResearchKind::{id,label,description}`, `research_step`, `research_building` |
+| `stances.ron` | `StanceDef` — the posture, ring, leash, retreat threshold, rally and focus list behind each of the five stance words | `StanceKind::def` |
 
 **What is data and what is code.** *Every number and every flag* is data.
 *Identity and rules* stay in Rust:
 
-- `UnitKind` / `BuildingKind` / `ItemId` / `ResearchKind` / `StatusKind` stay
-  enums. A KIND is code identity — it needs a variant and a mesh arm in
-  `units.rs` regardless — and making kinds dynamic would buy nothing but the
-  loss of exhaustiveness everywhere else.
+- `UnitKind` / `BuildingKind` / `ItemId` / `ResearchKind` / `StatusKind` /
+  `StanceKind` stay enums. A KIND is code identity — it needs a variant and a
+  mesh arm in `units.rs` regardless — and making kinds dynamic would buy nothing
+  but the loss of exhaustiveness everywhere else. `StanceKind` is the newest and
+  the clearest case: the five stance WORDS are a fixed vocabulary both seats and
+  the arena ledger speak, so they are identity; their numbers are data.
 - Derived facts stay derived: `building_tier`, `upgrade_root`, `is_hall`,
   `building_placeable`, `upgrade_cost`, `unit_tier`, `tech_tier_for`. The
   upgrade LADDER is one data field (`upgrades_to`) and everything else is walked
