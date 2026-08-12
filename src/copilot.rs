@@ -741,7 +741,9 @@ fn ingest_wire(
         // `tools/bridge_send.py` working at this seat with no changes.
         let is_propose = raw.get("type").and_then(|t| t.as_str()) == Some("propose");
         if !is_propose {
-            match serde_json::from_value::<Intent>(raw) {
+            // The same door an ordinary seat comes through — see
+            // `intent::parse_command`. A co-commander reads the same document.
+            match crate::intent::parse_command(&raw) {
                 Ok(intent) if direct_allowed(policy, &intent) => {
                     submissions.write(SubmitIntent {
                         team,
@@ -757,9 +759,7 @@ fn ingest_wire(
                         .get_mut(team)
                         .push(needs_proposal_error(&tag, &intent, policy));
                 }
-                Err(err) => errors
-                    .get_mut(team)
-                    .push(format!("{tag}: unrecognized command ({err})")),
+                Err(err) => errors.get_mut(team).push(format!("{tag}: {err}")),
             }
             continue;
         }
@@ -811,11 +811,9 @@ fn ingest_wire(
         // human sees the sentences of what actually survived.
         let mut intents: Vec<Intent> = Vec::with_capacity(wrapper.commands.len());
         for (j, sub) in wrapper.commands.iter().enumerate() {
-            match serde_json::from_value::<Intent>(sub.clone()) {
+            match crate::intent::parse_command(sub) {
                 Ok(intent) => intents.push(intent),
-                Err(err) => errors
-                    .get_mut(team)
-                    .push(format!("{tag}.{j}: unrecognized command ({err})")),
+                Err(err) => errors.get_mut(team).push(format!("{tag}.{j}: {err}")),
             }
         }
         if intents.is_empty() {

@@ -2101,7 +2101,7 @@ it is in:
 | | judged at arm time | late-bound |
 |---|---|---|
 | plan step | the predicate's **shape** — a count of zero, a misspelt target class, a fraction outside (0,1] | the predicate's **place**, and the step's own target |
-| trigger | shape **and** place | its `then`, entirely |
+| trigger | shape **and** place; plus the one permanent hole in `then` (below) | its `then`, otherwise entirely |
 
 Shape is a typo: no amount of later world turns `"count":0` into a sentence, so
 refusing it is the only honest answer. A place is *vocabulary*, and vocabulary
@@ -2112,6 +2112,29 @@ has no earlier step to name ground in; its `then` may not name ground at all; an
 it is one statement a commander re-sends in one line, so a refusal costs a line
 rather than a sequence. A plan is the construct explicitly written before the
 world it describes exists.
+
+**The one thing about a `then` that is judged now: a hole no later world can
+fill.** *(`wc3clone-2su4`.)* A `build`, `move`, `attackmove` or ground-anchored
+`posture` that names neither `x`/`z` nor a `region` is not late binding. It is a
+form sent back with the hole still in it, and it will refuse identically on
+every fire for the rest of the match. So the trigger arms — this is teaching and
+never a gate, on exactly the terms a plan's chain-holds notice is — and the seat
+is told at once, in the resolver's own words:
+
+    cmd 0: trigger expand holds when it fires: build needs x/z or a region name
+    — the rule is armed anyway, but nothing that happens later can fill that
+    hole; re-send it with "region": "<place>" in the `then` (known places: …)
+
+The distinction it is careful about is the same one this section is built on. A
+`then` naming units this seat has not trained yet, or a hero it has not fielded,
+or a place it has not scouted, is *pending* and stays unjudged — that is what
+deferral is for. A `then` naming no ground at all is *permanent*, and the
+difference is visible in the sentence rather than guessed at.
+
+The bill for not having this was arena r34: blue armed the document's `expand`
+recipe at t=0 with `then.region` left `null`, the mine ran dry at t=322, the
+rule fired its one fire into `build needs x/z or a region name`, and the seat
+played the rest of the match on one base without ever learning why.
 
 **Late binding is only honest because the hold is audible.** `holds()` answers
 `false` for a region it cannot find — correct, and completely silent — so a plan

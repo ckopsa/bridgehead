@@ -141,6 +141,19 @@ Everything in a note comes from your own snapshot: your units, your squads, your
 point is *when* you are told.
 
 ## Command reference
+
+**`null` means the key is not there.** At any depth, in any command, on either
+seat: `{"repeat": null}` is `repeat` omitted, `{"target": null}` is `target`
+omitted, and `"advance": null` inside a plan step is a step with no advance
+condition. So wherever this reference says *omit X*, sending `X: null` says the
+same thing — which is what makes an `--doc` template sendable with its optional
+holes still in it.
+
+What that does **not** buy you is a required key. Leave one null and the command
+is refused, by name, with the fix: `stance needs 'squad', and you left it null —
+null on this wire means the key is not there at all`. The document marks which
+holes are which (see *The affordance document*, rung 3).
+
 Unit orders (ids from state):
 - `{"type":"move"|"attackmove","units":[ids],"x":..,"z":..}` — or
   `{"type":"move","units":[ids],"region":"north-pass"}`. **Every verb below that
@@ -1053,7 +1066,7 @@ in front of you beats a sequence written before the match.
 python3 tools/bridge_view.py --doc <SEAT>/state.json          # ~75 lines: read every cycle
 python3 tools/bridge_view.py --doc --all <SEAT>/state.json    # ~650 lines: read once
 python3 tools/bridge_view.py --doc --json <SEAT>/state.json   # to parse; never folded
-python3 tools/bridge_view.py --doc-version                    # affordance-doc/2.1
+python3 tools/bridge_view.py --doc-version                    # affordance-doc/2.2
 ```
 
 The digest tells you **what is going on**. The document tells you **what you can
@@ -1144,8 +1157,8 @@ default page carries the same facts folded onto one line each.*
        template: {"type":"trigger_set","name":"hero-save","repeat":45,
                   "when":{"type":"hero_below","frac":null},
                   "then":{"type":"move","select":"my hero","region":null}}
-         when.frac   <number> range 0.05..0.95  (leave null — this one is yours)
-         then.region <place>                    (leave null — this one is yours)
+         when.frac   <number> range 0.05..0.95  (REQUIRED — yours to fill; the null is a hole, not a value)
+         then.region <place>                    (REQUIRED — yours to fill; the null is a hole, not a value)
            domain: our base · their base · mid · north-pass (YOUR region) · …
    ```
 
@@ -1153,6 +1166,23 @@ default page carries the same facts folded onto one line each.*
    `map.places` plus your own `regions`, the selector phrases, the building kinds
    with their prices and whether your tech allows them. The refusal that would
    have taught you this arrives with the form instead of costing you a cycle.
+
+   **Every hole says which of three things it is**, and the difference is the
+   whole reason the annotation is long:
+
+   | annotation | what to do |
+   |---|---|
+   | `default=<value>` | the engine already filled it from a fact. Send it as printed, or overwrite it. |
+   | `(REQUIRED — yours to fill …)` | **the null is a hole.** Send it as printed and the command is refused. |
+   | `(optional — leave it null …)` | send it as printed and the key is simply not there. The note says what that means. |
+
+   **THE GUARANTEE: fill every REQUIRED hole, change nothing else, and the
+   template is a command.** That is the contract, and `--doc --json` carries
+   `required` on every field so a parser can act on it. r34's blue seat sent
+   `recipe:home-guard` back with `"squad": null` still in it — the old
+   annotation said "leave null — this one is yours" for both kinds of hole —
+   and later armed `recipe:expand` with `then.region` null, which cost it a
+   second base 322 seconds later when the rule fired once and refused.
 
 4. **raw** — the URI bar. **Everything in this brief is legal whether or not it
    appears in the document.** The document is a floor, never a ceiling: it lists
@@ -1218,7 +1248,7 @@ the building selector so there is no id to look up:
             why: 2 finished Barracks, 1 idle; you hold 964g/145l at 36/50 supply
     template: {"type":"train","select":"idle Barracks","unit":null}
       select <selector> default="idle Barracks"
-      unit   <kind>     (leave null — this one is yours)
+      unit   <kind>     (REQUIRED — yours to fill; the null is a hole, not a value)
         domain: Footman — 135g/0l 2supply — available
                 Knight  — 245g/60l 3supply — NOT AVAILABLE at your tech
                 …
@@ -1230,6 +1260,10 @@ The `unit` domain prices every row against your own bank, your own tech and
 (for heroes) your own slots, so a refusal that would have cost a poll cycle
 arrives with the menu instead.
 
+`affordance-doc/2.2` makes the forms honest about their own holes: every field
+carries `required`, the render says REQUIRED or optional instead of the one
+phrase it used for both, and `recipe:expand` now ships its mine pre-filled off
+`mines[]` so the recipe works sent verbatim.
 `affordance-doc/2.1` adds the PLAYBOOK section (below) — a declared game-plan
 served as the fork you are on. Additive: no action moved, and a seat that
 declares nothing gets one line advertising the library.

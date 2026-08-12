@@ -95,6 +95,182 @@ def by_rel(d, rel):
     return next(a for a in d["actions"] if a["rel"] == rel)
 
 
+# ---------------------------------------------------------------------------
+# THE ONE RULE (wc3clone-2su4)
+#
+#   A template the document prints must be sendable after filling ONLY the
+#   fields marked yours.
+#
+# r34 blue is what it is written against, twice in one match. It sent
+# `recipe:home-guard` back with `"then":{"squad":null}` — exactly as printed —
+# and got serde's *invalid type: null, expected u8*; and it armed
+# `recipe:expand` with `then.region` still null, which cost it a second base
+# 322 seconds later when the rule fired once and refused in words.
+#
+# The rule is pinned on both sides of the wire out of ONE artifact:
+# `fixtures/doc_wire_cases.json` is generated here from the real snapshots, and
+# `intent::tests::every_template_the_document_prints_survives_the_wire` reads
+# the same file and puts every case through `intent::parse_command`. A copy of
+# the templates in Rust would drift; a file both sides read cannot.
+# ---------------------------------------------------------------------------
+
+#: The generated cross-language fixture. Regenerate with
+#: `python3 tools/test_affordances.py --write-wire-cases`.
+WIRE_CASES = FIX / "doc_wire_cases.json"
+
+#: A legal-shaped value per field TYPE. Deliberately the test's own vocabulary
+#: and not the document's: what is being pinned is that the wire TAKES the
+#: filled template, so the values only have to be of the right shape. A domain,
+#: where the form serves one, always wins — that is the document's own answer
+#: and the one a commander would paste.
+_SYNTH = {
+    "integer": 0,
+    "number": 1.0,
+    "seconds": 20,
+    "string": "pinned",
+    "array": [{"intent": {"type": "stop", "select": "all army"}}],
+    "predicate": {"type": "base_under_attack"},
+    "intent": {"type": "stop", "select": "all army"},
+}
+
+
+def _from_domain(f):
+    """The first served value, as a command would carry it.
+
+    Domain rows are annotated (`southeast mine — map place at (60, -60), r14`),
+    and the token before the em dash is the part that goes in the JSON.
+    """
+    # `predicate`, `intent` and `array` serve a domain of SIGNATURES
+    # (`enemy_in(region, [class], [count=1])`) or of legal phrases, never of
+    # values — so those three take the synthesized shape and not row zero.
+    if f["type"] in ("predicate", "intent", "array"):
+        return None
+    dom = f.get("domain") or []
+    if not dom:
+        return None
+    token = str(dom[0]).split(" — ")[0].strip()
+    if f["type"] == "integer":
+        try:
+            return int(token)
+        except ValueError:
+            return None
+    return token
+
+
+def synth(f):
+    """A value for one REQUIRED hole."""
+    from_domain = _from_domain(f)
+    if from_domain is not None:
+        return from_domain
+    if f.get("range") and f["type"] in ("integer", "number", "seconds"):
+        lo = f["range"][0]
+        return int(lo) if f["type"] == "integer" else lo
+    return copy.deepcopy(_SYNTH[f["type"]])
+
+
+def fill(action):
+    """One form's template with every REQUIRED hole filled and every optional
+    one left exactly as the document printed it."""
+    out = copy.deepcopy(action["template"])
+    for f in action["fields"]:
+        if f["default"] is not None or not f["required"]:
+            continue
+        node, *rest = f["path"].split(".")
+        target, key = out, node
+        for step in rest:
+            target, key = target[key], step
+        target[key] = synth(f)
+    return out
+
+
+def every_action(d):
+    """Every action the document prints, including the ones an alarm re-serves.
+
+    The alarm pool matters and is not decoration: `income_collapse` re-serves
+    `recipe:expand` — the exact recipe r34 blue armed with a hole in it — beside
+    the fact that made it urgent, and a form that is correct in the ACTIONS
+    section and broken under an alarm would be broken at the one moment it is
+    read.
+    """
+    seen, out = [], []
+    pools = [d["actions"]] + [a["actions"] for a in (d.get("alarms") or [])]
+    for pool in pools:
+        for a in pool:
+            if a["rel"] not in seen:
+                seen.append(a["rel"])
+                out.append(a)
+    return out
+
+
+def playbook_commands(d):
+    """The commands a playbook step's fork prints. Complete by construction —
+    `assets/data/playbooks.ron` is authored, not filled — which is exactly why
+    they belong in this pin: an authored command that stopped parsing would be
+    a plan a trusting commander enacts one refusal at a time."""
+    fork = (d.get("playbook") or {}).get("fork") or {}
+    return [o["command"] for o in fork.get("options") or [] if o.get("command")]
+
+
+def wire_cases():
+    """The generated fixture, rebuilt from the snapshots on every call."""
+    cases = []
+    for path in LIVE + [EARLY, LEGACY]:
+        d = doc(path)
+        for a in every_action(d):
+            if a["kind"] == "form":
+                cases.append({
+                    "fixture": path.name,
+                    "rel": a["rel"],
+                    "filled": fill(a),
+                    "as_printed": a["template"],
+                    "optional": [f["path"] for f in a["fields"]
+                                 if f["default"] is None and not f["required"]],
+                })
+            elif a.get("command") is not None:
+                # A LINK is a complete command already, so "filled" is what the
+                # page prints and the pin is that it still parses.
+                cases.append({
+                    "fixture": path.name,
+                    "rel": a["rel"],
+                    "filled": a["command"],
+                    "as_printed": a["command"],
+                    "optional": [],
+                })
+        for i, cmd in enumerate(playbook_commands(
+                affordances.document(load(path), catalog(), prefs_file(playbook=BOOK)))):
+            cases.append({
+                "fixture": path.name,
+                "rel": "playbook:{}:{}".format(BOOK, i),
+                "filled": cmd,
+                "as_printed": cmd,
+                "optional": [],
+            })
+    return {
+        "note": (
+            "GENERATED — `python3 tools/test_affordances.py --write-wire-cases`. "
+            "Every form tools/affordances.py prints, with only the fields it "
+            "marks REQUIRED filled in. `intent::parse_command` must take every "
+            "`filled` command: that is wc3clone-2su4's one rule, pinned on both "
+            "sides of the wire out of one artifact."
+        ),
+        "doc_version": affordances.DOC_VERSION,
+        "cases": cases,
+    }
+
+
+def nulls_in(node, path=""):
+    """Dotted paths of every null-valued KEY, at any depth."""
+    out = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            here = "{}.{}".format(path, k) if path else k
+            out += [here] if v is None else nulls_in(v, here)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out += nulls_in(v, "{}.{}".format(path, i))
+    return out
+
+
 def walk(node):
     """Every scalar in a nested structure, so a test can look for ids."""
     if isinstance(node, dict):
@@ -134,7 +310,14 @@ def test_the_document_carries_its_own_version():
     # advertisement line — but a seat that declares one reads a sequenced plan
     # with a "you are here" pointer at the decision moment, which is a different
     # scaffold and has to compare as one.
-    assert affordances.DOC_VERSION == "affordance-doc/2.1"
+    # `2.2`: the forms stop rendering a REQUIRED hole and an optional one with
+    # the same words. r34 blue read "leave null — this one is yours" as
+    # permission and sent `recipe:home-guard` back with `"squad": null` in it;
+    # the same reading cost it a second base, because `recipe:expand`'s
+    # `then.region` null is fatal only when the rule FIRES. The page a
+    # commander reads is different, so the ledger has to be able to tell them
+    # apart.
+    assert affordances.DOC_VERSION == "affordance-doc/2.2"
     assert doc()["doc_version"] == affordances.DOC_VERSION
     assert run("--doc-version").strip() == affordances.DOC_VERSION
     assert subprocess.run(
@@ -643,6 +826,106 @@ def test_numeric_fields_carry_the_engines_real_ranges():
     assert steps["range"] == [1, affordances.MAX_PLAN_STEPS]
 
 
+def test_a_printed_template_is_sendable_once_only_your_own_fields_are_filled():
+    """**THE ONE RULE.** Fill every hole the form marks REQUIRED, leave every
+    other one exactly as printed, and what is left must be a command — no null
+    anywhere the wire would read as a hole.
+
+    This is the half of the rule that lives in Python. The other half — that
+    the engine's own parser takes each of these — is
+    `intent::tests::every_template_the_document_prints_survives_the_wire`,
+    reading the same generated fixture.
+    """
+    for path in LIVE + [EARLY, LEGACY]:
+        d = doc(path)
+        for a in every_action(d):
+            if a["kind"] != "form":
+                continue
+            printed = nulls_in(a["template"])
+            marked = [f["path"] for f in a["fields"] if f["default"] is None]
+            assert set(printed) <= set(marked), (
+                "{}: {} prints null at {} and marks nobody to fill it".format(
+                    path.name, a["rel"], sorted(set(printed) - set(marked))))
+            left = nulls_in(fill(a))
+            optional = [f["path"] for f in a["fields"]
+                        if f["default"] is None and not f["required"]]
+            assert set(left) <= set(optional), (
+                "{}: {} still has a hole at {} after every REQUIRED field was "
+                "filled".format(path.name, a["rel"], sorted(set(left) - set(optional))))
+
+
+def test_the_cross_language_wire_fixture_is_current():
+    """The generated artifact both sides of the wire read.
+
+    A Rust copy of these templates would drift the first time a form changed;
+    a file that is regenerated here and asserted byte-current cannot. If this
+    fails, run `python3 tools/test_affordances.py --write-wire-cases` and read
+    the diff — a template that moved is news for
+    `intent::tests::every_template_the_document_prints_survives_the_wire`.
+    """
+    assert WIRE_CASES.exists(), "run --write-wire-cases"
+    assert load(WIRE_CASES) == wire_cases(), (
+        "fixtures/doc_wire_cases.json is stale — regenerate with "
+        "`python3 tools/test_affordances.py --write-wire-cases`")
+
+
+def test_the_r34_recipes_are_sendable_exactly_as_printed():
+    """The two forms that cost r34 blue, named.
+
+    `recipe:home-guard` has one hole and it is REQUIRED, so the fold says
+    `you fill: then.squad` and the render says REQUIRED rather than "leave
+    null". `recipe:expand` has none left at all: its mine comes off `mines[]`.
+    """
+    d = doc(ARMED)
+    guard = by_rel(d, "recipe:home-guard")
+    squad = next(f for f in guard["fields"] if f["path"] == "then.squad")
+    assert squad["required"] and squad["default"] is None
+    assert "then.squad" in affordances.collapse_action(guard)
+    line = "\n".join(affordances.render_action(guard))
+    assert "REQUIRED" in line and "leave null" not in line
+
+    expand = by_rel(d, "recipe:expand")
+    assert nulls_in(expand["template"]) == [], expand["template"]
+    assert expand["template"]["then"]["region"] == "southeast mine"
+    assert "you fill:" not in affordances.collapse_action(expand)
+
+
+def test_the_expansion_default_is_a_fact_and_never_an_invention():
+    """`expansion_place` reads `mines[]` and this seat's own halls and nothing
+    else. Dry mines are out, mines a hall of ours already works are out, and
+    with neither left the field goes back to being the commander's — the
+    document does not invent a mine to point at."""
+    st = load(ARMED)
+    assert affordances.expansion_place(st, catalog()) == "southeast mine"
+    # The northwest mine is nearer, and it is excluded because this seat has a
+    # hall 10 units from it — which is the same `MINE_HOME_RADIUS` that decides
+    # what `mine_dry` is about.
+    assert affordances.MINE_HOME_RADIUS == 40.0, "shared::MINE_HOME_RADIUS"
+
+    dry = copy.deepcopy(st)
+    for m in dry["mines"]:
+        m["remaining"] = 0
+    assert affordances.expansion_place(dry, catalog()) is None
+    d = affordances.document(dry, catalog(), None)
+    expand = by_rel(d, "recipe:expand")
+    assert expand["template"]["then"]["region"] is None
+    assert "NOTHING IS PRE-FILLED" in expand["reason"]
+    assert "then.region" in affordances.collapse_action(expand)
+
+
+def test_an_optional_hole_and_a_required_one_do_not_render_alike():
+    """r34's actual complaint. The old annotation was one string for both, and
+    "leave null — this one is yours" reads as permission."""
+    d = doc(ARMED)
+    trig = by_rel(d, "trigger_set")
+    lines = "\n".join(affordances.render_action(trig))
+    assert "then <intent> (REQUIRED" in lines
+    assert "repeat <number> (optional" in lines
+    assert "leave null — this one is yours" not in lines
+    # ...and the fold demands only the required half.
+    assert "you fill: name, when, then" in affordances.collapse_action(trig)
+
+
 def test_judgment_fields_ship_empty_and_fact_fields_ship_filled():
     """AFFORDANCES.md guard 1. A default that encodes strategy makes the arena
     measure the form's author, so a threshold, an anchor and a squad choice all
@@ -1039,7 +1322,13 @@ def test_the_text_render_is_readable_and_terminates():
 #: and the PLAYBOOK section is 5 lines with nothing declared. `--all` is still
 #: the pre-2.0 ACTIONS render exactly — the fold is what `--all` undoes, and a
 #: top-level section is not folded in either mode.
-FULL_LINES = {"doc_open_armed.json": 653, "doc_open_alarm.json": 813}
+#: 2.2 moved both again, and only in prose: the three-way field annotation
+#: (engine-filled / REQUIRED / optional) is a longer string than the one it
+#: replaced, and `recipe:expand`'s `then.region` note now says where its
+#: pre-filled mine came from. No action, no field and no template row was added
+#: — the alarm fixture moves further only because it renders `recipe:expand`
+#: twice, once under `income_collapse`.
+FULL_LINES = {"doc_open_armed.json": 659, "doc_open_alarm.json": 821}
 
 #: What the collapsed render must fit in. The real numbers when this landed were
 #: **76** (armed, 43 actions) and **94** (alarm, 51 actions and a ringing
@@ -1100,8 +1389,16 @@ def test_a_folded_line_still_carries_its_complete_command():
         assert json.dumps(blob, separators=(",", ":")) in line, a["rel"]
         if a["kind"] == "form":
             for f in a["fields"]:
-                if f["default"] is None:
+                # REQUIRED holes only, since 2.2. An optional field left exactly
+                # as printed is a legal command — the wire reads a null key as
+                # an omitted key — so putting it under `you fill:` would make
+                # the fold demand something the form does not.
+                if f["default"] is None and f["required"]:
                     assert f["path"] in line, "{}: {} is not named as yours".format(
+                        a["rel"], f["path"])
+                elif f["default"] is None:
+                    assert "you fill: " not in line or f["path"] not in line.split(
+                        "you fill: ")[1], "{}: optional {} rides `you fill:`".format(
                         a["rel"], f["path"])
 
 
@@ -1743,4 +2040,8 @@ def _run():
 
 
 if __name__ == "__main__":
+    if "--write-wire-cases" in sys.argv:
+        WIRE_CASES.write_text(json.dumps(wire_cases(), indent=2, sort_keys=True) + "\n")
+        print("wrote {}".format(WIRE_CASES))
+        sys.exit(0)
     sys.exit(_run())
