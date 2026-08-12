@@ -686,8 +686,9 @@ def main():
     ap.add_argument(
         "--prefs",
         help="with --doc: a JSON file of commander-declared doctrine, which "
-        "SORTS the actions and — via its optional `focus` — chooses which "
-        "section the text render expands. It changes no fact",
+        "SORTS the actions, via its optional `focus` chooses which section the "
+        "text render expands, and via its optional `playbook` names a plan from "
+        "catalog.playbooks to be served as a fork. It changes no fact",
     )
     ap.add_argument(
         "--doc-version",
