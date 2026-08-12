@@ -557,6 +557,19 @@ Rules of thumb:
   reading proves it. It is also the fastest way to discover that your "pure
   refactor" changed the frame order.
 
+`identity` builds two source trees through one cargo target directory, and both
+of them are the same cargo unit — cargo hashes a workspace-root package's path
+*relative to the workspace root*, which is empty for every checkout. That is a
+fight with cargo's freshness rules, and the script now wins it by force: it
+drops this crate's fingerprint before each build and again on the way out, and
+refuses to compare unless cargo actually printed `Compiling bridgehead` for
+each tree. Two costs to expect, both deliberate — the tier always pays two crate
+compiles, and your next `cargo build` in the worktree recompiles once. The
+alternative was a tier that reported IDENTICAL in sixty seconds having compiled
+nothing, and left the worktree saying `Finished` over a syntax error. The tier's
+own negative — a ref that must diverge and a ref that must not — is
+`tools/test_verify_identity.sh`, which is manual and takes about ten minutes.
+
 `tools/verify.sh` is being built by a sibling bead (`wc3clone-5g8`). **Do not
 build it yourself** — if it is not there yet, run the raw litany in Appendix A,
 which is what the tiers compose.

@@ -31,10 +31,15 @@
 #            against a live engine. Tens of minutes; the bridges dominate.
 #
 # identity   [ref] — for "this changes no behavior" claims. Builds `ref`
-#            (default: merge-base with master) and HEAD, runs seeded fixed-dt
-#            fingerprint sims on both maps with both binaries, and byte-compares
-#            the fingerprint streams. Cheaper and stricter than re-reading a
-#            diff: identical fingerprints ARE the no-behavior-change proof.
+#            (default: merge-base with master, or with main) and HEAD, runs
+#            seeded fixed-dt fingerprint sims on both maps with both binaries,
+#            and byte-compares the fingerprint streams. Cheaper and stricter
+#            than re-reading a diff: identical fingerprints ARE the
+#            no-behavior-change proof — PROVIDED the two binaries are really
+#            the two trees, which is a fight with cargo's freshness rules and
+#            is fought in the block above st_identity. Its self-test is
+#            tools/test_verify_identity.sh: a ref that must diverge, and a ref
+#            that must not.
 #
 # Tiers are cumulative and ordered cheapest-first WITHIN a tier, so the first
 # failure is usually the cheapest one to reproduce. It stops at the first
@@ -70,13 +75,19 @@
 #   SIM_CAP=900        BH_MAX_GAME_SECS safety cap, in GAME seconds
 #   SIM_SEEDS="42 7"   seeds for full's matrix
 #   IDENT_SEED=42      seed for identity's fingerprint sims
+#   IDENT_MAPS="open crossings"
+#                      maps identity compares on; one map is the fast form, for
+#                      tools/test_verify_identity.sh and for a quick re-check
 #   FP_INTERVAL=10     BH_FINGERPRINT sampling interval, in game seconds
 #   BRIDGE_SPEED=4     BH_SPEED for the engine verify_intent_bridge.py drives
 #   BRIDGE_CAP=20000   that engine's BH_MAX_GAME_SECS — high on purpose, so the
 #                      match cannot time-cap out from under the verifier; the
 #                      engine is stopped by PID when the verifier returns
 #   KEEP_LOGS=1        keep the log directory, and identity's target/verify-identity
-#                      work area (the two binaries and the extracted ref tree)
+#                      work area (the two binaries and the extracted ref tree).
+#                      It does NOT keep identity's cargo fingerprint: that one
+#                      is dropped on every exit, because keeping it is how a
+#                      checkout ends up building nothing (see st_identity).
 #
 # Logs for every stage land in one temp directory, printed at the end.
 #
@@ -120,6 +131,7 @@ SIM_DT="${SIM_DT:-0.05}"
 SIM_CAP="${SIM_CAP:-900}"
 SIM_SEEDS="${SIM_SEEDS:-42 7}"
 IDENT_SEED="${IDENT_SEED:-42}"
+IDENT_MAPS="${IDENT_MAPS:-open crossings}"
 FP_INTERVAL="${FP_INTERVAL:-10}"
 # Speed 4 is a compromise the intent verifier forces: it waits up to 120 WALL
 # seconds for red's economy to afford a tier-up, so the game clock has to move
@@ -182,8 +194,18 @@ cleanup() {
         [ -n "$p" ] || continue
         kill -KILL "$p" 2>/dev/null
     done
-    if [ -n "$IDENT_WORK" ] && [ -d "$IDENT_WORK" ] && [ "$KEEP_LOGS" != "1" ]; then
-        rm -rf "$IDENT_WORK"
+    if [ -n "$IDENT_WORK" ]; then
+        # Unconditional, and before the KEEP_LOGS branch. The identity stage
+        # builds two trees into one cargo unit, so on the way out this
+        # checkout's fingerprint may describe the ref tree instead of this one
+        # (see the block above st_identity). Dropping it costs one recompile
+        # and is the difference between a checkout that rebuilds and a checkout
+        # that reports `Finished` over a syntax error. It matters MOST when
+        # KEEP_LOGS=1, which is the state a failed run leaves behind.
+        ident_forget_crate
+        if [ -d "$IDENT_WORK" ] && [ "$KEEP_LOGS" != "1" ]; then
+            rm -rf "$IDENT_WORK"
+        fi
     fi
     if [ "$rc" -eq 0 ] && [ "$KEEP_LOGS" != "1" ]; then
         rm -rf "$LOGDIR"
@@ -415,9 +437,102 @@ st_bridge_r9() {
 
 # --- identity -------------------------------------------------------------
 
+# The two builds this stage makes are ONE cargo unit, and every trap here comes
+# from that. Cargo's `-C metadata` hash for a workspace-root package hashes the
+# package path RELATIVE to the workspace root — the empty string for every
+# checkout — so this checkout and the extracted ref compile to the same unit
+# name: one `target/debug/.fingerprint/bridgehead-<hash>/`, one
+# `target/debug/deps/bridgehead-<hash>` artifact, one uplifted binary. Cargo's
+# freshness is mtimes, and `git archive` stamps every extracted file with the
+# ref's COMMIT time, i.e. the past. Left alone that pair is a machine for
+# comparing stale artifacts, in both directions:
+#
+#   * the ref build sees sources older than the fingerprint's reference mtime,
+#     prints `Finished` in 0.2s having compiled nothing, and leaves the binary
+#     that was already there — HEAD's. The tier then compares HEAD against HEAD
+#     and PASSES, vacuously, in about a minute. Observed, on a first run as
+#     well as a second: it is not a second-run bug, it is a coin flip decided
+#     by which mtime happens to be later.
+#   * the fingerprint that survives the stage describes the REF tree — and by
+#     target-root-relative paths, because the checkout lives under `target/` —
+#     so the next plain `cargo build` in THIS checkout checks the wrong tree's
+#     mtimes. A source file you edited afterwards is not in the list at all,
+#     and cargo says `Finished` over a syntax error. That is precisely the
+#     stale-binary trap BUILDER_BRIEF §4 exists to prevent, manufactured by the
+#     tool that is supposed to prove things.
+#
+# Three defences, each sufficient on its own for one half of it:
+#
+#   1. forget this crate's fingerprint before each build AND after the stage
+#      (unconditionally — a FAILING run sets KEEP_LOGS=1 and keeps the ref tree,
+#      which is exactly the state that poisons the next `cargo build`);
+#   2. touch the extracted tree, so its mtimes are the present;
+#   3. refuse to compare at all unless BOTH builds actually compiled, each from
+#      its own directory — asserted against cargo's own
+#      `Compiling bridgehead v0.1.0 (<path>)` line, which names the tree it
+#      read, and against the binary's mtime moving.
+#
+# The cost of (1) is one crate recompile per build and one more the next time
+# you build in this checkout. That is minutes; a tier that can pass without
+# compiling the thing it claims to have compared is worthless.
+
+# Forget this crate's build verdict. The bin unit only: the test-harness unit
+# (test-bin-bridgehead) is never built from the ref checkout, and dropping it
+# would cost a `cargo test` rebuild for nothing.
+ident_forget_crate() {
+    local d
+    for d in "$ROOT"/target/debug/.fingerprint/bridgehead-*; do
+        [ -d "$d" ] || continue
+        [ -e "$d/bin-bridgehead" ] || continue
+        rm -rf "$d"
+    done
+}
+
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+
+# ident_build <dir> <log> — build one tree, and prove it compiled THAT tree.
+#
+# The proof is cargo's own Compiling line plus a moved binary mtime. Two
+# witnesses because they fail differently: the log line is what a fresh-and-
+# skipped build omits, the mtime is what a build that compiled something else
+# leaves behind.
+ident_build() {
+    local dir="$1" log="$2"
+    local before after
+    before="$(mtime_of "$BIN")"
+    before="${before:-0}"
+    ident_forget_crate
+    ( cd "$dir" && CARGO_TARGET_DIR="$ROOT/target" cargo build ) >"$log" 2>&1 || {
+        tail -n 30 "$log"; return 1; }
+    if ! grep -F 'Compiling bridgehead' "$log" | grep -qF "($dir)"; then
+        printf '  the build in %s compiled nothing.\n' "$dir"
+        printf '  cargo called the crate fresh, so target/debug/bridgehead is whatever\n'
+        printf '  was there before — refusing to fingerprint an artifact that may not\n'
+        printf '  be this tree.\n'
+        grep -E 'Compiling|Finished' "$log" | sed 's/^/      /'
+        return 1
+    fi
+    if [ ! -x "$BIN" ]; then
+        printf '  build reported success but there is no binary at %s\n' "$BIN"
+        return 1
+    fi
+    after="$(mtime_of "$BIN")"
+    after="${after:-0}"
+    if [ "$after" -le "$before" ]; then
+        printf '  %s was compiled but %s did not change (mtime %s -> %s).\n' \
+            "$dir" "$BIN" "$before" "$after"
+        return 1
+    fi
+    printf '  compiled bridgehead from %s\n' "$dir"
+    return 0
+}
+
 # fingerprints <binary> <cwd> <map> <seed> <outfile>
-# The binary runs with ITS OWN checkout as cwd, because assets/data/*.ron are
-# read relative to it and are as much "behavior" as the code is.
+# The binary runs with ITS OWN checkout as cwd, so that anything the engine
+# resolves relative to the working directory belongs to the tree that binary
+# was built from. (The stat tables are not one of those things: assets/data is
+# `include_str!`d, so each binary already carries its own copy — which is why a
+# data-only change still shows up here as a different binary.)
 fingerprints() {
     local bin="$1" cwd="$2" map="$3" seed="$4" out="$5"
     local log="$out.log" prev="$PWD"
@@ -444,9 +559,15 @@ fingerprints() {
 st_identity() {
     local ref="$IDENT_REF"
     if [ -z "$ref" ]; then
-        ref="$(git -C "$ROOT" merge-base HEAD master 2>/dev/null)"
+        # The trunk has been called both things in this repo's life, and a tier
+        # that errors out on the default ref is a tier nobody runs.
+        local cand base
+        for cand in master main; do
+            base="$(git -C "$ROOT" merge-base HEAD "$cand" 2>/dev/null)"
+            if [ -n "$base" ]; then ref="$base"; break; fi
+        done
         if [ -z "$ref" ]; then
-            printf '  no merge-base with master; pass a ref explicitly\n'
+            printf '  no merge-base with master or main; pass a ref explicitly\n'
             return 1
         fi
     fi
@@ -477,8 +598,7 @@ st_identity() {
     mkdir -p "$IDENT_WORK" || return 1
 
     printf '  building HEAD ...\n'
-    cargo build >"$LOGDIR/build-head.log" 2>&1 || {
-        tail -n 30 "$LOGDIR/build-head.log"; return 1; }
+    ident_build "$ROOT" "$LOGDIR/build-head.log" || return 1
     cp "$BIN" "$IDENT_WORK/bin-head" || return 1
 
     # `git archive | tar -x`, deliberately, and NOT `git worktree add`: adding a
@@ -486,7 +606,12 @@ st_identity() {
     # checkout hangs off. Materialising the ref as a plain directory is
     # read-only on the repo, needs no cleanup registration, and there is no
     # build.rs here that would miss the missing .git.
-    IDENT_CHECKOUT="$IDENT_WORK/ref-checkout"
+    #
+    # The directory is keyed by the resolved SHA, never by the ref NAME. "the
+    # ref checkout" is a different tree for every commit, and one fixed path
+    # holding all of them in turn is how the wrong tree gets compared — by this
+    # script, or by a cargo fingerprint that still remembers the last one.
+    IDENT_CHECKOUT="$IDENT_WORK/ref-${ref_sha:0:12}"
     printf '  extracting ref into %s ...\n' "$IDENT_CHECKOUT"
     mkdir -p "$IDENT_CHECKOUT" || return 1
     git -C "$ROOT" archive --format=tar "$ref_sha" 2>"$LOGDIR/archive.log" \
@@ -496,14 +621,17 @@ st_identity() {
         tail -n 20 "$LOGDIR/archive.log"
         return 1
     fi
+    # git archive dates every extracted file to the ref's commit, which is by
+    # definition in the past. Cargo's freshness is mtimes, so an untouched
+    # extraction looks older than whatever artifact is already in target/ and
+    # compiles nothing at all.
+    find "$IDENT_CHECKOUT" -exec touch {} + || return 1
     printf '  building ref ...\n'
-    ( cd "$IDENT_CHECKOUT" && CARGO_TARGET_DIR="$ROOT/target" cargo build ) \
-        >"$LOGDIR/build-ref.log" 2>&1 || {
-        tail -n 30 "$LOGDIR/build-ref.log"; return 1; }
+    ident_build "$IDENT_CHECKOUT" "$LOGDIR/build-ref.log" || return 1
     cp "$BIN" "$IDENT_WORK/bin-ref" || return 1
 
     local map rc=0
-    for map in open crossings; do
+    for map in $IDENT_MAPS; do
         fingerprints "$IDENT_WORK/bin-head" "$ROOT" "$map" "$IDENT_SEED" \
             "$LOGDIR/fp-head-$map" || { rc=1; continue; }
         fingerprints "$IDENT_WORK/bin-ref" "$IDENT_CHECKOUT" "$map" "$IDENT_SEED" \
@@ -522,7 +650,13 @@ st_identity() {
 
     # The ref build left target/debug/bridgehead belonging to the ref. Put HEAD's
     # back so the next thing to use this checkout is not quietly running old code.
+    # rm first: cargo uplifts by HARD LINK, so copying onto the path in place
+    # would write HEAD's bytes into target/debug/deps/bridgehead-<hash> as well.
+    rm -f "$BIN"
     cp "$IDENT_WORK/bin-head" "$BIN" 2>/dev/null
+    printf '  head binary restored to %s\n' "$BIN"
+    printf '  (this crate'"'"'s cargo fingerprint is dropped on exit — your next\n'
+    printf '   `cargo build` here recompiles once, on purpose)\n'
     return "$rc"
 }
 
@@ -568,9 +702,12 @@ usage: tools/verify.sh [smoke|standard|full|identity [ref]] [--list]
              The default bead-level bar, and what a bare invocation runs.
   full       standard + a 2-seed x 2-map sim matrix + a determinism pair +
              all four bridge verifiers driven against a live engine.
-  identity   [ref] build ref (default: merge-base with master) and HEAD, run
-             seeded fixed-dt fingerprint sims on both maps, byte-compare —
-             the cheap proof that a change is no-behavior-change.
+  identity   [ref] build ref (default: merge-base with master, or main) and
+             HEAD, run seeded fixed-dt fingerprint sims on both maps,
+             byte-compare — the cheap proof that a change is
+             no-behavior-change. Both builds must actually compile, and this
+             checkout's crate fingerprint is dropped afterwards, so your next
+             `cargo build` here recompiles once.
 
 Read the header of this file for the knobs and the reasoning.
 EOF
