@@ -50,6 +50,14 @@ EXPECTED_TOP_KEYS = {
 #     Same `skip_serializing_if` rule and the same reason: the v3 vocabulary is
 #     additive, and a commander that never says the word must not be able to
 #     tell it exists from the shape of its snapshot.
+#   * alarms is present only while this seat has a standing alarm
+#     (docs/AFFORDANCES.md, "Alarms"). Same `skip_serializing_if` empty rule as
+#     triggers and plans: a quiet seat's snapshot is byte-shape identical to a
+#     pre-alarm one, and this script's own short scripted run raises nothing —
+#     it never sees an enemy army, never loses a squad, never runs its mine
+#     dry. Listed here rather than in the exact set for the honest reason that
+#     a slow or unlucky run could raise one, not because the alarm layer is
+#     optional.
 #   * waiting_for / match_started exist ONLY while the ready handshake is
 #     holding the match at t=0 (docs/INTENT.md, "The ready handshake"). This
 #     script sends `ready` below and then waits for the hold to lift, so by the
@@ -59,7 +67,7 @@ EXPECTED_TOP_KEYS = {
 #     mid-match. `the_handshake_keys_are_gone_once_the_match_starts` (step 2b)
 #     is the assertion that actually pins their disappearance.
 OPTIONAL_TOP_KEYS = {
-    "applied", "game_over_reason", "triggers", "plans",
+    "applied", "game_over_reason", "triggers", "plans", "alarms",
     "waiting_for", "match_started",
 }
 

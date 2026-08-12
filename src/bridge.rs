@@ -273,7 +273,16 @@ impl Plugin for BridgePlugin {
                     // snapshot describes the finished frame, so it now lands
                     // after movement, combat and the economy rather than
                     // racing them and photographing a half-stepped world.
-                    write_snapshot.in_set(SimSet::Feed).after(IntentApply),
+                    // ...and after `AlarmSet`, so the `alarms` array is
+                    // the one computed from THIS frame rather than the
+                    // previous one. Both are in `Feed`; without the edge the
+                    // executor decides, and a snapshot that reported alarms
+                    // one frame stale would be a rendering that disagreed
+                    // with the feed line beside it.
+                    write_snapshot
+                        .in_set(SimSet::Feed)
+                        .after(IntentApply)
+                        .after(AlarmSet),
                 )
                     .after(FogSet)
                     .run_if(bridge_enabled),
@@ -694,6 +703,30 @@ struct StateOut {
     /// Absent when you have none, on the same rule as `command_nodes`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     plans: Vec<PlanOut>,
+    /// **The decisions the engine thinks are worth interrupting you for**, and
+    /// what is already being done about each — docs/AFFORDANCES.md § Alarms.
+    ///
+    /// A STATUS, not an event: an entry is here for exactly as long as its
+    /// condition holds, refreshed every sweep so its counts and its ETA are
+    /// this frame's. The transitions ride in `events` (`alarm: …` on the way
+    /// in, `alarm clear: …` on the way out), so a reader who polls slowly sees
+    /// what is true now and a reader who watches the feed sees when it
+    /// changed. Neither has to poll for the other's half.
+    ///
+    /// **Read `running_default` before you decide anything.** An alarm never
+    /// acts and never waits for you — it fires only after the fast tier
+    /// (doctrine, triggers) has already answered, and that answer is what
+    /// `running_default` names. Saying nothing is a legitimate move: you get
+    /// the running default. The alarm exists so that getting it is a choice.
+    ///
+    /// Own team only, and fog-legal throughout: the enemy half of
+    /// `enemy_army_sighted` comes from your own `intel` ledger and every other
+    /// alarm is about your own units, buildings and doctrine.
+    ///
+    /// Absent when nothing is standing, on the same rule as `command_nodes` —
+    /// a snapshot from a quiet match is byte-shape identical to a v3 one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    alarms: Vec<AlarmOut>,
 
     // --- co-command (copilot seats only) ---------------------------------
     //
@@ -1258,6 +1291,54 @@ fn plans_out(my_plans: &[PlanRun]) -> Vec<PlanOut> {
         .collect()
 }
 
+/// One standing alarm, wire-shaped. docs/AFFORDANCES.md § Alarms.
+///
+/// Four fields carry the whole design and none of them is optional:
+/// **what happened** (`fact`), **what is already being done about it**
+/// (`running_default`), **since when** (`since_t`), and **which alarm this is**
+/// (`id`, so a commander can key off a stable string rather than parse
+/// English). The affordance menu this feeds (AFFORDANCES.md plan item 3) is a
+/// later bead; these are the fields it will render, and they are useful on
+/// their own in the meantime.
+#[derive(Serialize)]
+struct AlarmOut {
+    /// Stable wire id — `"enemy_army_sighted"`, `"squad_below_half"`,
+    /// `"income_collapse"`, `"places_under_attack"`.
+    id: &'static str,
+    /// The triggering fact, in the same English the `events` line used.
+    fact: String,
+    /// **What happens if you say nothing.** Never empty: when nothing is
+    /// standing it says so in those words, which is the single most useful
+    /// thing this array can tell you.
+    running_default: String,
+    /// Game time the alarm started standing.
+    since_t: f32,
+    /// `"info"`, `"warning"` or `"critical"` — triage, for a reader with four
+    /// of these and one poll's worth of attention.
+    severity: &'static str,
+    /// Seconds until the running default arrives, when it is a movement.
+    /// Absent when nothing is in transit, which means the default is to hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eta_s: Option<f32>,
+}
+
+/// This seat's standing alarms, wire-shaped. A free function for the reason
+/// `plans_out` is one: the shape a commander parses should be testable without
+/// standing up a whole snapshot.
+fn alarms_out(my_alarms: &[Alarm]) -> Vec<AlarmOut> {
+    my_alarms
+        .iter()
+        .map(|a| AlarmOut {
+            id: a.kind.id(),
+            fact: a.fact.clone(),
+            running_default: a.running_default.clone(),
+            since_t: a.since_t,
+            severity: a.severity.as_str(),
+            eta_s: a.eta_s,
+        })
+        .collect()
+}
+
 #[derive(Serialize)]
 struct HeroOut {
     level: u32,
@@ -1628,6 +1709,13 @@ struct StandingOrders<'w> {
     regions: Res<'w, Regions>,
     /// The third kind, sequenced. Same one-writer rule, same two readers.
     plans: Res<'w, Plans>,
+    /// Here rather than as a seventeenth parameter — `write_snapshot` sits
+    /// exactly on Bevy's 16-parameter ceiling — and the pairing is the right
+    /// one anyway: an alarm's whole content is the RUNNING DEFAULT of the
+    /// standing policy in this bundle, so the two answer one question from
+    /// opposite ends. What did you tell the engine to do without you, and what
+    /// is it doing about the thing that just happened.
+    alarms: Res<'w, Alarms>,
 }
 
 /// The co-command side-channel: the pending proposal queue and the team's
@@ -1703,6 +1791,7 @@ fn write_snapshot(
             standing.triggers.get(seat.team),
             standing.regions.get(seat.team),
             standing.plans.get(seat.team),
+            standing.alarms.get(seat.team),
             *tech.tiers,
             *tech.research,
             tech.races.get(seat.team),
@@ -1740,6 +1829,11 @@ fn write_seat_snapshot(
     my_regions: &[Region],
     // This seat's own plans, pre-sliced by team on the same reasoning.
     my_plans: &[PlanRun],
+    // This seat's own standing alarms, pre-sliced by team for the third time
+    // and the strongest reason yet: an alarm is a reading of one team's own
+    // trouble, and the opponent learning that your income collapsed would be
+    // the single most valuable leak in the protocol.
+    my_alarms: &[Alarm],
     tiers: TechTiers,
     team_research: TeamResearch,
     // **Your roster.** The catalog is one document for the whole session and
@@ -2092,6 +2186,11 @@ fn write_seat_snapshot(
     // trigger list is not.
     let plans = plans_out(my_plans);
 
+    // Standing alarms, in `ALL_ALARM_KINDS` order — `Alarms` sorts them there
+    // so the array a commander diffs between two polls depends on which
+    // alarms stand and never on the order they arrived in.
+    let alarms = alarms_out(my_alarms);
+
     // Bounty caches this seat can see, sorted by id so a seat serializes the
     // same order every tick. The two seats' lists now legitimately differ.
     let mut bounty_snaps: Vec<BountySnap> = bounties
@@ -2322,6 +2421,7 @@ fn write_seat_snapshot(
         triggers,
         regions,
         plans,
+        alarms,
         copilot: copilot_out,
         proposals: proposals_out,
         recent_resolutions: resolutions_out,
@@ -2802,6 +2902,86 @@ mod tests {
     /// The contract is that `step`/`of`/`status` answer "is the sequence I
     /// wrote still happening" without any correlation work, and that `steps` is
     /// the JSON the commander sent — so reading a plan out, changing one step,
+    /// The alarm wire shape, pinned. Four keys are mandatory because the
+    /// design is: `fact` says what happened, `running_default` says what is
+    /// already being done, `since_t` says since when, `id` is the stable
+    /// string a commander branches on. `eta_s` is the one optional field and
+    /// is absent — not zero — when nothing is in transit, because "nothing is
+    /// moving" and "it arrives now" are opposite answers.
+    #[test]
+    fn an_alarm_carries_its_fact_its_running_default_and_its_clock() {
+        let alarms = vec![
+            Alarm {
+                kind: AlarmKind::PlacesUnderAttack,
+                fact: "2 places under attack at once: near our base (TownHall); at (60, 60) (Farm)"
+                    .to_string(),
+                running_default: "your trigger home-guard fired at t=203 — squad 1 is closing \
+                                  on near our base (ETA 22s)"
+                    .to_string(),
+                since_t: 209.0,
+                severity: EventSeverity::Critical,
+                eta_s: Some(22.0),
+                pos: Some(Vec3::ZERO),
+            },
+            Alarm {
+                kind: AlarmKind::IncomeCollapse,
+                fact: "income collapse: the one gold mine your hall works is dry".to_string(),
+                running_default: "nothing recovers this automatically — workers continue their \
+                                  current assignment; squad 1 (4 units) holds defend near our base"
+                    .to_string(),
+                since_t: 180.0,
+                severity: EventSeverity::Warning,
+                eta_s: None,
+                pos: None,
+            },
+        ];
+        let json = serde_json::to_string(&alarms_out(&alarms)).unwrap();
+        let back: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.len(), 2);
+
+        assert_eq!(back[0]["id"], "places_under_attack");
+        assert_eq!(back[0]["severity"], "critical");
+        assert_eq!(back[0]["since_t"], 209.0);
+        assert_eq!(back[0]["eta_s"], 22.0);
+        assert!(back[0]["fact"].as_str().unwrap().starts_with("2 places under attack"));
+        assert!(back[0]["running_default"]
+            .as_str()
+            .unwrap()
+            .contains("home-guard"));
+
+        assert_eq!(back[1]["id"], "income_collapse");
+        assert_eq!(back[1]["severity"], "warning");
+        assert!(
+            back[1].get("eta_s").is_none(),
+            "nothing in transit must be an ABSENT eta, never an eta of zero"
+        );
+
+        // `pos` is deliberately not on the wire: it is the HUD's camera hint,
+        // and the coordinate is already inside `fact` where a commander reads
+        // it as English. Adding it later is additive; removing it would not be.
+        assert!(back[0].get("pos").is_none());
+
+        // Every alarm names its running default. Not a style note — it is the
+        // property the whole layer is for, and an empty string would be an
+        // alarm that shouts and helps nobody.
+        for row in &back {
+            assert!(
+                !row["running_default"].as_str().unwrap().is_empty(),
+                "an alarm with no running default is an alarm that only shouts"
+            );
+        }
+    }
+
+    /// A seat that has nothing standing sends the key set it always did.
+    #[test]
+    fn a_quiet_seat_carries_no_alarms_key_at_all() {
+        assert!(
+            alarms_out(&[]).is_empty(),
+            "and `skip_serializing_if = Vec::is_empty` keeps the key out of the \
+             snapshot, so a v3 exact-key-set assertion still passes mid-match"
+        );
+    }
+
     /// and sending it back under the same name is a legal `plan_set`.
     #[test]
     fn a_plan_round_trips_through_the_snapshot_json() {

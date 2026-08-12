@@ -180,6 +180,7 @@ conflicts loudly (both edited the same record) or not at all.
 | `abilities.ron` | `AbilityDef` rows + per-caster slot lists + default auto-cast | `abilities_of_unit`, `abilities_of_building`, `default_autocast` |
 | `items.ron` | `ItemDef` (Shop shelf) | `item_def` |
 | `research.ron` | ladder ids/labels/descriptions, the shared price list, the forge | `ResearchKind::{id,label,description}`, `research_step`, `research_building` |
+| `alarms.ron` | `AlarmTuning` — one threshold and one reflex window per `AlarmKind` | `alarm_tuning` |
 
 **What is data and what is code.** *Every number and every flag* is data.
 *Identity and rules* stay in Rust:
@@ -341,7 +342,7 @@ Deaths → Fog → Input → CoCommand → AiThink → Think → Intent
 | `Bounty` | bounty.rs — spawn, claim, expire |
 | `Economy` | economy.rs — bank, build, research, harvest, train, buy |
 | `Upkeep` | xp, regen, cooldowns, status, supply, tech, win check |
-| `Feed` | `produce_game_events`, `write_snapshot`, fingerprint, logging, headless exit |
+| `Feed` | `produce_game_events`, alarm.rs's evaluator (`AlarmSet`, ordered between the two), `write_snapshot`, fingerprint, logging, headless exit |
 | `Cosmetic` | health bars, rings, shockwaves, orb pulses, camera — outside the contract |
 
 Before this, the schedule had exactly two ordering handles — `FogSet` and
