@@ -63,6 +63,11 @@ LEDGER = REPO / "arena" / "ledger.jsonl"
 
 ID_RE = re.compile(r"^r\d+$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The short content hashes `arena_run.file_digest` writes into
+# `ruleset.constants` for the data tables a round was played under. Pinned to a
+# shape so a truncated, uppercased or full-length digest cannot land beside the
+# twelve-character ones and compare unequal to a round it is identical to.
+DIGEST_RE = re.compile(r"^[0-9a-f]{12}$")
 
 MAPS = ("open", "crossings")
 TEAMS = ("Claude", "Human")
@@ -75,6 +80,20 @@ PROVENANCE = ("recorded", "backfilled")
 # purpose. `none` is a round that stopped without ending.
 END_REASONS = ("razed", "surrender", "score", "none")
 VERDICT_STATUS = ("confirmed", "refuted", "unresolved")
+
+#: The data tables whose tuning a round is played under but which appear
+#: nowhere in `env`, as `ruleset.constants` key -> file in `assets/data/`.
+#: `arena_run.ruleset_constants` writes the digests and the validator below
+#: checks their shape, so the two read one table rather than agreeing twice.
+#:
+#: `alarms.ron` decides when a commander is forced to re-decide and
+#: `stances.ron` decides what each stance word does; both move every round
+#: after a retune, which is precisely what a ledger comparison must be able to
+#: see (docs/AFFORDANCES.md constraint 3).
+TUNING_FILES = {
+    "alarms_ron": "alarms.ron",
+    "stances_ron": "stances.ron",
+}
 
 TOP_LEVEL = (
     "id",
@@ -172,6 +191,33 @@ def validate(rec: dict) -> list[str]:
         want(rules.get("map") in (None,) + MAPS, f"map {rules.get('map')!r} not in {MAPS}")
         want(isinstance(rules.get("env"), dict), "ruleset.env must be an object")
         want(isinstance(rules.get("constants"), dict), "ruleset.constants must be an object")
+        consts = rules.get("constants") if isinstance(rules.get("constants"), dict) else {}
+        # `constants` stays open — it is where a round writes whatever balance
+        # value it was played under, and closing it would mean a bead per
+        # number. Three keys are typed anyway, because they are written by a
+        # tool rather than by a person and a silent format drift in one of them
+        # would make two identical rounds compare as different ones.
+        #
+        # `affordance_doc` is the scaffold version the round was played with
+        # (docs/AFFORDANCES.md constraint 3: "once the scaffold encodes any
+        # judgment, an arena result measures model+scaffold"). Present only on
+        # rounds where a seat actually read the document — an unconditional
+        # stamp would make the scaffolded and bare rounds indistinguishable,
+        # which is the comparison the field exists for. WHICH seat read it is
+        # `seats[].scaffold`.
+        doc = consts.get("affordance_doc")
+        want(
+            "affordance_doc" not in consts
+            or (isinstance(doc, str) and doc.strip() != ""),
+            "ruleset.constants.affordance_doc must be a non-empty version string "
+            "(tools/affordances.py DOC_VERSION) when present",
+        )
+        for key in TUNING_FILES:
+            want(
+                key not in consts or bool(DIGEST_RE.match(str(consts[key]))),
+                f"ruleset.constants.{key} must be a {DIGEST_RE.pattern} content digest "
+                f"of assets/data/{TUNING_FILES[key]} when present",
+            )
 
     want(isinstance(rec["seats"], list) and rec["seats"] != [], "a round needs at least one seat")
     for i, seat in enumerate(rec["seats"] if isinstance(rec["seats"], list) else []):
@@ -183,6 +229,16 @@ def validate(rec: dict) -> list[str]:
         want(seat.get("team") in TEAMS, f"{where}.team {seat.get('team')!r} not in {TEAMS}")
         want(seat.get("kind") in SEAT_KINDS, f"{where}.kind {seat.get('kind')!r} not in {SEAT_KINDS}")
         want("persona" in seat, f"{where} has no persona field")
+        # `scaffold` — the media-type version of the affordance document THIS
+        # seat played with (docs/AFFORDANCES.md constraint 3). Additive and
+        # OPTIONAL on the same terms as `ready_wait_s`: a seat that played bare
+        # omits the key rather than nulling it, so an A/B round says which
+        # chair had the document without claiming ignorance about the other.
+        want(
+            "scaffold" not in seat
+            or (isinstance(seat["scaffold"], str) and seat["scaffold"].strip() != ""),
+            f"{where}.scaffold must be a non-empty version string when present",
+        )
         # `ready_wait_s` — wall seconds this seat took to send `ready` before
         # the match clock started (docs/INTENT.md, "The ready handshake").
         # Additive and OPTIONAL: rounds recorded before the handshake existed
@@ -216,6 +272,19 @@ def validate(rec: dict) -> list[str]:
         want(
             not (res.get("winner") is None and res.get("decisive") is True),
             "result says decisive but names no winner",
+        )
+        # A score round is never decisive, enforced at the boundary rather than
+        # trusted to the two readers upstream (wc3clone-j84). `read_log` and
+        # `wait_for_seat_game_over` each derive `decisive` from the reason, and
+        # they agree today; a third reader, a hand-written record or a
+        # backfill has no such habit. The claim is the ledger's, so the ledger
+        # checks it: a time-cap verdict is a referee's opinion about who was
+        # ahead, and the whole reason it is spelled differently from the
+        # engine's own two endings is that it must never be quoted as a win.
+        want(
+            not (res.get("game_over_reason") == "score" and res.get("decisive") is True),
+            "result says decisive on a `score` round — a time-cap verdict is the "
+            "referee's opinion about who was ahead, not a win the game recognises",
         )
 
     ev = rec["evidence"]

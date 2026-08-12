@@ -26,8 +26,8 @@ Every record answers six questions, in this order:
 
 | Field | The question it answers |
 |---|---|
-| `ruleset` | **Under what rules?** Map, environment, the balance constants at play, the commit. |
-| `seats` | **Who was playing?** Which side, which team, scripted or commander, and which creed. |
+| `ruleset` | **Under what rules?** Map, environment, the balance constants at play, the scaffold version in force, the commit. |
+| `seats` | **Who was playing?** Which side, which team, scripted or commander, which creed, and which seat read the affordance document. |
 | `hypothesis` | **What did we want to find out?** Written before the match. |
 | `result` | **What happened?** Winner, length, and which of the engine's endings it was. |
 | `evidence` | **How do we know?** AARs, logs, final snapshots, screenshots, metrics, sources. |
@@ -95,13 +95,19 @@ diff shows what changed about a round rather than that a dict reordered itself.
   "ruleset": {
     "map": "crossings",           // open | crossings
     "env": {"BH_BRIDGE": "both", "BH_MAP": "crossings"},
-    "constants": {"mine_gold": 5000},
+    "constants": {
+      "mine_gold": 5000,                 // a balance value not visible in env
+      "alarms_ron": "a773dd4c4f9a",      // content digest of assets/data/alarms.ron
+      "stances_ron": "22ef85561d44",     // content digest of assets/data/stances.ron
+      "affordance_doc": "affordance-doc/1"  // only when a seat read the document
+    },
     "commit": "c8be188",
     "notes": "One lever changed from r9: MINE_GOLD 3500->5000."
   },
   "seats": [
     {"seat": "bridge/red",  "team": "Claude", "kind": "commander",
-     "persona": "rusher", "model": "opus"}
+     "persona": "rusher", "model": "opus",
+     "scaffold": "affordance-doc/1"}     // optional; absent on a seat that played bare
   ],
   "hypothesis": "Does the rusher line still win with 40% more gold in the ground?",
   "result": {
@@ -155,6 +161,48 @@ diff shows what changed about a round rather than that a dict reordered itself.
 - **`constants` is for balance values that were in force but are not in `env`.**
   `MINE_GOLD` is a compile-time constant, so the only way a round can say which
   value it was played under is to write it down.
+- **A `score` round is never `decisive`, and the validator now says so.** Both
+  readers of a verdict derive it that way already (`read_log` from the engine's
+  log, `wait_for_seat_game_over` from the snapshot); the check exists because a
+  hand-written or backfilled record has no such habit, and the claim belongs to
+  the ledger rather than to whoever filled it in.
+
+### What the ruleset records about the scaffold
+
+`docs/AFFORDANCES.md` constraint 3: *once the scaffold encodes any judgment, an
+arena result measures model+scaffold. That is fine — it is the experiment we
+want — but the scaffold version must appear in the round's `ruleset` so ledger
+comparisons stay honest.* Three keys carry that, and they are written by
+`tools/arena_run.py` rather than typed:
+
+| Key | Where | When | What it is |
+|---|---|---|---|
+| `ruleset.constants.affordance_doc` | round | only when a seat read the document | `tools/affordances.py`'s `DOC_VERSION` — the media type of the affordance document (`bridge_view.py --doc`). |
+| `seats[].scaffold` | seat | only on the seats that read it | the same version, on the chair it sat in. |
+| `ruleset.constants.alarms_ron`, `.stances_ron` | round | **always** | the first 12 hex of the sha256 of `assets/data/alarms.ron` and `stances.ron`. |
+
+Three decisions in there are worth their reasons:
+
+- **The document version is per seat, because the interesting rounds are A/B
+  rounds** — the same model in both chairs, the document in one of them. A
+  round-level flag cannot describe that experiment, so the seat carries which
+  chair had it and `constants` carries which version was in force. A seat that
+  played bare **omits** the key; it is a fact, not a gap, and nothing lands in
+  `unknown`.
+- **The stamp is conditional.** An unconditional `affordance_doc` on every
+  round would make the scaffolded and unscaffolded rounds indistinguishable,
+  which is the one comparison the field exists to enable.
+- **The tuning digests are unconditional.** `alarms.ron` decides when a
+  commander is *forced* to re-decide and `stances.ron` decides what each stance
+  word does; a retune of either moves every round after it, scaffolded or not,
+  so recording them only for scaffolded rounds would hide a change in exactly
+  the comparison it invalidates. They hash the bytes, so a comment reflow reads
+  as a retune — the safe direction to be wrong in, since a false "something
+  moved" costs one glance at a diff and a missed one costs a comparison between
+  two rounds that were not playing the same game. `BH_DATA_DIR` is honoured
+  when it is set, because that flag is what decides which copy of the tables
+  the engine actually reads; without it the engine runs the copy compiled into
+  the binary and `ruleset.commit` is the record of that.
 
 ## Using it
 
@@ -192,7 +240,18 @@ tools/arena_run.py --hypothesis "does the tier ladder change scripted pacing?" \
 tools/arena_run.py --hypothesis "does the rush still win at 5000g?" \
     --seat red=commander:rusher --seat blue=commander:boomer \
     --map crossings --windowed --cap 3000
+
+# an A/B round: red plays with the affordance document, blue plays bare
+tools/arena_run.py --hypothesis "does the scaffold carry a smaller model?" \
+    --seat red=commander:haiku --seat blue=commander:haiku --scaffold red
 ```
+
+`--scaffold red|blue|both` says which commander seats read
+`tools/bridge_view.py --doc`, and it does two things: it stamps the round (the
+three keys above) and it puts the document in the briefing line the orchestrator
+spawns that seat from — the ledger entry is a claim about what the seat was
+given, and the briefing is where the claim is made true. It refuses a scripted
+seat, which reads no snapshot and therefore no document.
 
 It derives `BH_BRIDGE` and `BH_AI_BOTH` from the seats rather than trusting a
 hand-typed value — they are two spellings of one fact (who is playing which
