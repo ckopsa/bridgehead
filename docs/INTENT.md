@@ -1051,10 +1051,21 @@ mutation path. What it gains is a shorter way to write the same verbs.
 
 ```
 "hold the northwest ford, forage mid with the cavalry, retreat at 35%"
-  -> {"type":"squad","units":[…],"id":1}
+  -> {"type":"squad","select":"all army","id":1}
      {"type":"posture","id":1,"posture":{"type":"defend","x":-60.0,"z":60.0,"radius":18.0}}
      …
 ```
+
+**A role goes on the wire as a role.** The clause above says "the army", which
+is a *selector*, so the phrase travels and the engine resolves it when the
+intent compiles — and the same clause inside a trigger or a plan resolves when
+it *fires*. "with the cavalry" names kinds, which no selector spells, so that
+one still compiles to ids and goes stale like any photograph. Same rule for the
+node a `harvest` gathers (`"target_select":"nearest tree"`) and the footprint a
+`build` takes (`"site":"nearest legal site"`, on a landmark but never on
+coordinates the commander typed). The tool used to freeze all of it; freezing
+was the entire content of red-r23's dead-hero trigger and blue-r23's farm that
+reported `site blocked` for a whole match.
 
 Two layers, deterministic first. A pattern table covers the idioms that already
 appear in COMMANDER_BRIEF.md and eight rounds of AARs — hold/push/forage/escort,

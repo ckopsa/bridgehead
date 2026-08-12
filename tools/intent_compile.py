@@ -92,6 +92,37 @@ clause into two. Say ", then" when you mean a step.
 
 A plan is once-through and bounded at 8 steps. Repetition is a trigger's job
 (`whenever`), which is the other half of the same sentence.
+
+ROLES ARE LATE-BOUND NOW
+------------------------
+This tool used to answer "who?" by reading the snapshot: "the army" became a
+list of unit ids, frozen at the moment you typed the sentence. That is fine for
+an order you send this second and wrong for everything else — the ids in an
+armed trigger are ids that die, and a rule that says `[7, 8, 9]` orders three
+corpses on its hundredth firing.
+
+The engine takes `{"select": "<phrase>"}` wherever it takes `units` now, and
+resolves the phrase when the intent is COMPILED — which for a trigger's `then`
+and a plan's step is when it FIRES. So whenever the English names a ROLE, this
+tool emits the role:
+
+    "send the army to north-pass"  -> {"type":"move","select":"all army", ...}
+    "retreat at 35%"               -> {"type":"retreat","select":"all army", ...}
+    "harvest lumber"               -> {"type":"harvest","select":"workers",
+                                       "target_select":"nearest tree"}
+
+Four English roles are engine selectors: the army words ("all army"), the
+worker words ("workers"), the hero words ("my hero") and "squad N". A phrase
+that names KINDS instead — "the cavalry", "the siege", "the champion" — has no
+selector to become, so it still compiles to ids, and that is honest: the engine
+has no role called "cavalry", and inventing one here would be this tool
+speaking a language the game does not.
+
+The same rule reaches the nodes and the site: `harvest` says `nearest tree` /
+`nearest mine` rather than memorising a node that gets chopped down, and a
+`build` whose ground came from a landmark rather than from typed coordinates
+says `"site": "nearest legal site"` so a footprint that is blocked at fire time
+is moved instead of refused.
 """
 
 import argparse
@@ -678,6 +709,105 @@ def resolve_units(text, snap, default="army"):
     return [u["id"] for u in mine if u.get("kind") in kinds]
 
 
+# The English roles that ARE engine selectors (shared.rs::parse_selector),
+# keyed by the kind list `KIND_WORDS` gives them. Keying on the kinds rather
+# than on the words is what makes the phrase and the id list agree BY
+# CONSTRUCTION: a word that selects exactly the kinds a selector selects is
+# that selector, and a word that selects anything else — "cavalry", "the
+# champion", "casters" — has no selector and keeps its ids.
+#
+# `Selector::AllUnits` ("all units", workers included) is deliberately absent.
+# Every army word this tool knows, "everything" included, has always meant the
+# FIGHTING force here (see `resolve_units`), and quietly widening it to sweep
+# up the workers would send peasants into a push on a sentence that used to
+# mean the opposite.
+SELECTOR_FOR_KINDS = {
+    ("Worker",): "workers",
+    ("Hero", "Priestess"): "my hero",
+}
+
+
+def selector_phrase(text, default="army"):
+    """The engine SELECTOR this phrase names, or `None` if it names kinds.
+
+    Mirrors `resolve_units` branch for branch, and on purpose: these two
+    functions answer the same question in two vocabularies, and the moment they
+    disagree the tool is reporting one selection and sending another.
+    """
+    phrase = (text or default).strip().lower()
+    tokens = [w for w in _words(phrase) if w not in NOISE]
+
+    m = re.search(r"squad\s*(\d+)", phrase)
+    if m:
+        return f"squad {int(m.group(1))}"
+
+    if phrase in ARMY_WORDS or any(w in ARMY_WORDS for w in tokens) or not tokens:
+        return "all army"
+
+    kinds = []
+    for token in tokens:
+        if token not in KIND_WORDS:
+            return None
+        kinds.extend(k for k in KIND_WORDS[token] if k not in kinds)
+    return SELECTOR_FOR_KINDS.get(tuple(kinds))
+
+
+class Selection:
+    """WHO a clause named: a late-bound role, or a frozen list of ids.
+
+    The distinction is the whole of this layer. A `phrase` travels in the
+    command and is resolved by the engine at the moment the intent compiles —
+    which for a trigger's `then` and a plan's step is when it fires. An id list
+    is a photograph of the snapshot the sentence was typed against, and it goes
+    stale the first time somebody dies.
+
+    So `fields()` sends ONE of them, never both: the engine's rule is that a
+    selector outranks the `units` beside it and the ids are not even reported,
+    which makes sending both a way to write something misleading in the log.
+    """
+
+    def __init__(self, ids, phrase=None):
+        self.ids = list(ids)
+        self.phrase = phrase
+
+    def frozen(self):
+        """The same units as ids. For the one caller that must EXCLUDE a member
+        (an escort may not escort itself) — a selector cannot say "except"."""
+        return Selection(self.ids, None)
+
+    def empty(self):
+        """Is there nothing here to order?
+
+        A role phrase is never empty, even when it currently matches nobody:
+        "when we have 8 footmen, retreat at 30%" is a rule about an army that
+        does not exist yet, and refusing it here would be this tool re-freezing
+        what the engine just unfroze. An empty match at FIRE time is the
+        engine's refusal to make, and it makes it out loud.
+        """
+        return not self.ids and self.phrase is None
+
+    def fields(self):
+        return {"select": self.phrase} if self.phrase else {"units": list(self.ids)}
+
+    def english(self):
+        """How the confirmation line names this selection.
+
+        A phrase reports its live count too, and says that is what it is: the
+        number is a fact about right now, and the phrase is what was sent.
+        """
+        if self.phrase:
+            return f"{self.phrase} ({len(self.ids)} right now)"
+        return f"{len(self.ids)} unit(s)"
+
+
+def resolve_selection(text, snap, default="army"):
+    """A phrase -> a `Selection`, or `None` if it names nothing this tool knows."""
+    ids = resolve_units(text, snap, default=default)
+    if ids is None:
+        return None
+    return Selection(ids, selector_phrase(text, default))
+
+
 def resolve_one_unit(text, snap, role, result, clause, default="hero"):
     """Exactly one unit, or a refusal that says how to say it unambiguously.
 
@@ -752,6 +882,15 @@ class Ctx:
         # taken, and the batch came back rejected.
         self.claimed_sites = [tuple(b["pos"]) for b in snap.own_buildings()]
         self.busy_workers = set()
+        # Is this clause being compiled as the ACTION OF A RULE — a trigger's
+        # `then`, or a step of a plan — rather than as an order to send now?
+        # It changes one thing, and only for the handlers that would otherwise
+        # freeze a specific entity: a `build` that picks the nearest worker
+        # today is picking a worker that may be dead when the rule fires, so
+        # under this flag it names the ROLE and lets the engine pick at fire
+        # time. Everything the selector layer already handles is late-bound
+        # whether or not this is set.
+        self.late_bound = False
 
     def claim_site(self, pos):
         """A free-enough site near `pos`, given what this batch already took."""
@@ -770,16 +909,20 @@ class Ctx:
     def squad_for(self, key, same_job):
         """A squad id for one directive clause, stable across re-issues.
 
-        `same_job(posture_string)` decides whether a live squad is already
-        doing this clause's work. When one is, the clause re-targets it instead
-        of allocating a new one — a commander that repeats a standing directive
-        every cycle keeps one squad rather than shredding its army into a fresh
-        one per turn.
+        `same_job(squad)` is handed the whole snapshot record and decides
+        whether that live squad is already doing this clause's work. When one
+        is, the clause re-targets it instead of allocating a new one — a
+        commander that repeats a standing directive every cycle keeps one squad
+        rather than shredding its army into a fresh one per turn.
+
+        The whole record rather than just `posture` because a squad's job is
+        now spelled two ways: the posture string, and the `stance` word beside
+        it that says which preset put it there.
         """
         if key in self.assigned:
             return self.assigned[key]
         for s in self.snap.squads:
-            if s.get("id") is None or not same_job(s.get("posture")):
+            if s.get("id") is None or not same_job(s):
                 continue
             self.assigned[key] = s["id"]
             return s["id"]
@@ -811,21 +954,21 @@ def posture_clause(ctx, clause, word, place_text, who_text, extra=None, radius=N
     if pos is None or place is None:
         ctx.result.fail(clause, f"cannot resolve place {place_text!r}")
         return []
-    ids = resolve_units(who_text, snap)
-    if ids is None:
+    who = resolve_selection(who_text, snap)
+    if who is None:
         ctx.result.fail(clause, f"cannot resolve units {who_text!r}")
         return []
 
-    def same_job(posture):
-        parsed = parse_posture(posture)
+    def same_job(s):
+        parsed = parse_posture(s.get("posture"))
         return (parsed is not None and parsed[0] == word
                 and parsed[1] is not None
                 and dist(parsed[1], pos) <= SQUAD_REUSE_RADIUS)
 
     sid = ctx.squad_for((word, round(pos[0]), round(pos[1])), same_job)
     out = []
-    if ids:
-        out.append({"type": "squad", "units": ids, "id": sid})
+    if not who.empty():
+        out.append({"type": "squad", **who.fields(), "id": sid})
     posture = dict(extra or {})
     posture["type"] = word
     posture.update(place)
@@ -839,7 +982,7 @@ def posture_clause(ctx, clause, word, place_text, who_text, extra=None, radius=N
     out.append({"type": "posture", "id": sid, "posture": posture})
     ctx.result.ok(
         clause,
-        f"squad {sid} {word}s {place_english(place)} with {len(ids)} unit(s)",
+        f"squad {sid} {word}s {place_english(place)} with {who.english()}",
     )
     return out
 
@@ -907,6 +1050,226 @@ def _squad_posture(m, ctx, clause):
         # a sentence with no numbers in it at either end of the wire.
     ctx.result.ok(clause, f"squad {sid} {word}s {place_english(place)}")
     return [{"type": "posture", "id": sid, "posture": posture}]
+
+
+# ---------------------------------------------------------------------------
+# Stances: one word for a whole doctrine
+# ---------------------------------------------------------------------------
+#
+# `shared.rs::ALL_STANCES`. Five fixed presets, each a bundle of posture +
+# anchor + leash + retreat threshold + focus list, installed atomically. The
+# tool validates the word only to produce the refusal that names all five —
+# the engine is what makes the rule true, and it refuses the same way.
+
+STANCES = ("turtle", "stage", "push", "secure", "harass")
+# Every English spelling of each, as a verb a squad does. Written out rather
+# than derived, because the derivation is exactly the kind of cleverness that
+# produces "pushs" and nobody notices until a commander types the word.
+STANCE_VERBS = {
+    "turtle": "turtle", "turtles": "turtle", "turtling": "turtle",
+    "stage": "stage", "stages": "stage", "staging": "stage",
+    "push": "push", "pushes": "push", "pushing": "push",
+    "secure": "secure", "secures": "secure", "securing": "secure",
+    "harass": "harass", "harasses": "harass", "harassing": "harass",
+}
+
+# The four stance words that are ONLY stance words, spelled for a regex.
+#
+# `push` is deliberately absent, and this is the one real seam between the two
+# doctrine vocabularies. "squad 2 pushes their base" has meant `posture push`
+# since squads existed, it is pinned by tests and written in
+# COMMANDER_BRIEF — and the brief is equally clear that the hand-tuned verbs
+# must stay reachable ("nothing here can be expressed only as a stance"). A
+# word cannot mean both in the same sentence shape, so the bare verb keeps the
+# older meaning and the preset is one of the explicit forms below:
+# "squad 2 takes the push stance at north-pass" / "put squad 2 on push".
+BARE_STANCE_VERBS = "turtles?|turtling|stages?|staging|secures?|securing|harass(?:es|ing)?"
+# Where an anchor hangs off a stance sentence.
+AT_PLACE = r"(?:\s+(?:at|on|in|around|near|to|onto)\s+(?P<place>.+?))?"
+
+
+def stance_word(raw, ctx, clause):
+    """A word -> one of the five, or a refusal that lists them.
+
+    The refusal is the point of parsing this here at all: the engine's own is
+    identically worded, but it arrives a turn later against a JSON string, and
+    by then the sentence that produced it is gone.
+    """
+    word = STANCE_VERBS.get(re.sub(r"\s+", " ", (raw or "").strip().lower()))
+    if word is None:
+        ctx.result.fail(clause, f"no stance called {(raw or '').strip()!r} — "
+                                f"the five are {', '.join(STANCES)}")
+        return None
+    return word
+
+
+def stance_anchor(place_text, ctx, clause):
+    """The `target`/`x`/`z` half of a stance sentence, `None` if unresolvable.
+
+    Spelled `target` for a name rather than `region`, because that is the word
+    COMMANDER_BRIEF's stance section uses and the engine takes both (`Intent::
+    Stance`'s `region` carries `#[serde(alias = "target")]`).
+
+    An anchor-less sentence carries NO anchor key at all: the engine's default
+    is the team's own base, which is what `turtle` means anyway, and writing it
+    out here would freeze a hall position that a second hall can move.
+    """
+    if not place_text:
+        return {}
+    fields = place_fields(place_text, ctx.snap)
+    if fields is None:
+        ctx.result.fail(clause, f"cannot resolve place {place_text!r}")
+        return None
+    if "region" in fields:
+        return {"target": fields["region"]}
+    return fields
+
+
+def stance_english(anchor):
+    if "target" in anchor:
+        return anchor["target"]
+    if "x" in anchor:
+        return f"({anchor['x']:.1f}, {anchor['z']:.1f})"
+    return "our base"
+
+
+def stance_intent(sid, word, anchor):
+    """One intent, and exactly one — which is what makes a stance the natural
+    action half of a trigger: "when my base is attacked, squad 1 turtles" defers
+    a whole doctrine without deferring a membership change nobody asked to
+    postpone."""
+    return {"type": "stance", "squad": sid, "stance": word, **anchor}
+
+
+@rule("squad-stance",
+      r"^squad\s*(?P<sid>\d+)\s+(?:should\s+|now\s+)?"
+      rf"(?P<stance>{BARE_STANCE_VERBS})"
+      r"(?:\s+(?:(?:at|on|in|around|near|to|onto)\s+)?(?P<place>.+?))?$")
+def _squad_stance(m, ctx, clause):
+    """"squad 1 turtles at our base" — a preset on a squad you already have.
+
+    Above `squad-retask` for the same reason `squad-posture` is: that rule
+    treats everything after the number as a place, so "turtles at our base"
+    would reach it as an unresolvable place name and earn an error about
+    geography for a sentence about doctrine.
+    """
+    word = stance_word(m.group("stance"), ctx, clause)
+    if word is None:
+        return []
+    anchor = stance_anchor(m.group("place"), ctx, clause)
+    if anchor is None:
+        return []
+    sid = int(m.group("sid"))
+    ctx.result.ok(clause, f"squad {sid} takes the {word} stance "
+                          f"at {stance_english(anchor)}")
+    return [stance_intent(sid, word, anchor)]
+
+
+@rule("squad-stance-named",
+      r"^(?:(?:put|set|switch|move)\s+)?squad\s*(?P<sid>\d+)\s+"
+      r"(?:to|on|into|in|takes?|adopts?|uses?|switch(?:es)?\s+to)\s+"
+      r"(?:the\s+)?(?P<stance>[a-z]+)\s+stance" + AT_PLACE + r"$")
+def _squad_stance_named(m, ctx, clause):
+    """"squad 2 takes the push stance at north-pass" — any of the five.
+
+    The literal word `stance` is what makes this shape safe to spell loosely:
+    without it, "squad 1 to mid" would be read as a request for a stance called
+    "mid" instead of the re-point it plainly is.
+    """
+    word = stance_word(m.group("stance"), ctx, clause)
+    if word is None:
+        return []
+    anchor = stance_anchor(m.group("place"), ctx, clause)
+    if anchor is None:
+        return []
+    sid = int(m.group("sid"))
+    ctx.result.ok(clause, f"squad {sid} takes the {word} stance "
+                          f"at {stance_english(anchor)}")
+    return [stance_intent(sid, word, anchor)]
+
+
+@rule("squad-stance-put",
+      r"^(?:put|set|switch)\s+squad\s*(?P<sid>\d+)\s+(?:on|to|into|in)\s+"
+      r"(?:the\s+)?(?P<stance>[a-z]+)" + AT_PLACE + r"$")
+def _squad_stance_put(m, ctx, clause):
+    """"put squad 3 on harass at their base". The leading verb is required so
+    the loose shape cannot swallow "squad 3 to mid"."""
+    return _squad_stance_named(m, ctx, clause)
+
+
+@rule("stance-imperative",
+      r"^stance\s+(?P<stance>[a-z]+)(?:\s+(?:for|on)\s+squad\s*(?P<sid>\d+))?"
+      + AT_PLACE + r"$")
+def _stance_imperative(m, ctx, clause):
+    """"stance push for squad 2 at north-pass" — the wire's own word order, for
+    a commander reading COMMANDER_BRIEF rather than this file."""
+    word = stance_word(m.group("stance"), ctx, clause)
+    if word is None:
+        return []
+    anchor = stance_anchor(m.group("place"), ctx, clause)
+    if anchor is None:
+        return []
+    # No squad named: squad 0 is the engine's auto-enroll pool, i.e. "the army
+    # I have not sorted", which is exactly who a bare "stance turtle" means.
+    sid = int(m.group("sid")) if m.group("sid") else 0
+    ctx.result.ok(clause, f"squad {sid} takes the {word} stance "
+                          f"at {stance_english(anchor)}")
+    return [stance_intent(sid, word, anchor)]
+
+
+@rule("stance-order",
+      rf"^(?P<stance>{BARE_STANCE_VERBS})"
+      r"(?:\s+(?:(?:at|on|in|around|near|to|onto)\s+)?(?P<place>.+?))??"
+      + WITH + r"$")
+def _stance_order(m, ctx, clause):
+    """"harass their base with squad 3" — the leading-verb form.
+
+    The mirror of `hold`/`push`/`forage`: name the job and the ground, and say
+    who with. Naming a squad targets that squad; naming units enrols them into
+    a squad first, which is the same two-sentence shape `posture_clause` emits
+    and for the same reason — membership and purpose are separate verbs.
+    """
+    word = stance_word(m.group("stance"), ctx, clause)
+    if word is None:
+        return []
+    anchor = stance_anchor(m.group("place"), ctx, clause)
+    if anchor is None:
+        return []
+    who_text = m.group("who")
+
+    named = re.match(r"^\s*squad\s*(\d+)\s*$", who_text or "", re.I)
+    if named:
+        sid = int(named.group(1))
+        ctx.result.ok(clause, f"squad {sid} takes the {word} stance "
+                              f"at {stance_english(anchor)}")
+        return [stance_intent(sid, word, anchor)]
+
+    who = resolve_selection(who_text, ctx.snap)
+    if who is None:
+        ctx.result.fail(clause, f"cannot resolve units {who_text!r}")
+        return []
+    # The ground, for the squad-reuse heuristic only — "is a squad already
+    # doing this job over there?" is a question about coordinates, and the
+    # anchor that goes on the wire may be a name.
+    pos = (resolve_place(m.group("place"), ctx.snap) if m.group("place")
+           else ctx.snap.my_base())
+
+    def same_job(s):
+        if s.get("stance") != word:
+            return False
+        parsed = parse_posture(s.get("posture"))
+        if parsed is None or parsed[1] is None:
+            return True
+        return dist(parsed[1], pos) <= SQUAD_REUSE_RADIUS
+
+    sid = ctx.squad_for(("stance", word, round(pos[0]), round(pos[1])), same_job)
+    out = []
+    if not who.empty():
+        out.append({"type": "squad", **who.fields(), "id": sid})
+    out.append(stance_intent(sid, word, anchor))
+    ctx.result.ok(clause, f"squad {sid} takes the {word} stance at "
+                          f"{stance_english(anchor)} with {who.english()}")
+    return out
 
 
 DEFAULT_REGION_RADIUS = 22.0
@@ -1052,6 +1415,32 @@ def _forage(m, ctx, clause):
     return posture_clause(ctx, clause, "forage", m.group("place"), m.group("who"))
 
 
+@rule("send", r"^(?:send|move|reposition)\s+(?P<who>.+?)\s+"
+              r"(?:to|into|onto|towards?)\s+(?P<place>.+?)$")
+def _send(m, ctx, clause):
+    """"send the army to north-pass" — a walk, and only a walk.
+
+    The one raw unit order in a table otherwise made of standing doctrine, and
+    it earns its place because it is the shortest sentence that shows what a
+    selector IS: the phrase goes on the wire and the engine decides who "the
+    army" is. Say `push` for the aggressive reading — a `move` walks past a
+    fight rather than taking it.
+    """
+    who = resolve_selection(m.group("who"), ctx.snap)
+    if who is None:
+        ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
+        return []
+    if who.empty():
+        ctx.result.fail(clause, f"no unit matches {m.group('who')!r}")
+        return []
+    place = place_fields(m.group("place"), ctx.snap)
+    if place is None:
+        ctx.result.fail(clause, f"cannot resolve place {m.group('place')!r}")
+        return []
+    ctx.result.ok(clause, f"{who.english()} walk to {place_english(place)}")
+    return [{"type": "move", **who.fields(), **place}]
+
+
 @rule("escort", r"^(?:escort|bodyguard|protect|babysit)\s+(?P<who_target>.+?)" + WITH + r"$")
 def _escort(m, ctx, clause):
     snap = ctx.snap
@@ -1059,19 +1448,26 @@ def _escort(m, ctx, clause):
                               ctx.result, clause)
     if target is None:
         return []
-    escorts = resolve_units(m.group("who"), snap)
-    if escorts is None:
+    who = resolve_selection(m.group("who"), snap)
+    if who is None:
         ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
         return []
-    escorts = [i for i in escorts if i != target]
+    # The one place a role phrase must be spent back into ids: an escort may
+    # not escort itself, "all army" contains the hero it is escorting, and no
+    # selector can say "except that one". Frozen ids are the honest answer to a
+    # sentence with an exception in it.
+    if who.phrase and target in who.ids:
+        who = who.frozen()
+    escorts = Selection([i for i in who.ids if i != target], who.phrase)
     # An escort has no ground position, so "already doing this job" means
     # "already escorting this exact unit" — the wire form is `escort:<id>`.
-    sid = ctx.squad_for(("escort", target), lambda p: p == f"escort:{target}")
+    sid = ctx.squad_for(("escort", target),
+                        lambda s: s.get("posture") == f"escort:{target}")
     out = []
-    if escorts:
-        out.append({"type": "squad", "units": escorts, "id": sid})
+    if not escorts.empty():
+        out.append({"type": "squad", **escorts.fields(), "id": sid})
     out.append({"type": "posture", "id": sid, "posture": {"type": "escort", "unit": target}})
-    ctx.result.ok(clause, f"squad {sid} escorts unit {target} with {len(escorts)} unit(s)")
+    ctx.result.ok(clause, f"squad {sid} escorts unit {target} with {escorts.english()}")
     return out
 
 
@@ -1117,11 +1513,11 @@ def _stand_down(m, ctx, clause):
                  r"(?:\s+to\s+(?P<place>.+?))?" + WITH + r"$")
 def _retreat(m, ctx, clause):
     snap = ctx.snap
-    ids = resolve_units(m.group("who"), snap)
-    if ids is None:
+    who = resolve_selection(m.group("who"), snap)
+    if who is None:
         ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
         return []
-    if not ids:
+    if who.empty():
         ctx.result.fail(clause, "no matching units to give a retreat policy")
         return []
     pos = resolve_place(m.group("place"), snap) if m.group("place") else snap.my_base()
@@ -1129,9 +1525,9 @@ def _retreat(m, ctx, clause):
         ctx.result.fail(clause, f"cannot resolve place {m.group('place')!r}")
         return []
     frac = round(int(m.group("pct")) / 100.0, 3)
-    ctx.result.ok(clause, f"{len(ids)} unit(s) fall back to "
+    ctx.result.ok(clause, f"{who.english()} fall back to "
                           f"({pos[0]:.1f}, {pos[1]:.1f}) below {frac:.0%}")
-    return [{"type": "retreat", "units": ids, "below": frac,
+    return [{"type": "retreat", **who.fields(), "below": frac,
              "x": round(pos[0], 1), "z": round(pos[1], 1)}]
 
 
@@ -1151,23 +1547,23 @@ def _focus(m, ctx, clause):
     if not classes:
         ctx.result.fail(clause, f"no valid target class in {m.group('classes')!r}")
         return []
-    ids = resolve_units(m.group("who"), snap)
-    if ids is None:
+    who = resolve_selection(m.group("who"), snap)
+    if who is None:
         ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
         return []
-    if not ids:
+    if who.empty():
         ctx.result.fail(clause, "no matching units to give a focus order")
         return []
-    ctx.result.ok(clause, f"{len(ids)} unit(s) focus {' > '.join(classes)}")
-    return [{"type": "priority", "units": ids, "classes": classes}]
+    ctx.result.ok(clause, f"{who.english()} focus {' > '.join(classes)}")
+    return [{"type": "priority", **who.fields(), "classes": classes}]
 
 
 @rule("leash", r"^(?:leash|tether|anchor|chain)\s+(?P<who>.+?)\s+(?:to|at|on)\s+"
                r"(?P<place>.+?)(?:\s+within\s+(?P<r>\d+))?$")
 def _leash(m, ctx, clause):
     snap = ctx.snap
-    ids = resolve_units(m.group("who"), snap)
-    if not ids:
+    who = resolve_selection(m.group("who"), snap)
+    if who is None or who.empty():
         ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
         return []
     pos = resolve_place(m.group("place"), snap)
@@ -1175,22 +1571,22 @@ def _leash(m, ctx, clause):
         ctx.result.fail(clause, f"cannot resolve place {m.group('place')!r}")
         return []
     radius = float(m.group("r")) if m.group("r") else 20.0
-    ctx.result.ok(clause, f"{len(ids)} unit(s) leashed to "
+    ctx.result.ok(clause, f"{who.english()} leashed to "
                           f"({pos[0]:.1f}, {pos[1]:.1f}) r{radius:.0f}")
-    return [{"type": "leash", "units": ids, "x": round(pos[0], 1),
+    return [{"type": "leash", **who.fields(), "x": round(pos[0], 1),
              "z": round(pos[1], 1), "radius": radius}]
 
 
 @rule("autocast", r"^(?:auto-?cast|auto-?slam)\s*(?:at\s+)?(?P<n>\d+)\+?" + WITH + r"$")
 def _autocast(m, ctx, clause):
     snap = ctx.snap
-    ids = resolve_units(m.group("who"), snap, default="hero")
-    if not ids:
+    who = resolve_selection(m.group("who"), snap, default="hero")
+    if who is None or who.empty():
         ctx.result.fail(clause, "no hero to give an auto-cast rule")
         return []
     n = int(m.group("n"))
-    ctx.result.ok(clause, f"{len(ids)} caster(s) auto-cast at {n}+ enemies")
-    return [{"type": "autocast", "units": ids, "min_enemies": n}]
+    ctx.result.ok(clause, f"{who.english()} auto-cast at {n}+ enemies")
+    return [{"type": "autocast", **who.fields(), "min_enemies": n}]
 
 
 @rule("buy", r"^(?:buy|purchase)\s+(?:a\s+|an\s+|the\s+)?(?P<item>.+?)"
@@ -1360,19 +1756,44 @@ def _build(m, ctx, clause):
         base = snap.my_base()
         pos = clamp((base[0] + (-12.0 if base[0] > 0 else 12.0),
                      base[1] + (-12.0 if base[1] > 0 else 12.0)))
-    if not is_literal_coords(m.group("place")):
+    exact = is_literal_coords(m.group("place"))
+    if not exact:
         pos = ctx.claim_site(pos)
-    workers = [u for u in snap.own_units()
-               if u.get("kind") == WORKER_KIND and u["id"] not in ctx.busy_workers]
-    if not workers:
-        ctx.result.fail(clause, "no free worker to build with")
-        return []
-    builder = min(workers, key=lambda u: dist(tuple(u["pos"]), pos))
-    ctx.busy_workers.add(builder["id"])
-    ctx.result.ok(clause, f"worker {builder['id']} builds {kind} at "
-                          f"({pos[0]:.1f}, {pos[1]:.1f})")
-    return [{"type": "build", "worker": builder["id"], "kind": kind,
-             "x": round(pos[0], 1), "z": round(pos[1], 1)}]
+    intent = {"type": "build", "kind": kind,
+              "x": round(pos[0], 1), "z": round(pos[1], 1)}
+
+    if ctx.late_bound:
+        # The action of a rule. A worker id frozen here is a worker that may be
+        # dead, or holding a different job, when the rule fires — red-r23's
+        # "wrong worker frozen into a repeating trigger". The role resolves at
+        # fire time to the lowest-id living worker, which is a worker.
+        intent["select"] = "workers"
+        builder = "whichever worker is free"
+    else:
+        workers = [u for u in snap.own_units()
+                   if u.get("kind") == WORKER_KIND and u["id"] not in ctx.busy_workers]
+        if not workers:
+            ctx.result.fail(clause, "no free worker to build with")
+            return []
+        chosen = min(workers, key=lambda u: dist(tuple(u["pos"]), pos))
+        ctx.busy_workers.add(chosen["id"])
+        intent["worker"] = chosen["id"]
+        builder = f"worker {chosen['id']}"
+
+    if not exact:
+        # The site the commander named is an ANCHOR, not a decision — they said
+        # "at our base", and this tool already reserves the right to nudge it
+        # off the buildings it can see. `site` hands that same permission to the
+        # engine, which can see the ones it cannot: blue-r23 armed a farm
+        # trigger on a point that was blocked, and got `site blocked` on every
+        # retry for the whole match instead of a farm. Literal coordinates never
+        # get it — those are a decision, and moving one is overruling it.
+        intent["site"] = "nearest legal site"
+
+    ctx.result.ok(clause, f"{builder} builds {kind} at "
+                          f"({pos[0]:.1f}, {pos[1]:.1f})"
+                          + ("" if exact else ", or the nearest legal site to it"))
+    return [intent]
 
 
 @rule("harvest", r"^(?:harvest|mine|gather|work|chop)\s+(?P<what>gold|lumber|wood|trees?|"
@@ -1380,35 +1801,33 @@ def _build(m, ctx, clause):
 def _harvest(m, ctx, clause):
     snap = ctx.snap
     what = m.group("what").lower()
-    selected = resolve_units(m.group("who"), snap, default="workers")
-    if selected is None:
+    who = resolve_selection(m.group("who"), snap, default="workers")
+    if who is None:
         ctx.result.fail(clause, f"cannot resolve units {m.group('who')!r}")
         return []
-    # Only workers can gather — intent.rs rejects anyone else with an error per
-    # unit, so filtering here turns a wall of errors into an empty selection.
-    chosen = set(selected)
-    workers = [u["id"] for u in snap.own_units()
-               if u.get("kind") == WORKER_KIND and u["id"] in chosen]
-    if not workers:
-        ctx.result.fail(clause, "no workers")
-        return []
-    if "lumber" in what or "wood" in what or "tree" in what:
-        trees = snap.data.get("trees_near", [])
-        if not trees:
-            ctx.result.fail(clause, "no trees in `trees_near`")
-            return []
-        home = snap.my_base()
-        node = min(trees, key=lambda t: dist(tuple(t["pos"]), home))["id"]
-        label = "lumber"
+    if who.phrase == "workers":
+        crew = who
     else:
-        target = pick_mine([], snap)
-        if target is None:
-            ctx.result.fail(clause, "no gold mine in the snapshot")
+        # Only workers can gather — intent.rs rejects anyone else with an error
+        # per unit, so filtering here turns a wall of errors into an empty
+        # selection. A phrase that is not the worker role has to be spent into
+        # ids to be filtered at all, which is the honest cost of naming a
+        # mixed selection for a workers-only verb.
+        chosen = set(who.ids)
+        crew = Selection([u["id"] for u in snap.own_units()
+                          if u.get("kind") == WORKER_KIND and u["id"] in chosen])
+        if crew.empty():
+            ctx.result.fail(clause, "no workers")
             return []
-        node = target["id"]
-        label = "gold"
-    ctx.result.ok(clause, f"{len(workers)} worker(s) harvest {label} at node {node}")
-    return [{"type": "harvest", "units": workers, "target": node}]
+    # The NODE is late-bound too, and this is the memorized-tree bug: an id
+    # picked here is the nearest node to our hall at the moment the sentence
+    # was typed, and a repeating trigger that says "harvest lumber" would send
+    # workers to a stump for the rest of the match. `target_select` is measured
+    # from the workers actually being sent, when the order compiles.
+    node = ("nearest tree" if ("lumber" in what or "wood" in what or "tree" in what)
+            else "nearest mine")
+    ctx.result.ok(clause, f"{crew.english()} harvest the {node}")
+    return [{"type": "harvest", **crew.fields(), "target_select": node}]
 
 
 @rule("scout", r"^(?:scout|probe|peek\s+at|look\s+at|check)\s+(?P<place>.+?)" + WITH + r"$")
@@ -1418,20 +1837,24 @@ def _scout(m, ctx, clause):
     if pos is None:
         ctx.result.fail(clause, f"cannot resolve place {m.group('place')!r}")
         return []
-    ids = resolve_units(m.group("who"), snap) if m.group("who") else None
-    if not ids:
+    who = resolve_selection(m.group("who"), snap) if m.group("who") else None
+    if who is None or who.empty():
         # Cheapest eyes on the map first (COMMANDER_BRIEF: raiders see 24).
+        # An id, not a role: "the cheapest thing I own that can see" is a
+        # judgement this tool makes about one unit, and the engine has no
+        # selector that means it.
+        ids = []
         for preference in ("Raider", "Archer", "Footman", "Worker"):
             ids = [u["id"] for u in snap.own_units() if u.get("kind") == preference]
             if ids:
                 break
-        ids = ids[:1]
-    if not ids:
+        who = Selection(ids[:1])
+    if who.empty():
         ctx.result.fail(clause, "no unit available to scout with")
         return []
-    ctx.result.ok(clause, f"{len(ids)} unit(s) attack-move to "
+    ctx.result.ok(clause, f"{who.english()} attack-move to "
                           f"({pos[0]:.1f}, {pos[1]:.1f}) to look")
-    return [{"type": "attackmove", "units": ids,
+    return [{"type": "attackmove", **who.fields(),
              "x": round(pos[0], 1), "z": round(pos[1], 1)}]
 
 
@@ -1794,6 +2217,10 @@ def compile_conditional(conn, cond_text, action_text, clause, ctx):
     probe_ctx.assigned = dict(ctx.assigned)
     probe_ctx.claimed_sites = list(ctx.claimed_sites)
     probe_ctx.busy_workers = set(ctx.busy_workers)
+    # Everything compiled here is the action of a RULE, so the handlers that
+    # would otherwise freeze one entity name a role instead. This is the whole
+    # reason a trigger's action can be trusted on its hundredth firing.
+    probe_ctx.late_bound = True
     trial = compile_clause(action_text, probe_ctx)
 
     if when is None:
@@ -1935,7 +2362,13 @@ def compile_plan(parts, directive, ctx):
             # It governs the step BEFORE it: the plan waits there.
             steps[-1]["advance"] = advance
 
-        out = compile_clause(part, ctx)
+        # Every step of a plan is submitted later, by the engine — so a step
+        # is late-bound for the same reason a trigger's action is.
+        was_late, ctx.late_bound = ctx.late_bound, True
+        try:
+            out = compile_clause(part, ctx)
+        finally:
+            ctx.late_bound = was_late
         if out is None:
             ctx.result.fail(directive, f"step {i + 1}: {part!r} did not compile — "
                                        f"see --explain")
@@ -2086,8 +2519,12 @@ WHAT THE PATTERN LAYER UNDERSTANDS
        (also: attack / strike / press / hit / assault / advance on / raze)
     forage <place> [with <units>]              -> squad + posture forage
     escort <unit> [with <units>]               -> squad + posture escort
+    send <units> to <place>                    -> move (a walk; push to fight)
     squad <n> <place>                          -> re-point squad n, keeping its job
     squad <n> holds|pushes|forages <place>     -> re-point and change its job
+    squad <n> turtles|stages|secures|harasses <place>  -> stance (see STANCES)
+    harass|secure|turtle|stage <place> [with <units>|with squad <n>] -> stance
+    put squad <n> on <stance> [at <place>]     -> any of the five, push included
     stand down [squad <n>]                     -> clear a posture
     retreat at <p>% [to <place>] [with <units>]-> retreat policy
     focus <class> [> <class> ...]              -> focus-fire priority
@@ -2098,7 +2535,9 @@ WHAT THE PATTERN LAYER UNDERSTANDS
 
   Economy and production:
     harvest gold|lumber [with <units>]         -> harvest
-    build <kind> [at <place>]                  -> build (nearest worker)
+    build <kind> [at <place>]                  -> build (nearest worker; the
+                                                  engine may shift a landmark
+                                                  site, never typed coords)
     train [n] <unit>                           -> train, spread across producers
     tier up                                    -> upgrade your top hall
     research attack|armor                      -> research at a Blacksmith
@@ -2113,6 +2552,27 @@ WHAT THE PATTERN LAYER UNDERSTANDS
           so a Keep team has TWO; verbs taking a list get both, and the verbs
           taking exactly one (escort, buy, use) refuse and ask for
           "the champion" or "the priestess" rather than guess.
+
+  ROLES ARE SENT AS ROLES, NOT AS ID LISTS. Four of those words are engine
+  SELECTORS, and when you use one the phrase itself travels in the command:
+      the army / everything / troops  -> "select":"all army"
+      workers / peons                 -> "select":"workers"
+      the hero / heroes               -> "select":"my hero"
+      squad <n>                       -> "select":"squad <n>"
+  The engine resolves the phrase when the intent COMPILES — which for a
+  trigger's action and a plan's step is when it FIRES. So "when my hero drops
+  below 30%, retreat at 40% with the hero" keeps working after that hero dies
+  and is revived with a new id, and "whenever we are supply blocked, build a
+  farm" picks a worker that is alive at the time.
+    "send the army to north-pass" -> {"type":"move","select":"all army",...}
+    "harvest lumber"              -> {"type":"harvest","select":"workers",
+                                      "target_select":"nearest tree"}
+  A phrase that names KINDS — the cavalry, the siege, the champion — has no
+  selector to be, so it compiles to ids and goes stale like any photograph.
+  Say it with a SQUAD if it has to survive: enrol once, then name the squad.
+  `harvest` picks its node the same way ("nearest tree"/"nearest mine"), and a
+  `build` at a landmark rather than at typed coordinates adds
+  "site":"nearest legal site" so a blocked footprint is moved, not refused.
   PLACES: mid | our base | their base | <choke name, e.g. "the west ford">
           the west/east/north/south | the north mine | the contested mine
           the nearest bounty | our expansion | explicit "(-40, 20)" | here
@@ -2120,6 +2580,40 @@ WHAT THE PATTERN LAYER UNDERSTANDS
   CLASSES (focus): Hero Archer Footman Worker Building Siege Cavalry
 
   Clauses split on commas, semicolons and newlines — not on "and".
+
+STANCES — one word for a whole doctrine
+  Five fixed presets. Each sets a squad's posture, anchor, leash, retreat
+  threshold and focus list in ONE sentence, atomically, using the same
+  machinery the individual verbs use.
+
+    squad 1 turtles at our base            -> {"type":"stance","squad":1,
+                                               "stance":"turtle","x":..,"z":..}
+    squad 2 secures north-pass             (a named region rides as "target")
+    harass their base with squad 3
+    harass their base with the cavalry     (enrols them into a squad first)
+    put squad 2 on push at the northwest ford
+    squad 2 takes the push stance at north-pass
+    stance turtle for squad 1
+
+    turtle   hold home tight        defend r14, leash 20, falls back at 45%
+    stage    gather forward, wait   defend r10, leash 16, falls back at 40%
+    push     commit to the objective push, no leash, falls back at 25%
+    secure   hold ground away home  defend r30, leash 38, falls back at 35%
+    harass   hit soft, leave early  push, leash 44, falls back at 55%
+
+  Omit the place and the anchor is your own base, which is what turtle means.
+  Switching replaces the whole bundle; silence continues it. The ring is the
+  STANCE'S, never the region's — that is what makes a preset a preset, and
+  `posture`/`leash`/`retreat` stay open for when you want the numbers yourself.
+
+  ONE SEAM WORTH KNOWING. `push` and `defend` are stance words AND posture
+  words, and the bare verb keeps its older, hand-tuned meaning:
+    "squad 2 pushes their base"            -> posture push  (no leash, no
+                                              retreat threshold, no focus list)
+    "squad 2 takes the push stance at their base" -> the push STANCE
+  The four words that are only stances — turtle, stage, secure, harass — have
+  no such ambiguity, so their bare verb is the stance.
+  An unknown stance word is refused with all five named, and installs nothing.
 
 TERRITORY — the ground, given names
   Every verb that takes x/z also takes `"region": "<name>"`, and the engine
