@@ -384,11 +384,20 @@ def intel_note(state):
 
 
 def affordable(state, gold, lumber):
-    """`(ok, sentence)` for a price against this seat's own bank."""
+    """`(ok, price, shortfall)` for a price against this seat's own bank.
+
+    The bank is stated only when it is the news: repeating "you hold 964g/145l"
+    on fifteen rows of a domain list is fifteen lines a reader has to skip to
+    find the two rows where it matters.
+    """
     me = state.get("me") or {}
     have_g, have_l = me.get("gold", 0), me.get("lumber", 0)
-    ok = have_g >= gold and have_l >= lumber
-    return ok, "{}g/{}l against your {}g/{}l".format(gold, lumber, have_g, have_l)
+    short = []
+    if have_g < gold:
+        short.append("{}g short".format(gold - have_g))
+    if have_l < lumber:
+        short.append("{}l short".format(lumber - have_l))
+    return not short, "{}g/{}l".format(gold, lumber), ", ".join(short)
 
 
 # ---------------------------------------------------------------------------
@@ -842,12 +851,12 @@ def build_form(state, catalog):
         if g is None:
             rows.append("{} — price not in this catalog".format(kid))
             continue
-        ok, price = affordable(state, g, l)
+        ok, price, short = affordable(state, g, l)
         if unlocked.get(kid) is False:
             req = ", ".join(b.get("requires") or []) or "higher tech"
             rows.append("{} — {} — NOT AVAILABLE: requires {}".format(kid, price, req))
         elif not ok:
-            rows.append("{} — {} — cannot afford".format(kid, price))
+            rows.append("{} — {} — cannot afford ({})".format(kid, price, short))
         else:
             rows.append("{} — {} — available".format(kid, price))
     return form(
