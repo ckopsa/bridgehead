@@ -135,13 +135,37 @@ Win by destroying all enemy buildings.
   selection info panel, game-over banner from `GameOver`, top-right alert stack
   rendering `GameEvents::feed(Team::Human)` (severity colours, fade-out, Space
   or click focuses the camera via `CameraFocus`).
-- `ai.rs`: the Claude faction. Assigns idle workers to harvest, maintains build
-  order (farms before supply block, barracks, more workers), trains army,
-  attack-moves waves at the human base. Acts ONLY through the same primitives the
-  UI uses: writing `Order`, pushing to `TrainingQueue` (after checking/paying the
-  same way), sending events. Never teleports or cheats resources. It is engine
-  baseline rather than a seat, so it still writes those directly instead of
-  going through `intent.rs` — a known asymmetry, noted in docs/INTENT.md.
+- `ai.rs`: the scripted commander. Assigns workers, maintains a build order,
+  expands, tiers up, trains and attacks. Since v3 it is a full intent seat —
+  every decision becomes a `SubmitIntent` with `IntentSource::Script`, compiled
+  by the same compiler as both player seats. The old direct-write asymmetry is
+  closed (docs/INTENT.md, "The residual asymmetry, and how it was closed").
+- `bridge.rs`: the LLM seat. Serializes each bridged seat's fog-gated snapshot
+  to `<seat>/state.json`, polls `<seat>/commands.json` at 4 Hz, and compiles
+  each batch through `intent.rs`. Owns the content catalog write, the ready
+  handshake, the `alarms` array, and the copilot wire. Never mutates game
+  state; it is a renderer and a mail slot.
+- `doctrine.rs`: standing orders between commands — squad postures (defend /
+  push / escort / forage), retreat thresholds, leashes, focus priorities,
+  autocast. Re-tasks squads every second, acting only through `Order`,
+  `MoveTo` and `CastAbility`. This is the fast tier that fights between an
+  LLM commander's polls, for whichever seat armed it.
+- `trigger.rs`: contingent standing orders — thirteen fog-legal predicates
+  evaluated at 4 Hz; a firing rule submits its stored intent through the one
+  compiler. `command.rs`-exempt (you paid the link at arm time).
+- `plan.rs`: sequenced standing orders — up to two plans of eight steps, each
+  step an intent plus an advance condition (accepted / after secs / any
+  trigger predicate). Blocked steps teach via `plans[].status`.
+- `command.rs`: the chain of command — optional per-intent delivery latency
+  (docs/TEMPO.md). Off by default pending the owner's rematch (bead 4ez).
+- `copilot.rs`: the co-command seat (`BH_BRIDGE=copilot`) — proposals,
+  approve/veto with reasons, conflict scoping against the human's own orders.
+- `alarm.rs`: the four forced re-decision conditions (docs/AFFORDANCES.md) —
+  computed fog-legally per seat, each naming its running default. Never acts;
+  renders into the snapshot's `alarms` array and the HUD event feed.
+- `bounty.rs`: midfield treasure spawns and claims.
+- `hotkeys.rs`: the hotkey registry and card paging — per-card disjointness,
+  every letter accounted for.
 
 ## Cross-module conventions
 

@@ -514,6 +514,75 @@ mod tests {
         assert_eq!(app.world().resource::<Time>().elapsed_secs(), 0.0);
     }
 
+    // -----------------------------------------------------------------------
+    // The exit waits for the bridge (wc3clone-0i9)
+    // -----------------------------------------------------------------------
+
+    /// `headless_exit` alone, on the hand-driven clock, with whatever bridge
+    /// the caller wants. Deliberately *not* the whole game: the claim is about
+    /// one system's exit condition, and a full match would decide its own game
+    /// over on its own schedule.
+    fn exit_app(bridge: Option<bridge::Bridge>) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<shared::GameOver>()
+            .init_resource::<shared::Economies>()
+            .add_systems(Update, headless_exit);
+        if let Some(bridge) = bridge {
+            app.insert_resource(bridge);
+        }
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f64(TEST_DT),
+        ));
+        app
+    }
+
+    fn decide(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<shared::GameOver>()
+            .decide(shared::Team::Claude, shared::GameOverReason::Razed);
+    }
+
+    /// Frames of `TEST_DT` each. The two tests below run 300 of them after the
+    /// verdict — fifteen game-seconds, three times `check_decided`'s
+    /// post-verdict window — so "did not exit" cannot be read as "has not got
+    /// there yet".
+    fn run_frames(app: &mut App, frames: usize) {
+        for _ in 0..frames {
+            app.update();
+        }
+    }
+
+    /// The historical behaviour, unchanged: no seat, so nothing to wait for.
+    #[test]
+    fn an_unbridged_run_still_exits_shortly_after_the_verdict() {
+        let mut app = exit_app(Some(bridge::Bridge::default()));
+        run_frames(&mut app, 20);
+        assert!(app.should_exit().is_none(), "no verdict, no exit");
+        decide(&mut app);
+        run_frames(&mut app, 300);
+        assert!(
+            app.should_exit().is_some(),
+            "a decided match with no bridged seat must still terminate"
+        );
+    }
+
+    /// **The bug.** A seat that has not yet been handed a snapshot carrying
+    /// `game_over` holds the process open. Without this the engine could exit
+    /// first and the seat's last `state.json` would say `game_over: null`
+    /// forever — which is not a missing file but a hung commander, since the
+    /// documented loop is "repeat until `game_over` is non-null".
+    #[test]
+    fn a_seat_that_has_not_been_told_the_verdict_holds_the_exit_open() {
+        let mut app = exit_app(Some(bridge::one_unpublished_seat()));
+        decide(&mut app);
+        run_frames(&mut app, 300);
+        assert!(
+            app.should_exit().is_none(),
+            "the process may not stop while a commander is still owed the result"
+        );
+    }
+
     /// **No bridge seat, no handshake.** The default that keeps every existing
     /// sim, every fingerprint run and the whole determinism harness byte-identical:
     /// an empty gate never holds, and the clock runs from the first frame.
@@ -542,6 +611,10 @@ fn headless_exit(
     economies: Res<shared::Economies>,
     units: Query<(&shared::Unit, &shared::Team)>,
     buildings: Query<(&shared::Building, &shared::Team)>,
+    // Optional so a harness can register this system without the bridge
+    // plugin; the real game always has the resource, empty when no seat is
+    // open. See `check_decided`.
+    bridge: Option<Res<bridge::Bridge>>,
     decided_at: Local<Option<f32>>,
     mut exit: EventWriter<AppExit>,
 ) {
@@ -553,7 +626,7 @@ fn headless_exit(
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
     else {
-        return check_decided(time, game_over, decided_at, exit);
+        return check_decided(time, game_over, bridge, decided_at, exit);
     };
     if time.elapsed_secs() > cap {
         let score = |team: Team| {
@@ -575,7 +648,7 @@ fn headless_exit(
         exit.write(AppExit::Success);
         return;
     }
-    check_decided(time, game_over, decided_at, exit);
+    check_decided(time, game_over, bridge, decided_at, exit);
 }
 
 /// Exit shortly after a real, decisive game over — the only ending the game
@@ -583,11 +656,23 @@ fn headless_exit(
 fn check_decided(
     time: Res<Time>,
     game_over: Res<shared::GameOver>,
+    bridge: Option<Res<bridge::Bridge>>,
     mut decided_at: Local<Option<f32>>,
     mut exit: EventWriter<AppExit>,
 ) {
     if let Some(winner) = game_over.winner {
         let decided = *decided_at.get_or_insert(time.elapsed_secs());
+        // **The commanders learn the result before the process is allowed to
+        // stop.** A bridged seat's only channel is its `state.json`, and the
+        // documented poll loop is "repeat until `game_over` is non-null" — so
+        // an exit that beats the final write does not merely lose a file, it
+        // hangs the reader forever (arena r23). `write_snapshot` forces that
+        // write on the frame the verdict lands, and this holds the door until
+        // it has been attempted for every seat, so the two systems' order
+        // inside `SimSet::Feed` is not something anyone has to maintain.
+        if bridge.is_some_and(|bridge| bridge.awaiting_verdict()) {
+            return;
+        }
         if time.elapsed_secs() > decided + 5.0 {
             // The reason, not just the winner: a sim log that cannot tell a
             // razed base from a concession is a log somebody misreads later.
