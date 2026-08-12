@@ -132,6 +132,12 @@ def test_a_late_game_snapshot_cannot_blow_the_ceiling():
     # happen (a held match has not started and a finished one has no queues)
     # but is the worst case the renderer must survive.
     s["errors"] = ["cmd 1: cannot afford Footman", "cmd 2: no region named 'x'"]
+    # ...and a batch in which every commitment contradicted something, which is
+    # the worst case the NOTE section must survive.
+    s["notes"] = [
+        "cmd {}: accepted; note: push gates not met (squad 2/6); your intel ledger is empty".format(i)
+        for i in range(6)
+    ]
     s["waiting_for"] = ["blue"]
     s["game_over"] = "Human"
     s["game_over_reason"] = "razed"
@@ -140,6 +146,12 @@ def test_a_late_game_snapshot_cannot_blow_the_ceiling():
     # The sections that survive the trim are the ones a commander cannot
     # reconstruct from the snapshot for free.
     assert "DEFAULT" in prefixes(lines) and "WIN" in prefixes(lines)
+    # The notes COLLAPSE rather than disappear: the text is verbatim in
+    # `state.notes`, but the knowledge that there is any is not recoverable
+    # from anywhere else the commander is looking.
+    note_lines = [ln for ln in lines if ln.startswith("NOTE ")]
+    assert len(note_lines) == 1, note_lines
+    assert "6 accepted commands contradict" in note_lines[0], note_lines[0]
 
 
 def test_the_ending_is_named_the_way_it_happened():
@@ -668,6 +680,62 @@ def test_the_digest_leaves_no_marker_behind():
         assert out.returncode == 0, out.stderr
         leftovers = list(marker_dir.glob("*")) if marker_dir.exists() else []
         assert not leftovers, "the digest must not fight bridge_wait for a read position"
+
+
+# -- acceptance notes (wc3clone-b9m) -----------------------------------------
+
+
+def test_an_acceptance_note_reaches_the_digest_under_its_own_prefix():
+    """The whole point of the feature at this level.
+
+    The engine's advisory arrives in `state.json`'s `notes`, and the digest is
+    the page every tier actually reads at loop cadence (arena/LADDER.md,
+    Finding 5). It has to be HERE, and it has to be `NOTE` rather than `ERRORS`:
+    a note is the echo of a command that was accepted, and filing it under
+    errors would teach a commander that the engine refuses pushes.
+    """
+    s = load(LIVE[0])
+    s["notes"] = [
+        "cmd 1: accepted; note: push gates not met (squad 4/6, Hero 61%, "
+        "gate is 80%); last enemy sighting 190s stale, threshold is 45s"
+    ]
+    lines = bridge_view.render_digest(bridge_view.digest(s))
+    notes = [ln for ln in lines if ln.startswith("NOTE ")]
+    assert len(notes) == 1, "expected one NOTE line, got {}".format(lines)
+    assert "accepted" in notes[0]
+    assert "squad 4/6" in notes[0], "both halves of the comparison survive: {}".format(notes[0])
+    # ...and so does the clause AFTER it. The gates come first in the string, so
+    # the digest's 110-column truncation would eat the staleness half — the
+    # exact half r26 lost to — which is why this line runs at DEFAULT's width.
+    assert "190s stale, threshold is 45s" in notes[0], notes[0]
+    assert not any(ln.startswith("ERRORS") for ln in lines), (
+        "a note is not an error and must not be counted as one"
+    )
+    # ...and it is carried structurally too, for `--json` readers.
+    assert bridge_view.digest(s)["status"]["notes"] == s["notes"]
+
+
+def test_a_snapshot_with_no_notes_renders_exactly_as_it_did():
+    """`notes` is `skip_serializing_if` empty on the wire, so most snapshots
+    never carry the key at all. The digest of one must be byte-identical to
+    what it was before the key existed."""
+    s = load(LIVE[0])
+    assert "notes" not in s, "the fixture predates the key — that is the point"
+    lines = bridge_view.render_digest(bridge_view.digest(s))
+    assert not [ln for ln in lines if ln.startswith("NOTE ")]
+    assert bridge_view.digest(s)["status"]["notes"] == []
+    assert bridge_view.digest({})["status"]["notes"] == [], "and the paranoid case"
+
+
+def test_notes_and_errors_are_two_channels_in_one_readout():
+    """Both at once, in the same digest, distinguishable at a glance. The
+    contrast IS the contract: `cmd 0` was refused and `cmd 1` was not."""
+    s = load(LIVE[0])
+    s["errors"] = ["cmd 0: no stance called 'charge' - the five are: turtle, stage, push, secure, harass"]
+    s["notes"] = ["cmd 1: accepted; note: push gates not met (squad 2/6)"]
+    lines = bridge_view.render_digest(bridge_view.digest(s))
+    assert any(ln.startswith("ERRORS 1:") for ln in lines)
+    assert any(ln.startswith("NOTE cmd 1: accepted") for ln in lines)
 
 
 def _run():

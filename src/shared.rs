@@ -2010,6 +2010,37 @@ pub struct CatalogPredicate {
     pub fields: Vec<CatalogPredicateField>,
 }
 
+/// **The commitment gates, published so there is one copy of them.**
+///
+/// The three numbers the engine measures a push against when it writes an
+/// acceptance note (`IntentNotes`), and the same three the affordance document
+/// measures a `push` link's readiness against (`tools/affordances.py`,
+/// `push_gate_facts` / `intel_note`). Two renderings of one rule was exactly the
+/// arrangement docs/FOG.md warns about — nothing errors when they drift, they
+/// simply disagree — so the document reads them off the catalog and keeps its
+/// module constants only as the fallback for a document rendered beside a
+/// `catalog.json` written before this block existed (the `stances` precedent).
+///
+/// They are **thresholds a note is written against, never a refusal**. A push
+/// that fails all three still compiles, still applies, and still does exactly
+/// what it says; the engine says both numbers out loud and gets out of the way
+/// (docs/AFFORDANCES.md constraint 1).
+///
+/// Additive, like `stances`, `selectors` and `predicates` before it.
+#[derive(Serialize, Clone, Debug)]
+pub struct CatalogGates {
+    /// [`PUSH_MIN_UNITS`].
+    pub push_min_units: u32,
+    /// [`PUSH_HERO_FRAC`], as a fraction of max HP.
+    pub push_hero_frac: f32,
+    /// [`COMMIT_INTEL_STALE_S`], in game-seconds.
+    pub intel_stale_s: f32,
+    /// [`SIGHTING_TTL_S`] — the horizon past which a unit sighting is dropped
+    /// entirely, which is what makes an EMPTY ledger the loudest reading rather
+    /// than a very large `intel_stale_s`.
+    pub sighting_ttl_s: f32,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct Catalog {
     pub units: Vec<CatalogUnit>,
@@ -2031,6 +2062,9 @@ pub struct Catalog {
     /// [`TriggerWhen`] declares them, which is the order
     /// tools/COMMANDER_BRIEF.md's table lists them in.
     pub predicates: Vec<CatalogPredicate>,
+    /// The thresholds an acceptance note is written against. See
+    /// [`CatalogGates`].
+    pub gates: CatalogGates,
 }
 
 /// The `when` schema, as one table.
@@ -2309,6 +2343,12 @@ pub fn game_catalog() -> Catalog {
             buildings: SELECTOR_BUILDING_NAMES.split(", ").collect(),
         },
         predicates: catalog_predicates(),
+        gates: CatalogGates {
+            push_min_units: PUSH_MIN_UNITS as u32,
+            push_hero_frac: PUSH_HERO_FRAC,
+            intel_stale_s: COMMIT_INTEL_STALE_S,
+            sighting_ttl_s: SIGHTING_TTL_S,
+        },
     }
 }
 
@@ -5005,6 +5045,41 @@ pub struct RememberedBuilding {
 /// the difference is exactly the thing that moves.
 pub const SIGHTING_TTL_S: f32 = 90.0;
 
+// ---------------------------------------------------------------------------
+// The commitment gates
+//
+// Three numbers, and they are NOT a rule: nothing in the engine refuses a
+// command for failing them. They are the thresholds an acceptance note is
+// written against — see `IntentNotes` — and the same ones the affordance
+// document already annotated its `push` links with. They live here, in code,
+// beside the fog horizon they are read next to, and travel to the document
+// through `catalog.gates` so the two channels cannot drift into two different
+// definitions of "ready" (BUILDER_BRIEF §6.7: scalars stay, and the catalog is
+// how a scalar reaches a renderer).
+//
+// The evidence is the r25-r29 ladder (arena/LADDER.md, Finding 5): the
+// document's push-gate and staleness annotations named the losing tiers' fatal
+// commitments and no tier read them, because every tier reads the digest at
+// loop cadence and the action render once.
+// ---------------------------------------------------------------------------
+
+/// **How many bodies a push wants.** Blue's failed trickle-push at t=697 went
+/// out at four; the winning one at t=787 at eight.
+pub const PUSH_MIN_UNITS: usize = 6;
+
+/// **How healthy a hero walking into a fight should be.** Below this it is the
+/// most expensive casualty in the game (tools/COMMANDER_BRIEF.md, "Hero save").
+pub const PUSH_HERO_FRAC: f32 = 0.80;
+
+/// **How old a picture of the enemy may be before committing to one is worth
+/// saying out loud**, in game-seconds.
+///
+/// Half [`SIGHTING_TTL_S`], deliberately. Past the TTL a sighting is dropped
+/// and the ledger goes quiet, so a threshold at or above the horizon could only
+/// ever fire on the hero ledger; at half of it the note fires while the memory
+/// is still there to argue with, which is the point of stating both numbers.
+pub const COMMIT_INTEL_STALE_S: f32 = 45.0;
+
 /// How close two concurrent sightings must be to read as one body of troops.
 pub const GROUP_RADIUS: f32 = 18.0;
 
@@ -5422,6 +5497,40 @@ impl FogGrid {
         self.heroes.iter().find(|h| h.kind == kind)
     }
 
+    /// **Game-seconds since this team last laid eyes on anything of theirs**, or
+    /// `None` if it never has and remembers nothing.
+    ///
+    /// Read over the two ledgers together — the unit sightings and the hero
+    /// beliefs — because they expire on different clocks and neither alone
+    /// answers the question. `sightings` is dropped after [`SIGHTING_TTL_S`], so
+    /// on its own it can never report an age past ninety and an army that walked
+    /// out of vision two minutes ago simply vanishes from the count; `heroes`
+    /// keeps its `t_seen` forever, so it is the half that can say *four hundred
+    /// seconds*. The freshest of the two is the honest answer to "how old is my
+    /// picture of them".
+    ///
+    /// **Memory only.** It touches `sightings` and `heroes` and nothing else —
+    /// no `world.units`, no live-sight query — which is the structural version
+    /// of the claim that it is fog-honest, exactly as `enemy_army_seen` and
+    /// `enemy_hero_down` are (docs/FOG.md; tools/BUILDER_BRIEF.md §6.10).
+    pub fn freshest_enemy_age(&self, now: f32) -> Option<f32> {
+        self.sightings
+            .values()
+            .map(|s| s.age(now))
+            .chain(
+                self.heroes
+                    .iter()
+                    .filter_map(|h| h.t_seen)
+                    .map(|t| (now - t).max(0.0)),
+            )
+            .fold(None, |best: Option<f32>, age| {
+                Some(match best {
+                    Some(b) if b <= age => b,
+                    _ => age,
+                })
+            })
+    }
+
     /// Cluster concurrent sightings into bodies of troops.
     ///
     /// Single-link agglomeration: two sightings join the same group when they
@@ -5635,6 +5744,22 @@ impl FogGrids {
     #[cfg(test)]
     pub fn test_hero_intel(&mut self, team: Team, kind: UnitKind, status: HeroStatus, pos: Vec3) {
         set_hero_intel(&mut self.get_mut(team).heroes, kind, status, pos, 0.0, 0.0);
+    }
+
+    /// The same, with the observation's CLOCK. The hero ledger is the half of
+    /// memory that never expires, so it is the only one that can report an age
+    /// past [`SIGHTING_TTL_S`] — which is exactly what a staleness test needs to
+    /// stage, and what the zero-stamped helper above cannot express.
+    #[cfg(test)]
+    pub fn test_hero_intel_at(
+        &mut self,
+        team: Team,
+        kind: UnitKind,
+        status: HeroStatus,
+        pos: Vec3,
+        t_seen: f32,
+    ) {
+        set_hero_intel(&mut self.get_mut(team).heroes, kind, status, pos, t_seen, 0.0);
     }
 
     pub fn get(&self, team: Team) -> &FogGrid {
@@ -10156,6 +10281,75 @@ impl IntentApplied {
         }
     }
     pub fn get_mut(&mut self, team: Team) -> &mut Vec<AppliedCommand> {
+        match team {
+            Team::Human => &mut self.human,
+            Team::Claude => &mut self.claude,
+        }
+    }
+}
+
+/// **The advisory channel** — what the engine noticed about a command it
+/// accepted anyway.
+///
+/// The third sibling of [`IntentErrors`] and [`IntentApplied`], same per-team
+/// split, same "cleared when a batch is accepted, appended to by the compiler,
+/// copied into the next snapshot" lifecycle, same `cmd <i>:` identity prefix, so
+/// the three join without a second identity scheme.
+///
+/// **What it is for** (arena/LADDER.md, Finding 5). The affordance document
+/// already computes whether a push's gates hold and how old the seat's picture
+/// of the enemy is, and prints both on the `push` link. Across five rounds and
+/// four tiers, not one commander read them at the moment it committed: every
+/// tier reads the fifteen-line digest at loop cadence and the 380-line action
+/// render once, at the top of the match. The annotation was right and it was
+/// unread. So the fact is repeated where it cannot be missed — in the echo of
+/// the very command it contradicts.
+///
+/// **Three rules it must keep.**
+///
+/// 1. It NEVER refuses and never alters what the command does. The intent
+///    applies byte-identically with the note and without it; an engine that
+///    blocked a gate-failing push would delete the winning move nobody
+///    anticipated, which is the one thing docs/AFFORDANCES.md constraint 1
+///    forbids. Read every entry as `accepted; note: …` — because that is
+///    literally what it says.
+/// 2. It states FACTS with both numbers on them and never a recommendation.
+///    "squad 4/6" is a fact the commander can disagree with; "wait for two more"
+///    is an opinion, and the engine does not have opinions.
+/// 3. Every fact in it comes from the seat's own knowable state — its own units,
+///    its own squads, its own intel ledger — and never from `world.units` of the
+///    enemy. See `intent::readiness_note`, whose parameter list is the
+///    structural version of that claim.
+///
+/// Bridge-sourced only, on the identical reasoning [`IntentApplied`] gives: a
+/// human at the keyboard reads squad size and hero health off the selection
+/// panel continuously, and echoing every right-click into a notice feed would be
+/// noise for a reader that already has the fact. The commander on the wire has
+/// no HUD.
+///
+/// **Direct commands only**, too. A trigger or a plan step firing a push is
+/// standing policy the engine is executing on its own clock; "this squad is
+/// under strength" is a *level*, and a note per firing is precisely the r17
+/// fire hose (tools/BUILDER_BRIEF.md §6.11). The level-triggered rendering of
+/// the same fact is the affordance document's `push` link, which prints all
+/// three gates in every cycle.
+///
+/// Empty for every command that contradicts nothing, so the wire key is absent
+/// from any snapshot of a match in which nobody over-committed.
+#[derive(Resource, Default)]
+pub struct IntentNotes {
+    pub human: Vec<String>,
+    pub claude: Vec<String>,
+}
+
+impl IntentNotes {
+    pub fn get(&self, team: Team) -> &Vec<String> {
+        match team {
+            Team::Human => &self.human,
+            Team::Claude => &self.claude,
+        }
+    }
+    pub fn get_mut(&mut self, team: Team) -> &mut Vec<String> {
         match team {
             Team::Human => &mut self.human,
             Team::Claude => &mut self.claude,

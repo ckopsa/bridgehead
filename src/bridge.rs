@@ -660,6 +660,33 @@ struct StateOut {
     /// does not exist at all when `BH_COMMAND_LATENCY` is off.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     applied: Vec<AppliedOut>,
+    /// **What a command you sent contradicts about what the engine just told
+    /// you** — one line per accepted command that over-committed, naming the
+    /// same `cmd N` the `errors` and `applied` arrays use.
+    ///
+    /// The third half of the acknowledgement. `errors` says what was refused,
+    /// `applied` says what the rest cost, and this says what was accepted
+    /// *anyway*: `"cmd 1: accepted; note: push gates not met (squad 4/6, Hero
+    /// 61%, gate is 80%); last enemy sighting 190s stale, threshold is 45s"`.
+    ///
+    /// **These are not errors and they never block.** The command applied,
+    /// exactly as written, before this string existed; re-sending it changes
+    /// nothing. Read `accepted;` as literal. The engine has an opinion about
+    /// neither your plan nor the thresholds — it states both sides of every
+    /// comparison so you can disagree with the number rather than with the
+    /// engine, which is the same contract the affordance document's readiness
+    /// annotations keep (docs/AFFORDANCES.md, readiness channel).
+    ///
+    /// Every fact in a note comes from your own knowable state: your units,
+    /// your squads, your intel ledger. There is nothing here you could not have
+    /// derived from this snapshot yourself — the point is *when* you are told,
+    /// not what.
+    ///
+    /// `skip_serializing_if` empty, on the same rule as `applied`: a match in
+    /// which nobody over-committed sends a snapshot byte-identical to the
+    /// pre-feature one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
     /// **The seats that have not yet said `{"type":"ready"}`**, by name —
     /// `["red","blue"]`. Present ONLY while the match is held at t=0; the
     /// moment the clock starts this key and `match_started` both disappear and
@@ -1903,6 +1930,10 @@ struct TeamTech<'w> {
 struct SeatVerdicts<'w> {
     errors: Res<'w, IntentErrors>,
     applied: Res<'w, IntentApplied>,
+    /// The third half: what an ACCEPTED command contradicted about the
+    /// readiness this seat has been served all match. Never a refusal — see
+    /// `shared::IntentNotes`.
+    notes: Res<'w, IntentNotes>,
 }
 
 /// Where the match is in its own life: has it started, and has it ended. The
@@ -2036,6 +2067,7 @@ fn write_snapshot(
             (fog.enabled(), seat_fog),
             verdicts.errors.get(seat.team),
             verdicts.applied.get(seat.team),
+            verdicts.notes.get(seat.team),
             co_out,
             &units,
             &buildings,
@@ -2100,6 +2132,9 @@ fn write_seat_snapshot(
     // What the rest of that batch cost to deliver — see `StateOut::applied`.
     // Empty whenever nothing was charged, which is always with the feature off.
     intent_applied: &[AppliedCommand],
+    // ...and what any of it CONTRADICTED — see `StateOut::notes`. Empty for
+    // every batch that over-committed nothing, which is most of them.
+    intent_notes: &[String],
     // `Some` for a copilot seat: its etiquette, its pending queue, what became
     // of the ones it already asked, and its team's recent sentences. `None`
     // for every other seat, which is what keeps their wire format unchanged.
@@ -2565,6 +2600,10 @@ fn write_seat_snapshot(
                 delay: r1(a.delay),
             })
             .collect(),
+        // Verbatim from the compiler, in submission order. Nothing is rounded
+        // or reworded here: the numbers were formatted where the comparison was
+        // made, beside the threshold each was measured against.
+        notes: intent_notes.to_vec(),
         // Both keys live and die together: while held they are `Some`, and the
         // instant the clock starts they are `None` and the snapshot is shaped
         // exactly as it has always been.
@@ -2889,6 +2928,7 @@ fn poll_commands(
     game_over: Res<GameOver>,
     mut intent_errors: ResMut<IntentErrors>,
     mut intent_applied: ResMut<IntentApplied>,
+    mut intent_notes: ResMut<IntentNotes>,
     mut submissions: EventWriter<SubmitIntent>,
     mut copilot_wire: EventWriter<CopilotWire>,
 ) {
@@ -2940,6 +2980,9 @@ fn poll_commands(
         // ...and so does the other half of the verdict: `applied` describes the
         // batch being acknowledged, never the one before it.
         intent_applied.get_mut(seat.team).clear();
+        // ...and the third: a note is about the command it is echoing, and a
+        // stale one would read as an advisory about the batch just sent.
+        intent_notes.get_mut(seat.team).clear();
 
         if game_over.decided() {
             seat.errors
