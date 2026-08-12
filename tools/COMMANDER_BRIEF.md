@@ -791,10 +791,15 @@ documented above, and writes the batch with the next `seq` (exactly like
 `bridge_send.py`). It prints what it understood, per clause, to stderr:
 
 ```
-  ok       'hold the northwest ford'   -> squad 1 defends (-60.0, 60.0) with 7 unit(s)
+  ok       'hold the northwest ford'   -> squad 1 defends (-60.0, 60.0) with all army (7 right now)
   ok       'forage mid with the cavalry'-> squad 2 forages (0.0, 0.0) with 3 unit(s)
-  ok       'retreat at 35%'            -> 10 unit(s) fall back to (70.0, 70.0) below 35%
+  ok       'retreat at 35%'            -> all army (10 right now) fall back to (70.0, 70.0) below 35%
 ```
+
+Two of those name a **role** and one names a kind, and the difference is on the
+wire: a role compiles to `"select":"all army"`, a kind to a list of ids. The
+count in the confirmation is a fact about right now; the phrase is what was
+sent.
 
 Why bother when you can write JSON? Because the phrases are shorter than the
 ids, and because places have names: `mid`, `our base`, `their base`, `the
@@ -824,6 +829,21 @@ in `buy`'s optional `hero` field for you; with only one hero alive it is
 omitted, exactly as before. The Sorcerer is a caster but **not** a hero, so
 `the hero` never sweeps it up — use `sorcerers`.
 
+- **It speaks selectors, so your standing orders stay live.** Four English
+  words are engine roles and go on the wire as roles: `the army` /
+  `everything` → `"select":"all army"`, `workers` → `"select":"workers"`,
+  `the hero` → `"select":"my hero"`, `squad 2` → `"select":"squad 2"`.
+  `harvest gold` says `"target_select":"nearest mine"` rather than memorising a
+  node, and a `build` at a landmark (not at typed coordinates) adds
+  `"site":"nearest legal site"`. A phrase naming KINDS — `the cavalry`, `the
+  siege`, `the champion` — has no role to become and still compiles to ids, so
+  say it with a squad when it has to outlive the units in it.
+- **Stances have sentences too**: `squad 1 turtles at our base`, `squad 2
+  secures north-pass`, `harass their base with squad 3`, and for the two words
+  that are also postures, the longer spelling — `put squad 2 on push at the
+  northwest ford` or `squad 2 takes the push stance at north-pass`. Bare
+  `squad 2 pushes their base` still means `posture push`, so both vocabularies
+  stay reachable. An unknown stance word is refused with all five named.
 - `--explain` prints the full vocabulary. **Read it once**; it is the list of
   idioms that compile deterministically.
 - Anything it does not know, write by hand. It is a convenience over the schema
