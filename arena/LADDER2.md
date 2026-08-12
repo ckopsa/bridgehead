@@ -197,3 +197,34 @@ all filed. The next measurable question is unchanged from the report body,
 now with a working delivery mechanism: the cross-tier round, playbooked
 small model versus a larger one, with the confirm-everything executor as
 control — and an autopilot ruling in the round rules first.
+
+## Addendum 2: the cross-tier round (r36) — Haiku vs Fable, autopilot banned
+
+*`BH_NO_AUTOPILOT=1` now refuses the handoff at the compiler (a prompt cannot
+bind a model — r33/r35 proved it), recorded in the round's env. Both seats
+scaffolded, both booked.*
+
+**Fable won by surrender at t=343, losing three units.** The mechanism is the
+cross-tier question answered at n=1: Haiku followed the book faithfully —
+step 3, a clean ten-worker economy, every automation correct — and Fable
+attacked forty seconds before the book's assumed army breakpoint with a
+mixed composition mono-Footmen cannot answer, killing 13 of 16 workers in
+one raid. Haiku's own diagnosis was exact: "the playbook assumed symmetric
+army breakpoints; the opponent attacked early." **A fixed-timeline strategy
+is legible to an opponent who can read timelines** — the book supplies a
+skeleton, not a defense against being timed, and timing is precisely the
+judgment the tiers differ in.
+
+The winning side's report is the deeper data point: Fable sent **zero
+unit-level combat orders all match** — the entire win was authored at the
+policy tier (plans, triggers, templates, stances; hero-save and
+counter-punch both fired and mattered). The equitable-access vocabulary is
+sufficient for top-tier play conducted purely as standing orders; what
+separated the tiers was *which* policies, armed *when*. So the scaffold
+verdict after twelve rounds: data and affordances made the small commander
+*playable* (the floor) and *literate* (the book); they do not make it
+*fast*, and tempo is where the two-tier gap lives. The next levers are
+content, not machinery: a book chapter on reacting to scouted timing
+(scout-before-commit, defensive breakpoints keyed to enemy sightings rather
+than the clock), or accepting the gap as the game's honest measurement of
+judgment — which is the thesis.
