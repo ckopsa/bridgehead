@@ -164,6 +164,11 @@ pub enum Action {
     PostureForage,
     PostureEscort,
     StandDown,
+    /// Step the squad's stance one word along the fixed five and arm the ground
+    /// click that anchors it. A cycle rather than five tiles for the same reason
+    /// [P] Priority is one: the doctrine page has no five spare letters, and the
+    /// human's fast path through a small fixed vocabulary is a switch.
+    CycleStance,
     CycleFallback,
     CycleLeash,
     CyclePriority,
@@ -520,6 +525,10 @@ pub const REGISTRY: &[Binding] = &[
     b(Action::PostureForage, KeyCode::KeyE, Ctx::DoctrinePage),
     b(Action::PostureEscort, KeyCode::KeyR, Ctx::DoctrinePage),
     b(Action::StandDown, KeyCode::KeyT, Ctx::DoctrinePage),
+    // [S] for Stance. It is the orders card's Stop, and the two never share a
+    // context — `CardContext::UnitsDoctrine` carries no `Ctx::Orders` tag — so
+    // the validator allows it, and the mnemonic is worth the reuse.
+    b(Action::CycleStance, KeyCode::KeyS, Ctx::DoctrinePage),
     b(Action::CycleFallback, KeyCode::KeyF, Ctx::DoctrinePage),
     b(Action::CycleLeash, KeyCode::KeyG, Ctx::DoctrinePage),
     b(Action::CyclePriority, KeyCode::KeyP, Ctx::DoctrinePage),
