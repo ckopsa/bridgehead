@@ -584,7 +584,10 @@ mod tests {
     }
 
     fn stop_intent() -> Intent {
-        Intent::Stop { units: vec![] }
+        Intent::Stop {
+            units: vec![],
+            select: None,
+        }
     }
 
     fn fired(app: &mut App) -> Vec<SubmitIntent> {

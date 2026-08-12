@@ -462,7 +462,10 @@ mod tests {
 
     /// A step whose intent is trivially legal and names nothing.
     fn stop() -> Intent {
-        Intent::Stop { units: vec![] }
+        Intent::Stop {
+            units: vec![],
+            select: None,
+        }
     }
 
     fn sent(app: &mut App) -> Vec<SubmitIntent> {
