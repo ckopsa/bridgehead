@@ -3146,6 +3146,24 @@ fn compile_intent(
             });
         }
         Intent::Autopilot { on } => {
+            // `BH_NO_AUTOPILOT=1` refuses the verb for the whole match — an
+            // arena rule, not a game rule. Ladder rounds r33/r35 showed the
+            // floor tier's dominant strategy is handing the faction to the
+            // scripted AI, at which point the round stops measuring the
+            // commander; the owner's call is that measured rounds ban it.
+            // Refused at the one choke point (a prompt cannot bind a model,
+            // r33/r35 proved that too), with a message that says whose rule
+            // it is. Read per-call: the verb is rare and the env is fixed
+            // for a process lifetime anyway.
+            if on && std::env::var("BH_NO_AUTOPILOT").is_ok_and(|v| v == "1") {
+                errors.push(format!(
+                    "{tag}: autopilot is disabled for this match (BH_NO_AUTOPILOT=1) — \
+                     this round measures the commander, not the scripted AI. \
+                     The doctrine tier (stances, triggers, plans) still fights \
+                     for you between polls."
+                ));
+                return;
+            }
             // Only ever this seat's own faction.
             set_autopilot(ai_controlled, me, on);
             info!(
