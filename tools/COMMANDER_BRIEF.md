@@ -17,7 +17,12 @@ co-commander section near the end, which is the only part that differs.
    (~1-2s) the moment an event fires (attacks, losses, bounty spawns, your command errors)
    or the game ends. It prints why it woke.
 2. `python3 tools/bridge_view.py <SEAT>/state.json` — compact readout (combine 1+2 in one
-   bash call: `wait ... && view ...`).
+   bash call: `wait ... && view ...`). Add `--digest` for the ~15-line version:
+   resources, your army by squad, your production queues, the enemy production
+   buildings you have SEEN (the win-condition line), the last five events, any
+   active alarms, and one line naming what happens if you send nothing this
+   cycle. Both read the same `state.json` and neither writes anything; the full
+   readout is there whenever you want the ids the digest drops.
 3. Decide. 4. Write commands (see below).
 Repeat until `game_over` is non-null, then stop and report the result.
 
