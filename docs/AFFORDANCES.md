@@ -136,6 +136,21 @@ raw tier. The commander brief's opening recipes become served forms —
 pre-filled in selectors, one or two judgment fields open — instead of prose
 transcribed by hand (r21 transcribed one wrong, and died of it).
 
+**A form owes the commander one promise: fill every hole it marks REQUIRED,
+change nothing else, and what is left is a command.** (`wc3clone-2su4`.) For
+two versions it was not kept, because the render had one phrase — *"leave null
+— this one is yours"* — for two different facts: a hole the wire refuses empty
+and a hole it takes empty. r34's blue seat read it as permission and sent
+`recipe:home-guard` back with `"squad": null` in it; the same reading later
+cost it a second base, because `recipe:expand`'s `then.region` null is fatal
+only at FIRE time, 322 seconds after the mistake. Every field now carries
+`required`, the render says which of the three things a hole is (engine-filled
+/ REQUIRED / optional), the wire reads a null key as an omitted key so the
+optional ones are honest, and the promise is pinned as one artifact both sides
+read — `tools/fixtures/doc_wire_cases.json`, generated from real snapshots by
+`tools/test_affordances.py` and put through the engine's own parser by
+`intent::tests::every_template_the_document_prints_survives_the_wire`.
+
 Two guards keep the document on the right side of the fact/judgment line.
 Form defaults come only from engine facts or the commander's own pregame
 declarations — a default that encodes strategy makes the arena measure the
@@ -147,7 +162,7 @@ layer (constraint 3).
 
 **Shipped** (`wc3clone-0uu.3`) as `tools/affordances.py`, rendered by
 `bridge_view.py --doc` / `--doc --all` / `--doc --json`, versioned
-`affordance-doc/2.1` and
+`affordance-doc/2.2` and
 readable from `bridge_view.py --doc-version`. The wire is untouched: the
 document is composed entirely from `state.json` and `catalog.json`, and the
 only engine change was three additive catalog keys (`stances`, `selectors`,

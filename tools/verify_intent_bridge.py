@@ -227,6 +227,15 @@ def main():
         {"type": "priority", "units": movers, "classes": ["Wizard"]},
         {"type": "cast", "caster": hall, "ability": "Fireball"},
         {"type": "nonsense_verb", "units": movers},
+        # --- null is an omitted key (wc3clone-2su4) -------------------------
+        # r34 blue sent the document's own `home-guard` template back with the
+        # optional `target` still null and got serde's *invalid type: null*.
+        # This is that exact command, and it must be ACCEPTED.
+        {"type": "trigger_set", "name": "null-is-omitted", "repeat": None,
+         "when": {"type": "base_under_attack"},
+         "then": {"type": "stance", "squad": 2, "stance": "turtle", "target": None}},
+        # ...and a REQUIRED key left null is refused in words that name it.
+        {"type": "stance", "squad": None, "stance": "turtle"},
     ])
     st = wait_for_seq(seq)
     print(f"[3] batch seq={seq} applied")
@@ -243,6 +252,16 @@ def main():
         "FAIL: missing ability-selector error"
     assert any("unrecognized command" in e for e in errs), "FAIL: missing parse error"
     assert all(e.startswith("cmd ") for e in errs), f"FAIL: error prefix changed: {errs}"
+    # wc3clone-2su4: null is an omitted key, so the optional-null trigger armed
+    # and only the REQUIRED-null one was refused — by name, with the fix.
+    assert not [e for e in errs if "null-is-omitted" in e], \
+        f"FAIL: a null on an optional key was refused: {errs}"
+    assert any(s["name"] == "null-is-omitted" for s in st.get("triggers") or []), \
+        "FAIL: the template with its optional hole left null never armed"
+    null_err = [e for e in errs if "you left it null" in e]
+    assert null_err, f"FAIL: a required key left null was not refused in words: {errs}"
+    assert "'squad'" in null_err[0] and "re-send" in null_err[0], \
+        f"FAIL: the null refusal names neither the field nor the fix: {null_err[0]}"
     print(f"[4] {len(errs)} validation errors, all with historical `cmd <i>:` prefix")
 
     # --- effects: the valid half actually changed the world -----------------
