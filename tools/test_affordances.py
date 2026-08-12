@@ -1328,7 +1328,13 @@ def test_the_text_render_is_readable_and_terminates():
 #: pre-filled mine came from. No action, no field and no template row was added
 #: — the alarm fixture moves further only because it renders `recipe:expand`
 #: twice, once under `income_collapse`.
-FULL_LINES = {"doc_open_armed.json": 659, "doc_open_alarm.json": 821}
+#: kpp then moved both by exactly one more: the digest gained a RUNWAY line
+#: (the gold runway — bank, income/min, mine remaining, what the bank buys,
+#: and the commitment already standing against it). Both fixtures predate the
+#: engine keys it reads, so on these two the line is the `buys` clause alone,
+#: priced off `catalog_full.json` — which is the point of that clause degrading
+#: separately from the rest.
+FULL_LINES = {"doc_open_armed.json": 660, "doc_open_alarm.json": 822}
 
 #: What the collapsed render must fit in. The real numbers when this landed were
 #: **76** (armed, 43 actions) and **94** (alarm, 51 actions and a ringing

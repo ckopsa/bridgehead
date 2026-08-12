@@ -14,13 +14,16 @@
 //! stance persists, persistence is right almost always, and the game never
 //! interrupted to say that this was one of the times it was not.
 //!
-//! So four conditions force a fresh choice and everything else defaults to
+//! So five conditions force a fresh choice and everything else defaults to
 //! continue:
 //!
 //! 1. an enemy army at or above the threshold is in the **sightings ledger**,
 //! 2. one of your own squads is below half pooled strength,
 //! 3. your gold has stopped — mines dry or nobody mining,
-//! 4. buildings are being hit in two or more places at once, with the recall
+//! 4. the mines your halls work are down to the threshold fraction of what
+//!    they held — the early half of 3, added because r26 and r27 each lost a
+//!    round to being told only the late half,
+//! 5. buildings are being hit in two or more places at once, with the recall
 //!    ETA of whatever is already moving.
 //!
 //! ## The three rules, and where each one is enforced
@@ -54,9 +57,11 @@
 //!
 //! ## Fog
 //!
-//! Inherited, not re-derived (docs/FOG.md; BUILDER_BRIEF §6.10). The three
-//! own-team alarms read this team's own units, buildings and doctrine, which
-//! are its own knowledge by construction. The one alarm about the enemy reads
+//! Inherited, not re-derived (docs/FOG.md; BUILDER_BRIEF §6.10). The four
+//! own-team alarms read this team's own units, buildings and doctrine — plus,
+//! for the two economy ones, the neutral mines, whose positions and remaining
+//! gold are unfiltered map geography that both seats are shown in full. The
+//! one alarm about the enemy reads
 //! `FogGrid::army_groups()` — **the ledger, and no `world.units` access at
 //! all**, which is the same structural claim `enemy_army_seen` and
 //! `enemy_hero_down` make in trigger.rs and is pinned by
@@ -549,10 +554,11 @@ fn income_alarm(me: Team, now: f32, threshold: f32, world: &AlarmWorld) -> Optio
             continue;
         }
         gold_nodes.push(entity);
-        if halls
-            .iter()
-            .any(|hall| xz_dist(*hall, tf.translation) <= MINE_HOME_RADIUS)
-        {
+        // `mine_is_home` and not a distance test written out here: "our mine"
+        // has one definition (shared.rs), and this alarm, the depletion alarm
+        // below it, `TriggerWhen::MineDry` and the snapshot's `mines[].home`
+        // all read it from there.
+        if mine_is_home(&halls, tf.translation) {
             near_home += 1;
             if node.remaining > 0 {
                 live_mines += 1;
@@ -622,6 +628,140 @@ fn income_alarm(me: Team, now: f32, threshold: f32, world: &AlarmWorld) -> Optio
         // minimap at an arbitrary mine would point the camera at the symptom.
         eta_s: None,
         pos: None,
+    })
+}
+
+/// **The mines your halls work are running out.** The early half of
+/// `IncomeCollapse`, and the one an expansion is still buildable from.
+///
+/// r26-blue: *"income_collapse fires when it is already too late;
+/// your-only-mine-is-20%-depleted is the alarm that would have made me expand
+/// at t=240."* r27-red, a different model on a different tier, lost a game to
+/// the same blind spot with every mine on the map permanently dry. Two rounds,
+/// two tiers, one missing derivative.
+///
+/// **Pooled across the mines your halls work**, not per mine, because the
+/// decision is about the team's runway and not about a particular hole in the
+/// ground: with a fresh expansion standing beside a spent main, you are not
+/// short of gold and an alarm saying otherwise would be crying wolf at the
+/// exact moment the commander did the right thing. The worst single mine is
+/// named in the fact anyway, because that is the one to replace.
+///
+/// Fog: own halls and neutral geography. Mine positions and their remaining
+/// gold are unfiltered map facts for both seats (`bridge.rs` §"mines, trees,
+/// map"), and *which mines are yours* is decided by your own halls' positions
+/// — so there is nothing here an omniscient reader could see that this team
+/// cannot.
+fn mine_alarm(me: Team, now: f32, threshold: f32, world: &AlarmWorld) -> Option<Alarm> {
+    let halls: Vec<Vec3> = world
+        .buildings
+        .iter()
+        .filter(|(b, team, _, _, uc)| **team == me && is_hall(b.kind) && uc.is_none())
+        .map(|(_, _, tf, _, _)| tf.translation)
+        .collect();
+    if halls.is_empty() {
+        return None;
+    }
+
+    let mut remaining = 0u32;
+    let mut capacity = 0u32;
+    let mut mines = 0usize;
+    // (fraction left, position) of the worst one, ties to the first in query
+    // order — which is stable for a given seed because nothing here re-orders.
+    let mut worst: Option<(f32, Vec3)> = None;
+    // The nearest gold nobody's hall is working yet: the running default's
+    // "where would you even go?", answered rather than implied.
+    let mut spare: Option<(f32, Vec3, u32)> = None;
+    for (_, node, tf) in world.nodes.iter() {
+        if node.kind != ResourceKind::Gold {
+            continue;
+        }
+        if mine_is_home(&halls, tf.translation) {
+            mines += 1;
+            remaining += node.remaining;
+            capacity += node.capacity;
+            let frac = node.remaining_frac();
+            if worst.is_none_or(|(w, _)| frac < w) {
+                worst = Some((frac, tf.translation));
+            }
+        } else if node.remaining > 0 {
+            let d = halls
+                .iter()
+                .map(|h| xz_dist(*h, tf.translation))
+                .fold(f32::INFINITY, f32::min);
+            if spare.is_none_or(|(best, _, _)| d < best) {
+                spare = Some((d, tf.translation, node.remaining));
+            }
+        }
+    }
+    if capacity == 0 {
+        // No mine in reach of any hall. That is `income_collapse`'s sentence
+        // and it says it better; a depletion fraction of nothing is not a
+        // fraction.
+        return None;
+    }
+    let frac = remaining as f32 / capacity as f32;
+    if frac > threshold.clamp(0.0, 1.0) {
+        return None;
+    }
+
+    let fact = format!(
+        "gold running out: the {} mine{} your halls work {} down to {:.0}% ({}g of {}g left){}",
+        mines,
+        if mines == 1 { "" } else { "s" },
+        if mines == 1 { "is" } else { "are" },
+        frac * 100.0,
+        remaining,
+        capacity,
+        match worst {
+            // Only worth saying when there is more than one and they differ:
+            // "the worst is 24%" about a single mine already at 24% is noise.
+            Some((w, pos)) if mines > 1 => format!(
+                ", lowest {:.0}% {}",
+                w * 100.0,
+                place_name(pos, me)
+            ),
+            _ => String::new(),
+        }
+    );
+
+    // What is already happening about it, in the order a commander would ask.
+    // A hall going up is the answer; a trigger that fired is the answer; and
+    // when neither exists, the honest sentence names the ground an expansion
+    // would go to, because "expand" with no destination is advice and this
+    // layer does not give advice.
+    let rising = world
+        .buildings
+        .iter()
+        .filter(|(b, team, _, _, uc)| **team == me && is_hall(b.kind) && uc.is_some())
+        .map(|(_, _, tf, _, _)| tf.translation)
+        .next();
+    let reflex = reflex_note(me, now, world, |when| matches!(when, TriggerWhen::MineDry));
+    let tail = match rising {
+        Some(pos) => format!("a hall is already going up {}", place_name(pos, me)),
+        None => match spare {
+            Some((_, pos, left)) => format!(
+                "no new hall is going up; the nearest unworked gold is {} ({left}g)",
+                place_name(pos, me)
+            ),
+            None => "no new hall is going up, and no unworked gold is left on the map".to_string(),
+        },
+    };
+    Some(Alarm {
+        kind: AlarmKind::MineDepleting,
+        fact,
+        running_default: default_with(reflex, "nothing expands your economy for you", tail),
+        since_t: 0.0,
+        // Warning and not Critical: this is the alarm you have TIME to answer,
+        // which is the whole reason it exists a few minutes ahead of
+        // `income_collapse`.
+        severity: EventSeverity::Warning,
+        eta_s: None,
+        // The worst mine, so the HUD can ping the hole in the ground that is
+        // about to stop paying. Unlike `income_collapse` — which deliberately
+        // points nowhere because a collapsed economy has no one place — this
+        // one does have a place, and it is where the next hall goes.
+        pos: worst.map(|(_, pos)| pos),
     })
 }
 
@@ -781,6 +921,7 @@ pub fn evaluate_alarms(
                 AlarmKind::EnemyArmySighted => army_alarm(me, now, tuning.threshold, &world),
                 AlarmKind::SquadBelowHalf => squad_alarm(me, now, tuning.threshold, &world),
                 AlarmKind::IncomeCollapse => income_alarm(me, now, tuning.threshold, &world),
+                AlarmKind::MineDepleting => mine_alarm(me, now, tuning.threshold, &world),
                 AlarmKind::PlacesUnderAttack => places_alarm(me, now, tuning.threshold, &world),
             };
             // The feed line is built before the state machine consumes the
@@ -1243,10 +1384,7 @@ mod tests {
         let mut app = alarm_app();
         spawn_building(&mut app, Team::Human, BuildingKind::TownHall, Vec3::ZERO);
         app.world_mut().spawn((
-            ResourceNode {
-                kind: ResourceKind::Gold,
-                remaining: 0,
-            },
+            ResourceNode { kind: ResourceKind::Gold, remaining: 0, capacity: 5000 },
             Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
         ));
         spawn_unit(
@@ -1277,10 +1415,7 @@ mod tests {
         let node = app
             .world_mut()
             .spawn((
-                ResourceNode {
-                    kind: ResourceKind::Gold,
-                    remaining: 5000,
-                },
+                ResourceNode::full(ResourceKind::Gold, 5000),
                 Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
             ))
             .id();
@@ -1317,10 +1452,7 @@ mod tests {
         // A gold node on the map, but far outside `MINE_HOME_RADIUS` — so the
         // alarm counts zero mines near home rather than zero mines at all.
         app.world_mut().spawn((
-            ResourceNode {
-                kind: ResourceKind::Gold,
-                remaining: 5000,
-            },
+            ResourceNode::full(ResourceKind::Gold, 5000),
             Transform::from_translation(Vec3::new(MINE_HOME_RADIUS * 3.0, 0.0, 0.0)),
         ));
 
@@ -1349,7 +1481,164 @@ mod tests {
         );
     }
 
-    // -- 4. multiple places under attack ------------------------------------
+    // -- 4. the mines running out -------------------------------------------
+
+    /// A mine at a fifth of what it held, with a hall on it and a worker
+    /// swinging: no collapse, and the alarm that would have made r26-blue
+    /// expand.
+    #[test]
+    fn a_mine_below_the_threshold_warns_long_before_the_income_collapses() {
+        let mut app = alarm_app();
+        spawn_building(&mut app, Team::Human, BuildingKind::TownHall, Vec3::ZERO);
+        let node = app
+            .world_mut()
+            .spawn((
+                ResourceNode { kind: ResourceKind::Gold, remaining: 1000, capacity: 5000 },
+                Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+            ))
+            .id();
+        let worker = spawn_unit(
+            &mut app,
+            Team::Human,
+            race_worker(Race::Kingdom),
+            Vec3::new(2.0, 0.0, 0.0),
+            None,
+        );
+        app.world_mut().entity_mut(worker).insert(Order::Harvest(node));
+
+        // Long enough for the SLOWER of the two economy alarms, so "the
+        // collapse did not fire" is a fact and not a race with its own window.
+        run_for(&mut app, alarm_tuning(AlarmKind::IncomeCollapse).grace_s + 2.0);
+        let alarm = alarm_of(&app, Team::Human, AlarmKind::MineDepleting)
+            .expect("a fifth of one mine is under any sane threshold");
+        assert!(alarm.fact.contains("20%"), "{}", alarm.fact);
+        assert!(alarm.fact.contains("1000g of 5000g left"), "{}", alarm.fact);
+        assert!(
+            alarm.pos.is_some(),
+            "unlike an income collapse this alarm has a place — it is where the next hall goes"
+        );
+        assert!(
+            alarm_of(&app, Team::Human, AlarmKind::IncomeCollapse).is_none(),
+            "the whole point is that this fires while the gold is still flowing"
+        );
+    }
+
+    /// The running default answers "where would I even expand to?" rather than
+    /// leaving the commander to go and look — and says plainly that nothing is
+    /// happening, which is the sentence this layer exists to be able to say.
+    #[test]
+    fn with_no_hall_going_up_the_default_names_the_nearest_unworked_gold() {
+        let mut app = alarm_app();
+        spawn_building(&mut app, Team::Human, BuildingKind::TownHall, Vec3::ZERO);
+        app.world_mut().spawn((
+            ResourceNode { kind: ResourceKind::Gold, remaining: 200, capacity: 5000 },
+            Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+        ));
+        // Far enough that no hall works it — the place an expansion goes.
+        app.world_mut().spawn((
+            ResourceNode::full(ResourceKind::Gold, 5000),
+            Transform::from_translation(Vec3::new(MINE_HOME_RADIUS * 2.0, 0.0, 0.0)),
+        ));
+
+        run_for(&mut app, alarm_tuning(AlarmKind::MineDepleting).grace_s + 2.0);
+        let alarm = alarm_of(&app, Team::Human, AlarmKind::MineDepleting).expect("4% left");
+        assert!(
+            alarm.running_default.contains("nothing expands your economy for you"),
+            "{}",
+            alarm.running_default
+        );
+        assert!(
+            alarm.running_default.contains("nearest unworked gold")
+                && alarm.running_default.contains("5000g"),
+            "an alarm that says 'expand' without saying where is advice, not a fact: {}",
+            alarm.running_default
+        );
+    }
+
+    /// A hall already going up IS the running default, and naming it is the
+    /// difference between "you have a problem" and "you have a problem and it
+    /// is being handled".
+    #[test]
+    fn a_hall_already_under_construction_is_the_running_default() {
+        let mut app = alarm_app();
+        spawn_building(&mut app, Team::Human, BuildingKind::TownHall, Vec3::ZERO);
+        app.world_mut().spawn((
+            ResourceNode { kind: ResourceKind::Gold, remaining: 200, capacity: 5000 },
+            Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+        ));
+        let site = spawn_building(
+            &mut app,
+            Team::Human,
+            BuildingKind::TownHall,
+            Vec3::new(60.0, 0.0, 60.0),
+        );
+        app.world_mut()
+            .entity_mut(site)
+            .insert(UnderConstruction { remaining: 20.0 });
+
+        run_for(&mut app, alarm_tuning(AlarmKind::MineDepleting).grace_s + 2.0);
+        let alarm = alarm_of(&app, Team::Human, AlarmKind::MineDepleting).expect("4% left");
+        assert!(
+            alarm.running_default.contains("a hall is already going up"),
+            "{}",
+            alarm.running_default
+        );
+    }
+
+    /// **Pooled, and that is the design.** A spent main plus a fresh expansion
+    /// is not a team running out of gold, and an alarm that kept ringing at the
+    /// commander who had just done the right thing would be teaching the wrong
+    /// lesson. The clearing edge is owed and paid.
+    #[test]
+    fn a_fresh_expansion_clears_the_depletion_alarm() {
+        let mut app = alarm_app();
+        spawn_building(&mut app, Team::Human, BuildingKind::TownHall, Vec3::ZERO);
+        app.world_mut().spawn((
+            ResourceNode { kind: ResourceKind::Gold, remaining: 500, capacity: 5000 },
+            Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+        ));
+        run_for(&mut app, alarm_tuning(AlarmKind::MineDepleting).grace_s + 2.0);
+        assert!(alarm_of(&app, Team::Human, AlarmKind::MineDepleting).is_some());
+
+        // A second hall on a full mine, far from the first.
+        let away = Vec3::new(120.0, 0.0, 0.0);
+        spawn_building(&mut app, Team::Human, BuildingKind::TownHall, away);
+        app.world_mut().spawn((
+            ResourceNode::full(ResourceKind::Gold, 5000),
+            Transform::from_translation(away + Vec3::new(10.0, 0.0, 0.0)),
+        ));
+
+        run_for(&mut app, 3.0);
+        assert!(
+            alarm_of(&app, Team::Human, AlarmKind::MineDepleting).is_none(),
+            "5500 of 10000 pooled is not a team running out of gold"
+        );
+        assert!(feed_lines(&app, Team::Human)
+            .iter()
+            .any(|l| l == "alarm clear: mines running out"));
+    }
+
+    #[test]
+    fn a_full_mine_raises_nothing_and_a_hall_with_no_mine_is_not_a_depletion() {
+        let mut app = alarm_app();
+        spawn_building(&mut app, Team::Human, BuildingKind::TownHall, Vec3::ZERO);
+        app.world_mut().spawn((
+            ResourceNode::full(ResourceKind::Gold, 5000),
+            Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+        ));
+        run_for(&mut app, alarm_tuning(AlarmKind::MineDepleting).grace_s + 2.0);
+        assert!(alarm_of(&app, Team::Human, AlarmKind::MineDepleting).is_none());
+
+        // And a hall with nothing in reach: `income_collapse` already has the
+        // right sentence for that, and a fraction of no mine is not a fraction.
+        let mut bare = alarm_app();
+        spawn_building(&mut bare, Team::Human, BuildingKind::TownHall, Vec3::ZERO);
+        run_for(&mut bare, alarm_tuning(AlarmKind::IncomeCollapse).grace_s + 2.0);
+        assert!(alarm_of(&bare, Team::Human, AlarmKind::MineDepleting).is_none());
+        assert!(alarm_of(&bare, Team::Human, AlarmKind::IncomeCollapse).is_some());
+    }
+
+    // -- 5. multiple places under attack ------------------------------------
 
     /// The headline case, and the one AFFORDANCES.md writes out longhand:
     /// two fronts, a home-guard trigger that has ALREADY fired, and a running

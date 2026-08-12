@@ -18,7 +18,8 @@ co-commander section near the end, which is the only part that differs.
    or the game ends. It prints why it woke.
 2. `python3 tools/bridge_view.py <SEAT>/state.json` — compact readout (combine 1+2 in one
    bash call: `wait ... && view ...`). Add `--digest` for the ~15-line version:
-   resources, your army by squad, your production queues, the enemy production
+   resources, **the gold runway** (the `RUNWAY` line — see *The gold runway*
+   below), your army by squad, your production queues, the enemy production
    buildings you have SEEN (the win-condition line), the last five events, any
    active alarms, and one line naming what happens if you send nothing this
    cycle. Add `--doc` instead for the whole affordance document: that digest,
@@ -527,11 +528,47 @@ with `posture`, which never needed a roster. You get the ordinary
 against an id that becomes a corpse; memorising a tree id that gets chopped
 down; a `build` trigger on fixed coordinates that reports `site blocked` for the
 rest of the match. Write the role once and stop.
-## Alarms: the four things worth re-deciding
+## The gold runway: the bank read forwards
+
+`RESOURCES` says what you have. **`RUNWAY` says how fast it is arriving, how
+much ore is behind it, what it buys, and what is already spoken for** — the four
+numbers you cannot get by staring at `gold` harder:
+
+    RESOURCES gold 936 lumber 210 supply 24/30 upkeep 100% tier 2 workers 9
+    RUNWAY gold 936 +513/min · buys 6x Footman · mines 64% 16% 4000g ≈ 7.8m at this rate · commit 1238/min > income 513/min
+
+Read left to right, it says: you are banking 513 gold a minute; that bank buys
+six more Footmen right now; the mines your halls work hold 4,000 gold between
+them, which is under eight minutes at this rate; and your standing training
+queues want 1,238 a minute, which is why the bank is not growing.
+
+The pieces, and where each one comes from:
+
+| clause | source | what it means |
+| --- | --- | --- |
+| `+513/min` | `me.income_per_min` | gold **banked** over the last 60 game seconds, *after* upkeep. Measured, not modelled — a raided mining crew and an upkeep bracket you just crossed both show up here and in nothing else. |
+| `buys 6x Footman` | your bank ÷ `catalog.units[].cost_gold` | the cheapest unit you can train **right now**, capped by supply room. `buys 0x` is a real answer. |
+| `mines 64% 16% 4000g` | `mines[]` where `home` is true | per mine, so one spent main beside one fresh expansion does not read the same as two half-empty ones. |
+| `≈ 7.8m at this rate` | the ore ÷ the rate | how long the gold lasts if nothing changes. Compare it against a hall's 40-second build time and the walk to the next mine. |
+| `commit 1238/min > income 513/min` | `me.commit_per_min` | what your **standing queues** will demand if they run as scheduled — printed only when it outruns income. Over income, the excess is not production, it is a queue of items waiting on gold that has not arrived. |
+
+`me.commit_per_min` is absent when nothing is queued, and the whole `RUNWAY`
+line is absent when the snapshot has nothing to put on it. The human at the
+keyboard reads the same three numbers off the resource bar at the top of the
+screen — same facts, different pixels.
+
+**Why this exists.** Three ladder rounds lost the same information three ways:
+a commander that could not tell whether its economy was growing (r26), one that
+could not tell what its bank would buy (r27), and one that ran three trainers
+off a bank that could feed one and found out only from a stream of `cannot
+afford` refusals (r36). None of them was missing a *word* — they were missing a
+*derivative*.
+
+## Alarms: the five things worth re-deciding
 
 Everything else defaults to **continue**. Silence is a legal, and usually
 correct, move — your squads keep their postures, your triggers keep watching,
-your plans keep stepping. The engine forces a fresh choice on exactly four
+your plans keep stepping. The engine forces a fresh choice on exactly five
 conditions, and it puts them in your snapshot's `alarms` array:
 
 | `id` | fires when |
@@ -539,7 +576,20 @@ conditions, and it puts them in your snapshot's `alarms` array:
 | `enemy_army_sighted` | a body of enemy troops at or above the threshold is in **your `intel` ledger**, seen recently |
 | `squad_below_half` | one of your own squads is under half its pooled health |
 | `income_collapse` | your gold has stopped — every mine your halls work is dry, or nobody is on gold |
+| `mine_depleting` | the mines your halls work are **down to 30% of what they held**, pooled — the expansion warning, minutes before the collapse |
 | `places_under_attack` | your buildings are being hit in **two or more places at once** |
+
+The whole table is also in `catalog.alarms`, one row per `id` with its `label`,
+a `fires_when` sentence and the two numbers that decide it — `threshold` and
+`grace_s`. Read it there rather than trusting this table: the numbers live in a
+data file the arena can turn, and the catalog is what your match was actually
+played under.
+
+**`mine_depleting` is the one you get to act on.** `income_collapse` tells you
+the gold has stopped; by then an expansion is a worker walk plus 40 seconds of
+build time plus a fresh crew, and you are paying for it out of a bank that is no
+longer filling. `mine_depleting` fires while the last third is still coming in.
+Both can stand at once, and when they do the second one is old news.
 
 ```json
 "alarms": [
@@ -1759,6 +1809,12 @@ commands, read that instead of parsing this document.
     Map geography is not a secret; what the enemy is DOING with it is. A mined-out
     mine **stays** in `mines` reading `"remaining": 0` — a dry mine is still a place,
     and it is the thing `mine_dry` watches for. (Felled trees leave `trees_near`.)
+    Each mine also carries `capacity` (what it held when the map was laid out, so
+    `remaining` can be read as a fraction) and `home: true` when it is inside 40 of
+    one of *your* finished halls — which is what "your mine" means in a game where
+    mines are neutral, and the same test `mine_dry`, `income_collapse` and
+    `mine_depleting` use. `home` is computed from YOUR halls; it says nothing about
+    whose mine the enemy thinks it is.
   - You cannot `attack` an id you cannot see or remember — it is rejected as
     `target N is not visible`. Use `attackmove` to advance into the unknown.
   - **Scout deliberately.** Vision radius is per-kind in `catalog.json` (`vision`).
@@ -1811,7 +1867,9 @@ commands, read that instead of parsing this document.
 - **UPKEEP**: gold income is taxed by army size — supply ≤40: keep 100% of each delivery;
   41-70: 70%; 71+: 40% (`me.upkeep_rate` in your snapshot). Lumber untaxed. A huge idle
   army bleeds your economy — either use it or stay lean.
-- **Mines are finite** (3500 each — they die around minute 10). The map runs dry; late-game armies are irreplaceable.
+- **Mines are finite** (3500 each — they die around minute 10; each mine's own
+  `capacity` and `remaining` are on the wire, and the `RUNWAY` line divides them
+  by your income so you get the answer in minutes). The map runs dry; late-game armies are irreplaceable.
   Long passive games punish you twice (upkeep + exhaustion) — force the issue.
 - **Bounty caches**: neutral treasure spawns in the contested middle every ~90s (watch the
   `bounties` list and event feed — but see fog above: you only see caches you have eyes on,

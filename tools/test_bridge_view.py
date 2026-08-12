@@ -738,6 +738,130 @@ def test_notes_and_errors_are_two_channels_in_one_readout():
     assert any(ln.startswith("NOTE cmd 1: accepted") for ln in lines)
 
 
+# -- the gold runway (wc3clone-kpp) ------------------------------------------
+#
+# Three arena rounds asked for this line and none of them could compute it: r26
+# ("bank, income/min, mine remaining per hall"), r27 on a different model tier
+# ("your banked gold buys K more units"), r36 ("three standing trainers
+# oversubscribed one bank"). What follows pins the shape of the answer.
+
+
+CATALOG = load(FIX / "catalog_full.json")
+
+
+def with_runway(path=None, **me):
+    """A live fixture wearing the engine keys this line reads."""
+    s = load(path or LIVE[0])
+    s["me"].update({"income_per_min": 480.0, **me})
+    # Two mines this seat's halls work, one two-thirds gone, plus one that is
+    # NOT ours — the ownership case: an unworked mine's gold is nobody's runway.
+    s["mines"] = [
+        {"id": 1, "pos": [0.0, 0.0], "remaining": 3200, "capacity": 5000, "home": True},
+        {"id": 2, "pos": [9.0, 9.0], "remaining": 800, "capacity": 5000, "home": True},
+        {"id": 3, "pos": [80.0, 80.0], "remaining": 5000, "capacity": 5000},
+    ]
+    return s
+
+
+def runway_line(s, catalog=None):
+    lines = bridge_view.render_digest(bridge_view.digest(s, catalog))
+    got = [ln for ln in lines if ln.startswith("RUNWAY ")]
+    return got[0] if got else None
+
+
+def test_the_runway_line_carries_the_rate_the_ore_and_the_time_between_them():
+    line = runway_line(with_runway())
+    assert line, "no RUNWAY line"
+    assert "+480/min" in line, line
+    # Per mine, because "mine remaining per hall" was the ask: one spent main
+    # beside one fresh expansion is a different game from two half mines.
+    assert "mines 64% 16%" in line, line
+    assert "4000g" in line, line
+    # ...and the two divided: how long the ore behind the rate lasts, which is
+    # the number an expansion decision is actually made against.
+    assert "8.3m at this rate" in line, line
+    # The mine nobody's hall works is nobody's runway.
+    assert "9000g" not in line, "an unworked mine is not your gold: {}".format(line)
+
+
+def test_the_runway_sits_under_resources_and_costs_one_line():
+    lines = bridge_view.render_digest(bridge_view.digest(with_runway()))
+    assert prefixes(lines)[:3] == ["DIGEST", "RESOURCES", "RUNWAY"], prefixes(lines)
+    assert len(lines) <= bridge_view.MAX_LINES, len(lines)
+
+
+def test_the_commitment_speaks_only_when_it_outruns_the_income():
+    """r36's fact. Under income it is a healthy economy and needs no words;
+    over it, it is the reason the bank is not growing."""
+    quiet = runway_line(with_runway(commit_per_min=200.0))
+    assert "commit" not in quiet, quiet
+    loud = runway_line(with_runway(commit_per_min=1240.0))
+    assert "commit 1240/min > income 480/min" in loud, loud
+
+
+def test_the_bank_is_priced_off_the_catalog_and_never_off_a_number_here():
+    """The prices come from `catalog.units[].cost_gold` — change the catalog and
+    the count changes with it, which is the only way to prove nothing here has
+    memorised a price."""
+    s = with_runway()
+    s["me"].update({"gold": 900, "lumber": 900, "supply_used": 0, "supply_cap": 40})
+    line = runway_line(s, CATALOG)
+    cheapest = min(
+        (u for u in CATALOG["units"]
+         if u["cost_gold"] and u["role"] != "Worker" and not u["role"].startswith("Hero")
+         and s["unlocked"].get(u["id"])),
+        key=lambda u: (u["cost_gold"], u["id"]),
+    )
+    assert "buys {}x {}".format(900 // cheapest["cost_gold"], cheapest["id"]) in line, line
+
+    dearer = copy.deepcopy(CATALOG)
+    for u in dearer["units"]:
+        u["cost_gold"] = u["cost_gold"] * 3
+    assert "buys {}x".format(900 // (3 * cheapest["cost_gold"])) in runway_line(s, dearer)
+
+
+def test_the_bank_is_counted_in_bodies_you_could_actually_field():
+    """Gold that buys six Footmen into two supply of room buys two Footmen.
+    A true number nobody can act on is what this page exists to replace."""
+    s = with_runway()
+    s["me"].update({"gold": 900, "lumber": 900, "supply_used": 38, "supply_cap": 40})
+    line = runway_line(s, CATALOG)
+    assert "supply room 2" in line and "gold covers" in line, line
+
+
+def test_the_runway_reads_nothing_about_the_enemy():
+    """Fog by construction: `me` is this seat's own bank, `home` is computed
+    from this seat's own halls, and mines are unfiltered geography for both
+    seats anyway. Deleting the entire enemy from the snapshot changes nothing."""
+    s = with_runway()
+    mine = bridge_view.digest(s, CATALOG)["runway"]
+    s["units"] = [u for u in s["units"] if u.get("team") == s.get("my_team")]
+    s["buildings"] = [b for b in s["buildings"] if b.get("team") == s.get("my_team")]
+    assert bridge_view.digest(s, CATALOG)["runway"] == mine
+
+
+def test_a_snapshot_from_before_the_runway_keeps_its_old_page():
+    """Every key here is a `.get`. Without the engine's half and without a
+    catalog there is nothing to say, and the line is absent rather than empty —
+    a section that renders "unknown" four ways is worse than one that is not
+    there."""
+    for path in LIVE + [EARLY, LEGACY]:
+        s = load(path)
+        assert "income_per_min" not in s["me"], "fixture predates the key — that is the point"
+        assert runway_line(s) is None, path.name
+        props = bridge_view.digest(s)
+        assert props["runway"]["income_per_min"] is None
+        assert props["runway"]["mines"] == []
+    assert bridge_view.digest({})["runway"]["buys"] is None, "and the paranoid case"
+
+
+def test_an_income_of_zero_is_not_a_division():
+    """A dry economy still renders: no estimate rather than an infinity."""
+    line = runway_line(with_runway(income_per_min=0.0))
+    assert "at this rate" not in line, line
+    assert "+0/min" in line, line
+
+
 def _run():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

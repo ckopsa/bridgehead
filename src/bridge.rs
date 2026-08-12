@@ -1053,6 +1053,28 @@ struct MeOut {
     supply_cap: u32,
     /// Fraction of each gold delivery you actually receive (upkeep tax).
     upkeep_rate: f32,
+    /// **Gold actually banked per minute**, measured over the last 60 game
+    /// seconds (`shared::INCOME_WINDOW_S`) and *after* upkeep — the number
+    /// `gold` is going up by, not the number your workers are digging.
+    ///
+    /// Measured, never modelled: a raided mining crew, a mine that just ran
+    /// out and an upkeep bracket you crossed on your last Farm all show up
+    /// here and in none of the counts beside it. In the first minute of a match
+    /// it is the rate over however long the match has lasted, which is why an
+    /// opening reads low rather than reading zero.
+    income_per_min: f32,
+    /// **Gold per minute your standing training queues will demand** if they
+    /// run as scheduled: for each production building, the gold in its queue
+    /// over the time that queue takes, summed across buildings.
+    ///
+    /// Compare it with `income_per_min`. Three Barracks cycling Footmen want
+    /// more than a four-worker economy earns, and the only symptom of that is a
+    /// bank that never grows and a trickle of "cannot afford" — which is the
+    /// hole r36 found. Absent (not zero) when nothing is queued: nothing
+    /// standing and a standing commitment of nothing are the same thing here,
+    /// and the key is skipped so a quiet seat's snapshot keeps its old shape.
+    #[serde(skip_serializing_if = "is_zero_rate")]
+    commit_per_min: f32,
     /// Highest hall tier you have STANDING and finished: 1 TownHall, 2 Keep,
     /// 3 Castle. The one number tier-gated content is written against; the
     /// per-building `tier` field says where each hall individually sits.
@@ -1826,6 +1848,25 @@ struct MineOut {
     id: u64,
     pos: [f32; 2],
     remaining: u32,
+    /// What this mine held when the map was laid out — the denominator
+    /// `remaining` never had. `remaining: 1200` is a fresh mine on a map with
+    /// small mines and the last quarter of one here, and a commander cannot
+    /// tell which without this.
+    capacity: u32,
+    /// **One of yours**: inside `MINE_HOME_RADIUS` of one of your completed
+    /// halls, which is what "our mine" means in a game where mines are neutral
+    /// (`shared::mine_is_home`, the same predicate `mine_dry` and both economy
+    /// alarms read). Skipped when false, so the mines nobody's hall works keep
+    /// exactly the shape they always had.
+    #[serde(skip_serializing_if = "is_false")]
+    home: bool,
+}
+
+/// `skip_serializing_if` helper for a rate nobody is running: absent and zero
+/// are the same claim here, and absent keeps a quiet seat's snapshot the shape
+/// it has always had. (`is_false` for the flags already exists above.)
+fn is_zero_rate(v: &f32) -> bool {
+    *v <= 0.0
 }
 
 /// Trees carry their entity id so `{"type":"harvest","target":<id>}` can name
@@ -1983,6 +2024,18 @@ struct StandingOrders<'w> {
     alarms: Res<'w, Alarms>,
 }
 
+/// The bank and its two derivatives. Bundled for the reason `TeamTech` is —
+/// `write_snapshot` sits exactly on Bevy's 16-parameter ceiling — and the
+/// pairing is the natural one: `GoldFlow` is `Economies` differentiated, and a
+/// `me` block that reported the level without the rate is the snapshot r26-blue
+/// read four times a minute and still could not tell whether it was getting
+/// richer.
+#[derive(SystemParam)]
+struct Treasury<'w> {
+    economies: Res<'w, Economies>,
+    flow: Res<'w, GoldFlow>,
+}
+
 /// The co-command side-channel: the pending proposal queue and the team's
 /// recent intent history. Bundled for the same reason `TeamTech` is — this
 /// system sits on Bevy's 16-parameter ceiling, and these two answer the one
@@ -1998,7 +2051,7 @@ fn write_snapshot(
     time: Res<Time>,
     real: Res<Time<Real>>,
     mut bridge: ResMut<Bridge>,
-    economies: Res<Economies>,
+    treasury: Treasury,
     records: Res<HeroRecords>,
     match_state: MatchState,
     standing: StandingOrders,
@@ -2049,7 +2102,8 @@ fn write_snapshot(
         write_seat_snapshot(
             seat,
             now,
-            &economies,
+            &treasury.economies,
+            treasury.flow.get(seat.team),
             &records,
             &match_state.over,
             &match_state.ready,
@@ -2085,6 +2139,10 @@ fn write_seat_snapshot(
     seat: &mut Seat,
     now: f32,
     economies: &Economies,
+    // This seat's own gold rates, pre-sliced by team like the alarms and for
+    // the same reason: an income rate is a reading of one team's own economy,
+    // and the opponent's is something you learn by scouting their mines.
+    flow: &TeamFlow,
     records: &HeroRecords,
     game_over: &GameOver,
     // Whether the match has started, and who it is still waiting for. Read for
@@ -2395,6 +2453,16 @@ fn write_seat_snapshot(
         .collect();
     let unlocked = unlocked_map(&completed);
 
+    // Which of them your halls work, decided once here off the same predicate
+    // the alarms use, so the runway line in a digest and the alarm that fires
+    // about it can never disagree about whose mine it is.
+    let my_halls: Vec<Vec3> = buildings
+        .iter()
+        .filter(|(_, b, team, _, _, under, _, _, _, _, _, _)| {
+            **team == me && is_hall(b.kind) && under.is_none()
+        })
+        .map(|(_, _, _, tf, ..)| tf.translation)
+        .collect();
     let mut mines: Vec<MineOut> = nodes
         .iter()
         .filter(|(_, node, _)| node.kind == ResourceKind::Gold)
@@ -2402,6 +2470,8 @@ fn write_seat_snapshot(
             id: e.to_bits(),
             pos: [r1(tf.translation.x), r1(tf.translation.z)],
             remaining: node.remaining,
+            capacity: node.capacity,
+            home: mine_is_home(&my_halls, tf.translation),
         })
         .collect();
     mines.sort_by_key(|m| m.id);
@@ -2617,6 +2687,8 @@ fn write_seat_snapshot(
             supply_used: eco.supply_used,
             supply_cap: eco.supply_cap,
             upkeep_rate: upkeep_rate(eco.supply_used),
+            income_per_min: r1(flow.income_per_min),
+            commit_per_min: r1(flow.commit_per_min),
             tier: completed
                 .iter()
                 .filter(|k| is_hall(**k))

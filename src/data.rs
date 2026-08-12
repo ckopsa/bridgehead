@@ -2847,4 +2847,30 @@ mod tests {
             "an empty library must be absent, not an empty array"
         );
     }
+
+    /// **The alarm vocabulary is discoverable and its numbers are the data's.**
+    ///
+    /// A commander that has to read the brief to learn `mine_depleting` exists
+    /// will not learn it (arena/LADDER.md, Finding 5: what is not on the page
+    /// is not read), and a threshold published from anywhere but `alarms.ron`
+    /// would be a second copy of a number the evaluator does not use — which is
+    /// the failure docs/FOG.md names: nothing errors, the two just disagree.
+    #[test]
+    fn the_catalog_publishes_every_alarm_with_the_numbers_the_evaluator_uses() {
+        let catalog = crate::shared::game_catalog();
+        assert_eq!(catalog.alarms.len(), crate::shared::ALL_ALARM_KINDS.len());
+        for kind in crate::shared::ALL_ALARM_KINDS {
+            let row = catalog
+                .alarms
+                .iter()
+                .find(|a| a.id == kind.id())
+                .unwrap_or_else(|| panic!("{kind:?} is missing from catalog.alarms"));
+            let tuning = crate::shared::alarm_tuning(kind);
+            assert_eq!(row.threshold, tuning.threshold, "{kind:?} threshold");
+            assert_eq!(row.grace_s, tuning.grace_s, "{kind:?} grace");
+            assert!(!row.fires_when.is_empty(), "{kind:?} says when it fires");
+        }
+        // And the fifth one is really there, by the id a commander keys off.
+        assert!(catalog.alarms.iter().any(|a| a.id == "mine_depleting"));
+    }
 }

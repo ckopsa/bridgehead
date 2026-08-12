@@ -55,7 +55,15 @@ BASES = {"Claude": (70.0, 70.0), "Human": (-70.0, -70.0)}
 # sent — which is exactly the state in which a commander should be reading one
 # more line. The notes section collapses to a single summary before the ceiling
 # is reached, so the nineteenth line is the most it can ever cost.
-MAX_LINES = 19
+#
+# 19 → 20 with the gold runway (wc3clone-kpp). The line RESOURCES could not
+# carry: r26-blue asked for "bank, income/min, mine remaining per hall" and
+# r27-red, a different tier, asked for "what does my banked gold buy" — one
+# line of derivatives under one line of levels, rather than a RESOURCES line
+# nobody can read at a glance. It costs at most one event, which is the
+# cheapest thing on this page (every event is verbatim in `state.events`) and
+# the runway is the one section here that is about the NEXT four minutes.
+MAX_LINES = 20
 #: Events shown, newest last. Five is AFFORDANCES.md's number.
 EVENT_LINES = 5
 #: Squad lines before the rest collapse into a "+N more" tail.
@@ -253,6 +261,128 @@ def _squad_props(sid, sq, members, smap):
     }
 
 
+def _buys(state, catalog):
+    """**What the bank buys, in bodies** — r27-red's ask, in one clause.
+
+    "gold 936" is a level with no unit attached; "buys 6x Footman" is the same
+    number in the currency decisions are actually made in. A commander that has
+    to divide its bank by a price it looked up in a 380-line catalog render will
+    not do it every cycle, and r27 (a different model tier from r26, in a match
+    where every mine was permanently dry) named this as *the* single most
+    decision-relevant number missing from the page.
+
+    **The catalog is the price source, always.** Nothing here hardcodes a cost:
+    no catalog, or a catalog without prices, and the clause simply is not
+    rendered — the same degradation rule every other key on this page follows.
+
+    ONE unit, not a table: the cheapest thing this seat can train right now,
+    which is the floor of "how many more bodies can I put on the field". The
+    per-unit table is `--prices` (wc3clone-rmw) and belongs there, not here.
+
+    Supply is part of the answer. Gold that buys six Footmen into two supply of
+    room buys two Footmen, and reporting six would be the kind of true-but-
+    useless number this page exists to replace.
+    """
+    if not catalog:
+        return None
+    me = state.get("me") or {}
+    unlocked = state.get("unlocked") or {}
+    gold, lumber = me.get("gold", 0), me.get("lumber", 0)
+    room = max(0, me.get("supply_cap", 0) - me.get("supply_used", 0))
+    best = None
+    for u in catalog.get("units") or []:
+        kind, cost = u.get("id"), u.get("cost_gold")
+        # A free unit is a hero waiver, not a bargain (`me.hero_costs` prices
+        # those honestly and they are slot-gated anyway); a worker is an
+        # investment rather than a body on the field; and an entry this seat
+        # cannot train is not an answer to "what can I buy".
+        role = u.get("role") or ""
+        if not kind or not cost or role == "Worker" or role.startswith("Hero"):
+            continue
+        if unlocked and not unlocked.get(kind):
+            continue
+        if best is None or (cost, kind) < (best.get("cost_gold"), best.get("id")):
+            best = u
+    if best is None:
+        return None
+    counts = [gold // best["cost_gold"]]
+    if best.get("cost_lumber"):
+        counts.append(lumber // best["cost_lumber"])
+    by_price = min(counts)
+    supply = best.get("supply") or 0
+    by_supply = room // supply if supply else by_price
+    return {
+        "kind": best["id"],
+        "cost_gold": best["cost_gold"],
+        "count": max(0, min(by_price, by_supply)),
+        "by_price": max(0, by_price),
+        "supply_room": room,
+    }
+
+
+def runway(state, catalog=None):
+    """**The gold runway**: the bank's two derivatives and the ore behind them.
+
+    Three facts that arrived from three different rounds and turned out to be
+    one:
+
+    * *the rate* — `me.income_per_min`, measured by the engine over a 60-second
+      window and net of upkeep. r26-blue read `RESOURCES gold 165` four times a
+      minute and could not tell whether it was getting richer.
+    * *the ore* — `mines[]` where `home` is true, i.e. the mines this seat's own
+      halls work, with the `capacity` that turns `remaining` into a percentage.
+      Divided by the rate it is a TIME, which is the number an expansion
+      decision is actually made against.
+    * *the commitment* — `me.commit_per_min`, what the standing training queues
+      will demand. r36's three trainers oversubscribed one bank and the only
+      symptom was a stream of "cannot afford" bounces.
+
+    Every key is optional and every read is a `.get`: rendered beside a
+    pre-runway snapshot this returns whatever half it can compute (usually just
+    `buys`, which needs only a catalog and a bank), and the renderer drops the
+    line entirely when that is nothing.
+
+    Fog: `mines[]` is unfiltered map geography for both seats by design
+    (src/bridge.rs, "mines, trees, map"), `home` is computed from this seat's
+    own halls, and `me` is this seat's own bank. Nothing here is a fact about
+    the opponent's economy.
+    """
+    me = state.get("me") or {}
+    home = [
+        m
+        for m in state.get("mines") or []
+        if m.get("home") and m.get("capacity")
+    ]
+    remaining = sum(m.get("remaining", 0) for m in home)
+    capacity = sum(m.get("capacity", 0) for m in home)
+    income = me.get("income_per_min")
+    return {
+        "income_per_min": income,
+        # Absent and zero are the same claim (the engine skips the key when
+        # nothing is queued), so this normalizes to a number and the renderer
+        # decides whether it is worth a word.
+        "commit_per_min": me.get("commit_per_min") or 0.0,
+        "mines": [
+            {
+                "remaining": m.get("remaining", 0),
+                "capacity": m["capacity"],
+                "frac": round(m.get("remaining", 0) / m["capacity"], 2),
+            }
+            # Deterministic: `mines[]` arrives sorted by id from the engine and
+            # nothing here re-sorts it.
+            for m in home
+        ],
+        "mine_remaining": remaining,
+        "mine_capacity": capacity,
+        "mine_frac": round(remaining / capacity, 2) if capacity else None,
+        # How long the ore behind the current rate lasts, in minutes. `None`
+        # when either half is missing — an extrapolation from an income of zero
+        # is a division, not an estimate.
+        "minutes_left": round(remaining / income, 1) if income and remaining else None,
+        "buys": _buys(state, catalog),
+    }
+
+
 def _alarm_props(raw):
     """Normalize one alarm.
 
@@ -430,6 +560,11 @@ def digest(state, catalog=None):
             "workers": len(workers),
             "idle_workers": sum(1 for w in workers if w.get("order") == "Idle"),
         },
+        # The same economy one derivative later — see `runway()`. A section of
+        # its own rather than more keys under `resources`, because everything
+        # in it is about the NEXT four minutes and everything above it is about
+        # this instant.
+        "runway": runway(state, catalog),
         "army": {
             "units": len(army),
             "strength": round(sum(u.get("hp", 0.0) for u in army)),
@@ -527,6 +662,65 @@ def _trunc(line, width=110):
     return line if len(line) <= width else line[: width - 1] + "…"
 
 
+def _minutes(m):
+    """A duration a commander compares against a build time. One decimal while
+    the answer is "soon", none once it stops being a countdown."""
+    return "{:.0f}m".format(m) if m >= 10 else "{:.1f}m".format(m)
+
+
+def render_runway(props):
+    """The RUNWAY line, or `None` when there is nothing to put on it.
+
+    Sits directly under RESOURCES because it is the same economy read forward:
+    RESOURCES says what you have, RUNWAY says how fast it is arriving, how much
+    ore is behind it, what it buys, and what is already spoken for.
+
+    Rendered at DEFAULT's width rather than the digest's 110, for DEFAULT's
+    reason: the clauses are ordered cheapest-to-reconstruct LAST, but a seat
+    working four mines can push the mine list out past a 110-column cut, and the
+    clause lost off the end would be the commitment — the one fact here that no
+    other line on the page carries at all.
+    """
+    r = props.get("runway") or {}
+    parts = []
+    income = r.get("income_per_min")
+    if income is not None:
+        parts.append("gold {} +{:.0f}/min".format(props["resources"]["gold"], income))
+    b = r.get("buys")
+    if b:
+        clause = "buys {}x {}".format(b["count"], b["kind"])
+        # Only when supply is the binding constraint — otherwise the count IS
+        # the gold answer and a second number would be noise.
+        if b["count"] < b["by_price"]:
+            clause += " (gold covers {}, supply room {})".format(b["by_price"], b["supply_room"])
+        parts.append(clause)
+    mines = r.get("mines") or []
+    if mines:
+        # Per mine, because "mine remaining per hall" is what was asked for and
+        # because one spent main beside one fresh expansion is a different
+        # situation from two half-empty mines with the same total.
+        each = " ".join("{:.0f}%".format(100.0 * m["frac"]) for m in mines[:4])
+        if len(mines) > 4:
+            each += " +{}".format(len(mines) - 4)
+        clause = "mine{} {} {}g".format(
+            "" if len(mines) == 1 else "s", each, r["mine_remaining"]
+        )
+        if r.get("minutes_left") is not None:
+            clause += " ≈ {} at this rate".format(_minutes(r["minutes_left"]))
+        parts.append(clause)
+    commit = r.get("commit_per_min") or 0.0
+    # Only when the queues want more than the mines deliver. Under income it is
+    # a healthy economy and needs no words; over it, it is the reason the bank
+    # is not growing, and r36 had to infer that from "cannot afford" bounces.
+    if commit and income is not None and commit > income:
+        parts.append("commit {:.0f}/min > income {:.0f}/min".format(commit, income))
+    elif commit and income is None:
+        parts.append("commit {:.0f}/min".format(commit))
+    if not parts:
+        return None
+    return _trunc("RUNWAY " + " · ".join(parts), 240)
+
+
 def _game_over_phrase(game_over):
     """`game_over` is a team name, or `"draw"` — the one value that is not a
     team (wc3clone-j84: a capped match ends dead even and still has to end).
@@ -555,6 +749,10 @@ def render_digest(props):
             )
         ),
     ]
+
+    runway_line = render_runway(props)
+    if runway_line:
+        head.append(runway_line)
 
     st = props["status"]
     if st["waiting_for"] is not None:
@@ -983,14 +1181,19 @@ def full_view(s, path):
         print(f"TRIGGER [{t['status']}]{fired} {t['sentence']}")
 
     # --- mines & trees ---
-    print(
-        "MINES: "
-        + " ".join(
-            f"id={m['id']}@{tuple(m['pos'])}:{m['remaining']}"
-            + ("(near me)" if dist(m["pos"], BASE) < 40 else "")
-            for m in s["mines"]
-        )
-    )
+    # `home` is the engine's own verdict on whose mine it is (`mine_is_home`,
+    # the same predicate `mine_dry` and both economy alarms read), so the
+    # readout stopped guessing at it with a distance from the base — the two
+    # agreed until a hall moved. The percentage needs `capacity`; a snapshot
+    # written before either key falls back to what it always printed.
+    def mine_line(m):
+        out = f"id={m['id']}@{tuple(m['pos'])}:{m['remaining']}"
+        if m.get("capacity"):
+            out += "/{}({:.0f}%)".format(m["capacity"], 100.0 * m["remaining"] / m["capacity"])
+        near = m["home"] if "home" in m else dist(m["pos"], BASE) < 40
+        return out + ("(near me)" if near else "")
+
+    print("MINES: " + " ".join(mine_line(m) for m in s["mines"]))
     trees = s.get("trees_near", [])
     if trees and isinstance(trees[0], dict):
         print(

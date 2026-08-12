@@ -10598,7 +10598,7 @@ mod tests {
     fn spawn_node(app: &mut App, kind: ResourceKind, at: Vec3, remaining: u32) -> Entity {
         app.world_mut()
             .spawn((
-                ResourceNode { kind, remaining },
+                ResourceNode::full(kind, remaining),
                 Transform::from_translation(at),
             ))
             .id()

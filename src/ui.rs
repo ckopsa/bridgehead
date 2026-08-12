@@ -8324,10 +8324,58 @@ struct SelectionReasons<'w, 's> {
     fog: Res<'w, FogGrids>,
 }
 
+/// **The gold runway, for the seat with a mouse.** The rates `GoldFlow`
+/// publishes and the mines they are being dug out of.
+///
+/// One `SystemParam` because `update_hud` sits on Bevy's 16-parameter ceiling
+/// (see `SelectionReasons` above), and because the two are one fact: an income
+/// rate with no idea how much ore is left behind it is the half-answer that
+/// cost r26-blue its game. Nothing is computed here that the bridge seat is not
+/// handed in `me.income_per_min` / `mines[]` — same numbers, different pixels,
+/// which is where the two seats are allowed to differ.
+#[derive(SystemParam)]
+struct RunwayView<'w, 's> {
+    flow: Res<'w, GoldFlow>,
+    nodes: Query<'w, 's, (&'static ResourceNode, &'static Transform)>,
+}
+
+/// **The human's gold runway**, in the one place a player already looks for
+/// money — the same three facts the bridge seat reads off `me.income_per_min`,
+/// `me.commit_per_min` and `mines[]`, in a bar instead of a line of text.
+///
+/// A free function so it can be tested without a HUD, and so the equity claim
+/// ("both seats are told the same thing") is a readable string rather than an
+/// argument about pixels. The commitment appears only when it outruns income,
+/// for the reason the digest's line gives: under income it is a healthy
+/// economy and needs no words.
+fn resource_line(econ: &Economy, flow: &TeamFlow, mine_left: u32, mine_cap: u32) -> String {
+    format!(
+        "Gold: {} (+{:.0}/min{})   Lumber: {}{}",
+        econ.gold,
+        flow.income_per_min,
+        if flow.commit_per_min > flow.income_per_min {
+            format!(", queues want {:.0}", flow.commit_per_min)
+        } else {
+            String::new()
+        },
+        econ.lumber,
+        if mine_cap > 0 {
+            format!(
+                "   Mines: {:.0}% ({}g)",
+                100.0 * mine_left as f32 / mine_cap as f32,
+                mine_left
+            )
+        } else {
+            String::new()
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_hud(
     mut ui: ResMut<UiState>,
     economies: Res<Economies>,
+    runway: RunwayView,
     records: Res<HeroRecords>,
     game_over: Res<GameOver>,
     ai_controlled: Res<AiControlled>,
@@ -8395,6 +8443,28 @@ fn update_hud(
 ) {
     let econ = *economies.get(Team::Human);
     let supply_blocked = econ.supply_cap > 0 && econ.supply_used >= econ.supply_cap;
+
+    // --- the gold runway ---------------------------------------------------
+    // Bank, rate, and how much of the ore behind the rate is left: the three
+    // facts the bridge seat reads off `me.income_per_min` and `mines[]`, in the
+    // one place the human already looks for money. `mine_is_home` decides whose
+    // mine it is, exactly as it does for the snapshot and for both alarms.
+    let flow = runway.flow.get(Team::Human);
+    let my_halls: Vec<Vec3> = all_buildings
+        .iter()
+        .filter(|(b, team, _, _, under, _)| {
+            **team == Team::Human && is_hall(b.kind) && !*under
+        })
+        .map(|(_, _, tf, ..)| tf.translation)
+        .collect();
+    let (mut mine_left, mut mine_cap) = (0u32, 0u32);
+    for (node, tf) in runway.nodes.iter() {
+        if node.kind == ResourceKind::Gold && mine_is_home(&my_halls, tf.translation) {
+            mine_left += node.remaining;
+            mine_cap += node.capacity;
+        }
+    }
+    let resources_line = resource_line(&econ, flow, mine_left, mine_cap);
 
     let unit_count = sel_units.iter().count();
     let building_count = sel_buildings.iter().count();
@@ -9061,9 +9131,7 @@ fn update_hud(
     // --- texts -------------------------------------------------------------
     for (slot, mut text, mut color) in &mut texts {
         match *slot {
-            Slot::Resources => {
-                text.0 = format!("Gold: {}   Lumber: {}", econ.gold, econ.lumber);
-            }
+            Slot::Resources => text.0 = resources_line.clone(),
             Slot::Supply => {
                 text.0 = format!(
                     "Supply: {}/{} · {}",
@@ -12608,6 +12676,34 @@ mod tests {
     /// collects anything, and `update_transit_markers` queries `PendingOrder`,
     /// which cannot exist with the feature off — so this test covers the half
     /// that is a decision rather than a consequence.
+    #[test]
+    /// **The human seat gets the runway too** (wc3clone-kpp).
+    ///
+    /// The bridge seat reads bank, income, commitment and mine remaining off
+    /// `me` and `mines[]`; the player reads the same four off the resource bar.
+    /// A fact that reaches one seat and not the other is a fairness bug even
+    /// when it works (THESIS.md, docs/INTENT.md § the fairness invariant), and
+    /// this is the cheapest place to notice one.
+    #[test]
+    fn the_resource_bar_carries_the_same_runway_facts_the_bridge_seat_gets() {
+        let econ = Economy { gold: 936, lumber: 210, ..Default::default() };
+        let mut flow = TeamFlow::default();
+        flow.income_per_min = 513.0;
+
+        // A healthy economy says nothing about its queues.
+        let calm = resource_line(&econ, &flow, 4000, 10000);
+        assert_eq!(calm, "Gold: 936 (+513/min)   Lumber: 210   Mines: 40% (4000g)");
+
+        // Oversubscribed, it says why the bank is not growing — r36's fact.
+        flow.commit_per_min = 1238.0;
+        let loud = resource_line(&econ, &flow, 4000, 10000);
+        assert!(loud.contains("queues want 1238"), "{loud}");
+
+        // And a team whose halls work no mine is told nothing about mines
+        // rather than a percentage of nothing.
+        assert!(!resource_line(&econ, &flow, 0, 0).contains("Mines"));
+    }
+
     #[test]
     fn the_hud_says_nothing_at_all_when_the_chain_of_command_is_off() {
         assert_eq!(coverage_line(false, 3, 8, 12), "");
